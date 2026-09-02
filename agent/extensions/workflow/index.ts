@@ -46,8 +46,21 @@ import {
   extractPlanStepsFromMarkdown,
   markCompletedSteps,
   isPlanWritePath,
+  isUserInteractionEntry,
+  getHeaderText,
+  formatTimestamp,
+  shortId,
   type TodoItem,
 } from "./utils.ts";
+import {
+  isGitRepo,
+  isGitRepoSync,
+  createCheckpoint,
+  isDirty,
+  createSafetySnapshot,
+  restoreCode,
+  findPersistedRef,
+} from "./checkpoint.ts";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -123,7 +136,9 @@ function discoverAgents(cwd: string): AgentConfig[] {
           systemPrompt: body,
           filePath: fp,
         });
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     }
   }
   // dedup by name (last wins)
@@ -150,7 +165,7 @@ async function runSingleAgent(
       });
     });
   }
-  const args = [
+  const _args = [
     "--mode",
     "json",
     "-p",
@@ -174,7 +189,7 @@ async function runSingleAgent(
     !process.argv[1].startsWith("/$bunfs/")
       ? process.execPath
       : "pi";
-  const piArgs = piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs];
+  const _piArgs = piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs];
 
   return new Promise((resolve) => {
     const proc = spawn(
@@ -189,12 +204,14 @@ async function runSingleAgent(
     let buffer = "";
     const messages: any[] = [];
     let stderr = "";
-    let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
     const onAbort = () => {
       try {
         proc.kill("SIGTERM");
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     };
     if (signal) {
       if (signal.aborted) onAbort();
@@ -220,7 +237,9 @@ async function runSingleAgent(
               usage.cost += u.cost?.total || 0;
             }
           }
-        } catch {}
+        } catch (_e) {
+          void _e;
+        }
       }
     });
     proc.stderr.on("data", (d) => {
@@ -258,6 +277,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let currentPlanFile: string | undefined;
   let awaitingDecision = false;
   let btwNotes: string[] = [];
+
+  // ── Checkpoint (shadow bare-repo) state ────────────────────────
+  const checkpoints = new Map<string, string>();
+  let currentEntryId: string | undefined;
+  let lastPromptHeader: string | undefined;
+  const recentRestores = new Set<string>();
 
   const PLAN_MODE_TOOLS = [
     "read",
@@ -359,7 +384,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
           recursive: true,
         });
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     } else {
       pi.setActiveTools(
         toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
@@ -386,7 +413,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (extracted.length > 0) {
         todoItems = extracted;
       }
-    } catch {}
+    } catch (_e) {
+      void _e;
+    }
     updateStatus(ctx);
     persistState();
     ctx.ui.notify(
@@ -402,7 +431,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       type: "boolean",
       default: false,
     } as any);
-  } catch {}
+  } catch (_e) {
+    void _e;
+  }
 
   try {
     pi.registerCommand("plan", {
@@ -422,7 +453,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       description: "Toggle plan mode",
       handler: async (ctx) => togglePlanMode(ctx as any),
     });
-  } catch {}
+  } catch (_e) {
+    void _e;
+  }
 
   // ── Todo tool (persisted via details) ────────────────────────────
 
@@ -637,8 +670,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const MAX_CONC = 4;
       const results: any[] = new Array(jobs.length);
       let next = 0;
-      const workers = new Array(Math.min(MAX_CONC, jobs.length))
-        .fill(null)
+      const workers = Array.from(
+        { length: Math.min(MAX_CONC, jobs.length) },
+        () => null,
+      )
+        // eslint-disable-next-line array-callback-return
         .map(async () => {
           while (true) {
             const idx = next++;
@@ -995,10 +1031,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const wrap = (s: string) => {
             // simple wrap using visibleWidth? use pi-tui helper via manual
             const out: string[] = [];
-            let cur = s;
+            const cur = s;
             // Not perfect but use Text wrapping logic: split lines naive
             for (const line of cur.split("\n")) {
-              // @ts-ignore
+              // @ts-expect-error
               const { wrapTextWithAnsi } = require("@earendil-works/pi-tui");
               out.push(...wrapTextWithAnsi(line, W));
             }
@@ -1151,30 +1187,112 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── /rewind and /btw ─────────────────────────────────────────────
 
   pi.registerCommand("rewind", {
-    description: "Rewind to previous checkpoint (branch navigation)",
+    description:
+      "Rewind to previous user checkpoint (restores messages + tracked files)",
     handler: async (_args, ctx) => {
-      const tree = (ctx.sessionManager as any).getTree?.() ?? null;
-      const branch = ctx.sessionManager.getBranch();
+      const branch: any[] = ctx.sessionManager.getBranch();
       if (!branch || branch.length === 0) {
         ctx.ui.notify("No history to rewind", "info");
         return;
       }
 
-      // Build selectable checkpoints: last 15 entries + labels
-      const entries = branch.slice(-20).reverse();
-      const items: SelectItem[] = entries.map((e: any, idx: number) => {
-        const id = e.id || e.entryId || String(idx);
-        const type = e.type || e.message?.role || "entry";
-        let label = `${type} ${id.slice(0, 6)}`;
-        if (e.message?.role === "user") {
-          const t =
-            typeof e.message.content === "string"
-              ? e.message.content
-              : e.message.content?.[0]?.text || "";
-          label = `user: ${t.slice(0, 50)}`;
-        } else if (e.type === "label")
-          label = `label: ${e.label} @ ${e.targetId?.slice(0, 6)}`;
-        return { value: id, label, description: `${e.timestamp || ""}` };
+      // Build user-interaction checkpoints: filtered, newest-first, cap 20
+      let userEntries: any[] = branch.filter((e: any) =>
+        isUserInteractionEntry(e),
+      );
+      // Fallback to tree labels if branch has few user entries (orphan labels)
+      if (userEntries.length < 2) {
+        try {
+          const tree: any = (ctx.sessionManager as any).getTree?.();
+          if (Array.isArray(tree)) {
+            const walk = (nodes: any[]) => {
+              for (const n of nodes) {
+                if (n?.entry && n.entry.type === "label") {
+                  // Synthetic entry for orphan label
+                  userEntries.push(n.entry);
+                }
+                if (Array.isArray(n?.children)) walk(n.children);
+              }
+            };
+            walk(tree);
+          }
+        } catch (_e) {
+          void _e;
+        }
+      }
+      // Deduplicate btw synthetic entries by note+timestamp proximity (2s)
+      const seenBtw = new Map<string, number>();
+      const deduped: any[] = [];
+      for (const e of userEntries) {
+        if (e.type === "custom" && e.customType === "workflow-btw") {
+          const key = String(e.data?.note ?? "").trim();
+          const ts = e.timestamp ? new Date(e.timestamp).getTime() : 0;
+          const prev = seenBtw.get(key);
+          if (prev !== undefined && Math.abs(prev - ts) < 2000) continue;
+          seenBtw.set(key, ts);
+        }
+        if (e.type === "custom_message" && e.customType === "workflow-btw") {
+          const key = String(e.content ?? "").trim();
+          const ts = e.timestamp ? new Date(e.timestamp).getTime() : 0;
+          const prev = seenBtw.get(key);
+          if (prev !== undefined && Math.abs(prev - ts) < 2000) continue;
+          seenBtw.set(key, ts);
+        }
+        deduped.push(e);
+      }
+      userEntries = deduped;
+
+      // Merge label entries that target an existing user entry id: fold into that row's description later, avoid duplicate row
+      const labelByTarget = new Map<string, any>();
+      for (const e of branch as any[])
+        if (e.type === "label" && e.targetId) labelByTarget.set(e.targetId, e);
+      const userIds = new Set(userEntries.map((e: any) => e.id));
+      const visibleLabels: any[] = [];
+      for (const e of branch as any[]) {
+        if (e.type === "label" && !userIds.has(e.targetId))
+          visibleLabels.push(e);
+      }
+      // Combine and order newest-first
+      let combined: any[] = [...userEntries, ...visibleLabels];
+      // Reverse chronological: newest first based on branch order; branch is root->leaf, so reverse
+      combined = combined
+        .slice()
+        .sort((a: any, b: any) => {
+          const ai = branch.indexOf(a);
+          const bi = branch.indexOf(b);
+          // Items not in branch (orphan labels) go last; otherwise sort by branch position descending
+          if (ai === -1 && bi === -1) return 0;
+          if (ai === -1) return 1;
+          if (bi === -1) return -1;
+          return bi - ai;
+        })
+        .slice(0, 20);
+      if (combined.length < 2) {
+        ctx.ui.notify(
+          "No checkpoints yet — need at least one user prompt",
+          "info",
+        );
+        return;
+      }
+      const items: SelectItem[] = combined.map((e: any) => {
+        const id =
+          e.id ||
+          e.entryId ||
+          e.targetId ||
+          String(e.timestamp ?? Math.random());
+        const header = getHeaderText(e);
+        const label = header ? header : `user ${shortId(id)}`;
+        const ts = formatTimestamp(e.timestamp);
+        const hasSnap = checkpoints.has(id) || !!findPersistedRef(branch, id);
+        const extra = hasSnap ? "" : " · [no snapshot]";
+        const labelSuffix = labelByTarget.get(id)
+          ? ` · label: ${String(labelByTarget.get(id).label ?? "").slice(0, 20)}`
+          : "";
+        return {
+          value: id,
+          label,
+          description: `${ts ? ts + " · " : ""}${shortId(id)}${extra}${labelSuffix}`,
+        };
       });
 
       const choice = await ctx.ui.custom<string | null>(
@@ -1189,7 +1307,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const container = new Container();
           container.addChild(
             new Text(
-              theme.fg("accent", theme.bold(" Rewind — pick a checkpoint ")),
+              theme.fg("accent", theme.bold(" Rewind — user checkpoints ")),
+              1,
+              0,
+            ),
+          );
+          container.addChild(
+            new Text(
+              theme.fg(
+                "dim",
+                ` Showing user prompts only (tools hidden) • ${items.length} • Restores messages + tracked files `,
+              ),
               1,
               0,
             ),
@@ -1219,9 +1347,71 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Rewind cancelled", "info");
         return;
       }
+      // Always Both: messages + tracked files atomically
+      const cwd = (ctx as any).cwd as string;
       try {
+        const isRepo = isGitRepoSync(cwd) || (await isGitRepo(pi as any, cwd));
+        if (!isRepo) {
+          await (ctx as any).navigateTree(choice, { summarize: false });
+          ctx.ui.notify(
+            `Rewound to ${shortId(choice)} — messages only (no git repo, file restore unavailable)`,
+            "info",
+          );
+          return;
+        }
+        // Dirty check with safety snapshot
+        let dirty = false;
+        try {
+          dirty = await isDirty(pi as any, cwd);
+        } catch (_e) {
+          void _e;
+        }
+        if (dirty && (ctx as any).hasUI) {
+          const sel = await (ctx as any).ui.select(
+            "Working tree has uncommitted changes. Create safety snapshot and restore?",
+            [
+              "Restore — snapshot current state then revert tracked files",
+              "Cancel",
+            ],
+          );
+          if (!sel || String(sel).startsWith("Cancel")) {
+            ctx.ui.notify("Rewind cancelled — working tree preserved", "info");
+            return;
+          }
+        }
+        // Always create safety snapshot before destructive checkout
+        try {
+          await createSafetySnapshot(pi as any, cwd);
+        } catch (_e) {
+          void _e;
+        }
+        const ref = checkpoints.get(choice) ?? findPersistedRef(branch, choice);
+        if (!ref) {
+          await (ctx as any).navigateTree(choice, { summarize: false });
+          ctx.ui.notify(
+            `Rewound to ${shortId(choice)} — restored messages only (no file snapshot for this checkpoint)`,
+            "info",
+          );
+          return;
+        }
+        // Move conversation branch first, then restore files so getBranch matches files
         await (ctx as any).navigateTree(choice, { summarize: false });
-        ctx.ui.notify(`Rewound to ${choice.slice(0, 6)}`, "info");
+        recentRestores.add(choice);
+        setTimeout(() => recentRestores.delete(choice), 2000);
+        const res = await restoreCode(pi as any, cwd, ref, {
+          signal: (ctx as any).signal,
+        } as any);
+        if (res.restored) {
+          ctx.ui.notify(
+            `Rewound to ${shortId(choice)} · files restored`,
+            "info",
+          );
+        } else {
+          ctx.ui.notify(
+            `Rewound to ${shortId(choice)} — messages restored, file restore failed`,
+            "error",
+          );
+        }
       } catch (e: any) {
         ctx.ui.notify(`Rewind failed: ${e?.message || e}`, "error");
       }
@@ -1240,7 +1430,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       // Persist as custom entry so it survives reload and appears in transcript
       try {
         pi.appendEntry("workflow-btw", { note, at: Date.now() });
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
       // Inject as custom message so next LLM turn sees it
       try {
         (pi as any).sendMessage?.(
@@ -1251,7 +1443,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
           },
           { triggerTurn: false },
         );
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
       // Also append via sessionManager if available
       try {
         (ctx.sessionManager as any).appendCustomMessageEntry?.(
@@ -1259,7 +1453,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
           `[BTW] ${note}`,
           true,
         );
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
 
       if ((ctx as any).isIdle?.() === false) {
         ctx.ui.notify(`Note queued (agent busy): ${note.slice(0, 60)}`, "info");
@@ -1280,7 +1476,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         btwNotes.push(note);
         try {
           pi.appendEntry("workflow-btw", { note, at: Date.now() });
-        } catch {}
+        } catch (_e) {
+          void _e;
+        }
       }
       return { action: "handled" } as any;
     }
@@ -1312,8 +1510,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ) {
           btwNotes.push(e.data.note);
         }
+        if (
+          e.type === "custom" &&
+          e.customType === "workflow-checkpoint" &&
+          e.data?.entryId &&
+          typeof e.data?.ref === "string"
+        ) {
+          checkpoints.set(e.data.entryId, e.data.ref);
+        }
       }
-    } catch {}
+    } catch (_e) {
+      void _e;
+    }
     // auto-enable plan mode if flag set at startup (support both --plan and --workflow-plan)
     const flagPlan =
       (pi as any).getFlagValue?.("plan") ??
@@ -1328,7 +1536,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
           recursive: true,
         });
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
       persistState();
     }
     updateStatus(ctx as any);
@@ -1357,7 +1567,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
           todoItems = e.message.details.todos;
         }
       }
-    } catch {}
+    } catch (_e) {
+      void _e;
+    }
     updateStatus(ctx as any);
   });
 
@@ -1390,7 +1602,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         fs.mkdirSync(path.join(cwd, CONFIG_DIR_NAME, "plans"), {
           recursive: true,
         });
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     }
     // In build mode, ensure todos exist before first real edit
     if (
@@ -1411,8 +1625,109 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   });
 
+  // ── Checkpoint lifecycle: track leaf entryId and prompt header ─
+  pi.on("tool_result", async (_event, ctx) => {
+    try {
+      const leaf =
+        (ctx.sessionManager as any).getLeafEntry?.() ??
+        ctx.sessionManager.getBranch()?.at(-1);
+      if (leaf?.id) currentEntryId = leaf.id;
+    } catch (_e) {
+      void _e;
+    }
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    if (!currentEntryId) return;
+    const cwd = (ctx as any).cwd as string;
+    try {
+      if (!isGitRepoSync(cwd) && !(await isGitRepo(pi as any, cwd))) return;
+      const header = lastPromptHeader ?? "checkpoint";
+      const res = await createCheckpoint(
+        pi as any,
+        cwd,
+        currentEntryId,
+        header,
+      );
+      if (res.ref) {
+        checkpoints.set(currentEntryId, res.ref);
+        try {
+          pi.appendEntry("workflow-checkpoint", {
+            entryId: currentEntryId,
+            ref: res.ref,
+            prompt: header,
+            createdAt: Date.now(),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
+  });
+
+  pi.on("agent_settled", async () => {
+    // keep persisted CustomEntry for reload, clear in-memory tombstone only on explicit prune; for now no clear to survive fork
+  });
+
+  // Dedup helper for /tree vs /rewind double-restore
+  pi.on("session_before_tree", async (event, ctx) => {
+    const targetId =
+      (event as any).preparation?.targetId ?? (event as any).targetId;
+    if (!targetId || recentRestores.has(targetId)) return;
+    const branch: any[] = ctx.sessionManager.getBranch();
+    const ref = checkpoints.get(targetId) ?? findPersistedRef(branch, targetId);
+    if (!ref) return;
+    const cwd = (ctx as any).cwd as string;
+    if (!isGitRepoSync(cwd) && !(await isGitRepo(pi as any, cwd))) return;
+    if (!(ctx as any).hasUI) return;
+    try {
+      const dirty = await isDirty(pi as any, cwd);
+      if (dirty) {
+        const sel = await (ctx as any).ui.select(
+          "Restore tracked files to this checkpoint?",
+          ["Yes, restore files", "No, messages only"],
+        );
+        if (!sel || String(sel).startsWith("No")) return;
+      }
+      try {
+        await createSafetySnapshot(pi as any, cwd);
+      } catch (_e) {
+        void _e;
+      }
+      const res = await restoreCode(pi as any, cwd, ref, {
+        signal: (event as any).signal,
+      } as any);
+      if (res.restored) {
+        (ctx as any).ui?.notify?.(
+          `Files restored to ${shortId(targetId)}`,
+          "info",
+        );
+        recentRestores.add(targetId);
+        setTimeout(() => recentRestores.delete(targetId), 2000);
+      }
+    } catch (_e) {
+      void _e;
+    }
+  });
+
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, _ctx) => {
+    // Capture header for next checkpoint commit message (first line of prompt)
+    try {
+      const raw = String((event as any).prompt ?? (event as any).text ?? "");
+      if (raw.trim()) {
+        const first =
+          raw
+            .split(/\r?\n/)
+            .find((l: string) => l.trim())
+            ?.trim() ?? raw.trim();
+        lastPromptHeader = first.replace(/\s+/g, " ").slice(0, 80);
+      }
+    } catch (_e) {
+      void _e;
+    }
     if (planModeEnabled) {
       const btwBlock = btwNotes.length
         ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}`
@@ -1521,7 +1836,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
             },
             { triggerTurn: false },
           );
-        } catch {}
+        } catch (_e) {
+          void _e;
+        }
         executionMode = false;
         // keep todos for history but clear executing flag
         updateStatus(ctx as any);
@@ -1542,7 +1859,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         extracted = extractTodoItems(
           getTextContent(lastAssistant as AssistantMessage),
         );
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     }
     if (extracted.length > 0) todoItems = extracted;
     if (todoItems.length === 0 && lastPlanWritePath) {
@@ -1555,7 +1874,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         );
         const fromFile = extractPlanStepsFromMarkdown(planText);
         if (fromFile.length > 0) todoItems = fromFile;
-      } catch {}
+      } catch (_e) {
+        void _e;
+      }
     }
     if (todoItems.length === 0) return;
 
@@ -1581,7 +1902,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     try {
       if (planPath && fs.existsSync(planPath))
         planTextForRender = fs.readFileSync(planPath, "utf8");
-    } catch {}
+    } catch (_e) {
+      void _e;
+    }
     if (!planTextForRender && lastAssistant)
       planTextForRender = getTextContent(lastAssistant as AssistantMessage);
 
@@ -1618,7 +1941,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           return {
             render: (w: number) => container.render(w),
             invalidate: () => container.invalidate(),
-            handleInput: (data: string) => {
+            handleInput: (_data: string) => {
               done();
             },
           };
@@ -1697,7 +2020,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
             fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
             fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
           }
-        } catch {}
+        } catch (_e) {
+          void _e;
+        }
         enterBuildModeFromPlan(ctx as any, resolvedPlan);
         updateStatus(ctx as any);
         // Show todos widget immediately
@@ -1733,13 +2058,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
               toolsBeforePlanMode = pi.getActiveTools();
             try {
               pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
-            } catch {}
+            } catch (_e) {
+              void _e;
+            }
           } else {
             try {
               pi.setActiveTools(
                 toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
               );
-            } catch {}
+            } catch (_e) {
+              void _e;
+            }
             toolsBeforePlanMode = undefined;
           }
           // Find a ctx to update status — use a no-op if none
@@ -1748,5 +2077,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
       });
     }
-  } catch {}
+  } catch (_e) {
+    void _e;
+  }
 }
