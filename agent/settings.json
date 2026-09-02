@@ -2,7 +2,7 @@
   "lastChangelogVersion": "0.84.4",
   "theme": "dark",
   "packages": [
-    "npm:pi-code"
+    "npm:pi-lens"
   ],
   "enabledModels": [
     "opencode-go/muse-spark-1.2-contributor",

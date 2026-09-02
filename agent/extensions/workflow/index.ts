@@ -17,9 +17,27 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, getAgentDir, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Text, Key, matchesKey, SelectList, Editor, type EditorTheme, type SelectItem } from "@earendil-works/pi-tui";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  getAgentDir,
+  getMarkdownTheme,
+  withFileMutationQueue,
+} from "@earendil-works/pi-coding-agent";
+import {
+  Container,
+  Markdown,
+  Text,
+  Key,
+  matchesKey,
+  SelectList,
+  Editor,
+  type EditorTheme,
+  type SelectItem,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -37,15 +55,31 @@ function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
   return m.role === "assistant" && Array.isArray((m as any).content);
 }
 function getTextContent(msg: AssistantMessage): string {
-  return msg.content.filter((b): b is TextContent => b.type === "text").map((b) => b.text).join("\n");
+  return msg.content
+    .filter((b): b is TextContent => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
 }
 function slugify(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "plan";
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "plan"
+  );
 }
 
 // ── Subagent runner (trimmed from examples/extensions/subagent) ─────
 
-interface AgentConfig { name: string; description: string; tools?: string[]; model?: string; systemPrompt: string; filePath: string; }
+interface AgentConfig {
+  name: string;
+  description: string;
+  tools?: string[];
+  model?: string;
+  systemPrompt: string;
+  filePath: string;
+}
 function discoverAgents(cwd: string): AgentConfig[] {
   const agents: AgentConfig[] = [];
   const dirs = [path.join(getAgentDir(), "agents")];
@@ -68,14 +102,27 @@ function discoverAgents(cwd: string): AgentConfig[] {
         // simple frontmatter parse
         const fmMatch = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
         if (!fmMatch) continue;
-        const fm = fmMatch[1]; const body = fmMatch[2];
+        const fm = fmMatch[1];
+        const body = fmMatch[2];
         const name = fm.match(/name:\s*(.+)/)?.[1].trim();
         const description = fm.match(/description:\s*(.+)/)?.[1].trim();
         if (!name || !description) continue;
         const toolsRaw = fm.match(/tools:\s*(.+)/)?.[1].trim();
         const model = fm.match(/model:\s*(.+)/)?.[1].trim();
-        const tools = toolsRaw ? toolsRaw.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
-        agents.push({ name, description, tools, model, systemPrompt: body, filePath: fp });
+        const tools = toolsRaw
+          ? toolsRaw
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined;
+        agents.push({
+          name,
+          description,
+          tools,
+          model,
+          systemPrompt: body,
+          filePath: fp,
+        });
       } catch {}
     }
   }
@@ -91,37 +138,64 @@ async function runSingleAgent(
   task: string,
   signal?: AbortSignal,
 ): Promise<{ messages: any[]; stderr: string; exitCode: number; usage: any }> {
-  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
+  const tmpDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "pi-subagent-"),
+  );
   const promptPath = path.join(tmpDir, `prompt-${agent.name}.md`);
   if (agent.systemPrompt.trim()) {
     await withFileMutationQueue(promptPath, async () => {
-      await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+      await fs.promises.writeFile(promptPath, agent.systemPrompt, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
     });
   }
-  const args = ["--mode", "json", "-p", "--no-session", "--no-session", "--mode", "json"];
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--no-session",
+    "--mode",
+    "json",
+  ];
   // Actually pi --mode json -p --no-session ; ensure correct
   const cleanArgs = ["--mode", "json", "-p", "--no-session"];
   if (agent.model) cleanArgs.push("--model", agent.model);
   if (agent.tools?.length) cleanArgs.push("--tools", agent.tools.join(","));
-  if (agent.systemPrompt.trim()) cleanArgs.push("--append-system-prompt", promptPath);
+  if (agent.systemPrompt.trim())
+    cleanArgs.push("--append-system-prompt", promptPath);
   cleanArgs.push(`Task: ${task}`);
 
   // Resolve pi invocation
-  const piCmd = process.argv[1] && fs.existsSync(process.argv[1]) && !process.argv[1].startsWith("/$bunfs/") ? process.execPath : "pi";
+  const piCmd =
+    process.argv[1] &&
+    fs.existsSync(process.argv[1]) &&
+    !process.argv[1].startsWith("/$bunfs/")
+      ? process.execPath
+      : "pi";
   const piArgs = piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs];
 
   return new Promise((resolve) => {
-    const proc = spawn(piCmd, piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs], {
-      cwd,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const proc = spawn(
+      piCmd,
+      piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs],
+      {
+        cwd,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let buffer = "";
     const messages: any[] = [];
     let stderr = "";
     let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
-    const onAbort = () => { try { proc.kill("SIGTERM"); } catch {} };
+    const onAbort = () => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {}
+    };
     if (signal) {
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
@@ -139,15 +213,19 @@ async function runSingleAgent(
             messages.push(ev.message);
             const u = ev.message.usage;
             if (u) {
-              usage.input += u.input || 0; usage.output += u.output || 0;
-              usage.cacheRead += u.cacheRead || 0; usage.cacheWrite += u.cacheWrite || 0;
+              usage.input += u.input || 0;
+              usage.output += u.output || 0;
+              usage.cacheRead += u.cacheRead || 0;
+              usage.cacheWrite += u.cacheWrite || 0;
               usage.cost += u.cost?.total || 0;
             }
           }
         } catch {}
       }
     });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
     proc.on("close", (code) => {
       if (signal) signal.removeEventListener("abort", onAbort);
       // cleanup tmp
@@ -181,23 +259,54 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let awaitingDecision = false;
   let btwNotes: string[] = [];
 
-  const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "explore", "questionnaire", "workflow_todo"];
-  const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "explore", "questionnaire", "workflow_todo"];
+  const PLAN_MODE_TOOLS = [
+    "read",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo",
+  ];
+  const NORMAL_MODE_TOOLS = [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo",
+  ];
   const PLAN_DISABLED = new Set(["edit", "write"]);
 
-  function unique(arr: string[]): string[] { return [...new Set(arr)]; }
+  function unique(arr: string[]): string[] {
+    return [...new Set(arr)];
+  }
   function getPlanModeTools(active: string[]): string[] {
-    return unique([...active.filter((n) => !PLAN_DISABLED.has(n)), ...PLAN_MODE_TOOLS]);
+    return unique([
+      ...active.filter((n) => !PLAN_DISABLED.has(n)),
+      ...PLAN_MODE_TOOLS,
+    ]);
   }
   function getNormalTools(active: string[]): string[] {
     const managed = new Set([...PLAN_MODE_TOOLS, ...NORMAL_MODE_TOOLS]);
-    return unique([...NORMAL_MODE_TOOLS, ...active.filter((n) => !managed.has(n))]);
+    return unique([
+      ...NORMAL_MODE_TOOLS,
+      ...active.filter((n) => !managed.has(n)),
+    ]);
   }
 
   function updateStatus(ctx: ExtensionContext) {
     if (executionMode && todoItems.length > 0) {
       const done = todoItems.filter((t) => t.completed).length;
-      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", `▶ build ${done}/${todoItems.length}`));
+      ctx.ui.setStatus(
+        "workflow",
+        ctx.ui.theme.fg("accent", `▶ build ${done}/${todoItems.length}`),
+      );
     } else if (planModeEnabled) {
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", "⏸ plan"));
     } else {
@@ -205,12 +314,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     if (executionMode && todoItems.length > 0) {
       const lines = todoItems.map((item) => {
-        if (item.completed) return ctx.ui.theme.fg("success", "☑ ") + ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text));
+        if (item.completed)
+          return (
+            ctx.ui.theme.fg("success", "☑ ") +
+            ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
+          );
         return `${ctx.ui.theme.fg("dim", "☐ ")}${item.text}`;
       });
       ctx.ui.setWidget("workflow-todos", lines);
     } else if (planModeEnabled && todoItems.length > 0) {
-      const lines = todoItems.map((item) => `${ctx.ui.theme.fg("dim", "☐ ")}${ctx.ui.theme.fg("muted", item.text)}`);
+      const lines = todoItems.map(
+        (item) =>
+          `${ctx.ui.theme.fg("dim", "☐ ")}${ctx.ui.theme.fg("muted", item.text)}`,
+      );
       ctx.ui.setWidget("workflow-todos", lines);
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
@@ -232,12 +348,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
     planModeEnabled = !planModeEnabled;
     executionMode = false;
     if (planModeEnabled) {
-      if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
+      if (toolsBeforePlanMode === undefined)
+        toolsBeforePlanMode = pi.getActiveTools();
       pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
-      ctx.ui.notify("Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/.", "info");
-      try { fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), { recursive: true }); } catch {}
+      ctx.ui.notify(
+        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/.",
+        "info",
+      );
+      try {
+        fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
+          recursive: true,
+        });
+      } catch {}
     } else {
-      pi.setActiveTools(toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()));
+      pi.setActiveTools(
+        toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
+      );
       toolsBeforePlanMode = undefined;
       ctx.ui.notify("Build mode — full access restored.", "info");
     }
@@ -249,7 +375,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     planModeEnabled = false;
     executionMode = true;
     currentPlanFile = planPath;
-    pi.setActiveTools(toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()));
+    pi.setActiveTools(
+      toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
+    );
     toolsBeforePlanMode = undefined;
     // populate todos from plan file if not already
     try {
@@ -261,12 +389,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch {}
     updateStatus(ctx);
     persistState();
-    ctx.ui.notify(`Build mode: ${todoItems.length} todos loaded from plan.`, "info");
+    ctx.ui.notify(
+      `Build mode: ${todoItems.length} todos loaded from plan.`,
+      "info",
+    );
   }
 
   // pi-code package already owns --plan flag; we only add --workflow-plan alias to avoid duplicate-flag crash
   try {
-    pi.registerFlag("workflow-plan", { description: "Start in workflow plan mode (alias for --plan)", type: "boolean", default: false } as any);
+    pi.registerFlag("workflow-plan", {
+      description: "Start in workflow plan mode (alias for --plan)",
+      type: "boolean",
+      default: false,
+    } as any);
   } catch {}
 
   try {
@@ -291,40 +426,135 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // ── Todo tool (persisted via details) ────────────────────────────
 
-  interface TodoDetails { action: string; todos: TodoItem[]; nextStep: number; error?: string; }
+  interface TodoDetails {
+    action: string;
+    todos: TodoItem[];
+    nextStep: number;
+    error?: string;
+  }
 
   pi.registerTool({
     name: "workflow_todo",
     label: "Workflow Todo",
-    description: "Manage todo list for plan execution. Actions: list, add (text), toggle (step), clear. Before execute, create todos from plan steps.",
+    description:
+      "Manage todo list for plan execution. Actions: list, add (text), toggle (step), clear. Before execute, create todos from plan steps.",
     parameters: Type.Object({
       action: StringEnum(["list", "add", "toggle", "clear"] as const),
       text: Type.Optional(Type.String({ description: "Todo text (for add)" })),
-      step: Type.Optional(Type.Number({ description: "Step number (for toggle)" })),
+      step: Type.Optional(
+        Type.Number({ description: "Step number (for toggle)" }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       switch (params.action) {
         case "list":
-          return { content: [{ type: "text", text: todoItems.length ? todoItems.map((t) => `[${t.completed ? "x" : " "}] ${t.step}. ${t.text}`).join("\n") : "No todos" }], details: { action: "list", todos: [...todoItems], nextStep: todoItems.length + 1 } as TodoDetails };
+          return {
+            content: [
+              {
+                type: "text",
+                text: todoItems.length
+                  ? todoItems
+                      .map(
+                        (t) =>
+                          `[${t.completed ? "x" : " "}] ${t.step}. ${t.text}`,
+                      )
+                      .join("\n")
+                  : "No todos",
+              },
+            ],
+            details: {
+              action: "list",
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+            } as TodoDetails,
+          };
         case "add": {
-          if (!params.text) return { content: [{ type: "text", text: "Error: text required" }], details: { action: "add", todos: [...todoItems], nextStep: todoItems.length + 1, error: "text required" } as TodoDetails };
-          const item: TodoItem = { step: todoItems.length + 1, text: params.text.slice(0, 80), completed: false };
+          if (!params.text)
+            return {
+              content: [{ type: "text", text: "Error: text required" }],
+              details: {
+                action: "add",
+                todos: [...todoItems],
+                nextStep: todoItems.length + 1,
+                error: "text required",
+              } as TodoDetails,
+            };
+          const item: TodoItem = {
+            step: todoItems.length + 1,
+            text: params.text.slice(0, 80),
+            completed: false,
+          };
           todoItems.push(item);
-          return { content: [{ type: "text", text: `Added ${item.step}. ${item.text}` }], details: { action: "add", todos: [...todoItems], nextStep: todoItems.length + 1 } as TodoDetails };
+          return {
+            content: [
+              { type: "text", text: `Added ${item.step}. ${item.text}` },
+            ],
+            details: {
+              action: "add",
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+            } as TodoDetails,
+          };
         }
         case "toggle": {
-          if (params.step === undefined) return { content: [{ type: "text", text: "Error: step required" }], details: { action: "toggle", todos: [...todoItems], nextStep: todoItems.length + 1, error: "step required" } as TodoDetails };
+          if (params.step === undefined)
+            return {
+              content: [{ type: "text", text: "Error: step required" }],
+              details: {
+                action: "toggle",
+                todos: [...todoItems],
+                nextStep: todoItems.length + 1,
+                error: "step required",
+              } as TodoDetails,
+            };
           const it = todoItems.find((t) => t.step === params.step);
-          if (!it) return { content: [{ type: "text", text: `Step ${params.step} not found` }], details: { action: "toggle", todos: [...todoItems], nextStep: todoItems.length + 1, error: "not found" } as TodoDetails };
+          if (!it)
+            return {
+              content: [
+                { type: "text", text: `Step ${params.step} not found` },
+              ],
+              details: {
+                action: "toggle",
+                todos: [...todoItems],
+                nextStep: todoItems.length + 1,
+                error: "not found",
+              } as TodoDetails,
+            };
           it.completed = !it.completed;
-          return { content: [{ type: "text", text: `${it.step}. ${it.text} ${it.completed ? "done" : "pending"}` }], details: { action: "toggle", todos: [...todoItems], nextStep: todoItems.length + 1 } as TodoDetails };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${it.step}. ${it.text} ${it.completed ? "done" : "pending"}`,
+              },
+            ],
+            details: {
+              action: "toggle",
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+            } as TodoDetails,
+          };
         }
         case "clear": {
-          const c = todoItems.length; todoItems = [];
-          return { content: [{ type: "text", text: `Cleared ${c} todos` }], details: { action: "clear", todos: [], nextStep: 1 } as TodoDetails };
+          const c = todoItems.length;
+          todoItems = [];
+          return {
+            content: [{ type: "text", text: `Cleared ${c} todos` }],
+            details: { action: "clear", todos: [], nextStep: 1 } as TodoDetails,
+          };
         }
         default:
-          return { content: [{ type: "text", text: `Unknown action ${params.action}` }], details: { action: "list", todos: [...todoItems], nextStep: todoItems.length + 1, error: "unknown" } as TodoDetails };
+          return {
+            content: [
+              { type: "text", text: `Unknown action ${params.action}` },
+            ],
+            details: {
+              action: "list",
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+              error: "unknown",
+            } as TodoDetails,
+          };
       }
     },
   });
@@ -332,7 +562,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   pi.registerCommand("todos", {
     description: "Show workflow todos",
     handler: async (_args, ctx) => {
-      const list = todoItems.length ? todoItems.map((t, i) => `${i + 1}. ${t.completed ? "✓" : "○"} ${t.text}`).join("\n") : "No todos.";
+      const list = todoItems.length
+        ? todoItems
+            .map((t, i) => `${i + 1}. ${t.completed ? "✓" : "○"} ${t.text}`)
+            .join("\n")
+        : "No todos.";
       ctx.ui.notify(`Todos (${todoItems.length}):\n${list}`, "info");
     },
   });
@@ -342,69 +576,145 @@ export default function workflowExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "explore",
     label: "Explore",
-    description: "Explore codebase in parallel sub-agents (read-only). Single: {agent,task} Parallel: {tasks:[{agent,task,cwd?}]}. Use scout for fast recon.",
+    description:
+      "Explore codebase in parallel sub-agents (read-only). Single: {agent,task} Parallel: {tasks:[{agent,task,cwd?}]}. Use scout for fast recon.",
     parameters: Type.Object({
-      agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
+      agent: Type.Optional(
+        Type.String({ description: "Agent name for single mode" }),
+      ),
       task: Type.Optional(Type.String({ description: "Task for single mode" })),
-      tasks: Type.Optional(Type.Array(Type.Object({
-        agent: Type.String(), task: Type.String(), cwd: Type.Optional(Type.String()),
-      }))),
-      cwd: Type.Optional(Type.String({ description: "Working directory override" })),
+      tasks: Type.Optional(
+        Type.Array(
+          Type.Object({
+            agent: Type.String(),
+            task: Type.String(),
+            cwd: Type.Optional(Type.String()),
+          }),
+        ),
+      ),
+      cwd: Type.Optional(
+        Type.String({ description: "Working directory override" }),
+      ),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       const cwd = (params.cwd as string | undefined) ?? ctx.cwd;
       const agents = discoverAgents(cwd);
 
       let jobs: { agent: string; task: string; cwd?: string }[] = [];
-      if (params.tasks && Array.isArray(params.tasks) && params.tasks.length > 0) {
+      if (
+        params.tasks &&
+        Array.isArray(params.tasks) &&
+        params.tasks.length > 0
+      ) {
         jobs = params.tasks as any;
       } else if (params.agent && params.task) {
-        jobs = [{ agent: params.agent as string, task: params.task as string, cwd: cwd }];
+        jobs = [
+          {
+            agent: params.agent as string,
+            task: params.task as string,
+            cwd: cwd,
+          },
+        ];
       } else {
-        return { content: [{ type: "text", text: "Error: provide {agent,task} or {tasks:[...]}" }], details: {} };
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: provide {agent,task} or {tasks:[...]}",
+            },
+          ],
+          details: {},
+        };
       }
 
-      if (jobs.length > 8) return { content: [{ type: "text", text: "Error: max 8 tasks" }], details: {} };
+      if (jobs.length > 8)
+        return {
+          content: [{ type: "text", text: "Error: max 8 tasks" }],
+          details: {},
+        };
 
       // concurrency 4
       const MAX_CONC = 4;
       const results: any[] = new Array(jobs.length);
       let next = 0;
-      const workers = new Array(Math.min(MAX_CONC, jobs.length)).fill(null).map(async () => {
-        while (true) {
-          const idx = next++;
-          if (idx >= jobs.length) return;
-          const job = jobs[idx];
-          const ag = agents.find((a) => a.name === job.agent);
-          if (!ag) {
-            results[idx] = { agent: job.agent, task: job.task, error: `Unknown agent "${job.agent}". Available: ${agents.map((a) => a.name).join(", ") || "none"}` };
-            continue;
-          }
-          try {
-            const res = await runSingleAgent(job.cwd ?? cwd, ag, job.task, signal);
-            if (signal?.aborted) {
-              results[idx] = { agent: job.agent, task: job.task, error: "Aborted (Escape)" };
-            } else if (res.exitCode !== 0 && !getFinalOutput(res.messages)) {
-              results[idx] = { agent: job.agent, task: job.task, error: res.stderr.slice(0, 2000) || `exit ${res.exitCode}`, usage: res.usage };
-            } else {
-              const out = getFinalOutput(res.messages) || "(no output)";
-              results[idx] = { agent: job.agent, task: job.task, output: out.slice(0, 50000), usage: res.usage };
+      const workers = new Array(Math.min(MAX_CONC, jobs.length))
+        .fill(null)
+        .map(async () => {
+          while (true) {
+            const idx = next++;
+            if (idx >= jobs.length) return;
+            const job = jobs[idx];
+            const ag = agents.find((a) => a.name === job.agent);
+            if (!ag) {
+              results[idx] = {
+                agent: job.agent,
+                task: job.task,
+                error: `Unknown agent "${job.agent}". Available: ${agents.map((a) => a.name).join(", ") || "none"}`,
+              };
+              continue;
             }
-          } catch (e: any) {
-            results[idx] = { agent: job.agent, task: job.task, error: String(e?.message || e) };
+            try {
+              const res = await runSingleAgent(
+                job.cwd ?? cwd,
+                ag,
+                job.task,
+                signal,
+              );
+              if (signal?.aborted) {
+                results[idx] = {
+                  agent: job.agent,
+                  task: job.task,
+                  error: "Aborted (Escape)",
+                };
+              } else if (res.exitCode !== 0 && !getFinalOutput(res.messages)) {
+                results[idx] = {
+                  agent: job.agent,
+                  task: job.task,
+                  error: res.stderr.slice(0, 2000) || `exit ${res.exitCode}`,
+                  usage: res.usage,
+                };
+              } else {
+                const out = getFinalOutput(res.messages) || "(no output)";
+                results[idx] = {
+                  agent: job.agent,
+                  task: job.task,
+                  output: out.slice(0, 50000),
+                  usage: res.usage,
+                };
+              }
+            } catch (e: any) {
+              results[idx] = {
+                agent: job.agent,
+                task: job.task,
+                error: String(e?.message || e),
+              };
+            }
+            if (onUpdate)
+              onUpdate({
+                content: [
+                  {
+                    type: "text",
+                    text: `Explore ${idx + 1}/${jobs.length} done`,
+                  },
+                ],
+                details: { jobs, results: results.filter(Boolean) },
+              } as any);
           }
-          if (onUpdate) onUpdate({ content: [{ type: "text", text: `Explore ${idx + 1}/${jobs.length} done` }], details: { jobs, results: results.filter(Boolean) } } as any);
-        }
-      });
+        });
       await Promise.all(workers);
 
-      const summary = results.map((r, i) => {
-        const hdr = `### [${i + 1}] ${r.agent}: ${r.task.slice(0, 80)}`;
-        if (r.error) return `${hdr}\nERROR: ${r.error}`;
-        return `${hdr}\n${r.output}`;
-      }).join("\n\n---\n\n");
+      const summary = results
+        .map((r, i) => {
+          const hdr = `### [${i + 1}] ${r.agent}: ${r.task.slice(0, 80)}`;
+          if (r.error) return `${hdr}\nERROR: ${r.error}`;
+          return `${hdr}\n${r.output}`;
+        })
+        .join("\n\n---\n\n");
 
-      return { content: [{ type: "text", text: summary }], details: { mode: jobs.length === 1 ? "single" : "parallel", results } };
+      return {
+        content: [{ type: "text", text: summary }],
+        details: { mode: jobs.length === 1 ? "single" : "parallel", results },
+      };
     },
   });
 
@@ -412,18 +722,25 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   const QuestionOptionSchema = Type.Object({
     label: Type.String({ description: "Display label" }),
-    description: Type.Optional(Type.String({ description: "Optional description" })),
+    description: Type.Optional(
+      Type.String({ description: "Optional description" }),
+    ),
   });
   const QuestionSchema = Type.Object({
     question: Type.String({ description: "The question to ask" }),
-    header: Type.Optional(Type.String({ description: "Short label for tab, e.g. Scope" })),
-    options: Type.Array(QuestionOptionSchema, { description: "Options (first = recommended)" }),
+    header: Type.Optional(
+      Type.String({ description: "Short label for tab, e.g. Scope" }),
+    ),
+    options: Type.Array(QuestionOptionSchema, {
+      description: "Options (first = recommended)",
+    }),
   });
 
   pi.registerTool({
     name: "questionnaire",
     label: "Questionnaire",
-    description: "Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Loops until clear. Use in plan mode.",
+    description:
+      "Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Loops until clear. Use in plan mode.",
     parameters: Type.Object({
       questions: Type.Optional(Type.Array(QuestionSchema)),
       question: Type.Optional(Type.String()),
@@ -431,98 +748,242 @@ export default function workflowExtension(pi: ExtensionAPI) {
       options: Type.Optional(Type.Array(QuestionOptionSchema)),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      if (ctx.mode !== "tui") return { content: [{ type: "text", text: "UI not available" }], details: {} };
+      if (ctx.mode !== "tui")
+        return {
+          content: [{ type: "text", text: "UI not available" }],
+          details: {},
+        };
 
       // Normalize to questions[] array for unified UI (supports both single-question and multi-question calls)
-      let questions: { question: string; header?: string; options: { label: string; description?: string }[] }[] = [];
-      if (params.questions && Array.isArray(params.questions) && params.questions.length > 0) {
+      let questions: {
+        question: string;
+        header?: string;
+        options: { label: string; description?: string }[];
+      }[] = [];
+      if (
+        params.questions &&
+        Array.isArray(params.questions) &&
+        params.questions.length > 0
+      ) {
         questions = params.questions as any;
-      } else if (params.question && params.options && Array.isArray(params.options)) {
-        questions = [{ question: params.question as string, header: params.header as string | undefined, options: params.options as any }];
+      } else if (
+        params.question &&
+        params.options &&
+        Array.isArray(params.options)
+      ) {
+        questions = [
+          {
+            question: params.question as string,
+            header: params.header as string | undefined,
+            options: params.options as any,
+          },
+        ];
       } else {
-        return { content: [{ type: "text", text: "Error: provide questions[] or {question, options}" }], details: {} };
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: provide questions[] or {question, options}",
+            },
+          ],
+          details: {},
+        };
       }
 
       // Validate
-      for (const q of questions) if (!q.options || q.options.length < 2) return { content: [{ type: "text", text: `Error: question "${q.question.slice(0, 40)}" needs >=2 options` }], details: {} };
-      if (questions.length > 4) return { content: [{ type: "text", text: "Error: max 4 questions at once" }], details: {} };
+      for (const q of questions)
+        if (!q.options || q.options.length < 2)
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: question "${q.question.slice(0, 40)}" needs >=2 options`,
+              },
+            ],
+            details: {},
+          };
+      if (questions.length > 4)
+        return {
+          content: [{ type: "text", text: "Error: max 4 questions at once" }],
+          details: {},
+        };
 
       // Build items for UI - reuse questionnaire pattern: tabs
-      type DisplayOpt = { label: string; description?: string; isOther?: boolean };
+      type DisplayOpt = {
+        label: string;
+        description?: string;
+        isOther?: boolean;
+      };
       const isMulti = questions.length > 1;
 
-      const result = await ctx.ui.custom<{ answers: { question: string; header?: string; answer: string; wasCustom: boolean; index?: number }[]; cancelled: boolean } | null>((tui, theme, _kb, done) => {
+      const result = await ctx.ui.custom<{
+        answers: {
+          question: string;
+          header?: string;
+          answer: string;
+          wasCustom: boolean;
+          index?: number;
+        }[];
+        cancelled: boolean;
+      } | null>((tui, theme, _kb, done) => {
         let currentTab = 0;
         let optionIndex = 0;
         let inputMode = false;
         let inputQuestionIdx: number | null = null;
         let cached: string[] | undefined;
-        const answers = new Map<number, { answer: string; wasCustom: boolean; index?: number }>();
+        const answers = new Map<
+          number,
+          { answer: string; wasCustom: boolean; index?: number }
+        >();
 
         const editorTheme: EditorTheme = {
           borderColor: (s) => theme.fg("accent", s),
-          selectList: { selectedPrefix: (t) => theme.fg("accent", t), selectedText: (t) => theme.fg("accent", t), description: (t) => theme.fg("muted", t), scrollInfo: (t) => theme.fg("dim", t), noMatch: (t) => theme.fg("warning", t) },
+          selectList: {
+            selectedPrefix: (t) => theme.fg("accent", t),
+            selectedText: (t) => theme.fg("accent", t),
+            description: (t) => theme.fg("muted", t),
+            scrollInfo: (t) => theme.fg("dim", t),
+            noMatch: (t) => theme.fg("warning", t),
+          },
         };
         const editor = new Editor(tui, editorTheme);
         editor.onSubmit = (value) => {
           if (inputQuestionIdx === null) return;
           const trimmed = value.trim() || "(no response)";
           answers.set(inputQuestionIdx, { answer: trimmed, wasCustom: true });
-          inputMode = false; inputQuestionIdx = null; editor.setText("");
+          inputMode = false;
+          inputQuestionIdx = null;
+          editor.setText("");
           advanceAfter();
         };
 
-        function currentQ() { return questions[currentTab]; }
+        function currentQ() {
+          return questions[currentTab];
+        }
         function currentOpts(): DisplayOpt[] {
           const q = currentQ();
           if (!q) return [];
-          const opts: DisplayOpt[] = [...q.options.map((o) => ({ label: o.label, description: o.description }))];
+          const opts: DisplayOpt[] = [
+            ...q.options.map((o) => ({
+              label: o.label,
+              description: o.description,
+            })),
+          ];
           opts.push({ label: "Type something.", isOther: true });
           return opts;
         }
-        function allAnswered() { return questions.every((_, i) => answers.has(i)); }
+        function allAnswered() {
+          return questions.every((_, i) => answers.has(i));
+        }
         function advanceAfter() {
-          if (!isMulti) { submit(false); return; }
+          if (!isMulti) {
+            submit(false);
+            return;
+          }
           if (currentTab < questions.length - 1) currentTab++;
           else currentTab = questions.length; // submit tab
-          optionIndex = 0; cached = undefined; tui.requestRender();
+          optionIndex = 0;
+          cached = undefined;
+          tui.requestRender();
         }
         function submit(cancelled: boolean) {
-          if (cancelled) { done({ answers: [], cancelled: true }); return; }
+          if (cancelled) {
+            done({ answers: [], cancelled: true });
+            return;
+          }
           const arr = questions.map((q, i) => {
             const a = answers.get(i);
-            return { question: q.question, header: q.header, answer: a ? a.answer : "", wasCustom: a ? a.wasCustom : false, index: a?.index };
+            return {
+              question: q.question,
+              header: q.header,
+              answer: a ? a.answer : "",
+              wasCustom: a ? a.wasCustom : false,
+              index: a?.index,
+            };
           });
           done({ answers: arr, cancelled: false });
         }
-        function refresh() { cached = undefined; tui.requestRender(); }
+        function refresh() {
+          cached = undefined;
+          tui.requestRender();
+        }
 
         const handleInput = (data: string) => {
-          if (signal?.aborted) { done(null); return; }
+          if (signal?.aborted) {
+            done(null);
+            return;
+          }
           if (inputMode) {
-            if (matchesKey(data, Key.escape)) { inputMode = false; inputQuestionIdx = null; editor.setText(""); refresh(); return; }
-            editor.handleInput(data); refresh(); return;
+            if (matchesKey(data, Key.escape)) {
+              inputMode = false;
+              inputQuestionIdx = null;
+              editor.setText("");
+              refresh();
+              return;
+            }
+            editor.handleInput(data);
+            refresh();
+            return;
           }
           const q = currentQ();
           const opts = currentOpts();
           if (isMulti) {
-            if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) { currentTab = (currentTab + 1) % (questions.length + 1); optionIndex = 0; refresh(); return; }
-            if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) { currentTab = (currentTab - 1 + questions.length + 1) % (questions.length + 1); optionIndex = 0; refresh(); return; }
+            if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
+              currentTab = (currentTab + 1) % (questions.length + 1);
+              optionIndex = 0;
+              refresh();
+              return;
+            }
+            if (
+              matchesKey(data, Key.shift("tab")) ||
+              matchesKey(data, Key.left)
+            ) {
+              currentTab =
+                (currentTab - 1 + questions.length + 1) %
+                (questions.length + 1);
+              optionIndex = 0;
+              refresh();
+              return;
+            }
           }
           if (currentTab === questions.length) {
-            if (matchesKey(data, Key.enter) && allAnswered()) { submit(false); }
-            else if (matchesKey(data, Key.escape)) { submit(true); }
+            if (matchesKey(data, Key.enter) && allAnswered()) {
+              submit(false);
+            } else if (matchesKey(data, Key.escape)) {
+              submit(true);
+            }
             return;
           }
-          if (matchesKey(data, Key.up)) { optionIndex = Math.max(0, optionIndex - 1); refresh(); return; }
-          if (matchesKey(data, Key.down)) { optionIndex = Math.min(opts.length - 1, optionIndex + 1); refresh(); return; }
+          if (matchesKey(data, Key.up)) {
+            optionIndex = Math.max(0, optionIndex - 1);
+            refresh();
+            return;
+          }
+          if (matchesKey(data, Key.down)) {
+            optionIndex = Math.min(opts.length - 1, optionIndex + 1);
+            refresh();
+            return;
+          }
           if (matchesKey(data, Key.enter) && q) {
             const opt = opts[optionIndex];
-            if (opt.isOther) { inputMode = true; inputQuestionIdx = currentTab; editor.setText(""); refresh(); return; }
-            answers.set(currentTab, { answer: opt.label, wasCustom: false, index: optionIndex + 1 });
-            advanceAfter(); return;
+            if (opt.isOther) {
+              inputMode = true;
+              inputQuestionIdx = currentTab;
+              editor.setText("");
+              refresh();
+              return;
+            }
+            answers.set(currentTab, {
+              answer: opt.label,
+              wasCustom: false,
+              index: optionIndex + 1,
+            });
+            advanceAfter();
+            return;
           }
-          if (matchesKey(data, Key.escape)) { submit(true); }
+          if (matchesKey(data, Key.escape)) {
+            submit(true);
+          }
         };
 
         const render = (width: number): string[] => {
@@ -553,13 +1014,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const box = answered ? "■" : "□";
               const color = answered ? "success" : "muted";
               const text = ` ${box} ${lbl} `;
-              const styled = active ? theme.bg("selectedBg", theme.fg("text", text)) : theme.fg(color as any, text);
+              const styled = active
+                ? theme.bg("selectedBg", theme.fg("text", text))
+                : theme.fg(color as any, text);
               tabs.push(`${styled} `);
             }
             const canSubmit = allAnswered();
             const isSubmit = currentTab === questions.length;
             const submitText = " ✓ Submit ";
-            const sStyled = isSubmit ? theme.bg("selectedBg", theme.fg("text", submitText)) : theme.fg(canSubmit ? "success" : "dim", submitText);
+            const sStyled = isSubmit
+              ? theme.bg("selectedBg", theme.fg("text", submitText))
+              : theme.fg(canSubmit ? "success" : "dim", submitText);
             tabs.push(`${sStyled}`);
             // naive join wrapped
             lines.push(" " + tabs.join(""));
@@ -569,49 +1034,85 @@ export default function workflowExtension(pi: ExtensionAPI) {
             lines.push(...wrap(" " + theme.fg("text", q.question)));
             lines.push("");
             for (let i = 0; i < opts.length; i++) {
-              const opt = opts[i]; const sel = i === optionIndex; const isOther = !!opt.isOther;
+              const opt = opts[i];
+              const sel = i === optionIndex;
+              const isOther = !!opt.isOther;
               const prefix = sel ? theme.fg("accent", "> ") : "  ";
               const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
               const color = sel || (isOther && inputMode) ? "accent" : "text";
               lines.push(...wrap(prefix + theme.fg(color as any, label)));
-              if (opt.description) lines.push(...wrap("     " + theme.fg("muted", opt.description)));
+              if (opt.description)
+                lines.push(
+                  ...wrap("     " + theme.fg("muted", opt.description)),
+                );
             }
             lines.push("");
             lines.push(...wrap(" " + theme.fg("muted", "Your answer:")));
-            for (const l of editor.render(Math.max(1, W - 2))) lines.push(" " + l);
+            for (const l of editor.render(Math.max(1, W - 2)))
+              lines.push(" " + l);
             lines.push("");
-            lines.push(...wrap(" " + theme.fg("dim", "Enter to submit • Esc to go back")));
+            lines.push(
+              ...wrap(
+                " " + theme.fg("dim", "Enter to submit • Esc to go back"),
+              ),
+            );
           } else if (currentTab === questions.length) {
-            lines.push(...wrap(" " + theme.fg("accent", theme.bold("Ready to submit"))));
+            lines.push(
+              ...wrap(" " + theme.fg("accent", theme.bold("Ready to submit"))),
+            );
             lines.push("");
             for (let i = 0; i < questions.length; i++) {
               const a = answers.get(i);
               if (a) {
                 const prefix = a.wasCustom ? "(wrote) " : "";
-                lines.push(...wrap("  " + theme.fg("muted", `${questions[i].header || `Q${i + 1}`}: `) + theme.fg("text", prefix + a.answer)));
+                lines.push(
+                  ...wrap(
+                    "  " +
+                      theme.fg(
+                        "muted",
+                        `${questions[i].header || `Q${i + 1}`}: `,
+                      ) +
+                      theme.fg("text", prefix + a.answer),
+                  ),
+                );
               }
             }
             lines.push("");
-            if (allAnswered()) lines.push(...wrap(" " + theme.fg("success", "Press Enter to submit")));
+            if (allAnswered())
+              lines.push(
+                ...wrap(" " + theme.fg("success", "Press Enter to submit")),
+              );
             else {
-              const missing = questions.filter((_, i) => !answers.has(i)).map((q, idx) => q.header || `Q${idx + 1}`).join(", ");
-              lines.push(...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)));
+              const missing = questions
+                .filter((_, i) => !answers.has(i))
+                .map((q, idx) => q.header || `Q${idx + 1}`)
+                .join(", ");
+              lines.push(
+                ...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)),
+              );
             }
           } else if (q) {
             lines.push(...wrap(" " + theme.fg("text", q.question)));
             lines.push("");
             for (let i = 0; i < opts.length; i++) {
-              const opt = opts[i]; const sel = i === optionIndex; const isOther = !!opt.isOther;
+              const opt = opts[i];
+              const sel = i === optionIndex;
+              const isOther = !!opt.isOther;
               const prefix = sel ? theme.fg("accent", "> ") : "  ";
               const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
               const color = sel || (isOther && inputMode) ? "accent" : "text";
               lines.push(...wrap(prefix + theme.fg(color as any, label)));
-              if (opt.description) lines.push(...wrap("     " + theme.fg("muted", opt.description)));
+              if (opt.description)
+                lines.push(
+                  ...wrap("     " + theme.fg("muted", opt.description)),
+                );
             }
           }
           lines.push("");
           if (!inputMode) {
-            const help = isMulti ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : "↑↓ navigate • Enter select • Esc cancel";
+            const help = isMulti
+              ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
+              : "↑↓ navigate • Enter select • Esc cancel";
             lines.push(...wrap(" " + theme.fg("dim", help)));
           }
           lines.push(theme.fg("accent", "─".repeat(W)));
@@ -619,14 +1120,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
           return lines;
         };
 
-        return { render, invalidate: () => { cached = undefined; }, handleInput };
+        return {
+          render,
+          invalidate: () => {
+            cached = undefined;
+          },
+          handleInput,
+        };
       });
 
       if (!result || result.cancelled) {
-        return { content: [{ type: "text", text: "User cancelled questionnaire" }], details: { questions, answers: [], cancelled: true } };
+        return {
+          content: [{ type: "text", text: "User cancelled questionnaire" }],
+          details: { questions, answers: [], cancelled: true },
+        };
       }
-      const summary = result.answers.map((a) => `${a.header || a.question.slice(0, 30)}: ${a.wasCustom ? `wrote "${a.answer}"` : `selected "${a.answer}"`}`).join("; ");
-      return { content: [{ type: "text", text: `Answers: ${summary}` }], details: { questions, answers: result.answers, cancelled: false } };
+      const summary = result.answers
+        .map(
+          (a) =>
+            `${a.header || a.question.slice(0, 30)}: ${a.wasCustom ? `wrote "${a.answer}"` : `selected "${a.answer}"`}`,
+        )
+        .join("; ");
+      return {
+        content: [{ type: "text", text: `Answers: ${summary}` }],
+        details: { questions, answers: result.answers, cancelled: false },
+      };
     },
   });
 
@@ -637,7 +1155,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const tree = (ctx.sessionManager as any).getTree?.() ?? null;
       const branch = ctx.sessionManager.getBranch();
-      if (!branch || branch.length === 0) { ctx.ui.notify("No history to rewind", "info"); return; }
+      if (!branch || branch.length === 0) {
+        ctx.ui.notify("No history to rewind", "info");
+        return;
+      }
 
       // Build selectable checkpoints: last 15 entries + labels
       const entries = branch.slice(-20).reverse();
@@ -646,30 +1167,58 @@ export default function workflowExtension(pi: ExtensionAPI) {
         const type = e.type || e.message?.role || "entry";
         let label = `${type} ${id.slice(0, 6)}`;
         if (e.message?.role === "user") {
-          const t = typeof e.message.content === "string" ? e.message.content : (e.message.content?.[0]?.text || "");
+          const t =
+            typeof e.message.content === "string"
+              ? e.message.content
+              : e.message.content?.[0]?.text || "";
           label = `user: ${t.slice(0, 50)}`;
-        } else if (e.type === "label") label = `label: ${e.label} @ ${e.targetId?.slice(0, 6)}`;
+        } else if (e.type === "label")
+          label = `label: ${e.label} @ ${e.targetId?.slice(0, 6)}`;
         return { value: id, label, description: `${e.timestamp || ""}` };
       });
 
-      const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-        const list = new SelectList(items, Math.min(items.length, 10), {
-          selectedPrefix: (t) => theme.fg("accent", t),
-          selectedText: (t) => theme.fg("accent", t),
-          description: (t) => theme.fg("muted", t),
-          scrollInfo: (t) => theme.fg("dim", t),
-          noMatch: (t) => theme.fg("warning", t),
-        });
-        const container = new Container();
-        container.addChild(new Text(theme.fg("accent", theme.bold(" Rewind — pick a checkpoint ")), 1, 0));
-        (list as any).onSelect = (it: SelectItem) => done(it.value);
-        (list as any).onCancel = () => done(null);
-        container.addChild(list as any);
-        container.addChild(new Text(theme.fg("dim", " ↑↓ navigate • enter to rewind • esc cancel "), 1, 0));
-        return { render: (w) => container.render(w), invalidate: () => container.invalidate(), handleInput: (d) => { (list as any).handleInput(d); tui.requestRender(); } };
-      });
+      const choice = await ctx.ui.custom<string | null>(
+        (tui, theme, _kb, done) => {
+          const list = new SelectList(items, Math.min(items.length, 10), {
+            selectedPrefix: (t) => theme.fg("accent", t),
+            selectedText: (t) => theme.fg("accent", t),
+            description: (t) => theme.fg("muted", t),
+            scrollInfo: (t) => theme.fg("dim", t),
+            noMatch: (t) => theme.fg("warning", t),
+          });
+          const container = new Container();
+          container.addChild(
+            new Text(
+              theme.fg("accent", theme.bold(" Rewind — pick a checkpoint ")),
+              1,
+              0,
+            ),
+          );
+          (list as any).onSelect = (it: SelectItem) => done(it.value);
+          (list as any).onCancel = () => done(null);
+          container.addChild(list as any);
+          container.addChild(
+            new Text(
+              theme.fg("dim", " ↑↓ navigate • enter to rewind • esc cancel "),
+              1,
+              0,
+            ),
+          );
+          return {
+            render: (w) => container.render(w),
+            invalidate: () => container.invalidate(),
+            handleInput: (d) => {
+              (list as any).handleInput(d);
+              tui.requestRender();
+            },
+          };
+        },
+      );
 
-      if (!choice) { ctx.ui.notify("Rewind cancelled", "info"); return; }
+      if (!choice) {
+        ctx.ui.notify("Rewind cancelled", "info");
+        return;
+      }
       try {
         await (ctx as any).navigateTree(choice, { summarize: false });
         ctx.ui.notify(`Rewound to ${choice.slice(0, 6)}`, "info");
@@ -683,19 +1232,42 @@ export default function workflowExtension(pi: ExtensionAPI) {
     description: "Add note/question while agent is working (queued)",
     handler: async (args, ctx) => {
       const note = (args || "").trim();
-      if (!note) { ctx.ui.notify("Usage: /btw <note or question>", "info"); return; }
+      if (!note) {
+        ctx.ui.notify("Usage: /btw <note or question>", "info");
+        return;
+      }
       btwNotes.push(note);
       // Persist as custom entry so it survives reload and appears in transcript
-      try { pi.appendEntry("workflow-btw", { note, at: Date.now() }); } catch {}
+      try {
+        pi.appendEntry("workflow-btw", { note, at: Date.now() });
+      } catch {}
       // Inject as custom message so next LLM turn sees it
-      try { (pi as any).sendMessage?.({ customType: "workflow-btw", content: `[BTW] ${note}`, display: true }, { triggerTurn: false }); } catch {}
+      try {
+        (pi as any).sendMessage?.(
+          {
+            customType: "workflow-btw",
+            content: `[BTW] ${note}`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } catch {}
       // Also append via sessionManager if available
-      try { (ctx.sessionManager as any).appendCustomMessageEntry?.("workflow-btw", `[BTW] ${note}`, true); } catch {}
+      try {
+        (ctx.sessionManager as any).appendCustomMessageEntry?.(
+          "workflow-btw",
+          `[BTW] ${note}`,
+          true,
+        );
+      } catch {}
 
       if ((ctx as any).isIdle?.() === false) {
         ctx.ui.notify(`Note queued (agent busy): ${note.slice(0, 60)}`, "info");
       } else {
-        ctx.ui.notify(`Note added: ${note.slice(0, 60)} — will be included in next turn`, "info");
+        ctx.ui.notify(
+          `Note added: ${note.slice(0, 60)} — will be included in next turn`,
+          "info",
+        );
       }
     },
   });
@@ -706,7 +1278,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const note = event.text.slice(5).trim();
       if (note) {
         btwNotes.push(note);
-        try { pi.appendEntry("workflow-btw", { note, at: Date.now() }); } catch {}
+        try {
+          pi.appendEntry("workflow-btw", { note, at: Date.now() });
+        } catch {}
       }
       return { action: "handled" } as any;
     }
@@ -731,18 +1305,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
             awaitingDecision = !!d.awaitingDecision;
           }
         }
-        if (e.type === "custom" && e.customType === "workflow-btw" && e.data?.note) {
+        if (
+          e.type === "custom" &&
+          e.customType === "workflow-btw" &&
+          e.data?.note
+        ) {
           btwNotes.push(e.data.note);
         }
       }
     } catch {}
     // auto-enable plan mode if flag set at startup (support both --plan and --workflow-plan)
-    const flagPlan = (pi as any).getFlagValue?.("plan") ?? (pi as any).getFlagValue?.("workflow-plan") ?? false;
+    const flagPlan =
+      (pi as any).getFlagValue?.("plan") ??
+      (pi as any).getFlagValue?.("workflow-plan") ??
+      false;
     if (event.reason === "startup" && flagPlan && !planModeEnabled) {
       planModeEnabled = true;
-      if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
+      if (toolsBeforePlanMode === undefined)
+        toolsBeforePlanMode = pi.getActiveTools();
       pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
-      try { fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), { recursive: true }); } catch {}
+      try {
+        fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
+          recursive: true,
+        });
+      } catch {}
       persistState();
     }
     updateStatus(ctx as any);
@@ -760,8 +1346,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
     try {
       const branch = ctx.sessionManager.getBranch();
       for (const e of branch as any[]) {
-        if (e.type === "custom" && e.customType === "workflow" && e.data?.todos) todoItems = e.data.todos;
-        if (e.type === "message" && e.message?.role === "toolResult" && e.message.toolName === "workflow_todo" && e.message.details?.todos) {
+        if (e.type === "custom" && e.customType === "workflow" && e.data?.todos)
+          todoItems = e.data.todos;
+        if (
+          e.type === "message" &&
+          e.message?.role === "toolResult" &&
+          e.message.toolName === "workflow_todo" &&
+          e.message.details?.todos
+        ) {
           todoItems = e.message.details.todos;
         }
       }
@@ -775,24 +1367,46 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (event.toolName === "bash" && planModeEnabled) {
       const cmd = (event.input as any).command as string;
       if (!isSafeCommand(cmd)) {
-        return { block: true, reason: `Plan mode: command blocked (not allowlisted). Use /plan to switch to build mode.\nCommand: ${cmd}` } as any;
+        return {
+          block: true,
+          reason: `Plan mode: command blocked (not allowlisted). Use /plan to switch to build mode.\nCommand: ${cmd}`,
+        } as any;
       }
     }
-    if ((event.toolName === "edit" || event.toolName === "write") && planModeEnabled) {
-      const p = (event.input as any).path || (event.input as any).file_path || "";
+    if (
+      (event.toolName === "edit" || event.toolName === "write") &&
+      planModeEnabled
+    ) {
+      const p =
+        (event.input as any).path || (event.input as any).file_path || "";
       if (!isPlanWritePath(p, cwd)) {
-        return { block: true, reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed. Use /plan to enable build mode.` } as any;
+        return {
+          block: true,
+          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed. Use /plan to enable build mode.`,
+        } as any;
       }
       // Ensure plans dir exists
-      try { fs.mkdirSync(path.join(cwd, CONFIG_DIR_NAME, "plans"), { recursive: true }); } catch {}
+      try {
+        fs.mkdirSync(path.join(cwd, CONFIG_DIR_NAME, "plans"), {
+          recursive: true,
+        });
+      } catch {}
     }
     // In build mode, ensure todos exist before first real edit
-    if ((event.toolName === "edit" || event.toolName === "write") && executionMode && todoItems.length === 0) {
-      const p = (event.input as any).path || (event.input as any).file_path || "";
+    if (
+      (event.toolName === "edit" || event.toolName === "write") &&
+      executionMode &&
+      todoItems.length === 0
+    ) {
+      const p =
+        (event.input as any).path || (event.input as any).file_path || "";
       if (!isPlanWritePath(p, cwd)) {
         // not blocking, but warn and create placeholder todo
         // block until todo list is created
-        return { block: true, reason: `Build mode: create todos first. Use workflow_todo {action:"add", text:"..."} or ensure plan file exists. Then retry the edit.` } as any;
+        return {
+          block: true,
+          reason: `Build mode: create todos first. Use workflow_todo {action:"add", text:"..."} or ensure plan file exists. Then retry the edit.`,
+        } as any;
       }
     }
   });
@@ -800,7 +1414,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, _ctx) => {
     if (planModeEnabled) {
-      const btwBlock = btwNotes.length ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}` : "";
+      const btwBlock = btwNotes.length
+        ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}`
+        : "";
       btwNotes = []; // consume
       return {
         message: {
@@ -813,7 +1429,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (executionMode && todoItems.length > 0) {
       const remaining = todoItems.filter((t) => !t.completed);
       const list = remaining.map((t) => `${t.step}. ${t.text}`).join("\n");
-      const btwBlock = btwNotes.length ? `\n\n[BTW]: ${btwNotes.join(" | ")}` : "";
+      const btwBlock = btwNotes.length
+        ? `\n\n[BTW]: ${btwNotes.join(" | ")}`
+        : "";
       btwNotes = [];
       return {
         message: {
@@ -824,8 +1442,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
       } as any;
     }
     if (btwNotes.length) {
-      const notes = [...btwNotes]; btwNotes = [];
-      return { message: { customType: "workflow-btw", content: `[BTW] ${notes.join("\n[BTW] ")}`, display: true } } as any;
+      const notes = [...btwNotes];
+      btwNotes = [];
+      return {
+        message: {
+          customType: "workflow-btw",
+          content: `[BTW] ${notes.join("\n[BTW] ")}`,
+          display: true,
+        },
+      } as any;
     }
   });
 
@@ -838,7 +1463,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         if (m.role !== "user") return true;
         const c = m.content;
         if (typeof c === "string") return !c.includes("[PLAN MODE ACTIVE]");
-        if (Array.isArray(c)) return !c.some((x: any) => x.type === "text" && x.text?.includes("[PLAN MODE ACTIVE]"));
+        if (Array.isArray(c))
+          return !c.some(
+            (x: any) =>
+              x.type === "text" && x.text?.includes("[PLAN MODE ACTIVE]"),
+          );
         return true;
       }),
     } as any;
@@ -861,10 +1490,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let lastPlanWritePath: string | null = null;
 
   pi.on("tool_result", async (event) => {
-    if ((event.toolName === "write" || event.toolName === "edit") && !event.isError) {
-      const p = (event.input as any).path || (event.input as any).file_path || "";
+    if (
+      (event.toolName === "write" || event.toolName === "edit") &&
+      !event.isError
+    ) {
+      const p =
+        (event.input as any).path || (event.input as any).file_path || "";
       // Heuristic: if path looks like a plan file, remember it
-      if (p.includes(".pi/plans/") || p.includes(".pi\\plans\\") || p.includes("plans/")) {
+      if (
+        p.includes(".pi/plans/") ||
+        p.includes(".pi\\plans\\") ||
+        p.includes("plans/")
+      ) {
         lastPlanWritePath = p;
       }
     }
@@ -875,7 +1512,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (executionMode && todoItems.length > 0) {
       const allDone = todoItems.every((t) => t.completed);
       if (allDone) {
-        try { (pi as any).sendMessage?.({ customType: "workflow-complete", content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${t.step}. ${t.text}~~`).join("\n")}`, display: true }, { triggerTurn: false }); } catch {}
+        try {
+          (pi as any).sendMessage?.(
+            {
+              customType: "workflow-complete",
+              content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${t.step}. ${t.text}~~`).join("\n")}`,
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+        } catch {}
         executionMode = false;
         // keep todos for history but clear executing flag
         updateStatus(ctx as any);
@@ -887,15 +1533,26 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (!planModeEnabled || !(ctx as any).hasUI) return;
 
     // Extract todos from last assistant message if plan was emitted
-    const lastAssistant = [...(event.messages as any[])].reverse().find((m) => m.role === "assistant" && Array.isArray(m.content));
+    const lastAssistant = [...(event.messages as any[])]
+      .reverse()
+      .find((m) => m.role === "assistant" && Array.isArray(m.content));
     let extracted: TodoItem[] = [];
     if (lastAssistant) {
-      try { extracted = extractTodoItems(getTextContent(lastAssistant as AssistantMessage)); } catch {}
+      try {
+        extracted = extractTodoItems(
+          getTextContent(lastAssistant as AssistantMessage),
+        );
+      } catch {}
     }
     if (extracted.length > 0) todoItems = extracted;
     if (todoItems.length === 0 && lastPlanWritePath) {
       try {
-        const planText = fs.readFileSync(path.isAbsolute(lastPlanWritePath) ? lastPlanWritePath : path.join((ctx as any).cwd, lastPlanWritePath), "utf8");
+        const planText = fs.readFileSync(
+          path.isAbsolute(lastPlanWritePath)
+            ? lastPlanWritePath
+            : path.join((ctx as any).cwd, lastPlanWritePath),
+          "utf8",
+        );
         const fromFile = extractPlanStepsFromMarkdown(planText);
         if (fromFile.length > 0) todoItems = fromFile;
       } catch {}
@@ -905,10 +1562,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // Try to find plan file path
     let planPath = currentPlanFile;
     if (!planPath && lastPlanWritePath) planPath = lastPlanWritePath;
-    if (planPath && !path.isAbsolute(planPath)) planPath = path.join((ctx as any).cwd, planPath);
+    if (planPath && !path.isAbsolute(planPath))
+      planPath = path.join((ctx as any).cwd, planPath);
     if (!planPath) {
       // synthesize path for display if file not yet written but plan text exists
-      const slug = slugify((event.messages.find((m: any) => m.role === "user") as any)?.content?.[0]?.text || "plan");
+      const slug = slugify(
+        (event.messages.find((m: any) => m.role === "user") as any)
+          ?.content?.[0]?.text || "plan",
+      );
       const fname = `${new Date().toISOString().slice(0, 10)}-${slug}.md`;
       planPath = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans", fname);
     }
@@ -918,9 +1579,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // If plan file exists, render it fully without truncation
     let planTextForRender: string | null = null;
     try {
-      if (planPath && fs.existsSync(planPath)) planTextForRender = fs.readFileSync(planPath, "utf8");
+      if (planPath && fs.existsSync(planPath))
+        planTextForRender = fs.readFileSync(planPath, "utf8");
     } catch {}
-    if (!planTextForRender && lastAssistant) planTextForRender = getTextContent(lastAssistant as AssistantMessage);
+    if (!planTextForRender && lastAssistant)
+      planTextForRender = getTextContent(lastAssistant as AssistantMessage);
 
     if (planTextForRender && (ctx as any).hasUI && !awaitingDecision) {
       awaitingDecision = true;
@@ -929,42 +1592,99 @@ export default function workflowExtension(pi: ExtensionAPI) {
       // Show plan inline (non-blocking notify that plan exists), then decision gate
       // Full render overlay — no truncation
       const planContent = planTextForRender;
-      await (ctx as any).ui.custom<void>((tui: any, theme: any, _kb: any, done: any) => {
-        const container = new Container();
-        const mdTheme = getMarkdownTheme();
-        const md = new Markdown(planContent, 0, 0, mdTheme);
-        container.addChild(new Text(theme.fg("accent", theme.bold(` Plan: ${path.basename(planPath!)} `)), 1, 0));
-        container.addChild(md);
-        container.addChild(new Text(theme.fg("dim", " Press any key to choose next step "), 1, 0));
-        return {
-          render: (w: number) => container.render(w),
-          invalidate: () => container.invalidate(),
-          handleInput: (data: string) => { done(); },
-        };
-      }).catch(() => {});
+      await (ctx as any).ui
+        .custom<void>((tui: any, theme: any, _kb: any, done: any) => {
+          const container = new Container();
+          const mdTheme = getMarkdownTheme();
+          const md = new Markdown(planContent, 0, 0, mdTheme);
+          container.addChild(
+            new Text(
+              theme.fg(
+                "accent",
+                theme.bold(` Plan: ${path.basename(planPath!)} `),
+              ),
+              1,
+              0,
+            ),
+          );
+          container.addChild(md);
+          container.addChild(
+            new Text(
+              theme.fg("dim", " Press any key to choose next step "),
+              1,
+              0,
+            ),
+          );
+          return {
+            render: (w: number) => container.render(w),
+            invalidate: () => container.invalidate(),
+            handleInput: (data: string) => {
+              done();
+            },
+          };
+        })
+        .catch(() => {});
 
       // Decision gate: 1 Execute / 2 Refine / 3 Freeform
       const items: SelectItem[] = [
-        { value: "execute", label: "1. Execute the plan in Build Mode", description: "Create todos, switch to build, start implementing (recommended)" },
-        { value: "refine", label: "2. Refine the plan in Plan Mode", description: "Stay in plan mode, ask more questions, update the plan file" },
-        { value: "freeform", label: "3. Type something else", description: "Dismiss — type your own follow-up" },
+        {
+          value: "execute",
+          label: "1. Execute the plan in Build Mode",
+          description:
+            "Create todos, switch to build, start implementing (recommended)",
+        },
+        {
+          value: "refine",
+          label: "2. Refine the plan in Plan Mode",
+          description:
+            "Stay in plan mode, ask more questions, update the plan file",
+        },
+        {
+          value: "freeform",
+          label: "3. Type something else",
+          description: "Dismiss — type your own follow-up",
+        },
       ];
-      const choice = await (ctx as any).ui.custom<string | null>((tui: any, theme: any, _kb: any, done: any) => {
-        const container = new Container();
-        container.addChild(new Text(theme.fg("accent", theme.bold(" Plan complete — choose next step ")), 1, 0));
-        const list = new SelectList(items, Math.min(items.length, 8), {
-          selectedPrefix: (t: string) => theme.fg("accent", t),
-          selectedText: (t: string) => theme.fg("accent", t),
-          description: (t: string) => theme.fg("muted", t),
-          scrollInfo: (t: string) => theme.fg("dim", t),
-          noMatch: (t: string) => theme.fg("warning", t),
-        });
-        (list as any).onSelect = (it: SelectItem) => done(it.value);
-        (list as any).onCancel = () => done(null);
-        container.addChild(list as any);
-        container.addChild(new Text(theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "), 1, 0));
-        return { render: (w: number) => container.render(w), invalidate: () => container.invalidate(), handleInput: (d: string) => { (list as any).handleInput(d); tui.requestRender(); } };
-      });
+      const choice = await (ctx as any).ui.custom<string | null>(
+        (tui: any, theme: any, _kb: any, done: any) => {
+          const container = new Container();
+          container.addChild(
+            new Text(
+              theme.fg(
+                "accent",
+                theme.bold(" Plan complete — choose next step "),
+              ),
+              1,
+              0,
+            ),
+          );
+          const list = new SelectList(items, Math.min(items.length, 8), {
+            selectedPrefix: (t: string) => theme.fg("accent", t),
+            selectedText: (t: string) => theme.fg("accent", t),
+            description: (t: string) => theme.fg("muted", t),
+            scrollInfo: (t: string) => theme.fg("dim", t),
+            noMatch: (t: string) => theme.fg("warning", t),
+          });
+          (list as any).onSelect = (it: SelectItem) => done(it.value);
+          (list as any).onCancel = () => done(null);
+          container.addChild(list as any);
+          container.addChild(
+            new Text(
+              theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
+              1,
+              0,
+            ),
+          );
+          return {
+            render: (w: number) => container.render(w),
+            invalidate: () => container.invalidate(),
+            handleInput: (d: string) => {
+              (list as any).handleInput(d);
+              tui.requestRender();
+            },
+          };
+        },
+      );
 
       awaitingDecision = false;
       persistState();
@@ -982,7 +1702,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
         updateStatus(ctx as any);
         // Show todos widget immediately
       } else if (choice === "refine") {
-        ctx.ui.notify("Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.", "info");
+        ctx.ui.notify(
+          "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+          "info",
+        );
       } else {
         ctx.ui.notify("Dismissed. Type your follow-up.", "info");
       }
@@ -999,13 +1722,24 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (bus && typeof bus.on === "function") {
       bus.on("pi-code:plan-mode", (state: any) => {
         // Mirror pi-code plan-mode into workflow's plan mode to avoid double toggles
-        if (state && typeof state.active === "boolean" && state.active !== planModeEnabled) {
+        if (
+          state &&
+          typeof state.active === "boolean" &&
+          state.active !== planModeEnabled
+        ) {
           planModeEnabled = state.active;
           if (planModeEnabled) {
-            if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
-            try { pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode)); } catch {}
+            if (toolsBeforePlanMode === undefined)
+              toolsBeforePlanMode = pi.getActiveTools();
+            try {
+              pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+            } catch {}
           } else {
-            try { pi.setActiveTools(toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools())); } catch {}
+            try {
+              pi.setActiveTools(
+                toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
+              );
+            } catch {}
             toolsBeforePlanMode = undefined;
           }
           // Find a ctx to update status — use a no-op if none
