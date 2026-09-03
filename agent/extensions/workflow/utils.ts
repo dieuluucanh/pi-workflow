@@ -224,6 +224,44 @@ export function isPlanWritePath(p: string, cwd: string): boolean {
   return norm.includes(".pi/plans/") || norm.startsWith(cwdNorm + "/.pi/plans");
 }
 
+// ── Plan date helpers (UTC) ──────────────────────────────────────
+
+/** Return YYYY-MM-DD in UTC for the given date (default: now). Uses toISOString slice, deterministic across locales. */
+export function getUtcDatePrefix(d: Date = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+
+export function normalizePlanPath(
+  p: string,
+  cwd: string,
+  today: string,
+): { path: string; corrected: boolean; original: string } {
+  const original = p;
+  // Only touch paths that are under .pi/plans
+  if (!isPlanWritePath(p, cwd)) return { path: p, corrected: false, original };
+  // Split dir + basename (handle both / and \ separators)
+  const normalizedSep = p.replace(/\\/g, "/");
+  const lastSlash = normalizedSep.lastIndexOf("/");
+  const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
+  const base = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
+  if (!base) return { path: p, corrected: false, original };
+  const m = base.match(/^(\d{4}-\d{2}-\d{2})-(.+)$/);
+  if (m) {
+    const currentDate = m[1];
+    const rest = m[2];
+    if (currentDate === today) return { path: p, corrected: false, original };
+    // Validate that today looks like YYYY-MM-DD to avoid corrupting on invalid today
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
+      return { path: p, corrected: false, original };
+    const correctedBase = `${today}-${rest}`;
+    return { path: `${dir}${correctedBase}`, corrected: true, original };
+  }
+  // No date prefix — prepend today-
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
+    return { path: p, corrected: false, original };
+  return { path: `${dir}${today}-${base}`, corrected: true, original };
+}
+
 // ── Rewind checkpoint helpers (pure, no FS/git) ─────────────────────
 
 export function shortId(id: string): string {

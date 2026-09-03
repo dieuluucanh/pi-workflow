@@ -35,6 +35,7 @@ import {
   matchesKey,
   SelectList,
   Editor,
+  ScrollView,
   type EditorTheme,
   type SelectItem,
 } from "@earendil-works/pi-tui";
@@ -46,6 +47,8 @@ import {
   extractPlanStepsFromMarkdown,
   markCompletedSteps,
   isPlanWritePath,
+  getUtcDatePrefix,
+  normalizePlanPath,
   isUserInteractionEntry,
   getHeaderText,
   formatTimestamp,
@@ -165,15 +168,6 @@ async function runSingleAgent(
       });
     });
   }
-  const _args = [
-    "--mode",
-    "json",
-    "-p",
-    "--no-session",
-    "--no-session",
-    "--mode",
-    "json",
-  ];
   // Actually pi --mode json -p --no-session ; ensure correct
   const cleanArgs = ["--mode", "json", "-p", "--no-session"];
   if (agent.model) cleanArgs.push("--model", agent.model);
@@ -189,8 +183,6 @@ async function runSingleAgent(
     !process.argv[1].startsWith("/$bunfs/")
       ? process.execPath
       : "pi";
-  const _piArgs = piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs];
-
   return new Promise((resolve) => {
     const proc = spawn(
       piCmd,
@@ -276,6 +268,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let toolsBeforePlanMode: string[] | undefined;
   let currentPlanFile: string | undefined;
   let awaitingDecision = false;
+  let lastHandoffAt: number | undefined;
+  let handoffInFlight: Promise<void> | null = null;
+  let handoffHandle: { hide: () => void } | null = null;
   let btwNotes: string[] = [];
 
   // ── Checkpoint (shadow bare-repo) state ────────────────────────
@@ -368,6 +363,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       toolsBeforePlanMode,
       planFile: currentPlanFile,
       awaitingDecision,
+      awaitingDecisionAt: awaitingDecision ? lastHandoffAt : undefined,
     });
   }
 
@@ -1500,6 +1496,35 @@ export default function workflowExtension(pi: ExtensionAPI) {
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             currentPlanFile = d.planFile;
             awaitingDecision = !!d.awaitingDecision;
+            lastHandoffAt =
+              typeof d.awaitingDecisionAt === "number"
+                ? d.awaitingDecisionAt
+                : undefined;
+            // Stale guard: if awaitingDecision was persisted >60s ago (crash while modal open), reset
+            if (
+              awaitingDecision &&
+              lastHandoffAt &&
+              Date.now() - lastHandoffAt > 60_000
+            ) {
+              awaitingDecision = false;
+              lastHandoffAt = undefined;
+              try {
+                (ctx as any).ui?.notify?.(
+                  "Recovered stale handoff gate — showing again",
+                  "info",
+                );
+              } catch (_e) {
+                void _e;
+              }
+              try {
+                pi.appendEntry("workflow-handoff-stale-reset", {
+                  at: Date.now(),
+                  lastHandoffAt,
+                });
+              } catch (_e) {
+                void _e;
+              }
+            }
           }
         }
         if (
@@ -1541,9 +1566,61 @@ export default function workflowExtension(pi: ExtensionAPI) {
       persistState();
     }
     updateStatus(ctx as any);
+    // Observability: scan for stale-dated plan files on startup (do not auto-rename)
+    try {
+      const plansDir = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans");
+      if (fs.existsSync(plansDir)) {
+        const today = getUtcDatePrefix();
+        const files = fs.readdirSync(plansDir).filter((f) => f.endsWith(".md"));
+        const stale = files.filter((f) => {
+          const m = f.match(/^(\d{4}-\d{2}-\d{2})-/);
+          return m && m[1] !== today;
+        });
+        // Only warn if there are many stale or if any stale file was modified recently (within 7 days)
+        if (stale.length > 0) {
+          const recentStale = stale.filter((f) => {
+            try {
+              const st = fs.statSync(path.join(plansDir, f));
+              return Date.now() - st.mtimeMs < 7 * 24 * 60 * 60 * 1000;
+            } catch {
+              return false;
+            }
+          });
+          if (recentStale.length > 0) {
+            try {
+              (ctx as any).ui?.notify?.(
+                `Found ${recentStale.length} plan(s) with stale date prefix (today is ${today} UTC): ${recentStale.slice(0, 3).join(", ")}${recentStale.length > 3 ? "…" : ""} — new plans will be auto-corrected`,
+                "info",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Force-hide leaked handoff overlay so footer/navigation not trapped
+    try {
+      handoffHandle?.hide();
+    } catch (_e) {
+      void _e;
+    }
+    handoffHandle = null;
+    // Ensure awaitingDecision does not persist stale across restart
+    if (awaitingDecision) {
+      awaitingDecision = false;
+      lastHandoffAt = undefined;
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
     ctx.ui.setStatus("workflow", undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
   });
@@ -1596,7 +1673,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!isSafeCommand(cmd)) {
         return {
           block: true,
-          reason: `Plan mode: command blocked (not allowlisted). Use /plan to switch to build mode.\nCommand: ${cmd}`,
+          reason: `Plan mode: command blocked (not allowlisted). Use /plan to switch to build mode. Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.\nCommand: ${cmd}`,
         } as any;
       }
     }
@@ -1609,8 +1686,38 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!isPlanWritePath(p, cwd)) {
         return {
           block: true,
-          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed. Use /plan to enable build mode.`,
+          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /plan to enable build mode.`,
         } as any;
+      }
+      // Silent auto-correct: enforce UTC date prefix so LLM hallucinations don't create wrong-dated files
+      try {
+        const today = getUtcDatePrefix();
+        const norm = normalizePlanPath(p, cwd, today);
+        if (norm.corrected) {
+          const input: any = event.input as any;
+          if (input.path) input.path = norm.path;
+          if (input.file_path) input.file_path = norm.path;
+          try {
+            (ctx as any).ui?.notify?.(
+              `Plan path auto-corrected ${norm.original} → ${norm.path} (UTC ${today})`,
+              "warning",
+            );
+          } catch (_e) {
+            void _e;
+          }
+          try {
+            pi.appendEntry("workflow-plan-path-corrected", {
+              original: norm.original,
+              corrected: norm.path,
+              at: Date.now(),
+              today,
+            });
+          } catch (_e) {
+            void _e;
+          }
+        }
+      } catch (_e) {
+        void _e;
       }
       // Ensure plans dir exists
       try {
@@ -1729,6 +1836,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, _ctx) => {
+    // Stale handoff reset: fresh user prompt means previous gate was dismissed/crashed
+    try {
+      const fw =
+        (event as any).followUp === true ||
+        (event as any).deliverAs === "followUp";
+      if (awaitingDecision && !fw) {
+        // If user sent a new prompt while gate stale, free it so next agent_end can show again
+        const age = lastHandoffAt ? Date.now() - lastHandoffAt : Infinity;
+        if (age > 5_000) {
+          awaitingDecision = false;
+          lastHandoffAt = undefined;
+          persistState();
+          try {
+            pi.appendEntry("workflow-handoff-reset-before-start", {
+              at: Date.now(),
+              age,
+            });
+          } catch (_e) {
+            void _e;
+          }
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
     // Capture header for next checkpoint commit message (first line of prompt)
     try {
       const raw = String((event as any).prompt ?? (event as any).text ?? "");
@@ -1748,11 +1880,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}`
         : "";
       btwNotes = []; // consume
+      const today = getUtcDatePrefix();
       return {
         message: {
           customType: "workflow-plan-context",
-          content: `[PLAN MODE ACTIVE] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/2026-09-03-my-feature.md", content: "# Plan: ..."})
-- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation, include "Type something." automatically.\n- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
+          content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
+- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation, include "Type something." automatically.\n- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -1820,34 +1953,340 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // Plan file detection + full render + decision gate
   let lastPlanWritePath: string | null = null;
 
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx) => {
     if (
       (event.toolName === "write" || event.toolName === "edit") &&
       !event.isError
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
-      const norm = String(p).replace(/\\/g, "/").toLowerCase();
-      if (
-        norm.includes(".pi/plans/") ||
-        norm.includes("/plans/") ||
-        String(p).toLowerCase().includes(".pi/plans")
-      ) {
-        lastPlanWritePath = p;
+      if (!p) return;
+      const cwd = (ctx as any)?.cwd as string | undefined;
+      // Use shared helper when cwd available; fall back to substring check
+      let isPlan = false;
+      try {
+        if (cwd) isPlan = isPlanWritePath(String(p), cwd);
+        else
+          isPlan = String(p)
+            .replace(/\\/g, "/")
+            .toLowerCase()
+            .includes(".pi/plans/");
+      } catch (_e) {
+        void _e;
+        isPlan = String(p).toLowerCase().includes(".pi/plans");
+      }
+      if (isPlan) {
+        // Store absolute for robust agent_end resolution (handles relative + Windows backslashes)
+        try {
+          const cwd2 = cwd ?? process.cwd();
+          const abs = path.isAbsolute(String(p))
+            ? String(p)
+            : path.join(cwd2, String(p));
+          lastPlanWritePath = abs;
+        } catch (_e) {
+          void _e;
+          lastPlanWritePath = String(p);
+        }
+        try {
+          pi.appendEntry("workflow-handoff-resolve", {
+            source: "tool_result",
+            planPath: lastPlanWritePath,
+          });
+        } catch (_e) {
+          void _e;
+        }
       }
     }
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    // Build completion
-    if (executionMode && todoItems.length > 0) {
-      const allDone = todoItems.every((t) => t.completed);
-      if (allDone) {
+    // Mutex: serialize concurrent agent_end handoffs (bus may emit Promise.all)
+    if (handoffInFlight) {
+      try {
+        await handoffInFlight;
+      } catch (_e) {
+        void _e;
+      }
+      if (awaitingDecision) {
         try {
+          ctx.ui.notify(
+            "Plan handoff already pending — dismiss the existing prompt first.",
+            "info",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
+    }
+    const runHandoff = async () => {
+      // Build completion
+      if (executionMode && todoItems.length > 0) {
+        const allDone = todoItems.every((t) => t.completed);
+        if (allDone) {
+          try {
+            (pi as any).sendMessage?.(
+              {
+                customType: "workflow-complete",
+                content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${t.step}. ${t.text}~~`).join("\n")}`,
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+          } catch (_e) {
+            void _e;
+          }
+          executionMode = false;
+          // keep todos for history but clear executing flag
+          updateStatus(ctx as any);
+          persistState();
+        }
+        return;
+      }
+
+      if (!planModeEnabled) return;
+      const hasUI = !!(ctx as any).hasUI;
+
+      // Extract todos from last assistant message if plan was emitted
+      const lastAssistant = [...(event.messages as any[])]
+        .reverse()
+        .find((m) => m.role === "assistant" && Array.isArray(m.content));
+      let extracted: TodoItem[] = [];
+      if (lastAssistant) {
+        try {
+          extracted = extractTodoItems(
+            getTextContent(lastAssistant as AssistantMessage),
+          );
+        } catch (_e) {
+          void _e;
+        }
+      }
+      if (extracted.length > 0) todoItems = extracted;
+      if (todoItems.length === 0 && lastPlanWritePath) {
+        try {
+          const planText = fs.readFileSync(
+            path.isAbsolute(lastPlanWritePath)
+              ? lastPlanWritePath
+              : path.join((ctx as any).cwd, lastPlanWritePath),
+            "utf8",
+          );
+          const fromFile = extractPlanStepsFromMarkdown(planText);
+          if (fromFile.length > 0) todoItems = fromFile;
+        } catch (_e) {
+          void _e;
+        }
+      }
+      // Broaden planPath recovery: scan branch for any plan file if lastPlanWritePath is still null
+      if (todoItems.length === 0 && !lastPlanWritePath) {
+        try {
+          const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+          for (let i = branch.length - 1; i >= 0; i--) {
+            const e: any = branch[i];
+            const cand =
+              e?.data?.planFile ||
+              e?.data?.planPath ||
+              e?.data?.path ||
+              e?.message?.toolName === "write" ||
+              e?.message?.toolName === "edit"
+                ? e?.input?.path || e?.input?.file_path || ""
+                : "";
+            const s = String(cand).toLowerCase();
+            if (s.includes("plans/") || s.includes(".pi/plans")) {
+              // try to resolve that entry as plan source
+              try {
+                const text = fs.readFileSync(
+                  path.isAbsolute(cand)
+                    ? cand
+                    : path.join((ctx as any).cwd, cand),
+                  "utf8",
+                );
+                const fromFile = extractPlanStepsFromMarkdown(text);
+                if (fromFile.length > 0) {
+                  todoItems = fromFile;
+                  lastPlanWritePath = cand;
+                  break;
+                }
+              } catch (_e) {
+                void _e;
+              }
+            }
+            // Also check custom entries that store planFile
+            if (e?.customType === "workflow" && e?.data?.planFile) {
+              try {
+                const text = fs.readFileSync(e.data.planFile, "utf8");
+                const fromFile = extractPlanStepsFromMarkdown(text);
+                if (fromFile.length > 0) {
+                  todoItems = fromFile;
+                  lastPlanWritePath = e.data.planFile;
+                  break;
+                }
+              } catch (_e) {
+                void _e;
+              }
+            }
+          }
+        } catch (_e) {
+          void _e;
+        }
+      }
+      // If still zero but a plan file exists, synthesize a single todo from its title so the handoff still appears
+      let _synthesizedFromTitle = false;
+      void _synthesizedFromTitle;
+      if (todoItems.length === 0) {
+        // Try to synthesize from plan file title or last assistant text
+        let synthText: string | undefined;
+        // Prefer reading the resolved plan file if we can find one
+        const candPlan =
+          (currentPlanFile && fs.existsSync(currentPlanFile)
+            ? currentPlanFile
+            : null) ||
+          (lastPlanWritePath &&
+            (() => {
+              try {
+                const p = path.isAbsolute(lastPlanWritePath)
+                  ? lastPlanWritePath
+                  : path.join((ctx as any).cwd, lastPlanWritePath);
+                return fs.existsSync(p) ? p : null;
+              } catch {
+                return null;
+              }
+            })()) ||
+          null;
+        if (candPlan) {
+          try {
+            const md = fs.readFileSync(candPlan, "utf8");
+            const titleMatch =
+              md.match(/^#\s+Plan[:\s]+(.+)$/im) || md.match(/^#\s+(.+)$/m);
+            if (titleMatch) synthText = titleMatch[1].trim().slice(0, 80);
+          } catch (_e) {
+            void _e;
+          }
+        }
+        if (!synthText && lastAssistant) {
+          const t = getTextContent(lastAssistant as AssistantMessage)
+            .slice(0, 80)
+            .trim();
+          if (t) synthText = t.split("\n")[0].trim().slice(0, 80);
+        }
+        if (synthText) {
+          todoItems = [{ step: 1, text: synthText, completed: false }];
+          _synthesizedFromTitle = true;
+        } else {
+          // Ultimate fallback: single generic step so gate can appear
+          todoItems = [
+            { step: 1, text: "Review and execute the plan", completed: false },
+          ];
+          _synthesizedFromTitle = true;
+        }
+      }
+
+      // Try to find plan file path
+      let planPath = currentPlanFile;
+      if (!planPath && lastPlanWritePath) planPath = lastPlanWritePath;
+      if (planPath && !path.isAbsolute(planPath))
+        planPath = path.join((ctx as any).cwd, planPath);
+      if (!planPath) {
+        // synthesize path for display if file not yet written but plan text exists
+        const slug = slugify(
+          (event.messages.find((m: any) => m.role === "user") as any)
+            ?.content?.[0]?.text || "plan",
+        );
+        const fname = `${getUtcDatePrefix()}-${slug}.md`;
+        planPath = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans", fname);
+      }
+      currentPlanFile = planPath;
+      persistState();
+
+      // Robust planTextForRender resolution with source logging (Step 2)
+      let planTextForRender: string | null = null;
+      let planSource: string = "none";
+      const tryRead = (p: string | null | undefined): string | null => {
+        if (!p) return null;
+        try {
+          const abs = path.isAbsolute(p) ? p : path.join((ctx as any).cwd, p);
+          if (fs.existsSync(abs)) return fs.readFileSync(abs, "utf8");
+        } catch (_e) {
+          void _e;
+        }
+        return null;
+      };
+      // Priority: lastPlanWritePath (most recent write) -> current planPath -> branch scan -> assistant draft
+      const fromLastWrite = tryRead(lastPlanWritePath);
+      if (fromLastWrite) {
+        planTextForRender = fromLastWrite;
+        planSource = "lastPlanWritePath";
+      } else {
+        const fromPlanPath = tryRead(planPath);
+        if (fromPlanPath) {
+          planTextForRender = fromPlanPath;
+          planSource = "planPath";
+        } else {
+          // Branch scan for any .pi/plans write that we missed (e.g. file_path alias, timing)
+          try {
+            const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+            for (let i = branch.length - 1; i >= 0; i--) {
+              const e: any = branch[i];
+              const cand: string =
+                e?.input?.path ||
+                e?.input?.file_path ||
+                e?.data?.planFile ||
+                "";
+              const s = String(cand).toLowerCase();
+              if (s.includes("plans/") || s.includes(".pi/plans")) {
+                const txt = tryRead(cand);
+                if (txt) {
+                  const steps = extractPlanStepsFromMarkdown(txt);
+                  if (steps.length > 0 || txt.length > 200) {
+                    planTextForRender = txt;
+                    planSource = "branch-scan";
+                    if (!lastPlanWritePath)
+                      lastPlanWritePath = path.isAbsolute(cand)
+                        ? cand
+                        : path.join((ctx as any).cwd, cand);
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (_e) {
+            void _e;
+          }
+          if (!planTextForRender && lastAssistant) {
+            planTextForRender = getTextContent(
+              lastAssistant as AssistantMessage,
+            );
+            if (planTextForRender) planSource = "assistant-draft";
+            try {
+              if (planTextForRender)
+                ctx.ui.notify(
+                  "Using in-memory draft — plan file not yet persisted",
+                  "info",
+                );
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      }
+      try {
+        pi.appendEntry("workflow-handoff-resolve", {
+          at: Date.now(),
+          source: planSource,
+          planPath,
+          planTextLen: planTextForRender ? planTextForRender.length : 0,
+        });
+      } catch (_e) {
+        void _e;
+      }
+      // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
+      if (!hasUI && planTextForRender && !awaitingDecision) {
+        try {
+          const preview = planTextForRender.slice(0, 4000);
+          const list = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
           (pi as any).sendMessage?.(
             {
-              customType: "workflow-complete",
-              content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${t.step}. ${t.text}~~`).join("\n")}`,
+              customType: "workflow-handoff-fallback",
+              content: `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`,
               display: true,
             },
             { triggerTurn: false },
@@ -1855,348 +2294,185 @@ export default function workflowExtension(pi: ExtensionAPI) {
         } catch (_e) {
           void _e;
         }
-        executionMode = false;
-        // keep todos for history but clear executing flag
-        updateStatus(ctx as any);
-        persistState();
-      }
-      return;
-    }
-
-    if (!planModeEnabled) return;
-    const hasUI = !!(ctx as any).hasUI;
-
-    // Extract todos from last assistant message if plan was emitted
-    const lastAssistant = [...(event.messages as any[])]
-      .reverse()
-      .find((m) => m.role === "assistant" && Array.isArray(m.content));
-    let extracted: TodoItem[] = [];
-    if (lastAssistant) {
-      try {
-        extracted = extractTodoItems(
-          getTextContent(lastAssistant as AssistantMessage),
-        );
-      } catch (_e) {
-        void _e;
-      }
-    }
-    if (extracted.length > 0) todoItems = extracted;
-    if (todoItems.length === 0 && lastPlanWritePath) {
-      try {
-        const planText = fs.readFileSync(
-          path.isAbsolute(lastPlanWritePath)
-            ? lastPlanWritePath
-            : path.join((ctx as any).cwd, lastPlanWritePath),
-          "utf8",
-        );
-        const fromFile = extractPlanStepsFromMarkdown(planText);
-        if (fromFile.length > 0) todoItems = fromFile;
-      } catch (_e) {
-        void _e;
-      }
-    }
-    // Broaden planPath recovery: scan branch for any plan file if lastPlanWritePath is still null
-    if (todoItems.length === 0 && !lastPlanWritePath) {
-      try {
-        const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
-        for (let i = branch.length - 1; i >= 0; i--) {
-          const e: any = branch[i];
-          const cand =
-            e?.data?.planFile ||
-            e?.data?.planPath ||
-            e?.data?.path ||
-            e?.message?.toolName === "write" ||
-            e?.message?.toolName === "edit"
-              ? e?.input?.path || e?.input?.file_path || ""
-              : "";
-          const s = String(cand).toLowerCase();
-          if (s.includes("plans/") || s.includes(".pi/plans")) {
-            // try to resolve that entry as plan source
-            try {
-              const text = fs.readFileSync(
-                path.isAbsolute(cand)
-                  ? cand
-                  : path.join((ctx as any).cwd, cand),
-                "utf8",
-              );
-              const fromFile = extractPlanStepsFromMarkdown(text);
-              if (fromFile.length > 0) {
-                todoItems = fromFile;
-                lastPlanWritePath = cand;
-                break;
-              }
-            } catch (_e) {
-              void _e;
-            }
-          }
-          // Also check custom entries that store planFile
-          if (e?.customType === "workflow" && e?.data?.planFile) {
-            try {
-              const text = fs.readFileSync(e.data.planFile, "utf8");
-              const fromFile = extractPlanStepsFromMarkdown(text);
-              if (fromFile.length > 0) {
-                todoItems = fromFile;
-                lastPlanWritePath = e.data.planFile;
-                break;
-              }
-            } catch (_e) {
-              void _e;
-            }
-          }
-        }
-      } catch (_e) {
-        void _e;
-      }
-    }
-    // If still zero but a plan file exists, synthesize a single todo from its title so the handoff still appears
-    let _synthesizedFromTitle = false;
-    if (todoItems.length === 0) {
-      // Try to synthesize from plan file title or last assistant text
-      let synthText: string | undefined;
-      // Prefer reading the resolved plan file if we can find one
-      const candPlan =
-        (currentPlanFile && fs.existsSync(currentPlanFile)
-          ? currentPlanFile
-          : null) ||
-        (lastPlanWritePath &&
-          (() => {
-            try {
-              const p = path.isAbsolute(lastPlanWritePath)
-                ? lastPlanWritePath
-                : path.join((ctx as any).cwd, lastPlanWritePath);
-              return fs.existsSync(p) ? p : null;
-            } catch {
-              return null;
-            }
-          })()) ||
-        null;
-      if (candPlan) {
+        // Also notify
         try {
-          const md = fs.readFileSync(candPlan, "utf8");
-          const titleMatch =
-            md.match(/^#\s+Plan[:\s]+(.+)$/im) || md.match(/^#\s+(.+)$/m);
-          if (titleMatch) synthText = titleMatch[1].trim().slice(0, 80);
+          ctx.ui.notify(
+            "Plan ready — type Execute to build or tell me what to refine.",
+            "info",
+          );
         } catch (_e) {
           void _e;
         }
+        return;
       }
-      if (!synthText && lastAssistant) {
-        const t = getTextContent(lastAssistant as AssistantMessage)
-          .slice(0, 80)
-          .trim();
-        if (t) synthText = t.split("\n")[0].trim().slice(0, 80);
-      }
-      if (synthText) {
-        todoItems = [{ step: 1, text: synthText, completed: false }];
-        _synthesizedFromTitle = true;
-      } else {
-        // Ultimate fallback: single generic step so gate can appear
-        todoItems = [
-          { step: 1, text: "Review and execute the plan", completed: false },
-        ];
-        _synthesizedFromTitle = true;
-      }
-    }
-
-    // Try to find plan file path
-    let planPath = currentPlanFile;
-    if (!planPath && lastPlanWritePath) planPath = lastPlanWritePath;
-    if (planPath && !path.isAbsolute(planPath))
-      planPath = path.join((ctx as any).cwd, planPath);
-    if (!planPath) {
-      // synthesize path for display if file not yet written but plan text exists
-      const slug = slugify(
-        (event.messages.find((m: any) => m.role === "user") as any)
-          ?.content?.[0]?.text || "plan",
-      );
-      const fname = `${new Date().toISOString().slice(0, 10)}-${slug}.md`;
-      planPath = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans", fname);
-    }
-    currentPlanFile = planPath;
-    persistState();
-
-    // If plan file exists, render it fully without truncation
-    let planTextForRender: string | null = null;
-    try {
-      if (planPath && fs.existsSync(planPath))
-        planTextForRender = fs.readFileSync(planPath, "utf8");
-    } catch (_e) {
-      void _e;
-    }
-    if (!planTextForRender && lastAssistant)
-      planTextForRender = getTextContent(lastAssistant as AssistantMessage);
-    // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
-    if (!hasUI && planTextForRender && !awaitingDecision) {
-      try {
-        const preview = planTextForRender.slice(0, 4000);
-        const list = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
-        (pi as any).sendMessage?.(
-          {
-            customType: "workflow-handoff-fallback",
-            content: `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`,
-            display: true,
-          },
-          { triggerTurn: false },
-        );
-      } catch (_e) {
-        void _e;
-      }
-      // Also notify
-      try {
-        ctx.ui.notify(
-          "Plan ready — type Execute to build or tell me what to refine.",
-          "info",
-        );
-      } catch (_e) {
-        void _e;
-      }
-      return;
-    }
-    if (planTextForRender && hasUI && !awaitingDecision) {
-      awaitingDecision = true;
-      persistState();
-      try {
-        const planContent = planTextForRender;
-        const items: SelectItem[] = [
-          {
-            value: "execute",
-            label: "1. Execute the plan in Build Mode",
-            description:
-              "Create todos, switch to build, start implementing (recommended)",
-          },
-          {
-            value: "refine",
-            label: "2. Refine the plan in Plan Mode",
-            description:
-              "Stay in plan mode, ask more questions, update the plan file",
-          },
-          {
-            value: "freeform",
-            label: "3. Type something else",
-            description: "Dismiss — type your own follow-up",
-          },
-        ];
-        const choice = await ctx.ui.custom<string | null>(
-          (tui: any, theme: any, _kb: any, done: any) => {
-            const container = new Container();
-            const mdTheme = getMarkdownTheme();
-            const md = new Markdown(planContent, 0, 0, mdTheme);
-            container.addChild(
-              new Text(
-                theme.fg(
-                  "accent",
-                  theme.bold(` Plan: ${path.basename(planPath!)} `),
+      if (planTextForRender && hasUI && !awaitingDecision) {
+        awaitingDecision = true;
+        lastHandoffAt = Date.now();
+        persistState();
+        const handoffStart = Date.now();
+        try {
+          const planContent = planTextForRender;
+          const items: SelectItem[] = [
+            {
+              value: "execute",
+              label: "1. Execute the plan in Build Mode",
+              description:
+                "Create todos, switch to build, start implementing (recommended)",
+            },
+            {
+              value: "refine",
+              label: "2. Refine the plan in Plan Mode",
+              description:
+                "Stay in plan mode, ask more questions, update the plan file",
+            },
+            {
+              value: "freeform",
+              label: "3. Type something else",
+              description: "Dismiss — type your own follow-up",
+            },
+          ];
+          // Bounded overlay with ScrollView contain: fixes scroll bounce + footer trap
+          const choice = await ctx.ui.custom<string | null>(
+            (tui: any, theme: any, _kb: any, done: any) => {
+              const inner = new Container();
+              const mdTheme = getMarkdownTheme();
+              const md = new Markdown(planContent, 0, 0, mdTheme);
+              inner.addChild(
+                new Text(
+                  theme.fg(
+                    "accent",
+                    theme.bold(` Plan: ${path.basename(planPath!)} `),
+                  ),
+                  1,
+                  0,
                 ),
-                1,
-                0,
-              ),
-            );
-            container.addChild(md);
-            container.addChild(
-              new Text(
-                theme.fg(
-                  "accent",
-                  theme.bold(" Plan complete — choose next step "),
-                ),
-                1,
-                0,
-              ),
-            );
-            const list = new SelectList(items, Math.min(items.length, 8), {
-              selectedPrefix: (t: string) => theme.fg("accent", t),
-              selectedText: (t: string) => theme.fg("accent", t),
-              description: (t: string) => theme.fg("muted", t),
-              scrollInfo: (t: string) => theme.fg("dim", t),
-              noMatch: (t: string) => theme.fg("warning", t),
-            });
-            (list as any).onSelect = (it: SelectItem) => done(it.value);
-            (list as any).onCancel = () => done(null);
-            container.addChild(list as any);
-            container.addChild(
-              new Text(
-                theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
-                1,
-                0,
-              ),
-            );
-            return {
-              render: (w: number) => container.render(w),
-              invalidate: () => container.invalidate(),
-              handleInput: (d: string) => {
-                (list as any).handleInput(d);
-                tui.requestRender();
-              },
-            };
-          },
-        );
-
-        if (choice === "execute") {
-          const resolvedPlan = planPath!;
-          let fallbackWrote = false;
-          try {
-            if (!fs.existsSync(resolvedPlan)) {
-              fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
-              fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
-              fallbackWrote = true;
-            }
-          } catch (_e) {
-            void _e;
-          }
-          if (fallbackWrote) {
-            try {
-              ctx.ui.notify(
-                "Plan was not on disk before handoff — persisted now as fallback (fix: write should happen in plan mode via write tool)",
-                "warning",
               );
-            } catch (_e) {
-              void _e;
-            }
-            try {
-              pi.appendEntry("workflow-fallback-write", {
-                planPath: resolvedPlan,
-                at: Date.now(),
+              inner.addChild(md);
+              inner.addChild(
+                new Text(
+                  theme.fg(
+                    "accent",
+                    theme.bold(" Plan complete — choose next step "),
+                  ),
+                  1,
+                  0,
+                ),
+              );
+              const list = new SelectList(items, Math.min(items.length, 6), {
+                selectedPrefix: (t: string) => theme.fg("accent", t),
+                selectedText: (t: string) => theme.fg("accent", t),
+                description: (t: string) => theme.fg("muted", t),
+                scrollInfo: (t: string) => theme.fg("dim", t),
+                noMatch: (t: string) => theme.fg("warning", t),
               });
-            } catch (_e) {
-              void _e;
-            }
-          }
-          enterBuildModeFromPlan(ctx as any, resolvedPlan);
-          updateStatus(ctx as any);
-          try {
-            const remainingList = todoItems
-              .map((t) => `${t.step}. ${t.text}`)
-              .join("\n");
-            const todoListText = todoItems
-              .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-              .join("\n");
-            const planTodoListMessage = {
-              customType: "workflow-todo-list",
-              content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-              display: true,
-            };
-            const firstTodo = todoItems[0];
-            const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:n] tag in your response.`;
-            (pi as any).sendMessage?.(planTodoListMessage, {
-              deliverAs: "followUp",
-            });
-            (pi as any).sendMessage?.(
-              {
-                customType: "workflow-plan-execute",
-                content: execMessage,
-                display: true,
+              (list as any).onSelect = (it: SelectItem) => done(it.value);
+              (list as any).onCancel = () => done(null);
+              inner.addChild(list as any);
+              inner.addChild(
+                new Text(
+                  theme.fg(
+                    "dim",
+                    " ↑↓ navigate • enter select • esc/ctrl+c dismiss ",
+                  ),
+                  1,
+                  0,
+                ),
+              );
+              const outer = new ScrollView(inner as any, {
+                overscroll: "contain",
+                scrollbar: "auto",
+                follow: "none",
+                primary: false,
+              });
+              return {
+                render: (w: number) => outer.render(w),
+                invalidate: () => outer.invalidate(),
+                handleInput: (d: string) => {
+                  // Ensure ESC/Ctrl+C always dismiss (trap-proof) even if SelectList doesn't handle
+                  if (
+                    matchesKey(d, Key.escape) ||
+                    matchesKey(d, Key.ctrl("c")) ||
+                    matchesKey(d, Key.ctrl("d"))
+                  ) {
+                    try {
+                      pi.appendEntry("workflow-handoff-input", {
+                        at: Date.now(),
+                        key: d,
+                        choice: null,
+                      });
+                    } catch (_e) {
+                      void _e;
+                    }
+                    done(null);
+                    tui.requestRender();
+                    return;
+                  }
+                  const handled = (list as any).handleInput(d);
+                  void handled;
+                  tui.requestRender();
+                },
+              };
+            },
+            {
+              overlay: true,
+              overlayOptions: {
+                width: "80%",
+                maxHeight: "80%",
+                margin: 2,
+                anchor: "center",
               },
-              { triggerTurn: true, deliverAs: "followUp" },
-            );
+              onHandle: (h: any) => {
+                handoffHandle = h;
+              },
+            } as any,
+          );
+          try {
+            pi.appendEntry("workflow-handoff-result", {
+              at: Date.now(),
+              choice,
+              durationMs: Date.now() - handoffStart,
+              planPath,
+            });
           } catch (_e) {
             void _e;
           }
-        } else if (choice === "refine") {
-          try {
-            const refinement = await (ctx as any).ui.editor(
-              "Refine the plan:",
-              "",
-            );
-            if (refinement?.trim()) {
+
+          if (choice === "execute") {
+            const resolvedPlan = planPath!;
+            let fallbackWrote = false;
+            try {
+              if (!fs.existsSync(resolvedPlan)) {
+                fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
+                fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
+                fallbackWrote = true;
+              }
+            } catch (_e) {
+              void _e;
+            }
+            if (fallbackWrote) {
+              try {
+                ctx.ui.notify(
+                  "Plan was not on disk before handoff — persisted now as fallback (fix: write should happen in plan mode via write tool)",
+                  "warning",
+                );
+              } catch (_e) {
+                void _e;
+              }
+              try {
+                pi.appendEntry("workflow-fallback-write", {
+                  planPath: resolvedPlan,
+                  at: Date.now(),
+                });
+              } catch (_e) {
+                void _e;
+              }
+            }
+            enterBuildModeFromPlan(ctx as any, resolvedPlan);
+            updateStatus(ctx as any);
+            try {
+              const remainingList = todoItems
+                .map((t) => `${t.step}. ${t.text}`)
+                .join("\n");
               const todoListText = todoItems
                 .map((t, i) => `${i + 1}. ☐ ${t.text}`)
                 .join("\n");
@@ -2205,38 +2481,145 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
                 display: true,
               };
+              const firstTodo = todoItems[0];
+              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:n] tag in your response.`;
               (pi as any).sendMessage?.(planTodoListMessage, {
                 deliverAs: "followUp",
               });
-              if ((pi as any).sendUserMessage) {
-                (pi as any).sendUserMessage(refinement.trim(), {
+              (pi as any).sendMessage?.(
+                {
+                  customType: "workflow-plan-execute",
+                  content: execMessage,
+                  display: true,
+                },
+                { triggerTurn: true, deliverAs: "followUp" },
+              );
+            } catch (_e) {
+              void _e;
+            }
+          } else if (choice === "refine") {
+            try {
+              const refinement = await (ctx as any).ui.editor(
+                "Refine the plan:",
+                "",
+              );
+              if (refinement?.trim()) {
+                const todoListText = todoItems
+                  .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+                  .join("\n");
+                const planTodoListMessage = {
+                  customType: "workflow-todo-list",
+                  content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+                  display: true,
+                };
+                (pi as any).sendMessage?.(planTodoListMessage, {
                   deliverAs: "followUp",
                 });
+                if ((pi as any).sendUserMessage) {
+                  (pi as any).sendUserMessage(refinement.trim(), {
+                    deliverAs: "followUp",
+                  });
+                } else {
+                  (pi as any).sendMessage?.(refinement.trim(), {
+                    deliverAs: "followUp",
+                  });
+                }
               } else {
-                (pi as any).sendMessage?.(refinement.trim(), {
-                  deliverAs: "followUp",
-                });
+                ctx.ui.notify(
+                  "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+                  "info",
+                );
               }
-            } else {
+            } catch (_e) {
+              void _e;
               ctx.ui.notify(
                 "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
                 "info",
               );
             }
+          } else {
+            ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+          }
+        } finally {
+          awaitingDecision = false;
+          lastHandoffAt = undefined;
+          handoffHandle = null;
+          persistState();
+          try {
+            (ctx as any).ui?.requestRender?.();
           } catch (_e) {
             void _e;
-            ctx.ui.notify(
-              "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
-              "info",
-            );
+          }
+        }
+      } else if (!planTextForRender) {
+        // Never silent: no plan text found — diagnose and stay in plan mode
+        try {
+          ctx.ui.notify(
+            `Plan handoff: no plan text found (file missing and no assistant draft) — staying in plan mode. Use write to .pi/plans/${getUtcDatePrefix()}-<slug>.md`,
+            "warning",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        try {
+          pi.appendEntry("workflow-handoff-miss", {
+            at: Date.now(),
+            reason: "no-plan-text",
+            planPath,
+            todoLen: todoItems.length,
+            hasUI,
+          });
+        } catch (_e) {
+          void _e;
+        }
+        awaitingDecision = false;
+        lastHandoffAt = undefined;
+        persistState();
+      } else if (awaitingDecision) {
+        // Stale guard already checked at entry; this is re-entrant within same tick
+        const age = lastHandoffAt ? Date.now() - lastHandoffAt : 0;
+        if (age > 60_000) {
+          awaitingDecision = false;
+          lastHandoffAt = undefined;
+          persistState();
+          // retry once: in next agent_end call it will show
+          try {
+            ctx.ui.notify("Recovered stale handoff gate — retrying", "info");
+          } catch (_e) {
+            void _e;
           }
         } else {
-          ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+          try {
+            ctx.ui.notify(
+              "Plan handoff already pending — dismiss the existing prompt first.",
+              "info",
+            );
+          } catch (_e) {
+            void _e;
+          }
         }
-      } finally {
-        awaitingDecision = false;
-        persistState();
       }
+      // Telemetry: always log attempt outcome
+      try {
+        pi.appendEntry("workflow-handoff-attempt", {
+          at: Date.now(),
+          hasUI,
+          awaitingDecisionAtEntry: false,
+          planPath,
+          planTextLen: planTextForRender ? planTextForRender.length : 0,
+          todoLen: todoItems.length,
+          source:
+            planTextForRender && fs.existsSync(planPath) ? "file" : "assistant",
+        });
+      } catch (_e) {
+        void _e;
+      }
+    };
+    handoffInFlight = runHandoff();
+    try {
+      await handoffInFlight;
+    } finally {
+      handoffInFlight = null;
     }
   });
 
