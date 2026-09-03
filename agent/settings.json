@@ -3,7 +3,8 @@
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
-    "npm:pi-web-access"
+    "npm:pi-web-access",
+    "npm:@plannotator/pi-extension"
   ],
   "enabledModels": [
     "opencode-go/muse-spark-1.2-contributor",
@@ -20,5 +21,7 @@
     "opencode/hy3-free",
     "opencode/big-pickle"
   ],
-  "defaultThinkingLevel": "high"
+  "defaultThinkingLevel": "high",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "muse-spark-1.2-contributor"
 }

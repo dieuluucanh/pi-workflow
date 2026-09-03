@@ -1,0 +1,12 @@
+{
+  "executionMode": "external",
+  "phases": {
+    "planning": {
+      "activeTools": ["grep", "find", "ls", "plannotator_submit_plan"],
+      "statusLabel": "⏸ plan — reviewing in browser"
+    },
+    "executing": {
+      "statusLabel": ""
+    }
+  }
+}

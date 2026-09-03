@@ -6,3 +6,5 @@ checkpoints/
 # jiti cache can also appear outside node_modules in some setups
 **/.cache/jiti/
 nul
+web-search-cache/
+plannotator-review-status.json

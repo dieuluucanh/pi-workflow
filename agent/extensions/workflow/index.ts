@@ -34,9 +34,12 @@ import {
   Key,
   matchesKey,
   SelectList,
+  ScrollView,
   Editor,
   type EditorTheme,
   type SelectItem,
+  visibleWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -63,6 +66,11 @@ import {
   restoreCode,
   findPersistedRef,
 } from "./checkpoint.ts";
+
+// ── Plannotator Bridge ───────────────────────────────────────────────
+const PLANNOTATOR_REQUEST = "plannotator:request" as const;
+const PLANNOTATOR_REVIEW_RESULT = "plannotator:review-result" as const;
+const PLANNOTATOR_PLAN_APPROVED = "plannotator:plan-approved" as const;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -149,6 +157,11 @@ function discoverAgents(cwd: string): AgentConfig[] {
   return [...map.values()];
 }
 
+// Track active `pi --mode json` children spawned by runSingleAgent so they
+// can be killed on session_shutdown and don't become orphans if VS Code
+// closes the terminal or pi crashes (up to 4 concurrent via explore).
+const activeSubagents = new Set<import("node:child_process").ChildProcess>();
+
 async function runSingleAgent(
   cwd: string,
   agent: AgentConfig,
@@ -192,6 +205,9 @@ async function runSingleAgent(
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    // Track for cleanup on session_shutdown — prevents orphaned subagents
+    // if pi crashes while explore is running (up to 4 concurrent).
+    activeSubagents.add(proc);
     let buffer = "";
     const messages: any[] = [];
     let stderr = "";
@@ -237,12 +253,14 @@ async function runSingleAgent(
       stderr += d.toString();
     });
     proc.on("close", (code) => {
+      activeSubagents.delete(proc);
       if (signal) signal.removeEventListener("abort", onAbort);
       // cleanup tmp
       fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       resolve({ messages, stderr, exitCode: code ?? 0, usage });
     });
     proc.on("error", (err) => {
+      activeSubagents.delete(proc);
       resolve({ messages, stderr: stderr + String(err), exitCode: 1, usage });
     });
   });
@@ -271,8 +289,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let awaitingDecision = false;
   let lastHandoffAt: number | undefined;
   let handoffInFlight: Promise<void> | null = null;
-  let handoffHandle: { hide: () => void } | null = null;
   let btwNotes: string[] = [];
+
+  // ── Plannotator bridge state ──────────────────────────────────
+  let plannotatorActive = false;
+  let lastReviewId: string | null = null;
+  let plannotatorListenersRegistered = false;
+  let currentSessionCtx: ExtensionContext | null = null;
 
   // ── Checkpoint (shadow bare-repo) state ────────────────────────
   const checkpoints = new Map<string, string>();
@@ -343,7 +366,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx.ui.theme.fg("accent", `▶ build ${done}/${todoItems.length}`),
       );
     } else if (workflowMode === "plan") {
-      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", "⏸ plan"));
+      const label = plannotatorActive
+        ? "⏸ plan — reviewing in browser"
+        : "⏸ plan";
+      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (workflowMode === "build") {
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", "▶ build"));
     } else {
@@ -472,6 +498,184 @@ export default function workflowExtension(pi: ExtensionAPI) {
       `Build mode: ${todoItems.length} todos loaded from plan.`,
       "info",
     );
+  }
+
+  // ── Plannotator bridge helpers ─────────────────────────────────
+  function getActiveCtx(): ExtensionContext | null {
+    return currentSessionCtx;
+  }
+
+  function handlePlannotatorApprove(
+    planFilePath: string,
+    planContent: string,
+    feedback: string | undefined,
+    cwd: string | undefined,
+  ) {
+    const ctx = getActiveCtx();
+    if (!ctx) return;
+    if (workflowMode !== "plan") return;
+    // Resolve plan path (plannotator gives cwd + relative path)
+    let resolvedPlan = planFilePath;
+    try {
+      if (cwd && !path.isAbsolute(planFilePath)) {
+        resolvedPlan = path.join(cwd, planFilePath);
+      } else if (!path.isAbsolute(planFilePath)) {
+        resolvedPlan = path.join(
+          (ctx as any).cwd ?? cwd ?? process.cwd(),
+          planFilePath,
+        );
+      }
+    } catch (_e) {
+      void _e;
+    }
+    // Ensure file exists (fallback write if agent only gave content)
+    try {
+      if (!fs.existsSync(resolvedPlan) && planContent) {
+        fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
+        fs.writeFileSync(resolvedPlan, planContent, "utf8");
+      }
+    } catch (_e) {
+      void _e;
+    }
+    awaitingDecision = false;
+    lastHandoffAt = undefined;
+    lastReviewId = null;
+    enterBuildModeFromPlan(ctx as any, resolvedPlan);
+    updateStatus(ctx as any);
+    try {
+      const remainingList = todoItems
+        .map((t) => `${t.step}. ${t.text}`)
+        .join("\n");
+      const todoListText = todoItems
+        .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+        .join("\n");
+      const planTodoListMessage = {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        display: true,
+      };
+      const firstTodo = todoItems[0];
+      const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
+      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}\nAfter completing a step, include a [DONE:n] tag in your response.`;
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      (pi as any).sendMessage?.(
+        {
+          customType: "workflow-plan-execute",
+          content: execMessage,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: "execute",
+        source: "plannotator",
+        planPath: resolvedPlan,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function handlePlannotatorDeny(feedback: string) {
+    const ctx = getActiveCtx();
+    if (!ctx) return;
+    awaitingDecision = false;
+    lastHandoffAt = undefined;
+    lastReviewId = null;
+    persistState();
+    try {
+      const todoListText = todoItems
+        .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+        .join("\n");
+      const planTodoListMessage = {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        display: true,
+      };
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      if ((pi as any).sendUserMessage) {
+        (pi as any).sendUserMessage(feedback || "Please revise the plan.", {
+          deliverAs: "followUp",
+        });
+      } else {
+        (pi as any).sendMessage?.(feedback || "Please revise the plan.", {
+          deliverAs: "followUp",
+        });
+      }
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: "refine",
+        source: "plannotator",
+        feedback,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function ensurePlannotatorListeners() {
+    if (plannotatorListenersRegistered) return;
+    try {
+      const bus: any = (pi as any).events;
+      if (!bus || typeof bus.on !== "function") return;
+      // plan-approved (external executionMode) — direct handoff
+      bus.on(PLANNOTATOR_PLAN_APPROVED, (event: any) => {
+        try {
+          handlePlannotatorApprove(
+            event.planFilePath,
+            event.planContent,
+            event.feedback,
+            event.cwd,
+          );
+        } catch (_e) {
+          void _e;
+        }
+      });
+      // review-result (plan-review shared API) — approve/deny from browser
+      bus.on(PLANNOTATOR_REVIEW_RESULT, (event: any) => {
+        try {
+          if (!event || typeof event.reviewId !== "string") return;
+          if (lastReviewId && event.reviewId !== lastReviewId) return;
+          if (event.approved) {
+            // For review-result we need to resolve planPath from currentPlanFile or lastReviewId
+            const planPath = currentPlanFile || lastReviewId || "";
+            // planContent may not be in event — read from file if possible
+            let content = "";
+            try {
+              if (planPath && fs.existsSync(planPath))
+                content = fs.readFileSync(planPath, "utf8");
+            } catch (_e) {
+              void _e;
+            }
+            handlePlannotatorApprove(
+              planPath,
+              content,
+              event.feedback,
+              (getActiveCtx() as any)?.cwd,
+            );
+          } else {
+            handlePlannotatorDeny(event.feedback || "Plan needs revision.");
+          }
+        } catch (_e) {
+          void _e;
+        }
+      });
+      plannotatorListenersRegistered = true;
+      plannotatorActive = true;
+      const ctx = getActiveCtx();
+      if (ctx) updateStatus(ctx as any);
+    } catch (_e) {
+      void _e;
+    }
   }
 
   // pi-code package already owns --plan flag; we only add --workflow-plan alias to avoid duplicate-flag crash
@@ -971,29 +1175,43 @@ export default function workflowExtension(pi: ExtensionAPI) {
             },
           };
           const editor = new Editor(tui, editorTheme);
+          // ── Shared freeform helpers (single source of truth) ──
+          const FREEFORM_ALIASES = new Set([
+            "type something",
+            "type something else",
+            "other",
+            "other (please specify)",
+            "other please specify",
+          ]);
+          const normalizeFreeform = (s: string) =>
+            s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
+          function buildDisplayOptions(
+            raw: { label: string; description?: string }[],
+          ): DisplayOpt[] {
+            const filtered: DisplayOpt[] = (raw as DisplayOpt[]).filter(
+              (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
+            );
+            filtered.push({ label: "Type something.", isOther: true });
+            return filtered;
+          }
+          function isCustomSelected(
+            prev: { wasCustom: boolean; index?: number } | undefined,
+            opt: DisplayOpt | undefined,
+            idx: number,
+          ): boolean {
+            if (!prev) return false;
+            if (prev.wasCustom && opt?.isOther) return true;
+            return prev.index === idx + 1;
+          }
           editor.onSubmit = (value) => {
             if (inputQuestionIdx === null) return;
             const trimmed = value.trim() || "(no response)";
-            // Persist index for freeform so highlight restores correctly when revisiting tab
-            const q = questions[inputQuestionIdx];
-            let freeformIndex: number | undefined;
-            if (q) {
-              const base = q.options.map((o) => ({
+            const freeformIndex = buildDisplayOptions(
+              questions[inputQuestionIdx]?.options.map((o) => ({
                 label: o.label,
                 description: o.description,
-              }));
-              const nf = (s: string) =>
-                s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
-              const aliases = new Set([
-                "type something",
-                "type something else",
-                "other",
-                "other (please specify)",
-                "other please specify",
-              ]);
-              const filtered = base.filter((o) => !aliases.has(nf(o.label)));
-              freeformIndex = filtered.length + 1; // 1-based, last row is Type something.
-            }
+              })) ?? [],
+            ).length; // 1-based last row
             answers.set(inputQuestionIdx, {
               answer: trimmed,
               wasCustom: true,
@@ -1011,49 +1229,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
           function currentOpts(): DisplayOpt[] {
             const q = currentQ();
             if (!q) return [];
-            const opts: DisplayOpt[] = [
-              ...q.options.map((o) => ({
+            return buildDisplayOptions(
+              q.options.map((o) => ({
                 label: o.label,
                 description: o.description,
               })),
-            ];
-            // Deduplicate: remove any LLM-provided freeform label before appending single isOther entry
-            const normalizeFreeform = (s: string) =>
-              s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
-            const FREEFORM_ALIASES = new Set([
-              "type something",
-              "type something else",
-              "other",
-              "other (please specify)",
-              "other please specify",
-            ]);
-            const filtered = opts.filter(
-              (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
             );
-            filtered.push({ label: "Type something.", isOther: true });
-            return filtered;
           }
           function optsForTab(tab: number): DisplayOpt[] {
             const q = questions[tab];
             if (!q) return [];
-            const opts: DisplayOpt[] = [
-              ...q.options.map((o) => ({
+            return buildDisplayOptions(
+              q.options.map((o) => ({
                 label: o.label,
                 description: o.description,
               })),
-            ];
-            const nf = (s: string) =>
-              s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
-            const aliases = new Set([
-              "type something",
-              "type something else",
-              "other",
-              "other (please specify)",
-              "other please specify",
-            ]);
-            const filtered = opts.filter((o) => !aliases.has(nf(o.label)));
-            filtered.push({ label: "Type something.", isOther: true });
-            return filtered;
+            );
           }
           function restoreOptionIndex(tab: number) {
             if (tab >= questions.length) {
@@ -1061,11 +1252,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
               return;
             }
             const prev = answers.get(tab);
+            // wasCustom is authoritative for freeform (resilient to option count changes)
+            if (prev?.wasCustom) {
+              optionIndex = Math.max(0, optsForTab(tab).length - 1);
+              return;
+            }
             if (prev?.index) {
               const len = optsForTab(tab).length;
               optionIndex = Math.max(0, Math.min(prev.index - 1, len - 1));
-            } else if (prev?.wasCustom) {
-              optionIndex = Math.max(0, optsForTab(tab).length - 1);
             } else {
               optionIndex = 0;
             }
@@ -1167,7 +1361,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
               if (opt.isOther) {
                 inputMode = true;
                 inputQuestionIdx = currentTab;
-                editor.setText("");
+                const prev = answers.get(currentTab);
+                editor.setText(prev?.wasCustom ? prev.answer : "");
                 refresh();
                 return;
               }
@@ -1191,15 +1386,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
             const q = currentQ();
             const opts = currentOpts();
             const wrap = (s: string) => {
-              // simple wrap using visibleWidth? use pi-tui helper via manual
               const out: string[] = [];
-              const cur = s;
-              // Not perfect but use Text wrapping logic: split lines naive
-              for (const line of cur.split("\n")) {
-                const { wrapTextWithAnsi } = require("@earendil-works/pi-tui");
+              for (const line of s.split("\n")) {
                 out.push(...wrapTextWithAnsi(line, W));
               }
               return out;
+            };
+            const wrapWithPrefix = (prefix: string, text: string) => {
+              const pw = visibleWidth(prefix);
+              if (pw >= W) return wrap(prefix + text);
+              const wrapped = wrapTextWithAnsi(text, W - pw);
+              const cont = " ".repeat(pw);
+              return wrapped.map(
+                (ln, idx) => `${idx === 0 ? prefix : cont}${ln}`,
+              );
             };
             lines.push(theme.fg("accent", "─".repeat(W)));
             if (isMulti) {
@@ -1297,7 +1497,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               for (let i = 0; i < opts.length; i++) {
                 const opt = opts[i];
                 const sel = i === optionIndex;
-                const isPrevSelected = prevAns?.index === i + 1;
+                const isPrevSelected = isCustomSelected(prevAns, opt, i);
                 const isOther = !!opt.isOther;
                 const prefix = sel
                   ? theme.fg("accent", "> ")
@@ -1312,11 +1512,43 @@ export default function workflowExtension(pi: ExtensionAPI) {
                     : isOther && inputMode
                       ? "accent"
                       : "text";
-                lines.push(...wrap(prefix + theme.fg(color as any, label)));
+                lines.push(
+                  ...wrapWithPrefix(prefix, theme.fg(color as any, label)),
+                );
                 if (opt.description)
                   lines.push(
-                    ...wrap("     " + theme.fg("muted", opt.description)),
+                    ...wrapWithPrefix(
+                      "     ",
+                      theme.fg("muted", opt.description),
+                    ),
                   );
+                // Show previously typed custom answer inline below the Type something. row
+                if (isOther && prevAns?.wasCustom) {
+                  const answerLabel = theme.fg("muted", "↳ Your answer: ");
+                  const answerVal = theme.fg("text", `"${prevAns.answer}"`);
+                  // Handle multiline answers: split and wrap each segment
+                  const answerLines = prevAns.answer.split("\n");
+                  if (answerLines.length === 1) {
+                    lines.push(
+                      ...wrapWithPrefix("    ", answerLabel + answerVal),
+                    );
+                  } else {
+                    lines.push(
+                      ...wrapWithPrefix(
+                        "    ",
+                        answerLabel + theme.fg("text", `"${answerLines[0]}`),
+                      ),
+                    );
+                    for (let ai = 1; ai < answerLines.length; ai++) {
+                      const seg = theme.fg(
+                        "text",
+                        answerLines[ai] +
+                          (ai === answerLines.length - 1 ? `"` : ""),
+                      );
+                      lines.push(...wrapWithPrefix("    ", seg));
+                    }
+                  }
+                }
               }
             }
             lines.push("");
@@ -1765,21 +1997,56 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
       persistState();
     }
+    currentSessionCtx = ctx as any;
+    // Register plannotator bridge (idempotent) and detect presence
+    ensurePlannotatorListeners();
+    // Also detect via presence of plannotator package in settings
+    try {
+      const settings: any = (ctx as any).settings ?? {};
+      const pkgs: string[] = settings.packages ?? [];
+      if (pkgs.some((p: string) => String(p).includes("plannotator"))) {
+        plannotatorActive = true;
+        updateStatus(ctx as any);
+      }
+    } catch (_e) {
+      void _e;
+    }
+    // Fallback: check if bus already has plannotator listeners (plannotator loaded before workflow)
+    try {
+      const bus: any = (pi as any).events;
+      const hasPlannotator =
+        bus &&
+        typeof bus.listenerCount === "function" &&
+        bus.listenerCount(PLANNOTATOR_REQUEST) > 0;
+      if (hasPlannotator) {
+        plannotatorActive = true;
+        ensurePlannotatorListeners();
+        updateStatus(ctx as any);
+      }
+    } catch (_e) {
+      void _e;
+    }
     updateStatus(ctx as any);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    // Force-hide leaked handoff overlay so footer/navigation not trapped
-    try {
-      handoffHandle?.hide();
-    } catch (_e) {
-      void _e;
+    // Kill any active explore subagents to prevent orphan leaks.
+    // Without this, `pi --mode json` children spawned by runSingleAgent
+    // (up to 4 concurrent) could survive if VS Code closes the terminal
+    // or pi crashes, holding file handles and confusing the next session.
+    for (const proc of [...activeSubagents]) {
+      try {
+        proc.kill("SIGTERM");
+      } catch (_e) {
+        void _e;
+      }
     }
-    handoffHandle = null;
+    activeSubagents.clear();
     // Ensure awaitingDecision does not persist stale across restart
     if (awaitingDecision) {
       awaitingDecision = false;
       lastHandoffAt = undefined;
+      lastReviewId = null;
       try {
         persistState();
       } catch (_e) {
@@ -1788,6 +2055,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     ctx.ui.setStatus("workflow", undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
+    currentSessionCtx = null;
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -2000,7 +2268,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   // Inject plan/build context + btw notes
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    currentSessionCtx = ctx as any;
+    ensurePlannotatorListeners();
     // Stale handoff reset: fresh user prompt means previous gate was dismissed/crashed
     try {
       const fw =
@@ -2448,10 +2718,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
         try {
           const preview = planTextForRender.slice(0, 4000);
           const list = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
+          const content = plannotatorActive
+            ? `**Plan ready** (${todoItems.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
+            : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`;
           (pi as any).sendMessage?.(
             {
               customType: "workflow-handoff-fallback",
-              content: `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`,
+              content,
               display: true,
             },
             { triggerTurn: false },
@@ -2462,7 +2735,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         // Also notify
         try {
           ctx.ui.notify(
-            "Plan ready — type Execute to build or tell me what to refine.",
+            plannotatorActive
+              ? "Plan ready — awaiting browser review (or type Execute to build directly)"
+              : "Plan ready — type Execute to build or tell me what to refine.",
             "info",
           );
         } catch (_e) {
@@ -2471,6 +2746,103 @@ export default function workflowExtension(pi: ExtensionAPI) {
         return;
       }
       if (planTextForRender && hasUI && !awaitingDecision) {
+        // ── Plannotator webview branch (browser review) ──────────
+        if (plannotatorActive) {
+          awaitingDecision = true;
+          lastHandoffAt = Date.now();
+          persistState();
+          try {
+            const bus: any = (pi as any).events;
+            const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const response: any = await new Promise((resolve) => {
+              let settled = false;
+              const timer = setTimeout(() => {
+                if (!settled) {
+                  settled = true;
+                  resolve({ status: "timeout" });
+                }
+              }, 5000);
+              try {
+                bus.emit(PLANNOTATOR_REQUEST, {
+                  requestId,
+                  action: "plan-review",
+                  payload: {
+                    planContent: planTextForRender!,
+                    planFilePath: planPath,
+                  },
+                  respond: (res: any) => {
+                    if (!settled) {
+                      settled = true;
+                      clearTimeout(timer);
+                      resolve(res);
+                    }
+                  },
+                });
+              } catch (e) {
+                if (!settled) {
+                  settled = true;
+                  clearTimeout(timer);
+                  resolve({ status: "error", error: String(e) });
+                }
+              }
+            });
+            if (
+              response &&
+              response.status === "handled" &&
+              response.result &&
+              response.result.reviewId
+            ) {
+              lastReviewId = response.result.reviewId;
+              try {
+                pi.appendEntry("workflow-handoff-plannotator", {
+                  at: Date.now(),
+                  planPath,
+                  reviewId: lastReviewId,
+                  planTextLen: planTextForRender!.length,
+                  source: planSource,
+                });
+              } catch (_e) {
+                void _e;
+              }
+              try {
+                currentSessionCtx = ctx as any;
+                (ctx as any).ui?.notify?.(
+                  "Plan opened in browser for review. Approve or annotate there.",
+                  "info",
+                );
+                updateStatus(ctx as any);
+              } catch (_e) {
+                void _e;
+              }
+              return; // plannotator owns the review — result arrives via plannotator:review-result / plan-approved events
+            }
+            if (response && response.status !== "timeout") {
+              try {
+                (ctx as any).ui?.notify?.(
+                  `Plannotator unavailable (${response.status}), falling back to inline review`,
+                  "warning",
+                );
+              } catch (_e) {
+                void _e;
+              }
+            }
+          } catch (e) {
+            try {
+              (ctx as any).ui?.notify?.(
+                `Plannotator request failed, falling back to inline: ${String(e).slice(0, 80)}`,
+                "warning",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          }
+          // Browser branch failed — clear gate so inline can show
+          awaitingDecision = false;
+          lastHandoffAt = undefined;
+          lastReviewId = null;
+          persistState();
+          // fall through to inline handoff below
+        }
         awaitingDecision = true;
         lastHandoffAt = Date.now();
         persistState();
@@ -2496,28 +2868,43 @@ export default function workflowExtension(pi: ExtensionAPI) {
               description: "Dismiss — type your own follow-up",
             },
           ];
-          // Inline handoff (no overlay, no ScrollView) — restores previous full-width UX
-          // Fixes overlay regressions: no scrollbar (ScrollView never got viewportHeight via compositeOverlays),
-          // missing selection (slice truncation), and small 80% window. Inline renders as terminal
-          // lines via editorContainer (dock VStack), scroll handled by host transcriptScrollView/main-screen
-          // scrollback; no custom viewport needed. Keep guards (handoffInFlight/awaitingDecision) for trap fix.
+          // Fallback inline handoff — split plan (scrollable, fill available) + choices (static at bottom).
+          // Plannotator is primary; this branch is only reached on timeout/error or !hasUI.
+          // Leaf custom component renders as flat lines, so ScrollView alone would not clip — manual slice
+          // is required to bound the viewport. Plan slice fills available space above static choices.
           const choice = await ctx.ui.custom<string | null>(
             (tui: any, theme: any, _kb: any, done: any) => {
-              const container = new Container();
               const mdTheme = getMarkdownTheme();
-              const md = new Markdown(planContent, 0, 0, mdTheme);
-              container.addChild(
+              const planMd = new Markdown(planContent, 0, 0, mdTheme);
+              const planScroll = new ScrollView(planMd as any, {
+                overscroll: "contain",
+                scrollbar: "auto",
+                follow: "none",
+                primary: false,
+              });
+              try {
+                (planScroll as any).setScrollbarActive?.(true);
+              } catch (_e) {
+                void _e;
+              }
+              let collapsed = false;
+              const buildHeader = () =>
                 new Text(
                   theme.fg(
                     "accent",
-                    theme.bold(` Plan: ${path.basename(planPath!)} `),
+                    theme.bold(
+                      ` Plan: ${path.basename(planPath!)} ` +
+                        (collapsed
+                          ? "(collapsed — press c to expand)"
+                          : "(press c to collapse)"),
+                    ),
                   ),
                   1,
                   0,
-                ),
-              );
-              container.addChild(md);
-              container.addChild(
+                );
+              let headerText = buildHeader();
+              const choices = new Container();
+              choices.addChild(
                 new Text(
                   theme.fg(
                     "accent",
@@ -2536,18 +2923,149 @@ export default function workflowExtension(pi: ExtensionAPI) {
               });
               (list as any).onSelect = (it: SelectItem) => done(it.value);
               (list as any).onCancel = () => done(null);
-              container.addChild(list as any);
-              container.addChild(
+              choices.addChild(list as any);
+              choices.addChild(
                 new Text(
-                  theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
+                  theme.fg(
+                    "dim",
+                    " ↑↓ navigate • enter select • esc dismiss • c collapse ",
+                  ),
                   1,
                   0,
                 ),
               );
               return {
-                render: (w: number) => container.render(w),
-                invalidate: () => container.invalidate(),
+                render: (w: number) => {
+                  try {
+                    const termRows: number =
+                      (tui as any)?.terminal?.rows ??
+                      (tui as any)?.height ??
+                      30;
+                    const choiceLines = choices.render(w);
+                    const choiceH = choiceLines.length;
+                    const RESERVE = 3;
+                    const MIN_PLAN = 6;
+                    const MAX_PLAN = Math.max(MIN_PLAN, termRows - choiceH - 1);
+                    const planViewport = collapsed
+                      ? 0
+                      : Math.max(
+                          MIN_PLAN,
+                          Math.min(MAX_PLAN, termRows - 1 - choiceH - RESERVE),
+                        );
+                    const out: string[] = [];
+                    const hdr = buildHeader().render(w);
+                    out.push(...hdr);
+                    if (!collapsed) {
+                      const all: string[] = (planScroll as any).render
+                        ? (planScroll as any).render(w)
+                        : (planMd as any).render(w);
+                      try {
+                        (planScroll as any).updateLayout(
+                          all.length,
+                          planViewport,
+                          () => tui.requestRender(),
+                        );
+                      } catch (_e) {
+                        void _e;
+                      }
+                      const maxSt = Math.max(0, all.length - planViewport);
+                      if (((planScroll as any).scrollTop ?? 0) > maxSt) {
+                        try {
+                          (planScroll as any).scrollTo(maxSt);
+                        } catch (_e) {
+                          void _e;
+                        }
+                      }
+                      const st = Math.max(
+                        0,
+                        Math.min((planScroll as any).scrollTop ?? 0, maxSt),
+                      );
+                      out.push(...all.slice(st, st + planViewport));
+                    }
+                    out.push(...choiceLines);
+                    return out;
+                  } catch (_e) {
+                    void _e;
+                  }
+                  try {
+                    return choices.render(w);
+                  } catch (_ee) {
+                    void _ee;
+                    return [];
+                  }
+                },
+                invalidate: () => {
+                  try {
+                    (planScroll as any).invalidate?.();
+                  } catch (_e) {
+                    void _e;
+                  }
+                  try {
+                    choices.invalidate();
+                  } catch (_e) {
+                    void _e;
+                  }
+                  try {
+                    headerText.invalidate?.();
+                  } catch (_e) {
+                    void _e;
+                  }
+                },
                 handleInput: (d: string) => {
+                  if (d === "c" || d === "C") {
+                    collapsed = !collapsed;
+                    try {
+                      headerText = buildHeader();
+                    } catch (_e) {
+                      void _e;
+                    }
+                    try {
+                      (planScroll as any).scrollTo(0);
+                    } catch (_e) {
+                      void _e;
+                    }
+                    tui.requestRender();
+                    return;
+                  }
+                  const isWheel =
+                    d.startsWith("\x1b[<") || d.startsWith("\x1b[M");
+                  const isPageUp =
+                    matchesKey(d, Key.pageUp) || d.includes("[5~");
+                  const isPageDown =
+                    matchesKey(d, Key.pageDown) || d.includes("[6~");
+                  if (isWheel) {
+                    let dir = 0;
+                    if (d.includes(";")) {
+                      dir = d.includes("64") ? -1 : d.includes("65") ? 1 : 0;
+                      if (dir === 0)
+                        dir = d.includes("M") && d.includes("64") ? -3 : 3;
+                    } else {
+                      dir = d.charCodeAt(3) === 97 ? -3 : 3;
+                    }
+                    try {
+                      (planScroll as any).scrollBy(dir * 3);
+                    } catch (_e) {
+                      void _e;
+                    }
+                    tui.requestRender();
+                    return;
+                  }
+                  if (isPageUp || isPageDown) {
+                    const termRows: number =
+                      (tui as any)?.terminal?.rows ??
+                      (tui as any)?.height ??
+                      30;
+                    const delta = isPageUp
+                      ? -Math.max(6, Math.floor(termRows * 0.5))
+                      : Math.max(6, Math.floor(termRows * 0.5));
+                    try {
+                      (planScroll as any).scrollBy(delta);
+                    } catch (_e) {
+                      void _e;
+                    }
+                    tui.requestRender();
+                    return;
+                  }
                   (list as any).handleInput(d);
                   tui.requestRender();
                 },
@@ -2677,7 +3195,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
         } finally {
           awaitingDecision = false;
           lastHandoffAt = undefined;
-          handoffHandle = null;
           persistState();
           try {
             (ctx as any).ui?.requestRender?.();
@@ -2710,13 +3227,66 @@ export default function workflowExtension(pi: ExtensionAPI) {
         lastHandoffAt = undefined;
         persistState();
       } else if (awaitingDecision) {
-        // Stale guard already checked at entry; this is re-entrant within same tick
+        // Stale guard — if plannotator review is still pending, don't reset
         const age = lastHandoffAt ? Date.now() - lastHandoffAt : 0;
+        if (plannotatorActive && lastReviewId) {
+          try {
+            const bus: any = (pi as any).events;
+            const statusRes: any = await new Promise((resolve) => {
+              let settled = false;
+              const t = setTimeout(() => {
+                if (!settled) {
+                  settled = true;
+                  resolve({ status: "timeout" });
+                }
+              }, 2000);
+              try {
+                bus.emit(PLANNOTATOR_REQUEST, {
+                  requestId: `${Date.now()}-status`,
+                  action: "review-status",
+                  payload: { reviewId: lastReviewId },
+                  respond: (r: any) => {
+                    if (!settled) {
+                      settled = true;
+                      clearTimeout(t);
+                      resolve(r);
+                    }
+                  },
+                });
+              } catch (e) {
+                void e;
+                if (!settled) {
+                  settled = true;
+                  clearTimeout(t);
+                  resolve({ status: "error" });
+                }
+              }
+            });
+            if (
+              statusRes &&
+              statusRes.status === "handled" &&
+              statusRes.result &&
+              statusRes.result.status === "pending"
+            ) {
+              try {
+                ctx.ui.notify(
+                  "Plan review still open in browser — awaiting decision.",
+                  "info",
+                );
+              } catch (_e) {
+                void _e;
+              }
+              return;
+            }
+          } catch (_e) {
+            void _e;
+          }
+        }
         if (age > 60_000) {
           awaitingDecision = false;
           lastHandoffAt = undefined;
+          lastReviewId = null;
           persistState();
-          // retry once: in next agent_end call it will show
           try {
             ctx.ui.notify("Recovered stale handoff gate — retrying", "info");
           } catch (_e) {
@@ -2725,7 +3295,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         } else {
           try {
             ctx.ui.notify(
-              "Plan handoff already pending — dismiss the existing prompt first.",
+              plannotatorActive && lastReviewId
+                ? "Plan review still open in browser — approve or annotate there."
+                : "Plan handoff already pending — dismiss the existing prompt first.",
               "info",
             );
           } catch (_e) {
