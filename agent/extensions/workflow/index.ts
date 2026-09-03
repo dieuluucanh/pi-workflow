@@ -5,7 +5,7 @@
  * - plan/build modes with tool gating
  * - parallel exploration via subagent (pi --mode json)
  * - questionnaire (multi-choice, recommendation first, with Type-something editor)
- * - plan file to .pi/plans/*.md + full Markdown overlay (no truncation)
+ * - plan file to .pi/plans/*.md + inline Markdown handoff (no truncation, terminal scrollback)
  * - decision gate: 1 Execute / 2 Refine / 3 Freeform
  * - todo tool (persisted via details) + live widget/status tracking
  * - /rewind (tree nav) + /btw (queue note) + Escape abort (signal)
@@ -35,7 +35,6 @@ import {
   matchesKey,
   SelectList,
   Editor,
-  ScrollView,
   type EditorTheme,
   type SelectItem,
 } from "@earendil-works/pi-tui";
@@ -2476,7 +2475,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
         lastHandoffAt = Date.now();
         persistState();
         const handoffStart = Date.now();
-        overlayActive = true;
         try {
           const planContent = planTextForRender;
           const items: SelectItem[] = [
@@ -2498,13 +2496,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
               description: "Dismiss — type your own follow-up",
             },
           ];
-          // Bounded overlay with ScrollView contain: fixes scroll bounce + footer trap
+          // Inline handoff (no overlay, no ScrollView) — restores previous full-width UX
+          // Fixes overlay regressions: no scrollbar (ScrollView never got viewportHeight via compositeOverlays),
+          // missing selection (slice truncation), and small 80% window. Inline renders as terminal
+          // lines via editorContainer (dock VStack), scroll handled by host transcriptScrollView/main-screen
+          // scrollback; no custom viewport needed. Keep guards (handoffInFlight/awaitingDecision) for trap fix.
           const choice = await ctx.ui.custom<string | null>(
             (tui: any, theme: any, _kb: any, done: any) => {
-              const inner = new Container();
+              const container = new Container();
               const mdTheme = getMarkdownTheme();
               const md = new Markdown(planContent, 0, 0, mdTheme);
-              inner.addChild(
+              container.addChild(
                 new Text(
                   theme.fg(
                     "accent",
@@ -2514,8 +2516,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   0,
                 ),
               );
-              inner.addChild(md);
-              inner.addChild(
+              container.addChild(md);
+              container.addChild(
                 new Text(
                   theme.fg(
                     "accent",
@@ -2525,7 +2527,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   0,
                 ),
               );
-              const list = new SelectList(items, Math.min(items.length, 6), {
+              const list = new SelectList(items, Math.min(items.length, 8), {
                 selectedPrefix: (t: string) => theme.fg("accent", t),
                 selectedText: (t: string) => theme.fg("accent", t),
                 description: (t: string) => theme.fg("muted", t),
@@ -2534,64 +2536,23 @@ export default function workflowExtension(pi: ExtensionAPI) {
               });
               (list as any).onSelect = (it: SelectItem) => done(it.value);
               (list as any).onCancel = () => done(null);
-              inner.addChild(list as any);
-              inner.addChild(
+              container.addChild(list as any);
+              container.addChild(
                 new Text(
-                  theme.fg(
-                    "dim",
-                    " ↑↓ navigate • enter select • esc/ctrl+c dismiss ",
-                  ),
+                  theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
                   1,
                   0,
                 ),
               );
-              const outer = new ScrollView(inner as any, {
-                overscroll: "contain",
-                scrollbar: "auto",
-                follow: "none",
-                primary: false,
-              });
               return {
-                render: (w: number) => outer.render(w),
-                invalidate: () => outer.invalidate(),
+                render: (w: number) => container.render(w),
+                invalidate: () => container.invalidate(),
                 handleInput: (d: string) => {
-                  // Ensure ESC/Ctrl+C always dismiss (trap-proof) even if SelectList doesn't handle
-                  if (
-                    matchesKey(d, Key.escape) ||
-                    matchesKey(d, Key.ctrl("c")) ||
-                    matchesKey(d, Key.ctrl("d"))
-                  ) {
-                    try {
-                      pi.appendEntry("workflow-handoff-input", {
-                        at: Date.now(),
-                        key: d,
-                        choice: null,
-                      });
-                    } catch (_e) {
-                      void _e;
-                    }
-                    done(null);
-                    tui.requestRender();
-                    return;
-                  }
-                  const handled = (list as any).handleInput(d);
-                  void handled;
+                  (list as any).handleInput(d);
                   tui.requestRender();
                 },
               };
             },
-            {
-              overlay: true,
-              overlayOptions: {
-                width: "80%",
-                maxHeight: "80%",
-                margin: 2,
-                anchor: "center",
-              },
-              onHandle: (h: any) => {
-                handoffHandle = h;
-              },
-            } as any,
           );
           try {
             pi.appendEntry("workflow-handoff-result", {
@@ -2603,7 +2564,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
-          overlayActive = false;
 
           if (choice === "execute") {
             const resolvedPlan = planPath!;
