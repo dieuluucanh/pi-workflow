@@ -262,8 +262,10 @@ function getFinalOutput(messages: any[]): string {
 // ── Main Extension ───────────────────────────────────────────────────
 
 export default function workflowExtension(pi: ExtensionAPI) {
-  let planModeEnabled = false;
-  let executionMode = false;
+  type WorkflowMode = "plan" | "build";
+  let workflowMode: WorkflowMode | null = null;
+  // overlay guard: true while any ctx.ui.custom overlay is active (questionnaire/rewind/decision gate)
+  let overlayActive = false;
   let todoItems: TodoItem[] = [];
   let toolsBeforePlanMode: string[] | undefined;
   let currentPlanFile: string | undefined;
@@ -278,6 +280,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let currentEntryId: string | undefined;
   let lastPromptHeader: string | undefined;
   const recentRestores = new Set<string>();
+
+  // legacy aliases for bus sync / debug - keep in sync via setters (underscore to avoid unused lint)
+  let _planModeEnabled = false;
+  let _executionMode = false;
+  function syncLegacyFlags() {
+    _planModeEnabled = workflowMode === "plan";
+    _executionMode = workflowMode === "build";
+    void _planModeEnabled;
+    void _executionMode;
+  }
 
   const PLAN_MODE_TOOLS = [
     "read",
@@ -321,20 +333,25 @@ export default function workflowExtension(pi: ExtensionAPI) {
       ...active.filter((n) => !managed.has(n)),
     ]);
   }
+  // alias for clarity: Build is the off-state of Plan
+  const getBuildTools = getNormalTools;
 
   function updateStatus(ctx: ExtensionContext) {
-    if (executionMode && todoItems.length > 0) {
+    if (workflowMode === "build" && todoItems.length > 0) {
       const done = todoItems.filter((t) => t.completed).length;
       ctx.ui.setStatus(
         "workflow",
         ctx.ui.theme.fg("accent", `▶ build ${done}/${todoItems.length}`),
       );
-    } else if (planModeEnabled) {
+    } else if (workflowMode === "plan") {
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", "⏸ plan"));
+    } else if (workflowMode === "build") {
+      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", "▶ build"));
     } else {
+      // initial null: treat as build for naming parity, but show nothing until first explicit set to avoid flash
       ctx.ui.setStatus("workflow", undefined);
     }
-    if (executionMode && todoItems.length > 0) {
+    if (workflowMode === "build" && todoItems.length > 0) {
       const lines = todoItems.map((item) => {
         if (item.completed)
           return (
@@ -344,7 +361,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         return `${ctx.ui.theme.fg("dim", "☐ ")}${item.text}`;
       });
       ctx.ui.setWidget("workflow-todos", lines);
-    } else if (planModeEnabled && todoItems.length > 0) {
+    } else if (workflowMode === "plan" && todoItems.length > 0) {
       const lines = todoItems.map(
         (item) =>
           `${ctx.ui.theme.fg("dim", "☐ ")}${ctx.ui.theme.fg("muted", item.text)}`,
@@ -356,10 +373,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   function persistState() {
+    syncLegacyFlags();
     pi.appendEntry("workflow", {
-      enabled: planModeEnabled,
+      // new canonical field
+      mode: workflowMode,
+      // legacy for backward compat (old sessions / external readers)
+      enabled: workflowMode === "plan",
       todos: todoItems,
-      executing: executionMode,
+      executing: workflowMode === "build",
       toolsBeforePlanMode,
       planFile: currentPlanFile,
       awaitingDecision,
@@ -367,41 +388,73 @@ export default function workflowExtension(pi: ExtensionAPI) {
     });
   }
 
-  function togglePlanMode(ctx: ExtensionContext) {
-    planModeEnabled = !planModeEnabled;
-    executionMode = false;
-    if (planModeEnabled) {
-      if (toolsBeforePlanMode === undefined)
-        toolsBeforePlanMode = pi.getActiveTools();
-      pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+  function setPlanMode(ctx: ExtensionContext) {
+    if (workflowMode === "plan") {
       ctx.ui.notify(
-        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/.",
+        "Already in Plan mode — read-only. Press Tab or /build to switch to Build.",
         "info",
       );
-      try {
-        fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
-          recursive: true,
-        });
-      } catch (_e) {
-        void _e;
-      }
-    } else {
-      pi.setActiveTools(
-        toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
-      );
-      toolsBeforePlanMode = undefined;
-      ctx.ui.notify("Build mode — full access restored.", "info");
+      return;
+    }
+    workflowMode = "plan";
+    syncLegacyFlags();
+    if (toolsBeforePlanMode === undefined)
+      toolsBeforePlanMode = pi.getActiveTools();
+    pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+    ctx.ui.notify(
+      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab or /build to switch to Build.",
+      "info",
+    );
+    try {
+      fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
+        recursive: true,
+      });
+    } catch (_e) {
+      void _e;
     }
     updateStatus(ctx);
     persistState();
   }
 
+  function setBuildMode(ctx: ExtensionContext) {
+    if (workflowMode === "build") {
+      ctx.ui.notify(
+        "Already in Build mode — full access. Press Tab or /plan to switch to Plan.",
+        "info",
+      );
+      return;
+    }
+    workflowMode = "build";
+    syncLegacyFlags();
+    pi.setActiveTools(
+      toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
+    );
+    toolsBeforePlanMode = undefined;
+    ctx.ui.notify(
+      "Build mode — full access restored. Press Tab or /plan to switch to Plan.",
+      "info",
+    );
+    updateStatus(ctx);
+    persistState();
+  }
+
+  function cycleWorkflowMode(ctx: ExtensionContext) {
+    if (workflowMode === "plan") setBuildMode(ctx);
+    else setPlanMode(ctx);
+  }
+
+  // legacy alias for backward compat
+  function togglePlanMode(ctx: ExtensionContext) {
+    cycleWorkflowMode(ctx);
+  }
+  void togglePlanMode;
+
   function enterBuildModeFromPlan(ctx: ExtensionContext, planPath: string) {
-    planModeEnabled = false;
-    executionMode = true;
+    workflowMode = "build";
+    syncLegacyFlags();
     currentPlanFile = planPath;
     pi.setActiveTools(
-      toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
+      toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
     );
     toolsBeforePlanMode = undefined;
     // populate todos from plan file if not already
@@ -435,22 +488,50 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   try {
     pi.registerCommand("plan", {
-      description: "Toggle plan mode / build mode",
-      handler: async (_args, ctx) => togglePlanMode(ctx as any),
+      description: "Enable Plan mode (read-only, idempotent)",
+      handler: async (_args, ctx) => setPlanMode(ctx as any),
     });
   } catch {
-    // pi-code already owns /plan — add /workflow as our toggle alias
+    // pi-code already owns /plan — add /workflow as our alias
     pi.registerCommand("workflow", {
-      description: "Toggle workflow plan/build mode (alias for /plan)",
-      handler: async (_args, ctx) => togglePlanMode(ctx as any),
+      description: "Enable Plan mode (alias for /plan)",
+      handler: async (_args, ctx) => setPlanMode(ctx as any),
     });
   }
 
   try {
-    pi.registerShortcut(Key.ctrlAlt("p"), {
-      description: "Toggle plan mode",
-      handler: async (ctx) => togglePlanMode(ctx as any),
+    pi.registerCommand("build", {
+      description: "Enable Build mode (full access, idempotent)",
+      handler: async (_args, ctx) => setBuildMode(ctx as any),
     });
+  } catch (_e) {
+    void _e;
+  }
+
+  try {
+    pi.registerShortcut(Key.ctrlAlt("p"), {
+      description: "Toggle plan/build mode",
+      handler: async (ctx: any) => {
+        if (overlayActive) return;
+        cycleWorkflowMode(ctx as any);
+      },
+    });
+  } catch (_e) {
+    void _e;
+  }
+
+  // Tab to toggle plan/build (context-aware: not when overlay active) — single registration to avoid duplicate-conflict warning
+  try {
+    pi.registerShortcut(
+      "tab" as any,
+      {
+        description: "Toggle plan/build mode (Tab)",
+        handler: async (ctx: any) => {
+          if (overlayActive) return;
+          cycleWorkflowMode(ctx as any);
+        },
+      } as any,
+    );
   } catch (_e) {
     void _e;
   }
@@ -848,7 +929,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       };
       const isMulti = questions.length > 1;
 
-      const result = await ctx.ui.custom<{
+      overlayActive = true;
+      let result: {
         answers: {
           question: string;
           header?: string;
@@ -857,321 +939,410 @@ export default function workflowExtension(pi: ExtensionAPI) {
           index?: number;
         }[];
         cancelled: boolean;
-      } | null>((tui, theme, _kb, done) => {
-        let currentTab = 0;
-        let optionIndex = 0;
-        let inputMode = false;
-        let inputQuestionIdx: number | null = null;
-        let cached: string[] | undefined;
-        const answers = new Map<
-          number,
-          { answer: string; wasCustom: boolean; index?: number }
-        >();
+      } | null;
+      try {
+        result = await ctx.ui.custom<{
+          answers: {
+            question: string;
+            header?: string;
+            answer: string;
+            wasCustom: boolean;
+            index?: number;
+          }[];
+          cancelled: boolean;
+        } | null>((tui, theme, _kb, done) => {
+          let currentTab = 0;
+          let optionIndex = 0;
+          let inputMode = false;
+          let inputQuestionIdx: number | null = null;
+          let cached: string[] | undefined;
+          const answers = new Map<
+            number,
+            { answer: string; wasCustom: boolean; index?: number }
+          >();
 
-        const editorTheme: EditorTheme = {
-          borderColor: (s) => theme.fg("accent", s),
-          selectList: {
-            selectedPrefix: (t) => theme.fg("accent", t),
-            selectedText: (t) => theme.fg("accent", t),
-            description: (t) => theme.fg("muted", t),
-            scrollInfo: (t) => theme.fg("dim", t),
-            noMatch: (t) => theme.fg("warning", t),
-          },
-        };
-        const editor = new Editor(tui, editorTheme);
-        editor.onSubmit = (value) => {
-          if (inputQuestionIdx === null) return;
-          const trimmed = value.trim() || "(no response)";
-          answers.set(inputQuestionIdx, { answer: trimmed, wasCustom: true });
-          inputMode = false;
-          inputQuestionIdx = null;
-          editor.setText("");
-          advanceAfter();
-        };
-
-        function currentQ() {
-          return questions[currentTab];
-        }
-        function currentOpts(): DisplayOpt[] {
-          const q = currentQ();
-          if (!q) return [];
-          const opts: DisplayOpt[] = [
-            ...q.options.map((o) => ({
-              label: o.label,
-              description: o.description,
-            })),
-          ];
-          // Deduplicate: remove any LLM-provided freeform label before appending single isOther entry
-          const normalizeFreeform = (s: string) =>
-            s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
-          const FREEFORM_ALIASES = new Set([
-            "type something",
-            "type something else",
-            "other",
-            "other (please specify)",
-            "other please specify",
-          ]);
-          const filtered = opts.filter(
-            (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
-          );
-          filtered.push({ label: "Type something.", isOther: true });
-          return filtered;
-        }
-        function allAnswered() {
-          return questions.every((_, i) => answers.has(i));
-        }
-        function advanceAfter() {
-          if (!isMulti) {
-            submit(false);
-            return;
-          }
-          if (currentTab < questions.length - 1) currentTab++;
-          else currentTab = questions.length; // submit tab
-          optionIndex = 0;
-          cached = undefined;
-          tui.requestRender();
-        }
-        function submit(cancelled: boolean) {
-          if (cancelled) {
-            done({ answers: [], cancelled: true });
-            return;
-          }
-          const arr = questions.map((q, i) => {
-            const a = answers.get(i);
-            return {
-              question: q.question,
-              header: q.header,
-              answer: a ? a.answer : "",
-              wasCustom: a ? a.wasCustom : false,
-              index: a?.index,
-            };
-          });
-          done({ answers: arr, cancelled: false });
-        }
-        function refresh() {
-          cached = undefined;
-          tui.requestRender();
-        }
-
-        const handleInput = (data: string) => {
-          if (signal?.aborted) {
-            done(null);
-            return;
-          }
-          if (inputMode) {
-            if (matchesKey(data, Key.escape)) {
-              inputMode = false;
-              inputQuestionIdx = null;
-              editor.setText("");
-              refresh();
-              return;
+          const editorTheme: EditorTheme = {
+            borderColor: (s) => theme.fg("accent", s),
+            selectList: {
+              selectedPrefix: (t) => theme.fg("accent", t),
+              selectedText: (t) => theme.fg("accent", t),
+              description: (t) => theme.fg("muted", t),
+              scrollInfo: (t) => theme.fg("dim", t),
+              noMatch: (t) => theme.fg("warning", t),
+            },
+          };
+          const editor = new Editor(tui, editorTheme);
+          editor.onSubmit = (value) => {
+            if (inputQuestionIdx === null) return;
+            const trimmed = value.trim() || "(no response)";
+            // Persist index for freeform so highlight restores correctly when revisiting tab
+            const q = questions[inputQuestionIdx];
+            let freeformIndex: number | undefined;
+            if (q) {
+              const base = q.options.map((o) => ({
+                label: o.label,
+                description: o.description,
+              }));
+              const nf = (s: string) =>
+                s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
+              const aliases = new Set([
+                "type something",
+                "type something else",
+                "other",
+                "other (please specify)",
+                "other please specify",
+              ]);
+              const filtered = base.filter((o) => !aliases.has(nf(o.label)));
+              freeformIndex = filtered.length + 1; // 1-based, last row is Type something.
             }
-            editor.handleInput(data);
-            refresh();
-            return;
+            answers.set(inputQuestionIdx, {
+              answer: trimmed,
+              wasCustom: true,
+              index: freeformIndex,
+            });
+            inputMode = false;
+            inputQuestionIdx = null;
+            editor.setText("");
+            advanceAfter();
+          };
+
+          function currentQ() {
+            return questions[currentTab];
           }
-          const q = currentQ();
-          const opts = currentOpts();
-          if (isMulti) {
-            if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
-              currentTab = (currentTab + 1) % (questions.length + 1);
+          function currentOpts(): DisplayOpt[] {
+            const q = currentQ();
+            if (!q) return [];
+            const opts: DisplayOpt[] = [
+              ...q.options.map((o) => ({
+                label: o.label,
+                description: o.description,
+              })),
+            ];
+            // Deduplicate: remove any LLM-provided freeform label before appending single isOther entry
+            const normalizeFreeform = (s: string) =>
+              s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
+            const FREEFORM_ALIASES = new Set([
+              "type something",
+              "type something else",
+              "other",
+              "other (please specify)",
+              "other please specify",
+            ]);
+            const filtered = opts.filter(
+              (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
+            );
+            filtered.push({ label: "Type something.", isOther: true });
+            return filtered;
+          }
+          function optsForTab(tab: number): DisplayOpt[] {
+            const q = questions[tab];
+            if (!q) return [];
+            const opts: DisplayOpt[] = [
+              ...q.options.map((o) => ({
+                label: o.label,
+                description: o.description,
+              })),
+            ];
+            const nf = (s: string) =>
+              s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
+            const aliases = new Set([
+              "type something",
+              "type something else",
+              "other",
+              "other (please specify)",
+              "other please specify",
+            ]);
+            const filtered = opts.filter((o) => !aliases.has(nf(o.label)));
+            filtered.push({ label: "Type something.", isOther: true });
+            return filtered;
+          }
+          function restoreOptionIndex(tab: number) {
+            if (tab >= questions.length) {
               optionIndex = 0;
-              refresh();
               return;
             }
-            if (
-              matchesKey(data, Key.shift("tab")) ||
-              matchesKey(data, Key.left)
-            ) {
-              currentTab =
-                (currentTab - 1 + questions.length + 1) %
-                (questions.length + 1);
+            const prev = answers.get(tab);
+            if (prev?.index) {
+              const len = optsForTab(tab).length;
+              optionIndex = Math.max(0, Math.min(prev.index - 1, len - 1));
+            } else if (prev?.wasCustom) {
+              optionIndex = Math.max(0, optsForTab(tab).length - 1);
+            } else {
               optionIndex = 0;
-              refresh();
-              return;
             }
           }
-          if (currentTab === questions.length) {
-            if (matchesKey(data, Key.enter) && allAnswered()) {
+          function allAnswered() {
+            return questions.every((_, i) => answers.has(i));
+          }
+          function advanceAfter() {
+            if (!isMulti) {
               submit(false);
-            } else if (matchesKey(data, Key.escape)) {
+              return;
+            }
+            if (currentTab < questions.length - 1) currentTab++;
+            else currentTab = questions.length; // submit tab
+            restoreOptionIndex(currentTab);
+            cached = undefined;
+            tui.requestRender();
+          }
+          function submit(cancelled: boolean) {
+            if (cancelled) {
+              done({ answers: [], cancelled: true });
+              return;
+            }
+            const arr = questions.map((q, i) => {
+              const a = answers.get(i);
+              return {
+                question: q.question,
+                header: q.header,
+                answer: a ? a.answer : "",
+                wasCustom: a ? a.wasCustom : false,
+                index: a?.index,
+              };
+            });
+            done({ answers: arr, cancelled: false });
+          }
+          function refresh() {
+            cached = undefined;
+            tui.requestRender();
+          }
+
+          const handleInput = (data: string) => {
+            if (signal?.aborted) {
+              done(null);
+              return;
+            }
+            if (inputMode) {
+              if (matchesKey(data, Key.escape)) {
+                inputMode = false;
+                inputQuestionIdx = null;
+                editor.setText("");
+                refresh();
+                return;
+              }
+              editor.handleInput(data);
+              refresh();
+              return;
+            }
+            const q = currentQ();
+            const opts = currentOpts();
+            if (isMulti) {
+              if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
+                currentTab = (currentTab + 1) % (questions.length + 1);
+                restoreOptionIndex(currentTab);
+                refresh();
+                return;
+              }
+              if (
+                matchesKey(data, Key.shift("tab")) ||
+                matchesKey(data, Key.left)
+              ) {
+                currentTab =
+                  (currentTab - 1 + questions.length + 1) %
+                  (questions.length + 1);
+                restoreOptionIndex(currentTab);
+                refresh();
+                return;
+              }
+            }
+            if (currentTab === questions.length) {
+              if (matchesKey(data, Key.enter) && allAnswered()) {
+                submit(false);
+              } else if (matchesKey(data, Key.escape)) {
+                submit(true);
+              }
+              return;
+            }
+            if (matchesKey(data, Key.up)) {
+              optionIndex = Math.max(0, optionIndex - 1);
+              refresh();
+              return;
+            }
+            if (matchesKey(data, Key.down)) {
+              optionIndex = Math.min(opts.length - 1, optionIndex + 1);
+              refresh();
+              return;
+            }
+            if (matchesKey(data, Key.enter) && q) {
+              const opt = opts[optionIndex];
+              if (opt.isOther) {
+                inputMode = true;
+                inputQuestionIdx = currentTab;
+                editor.setText("");
+                refresh();
+                return;
+              }
+              answers.set(currentTab, {
+                answer: opt.label,
+                wasCustom: false,
+                index: optionIndex + 1,
+              });
+              advanceAfter();
+              return;
+            }
+            if (matchesKey(data, Key.escape)) {
               submit(true);
             }
-            return;
-          }
-          if (matchesKey(data, Key.up)) {
-            optionIndex = Math.max(0, optionIndex - 1);
-            refresh();
-            return;
-          }
-          if (matchesKey(data, Key.down)) {
-            optionIndex = Math.min(opts.length - 1, optionIndex + 1);
-            refresh();
-            return;
-          }
-          if (matchesKey(data, Key.enter) && q) {
-            const opt = opts[optionIndex];
-            if (opt.isOther) {
-              inputMode = true;
-              inputQuestionIdx = currentTab;
-              editor.setText("");
-              refresh();
-              return;
-            }
-            answers.set(currentTab, {
-              answer: opt.label,
-              wasCustom: false,
-              index: optionIndex + 1,
-            });
-            advanceAfter();
-            return;
-          }
-          if (matchesKey(data, Key.escape)) {
-            submit(true);
-          }
-        };
-
-        const render = (width: number): string[] => {
-          if (cached) return cached;
-          const lines: string[] = [];
-          const W = Math.max(1, width);
-          const q = currentQ();
-          const opts = currentOpts();
-          const wrap = (s: string) => {
-            // simple wrap using visibleWidth? use pi-tui helper via manual
-            const out: string[] = [];
-            const cur = s;
-            // Not perfect but use Text wrapping logic: split lines naive
-            for (const line of cur.split("\n")) {
-              const { wrapTextWithAnsi } = require("@earendil-works/pi-tui");
-              out.push(...wrapTextWithAnsi(line, W));
-            }
-            return out;
           };
-          lines.push(theme.fg("accent", "─".repeat(W)));
-          if (isMulti) {
-            const tabs: string[] = [];
-            for (let i = 0; i < questions.length; i++) {
-              const active = i === currentTab;
-              const answered = answers.has(i);
-              const lbl = questions[i].header || `Q${i + 1}`;
-              const box = answered ? "■" : "□";
-              const color = answered ? "success" : "muted";
-              const text = ` ${box} ${lbl} `;
-              const styled = active
-                ? theme.bg("selectedBg", theme.fg("text", text))
-                : theme.fg(color as any, text);
-              tabs.push(`${styled} `);
+
+          const render = (width: number): string[] => {
+            if (cached) return cached;
+            const lines: string[] = [];
+            const W = Math.max(1, width);
+            const q = currentQ();
+            const opts = currentOpts();
+            const wrap = (s: string) => {
+              // simple wrap using visibleWidth? use pi-tui helper via manual
+              const out: string[] = [];
+              const cur = s;
+              // Not perfect but use Text wrapping logic: split lines naive
+              for (const line of cur.split("\n")) {
+                const { wrapTextWithAnsi } = require("@earendil-works/pi-tui");
+                out.push(...wrapTextWithAnsi(line, W));
+              }
+              return out;
+            };
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            if (isMulti) {
+              const tabs: string[] = [];
+              for (let i = 0; i < questions.length; i++) {
+                const active = i === currentTab;
+                const answered = answers.has(i);
+                const lbl = questions[i].header || `Q${i + 1}`;
+                const box = answered ? "■" : "□";
+                const color = answered ? "success" : "muted";
+                const text = ` ${box} ${lbl} `;
+                const styled = active
+                  ? theme.bg("selectedBg", theme.fg("text", text))
+                  : theme.fg(color as any, text);
+                tabs.push(`${styled} `);
+              }
+              const canSubmit = allAnswered();
+              const isSubmit = currentTab === questions.length;
+              const submitText = " ✓ Submit ";
+              const sStyled = isSubmit
+                ? theme.bg("selectedBg", theme.fg("text", submitText))
+                : theme.fg(canSubmit ? "success" : "dim", submitText);
+              tabs.push(`${sStyled}`);
+              // naive join wrapped
+              lines.push(" " + tabs.join(""));
+              lines.push("");
             }
-            const canSubmit = allAnswered();
-            const isSubmit = currentTab === questions.length;
-            const submitText = " ✓ Submit ";
-            const sStyled = isSubmit
-              ? theme.bg("selectedBg", theme.fg("text", submitText))
-              : theme.fg(canSubmit ? "success" : "dim", submitText);
-            tabs.push(`${sStyled}`);
-            // naive join wrapped
-            lines.push(" " + tabs.join(""));
-            lines.push("");
-          }
-          if (inputMode && q) {
-            lines.push(...wrap(" " + theme.fg("text", q.question)));
-            lines.push("");
-            for (let i = 0; i < opts.length; i++) {
-              const opt = opts[i];
-              const sel = i === optionIndex;
-              const isOther = !!opt.isOther;
-              const prefix = sel ? theme.fg("accent", "> ") : "  ";
-              const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-              const color = sel || (isOther && inputMode) ? "accent" : "text";
-              lines.push(...wrap(prefix + theme.fg(color as any, label)));
-              if (opt.description)
+            if (inputMode && q) {
+              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push("");
+              for (let i = 0; i < opts.length; i++) {
+                const opt = opts[i];
+                const sel = i === optionIndex;
+                const isOther = !!opt.isOther;
+                const prefix = sel ? theme.fg("accent", "> ") : "  ";
+                const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
+                const color = sel || (isOther && inputMode) ? "accent" : "text";
+                lines.push(...wrap(prefix + theme.fg(color as any, label)));
+                if (opt.description)
+                  lines.push(
+                    ...wrap("     " + theme.fg("muted", opt.description)),
+                  );
+              }
+              lines.push("");
+              lines.push(...wrap(" " + theme.fg("muted", "Your answer:")));
+              for (const l of editor.render(Math.max(1, W - 2)))
+                lines.push(" " + l);
+              lines.push("");
+              lines.push(
+                ...wrap(
+                  " " + theme.fg("dim", "Enter to submit • Esc to go back"),
+                ),
+              );
+            } else if (currentTab === questions.length) {
+              lines.push(
+                ...wrap(
+                  " " + theme.fg("accent", theme.bold("Ready to submit")),
+                ),
+              );
+              lines.push("");
+              for (let i = 0; i < questions.length; i++) {
+                const a = answers.get(i);
+                if (a) {
+                  const prefix = a.wasCustom ? "(wrote) " : "";
+                  lines.push(
+                    ...wrap(
+                      "  " +
+                        theme.fg(
+                          "muted",
+                          `${questions[i].header || `Q${i + 1}`}: `,
+                        ) +
+                        theme.fg("text", prefix + a.answer),
+                    ),
+                  );
+                }
+              }
+              lines.push("");
+              if (allAnswered())
                 lines.push(
-                  ...wrap("     " + theme.fg("muted", opt.description)),
+                  ...wrap(" " + theme.fg("success", "Press Enter to submit")),
                 );
-            }
-            lines.push("");
-            lines.push(...wrap(" " + theme.fg("muted", "Your answer:")));
-            for (const l of editor.render(Math.max(1, W - 2)))
-              lines.push(" " + l);
-            lines.push("");
-            lines.push(
-              ...wrap(
-                " " + theme.fg("dim", "Enter to submit • Esc to go back"),
-              ),
-            );
-          } else if (currentTab === questions.length) {
-            lines.push(
-              ...wrap(" " + theme.fg("accent", theme.bold("Ready to submit"))),
-            );
-            lines.push("");
-            for (let i = 0; i < questions.length; i++) {
-              const a = answers.get(i);
-              if (a) {
-                const prefix = a.wasCustom ? "(wrote) " : "";
+              else {
+                const missing = questions
+                  .filter((_, i) => !answers.has(i))
+                  .map((q, idx) => q.header || `Q${idx + 1}`)
+                  .join(", ");
                 lines.push(
-                  ...wrap(
-                    "  " +
-                      theme.fg(
-                        "muted",
-                        `${questions[i].header || `Q${i + 1}`}: `,
-                      ) +
-                      theme.fg("text", prefix + a.answer),
-                  ),
+                  ...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)),
                 );
+              }
+            } else if (q) {
+              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push("");
+              const prevAns = answers.get(currentTab);
+              for (let i = 0; i < opts.length; i++) {
+                const opt = opts[i];
+                const sel = i === optionIndex;
+                const isPrevSelected = prevAns?.index === i + 1;
+                const isOther = !!opt.isOther;
+                const prefix = sel
+                  ? theme.fg("accent", "> ")
+                  : isPrevSelected
+                    ? theme.fg("success", "✓ ")
+                    : "  ";
+                const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
+                const color = sel
+                  ? "accent"
+                  : isPrevSelected
+                    ? "success"
+                    : isOther && inputMode
+                      ? "accent"
+                      : "text";
+                lines.push(...wrap(prefix + theme.fg(color as any, label)));
+                if (opt.description)
+                  lines.push(
+                    ...wrap("     " + theme.fg("muted", opt.description)),
+                  );
               }
             }
             lines.push("");
-            if (allAnswered())
-              lines.push(
-                ...wrap(" " + theme.fg("success", "Press Enter to submit")),
-              );
-            else {
-              const missing = questions
-                .filter((_, i) => !answers.has(i))
-                .map((q, idx) => q.header || `Q${idx + 1}`)
-                .join(", ");
-              lines.push(
-                ...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)),
-              );
+            if (!inputMode) {
+              const help = isMulti
+                ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
+                : "↑↓ navigate • Enter select • Esc cancel";
+              lines.push(...wrap(" " + theme.fg("dim", help)));
             }
-          } else if (q) {
-            lines.push(...wrap(" " + theme.fg("text", q.question)));
-            lines.push("");
-            for (let i = 0; i < opts.length; i++) {
-              const opt = opts[i];
-              const sel = i === optionIndex;
-              const isOther = !!opt.isOther;
-              const prefix = sel ? theme.fg("accent", "> ") : "  ";
-              const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-              const color = sel || (isOther && inputMode) ? "accent" : "text";
-              lines.push(...wrap(prefix + theme.fg(color as any, label)));
-              if (opt.description)
-                lines.push(
-                  ...wrap("     " + theme.fg("muted", opt.description)),
-                );
-            }
-          }
-          lines.push("");
-          if (!inputMode) {
-            const help = isMulti
-              ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
-              : "↑↓ navigate • Enter select • Esc cancel";
-            lines.push(...wrap(" " + theme.fg("dim", help)));
-          }
-          lines.push(theme.fg("accent", "─".repeat(W)));
-          cached = lines;
-          return lines;
-        };
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            cached = lines;
+            return lines;
+          };
 
-        return {
-          render,
-          invalidate: () => {
-            cached = undefined;
-          },
-          handleInput,
-        };
-      });
+          return {
+            render,
+            invalidate: () => {
+              cached = undefined;
+            },
+            handleInput,
+          };
+        });
+      } finally {
+        overlayActive = false;
+      }
 
       if (!result || result.cancelled) {
         return {
@@ -1303,8 +1474,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
         };
       });
 
-      const choice = await ctx.ui.custom<string | null>(
-        (tui, theme, _kb, done) => {
+      overlayActive = true;
+      let choice: string | null;
+      try {
+        choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
           const list = new SelectList(items, Math.min(items.length, 10), {
             selectedPrefix: (t) => theme.fg("accent", t),
             selectedText: (t) => theme.fg("accent", t),
@@ -1348,8 +1521,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
               tui.requestRender();
             },
           };
-        },
-      );
+        });
+      } finally {
+        overlayActive = false;
+      }
 
       if (!choice) {
         ctx.ui.notify("Rewind cancelled", "info");
@@ -1496,15 +1671,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
-    // restore state from custom entries
+    // restore state from custom entries (supports both legacy enabled/executing and new mode field)
     try {
       const entries = ctx.sessionManager.getBranch();
       for (const e of entries as any[]) {
         if (e.type === "custom" && e.customType === "workflow") {
           const d = e.data as any;
           if (d) {
-            planModeEnabled = !!d.enabled;
-            executionMode = !!d.executing;
+            if (typeof d.mode === "string") {
+              workflowMode =
+                d.mode === "plan"
+                  ? "plan"
+                  : d.mode === "build"
+                    ? "build"
+                    : null;
+            } else {
+              // legacy: enabled (plan) / executing (build)
+              if (d.enabled) workflowMode = "plan";
+              else if (d.executing) workflowMode = "build";
+              else if (workflowMode === null) workflowMode = null;
+            }
+            syncLegacyFlags();
             if (Array.isArray(d.todos)) todoItems = d.todos;
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             currentPlanFile = d.planFile;
@@ -1564,8 +1751,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       (pi as any).getFlagValue?.("plan") ??
       (pi as any).getFlagValue?.("workflow-plan") ??
       false;
-    if (event.reason === "startup" && flagPlan && !planModeEnabled) {
-      planModeEnabled = true;
+    if (event.reason === "startup" && flagPlan && workflowMode !== "plan") {
+      workflowMode = "plan";
+      syncLegacyFlags();
       if (toolsBeforePlanMode === undefined)
         toolsBeforePlanMode = pi.getActiveTools();
       pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
@@ -1579,41 +1767,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
       persistState();
     }
     updateStatus(ctx as any);
-    // Observability: scan for stale-dated plan files on startup (do not auto-rename)
-    try {
-      const plansDir = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans");
-      if (fs.existsSync(plansDir)) {
-        const today = getUtcDatePrefix();
-        const files = fs.readdirSync(plansDir).filter((f) => f.endsWith(".md"));
-        const stale = files.filter((f) => {
-          const m = f.match(/^(\d{4}-\d{2}-\d{2})-/);
-          return m && m[1] !== today;
-        });
-        // Only warn if there are many stale or if any stale file was modified recently (within 7 days)
-        if (stale.length > 0) {
-          const recentStale = stale.filter((f) => {
-            try {
-              const st = fs.statSync(path.join(plansDir, f));
-              return Date.now() - st.mtimeMs < 7 * 24 * 60 * 60 * 1000;
-            } catch {
-              return false;
-            }
-          });
-          if (recentStale.length > 0) {
-            try {
-              (ctx as any).ui?.notify?.(
-                `Found ${recentStale.length} plan(s) with stale date prefix (today is ${today} UTC): ${recentStale.slice(0, 3).join(", ")}${recentStale.length > 3 ? "…" : ""} — new plans will be auto-corrected`,
-                "info",
-              );
-            } catch (_e) {
-              void _e;
-            }
-          }
-        }
-      }
-    } catch (_e) {
-      void _e;
-    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -1665,7 +1818,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // Block edits/writes + bash gating
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
-    if (event.toolName === "bash" && planModeEnabled) {
+    if (event.toolName === "bash" && workflowMode === "plan") {
       const cmd = (event.input as any).command as string;
       // Narrow exception: allow mkdir -p .pi/plans as fallback for ensuring directory exists.
       // Bash writes via >, >>, tee, cp, mv stay blocked — plan file must use write tool (Claude Code parity).
@@ -1686,20 +1839,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!isSafeCommand(cmd)) {
         return {
           block: true,
-          reason: `Plan mode: command blocked (not allowlisted). Use /plan to switch to build mode. Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.\nCommand: ${cmd}`,
+          reason: `Plan mode: command blocked (not allowlisted). Use /build or Tab to switch to Build mode. Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.\nCommand: ${cmd}`,
         } as any;
       }
     }
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
-      planModeEnabled
+      workflowMode === "plan"
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
       if (!isPlanWritePath(p, cwd)) {
         return {
           block: true,
-          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /plan to enable build mode.`,
+          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /build or Tab to switch to Build mode.`,
         } as any;
       }
       // Silent auto-correct: enforce UTC date prefix so LLM hallucinations don't create wrong-dated files
@@ -1744,7 +1897,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // In build mode, ensure todos exist before first real edit
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
-      executionMode &&
+      workflowMode === "build" &&
       todoItems.length === 0
     ) {
       const p =
@@ -1888,7 +2041,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
-    if (planModeEnabled) {
+    if (workflowMode === "plan") {
       const btwBlock = btwNotes.length
         ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}`
         : "";
@@ -1904,7 +2057,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         },
       } as any;
     }
-    if (executionMode && todoItems.length > 0) {
+    if (workflowMode === "build" && todoItems.length > 0) {
       const remaining = todoItems.filter((t) => !t.completed);
       const list = remaining.map((t) => `${t.step}. ${t.text}`).join("\n");
       const btwBlock = btwNotes.length
@@ -1934,7 +2087,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Context filter when not in plan
   pi.on("context", async (event) => {
-    if (planModeEnabled) return;
+    if (workflowMode === "plan") return;
     return {
       messages: event.messages.filter((m: any) => {
         if (m.customType === "workflow-plan-context") return false;
@@ -1953,7 +2106,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Track progress
   pi.on("turn_end", async (event, ctx) => {
-    if (!executionMode || todoItems.length === 0) return;
+    if (workflowMode !== "build" || todoItems.length === 0) return;
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);
     if (markCompletedSteps(text, todoItems) > 0) {
@@ -2035,7 +2188,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     const runHandoff = async () => {
       // Build completion
-      if (executionMode && todoItems.length > 0) {
+      if (workflowMode === "build" && todoItems.length > 0) {
         const allDone = todoItems.every((t) => t.completed);
         if (allDone) {
           try {
@@ -2050,15 +2203,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
-          executionMode = false;
-          // keep todos for history but clear executing flag
+          // keep todos for history but stay in build
           updateStatus(ctx as any);
           persistState();
         }
         return;
       }
 
-      if (!planModeEnabled) return;
+      if (workflowMode !== "plan") return;
       const hasUI = !!(ctx as any).hasUI;
 
       // Extract todos from last assistant message if plan was emitted
@@ -2324,6 +2476,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         lastHandoffAt = Date.now();
         persistState();
         const handoffStart = Date.now();
+        overlayActive = true;
         try {
           const planContent = planTextForRender;
           const items: SelectItem[] = [
@@ -2450,6 +2603,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
+          overlayActive = false;
 
           if (choice === "execute") {
             const resolvedPlan = planPath!;
@@ -2513,36 +2667,42 @@ export default function workflowExtension(pi: ExtensionAPI) {
             }
           } else if (choice === "refine") {
             try {
-              const refinement = await (ctx as any).ui.editor(
-                "Refine the plan:",
-                "",
-              );
-              if (refinement?.trim()) {
-                const todoListText = todoItems
-                  .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-                  .join("\n");
-                const planTodoListMessage = {
-                  customType: "workflow-todo-list",
-                  content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-                  display: true,
-                };
-                (pi as any).sendMessage?.(planTodoListMessage, {
-                  deliverAs: "followUp",
-                });
-                if ((pi as any).sendUserMessage) {
-                  (pi as any).sendUserMessage(refinement.trim(), {
-                    deliverAs: "followUp",
-                  });
-                } else {
-                  (pi as any).sendMessage?.(refinement.trim(), {
-                    deliverAs: "followUp",
-                  });
-                }
-              } else {
-                ctx.ui.notify(
-                  "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
-                  "info",
+              overlayActive = true;
+              let refinement: string | null;
+              try {
+                refinement = await (ctx as any).ui.editor(
+                  "Refine the plan:",
+                  "",
                 );
+                if (refinement?.trim()) {
+                  const todoListText = todoItems
+                    .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+                    .join("\n");
+                  const planTodoListMessage = {
+                    customType: "workflow-todo-list",
+                    content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+                    display: true,
+                  };
+                  (pi as any).sendMessage?.(planTodoListMessage, {
+                    deliverAs: "followUp",
+                  });
+                  if ((pi as any).sendUserMessage) {
+                    (pi as any).sendUserMessage(refinement.trim(), {
+                      deliverAs: "followUp",
+                    });
+                  } else {
+                    (pi as any).sendMessage?.(refinement.trim(), {
+                      deliverAs: "followUp",
+                    });
+                  }
+                } else {
+                  ctx.ui.notify(
+                    "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+                    "info",
+                  );
+                }
+              } finally {
+                overlayActive = false;
               }
             } catch (_e) {
               void _e;
@@ -2647,13 +2807,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (bus && typeof bus.on === "function") {
       bus.on("pi-code:plan-mode", (state: any) => {
         // Mirror pi-code plan-mode into workflow's plan mode to avoid double toggles
+        const isPlan = workflowMode === "plan";
         if (
           state &&
           typeof state.active === "boolean" &&
-          state.active !== planModeEnabled
+          state.active !== isPlan
         ) {
-          planModeEnabled = state.active;
-          if (planModeEnabled) {
+          if (state.active) {
+            workflowMode = "plan";
+            syncLegacyFlags();
             if (toolsBeforePlanMode === undefined)
               toolsBeforePlanMode = pi.getActiveTools();
             try {
@@ -2662,9 +2824,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
               void _e;
             }
           } else {
+            workflowMode = "build";
+            syncLegacyFlags();
             try {
               pi.setActiveTools(
-                toolsBeforePlanMode ?? getNormalTools(pi.getActiveTools()),
+                toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
               );
             } catch (_e) {
               void _e;
