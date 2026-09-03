@@ -1,0 +1,21 @@
+{
+  "name": "@pi/autocompact",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": ["pi-package", "autocompact", "compaction", "context-management"],
+  "description": "Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-aware summarization, cheap model override, and rich UX.",
+  "pi": {
+    "extensions": ["./extensions/autocompact.ts"]
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "typebox": "1.3.7",
+    "@types/node": "^20.19.43",
+    "typescript": "5.5.4"
+  }
+}
