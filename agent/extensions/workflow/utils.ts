@@ -122,12 +122,29 @@ export function cleanStepText(text: string): string {
 
 export function extractTodoItems(message: string): TodoItem[] {
   const items: TodoItem[] = [];
-  const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
-  if (!headerMatch) return items;
-  const planSection = message.slice(
-    message.indexOf(headerMatch[0]) + headerMatch[0].length,
-  );
-  const numberedPattern = /^\s*(\d+)[.)]\s+\*{0,2}([^*\n]+)/gm;
+  // Try multiple header patterns: strict Plan:\n, "# Plan:" heading, or "Plan:" with trailing title
+  let headerIdx = -1;
+  let headerLen = 0;
+  const strict = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
+  if (strict && strict.index !== undefined) {
+    headerIdx = strict.index;
+    headerLen = strict[0].length;
+  } else {
+    const hashPlan = message.match(/^#{1,4}\s*\*{0,2}Plan\b[^\n]*\n/im);
+    if (hashPlan && hashPlan.index !== undefined) {
+      headerIdx = hashPlan.index;
+      headerLen = hashPlan[0].length;
+    } else {
+      const planColon = message.match(/Plan:\s*[^\n]*\n/i);
+      if (planColon && planColon.index !== undefined) {
+        headerIdx = planColon.index;
+        headerLen = planColon[0].length;
+      }
+    }
+  }
+  if (headerIdx === -1) return items;
+  const planSection = message.slice(headerIdx + headerLen);
+  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+\*{0,2}([^\n]+)/gm;
   for (const match of planSection.matchAll(numberedPattern)) {
     const text = match[2]
       .trim()
@@ -148,16 +165,37 @@ export function extractTodoItems(message: string): TodoItem[] {
 }
 
 export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
-  // Fallback: extract numbered list under "## Plan Steps" or "Plan:" header
   const items = extractTodoItems(md);
   if (items.length > 0) return items;
-  const idx = md.indexOf("## Plan Steps");
-  const section = idx >= 0 ? md.slice(idx) : md;
-  const numberedPattern = /^\s*(\d+)[.)]\s+(.+)$/gm;
+  // Tolerant heading search: any heading containing "Plan Steps" (case-insensitive)
+  const headingMatch = md.match(/^#+\s*.*Plan Steps.*$/im);
+  let section: string;
+  if (headingMatch && headingMatch.index !== undefined) {
+    section = md.slice(headingMatch.index);
+  } else {
+    // Also accept "## 4) Plan Steps" style via broader search
+    const altIdx = md.search(/^##+\s*.*Plan Steps/im);
+    section = altIdx >= 0 ? md.slice(altIdx) : md;
+  }
+  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+(.+)$/gm;
   for (const match of section.matchAll(numberedPattern)) {
     const text = cleanStepText(match[2].trim());
     if (text.length > 3)
       items.push({ step: items.length + 1, text, completed: false });
+  }
+  // Second pass: "### Step N: Title" or "#### 1. Title" style when numbered pattern yields zero
+  if (items.length === 0) {
+    const stepHeaderPattern =
+      /^\s*#{3,4}\s*Step\s*\d+\s*[:\-\u2014]?\s*(.+)$/gim;
+    for (const m of section.matchAll(stepHeaderPattern)) {
+      const text = cleanStepText(m[1].trim());
+      if (text.length > 3)
+        items.push({ step: items.length + 1, text, completed: false });
+    }
+  }
+  // Last resort: if still zero and section is whole file, try loose numbered pattern on full md but filtered to short list context
+  if (items.length === 0 && section === md) {
+    // Avoid capturing unrelated numbered lists by requiring at least 2 items; otherwise leave empty for caller to synthesize
   }
   return items;
 }
@@ -181,12 +219,9 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 }
 
 export function isPlanWritePath(p: string, cwd: string): boolean {
-  const norm = p.replace(/\\/g, "/");
-  return (
-    norm.includes(".pi/plans/") ||
-    norm.includes(".pi\\plans\\") ||
-    norm.startsWith(cwd.replace(/\\/g, "/") + "/.pi/plans")
-  );
+  const norm = p.replace(/\\/g, "/").toLowerCase();
+  const cwdNorm = cwd.replace(/\\/g, "/").toLowerCase();
+  return norm.includes(".pi/plans/") || norm.startsWith(cwdNorm + "/.pi/plans");
 }
 
 // ── Rewind checkpoint helpers (pure, no FS/git) ─────────────────────

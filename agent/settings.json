@@ -18,5 +18,6 @@
     "opencode/ling-3.0-flash-fin-free",
     "opencode/hy3-free",
     "opencode/big-pickle"
-  ]
+  ],
+  "defaultThinkingLevel": "high"
 }

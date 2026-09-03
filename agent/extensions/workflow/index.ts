@@ -287,6 +287,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
   const PLAN_MODE_TOOLS = [
     "read",
     "bash",
+    "edit",
+    "write",
     "grep",
     "find",
     "ls",
@@ -673,70 +675,68 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const workers = Array.from(
         { length: Math.min(MAX_CONC, jobs.length) },
         () => null,
-      )
-        // eslint-disable-next-line array-callback-return
-        .map(async () => {
-          while (true) {
-            const idx = next++;
-            if (idx >= jobs.length) return;
-            const job = jobs[idx];
-            const ag = agents.find((a) => a.name === job.agent);
-            if (!ag) {
-              results[idx] = {
-                agent: job.agent,
-                task: job.task,
-                error: `Unknown agent "${job.agent}". Available: ${agents.map((a) => a.name).join(", ") || "none"}`,
-              };
-              continue;
-            }
-            try {
-              const res = await runSingleAgent(
-                job.cwd ?? cwd,
-                ag,
-                job.task,
-                signal,
-              );
-              if (signal?.aborted) {
-                results[idx] = {
-                  agent: job.agent,
-                  task: job.task,
-                  error: "Aborted (Escape)",
-                };
-              } else if (res.exitCode !== 0 && !getFinalOutput(res.messages)) {
-                results[idx] = {
-                  agent: job.agent,
-                  task: job.task,
-                  error: res.stderr.slice(0, 2000) || `exit ${res.exitCode}`,
-                  usage: res.usage,
-                };
-              } else {
-                const out = getFinalOutput(res.messages) || "(no output)";
-                results[idx] = {
-                  agent: job.agent,
-                  task: job.task,
-                  output: out.slice(0, 50000),
-                  usage: res.usage,
-                };
-              }
-            } catch (e: any) {
-              results[idx] = {
-                agent: job.agent,
-                task: job.task,
-                error: String(e?.message || e),
-              };
-            }
-            if (onUpdate)
-              onUpdate({
-                content: [
-                  {
-                    type: "text",
-                    text: `Explore ${idx + 1}/${jobs.length} done`,
-                  },
-                ],
-                details: { jobs, results: results.filter(Boolean) },
-              } as any);
+      ).map(async () => {
+        while (true) {
+          const idx = next++;
+          if (idx >= jobs.length) return undefined;
+          const job = jobs[idx];
+          const ag = agents.find((a) => a.name === job.agent);
+          if (!ag) {
+            results[idx] = {
+              agent: job.agent,
+              task: job.task,
+              error: `Unknown agent "${job.agent}". Available: ${agents.map((a) => a.name).join(", ") || "none"}`,
+            };
+            continue;
           }
-        });
+          try {
+            const res = await runSingleAgent(
+              job.cwd ?? cwd,
+              ag,
+              job.task,
+              signal,
+            );
+            if (signal?.aborted) {
+              results[idx] = {
+                agent: job.agent,
+                task: job.task,
+                error: "Aborted (Escape)",
+              };
+            } else if (res.exitCode !== 0 && !getFinalOutput(res.messages)) {
+              results[idx] = {
+                agent: job.agent,
+                task: job.task,
+                error: res.stderr.slice(0, 2000) || `exit ${res.exitCode}`,
+                usage: res.usage,
+              };
+            } else {
+              const out = getFinalOutput(res.messages) || "(no output)";
+              results[idx] = {
+                agent: job.agent,
+                task: job.task,
+                output: out.slice(0, 50000),
+                usage: res.usage,
+              };
+            }
+          } catch (e: any) {
+            results[idx] = {
+              agent: job.agent,
+              task: job.task,
+              error: String(e?.message || e),
+            };
+          }
+          if (onUpdate)
+            onUpdate({
+              content: [
+                {
+                  type: "text",
+                  text: `Explore ${idx + 1}/${jobs.length} done`,
+                },
+              ],
+              details: { jobs, results: results.filter(Boolean) },
+            } as any);
+        }
+      });
       await Promise.all(workers);
 
       const summary = results
@@ -1034,7 +1034,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
             const cur = s;
             // Not perfect but use Text wrapping logic: split lines naive
             for (const line of cur.split("\n")) {
-              // @ts-expect-error
               const { wrapTextWithAnsi } = require("@earendil-works/pi-tui");
               out.push(...wrapTextWithAnsi(line, W));
             }
@@ -1578,6 +1577,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
     const cwd = (ctx as ExtensionContext).cwd;
     if (event.toolName === "bash" && planModeEnabled) {
       const cmd = (event.input as any).command as string;
+      // Narrow exception: allow mkdir -p .pi/plans as fallback for ensuring directory exists.
+      // Bash writes via >, >>, tee, cp, mv stay blocked — plan file must use write tool (Claude Code parity).
+      const lower = cmd.toLowerCase();
+      const isMkdirPlans =
+        /^\s*mkdir\s+(-p\s+)?/i.test(cmd) &&
+        (lower.includes(".pi/plans") || lower.includes(".pi\\plans"));
+      if (isMkdirPlans) {
+        try {
+          fs.mkdirSync(path.join(cwd, CONFIG_DIR_NAME, "plans"), {
+            recursive: true,
+          });
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
       if (!isSafeCommand(cmd)) {
         return {
           block: true,
@@ -1736,7 +1751,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       return {
         message: {
           customType: "workflow-plan-context",
-          content: `[PLAN MODE ACTIVE] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/\n- bash limited to read-only allowlist\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation, include "Type something." automatically.\n- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
+          content: `[PLAN MODE ACTIVE] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/2026-09-03-my-feature.md", content: "# Plan: ..."})
+- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation, include "Type something." automatically.\n- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -1811,11 +1827,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
-      // Heuristic: if path looks like a plan file, remember it
+      const norm = String(p).replace(/\\/g, "/").toLowerCase();
       if (
-        p.includes(".pi/plans/") ||
-        p.includes(".pi\\plans\\") ||
-        p.includes("plans/")
+        norm.includes(".pi/plans/") ||
+        norm.includes("/plans/") ||
+        String(p).toLowerCase().includes(".pi/plans")
       ) {
         lastPlanWritePath = p;
       }
@@ -1847,7 +1863,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (!planModeEnabled || !(ctx as any).hasUI) return;
+    if (!planModeEnabled) return;
+    const hasUI = !!(ctx as any).hasUI;
 
     // Extract todos from last assistant message if plan was emitted
     const lastAssistant = [...(event.messages as any[])]
@@ -1878,7 +1895,108 @@ export default function workflowExtension(pi: ExtensionAPI) {
         void _e;
       }
     }
-    if (todoItems.length === 0) return;
+    // Broaden planPath recovery: scan branch for any plan file if lastPlanWritePath is still null
+    if (todoItems.length === 0 && !lastPlanWritePath) {
+      try {
+        const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+        for (let i = branch.length - 1; i >= 0; i--) {
+          const e: any = branch[i];
+          const cand =
+            e?.data?.planFile ||
+            e?.data?.planPath ||
+            e?.data?.path ||
+            e?.message?.toolName === "write" ||
+            e?.message?.toolName === "edit"
+              ? e?.input?.path || e?.input?.file_path || ""
+              : "";
+          const s = String(cand).toLowerCase();
+          if (s.includes("plans/") || s.includes(".pi/plans")) {
+            // try to resolve that entry as plan source
+            try {
+              const text = fs.readFileSync(
+                path.isAbsolute(cand)
+                  ? cand
+                  : path.join((ctx as any).cwd, cand),
+                "utf8",
+              );
+              const fromFile = extractPlanStepsFromMarkdown(text);
+              if (fromFile.length > 0) {
+                todoItems = fromFile;
+                lastPlanWritePath = cand;
+                break;
+              }
+            } catch (_e) {
+              void _e;
+            }
+          }
+          // Also check custom entries that store planFile
+          if (e?.customType === "workflow" && e?.data?.planFile) {
+            try {
+              const text = fs.readFileSync(e.data.planFile, "utf8");
+              const fromFile = extractPlanStepsFromMarkdown(text);
+              if (fromFile.length > 0) {
+                todoItems = fromFile;
+                lastPlanWritePath = e.data.planFile;
+                break;
+              }
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      } catch (_e) {
+        void _e;
+      }
+    }
+    // If still zero but a plan file exists, synthesize a single todo from its title so the handoff still appears
+    let _synthesizedFromTitle = false;
+    if (todoItems.length === 0) {
+      // Try to synthesize from plan file title or last assistant text
+      let synthText: string | undefined;
+      // Prefer reading the resolved plan file if we can find one
+      const candPlan =
+        (currentPlanFile && fs.existsSync(currentPlanFile)
+          ? currentPlanFile
+          : null) ||
+        (lastPlanWritePath &&
+          (() => {
+            try {
+              const p = path.isAbsolute(lastPlanWritePath)
+                ? lastPlanWritePath
+                : path.join((ctx as any).cwd, lastPlanWritePath);
+              return fs.existsSync(p) ? p : null;
+            } catch {
+              return null;
+            }
+          })()) ||
+        null;
+      if (candPlan) {
+        try {
+          const md = fs.readFileSync(candPlan, "utf8");
+          const titleMatch =
+            md.match(/^#\s+Plan[:\s]+(.+)$/im) || md.match(/^#\s+(.+)$/m);
+          if (titleMatch) synthText = titleMatch[1].trim().slice(0, 80);
+        } catch (_e) {
+          void _e;
+        }
+      }
+      if (!synthText && lastAssistant) {
+        const t = getTextContent(lastAssistant as AssistantMessage)
+          .slice(0, 80)
+          .trim();
+        if (t) synthText = t.split("\n")[0].trim().slice(0, 80);
+      }
+      if (synthText) {
+        todoItems = [{ step: 1, text: synthText, completed: false }];
+        _synthesizedFromTitle = true;
+      } else {
+        // Ultimate fallback: single generic step so gate can appear
+        todoItems = [
+          { step: 1, text: "Review and execute the plan", completed: false },
+        ];
+        _synthesizedFromTitle = true;
+      }
+    }
 
     // Try to find plan file path
     let planPath = currentPlanFile;
@@ -1907,132 +2025,217 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     if (!planTextForRender && lastAssistant)
       planTextForRender = getTextContent(lastAssistant as AssistantMessage);
-
-    if (planTextForRender && (ctx as any).hasUI && !awaitingDecision) {
-      awaitingDecision = true;
-      persistState();
-
-      // Show plan inline (non-blocking notify that plan exists), then decision gate
-      // Full render overlay — no truncation
-      const planContent = planTextForRender;
-      await (ctx as any).ui
-        .custom<void>((tui: any, theme: any, _kb: any, done: any) => {
-          const container = new Container();
-          const mdTheme = getMarkdownTheme();
-          const md = new Markdown(planContent, 0, 0, mdTheme);
-          container.addChild(
-            new Text(
-              theme.fg(
-                "accent",
-                theme.bold(` Plan: ${path.basename(planPath!)} `),
-              ),
-              1,
-              0,
-            ),
-          );
-          container.addChild(md);
-          container.addChild(
-            new Text(
-              theme.fg("dim", " Press any key to choose next step "),
-              1,
-              0,
-            ),
-          );
-          return {
-            render: (w: number) => container.render(w),
-            invalidate: () => container.invalidate(),
-            handleInput: (_data: string) => {
-              done();
-            },
-          };
-        })
-        .catch(() => {});
-
-      // Decision gate: 1 Execute / 2 Refine / 3 Freeform
-      const items: SelectItem[] = [
-        {
-          value: "execute",
-          label: "1. Execute the plan in Build Mode",
-          description:
-            "Create todos, switch to build, start implementing (recommended)",
-        },
-        {
-          value: "refine",
-          label: "2. Refine the plan in Plan Mode",
-          description:
-            "Stay in plan mode, ask more questions, update the plan file",
-        },
-        {
-          value: "freeform",
-          label: "3. Type something else",
-          description: "Dismiss — type your own follow-up",
-        },
-      ];
-      const choice = await (ctx as any).ui.custom<string | null>(
-        (tui: any, theme: any, _kb: any, done: any) => {
-          const container = new Container();
-          container.addChild(
-            new Text(
-              theme.fg(
-                "accent",
-                theme.bold(" Plan complete — choose next step "),
-              ),
-              1,
-              0,
-            ),
-          );
-          const list = new SelectList(items, Math.min(items.length, 8), {
-            selectedPrefix: (t: string) => theme.fg("accent", t),
-            selectedText: (t: string) => theme.fg("accent", t),
-            description: (t: string) => theme.fg("muted", t),
-            scrollInfo: (t: string) => theme.fg("dim", t),
-            noMatch: (t: string) => theme.fg("warning", t),
-          });
-          (list as any).onSelect = (it: SelectItem) => done(it.value);
-          (list as any).onCancel = () => done(null);
-          container.addChild(list as any);
-          container.addChild(
-            new Text(
-              theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
-              1,
-              0,
-            ),
-          );
-          return {
-            render: (w: number) => container.render(w),
-            invalidate: () => container.invalidate(),
-            handleInput: (d: string) => {
-              (list as any).handleInput(d);
-              tui.requestRender();
-            },
-          };
-        },
-      );
-
-      awaitingDecision = false;
-      persistState();
-
-      if (choice === "execute") {
-        const resolvedPlan = planPath!;
-        // Ensure plan file exists — if LLM didn't write, synthesize
-        try {
-          if (!fs.existsSync(resolvedPlan)) {
-            fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
-            fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
-          }
-        } catch (_e) {
-          void _e;
-        }
-        enterBuildModeFromPlan(ctx as any, resolvedPlan);
-        updateStatus(ctx as any);
-        // Show todos widget immediately
-      } else if (choice === "refine") {
+    // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
+    if (!hasUI && planTextForRender && !awaitingDecision) {
+      try {
+        const preview = planTextForRender.slice(0, 4000);
+        const list = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
+        (pi as any).sendMessage?.(
+          {
+            customType: "workflow-handoff-fallback",
+            content: `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } catch (_e) {
+        void _e;
+      }
+      // Also notify
+      try {
         ctx.ui.notify(
-          "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+          "Plan ready — type Execute to build or tell me what to refine.",
           "info",
         );
-      } else {
-        ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+      } catch (_e) {
+        void _e;
+      }
+      return;
+    }
+    if (planTextForRender && hasUI && !awaitingDecision) {
+      awaitingDecision = true;
+      persistState();
+      try {
+        const planContent = planTextForRender;
+        const items: SelectItem[] = [
+          {
+            value: "execute",
+            label: "1. Execute the plan in Build Mode",
+            description:
+              "Create todos, switch to build, start implementing (recommended)",
+          },
+          {
+            value: "refine",
+            label: "2. Refine the plan in Plan Mode",
+            description:
+              "Stay in plan mode, ask more questions, update the plan file",
+          },
+          {
+            value: "freeform",
+            label: "3. Type something else",
+            description: "Dismiss — type your own follow-up",
+          },
+        ];
+        const choice = await ctx.ui.custom<string | null>(
+          (tui: any, theme: any, _kb: any, done: any) => {
+            const container = new Container();
+            const mdTheme = getMarkdownTheme();
+            const md = new Markdown(planContent, 0, 0, mdTheme);
+            container.addChild(
+              new Text(
+                theme.fg(
+                  "accent",
+                  theme.bold(` Plan: ${path.basename(planPath!)} `),
+                ),
+                1,
+                0,
+              ),
+            );
+            container.addChild(md);
+            container.addChild(
+              new Text(
+                theme.fg(
+                  "accent",
+                  theme.bold(" Plan complete — choose next step "),
+                ),
+                1,
+                0,
+              ),
+            );
+            const list = new SelectList(items, Math.min(items.length, 8), {
+              selectedPrefix: (t: string) => theme.fg("accent", t),
+              selectedText: (t: string) => theme.fg("accent", t),
+              description: (t: string) => theme.fg("muted", t),
+              scrollInfo: (t: string) => theme.fg("dim", t),
+              noMatch: (t: string) => theme.fg("warning", t),
+            });
+            (list as any).onSelect = (it: SelectItem) => done(it.value);
+            (list as any).onCancel = () => done(null);
+            container.addChild(list as any);
+            container.addChild(
+              new Text(
+                theme.fg("dim", " ↑↓ navigate • enter select • esc dismiss "),
+                1,
+                0,
+              ),
+            );
+            return {
+              render: (w: number) => container.render(w),
+              invalidate: () => container.invalidate(),
+              handleInput: (d: string) => {
+                (list as any).handleInput(d);
+                tui.requestRender();
+              },
+            };
+          },
+        );
+
+        if (choice === "execute") {
+          const resolvedPlan = planPath!;
+          let fallbackWrote = false;
+          try {
+            if (!fs.existsSync(resolvedPlan)) {
+              fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
+              fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
+              fallbackWrote = true;
+            }
+          } catch (_e) {
+            void _e;
+          }
+          if (fallbackWrote) {
+            try {
+              ctx.ui.notify(
+                "Plan was not on disk before handoff — persisted now as fallback (fix: write should happen in plan mode via write tool)",
+                "warning",
+              );
+            } catch (_e) {
+              void _e;
+            }
+            try {
+              pi.appendEntry("workflow-fallback-write", {
+                planPath: resolvedPlan,
+                at: Date.now(),
+              });
+            } catch (_e) {
+              void _e;
+            }
+          }
+          enterBuildModeFromPlan(ctx as any, resolvedPlan);
+          updateStatus(ctx as any);
+          try {
+            const remainingList = todoItems
+              .map((t) => `${t.step}. ${t.text}`)
+              .join("\n");
+            const todoListText = todoItems
+              .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+              .join("\n");
+            const planTodoListMessage = {
+              customType: "workflow-todo-list",
+              content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+              display: true,
+            };
+            const firstTodo = todoItems[0];
+            const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:n] tag in your response.`;
+            (pi as any).sendMessage?.(planTodoListMessage, {
+              deliverAs: "followUp",
+            });
+            (pi as any).sendMessage?.(
+              {
+                customType: "workflow-plan-execute",
+                content: execMessage,
+                display: true,
+              },
+              { triggerTurn: true, deliverAs: "followUp" },
+            );
+          } catch (_e) {
+            void _e;
+          }
+        } else if (choice === "refine") {
+          try {
+            const refinement = await (ctx as any).ui.editor(
+              "Refine the plan:",
+              "",
+            );
+            if (refinement?.trim()) {
+              const todoListText = todoItems
+                .map((t, i) => `${i + 1}. ☐ ${t.text}`)
+                .join("\n");
+              const planTodoListMessage = {
+                customType: "workflow-todo-list",
+                content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+                display: true,
+              };
+              (pi as any).sendMessage?.(planTodoListMessage, {
+                deliverAs: "followUp",
+              });
+              if ((pi as any).sendUserMessage) {
+                (pi as any).sendUserMessage(refinement.trim(), {
+                  deliverAs: "followUp",
+                });
+              } else {
+                (pi as any).sendMessage?.(refinement.trim(), {
+                  deliverAs: "followUp",
+                });
+              }
+            } else {
+              ctx.ui.notify(
+                "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+                "info",
+              );
+            }
+          } catch (_e) {
+            void _e;
+            ctx.ui.notify(
+              "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+              "info",
+            );
+          }
+        } else {
+          ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+        }
+      } finally {
+        awaitingDecision = false;
+        persistState();
       }
     }
   });

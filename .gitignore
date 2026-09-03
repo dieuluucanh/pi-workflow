@@ -1,3 +1,7 @@
 plans/
 sessions/
 checkpoints/
+# dependencies — ignore at any depth (workflow, npm, future extensions)
+**/node_modules/
+# jiti cache can also appear outside node_modules in some setups
+**/.cache/jiti/
