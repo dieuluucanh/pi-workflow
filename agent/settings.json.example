@@ -1,0 +1,27 @@
+{
+  "lastChangelogVersion": "0.84.4",
+  "theme": "dark",
+  "packages": [
+    "npm:pi-lens",
+    "npm:pi-web-access",
+    "npm:@plannotator/pi-extension"
+  ],
+  "enabledModels": [
+    "opencode-go/muse-spark-1.2-contributor",
+    "opencode-go/mimo-v2.5",
+    "opencode-go/longcat-2.0",
+    "opencode-go/deepseek-v4-flash",
+    "opencode-go/deepseek-v4-flash-vision-exp",
+    "opencode-go/qwen3.8-flash",
+    "opencode/muse-spark-1.2-contributor-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/ling-3.0-flash-fin-free",
+    "opencode/hy3-free",
+    "opencode/big-pickle"
+  ],
+  "defaultThinkingLevel": "high",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "muse-spark-1.2-contributor"
+}

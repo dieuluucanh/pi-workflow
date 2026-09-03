@@ -1,10 +1,21 @@
+# pi runtime — machine-local (regenerated)
 plans/
+.pi/plans/
+agent/sessions/
 sessions/
+agent/checkpoints/
 checkpoints/
 # dependencies — ignore at any depth (workflow, npm, future extensions)
 **/node_modules/
-# jiti cache can also appear outside node_modules in some setups
+# jiti / build caches
+**/.cache/
 **/.cache/jiti/
+# OS / pi artifacts
 nul
 web-search-cache/
 plannotator-review-status.json
+# secrets / volatile caches — do not commit (templates kept as *.example)
+agent/auth.json
+agent/models-store.json
+agent/trust.json
+agent/npm/package-lock.json
