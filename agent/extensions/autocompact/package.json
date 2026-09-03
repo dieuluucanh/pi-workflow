@@ -1,14 +1,28 @@
 {
-  "name": "@pi/autocompact",
-  "private": true,
+  "name": "@dieulc/autocompact",
   "version": "0.1.0",
   "type": "module",
+  "private": false,
   "keywords": ["pi-package", "autocompact", "compaction", "context-management"],
   "description": "Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-aware summarization, cheap model override, and rich UX.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dieuluucanh/pi-workflow",
+    "directory": "agent/extensions/autocompact"
+  },
   "pi": {
     "extensions": ["./extensions/autocompact.ts"]
   },
+  "files": ["extensions/", "prompts/", "README.md"],
   "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "0.84.4",
     "@earendil-works/pi-ai": "0.84.4",

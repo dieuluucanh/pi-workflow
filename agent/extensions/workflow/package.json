@@ -1,12 +1,28 @@
 {
-  "name": "workflow-extension",
-  "private": true,
-  "version": "0.0.1",
+  "name": "@dieulc/workflow",
+  "version": "0.1.0",
   "type": "module",
+  "private": false,
+  "keywords": ["pi-package", "workflow", "plan-mode", "questionnaire", "rewind"],
+  "description": "Plan↔Build mode, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dieuluucanh/pi-workflow",
+    "directory": "agent/extensions/workflow"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "files": ["index.ts", "utils.ts", "checkpoint.ts", "README.md"],
   "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "0.84.4",
     "@earendil-works/pi-ai": "0.84.4",

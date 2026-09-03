@@ -1,4 +1,4 @@
-# @pi/autocompact
+# @dieulc/autocompact
 
 Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-aware summarization, cheap model override, and rich UX.
 
@@ -14,8 +14,8 @@ Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-
 ## Install
 
 ```bash
-pi install /path/to/pi-autocompact        # local
-pi install npm:@pi/autocompact            # npm (when published)
+pi install npm:@dieulc/autocompact        # npm (when published)
+pi install git:github.com/dieuluucanh/pi-workflow  # git (bundled)
 pi -e ./extensions/autocompact.ts         # temp (one run)
 ```
 
