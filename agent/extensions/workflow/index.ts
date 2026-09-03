@@ -772,7 +772,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     name: "questionnaire",
     label: "Questionnaire",
     description:
-      "Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Loops until clear. Use in plan mode.",
+      'Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Loops until clear. Use in plan mode. Tool appends "Type something." automatically - do not include freeform in options.',
     parameters: Type.Object({
       questions: Type.Optional(Type.Array(QuestionSchema)),
       question: Type.Optional(Type.String()),
@@ -901,8 +901,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
               description: o.description,
             })),
           ];
-          opts.push({ label: "Type something.", isOther: true });
-          return opts;
+          // Deduplicate: remove any LLM-provided freeform label before appending single isOther entry
+          const normalizeFreeform = (s: string) =>
+            s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
+          const FREEFORM_ALIASES = new Set([
+            "type something",
+            "type something else",
+            "other",
+            "other (please specify)",
+            "other please specify",
+          ]);
+          const filtered = opts.filter(
+            (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
+          );
+          filtered.push({ label: "Type something.", isOther: true });
+          return filtered;
         }
         function allAnswered() {
           return questions.every((_, i) => answers.has(i));
@@ -1885,7 +1898,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
-- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation, include "Type something." automatically.\n- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
+- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
           display: false,
         },
       } as any;
