@@ -17,6 +17,6 @@
     "forceConsistentCasingInFileNames": true,
     "declaration": false
   },
-  "include": ["./index.ts", "./utils.ts", "./checkpoint.ts"],
+  "include": ["./index.ts", "./utils.ts", "./checkpoint.ts", "./roles.ts"],
   "exclude": ["node_modules"]
 }
