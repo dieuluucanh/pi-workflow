@@ -24,5 +24,11 @@
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "mimo-v2.5"
+  "defaultModel": "mimo-v2.5",
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "hideThinkingBlock": true,
+  "enableInstallTelemetry": false,
+  "doubleEscapeAction": "none"
 }
