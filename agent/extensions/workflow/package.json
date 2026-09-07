@@ -14,7 +14,7 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "files": ["index.ts", "utils.ts", "checkpoint.ts", "README.md"],
+  "files": ["index.ts", "utils.ts", "checkpoint.ts", "roles.ts", "README.md"],
   "dependencies": {},
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

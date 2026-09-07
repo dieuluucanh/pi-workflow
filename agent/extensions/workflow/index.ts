@@ -66,6 +66,22 @@ import {
   restoreCode,
   findPersistedRef,
 } from "./checkpoint.ts";
+import {
+  defaultRoleConfig,
+  loadRoleConfig,
+  saveRoleConfig,
+  getRole,
+  formatRolesForDisplay,
+  formatModelRef,
+  parseModelRef,
+  isValidThinkingLevel,
+  roleIcon,
+  VALID_THINKING_LEVELS,
+  type RoleConfig,
+  type Role,
+  type RoleModel,
+  type ThinkingLevel,
+} from "./roles.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -100,6 +116,7 @@ interface AgentConfig {
   description: string;
   tools?: string[];
   model?: string;
+  thinking?: string;
   systemPrompt: string;
   filePath: string;
 }
@@ -183,6 +200,7 @@ async function runSingleAgent(
   // Actually pi --mode json -p --no-session ; ensure correct
   const cleanArgs = ["--mode", "json", "-p", "--no-session"];
   if (agent.model) cleanArgs.push("--model", agent.model);
+  if (agent.thinking) cleanArgs.push("--thinking", agent.thinking);
   if (agent.tools?.length) cleanArgs.push("--tools", agent.tools.join(","));
   if (agent.systemPrompt.trim())
     cleanArgs.push("--append-system-prompt", promptPath);
@@ -303,6 +321,24 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let lastPromptHeader: string | undefined;
   const recentRestores = new Set<string>();
 
+  // ── Model roles state ──────────────────────────────────────────
+  let roleConfig: RoleConfig = defaultRoleConfig();
+  let roleConfigLoadedFor: string | undefined;
+  function ensureRoleConfig(cwd?: string): RoleConfig {
+    if (roleConfigLoadedFor === undefined) {
+      roleConfig = loadRoleConfig(cwd);
+      roleConfigLoadedFor = cwd ?? "";
+    }
+    return roleConfig;
+  }
+  function activeRoleLabel(): string {
+    if (roleConfig.activeRole)
+      return `${roleIcon(roleConfig.activeRole)} ${roleConfig.activeRole}`;
+    if (workflowMode === "plan") return "🧠 planner";
+    if (workflowMode === "build") return "🔨 builder";
+    return "";
+  }
+
   // legacy aliases for bus sync / debug - keep in sync via setters (underscore to avoid unused lint)
   let _planModeEnabled = false;
   let _executionMode = false;
@@ -359,19 +395,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
   const getBuildTools = getNormalTools;
 
   function updateStatus(ctx: ExtensionContext) {
+    const roleLabel = activeRoleLabel();
+    const suffix = roleLabel ? ` | ${roleLabel}` : "";
     if (workflowMode === "build" && todoItems.length > 0) {
       const done = todoItems.filter((t) => t.completed).length;
       ctx.ui.setStatus(
         "workflow",
-        ctx.ui.theme.fg("accent", `▶ build ${done}/${todoItems.length}`),
+        ctx.ui.theme.fg(
+          "accent",
+          `▶ build ${done}/${todoItems.length}${suffix}`,
+        ),
       );
     } else if (workflowMode === "plan") {
       const label = plannotatorActive
-        ? "⏸ plan — reviewing in browser"
-        : "⏸ plan";
+        ? `⏸ plan — reviewing in browser${suffix}`
+        : `⏸ plan${suffix}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (workflowMode === "build") {
-      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", "▶ build"));
+      ctx.ui.setStatus(
+        "workflow",
+        ctx.ui.theme.fg("accent", `▶ build${suffix}`),
+      );
     } else {
       // initial null: treat as build for naming parity, but show nothing until first explicit set to avoid flash
       ctx.ui.setStatus("workflow", undefined);
@@ -397,6 +441,116 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   }
 
+  // ── Mode → role model alignment (plan=planner, build=builder) ──────
+  const MODE_ROLE_MAP: Record<WorkflowMode, string> = {
+    plan: "planner",
+    build: "builder",
+  };
+  let lastModeSwitch: {
+    from: string;
+    to: string;
+    provider: string;
+    id: string;
+    thinking: string;
+    at: number;
+    workflowMode: WorkflowMode;
+  } | null = null;
+
+  /** Pure helper for tests: resolve which RoleModel plan/build will switch to. */
+  function resolveModeModel(
+    cfg: RoleConfig,
+    mode: WorkflowMode | null,
+  ): { role: Role; model: RoleModel } | undefined {
+    if (!mode) return undefined;
+    const targetName = cfg.activeRole ?? MODE_ROLE_MAP[mode];
+    if (!targetName) return undefined;
+    const role = getRole(cfg, targetName);
+    if (!role || !role.model) return undefined;
+    return { role, model: role.model };
+  }
+
+  async function applyModeModel(ctx: ExtensionContext): Promise<boolean> {
+    if (!workflowMode) return false;
+    try {
+      ensureRoleConfig((ctx as any)?.cwd ?? ctx.cwd);
+    } catch (_e) {
+      void _e;
+    }
+    const resolved = resolveModeModel(roleConfig, workflowMode);
+    if (!resolved) {
+      const targetName = roleConfig.activeRole ?? MODE_ROLE_MAP[workflowMode];
+      const role = targetName ? getRole(roleConfig, targetName) : undefined;
+      if (targetName && !role) {
+        ctx.ui.notify(
+          `Workflow ${workflowMode}: role "${targetName}" not found — staying on current model.`,
+          "warning",
+        );
+      } else if (role && !role.model) {
+        ctx.ui.notify(
+          `Workflow ${workflowMode}: role "${targetName}" has no model configured — run /role to pick one.`,
+          "warning",
+        );
+      }
+      return false;
+    }
+    const { role, model: m } = resolved;
+    let fromLabel = "";
+    try {
+      const cur =
+        (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+      if (cur?.provider && cur?.id) fromLabel = `${cur.provider}/${cur.id}`;
+      else if ((pi as any)?.model?.provider)
+        fromLabel = `${(pi as any).model.provider}/${(pi as any).model.id}`;
+    } catch (_e) {
+      void _e;
+    }
+    let found: any;
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      found = reg?.find?.(m.provider, m.id);
+    } catch (_e) {
+      void _e;
+    }
+    if (!found) {
+      ctx.ui.notify(
+        `Workflow ${workflowMode} → ${m.provider}/${m.id} not in model registry — staying on current model. Configure via /role set ${role.name} <provider/model>.`,
+        "warning",
+      );
+      return false;
+    }
+    try {
+      const result = await (pi as any).setModel?.(found);
+      if (result === false) throw new Error("setModel returned false");
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Model switch to ${m.provider}/${m.id} failed: ${String(e?.message || e)} — staying on current model (auth or registry error).`,
+        "warning",
+      );
+      return false;
+    }
+    try {
+      if (m.thinking && isValidThinkingLevel(m.thinking)) {
+        (pi as any).setThinkingLevel?.(m.thinking);
+      }
+    } catch (_e) {
+      void _e;
+    }
+    lastModeSwitch = {
+      from: fromLabel,
+      to: `${m.provider}/${m.id}`,
+      provider: m.provider,
+      id: m.id,
+      thinking: m.thinking,
+      at: Date.now(),
+      workflowMode,
+    };
+    ctx.ui.notify(
+      `Workflow ${workflowMode}: model → ${m.provider}/${m.id} (${m.thinking})`,
+      "info",
+    );
+    return true;
+  }
+
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
@@ -410,10 +564,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
       planFile: currentPlanFile,
       awaitingDecision,
       awaitingDecisionAt: awaitingDecision ? lastHandoffAt : undefined,
-    });
+      role: {
+        activeRole: roleConfig.activeRole,
+      },
+      lastModeSwitch,
+    } as any);
   }
 
-  function setPlanMode(ctx: ExtensionContext) {
+  async function setPlanMode(ctx: ExtensionContext) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
         "Already in Plan mode — read-only. Press Tab or /build to switch to Build.",
@@ -437,11 +595,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
+    try {
+      await applyModeModel(ctx);
+    } catch (_e) {
+      void _e;
+    }
     updateStatus(ctx);
     persistState();
   }
 
-  function setBuildMode(ctx: ExtensionContext) {
+  async function setBuildMode(ctx: ExtensionContext) {
     if (workflowMode === "build") {
       ctx.ui.notify(
         "Already in Build mode — full access. Press Tab or /plan to switch to Plan.",
@@ -459,13 +622,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
       "Build mode — full access restored. Press Tab or /plan to switch to Plan.",
       "info",
     );
+    try {
+      await applyModeModel(ctx);
+    } catch (_e) {
+      void _e;
+    }
     updateStatus(ctx);
     persistState();
   }
 
-  function cycleWorkflowMode(ctx: ExtensionContext) {
-    if (workflowMode === "plan") setBuildMode(ctx);
-    else setPlanMode(ctx);
+  async function cycleWorkflowMode(ctx: ExtensionContext) {
+    if (workflowMode === "plan") await setBuildMode(ctx);
+    else await setPlanMode(ctx);
   }
 
   // legacy alias for backward compat
@@ -474,7 +642,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
   void togglePlanMode;
 
-  function enterBuildModeFromPlan(ctx: ExtensionContext, planPath: string) {
+  async function enterBuildModeFromPlan(
+    ctx: ExtensionContext,
+    planPath: string,
+  ) {
     workflowMode = "build";
     syncLegacyFlags();
     currentPlanFile = planPath;
@@ -489,6 +660,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (extracted.length > 0) {
         todoItems = extracted;
       }
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      await applyModeModel(ctx);
     } catch (_e) {
       void _e;
     }
@@ -540,8 +716,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     awaitingDecision = false;
     lastHandoffAt = undefined;
     lastReviewId = null;
-    enterBuildModeFromPlan(ctx as any, resolvedPlan);
-    updateStatus(ctx as any);
+    void enterBuildModeFromPlan(ctx as any, resolvedPlan)
+      .then(() => updateStatus(ctx as any))
+      .catch(() => {
+        try {
+          updateStatus(ctx as any);
+        } catch (_e) {
+          void _e;
+        }
+      });
     try {
       const remainingList = todoItems
         .map((t) => `${t.step}. ${t.text}`)
@@ -886,13 +1069,689 @@ export default function workflowExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Model roles command ──────────────────────────────────────────
+
+  pi.registerCommand("role", {
+    description:
+      "Configure one model + thinking per role — opens picker UI",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd as string | undefined;
+      ensureRoleConfig(cwd);
+      const parts = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (parts[0] || "").toLowerCase();
+      const rest = parts.slice(1);
+
+      const saveAndSync = (msg: string) => {
+        try {
+          saveRoleConfig(roleConfig, "user");
+        } catch (e: any) {
+          ctx.ui.notify(
+            `Role updated but file save failed: ${String(e?.message || e)}`,
+            "warning",
+          );
+          return;
+        }
+        persistState();
+        updateStatus(ctx as any);
+        ctx.ui.notify(msg, "info");
+      };
+
+      // Bare /role → interactive config screen (3 blocks: planner /
+      // explorer / builder + custom roles). Headless → text summary.
+      if (!sub) {
+        if ((ctx as any)?.hasUI) {
+          await openRolePicker(ctx as any);
+          return;
+        }
+        ctx.ui.notify(formatRolesForDisplay(roleConfig), "info");
+        return;
+      }
+
+      if (sub === "list" || sub === "show") {
+        ctx.ui.notify(formatRolesForDisplay(roleConfig), "info");
+        return;
+      }
+
+      if (sub === "config") {
+        if (!(ctx as any)?.hasUI) {
+          ctx.ui.notify(
+            formatRolesForDisplay(roleConfig) +
+              "\n\nPicker needs UI — use /role set instead.",
+            "info",
+          );
+          return;
+        }
+        await openRolePicker(ctx as any);
+        return;
+      }
+
+      if (sub === "set") {
+        // /role set <role> <provider/model> [thinking]
+        const [roleName, modelRef, thinkingRaw] = rest;
+        if (!roleName || !modelRef) {
+          ctx.ui.notify(
+            "Usage: /role set <role> <provider/model> [thinking]",
+            "info",
+          );
+          return;
+        }
+        const role = getRole(roleConfig, roleName);
+        if (!role) {
+          ctx.ui.notify(
+            `Unknown role "${roleName}". Available: ${roleConfig.roles.map((r) => r.name).join(", ")}`,
+            "warning",
+          );
+          return;
+        }
+        const { provider, id } = parseModelRef(modelRef);
+        if (!provider || !id) {
+          ctx.ui.notify(
+            `Model must be provider/model (e.g. opencode-go/muse-spark-1.2-contributor). Got: ${modelRef}`,
+            "warning",
+          );
+          return;
+        }
+        let thinking = role.model?.thinking ?? "medium";
+        if (thinkingRaw) {
+          if (!isValidThinkingLevel(thinkingRaw.toLowerCase())) {
+            ctx.ui.notify(
+              `Invalid thinking level "${thinkingRaw}". Valid: off|minimal|low|medium|high|xhigh|max`,
+              "warning",
+            );
+            return;
+          }
+          thinking = thinkingRaw.toLowerCase() as any;
+        }
+        // validate against registry (warn-only — model may be added later)
+        try {
+          const reg = (ctx as any)?.modelRegistry;
+          if (
+            reg &&
+            typeof reg.find === "function" &&
+            !reg.find(provider, id)
+          ) {
+            ctx.ui.notify(
+              `Warning: ${provider}/${id} not in model registry — saved anyway.`,
+              "warning",
+            );
+          }
+        } catch (_e) {
+          void _e;
+        }
+        role.model = { provider, id, thinking };
+        saveAndSync(
+          `Role ${roleIcon(role.name)} ${role.name} → ${provider}/${id} (${thinking})`,
+        );
+        return;
+      }
+
+      if (sub === "add") {
+        // /role add <name> [provider/model] [thinking]
+        const [name, modelRef, thinkingRaw] = rest;
+        if (!name) {
+          ctx.ui.notify(
+            "Usage: /role add <name> [provider/model] [thinking]",
+            "info",
+          );
+          return;
+        }
+        if (getRole(roleConfig, name)) {
+          ctx.ui.notify(`Role "${name}" already exists.`, "warning");
+          return;
+        }
+        const fallback = roleConfig.roles[0]?.model;
+        const parsed = modelRef ? parseModelRef(modelRef) : undefined;
+        const thinking: ThinkingLevel =
+          thinkingRaw && isValidThinkingLevel(thinkingRaw.toLowerCase())
+            ? (thinkingRaw.toLowerCase() as ThinkingLevel)
+            : (fallback?.thinking ?? "medium");
+        roleConfig.roles.push({
+          name: name.toLowerCase(),
+          description: `Custom role ${name}`,
+          model: {
+            provider: parsed?.provider || fallback?.provider || "opencode-go",
+            id: parsed?.id || fallback?.id || "muse-spark-1.2-contributor",
+            thinking,
+          },
+          tools: [],
+          systemPromptAddendum: `You are in ${name} role.`,
+          builtIn: false,
+        });
+        saveAndSync(
+          `Role "${name.toLowerCase()}" added. Refine with /role set ${name.toLowerCase()} <provider/model> [thinking]`,
+        );
+        return;
+      }
+
+      if (sub === "remove" || sub === "rm" || sub === "delete") {
+        const [name] = rest;
+        if (!name) {
+          ctx.ui.notify("Usage: /role remove <name>", "info");
+          return;
+        }
+        const role = getRole(roleConfig, name);
+        if (!role) {
+          ctx.ui.notify(`Unknown role "${name}".`, "warning");
+          return;
+        }
+        if (role.builtIn) {
+          ctx.ui.notify(`Cannot remove built-in role "${name}".`, "warning");
+          return;
+        }
+        roleConfig.roles = roleConfig.roles.filter((r) => r !== role);
+        if (roleConfig.activeRole === role.name) roleConfig.activeRole = null;
+        saveAndSync(`Role "${name}" removed.`);
+        return;
+      }
+
+      if (sub === "reset") {
+        roleConfig = defaultRoleConfig();
+        saveAndSync(
+          "Roles reset to defaults — one model per role (planner/explorer/builder).",
+        );
+        return;
+      }
+
+      if (sub === "use") {
+        const [name] = rest;
+        if (!name || (name !== "auto" && !getRole(roleConfig, name))) {
+          ctx.ui.notify(
+            `Usage: /role use <role|auto>. Available: ${roleConfig.roles.map((r) => r.name).join(", ")}`,
+            "info",
+          );
+          return;
+        }
+        roleConfig.activeRole = name === "auto" ? null : name.toLowerCase();
+        saveAndSync(
+          roleConfig.activeRole
+            ? `Active role → ${roleConfig.activeRole}`
+            : "Active role → auto (plan→planner, build→builder)",
+        );
+        if (workflowMode) {
+          try {
+            await applyModeModel(ctx as any);
+            updateStatus(ctx as any);
+            persistState();
+          } catch (_e) {
+            void _e;
+          }
+        }
+        return;
+      }
+
+      // bare role name → show detail
+      const named = getRole(roleConfig, sub);
+      if (named) {
+        ctx.ui.notify(
+          `${roleIcon(named.name)} ${named.name}: ${formatModelRef(named.model)} (${named.model.thinking})\n  ${named.description}`,
+          "info",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        "Usage: /role (picker) | /role list | /role set <role> <provider/model> [thinking] | /role use <role|auto> | /role add|remove|reset",
+        "info",
+      );
+    },
+  });
+
+  // ── Role config screen (tabbed picker: one block per role) ─────────
+  //
+  // One overlay with a tab per role (built-ins first, then customs) plus
+  // a Submit tab. Each role tab has two phases: pick model (from the
+  // connected providers — scoped models first, Ctrl+O for all) then pick
+  // thinking level. Selections stage locally; Submit saves to roles.json.
+
+  interface StagedRoleModel {
+    provider: string;
+    id: string;
+    thinking: ThinkingLevel;
+  }
+
+  interface RoleCatalogEntry {
+    provider: string;
+    id: string;
+    inScope: boolean;
+  }
+
+  function collectRoleCatalog(ctx: ExtensionContext): {
+    scoped: RoleCatalogEntry[];
+    all: RoleCatalogEntry[];
+    truncated: boolean;
+  } {
+    const scoped: RoleCatalogEntry[] = [];
+    try {
+      const raw = ((ctx as any)?.scopedModels ?? []) as any[];
+      for (const s of raw) {
+        const m = s?.model ?? s;
+        if (m && typeof m.provider === "string" && typeof m.id === "string")
+          scoped.push({ provider: m.provider, id: m.id, inScope: true });
+      }
+    } catch (_e) {
+      void _e;
+    }
+    let available: any[] = [];
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      if (reg && typeof reg.getAvailable === "function")
+        available = [...reg.getAvailable()];
+      else if (reg && typeof reg.getAll === "function")
+        available = [...reg.getAll()];
+    } catch (_e) {
+      void _e;
+    }
+    const seen = new Set(scoped.map((s) => `${s.provider}/${s.id}`));
+    const rest: RoleCatalogEntry[] = [];
+    for (const m of available) {
+      if (!m || typeof m.provider !== "string" || typeof m.id !== "string")
+        continue;
+      const key = `${m.provider}/${m.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rest.push({ provider: m.provider, id: m.id, inScope: false });
+    }
+    const CAP = 200;
+    const all = [...scoped, ...rest];
+    return {
+      scoped,
+      all: all.slice(0, CAP),
+      truncated: all.length > CAP,
+    };
+  }
+
+  function orderedRoleTabs(): Role[] {
+    const rank = (name: string) => {
+      const i = ["planner", "explorer", "builder"].indexOf(
+        name.toLowerCase(),
+      );
+      return i === -1 ? 99 : i;
+    };
+    return [...roleConfig.roles].sort((a, b) => rank(a.name) - rank(b.name));
+  }
+
+  async function openRolePicker(ctx: ExtensionContext): Promise<void> {
+    const tabs = orderedRoleTabs();
+    if (tabs.length === 0) {
+      ctx.ui.notify("No roles configured — /role reset to reseed.", "warning");
+      return;
+    }
+    const catalog = collectRoleCatalog(ctx);
+    if (catalog.all.length === 0) {
+      ctx.ui.notify(
+        "No models available from connected providers — connect a provider first, or use /role set <role> <provider/model> [thinking].",
+        "warning",
+      );
+      return;
+    }
+    // Stage current values so the picker opens on the active selection.
+    const staged = new Map<string, StagedRoleModel>();
+    for (const r of tabs)
+      staged.set(r.name, { ...r.model });
+
+    overlayActive = true;
+    let saved: Map<string, StagedRoleModel> | null = null;
+    try {
+      saved = await ctx.ui.custom<Map<string, StagedRoleModel> | null>(
+        (tui, theme, _kb, done) => {
+          let currentTab = 0; // tabs.length = Submit
+          let phase: "model" | "thinking" = "model";
+          let showAll = catalog.scoped.length === 0;
+          let cached: string[] | undefined;
+          // One SelectList per role tab for models + one shared for thinking,
+          // so filter text + cursor survive tab switches.
+          const listTheme = {
+            selectedPrefix: (t: string) => theme.fg("accent", t),
+            selectedText: (t: string) => theme.fg("accent", t),
+            description: (t: string) => theme.fg("muted", t),
+            scrollInfo: (t: string) => theme.fg("dim", t),
+            noMatch: (t: string) => theme.fg("warning", t),
+          };
+          const currentRef = (role: Role) =>
+            `${role.model.provider}/${role.model.id}`;
+          const buildModelItems = (role: Role): SelectItem[] => {
+            const st = staged.get(role.name)!;
+            const cur = `${st.provider}/${st.id}`;
+            const src = showAll ? catalog.all : catalog.scoped;
+            return src.map((e) => ({
+              value: `${e.provider}/${e.id}`,
+              label: `${e.provider}/${e.id}`,
+              description:
+                `${e.provider}/${e.id}` === cur
+                  ? "● selected"
+                  : `${e.provider}/${e.id}` === currentRef(role)
+                    ? "current"
+                    : showAll && !e.inScope
+                      ? "all"
+                      : undefined,
+            }));
+          };
+          const modelLists = new Map<string, SelectList>();
+          const thinkingList = new SelectList(
+            VALID_THINKING_LEVELS.map((t) => ({
+              value: t,
+              label: t,
+            })),
+            Math.min(VALID_THINKING_LEVELS.length, 8),
+            listTheme,
+          );
+          const getModelList = (role: Role): SelectList => {
+            let list = modelLists.get(role.name);
+            if (!list) {
+              list = new SelectList(
+                buildModelItems(role),
+                10,
+                listTheme,
+              );
+              const st = staged.get(role.name)!;
+              const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
+                (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
+              );
+              if (idx > 0) list.setSelectedIndex(idx);
+              modelLists.set(role.name, list);
+            }
+            return list;
+          };
+          const rebuildModelLists = () => {
+            modelLists.clear();
+          };
+          const syncThinkingCursor = (role: Role) => {
+            const st = staged.get(role.name)!;
+            const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
+            thinkingList.setSelectedIndex(idx >= 0 ? idx : 0);
+            thinkingList.setFilter("");
+          };
+          const isSubmitTab = () => currentTab === tabs.length;
+
+          const commitModelSelection = (role: Role) => {
+            const sel = getModelList(role).getSelectedItem();
+            if (!sel) return false;
+            const { provider, id } = parseModelRef(sel.value);
+            if (!provider || !id) return false;
+            const st = staged.get(role.name)!;
+            staged.set(role.name, { ...st, provider, id });
+            // If the chosen model is unknown to the registry, keep it —
+            // save path warns, matching /role set behavior.
+            return true;
+          };
+          const commitThinkingSelection = (role: Role) => {
+            const sel = thinkingList.getSelectedItem();
+            if (!sel || !isValidThinkingLevel(sel.value)) return false;
+            const st = staged.get(role.name)!;
+            staged.set(role.name, { ...st, thinking: sel.value });
+            return true;
+          };
+          const advanceFromThinking = () => {
+            if (currentTab < tabs.length) currentTab++;
+            phase = "model";
+            cached = undefined;
+            tui.requestRender();
+          };
+
+          const handleInput = (data: string) => {
+            if (matchesKey(data, Key.escape)) {
+              if (phase === "thinking" && !isSubmitTab()) {
+                phase = "model";
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
+              done(null);
+              return;
+            }
+            if (
+              matchesKey(data, Key.tab) ||
+              matchesKey(data, Key.right) ||
+              matchesKey(data, Key.shift("tab")) ||
+              matchesKey(data, Key.left)
+            ) {
+              const fwd =
+                matchesKey(data, Key.tab) || matchesKey(data, Key.right);
+              const n = tabs.length + 1;
+              currentTab = fwd
+                ? (currentTab + 1) % n
+                : (currentTab - 1 + n) % n;
+              phase = "model";
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+            // Ctrl+O toggles scoped ↔ all models
+            try {
+              if (matchesKey(data, Key.ctrl("o"))) {
+                showAll = !showAll;
+                rebuildModelLists();
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
+            } catch (_e) {
+              void _e;
+            }
+            if (isSubmitTab()) {
+              if (matchesKey(data, Key.enter)) done(new Map(staged));
+              return;
+            }
+            const role = tabs[currentTab];
+            if (matchesKey(data, Key.enter)) {
+              if (phase === "model") {
+                if (!commitModelSelection(role)) return;
+                phase = "thinking";
+                syncThinkingCursor(role);
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
+              if (!commitThinkingSelection(role)) return;
+              advanceFromThinking();
+              return;
+            }
+            if (phase === "model") getModelList(role).handleInput(data);
+            else thinkingList.handleInput(data);
+            cached = undefined;
+            tui.requestRender();
+          };
+
+          const render = (width: number): string[] => {
+            if (cached) return cached;
+            const lines: string[] = [];
+            const W = Math.max(1, width);
+            const wrap = (s: string) => {
+              const out: string[] = [];
+              for (const line of s.split("\n"))
+                out.push(...wrapTextWithAnsi(line, W));
+              return out;
+            };
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            // Tabs row: one block per role + Submit
+            const chips: string[] = [];
+            for (let i = 0; i < tabs.length; i++) {
+              const r = tabs[i];
+              const st = staged.get(r.name)!;
+              const dirty =
+                `${st.provider}/${st.id}` !==
+                  `${r.model.provider}/${r.model.id}` ||
+                st.thinking !== r.model.thinking;
+              const box = dirty ? "■" : "□";
+              const lbl = ` ${box} ${roleIcon(r.name)} ${r.name} `;
+              chips.push(
+                i === currentTab
+                  ? theme.bg("selectedBg", theme.fg("text", lbl))
+                  : theme.fg(dirty ? "success" : "muted", lbl),
+              );
+            }
+            const submitLbl = " ✓ Submit ";
+            chips.push(
+              isSubmitTab()
+                ? theme.bg("selectedBg", theme.fg("text", submitLbl))
+                : theme.fg("success", submitLbl),
+            );
+            lines.push(" " + chips.join(""));
+            lines.push("");
+            if (isSubmitTab()) {
+              lines.push(
+                ...wrap(" " + theme.fg("text", "Review — Enter to save, Esc to cancel")),
+              );
+              lines.push("");
+              for (const r of tabs) {
+                const st = staged.get(r.name)!;
+                lines.push(
+                  ...wrap(
+                    "  " +
+                      theme.fg("muted", `${roleIcon(r.name)} ${r.name}: `) +
+                      theme.fg(
+                        "text",
+                        `${st.provider}/${st.id} (${st.thinking})`,
+                      ),
+                  ),
+                );
+              }
+            } else {
+              const role = tabs[currentTab];
+              const st = staged.get(role.name)!;
+              lines.push(
+                ...wrap(
+                  " " +
+                    theme.fg(
+                      "text",
+                      `${roleIcon(role.name)} ${role.name} — ${role.description}`,
+                    ),
+                ),
+              );
+              lines.push(
+                ...wrap(
+                  " " +
+                    theme.fg(
+                      "muted",
+                      `staged: ${st.provider}/${st.id} (${st.thinking})`,
+                    ),
+                ),
+              );
+              lines.push("");
+              if (phase === "model") {
+                const src = showAll ? catalog.all : catalog.scoped;
+                const scopeLabel = showAll
+                  ? "all " +
+                    String(catalog.all.length) +
+                    (catalog.truncated ? "+" : "")
+                  : "scoped " + String(catalog.scoped.length);
+                const toggleHint =
+                  catalog.scoped.length > 0 && !showAll
+                    ? " — Ctrl+O for all"
+                    : "";
+                lines.push(
+                  ...wrap(
+                    " " +
+                      theme.fg(
+                        "accent",
+                        "Model (" +
+                          scopeLabel +
+                          toggleHint +
+                          ") — type to filter:",
+                      ),
+                  ),
+                );
+                for (const l of getModelList(role).render(
+                  Math.max(1, W - 2),
+                ))
+                  lines.push(" " + l);
+                void src;
+              } else {
+                lines.push(
+                  ...wrap(" " + theme.fg("accent", "Thinking level:")),
+                );
+                for (const l of thinkingList.render(Math.max(1, W - 2)))
+                  lines.push(" " + l);
+              }
+            }
+            lines.push("");
+            lines.push(
+              ...wrap(
+                " " +
+                  theme.fg(
+                    "dim",
+                    "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+                  ),
+              ),
+            );
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            cached = lines;
+            return lines;
+          };
+
+          return {
+            render,
+            invalidate: () => {
+              cached = undefined;
+            },
+            handleInput,
+          };
+        },
+      );
+    } finally {
+      overlayActive = false;
+    }
+    if (!saved) {
+      ctx.ui.notify("Role picker cancelled.", "info");
+      return;
+    }
+    // Validate against registry (warn-only, matching /role set) then save.
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      if (reg && typeof reg.find === "function") {
+        for (const [name, st] of saved) {
+          if (!reg.find(st.provider, st.id))
+            ctx.ui.notify(
+              `Warning: ${st.provider}/${st.id} (${name}) not in model registry — saved anyway.`,
+              "warning",
+            );
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
+    for (const [name, st] of saved) {
+      const role = getRole(roleConfig, name);
+      if (role) role.model = { ...st };
+    }
+    try {
+      saveRoleConfig(roleConfig, "user");
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Roles updated but file save failed: ${String(e?.message || e)}`,
+        "warning",
+      );
+      return;
+    }
+    persistState();
+    updateStatus(ctx);
+    const summary = tabs
+      .map((r) => {
+        const st = staged.get(r.name)!;
+        return `${roleIcon(r.name)} ${r.name} → ${st.provider}/${st.id} (${st.thinking})`;
+      })
+      .join(" · ");
+    ctx.ui.notify(`Roles saved: ${summary}`, "info");
+    if (workflowMode) {
+      try {
+        await applyModeModel(ctx);
+        updateStatus(ctx);
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
   // ── Explore tool (parallel subagents) ────────────────────────────
 
   pi.registerTool({
     name: "explore",
     label: "Explore",
     description:
-      "Explore codebase in parallel sub-agents (read-only). Single: {agent,task} Parallel: {tasks:[{agent,task,cwd?}]}. Use scout for fast recon.",
+      "Explore codebase in parallel sub-agents (read-only). Single: {agent,task} Parallel: {tasks:[{agent,task,cwd?}]}. Use scout for fast recon. Agents without an explicit model use the explorer role's model.",
     parameters: Type.Object({
       agent: Type.Optional(
         Type.String({ description: "Agent name for single mode" }),
@@ -948,6 +1807,48 @@ export default function workflowExtension(pi: ExtensionAPI) {
           details: {},
         };
 
+      // ── Explorer role model ──────────────────────────────────
+      // Tasks whose agent has no explicit model use the explorer role's
+      // single model. Telemetry lands in details.
+      ensureRoleConfig(cwd);
+      const explorerRole = getRole(roleConfig, "explorer");
+      const routedMeta: { role: string; model: string; reason: string }[] =
+        new Array(jobs.length);
+      const routedAgents: (AgentConfig | undefined)[] = new Array(jobs.length);
+      for (let i = 0; i < jobs.length; i++) {
+        const job = jobs[i];
+        const base = agents.find((a) => a.name === job.agent);
+        if (!base || base.model) {
+          routedAgents[i] = base;
+          routedMeta[i] = {
+            role: "-",
+            model: base?.model ?? "inherit",
+            reason: base?.model ? "agent frontmatter model" : "unknown agent",
+          };
+          continue;
+        }
+        if (!explorerRole?.model) {
+          routedAgents[i] = base;
+          routedMeta[i] = {
+            role: "-",
+            model: "inherit",
+            reason: "no explorer model configured",
+          };
+          continue;
+        }
+        const m = explorerRole.model;
+        routedAgents[i] = {
+          ...base,
+          model: `${m.provider}/${m.id}`,
+          thinking: m.thinking,
+        };
+        routedMeta[i] = {
+          role: explorerRole.name,
+          model: `${m.provider}/${m.id}`,
+          reason: "explorer role model",
+        };
+      }
+
       // concurrency 4
       const MAX_CONC = 4;
       const results: any[] = new Array(jobs.length);
@@ -960,12 +1861,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const idx = next++;
           if (idx >= jobs.length) return undefined;
           const job = jobs[idx];
-          const ag = agents.find((a) => a.name === job.agent);
+          const ag =
+            routedAgents[idx] ?? agents.find((a) => a.name === job.agent);
+          const meta = routedMeta[idx];
           if (!ag) {
             results[idx] = {
               agent: job.agent,
               task: job.task,
               error: `Unknown agent "${job.agent}". Available: ${agents.map((a) => a.name).join(", ") || "none"}`,
+              role: meta?.role,
+              model: meta?.model,
             };
             continue;
           }
@@ -980,12 +1885,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
               results[idx] = {
                 agent: job.agent,
                 task: job.task,
+                role: meta?.role,
+                model: meta?.model,
                 error: "Aborted (Escape)",
               };
             } else if (res.exitCode !== 0 && !getFinalOutput(res.messages)) {
               results[idx] = {
                 agent: job.agent,
                 task: job.task,
+                role: meta?.role,
+                model: meta?.model,
                 error: res.stderr.slice(0, 2000) || `exit ${res.exitCode}`,
                 usage: res.usage,
               };
@@ -994,6 +1903,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
               results[idx] = {
                 agent: job.agent,
                 task: job.task,
+                role: meta?.role,
+                model: meta?.model,
                 output: out.slice(0, 50000),
                 usage: res.usage,
               };
@@ -1029,7 +1940,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text: summary }],
-        details: { mode: jobs.length === 1 ? "single" : "parallel", results },
+        details: {
+          mode: jobs.length === 1 ? "single" : "parallel",
+          routing: "explorer-single",
+          results,
+        },
       };
     },
   });
@@ -1926,6 +2841,24 @@ export default function workflowExtension(pi: ExtensionAPI) {
             if (Array.isArray(d.todos)) todoItems = d.todos;
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             currentPlanFile = d.planFile;
+            // restore role state (file config is source of truth for roles;
+            // session entry carries the latest activeRole)
+            try {
+              ensureRoleConfig((ctx as any)?.cwd);
+              const rd = (d as any).role;
+              if (rd && typeof rd === "object") {
+                if (typeof rd.activeRole === "string" || rd.activeRole === null)
+                  roleConfig.activeRole = rd.activeRole;
+              }
+            } catch (_e) {
+              void _e;
+            }
+            if (
+              (d as any).lastModeSwitch &&
+              typeof (d as any).lastModeSwitch === "object"
+            ) {
+              lastModeSwitch = (d as any).lastModeSwitch as any;
+            }
             awaitingDecision = !!d.awaitingDecision;
             lastHandoffAt =
               typeof d.awaitingDecisionAt === "number"
@@ -1992,6 +2925,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
           recursive: true,
         });
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        await applyModeModel(ctx as any);
       } catch (_e) {
         void _e;
       }

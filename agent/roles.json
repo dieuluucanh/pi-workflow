@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "roles": [
+    {
+      "name": "planner",
+      "description": "Frontier reasoning model for planning, orchestration, and ambiguous decisions",
+      "model": {
+        "provider": "opencode-go",
+        "id": "longcat-2.0",
+        "thinking": "high"
+      },
+      "tools": [],
+      "systemPromptAddendum": "You are in PLANNER role. Focus on reasoning, architecture, and planning. Delegate implementation to Builder and research to Explorer.",
+      "builtIn": true
+    },
+    {
+      "name": "explorer",
+      "description": "Fast, cheap model for read-only codebase exploration, web search, and summarization",
+      "model": {
+        "provider": "opencode-go",
+        "id": "mimo-v2.5",
+        "thinking": "low"
+      },
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash"
+      ],
+      "systemPromptAddendum": "You are in EXPLORER role. Read-only research only. Do NOT edit/write. Return concise findings.",
+      "builtIn": true
+    },
+    {
+      "name": "builder",
+      "description": "Capable model for code generation following a plan, with light reasoning",
+      "model": {
+        "provider": "opencode-go",
+        "id": "muse-spark-1.3-contributor",
+        "thinking": "medium"
+      },
+      "tools": [],
+      "systemPromptAddendum": "You are in BUILDER role. Implement the assigned task following the plan. Reason lightly. Ask if blocked.",
+      "builtIn": true
+    }
+  ],
+  "activeRole": null
+}
