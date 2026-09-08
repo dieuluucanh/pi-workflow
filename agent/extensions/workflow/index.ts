@@ -40,6 +40,7 @@ import {
   type SelectItem,
   visibleWidth,
   wrapTextWithAnsi,
+  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -421,21 +422,60 @@ export default function workflowExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus("workflow", undefined);
     }
     if (workflowMode === "build" && todoItems.length > 0) {
-      const lines = todoItems.map((item) => {
-        if (item.completed)
-          return (
-            ctx.ui.theme.fg("success", "☑ ") +
-            ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
-          );
-        return `${ctx.ui.theme.fg("dim", "☐ ")}${item.text}`;
+      const MAX_WIDGET_LINES = 15;
+      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
+        const listComponent = {
+          render(width: number): string[] {
+            const contentWidth = Math.max(1, width - 2);
+            const lines = todoItems.map((item) => {
+              const raw = item.completed
+                ? theme.fg("success", "☑ ") +
+                  theme.fg("muted", theme.strikethrough(item.text))
+                : `${theme.fg("dim", "☐ ")}${item.text}`;
+              return truncateToWidth(raw, contentWidth, "…");
+            });
+            const visible = lines.slice(0, MAX_WIDGET_LINES);
+            if (lines.length > MAX_WIDGET_LINES) {
+              visible.push(
+                theme.fg("muted", `… +${lines.length - MAX_WIDGET_LINES} more`),
+              );
+            }
+            return visible;
+          },
+          invalidate() {},
+        };
+        return {
+          render: (w: number) => listComponent.render(w),
+          invalidate: () => listComponent.invalidate(),
+          dispose: () => {},
+        };
       });
-      ctx.ui.setWidget("workflow-todos", lines);
     } else if (workflowMode === "plan" && todoItems.length > 0) {
-      const lines = todoItems.map(
-        (item) =>
-          `${ctx.ui.theme.fg("dim", "☐ ")}${ctx.ui.theme.fg("muted", item.text)}`,
-      );
-      ctx.ui.setWidget("workflow-todos", lines);
+      const MAX_WIDGET_LINES = 15;
+      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
+        const listComponent = {
+          render(width: number): string[] {
+            const contentWidth = Math.max(1, width - 2);
+            const lines = todoItems.map((item) => {
+              const raw = `${theme.fg("dim", "☐ ")}${theme.fg("muted", item.text)}`;
+              return truncateToWidth(raw, contentWidth, "…");
+            });
+            const visible = lines.slice(0, MAX_WIDGET_LINES);
+            if (lines.length > MAX_WIDGET_LINES) {
+              visible.push(
+                theme.fg("muted", `… +${lines.length - MAX_WIDGET_LINES} more`),
+              );
+            }
+            return visible;
+          },
+          invalidate() {},
+        };
+        return {
+          render: (w: number) => listComponent.render(w),
+          invalidate: () => listComponent.invalidate(),
+          dispose: () => {},
+        };
+      });
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
     }
@@ -979,7 +1019,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
             };
           const item: TodoItem = {
             step: todoItems.length + 1,
-            text: params.text.slice(0, 80),
+            text: params.text.slice(0, 200),
             completed: false,
           };
           todoItems.push(item);
@@ -1072,8 +1112,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Model roles command ──────────────────────────────────────────
 
   pi.registerCommand("role", {
-    description:
-      "Configure one model + thinking per role — opens picker UI",
+    description: "Configure one model + thinking per role — opens picker UI",
     handler: async (args, ctx) => {
       const cwd = (ctx as any)?.cwd as string | undefined;
       ensureRoleConfig(cwd);
@@ -1364,9 +1403,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   function orderedRoleTabs(): Role[] {
     const rank = (name: string) => {
-      const i = ["planner", "explorer", "builder"].indexOf(
-        name.toLowerCase(),
-      );
+      const i = ["planner", "explorer", "builder"].indexOf(name.toLowerCase());
       return i === -1 ? 99 : i;
     };
     return [...roleConfig.roles].sort((a, b) => rank(a.name) - rank(b.name));
@@ -1388,8 +1425,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     // Stage current values so the picker opens on the active selection.
     const staged = new Map<string, StagedRoleModel>();
-    for (const r of tabs)
-      staged.set(r.name, { ...r.model });
+    for (const r of tabs) staged.set(r.name, { ...r.model });
 
     overlayActive = true;
     let saved: Map<string, StagedRoleModel> | null = null;
@@ -1440,11 +1476,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const getModelList = (role: Role): SelectList => {
             let list = modelLists.get(role.name);
             if (!list) {
-              list = new SelectList(
-                buildModelItems(role),
-                10,
-                listTheme,
-              );
+              list = new SelectList(buildModelItems(role), 10, listTheme);
               const st = staged.get(role.name)!;
               const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
                 (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
@@ -1592,7 +1624,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
             lines.push("");
             if (isSubmitTab()) {
               lines.push(
-                ...wrap(" " + theme.fg("text", "Review — Enter to save, Esc to cancel")),
+                ...wrap(
+                  " " +
+                    theme.fg("text", "Review — Enter to save, Esc to cancel"),
+                ),
               );
               lines.push("");
               for (const r of tabs) {
@@ -1653,9 +1688,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
                       ),
                   ),
                 );
-                for (const l of getModelList(role).render(
-                  Math.max(1, W - 2),
-                ))
+                for (const l of getModelList(role).render(Math.max(1, W - 2)))
                   lines.push(" " + l);
                 void src;
               } else {
