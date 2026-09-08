@@ -19,3 +19,4 @@ agent/auth.json
 agent/models-store.json
 agent/trust.json
 agent/npm/package-lock.json
+agent/memory/MEMORY.md
