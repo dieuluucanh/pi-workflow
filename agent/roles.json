@@ -36,7 +36,7 @@
       "description": "Capable model for code generation following a plan, with light reasoning",
       "model": {
         "provider": "opencode-go",
-        "id": "deepseek-v4-flash",
+        "id": "mimo-v2.5",
         "thinking": "medium"
       },
       "tools": [],

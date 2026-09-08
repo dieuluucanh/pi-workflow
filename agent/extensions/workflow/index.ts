@@ -434,10 +434,26 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 : `${theme.fg("dim", "☐ ")}${item.text}`;
               return truncateToWidth(raw, contentWidth, "…");
             });
-            const visible = lines.slice(0, MAX_WIDGET_LINES);
-            if (lines.length > MAX_WIDGET_LINES) {
+            // Auto-scroll: skip completed items at the top to show first undone.
+            // If all items are done, show from the start.
+            let scrollOffset = 0;
+            for (let i = 0; i < todoItems.length; i++) {
+              if (!todoItems[i].completed) {
+                scrollOffset = i;
+                break;
+              }
+            }
+            if (todoItems.every((t) => t.completed)) scrollOffset = 0;
+            const visible = lines.slice(
+              scrollOffset,
+              scrollOffset + MAX_WIDGET_LINES,
+            );
+            if (lines.length > scrollOffset + MAX_WIDGET_LINES) {
               visible.push(
-                theme.fg("muted", `… +${lines.length - MAX_WIDGET_LINES} more`),
+                theme.fg(
+                  "muted",
+                  `… +${lines.length - scrollOffset - visible.length} more`,
+                ),
               );
             }
             return visible;
@@ -460,10 +476,25 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const raw = `${theme.fg("dim", "☐ ")}${theme.fg("muted", item.text)}`;
               return truncateToWidth(raw, contentWidth, "…");
             });
-            const visible = lines.slice(0, MAX_WIDGET_LINES);
-            if (lines.length > MAX_WIDGET_LINES) {
+            // Auto-scroll: skip completed items at the top to show first undone.
+            let scrollOffset = 0;
+            for (let i = 0; i < todoItems.length; i++) {
+              if (!todoItems[i].completed) {
+                scrollOffset = i;
+                break;
+              }
+            }
+            if (todoItems.every((t) => t.completed)) scrollOffset = 0;
+            const visible = lines.slice(
+              scrollOffset,
+              scrollOffset + MAX_WIDGET_LINES,
+            );
+            if (lines.length > scrollOffset + MAX_WIDGET_LINES) {
               visible.push(
-                theme.fg("muted", `… +${lines.length - MAX_WIDGET_LINES} more`),
+                theme.fg(
+                  "muted",
+                  `… +${lines.length - scrollOffset - visible.length} more`,
+                ),
               );
             }
             return visible;
@@ -1023,6 +1054,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
             completed: false,
           };
           todoItems.push(item);
+          try {
+            if (currentSessionCtx) updateStatus(currentSessionCtx);
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [
               { type: "text", text: `Added ${item.step}. ${item.text}` },
@@ -1059,6 +1095,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
               } as TodoDetails,
             };
           it.completed = !it.completed;
+          try {
+            if (currentSessionCtx) {
+              updateStatus(currentSessionCtx);
+              persistState();
+            }
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [
               {
@@ -1076,6 +1120,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         case "clear": {
           const c = todoItems.length;
           todoItems = [];
+          try {
+            if (currentSessionCtx) updateStatus(currentSessionCtx);
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [{ type: "text", text: `Cleared ${c} todos` }],
             details: { action: "clear", todos: [], nextStep: 1 } as TodoDetails,

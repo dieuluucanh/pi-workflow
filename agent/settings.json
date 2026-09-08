@@ -4,7 +4,8 @@
   "packages": [
     "npm:pi-lens",
     "npm:pi-web-access",
-    "npm:@plannotator/pi-extension"
+    "npm:@plannotator/pi-extension",
+    "npm:pi-memory"
   ],
   "enabledModels": [
     "opencode-go/muse-spark-1.2-contributor",
