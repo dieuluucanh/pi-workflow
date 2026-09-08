@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Pi Browser Inspector",
+  "version": "1.0.0",
+  "description": "Relays Chrome DevTools Protocol events to the Pi coding agent via WebSocket. Attach to inspect your real logged-in browser session.",
+  "permissions": ["debugger", "tabs", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_icon": "icon128.png",
+    "default_title": "Pi Browser Inspector — open DevTools (F12) to use"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "devtools_page": "devtools.html",
+  "icons": {
+    "128": "icon128.png"
+  }
+}
