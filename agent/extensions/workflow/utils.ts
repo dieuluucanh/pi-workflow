@@ -102,27 +102,411 @@ export interface TodoItem {
   step: number;
   text: string;
   completed: boolean;
+  /** Plan-faithful label, e.g. "1", "2.3". Legacy items derive it from step. */
+  label?: string;
+  /** Optional group/phase heading the step belongs to. */
+  group?: string;
+  /** Where the item came from. */
+  source?: "plan" | "agent" | "synthesized";
 }
 
-export function cleanStepText(text: string): string {
-  let cleaned = text
-    .replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(
-      /^(Use|Run|Execute|Create|Write|Read|Check|Verify|Update|Modify|Add|Remove|Delete|Install)\s+(the\s+)?/i,
-      "",
-    )
+/**
+ * Normalize step text for display and identity. Strips markdown emphasis
+ * (including orphan `**` left by partially consumed bold) and collapses
+ * whitespace. Deliberately does NOT strip imperative verbs — the todo list
+ * must mirror the plan's wording.
+ */
+export function normalizeStepText(text: string): string {
+  let cleaned = String(text ?? "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/__(.+?)__/g, "$1")
+    .replace(/\*{1,2}/g, "")
     .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[:\-\u2013\u2014]\s*$/, "")
     .trim();
-  if (cleaned.length > 0)
-    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   if (cleaned.length > 200) cleaned = `${cleaned.slice(0, 197)}...`;
   return cleaned;
 }
 
+/** @deprecated kept for compatibility; use normalizeStepText. */
+export function cleanStepText(text: string): string {
+  return normalizeStepText(text);
+}
+
+/** Stable identity key for dedupe/merge (case/punctuation-insensitive). */
+export function todoKey(item: Pick<TodoItem, "text" | "group">): string {
+  const norm = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const g = norm(item.group);
+  const t = norm(item.text);
+  return g ? `${g}|${t}` : t;
+}
+
+/** Backfill labels/source for items restored from older sessions. */
+export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
+  return (items ?? []).map((it, i) => {
+    const step = Number.isFinite(it?.step) ? Number(it.step) : i + 1;
+    return {
+      ...it,
+      step,
+      label: it?.label || String(step),
+      source: it?.source ?? "plan",
+    };
+  });
+}
+
+/** Stable dedupe — first occurrence wins. */
+export function dedupeTodoItems(items: TodoItem[]): TodoItem[] {
+  const seen = new Set<string>();
+  const out: TodoItem[] = [];
+  for (const it of items ?? []) {
+    const key = todoKey(it);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+export interface TodoMergeResult {
+  items: TodoItem[];
+  added: number;
+  removed: number;
+  kept: number;
+}
+
+/**
+ * Merge freshly extracted plan steps into the existing list while preserving
+ * completion state for steps that are still present. Extracted order wins.
+ * Match is by label first (same plan step), then by normalized text.
+ */
+export function mergeTodoItems(
+  existing: TodoItem[],
+  extracted: TodoItem[],
+): TodoMergeResult {
+  const prev = (existing ?? []).map((p) => ({ ...p }));
+  const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
+  const byLabel = new Map<string, TodoItem>();
+  const byKey = new Map<string, TodoItem>();
+  for (const p of prev) {
+    const label = p.label || String(p.step);
+    byLabel.set(label.toLowerCase(), p);
+    const k = todoKey(p);
+    if (k) byKey.set(k, p);
+  }
+  const used = new Set<TodoItem>();
+  let added = 0;
+  let kept = 0;
+  const items = next.map((n) => {
+    const nKey = todoKey(n);
+    let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
+    if (!match && n.label) {
+      const cand = byLabel.get(n.label.toLowerCase());
+      // Label fallback only when the text is unchanged (group may have been
+      // renamed); never carry completion onto a differently-worded step.
+      if (cand && todoKey({ text: cand.text }) === todoKey({ text: n.text }))
+        match = cand;
+    }
+    if (match && !used.has(match)) {
+      used.add(match);
+      kept++;
+      return {
+        ...n,
+        completed: match.completed,
+        source: n.source ?? match.source,
+      };
+    }
+    added++;
+    return n;
+  });
+  items.forEach((it, i) => {
+    it.step = i + 1;
+    if (!it.label) it.label = String(i + 1);
+  });
+  const removed = prev.filter((p) => !used.has(p)).length;
+  return { items, added, removed, kept };
+}
+
+export interface TodoRefResolution {
+  item?: TodoItem;
+  ambiguous?: TodoItem[];
+  unknown?: string;
+}
+
+/** Resolve a `[DONE:ref]` / toggle reference to a todo item. */
+export function resolveTodoRef(
+  items: TodoItem[],
+  ref: string,
+): TodoRefResolution {
+  const list = items ?? [];
+  const raw = String(ref ?? "").trim();
+  if (!raw) return { unknown: raw };
+  const norm = raw.replace(/[.)]+$/, "");
+  const numeric = Number(norm);
+  let matches = list.filter(
+    (it) => (it.label || String(it.step)).toLowerCase() === norm.toLowerCase(),
+  );
+  if (matches.length === 0 && Number.isFinite(numeric))
+    matches = list.filter((it) => it.step === numeric);
+  if (matches.length === 1) return { item: matches[0] };
+  if (matches.length > 1) return { ambiguous: matches };
+  const needle = norm.toLowerCase();
+  if (needle.length >= 12) {
+    const textMatches = list.filter((it) =>
+      it.text.toLowerCase().includes(needle),
+    );
+    if (textMatches.length === 1) return { item: textMatches[0] };
+    if (textMatches.length > 1) return { ambiguous: textMatches };
+  }
+  return { unknown: raw };
+}
+
+/**
+ * Leniently parse completion refs from assistant text: `[DONE:3]`,
+ * `[DONE: 3.1]`, `[DONE:2-4]`, `[DONE #2]`, `[DONE:1,2]`.
+ */
+export function parseDoneRefs(text: string): string[] {
+  const refs: string[] = [];
+  if (!text) return refs;
+  const re = /\[DONE\s*[:#]?\s*([^\]]+)\]/gi;
+  for (const m of text.matchAll(re)) {
+    const body = String(m[1] ?? "").trim();
+    if (!body) continue;
+    const range = body.match(/^(\d+)\s*(?:-|\u2013|\u2014|\.\.)\s*(\d+)$/);
+    if (range) {
+      const a = Number(range[1]);
+      const b = Number(range[2]);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        for (let i = lo; i <= hi && i - lo < 200; i++) refs.push(String(i));
+        continue;
+      }
+    }
+    for (const part of body.split(/[,\s]+/)) {
+      const p = part.trim().replace(/[.)]+$/, "");
+      if (/^\d+(?:\.\d+)?$/.test(p)) refs.push(p);
+    }
+  }
+  return refs;
+}
+
+export interface MarkCompletedResult {
+  marked: number;
+  unknown: string[];
+  ambiguous: string[];
+}
+
+/** Mark items completed from `[DONE:ref]` tags. Only sets true. */
+export function markCompletedRefs(
+  text: string,
+  items: TodoItem[],
+): MarkCompletedResult {
+  const result: MarkCompletedResult = {
+    marked: 0,
+    unknown: [],
+    ambiguous: [],
+  };
+  for (const ref of parseDoneRefs(text)) {
+    const res = resolveTodoRef(items, ref);
+    if (res.item) {
+      res.item.completed = true;
+      result.marked++;
+    } else if (res.ambiguous) {
+      result.ambiguous.push(ref);
+    } else {
+      result.unknown.push(ref);
+    }
+  }
+  return result;
+}
+
+/** Legacy numeric API retained for compatibility. */
+export function extractDoneSteps(message: string): number[] {
+  return parseDoneRefs(message)
+    .map(Number)
+    .filter((n) => Number.isFinite(n));
+}
+
+/** Legacy API retained for compatibility. */
+export function markCompletedSteps(text: string, items: TodoItem[]): number {
+  return markCompletedRefs(text, items).marked;
+}
+
+// ── Plan extraction (section-scoped) ─────────────────────────────
+
+const EXCLUDED_SECTION_RE =
+  /^(context|decisions?|exploration(\s+summary)?|risks?|verification|notes?|root\s+cause|background|summary|alternatives?|open\s+questions?|references?|appendix)\b/i;
+
+function headingMatch(line: string): { level: number; title: string } | null {
+  const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+  if (!m) return null;
+  return { level: m[1].length, title: m[2].trim() };
+}
+
+/** Step-shaped heading: `### 1. Title`, `### Step 2: Title`. */
+function stepFromHeading(line: string): { label: string; text: string } | null {
+  const m = line.match(
+    /^(#{3,6})\s*(?:(\d+(?:\.\d+)?)[.)]\s+|Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s+)(.+?)\s*$/i,
+  );
+  if (!m) return null;
+  const label = m[2] ?? m[3];
+  const text = normalizeStepText(m[4] ?? "");
+  if (!label || text.length <= 3) return null;
+  return { label, text };
+}
+
+/** Bold step paragraph: `**Step 1.1: Scaffold**`. */
+function stepFromBold(line: string): { label: string; text: string } | null {
+  const m = line.match(
+    /^\s*\*\*Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s*(.+?)\*\*\s*$/i,
+  );
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { label: m[1], text };
+}
+
+/** Numbered list item: `1. Title`. */
+function stepFromList(line: string): { label: string; text: string } | null {
+  const m = line.match(/^\s*(\d+(?:\.\d+)?)[.)]\s+(.+?)\s*$/);
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { label: m[1], text };
+}
+
+/** Checkbox item: `- [ ] Title` / `- [x] Title`. */
+function stepFromCheckbox(
+  line: string,
+): { text: string; completed: boolean } | null {
+  const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.+?)\s*$/);
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { text, completed: m[1].toLowerCase() === "x" };
+}
+
+function parseStepsFromLines(lines: string[]): TodoItem[] {
+  type RawStep = {
+    label?: string;
+    text: string;
+    completed?: boolean;
+    group?: string;
+  };
+  let usedExplicit = false;
+  for (const line of lines) {
+    if (stepFromHeading(line) || stepFromBold(line)) {
+      usedExplicit = true;
+      break;
+    }
+  }
+  let numberedCount = 0;
+  if (!usedExplicit) {
+    for (const line of lines) if (stepFromList(line)) numberedCount++;
+  }
+  const useNumberedList = !usedExplicit && numberedCount >= 2;
+  const raw: RawStep[] = [];
+  let group: string | undefined;
+  for (const line of lines) {
+    const bold = stepFromBold(line);
+    if (bold) {
+      raw.push({ ...bold, group });
+      continue;
+    }
+    const heading = headingMatch(line);
+    if (heading) {
+      const step = stepFromHeading(line);
+      if (step) {
+        raw.push({ ...step, group });
+        continue;
+      }
+      const title = heading.title;
+      if (heading.level >= 3 && !EXCLUDED_SECTION_RE.test(title)) group = title;
+      continue;
+    }
+    if (useNumberedList) {
+      const list = stepFromList(line);
+      if (list) {
+        raw.push({ ...list, group });
+      }
+    }
+  }
+  if (!usedExplicit && !useNumberedList) {
+    for (const line of lines) {
+      const cb = stepFromCheckbox(line);
+      if (cb) raw.push({ text: cb.text, completed: cb.completed });
+    }
+  }
+  const items: TodoItem[] = raw.map((r, i) => ({
+    step: i + 1,
+    text: r.text,
+    completed: !!r.completed,
+    label: r.label,
+    group: r.group,
+    source: "plan" as const,
+  }));
+  const deduped = dedupeTodoItems(items);
+  deduped.forEach((it, i) => {
+    it.step = i + 1;
+    if (!it.label) it.label = String(i + 1);
+  });
+  return deduped;
+}
+
+/**
+ * Extract plan steps from a plan markdown file. Section-scoped: only the
+ * `## Plan Steps` section is parsed (fallback: step-shaped headings across
+ * the document, skipping Context/Decisions/Exploration/Risks/Verification).
+ * Labels and phase groups are preserved. Verification is never extracted.
+ */
+export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
+  if (!md) return [];
+  const lines = md.split(/\r?\n/);
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = headingMatch(lines[i]);
+    if (!h || h.level < 2 || h.level > 4) continue;
+    if (/plan\s+steps/i.test(h.title)) {
+      start = i + 1;
+      level = h.level;
+      break;
+    }
+  }
+  let section: string[];
+  if (start >= 0) {
+    let end = lines.length;
+    for (let i = start; i < lines.length; i++) {
+      const h = headingMatch(lines[i]);
+      if (h && h.level <= level && !/plan\s+steps/i.test(h.title)) {
+        end = i;
+        break;
+      }
+    }
+    section = lines.slice(start, end);
+  } else {
+    section = [];
+    let skipping = false;
+    for (const line of lines) {
+      const h = headingMatch(line);
+      if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
+      else if (h && skipping) continue;
+      if (!skipping) section.push(line);
+    }
+  }
+  return parseStepsFromLines(section);
+}
+
+/**
+ * Extract plan steps from assistant chat text (used when no plan file exists).
+ * Finds a `Plan:` header, then parses section-scoped steps.
+ */
 export function extractTodoItems(message: string): TodoItem[] {
-  const items: TodoItem[] = [];
-  // Try multiple header patterns: strict Plan:\n, "# Plan:" heading, or "Plan:" with trailing title
+  if (!message) return [];
   let headerIdx = -1;
   let headerLen = 0;
   const strict = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
@@ -142,80 +526,27 @@ export function extractTodoItems(message: string): TodoItem[] {
       }
     }
   }
-  if (headerIdx === -1) return items;
-  const planSection = message.slice(headerIdx + headerLen);
-  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+\*{0,2}([^\n]+)/gm;
-  for (const match of planSection.matchAll(numberedPattern)) {
-    const text = match[2]
-      .trim()
-      .replace(/\*{1,2}$/, "")
-      .trim();
-    if (
-      text.length > 5 &&
-      !text.startsWith("`") &&
-      !text.startsWith("/") &&
-      !text.startsWith("-")
-    ) {
-      const cleaned = cleanStepText(text);
-      if (cleaned.length > 3)
-        items.push({ step: items.length + 1, text: cleaned, completed: false });
-    }
+  if (headerIdx === -1) return [];
+  const body = message.slice(headerIdx + headerLen).split(/\r?\n/);
+  const filtered: string[] = [];
+  let skipping = false;
+  for (const line of body) {
+    const h = headingMatch(line);
+    if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
+    else if (h && skipping) continue;
+    if (!skipping) filtered.push(line);
   }
-  return items;
+  return parseStepsFromLines(filtered);
 }
 
-export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
-  const items = extractTodoItems(md);
-  if (items.length > 0) return items;
-  // Tolerant heading search: any heading containing "Plan Steps" (case-insensitive)
-  const headingMatch = md.match(/^#+\s*.*Plan Steps.*$/im);
-  let section: string;
-  if (headingMatch && headingMatch.index !== undefined) {
-    section = md.slice(headingMatch.index);
-  } else {
-    // Also accept "## 4) Plan Steps" style via broader search
-    const altIdx = md.search(/^##+\s*.*Plan Steps/im);
-    section = altIdx >= 0 ? md.slice(altIdx) : md;
-  }
-  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+(.+)$/gm;
-  for (const match of section.matchAll(numberedPattern)) {
-    const text = cleanStepText(match[2].trim());
-    if (text.length > 3)
-      items.push({ step: items.length + 1, text, completed: false });
-  }
-  // Second pass: "### Step N: Title" or "#### 1. Title" style when numbered pattern yields zero
-  if (items.length === 0) {
-    const stepHeaderPattern =
-      /^\s*#{3,4}\s*Step\s*\d+\s*[:\-\u2014]?\s*(.+)$/gim;
-    for (const m of section.matchAll(stepHeaderPattern)) {
-      const text = cleanStepText(m[1].trim());
-      if (text.length > 3)
-        items.push({ step: items.length + 1, text, completed: false });
-    }
-  }
-  // Last resort: if still zero and section is whole file, try loose numbered pattern on full md but filtered to short list context
-  if (items.length === 0 && section === md) {
-    // Avoid capturing unrelated numbered lists by requiring at least 2 items; otherwise leave empty for caller to synthesize
-  }
-  return items;
-}
-
-export function extractDoneSteps(message: string): number[] {
-  const steps: number[] = [];
-  for (const match of message.matchAll(/\[DONE:(\d+)\]/gi)) {
-    const step = Number(match[1]);
-    if (Number.isFinite(step)) steps.push(step);
-  }
-  return steps;
-}
-
-export function markCompletedSteps(text: string, items: TodoItem[]): number {
-  const doneSteps = extractDoneSteps(text);
-  for (const step of doneSteps) {
-    const item = items.find((t) => t.step === step);
-    if (item) item.completed = true;
-  }
-  return doneSteps.length;
+/** Single placeholder step from a plan title when no steps could be parsed. */
+export function synthesizeFromPlanTitle(md: string): TodoItem | null {
+  const src = String(md ?? "");
+  const m = src.match(/^#\s+Plan[:\s]+(.+)$/im) || src.match(/^#\s+(.+)$/m);
+  if (!m) return null;
+  const text = normalizeStepText(m[1]).slice(0, 120);
+  if (!text) return null;
+  return { step: 1, text, completed: false, label: "1", source: "synthesized" };
 }
 
 export function isPlanWritePath(p: string, cwd: string): boolean {

@@ -6,6 +6,10 @@
   "keywords": ["pi-package", "workflow", "plan-mode", "questionnaire", "rewind"],
   "description": "Plan↔Build mode, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
   "license": "MIT",
+  "scripts": {
+    "test": "node --test utils.todo.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/dieuluucanh/pi-workflow",
@@ -14,7 +18,14 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "files": ["index.ts", "utils.ts", "checkpoint.ts", "roles.ts", "README.md"],
+  "files": [
+    "index.ts",
+    "utils.ts",
+    "utils.todo.test.ts",
+    "checkpoint.ts",
+    "roles.ts",
+    "README.md"
+  ],
   "dependencies": {},
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

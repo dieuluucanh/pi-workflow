@@ -138,7 +138,16 @@ function scanForPlanTodos(
   const todos: EnrichedDetails["todos"] = [];
   const planSteps: string[] = [];
 
+  let snapshotTodos: EnrichedDetails["todos"] | undefined;
   for (const entry of branchEntries) {
+    // Authoritative snapshot: the latest workflow custom entry's todos.
+    if (
+      entry.type === "custom" &&
+      (entry as any).customType === "workflow" &&
+      Array.isArray((entry as any).data?.todos)
+    ) {
+      snapshotTodos = (entry as any).data.todos as EnrichedDetails["todos"];
+    }
     // Scan CustomMessage for plan context
     if (entry.type === "message" && entry.message) {
       const msg = entry.message as {
@@ -198,15 +207,38 @@ function scanForPlanTodos(
     }
   }
 
-  // Deduplicate todos by step number, keep latest
+  // Prefer the latest workflow snapshot wholesale — it already carries the
+  // authoritative completion state, so step-key last-writer-wins cannot reset
+  // a completed item back to pending.
+  if (snapshotTodos && snapshotTodos.length > 0) {
+    return {
+      todos: [...snapshotTodos].sort((a, b) => a.step - b.step),
+      planSteps: dedupeLines(planSteps),
+    };
+  }
+
+  // Legacy fallback: deduplicate todos by step number, keep latest.
   const seen = new Map<number, EnrichedDetails["todos"][0]>();
   for (const t of todos) {
     seen.set(t.step, t);
   }
   return {
     todos: [...seen.values()].sort((a, b) => a.step - b.step),
-    planSteps,
+    planSteps: dedupeLines(planSteps),
   };
+}
+
+/** Dedupe plan-step lines while preserving order. */
+function dedupeLines(lines: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const l of lines) {
+    const k = l.trim().toLowerCase();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(l);
+  }
+  return out;
 }
 
 /** Build enriched details for compaction entry */

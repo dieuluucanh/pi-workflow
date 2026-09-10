@@ -7,7 +7,7 @@ Plan↔Build mode, questionnaire, subagent explore, todos and shadow-checkpoint 
 - **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; tab + `CtrlAlt+p` shortcuts, `--workflow-plan` flag
 - **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, inline `↳ Your answer:` editor
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
-- **Todos** — `workflow_todo` (`list/add/toggle/clear`, `[DONE:n]` preservation for compaction)
+- **Todos** — plan-faithful todo list (step labels + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/add/toggle/sync/clear`), lenient `[DONE:<label>]` markers, and a per-turn build reminder so completion tracking never decays.
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
 - **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, inline markdown handoff (`ScrollView` → inline scrollback), `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all).
