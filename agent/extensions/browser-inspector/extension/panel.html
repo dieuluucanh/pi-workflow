@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; color: #e0e0e0; background: #1e1e1e; }
+    h1 { font-size: 14px; margin: 0 0 12px; color: #4fc3f7; }
+    .status { font-size: 12px; padding: 8px; border-radius: 4px; margin-bottom: 12px; background: #2d2d2d; }
+    .status.connected { border-left: 3px solid #4caf50; }
+    .status.disconnected { border-left: 3px solid #f44336; }
+    button { background: #4fc3f7; color: #000; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-right: 8px; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .hint { font-size: 11px; color: #999; margin-top: 12px; }
+    code { background: #333; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>Pi Browser Inspector</h1>
+  <div id="status" class="status disconnected">Disconnected</div>
+  <div>
+    <button id="btnConnect">Connect</button>
+    <button id="btnAttach" disabled>Attach to Tab</button>
+    <button id="btnDetach" disabled>Detach</button>
+  </div>
+  <p class="hint">
+    1. Click <strong>Connect</strong> to link to the Pi agent's relay.<br>
+    2. Click <strong>Attach to Tab</strong> to start capturing DevTools events.<br>
+    3. The agent can then read console logs and network requests from <em>this</em> tab.<br>
+    <br>
+    Capture works while DevTools is open on the inspected tab.
+  </p>
+  <script src="panel.js"></script>
+</body>
+</html>

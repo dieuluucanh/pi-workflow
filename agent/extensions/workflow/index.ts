@@ -40,6 +40,7 @@ import {
   type SelectItem,
   visibleWidth,
   wrapTextWithAnsi,
+  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -303,6 +304,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let overlayActive = false;
   let todoItems: TodoItem[] = [];
   let toolsBeforePlanMode: string[] | undefined;
+  // Track the model active in Default mode so it can be restored when
+  // returning from Plan/Build (otherwise the role model leaks into Default).
+  let defaultModel:
+    | { provider: string; id: string; thinking?: string }
+    | undefined;
   let currentPlanFile: string | undefined;
   let awaitingDecision = false;
   let lastHandoffAt: number | undefined;
@@ -421,21 +427,91 @@ export default function workflowExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus("workflow", undefined);
     }
     if (workflowMode === "build" && todoItems.length > 0) {
-      const lines = todoItems.map((item) => {
-        if (item.completed)
-          return (
-            ctx.ui.theme.fg("success", "☑ ") +
-            ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
-          );
-        return `${ctx.ui.theme.fg("dim", "☐ ")}${item.text}`;
+      const MAX_WIDGET_LINES = 15;
+      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
+        const listComponent = {
+          render(width: number): string[] {
+            const contentWidth = Math.max(1, width - 2);
+            const lines = todoItems.map((item) => {
+              const raw = item.completed
+                ? theme.fg("success", "☑ ") +
+                  theme.fg("muted", theme.strikethrough(item.text))
+                : `${theme.fg("dim", "☐ ")}${item.text}`;
+              return truncateToWidth(raw, contentWidth, "…");
+            });
+            // Auto-scroll: skip completed items at the top to show first undone.
+            // If all items are done, show from the start.
+            let scrollOffset = 0;
+            for (let i = 0; i < todoItems.length; i++) {
+              if (!todoItems[i].completed) {
+                scrollOffset = i;
+                break;
+              }
+            }
+            if (todoItems.every((t) => t.completed)) scrollOffset = 0;
+            const visible = lines.slice(
+              scrollOffset,
+              scrollOffset + MAX_WIDGET_LINES,
+            );
+            if (lines.length > scrollOffset + MAX_WIDGET_LINES) {
+              visible.push(
+                theme.fg(
+                  "muted",
+                  `… +${lines.length - scrollOffset - visible.length} more`,
+                ),
+              );
+            }
+            return visible;
+          },
+          invalidate() {},
+        };
+        return {
+          render: (w: number) => listComponent.render(w),
+          invalidate: () => listComponent.invalidate(),
+          dispose: () => {},
+        };
       });
-      ctx.ui.setWidget("workflow-todos", lines);
     } else if (workflowMode === "plan" && todoItems.length > 0) {
-      const lines = todoItems.map(
-        (item) =>
-          `${ctx.ui.theme.fg("dim", "☐ ")}${ctx.ui.theme.fg("muted", item.text)}`,
-      );
-      ctx.ui.setWidget("workflow-todos", lines);
+      const MAX_WIDGET_LINES = 15;
+      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
+        const listComponent = {
+          render(width: number): string[] {
+            const contentWidth = Math.max(1, width - 2);
+            const lines = todoItems.map((item) => {
+              const raw = `${theme.fg("dim", "☐ ")}${theme.fg("muted", item.text)}`;
+              return truncateToWidth(raw, contentWidth, "…");
+            });
+            // Auto-scroll: skip completed items at the top to show first undone.
+            let scrollOffset = 0;
+            for (let i = 0; i < todoItems.length; i++) {
+              if (!todoItems[i].completed) {
+                scrollOffset = i;
+                break;
+              }
+            }
+            if (todoItems.every((t) => t.completed)) scrollOffset = 0;
+            const visible = lines.slice(
+              scrollOffset,
+              scrollOffset + MAX_WIDGET_LINES,
+            );
+            if (lines.length > scrollOffset + MAX_WIDGET_LINES) {
+              visible.push(
+                theme.fg(
+                  "muted",
+                  `… +${lines.length - scrollOffset - visible.length} more`,
+                ),
+              );
+            }
+            return visible;
+          },
+          invalidate() {},
+        };
+        return {
+          render: (w: number) => listComponent.render(w),
+          invalidate: () => listComponent.invalidate(),
+          dispose: () => {},
+        };
+      });
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
     }
@@ -551,6 +627,53 @@ export default function workflowExtension(pi: ExtensionAPI) {
     return true;
   }
 
+  /** Capture the model currently active so Default mode can restore it later. */
+  function captureDefaultModel(ctx: ExtensionContext) {
+    try {
+      const cur =
+        (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+      if (cur?.provider && cur?.id) {
+        let thinking: string | undefined;
+        try {
+          thinking = (pi as any)?.getThinkingLevel?.();
+        } catch (_e) {
+          void _e;
+        }
+        defaultModel = { provider: cur.provider, id: cur.id, thinking };
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Restore the model that was active the last time Default mode was left. */
+  async function restoreDefaultModel(ctx: ExtensionContext): Promise<void> {
+    if (!defaultModel) return;
+    let found: any;
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      found = reg?.find?.(defaultModel.provider, defaultModel.id);
+    } catch (_e) {
+      void _e;
+    }
+    if (!found) return; // registry no longer has it — keep current model
+    try {
+      await (pi as any).setModel?.(found);
+      if (
+        defaultModel.thinking &&
+        isValidThinkingLevel(defaultModel.thinking)
+      ) {
+        (pi as any).setThinkingLevel?.(defaultModel.thinking);
+      }
+      ctx.ui.notify(
+        `Default mode: model → ${defaultModel.provider}/${defaultModel.id}${defaultModel.thinking ? ` (${defaultModel.thinking})` : ""}`,
+        "info",
+      );
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
@@ -567,6 +690,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       role: {
         activeRole: roleConfig.activeRole,
       },
+      defaultModel,
       lastModeSwitch,
     } as any);
   }
@@ -574,18 +698,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
   async function setPlanMode(ctx: ExtensionContext) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
-        "Already in Plan mode — read-only. Press Tab or /build to switch to Build.",
+        "Already in Plan mode — read-only. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
         "info",
       );
       return;
     }
+    // Leaving Default mode: remember its model so it can be restored on return.
+    if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "plan";
     syncLegacyFlags();
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
     pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
     ctx.ui.notify(
-      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab or /build to switch to Build.",
+      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
       "info",
     );
     try {
@@ -607,11 +733,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
   async function setBuildMode(ctx: ExtensionContext) {
     if (workflowMode === "build") {
       ctx.ui.notify(
-        "Already in Build mode — full access. Press Tab or /plan to switch to Plan.",
+        "Already in Build mode — full access. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
         "info",
       );
       return;
     }
+    // Leaving Default mode (e.g. /build from default): remember its model.
+    if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "build";
     syncLegacyFlags();
     pi.setActiveTools(
@@ -619,7 +747,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     );
     toolsBeforePlanMode = undefined;
     ctx.ui.notify(
-      "Build mode — full access restored. Press Tab or /plan to switch to Plan.",
+      "Build mode — full access restored. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
       "info",
     );
     try {
@@ -631,9 +759,46 @@ export default function workflowExtension(pi: ExtensionAPI) {
     persistState();
   }
 
+  async function setDefaultMode(ctx: ExtensionContext) {
+    if (workflowMode === null) {
+      ctx.ui.notify(
+        "Already in Default mode — no workflow. Press Tab or /plan to switch to Plan.",
+        "info",
+      );
+      return;
+    }
+    workflowMode = null;
+    syncLegacyFlags();
+    // Restore original tools
+    if (toolsBeforePlanMode) {
+      pi.setActiveTools(toolsBeforePlanMode);
+      toolsBeforePlanMode = undefined;
+    }
+    // Clear workflow-specific state (default = no active workflow;
+    // the plan file on disk is preserved)
+    todoItems = [];
+    currentPlanFile = undefined;
+    awaitingDecision = false;
+    lastHandoffAt = undefined;
+    // Restore the model that was active in Default mode (don't leak the
+    // Build/Plan role model into Default).
+    try {
+      await restoreDefaultModel(ctx);
+    } catch (_e) {
+      void _e;
+    }
+    updateStatus(ctx);
+    persistState();
+    ctx.ui.notify(
+      "Default mode — workflow off, full access. Press Tab to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
+      "info",
+    );
+  }
+
   async function cycleWorkflowMode(ctx: ExtensionContext) {
-    if (workflowMode === "plan") await setBuildMode(ctx);
-    else await setPlanMode(ctx);
+    if (workflowMode === null) await setPlanMode(ctx);
+    else if (workflowMode === "plan") await setBuildMode(ctx);
+    else await setDefaultMode(ctx); // "build" → null (default)
   }
 
   // legacy alias for backward compat
@@ -895,6 +1060,155 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   try {
+    pi.registerCommand("default", {
+      description: "Switch to default mode (no workflow, full access)",
+      handler: async (_args, ctx) => setDefaultMode(ctx as any),
+    });
+  } catch (_e) {
+    void _e;
+  }
+
+  // ── /commit: AI-assisted commit of staged changes ────────────────
+
+  // Defensive git exec (mirrors checkpoint.ts gitShadow): pi.exec may report
+  // the exit code as `exitCode` or `code` depending on pi version; never throws.
+  async function piExecGit(args: string[], cwd?: string) {
+    try {
+      const res: any = await (pi as any).exec(
+        "git",
+        args,
+        cwd ? { cwd } : undefined,
+      );
+      return {
+        stdout: String(res?.stdout ?? ""),
+        stderr: String(res?.stderr ?? ""),
+        exitCode:
+          typeof res?.exitCode === "number"
+            ? res.exitCode
+            : typeof res?.code === "number"
+              ? res.code
+              : 0,
+      };
+    } catch (e: any) {
+      return {
+        stdout: "",
+        stderr: String(e?.message ?? e ?? "git exec failed"),
+        exitCode: 1,
+      };
+    }
+  }
+
+  function buildCommitPrompt(statSummary: string, stageAll: boolean): string {
+    return [
+      `The user ran /commit${stageAll ? " -a" : ""} and wants to commit the currently staged changes.`,
+      "",
+      "STAGED FILES:",
+      statSummary,
+      "",
+      "INSTRUCTIONS:",
+      "1. Run `git diff --staged` via the bash tool to see the full diff of the staged changes.",
+      "2. Analyze the diff and compose a concise, free-form commit message summarizing the changes.",
+      "3. Present the proposed message to the user using the questionnaire tool with exactly these options:",
+      '   - { label: "✅ Commit", description: "Commit with this message" }',
+      '   - { label: "✏️ Edit", description: "Modify the message before committing" }',
+      '   - { label: "❌ Cancel", description: "Abort without committing" }',
+      '   Use question: "Proposed commit message:\\n\\n  <your message>\\n\\nCommit these staged changes?" and header: "Commit".',
+      '   (The questionnaire tool auto-appends a "Type something." freeform option — if the user types a custom message, use that text as the commit message instead.)',
+      "4. After the user responds:",
+      '   - "✅ Commit" → run `git commit -m "<message>"` via the bash tool.',
+      '   - "✏️ Edit" or custom written text → run `git commit -m "<written message>"` via the bash tool.',
+      '   - "❌ Cancel" → do NOT commit; report that the commit was cancelled by the user.',
+      "5. Report the outcome (commit success output, or the error if it failed).",
+      "",
+      "IMPORTANT CONSTRAINTS:",
+      "- Only commit the staged changes. Do NOT run `git add` or `git commit -a`.",
+      "- Leave all unstaged changes untouched.",
+      "- If the commit fails (e.g., pre-commit hook, empty message), report the error and do NOT retry.",
+      "- Escape special characters in the commit message appropriately for the shell, or use `git commit -F <file>` for complex messages.",
+    ].join("\n");
+  }
+
+  async function handleCommitCommand(args: string, ctx: any) {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const stageAll = /(^|\s)-a(\s|$)/.test(args.trim());
+
+    // Not a git repo → warn and stop
+    if (!isGitRepoSync(cwd)) {
+      const isRepo = await isGitRepo(pi as any, cwd);
+      if (!isRepo) {
+        ctx.ui.notify("Not a git repository.", "warning");
+        return;
+      }
+    }
+
+    // Plan mode is read-only by design — committing is a write operation
+    if (workflowMode === "plan") {
+      ctx.ui.notify(
+        "Commit is not available in Plan mode. Switch to Build or Default mode first (/build or /default).",
+        "warning",
+      );
+      return;
+    }
+
+    // -a: stage all tracked changes (never touches untracked files)
+    if (stageAll) {
+      const addRes = await piExecGit(["add", "-u"], cwd);
+      if (addRes.exitCode !== 0) {
+        ctx.ui.notify(
+          `Failed to stage tracked changes: ${addRes.stderr.trim()}`,
+          "error",
+        );
+        return;
+      }
+    }
+
+    // Verify there is something staged to commit
+    const statRes = await piExecGit(["diff", "--staged", "--stat"], cwd);
+    const statSummary = statRes.stdout.trim();
+    if (!statSummary) {
+      ctx.ui.notify(
+        stageAll
+          ? "No tracked changes to commit."
+          : "No staged changes to commit. Use `git add` to stage files first, or `/commit -a` to stage all tracked changes.",
+        "info",
+      );
+      return;
+    }
+
+    // Inject a user message → triggers an agent turn that proposes + confirms + commits
+    const message = buildCommitPrompt(statSummary, stageAll);
+    if ((pi as any).sendUserMessage) {
+      (pi as any).sendUserMessage(message);
+    } else {
+      (pi as any).sendMessage?.(
+        { customType: "workflow-commit", content: message, display: true },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    }
+  }
+
+  try {
+    pi.registerCommand("commit", {
+      description:
+        "Commit staged changes with an AI-summarized message (-a: stage tracked changes first)",
+      handler: async (args: string, ctx: any) => handleCommitCommand(args, ctx),
+      getArgumentCompletions: (prefix: string) => {
+        const flags = [
+          {
+            value: "-a",
+            label: "-a",
+            description: "Stage all tracked changes before committing",
+          },
+        ];
+        const filtered = flags.filter((f) => f.value.startsWith(prefix));
+        return filtered.length ? filtered : null;
+      },
+    } as any);
+  } catch (_e) {
+    void _e;
+  }
+
+  try {
     pi.registerShortcut(Key.ctrlAlt("p"), {
       description: "Toggle plan/build mode",
       handler: async (ctx: any) => {
@@ -979,10 +1293,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
             };
           const item: TodoItem = {
             step: todoItems.length + 1,
-            text: params.text.slice(0, 80),
+            text: params.text.slice(0, 200),
             completed: false,
           };
           todoItems.push(item);
+          try {
+            if (currentSessionCtx) updateStatus(currentSessionCtx);
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [
               { type: "text", text: `Added ${item.step}. ${item.text}` },
@@ -1019,6 +1338,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
               } as TodoDetails,
             };
           it.completed = !it.completed;
+          try {
+            if (currentSessionCtx) {
+              updateStatus(currentSessionCtx);
+              persistState();
+            }
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [
               {
@@ -1036,6 +1363,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         case "clear": {
           const c = todoItems.length;
           todoItems = [];
+          try {
+            if (currentSessionCtx) updateStatus(currentSessionCtx);
+          } catch (_e) {
+            void _e;
+          }
           return {
             content: [{ type: "text", text: `Cleared ${c} todos` }],
             details: { action: "clear", todos: [], nextStep: 1 } as TodoDetails,
@@ -1072,8 +1404,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Model roles command ──────────────────────────────────────────
 
   pi.registerCommand("role", {
-    description:
-      "Configure one model + thinking per role — opens picker UI",
+    description: "Configure one model + thinking per role — opens picker UI",
     handler: async (args, ctx) => {
       const cwd = (ctx as any)?.cwd as string | undefined;
       ensureRoleConfig(cwd);
@@ -1364,9 +1695,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   function orderedRoleTabs(): Role[] {
     const rank = (name: string) => {
-      const i = ["planner", "explorer", "builder"].indexOf(
-        name.toLowerCase(),
-      );
+      const i = ["planner", "explorer", "builder"].indexOf(name.toLowerCase());
       return i === -1 ? 99 : i;
     };
     return [...roleConfig.roles].sort((a, b) => rank(a.name) - rank(b.name));
@@ -1388,8 +1717,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     // Stage current values so the picker opens on the active selection.
     const staged = new Map<string, StagedRoleModel>();
-    for (const r of tabs)
-      staged.set(r.name, { ...r.model });
+    for (const r of tabs) staged.set(r.name, { ...r.model });
 
     overlayActive = true;
     let saved: Map<string, StagedRoleModel> | null = null;
@@ -1415,18 +1743,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
             const st = staged.get(role.name)!;
             const cur = `${st.provider}/${st.id}`;
             const src = showAll ? catalog.all : catalog.scoped;
-            return src.map((e) => ({
-              value: `${e.provider}/${e.id}`,
-              label: `${e.provider}/${e.id}`,
-              description:
-                `${e.provider}/${e.id}` === cur
-                  ? "● selected"
-                  : `${e.provider}/${e.id}` === currentRef(role)
-                    ? "current"
-                    : showAll && !e.inScope
-                      ? "all"
-                      : undefined,
-            }));
+            return src.map((e) => {
+              const ref = `${e.provider}/${e.id}`;
+              let description: string | undefined;
+              if (ref === cur) {
+                description = "● selected";
+              } else if (ref === currentRef(role)) {
+                description = "current";
+              } else if (showAll && !e.inScope) {
+                description = "all";
+              } else {
+                description = undefined;
+              }
+              return { value: ref, label: ref, description };
+            });
           };
           const modelLists = new Map<string, SelectList>();
           const thinkingList = new SelectList(
@@ -1440,11 +1770,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const getModelList = (role: Role): SelectList => {
             let list = modelLists.get(role.name);
             if (!list) {
-              list = new SelectList(
-                buildModelItems(role),
-                10,
-                listTheme,
-              );
+              list = new SelectList(buildModelItems(role), 10, listTheme);
               const st = staged.get(role.name)!;
               const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
                 (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
@@ -1588,23 +1914,23 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 ? theme.bg("selectedBg", theme.fg("text", submitLbl))
                 : theme.fg("success", submitLbl),
             );
-            lines.push(" " + chips.join(""));
+            lines.push(` ${chips.join("")}`);
             lines.push("");
             if (isSubmitTab()) {
               lines.push(
-                ...wrap(" " + theme.fg("text", "Review — Enter to save, Esc to cancel")),
+                ...wrap(
+                  ` ${theme.fg("text", "Review — Enter to save, Esc to cancel")}`,
+                ),
               );
               lines.push("");
               for (const r of tabs) {
                 const st = staged.get(r.name)!;
                 lines.push(
                   ...wrap(
-                    "  " +
-                      theme.fg("muted", `${roleIcon(r.name)} ${r.name}: `) +
-                      theme.fg(
-                        "text",
-                        `${st.provider}/${st.id} (${st.thinking})`,
-                      ),
+                    `  ${theme.fg("muted", `${roleIcon(r.name)} ${r.name}: `)}${theme.fg(
+                      "text",
+                      `${st.provider}/${st.id} (${st.thinking})`,
+                    )}`,
                   ),
                 );
               }
@@ -1613,67 +1939,56 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const st = staged.get(role.name)!;
               lines.push(
                 ...wrap(
-                  " " +
-                    theme.fg(
-                      "text",
-                      `${roleIcon(role.name)} ${role.name} — ${role.description}`,
-                    ),
+                  ` ${theme.fg(
+                    "text",
+                    `${roleIcon(role.name)} ${role.name} — ${role.description}`,
+                  )}`,
                 ),
               );
               lines.push(
                 ...wrap(
-                  " " +
-                    theme.fg(
-                      "muted",
-                      `staged: ${st.provider}/${st.id} (${st.thinking})`,
-                    ),
+                  ` ${theme.fg(
+                    "muted",
+                    `staged: ${st.provider}/${st.id} (${st.thinking})`,
+                  )}`,
                 ),
               );
               lines.push("");
               if (phase === "model") {
                 const src = showAll ? catalog.all : catalog.scoped;
                 const scopeLabel = showAll
-                  ? "all " +
-                    String(catalog.all.length) +
-                    (catalog.truncated ? "+" : "")
-                  : "scoped " + String(catalog.scoped.length);
+                  ? `all ${String(catalog.all.length)}${catalog.truncated ? "+" : ""}`
+                  : `scoped ${String(catalog.scoped.length)}`;
                 const toggleHint =
                   catalog.scoped.length > 0 && !showAll
                     ? " — Ctrl+O for all"
                     : "";
                 lines.push(
                   ...wrap(
-                    " " +
-                      theme.fg(
-                        "accent",
-                        "Model (" +
-                          scopeLabel +
-                          toggleHint +
-                          ") — type to filter:",
-                      ),
+                    ` ${theme.fg(
+                      "accent",
+                      `Model (${scopeLabel}${toggleHint}) — type to filter:`,
+                    )}`,
                   ),
                 );
-                for (const l of getModelList(role).render(
-                  Math.max(1, W - 2),
-                ))
-                  lines.push(" " + l);
+                for (const l of getModelList(role).render(Math.max(1, W - 2)))
+                  lines.push(` ${l}`);
                 void src;
               } else {
                 lines.push(
-                  ...wrap(" " + theme.fg("accent", "Thinking level:")),
+                  ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
                 );
                 for (const l of thinkingList.render(Math.max(1, W - 2)))
-                  lines.push(" " + l);
+                  lines.push(` ${l}`);
               }
             }
             lines.push("");
             lines.push(
               ...wrap(
-                " " +
-                  theme.fg(
-                    "dim",
-                    "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
-                  ),
+                ` ${theme.fg(
+                  "dim",
+                  "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+                )}`,
               ),
             );
             lines.push(theme.fg("accent", "─".repeat(W)));
@@ -2339,11 +2654,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 : theme.fg(canSubmit ? "success" : "dim", submitText);
               tabs.push(`${sStyled}`);
               // naive join wrapped
-              lines.push(" " + tabs.join(""));
+              lines.push(` ${tabs.join("")}`);
               lines.push("");
             }
             if (inputMode && q) {
-              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
               lines.push("");
               for (let i = 0; i < opts.length; i++) {
                 const opt = opts[i];
@@ -2355,23 +2670,23 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 lines.push(...wrap(prefix + theme.fg(color as any, label)));
                 if (opt.description)
                   lines.push(
-                    ...wrap("     " + theme.fg("muted", opt.description)),
+                    ...wrap(`     ${theme.fg("muted", opt.description)}`),
                   );
               }
               lines.push("");
-              lines.push(...wrap(" " + theme.fg("muted", "Your answer:")));
+              lines.push(...wrap(` ${theme.fg("muted", "Your answer:")}`));
               for (const l of editor.render(Math.max(1, W - 2)))
-                lines.push(" " + l);
+                lines.push(` ${l}`);
               lines.push("");
               lines.push(
                 ...wrap(
-                  " " + theme.fg("dim", "Enter to submit • Esc to go back"),
+                  ` ${theme.fg("dim", "Enter to submit • Esc to go back")}`,
                 ),
               );
             } else if (currentTab === questions.length) {
               lines.push(
                 ...wrap(
-                  " " + theme.fg("accent", theme.bold("Ready to submit")),
+                  ` ${theme.fg("accent", theme.bold("Ready to submit"))}`,
                 ),
               );
               lines.push("");
@@ -2381,12 +2696,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   const prefix = a.wasCustom ? "(wrote) " : "";
                   lines.push(
                     ...wrap(
-                      "  " +
-                        theme.fg(
-                          "muted",
-                          `${questions[i].header || `Q${i + 1}`}: `,
-                        ) +
-                        theme.fg("text", prefix + a.answer),
+                      `  ${theme.fg(
+                        "muted",
+                        `${questions[i].header || `Q${i + 1}`}: `,
+                      )}${theme.fg("text", prefix + a.answer)}`,
                     ),
                   );
                 }
@@ -2394,7 +2707,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               lines.push("");
               if (allAnswered())
                 lines.push(
-                  ...wrap(" " + theme.fg("success", "Press Enter to submit")),
+                  ...wrap(` ${theme.fg("success", "Press Enter to submit")}`),
                 );
               else {
                 const missing = questions
@@ -2402,11 +2715,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   .map((q, idx) => q.header || `Q${idx + 1}`)
                   .join(", ");
                 lines.push(
-                  ...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)),
+                  ...wrap(` ${theme.fg("warning", `Unanswered: ${missing}`)}`),
                 );
               }
             } else if (q) {
-              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
               lines.push("");
               const prevAns = answers.get(currentTab);
               for (let i = 0; i < opts.length; i++) {
@@ -2414,19 +2727,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 const sel = i === optionIndex;
                 const isPrevSelected = isCustomSelected(prevAns, opt, i);
                 const isOther = !!opt.isOther;
-                const prefix = sel
-                  ? theme.fg("accent", "> ")
-                  : isPrevSelected
-                    ? theme.fg("success", "✓ ")
-                    : "  ";
+                let prefix: string;
+                let color: string;
+                if (sel) {
+                  prefix = theme.fg("accent", "> ");
+                  color = "accent";
+                } else if (isPrevSelected) {
+                  prefix = theme.fg("success", "✓ ");
+                  color = "success";
+                } else if (isOther && inputMode) {
+                  prefix = "  ";
+                  color = "accent";
+                } else {
+                  prefix = "  ";
+                  color = "text";
+                }
                 const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-                const color = sel
-                  ? "accent"
-                  : isPrevSelected
-                    ? "success"
-                    : isOther && inputMode
-                      ? "accent"
-                      : "text";
                 lines.push(
                   ...wrapWithPrefix(prefix, theme.fg(color as any, label)),
                 );
@@ -2445,20 +2761,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   const answerLines = prevAns.answer.split("\n");
                   if (answerLines.length === 1) {
                     lines.push(
-                      ...wrapWithPrefix("    ", answerLabel + answerVal),
+                      ...wrapWithPrefix("    ", `${answerLabel}${answerVal}`),
                     );
                   } else {
                     lines.push(
                       ...wrapWithPrefix(
                         "    ",
-                        answerLabel + theme.fg("text", `"${answerLines[0]}`),
+                        `${answerLabel}${theme.fg("text", `"${answerLines[0]}`)}`,
                       ),
                     );
                     for (let ai = 1; ai < answerLines.length; ai++) {
+                      const closing = ai === answerLines.length - 1 ? `"` : "";
                       const seg = theme.fg(
                         "text",
-                        answerLines[ai] +
-                          (ai === answerLines.length - 1 ? `"` : ""),
+                        `${answerLines[ai]}${closing}`,
                       );
                       lines.push(...wrapWithPrefix("    ", seg));
                     }
@@ -2471,7 +2787,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const help = isMulti
                 ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
                 : "↑↓ navigate • Enter select • Esc cancel";
-              lines.push(...wrap(" " + theme.fg("dim", help)));
+              lines.push(...wrap(` ${theme.fg("dim", help)}`));
             }
             lines.push(theme.fg("accent", "─".repeat(W)));
             cached = lines;
@@ -2858,6 +3174,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
               typeof (d as any).lastModeSwitch === "object"
             ) {
               lastModeSwitch = (d as any).lastModeSwitch as any;
+            }
+            // restore the remembered Default-mode model
+            const dm = (d as any).defaultModel;
+            if (
+              dm &&
+              typeof dm === "object" &&
+              typeof dm.provider === "string" &&
+              typeof dm.id === "string"
+            ) {
+              defaultModel = {
+                provider: dm.provider,
+                id: dm.id,
+                thinking:
+                  typeof dm.thinking === "string" ? dm.thinking : undefined,
+              };
             }
             awaitingDecision = !!d.awaitingDecision;
             lastHandoffAt =
