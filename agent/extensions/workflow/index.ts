@@ -1068,6 +1068,146 @@ export default function workflowExtension(pi: ExtensionAPI) {
     void _e;
   }
 
+  // ── /commit: AI-assisted commit of staged changes ────────────────
+
+  // Defensive git exec (mirrors checkpoint.ts gitShadow): pi.exec may report
+  // the exit code as `exitCode` or `code` depending on pi version; never throws.
+  async function piExecGit(args: string[], cwd?: string) {
+    try {
+      const res: any = await (pi as any).exec(
+        "git",
+        args,
+        cwd ? { cwd } : undefined,
+      );
+      return {
+        stdout: String(res?.stdout ?? ""),
+        stderr: String(res?.stderr ?? ""),
+        exitCode:
+          typeof res?.exitCode === "number"
+            ? res.exitCode
+            : typeof res?.code === "number"
+              ? res.code
+              : 0,
+      };
+    } catch (e: any) {
+      return {
+        stdout: "",
+        stderr: String(e?.message ?? e ?? "git exec failed"),
+        exitCode: 1,
+      };
+    }
+  }
+
+  function buildCommitPrompt(statSummary: string, stageAll: boolean): string {
+    return [
+      `The user ran /commit${stageAll ? " -a" : ""} and wants to commit the currently staged changes.`,
+      "",
+      "STAGED FILES:",
+      statSummary,
+      "",
+      "INSTRUCTIONS:",
+      "1. Run `git diff --staged` via the bash tool to see the full diff of the staged changes.",
+      "2. Analyze the diff and compose a concise, free-form commit message summarizing the changes.",
+      "3. Present the proposed message to the user using the questionnaire tool with exactly these options:",
+      '   - { label: "✅ Commit", description: "Commit with this message" }',
+      '   - { label: "✏️ Edit", description: "Modify the message before committing" }',
+      '   - { label: "❌ Cancel", description: "Abort without committing" }',
+      '   Use question: "Proposed commit message:\\n\\n  <your message>\\n\\nCommit these staged changes?" and header: "Commit".',
+      '   (The questionnaire tool auto-appends a "Type something." freeform option — if the user types a custom message, use that text as the commit message instead.)',
+      "4. After the user responds:",
+      '   - "✅ Commit" → run `git commit -m "<message>"` via the bash tool.',
+      '   - "✏️ Edit" or custom written text → run `git commit -m "<written message>"` via the bash tool.',
+      '   - "❌ Cancel" → do NOT commit; report that the commit was cancelled by the user.',
+      "5. Report the outcome (commit success output, or the error if it failed).",
+      "",
+      "IMPORTANT CONSTRAINTS:",
+      "- Only commit the staged changes. Do NOT run `git add` or `git commit -a`.",
+      "- Leave all unstaged changes untouched.",
+      "- If the commit fails (e.g., pre-commit hook, empty message), report the error and do NOT retry.",
+      "- Escape special characters in the commit message appropriately for the shell, or use `git commit -F <file>` for complex messages.",
+    ].join("\n");
+  }
+
+  async function handleCommitCommand(args: string, ctx: any) {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const stageAll = /(^|\s)-a(\s|$)/.test(args.trim());
+
+    // Not a git repo → warn and stop
+    if (!isGitRepoSync(cwd)) {
+      const isRepo = await isGitRepo(pi as any, cwd);
+      if (!isRepo) {
+        ctx.ui.notify("Not a git repository.", "warning");
+        return;
+      }
+    }
+
+    // Plan mode is read-only by design — committing is a write operation
+    if (workflowMode === "plan") {
+      ctx.ui.notify(
+        "Commit is not available in Plan mode. Switch to Build or Default mode first (/build or /default).",
+        "warning",
+      );
+      return;
+    }
+
+    // -a: stage all tracked changes (never touches untracked files)
+    if (stageAll) {
+      const addRes = await piExecGit(["add", "-u"], cwd);
+      if (addRes.exitCode !== 0) {
+        ctx.ui.notify(
+          `Failed to stage tracked changes: ${addRes.stderr.trim()}`,
+          "error",
+        );
+        return;
+      }
+    }
+
+    // Verify there is something staged to commit
+    const statRes = await piExecGit(["diff", "--staged", "--stat"], cwd);
+    const statSummary = statRes.stdout.trim();
+    if (!statSummary) {
+      ctx.ui.notify(
+        stageAll
+          ? "No tracked changes to commit."
+          : "No staged changes to commit. Use `git add` to stage files first, or `/commit -a` to stage all tracked changes.",
+        "info",
+      );
+      return;
+    }
+
+    // Inject a user message → triggers an agent turn that proposes + confirms + commits
+    const message = buildCommitPrompt(statSummary, stageAll);
+    if ((pi as any).sendUserMessage) {
+      (pi as any).sendUserMessage(message);
+    } else {
+      (pi as any).sendMessage?.(
+        { customType: "workflow-commit", content: message, display: true },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    }
+  }
+
+  try {
+    pi.registerCommand("commit", {
+      description:
+        "Commit staged changes with an AI-summarized message (-a: stage tracked changes first)",
+      handler: async (args: string, ctx: any) => handleCommitCommand(args, ctx),
+      getArgumentCompletions: (prefix: string) => {
+        const flags = [
+          {
+            value: "-a",
+            label: "-a",
+            description: "Stage all tracked changes before committing",
+          },
+        ];
+        const filtered = flags.filter((f) => f.value.startsWith(prefix));
+        return filtered.length ? filtered : null;
+      },
+    } as any);
+  } catch (_e) {
+    void _e;
+  }
+
   try {
     pi.registerShortcut(Key.ctrlAlt("p"), {
       description: "Toggle plan/build mode",
