@@ -304,6 +304,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let overlayActive = false;
   let todoItems: TodoItem[] = [];
   let toolsBeforePlanMode: string[] | undefined;
+  // Track the model active in Default mode so it can be restored when
+  // returning from Plan/Build (otherwise the role model leaks into Default).
+  let defaultModel:
+    | { provider: string; id: string; thinking?: string }
+    | undefined;
   let currentPlanFile: string | undefined;
   let awaitingDecision = false;
   let lastHandoffAt: number | undefined;
@@ -622,6 +627,53 @@ export default function workflowExtension(pi: ExtensionAPI) {
     return true;
   }
 
+  /** Capture the model currently active so Default mode can restore it later. */
+  function captureDefaultModel(ctx: ExtensionContext) {
+    try {
+      const cur =
+        (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+      if (cur?.provider && cur?.id) {
+        let thinking: string | undefined;
+        try {
+          thinking = (pi as any)?.getThinkingLevel?.();
+        } catch (_e) {
+          void _e;
+        }
+        defaultModel = { provider: cur.provider, id: cur.id, thinking };
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Restore the model that was active the last time Default mode was left. */
+  async function restoreDefaultModel(ctx: ExtensionContext): Promise<void> {
+    if (!defaultModel) return;
+    let found: any;
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      found = reg?.find?.(defaultModel.provider, defaultModel.id);
+    } catch (_e) {
+      void _e;
+    }
+    if (!found) return; // registry no longer has it — keep current model
+    try {
+      await (pi as any).setModel?.(found);
+      if (
+        defaultModel.thinking &&
+        isValidThinkingLevel(defaultModel.thinking)
+      ) {
+        (pi as any).setThinkingLevel?.(defaultModel.thinking);
+      }
+      ctx.ui.notify(
+        `Default mode: model → ${defaultModel.provider}/${defaultModel.id}${defaultModel.thinking ? ` (${defaultModel.thinking})` : ""}`,
+        "info",
+      );
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
@@ -638,6 +690,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       role: {
         activeRole: roleConfig.activeRole,
       },
+      defaultModel,
       lastModeSwitch,
     } as any);
   }
@@ -645,18 +698,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
   async function setPlanMode(ctx: ExtensionContext) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
-        "Already in Plan mode — read-only. Press Tab or /build to switch to Build.",
+        "Already in Plan mode — read-only. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
         "info",
       );
       return;
     }
+    // Leaving Default mode: remember its model so it can be restored on return.
+    if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "plan";
     syncLegacyFlags();
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
     pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
     ctx.ui.notify(
-      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab or /build to switch to Build.",
+      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
       "info",
     );
     try {
@@ -678,11 +733,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
   async function setBuildMode(ctx: ExtensionContext) {
     if (workflowMode === "build") {
       ctx.ui.notify(
-        "Already in Build mode — full access. Press Tab or /plan to switch to Plan.",
+        "Already in Build mode — full access. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
         "info",
       );
       return;
     }
+    // Leaving Default mode (e.g. /build from default): remember its model.
+    if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "build";
     syncLegacyFlags();
     pi.setActiveTools(
@@ -690,7 +747,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     );
     toolsBeforePlanMode = undefined;
     ctx.ui.notify(
-      "Build mode — full access restored. Press Tab or /plan to switch to Plan.",
+      "Build mode — full access restored. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
       "info",
     );
     try {
@@ -702,9 +759,46 @@ export default function workflowExtension(pi: ExtensionAPI) {
     persistState();
   }
 
+  async function setDefaultMode(ctx: ExtensionContext) {
+    if (workflowMode === null) {
+      ctx.ui.notify(
+        "Already in Default mode — no workflow. Press Tab or /plan to switch to Plan.",
+        "info",
+      );
+      return;
+    }
+    workflowMode = null;
+    syncLegacyFlags();
+    // Restore original tools
+    if (toolsBeforePlanMode) {
+      pi.setActiveTools(toolsBeforePlanMode);
+      toolsBeforePlanMode = undefined;
+    }
+    // Clear workflow-specific state (default = no active workflow;
+    // the plan file on disk is preserved)
+    todoItems = [];
+    currentPlanFile = undefined;
+    awaitingDecision = false;
+    lastHandoffAt = undefined;
+    // Restore the model that was active in Default mode (don't leak the
+    // Build/Plan role model into Default).
+    try {
+      await restoreDefaultModel(ctx);
+    } catch (_e) {
+      void _e;
+    }
+    updateStatus(ctx);
+    persistState();
+    ctx.ui.notify(
+      "Default mode — workflow off, full access. Press Tab to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
+      "info",
+    );
+  }
+
   async function cycleWorkflowMode(ctx: ExtensionContext) {
-    if (workflowMode === "plan") await setBuildMode(ctx);
-    else await setPlanMode(ctx);
+    if (workflowMode === null) await setPlanMode(ctx);
+    else if (workflowMode === "plan") await setBuildMode(ctx);
+    else await setDefaultMode(ctx); // "build" → null (default)
   }
 
   // legacy alias for backward compat
@@ -960,6 +1054,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     pi.registerCommand("build", {
       description: "Enable Build mode (full access, idempotent)",
       handler: async (_args, ctx) => setBuildMode(ctx as any),
+    });
+  } catch (_e) {
+    void _e;
+  }
+
+  try {
+    pi.registerCommand("default", {
+      description: "Switch to default mode (no workflow, full access)",
+      handler: async (_args, ctx) => setDefaultMode(ctx as any),
     });
   } catch (_e) {
     void _e;
@@ -1500,18 +1603,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
             const st = staged.get(role.name)!;
             const cur = `${st.provider}/${st.id}`;
             const src = showAll ? catalog.all : catalog.scoped;
-            return src.map((e) => ({
-              value: `${e.provider}/${e.id}`,
-              label: `${e.provider}/${e.id}`,
-              description:
-                `${e.provider}/${e.id}` === cur
-                  ? "● selected"
-                  : `${e.provider}/${e.id}` === currentRef(role)
-                    ? "current"
-                    : showAll && !e.inScope
-                      ? "all"
-                      : undefined,
-            }));
+            return src.map((e) => {
+              const ref = `${e.provider}/${e.id}`;
+              let description: string | undefined;
+              if (ref === cur) {
+                description = "● selected";
+              } else if (ref === currentRef(role)) {
+                description = "current";
+              } else if (showAll && !e.inScope) {
+                description = "all";
+              } else {
+                description = undefined;
+              }
+              return { value: ref, label: ref, description };
+            });
           };
           const modelLists = new Map<string, SelectList>();
           const thinkingList = new SelectList(
@@ -1669,13 +1774,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 ? theme.bg("selectedBg", theme.fg("text", submitLbl))
                 : theme.fg("success", submitLbl),
             );
-            lines.push(" " + chips.join(""));
+            lines.push(` ${chips.join("")}`);
             lines.push("");
             if (isSubmitTab()) {
               lines.push(
                 ...wrap(
-                  " " +
-                    theme.fg("text", "Review — Enter to save, Esc to cancel"),
+                  ` ${theme.fg("text", "Review — Enter to save, Esc to cancel")}`,
                 ),
               );
               lines.push("");
@@ -1683,12 +1787,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 const st = staged.get(r.name)!;
                 lines.push(
                   ...wrap(
-                    "  " +
-                      theme.fg("muted", `${roleIcon(r.name)} ${r.name}: `) +
-                      theme.fg(
-                        "text",
-                        `${st.provider}/${st.id} (${st.thinking})`,
-                      ),
+                    `  ${theme.fg("muted", `${roleIcon(r.name)} ${r.name}: `)}${theme.fg(
+                      "text",
+                      `${st.provider}/${st.id} (${st.thinking})`,
+                    )}`,
                   ),
                 );
               }
@@ -1697,65 +1799,56 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const st = staged.get(role.name)!;
               lines.push(
                 ...wrap(
-                  " " +
-                    theme.fg(
-                      "text",
-                      `${roleIcon(role.name)} ${role.name} — ${role.description}`,
-                    ),
+                  ` ${theme.fg(
+                    "text",
+                    `${roleIcon(role.name)} ${role.name} — ${role.description}`,
+                  )}`,
                 ),
               );
               lines.push(
                 ...wrap(
-                  " " +
-                    theme.fg(
-                      "muted",
-                      `staged: ${st.provider}/${st.id} (${st.thinking})`,
-                    ),
+                  ` ${theme.fg(
+                    "muted",
+                    `staged: ${st.provider}/${st.id} (${st.thinking})`,
+                  )}`,
                 ),
               );
               lines.push("");
               if (phase === "model") {
                 const src = showAll ? catalog.all : catalog.scoped;
                 const scopeLabel = showAll
-                  ? "all " +
-                    String(catalog.all.length) +
-                    (catalog.truncated ? "+" : "")
-                  : "scoped " + String(catalog.scoped.length);
+                  ? `all ${String(catalog.all.length)}${catalog.truncated ? "+" : ""}`
+                  : `scoped ${String(catalog.scoped.length)}`;
                 const toggleHint =
                   catalog.scoped.length > 0 && !showAll
                     ? " — Ctrl+O for all"
                     : "";
                 lines.push(
                   ...wrap(
-                    " " +
-                      theme.fg(
-                        "accent",
-                        "Model (" +
-                          scopeLabel +
-                          toggleHint +
-                          ") — type to filter:",
-                      ),
+                    ` ${theme.fg(
+                      "accent",
+                      `Model (${scopeLabel}${toggleHint}) — type to filter:`,
+                    )}`,
                   ),
                 );
                 for (const l of getModelList(role).render(Math.max(1, W - 2)))
-                  lines.push(" " + l);
+                  lines.push(` ${l}`);
                 void src;
               } else {
                 lines.push(
-                  ...wrap(" " + theme.fg("accent", "Thinking level:")),
+                  ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
                 );
                 for (const l of thinkingList.render(Math.max(1, W - 2)))
-                  lines.push(" " + l);
+                  lines.push(` ${l}`);
               }
             }
             lines.push("");
             lines.push(
               ...wrap(
-                " " +
-                  theme.fg(
-                    "dim",
-                    "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
-                  ),
+                ` ${theme.fg(
+                  "dim",
+                  "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+                )}`,
               ),
             );
             lines.push(theme.fg("accent", "─".repeat(W)));
@@ -2421,11 +2514,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 : theme.fg(canSubmit ? "success" : "dim", submitText);
               tabs.push(`${sStyled}`);
               // naive join wrapped
-              lines.push(" " + tabs.join(""));
+              lines.push(` ${tabs.join("")}`);
               lines.push("");
             }
             if (inputMode && q) {
-              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
               lines.push("");
               for (let i = 0; i < opts.length; i++) {
                 const opt = opts[i];
@@ -2437,23 +2530,23 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 lines.push(...wrap(prefix + theme.fg(color as any, label)));
                 if (opt.description)
                   lines.push(
-                    ...wrap("     " + theme.fg("muted", opt.description)),
+                    ...wrap(`     ${theme.fg("muted", opt.description)}`),
                   );
               }
               lines.push("");
-              lines.push(...wrap(" " + theme.fg("muted", "Your answer:")));
+              lines.push(...wrap(` ${theme.fg("muted", "Your answer:")}`));
               for (const l of editor.render(Math.max(1, W - 2)))
-                lines.push(" " + l);
+                lines.push(` ${l}`);
               lines.push("");
               lines.push(
                 ...wrap(
-                  " " + theme.fg("dim", "Enter to submit • Esc to go back"),
+                  ` ${theme.fg("dim", "Enter to submit • Esc to go back")}`,
                 ),
               );
             } else if (currentTab === questions.length) {
               lines.push(
                 ...wrap(
-                  " " + theme.fg("accent", theme.bold("Ready to submit")),
+                  ` ${theme.fg("accent", theme.bold("Ready to submit"))}`,
                 ),
               );
               lines.push("");
@@ -2463,12 +2556,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   const prefix = a.wasCustom ? "(wrote) " : "";
                   lines.push(
                     ...wrap(
-                      "  " +
-                        theme.fg(
-                          "muted",
-                          `${questions[i].header || `Q${i + 1}`}: `,
-                        ) +
-                        theme.fg("text", prefix + a.answer),
+                      `  ${theme.fg(
+                        "muted",
+                        `${questions[i].header || `Q${i + 1}`}: `,
+                      )}${theme.fg("text", prefix + a.answer)}`,
                     ),
                   );
                 }
@@ -2476,7 +2567,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               lines.push("");
               if (allAnswered())
                 lines.push(
-                  ...wrap(" " + theme.fg("success", "Press Enter to submit")),
+                  ...wrap(` ${theme.fg("success", "Press Enter to submit")}`),
                 );
               else {
                 const missing = questions
@@ -2484,11 +2575,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   .map((q, idx) => q.header || `Q${idx + 1}`)
                   .join(", ");
                 lines.push(
-                  ...wrap(" " + theme.fg("warning", `Unanswered: ${missing}`)),
+                  ...wrap(` ${theme.fg("warning", `Unanswered: ${missing}`)}`),
                 );
               }
             } else if (q) {
-              lines.push(...wrap(" " + theme.fg("text", q.question)));
+              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
               lines.push("");
               const prevAns = answers.get(currentTab);
               for (let i = 0; i < opts.length; i++) {
@@ -2496,19 +2587,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 const sel = i === optionIndex;
                 const isPrevSelected = isCustomSelected(prevAns, opt, i);
                 const isOther = !!opt.isOther;
-                const prefix = sel
-                  ? theme.fg("accent", "> ")
-                  : isPrevSelected
-                    ? theme.fg("success", "✓ ")
-                    : "  ";
+                let prefix: string;
+                let color: string;
+                if (sel) {
+                  prefix = theme.fg("accent", "> ");
+                  color = "accent";
+                } else if (isPrevSelected) {
+                  prefix = theme.fg("success", "✓ ");
+                  color = "success";
+                } else if (isOther && inputMode) {
+                  prefix = "  ";
+                  color = "accent";
+                } else {
+                  prefix = "  ";
+                  color = "text";
+                }
                 const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-                const color = sel
-                  ? "accent"
-                  : isPrevSelected
-                    ? "success"
-                    : isOther && inputMode
-                      ? "accent"
-                      : "text";
                 lines.push(
                   ...wrapWithPrefix(prefix, theme.fg(color as any, label)),
                 );
@@ -2527,20 +2621,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   const answerLines = prevAns.answer.split("\n");
                   if (answerLines.length === 1) {
                     lines.push(
-                      ...wrapWithPrefix("    ", answerLabel + answerVal),
+                      ...wrapWithPrefix("    ", `${answerLabel}${answerVal}`),
                     );
                   } else {
                     lines.push(
                       ...wrapWithPrefix(
                         "    ",
-                        answerLabel + theme.fg("text", `"${answerLines[0]}`),
+                        `${answerLabel}${theme.fg("text", `"${answerLines[0]}`)}`,
                       ),
                     );
                     for (let ai = 1; ai < answerLines.length; ai++) {
+                      const closing = ai === answerLines.length - 1 ? `"` : "";
                       const seg = theme.fg(
                         "text",
-                        answerLines[ai] +
-                          (ai === answerLines.length - 1 ? `"` : ""),
+                        `${answerLines[ai]}${closing}`,
                       );
                       lines.push(...wrapWithPrefix("    ", seg));
                     }
@@ -2553,7 +2647,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const help = isMulti
                 ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
                 : "↑↓ navigate • Enter select • Esc cancel";
-              lines.push(...wrap(" " + theme.fg("dim", help)));
+              lines.push(...wrap(` ${theme.fg("dim", help)}`));
             }
             lines.push(theme.fg("accent", "─".repeat(W)));
             cached = lines;
@@ -2940,6 +3034,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
               typeof (d as any).lastModeSwitch === "object"
             ) {
               lastModeSwitch = (d as any).lastModeSwitch as any;
+            }
+            // restore the remembered Default-mode model
+            const dm = (d as any).defaultModel;
+            if (
+              dm &&
+              typeof dm === "object" &&
+              typeof dm.provider === "string" &&
+              typeof dm.id === "string"
+            ) {
+              defaultModel = {
+                provider: dm.provider,
+                id: dm.id,
+                thinking:
+                  typeof dm.thinking === "string" ? dm.thinking : undefined,
+              };
             }
             awaitingDecision = !!d.awaitingDecision;
             lastHandoffAt =

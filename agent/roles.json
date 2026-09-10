@@ -6,7 +6,7 @@
       "description": "Frontier reasoning model for planning, orchestration, and ambiguous decisions",
       "model": {
         "provider": "opencode-go",
-        "id": "mimo-v2.5-pro",
+        "id": "longcat-2.0",
         "thinking": "high"
       },
       "tools": [],
@@ -36,7 +36,7 @@
       "description": "Capable model for code generation following a plan, with light reasoning",
       "model": {
         "provider": "opencode-go",
-        "id": "mimo-v2.5",
+        "id": "omen-alpha",
         "thinking": "medium"
       },
       "tools": [],

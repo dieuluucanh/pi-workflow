@@ -2,6 +2,7 @@
 plans/
 .pi/plans/
 agent/sessions/
+agent/memory/
 sessions/
 agent/checkpoints/
 checkpoints/

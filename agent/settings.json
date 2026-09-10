@@ -5,7 +5,9 @@
     "npm:pi-lens",
     "npm:pi-web-access",
     "npm:@plannotator/pi-extension",
-    "npm:pi-memory"
+    "npm:pi-memory",
+    "npm:@dieulc/pi-office-protocol@0.1.0",
+    "npm:@dieulc/pi-office-bridge"
   ],
   "enabledModels": [
     "opencode-go/muse-spark-1.2-contributor",
