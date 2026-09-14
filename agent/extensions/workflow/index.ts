@@ -51,7 +51,6 @@ import {
   markCompletedRefs,
   resolveTodoRef,
   mergeTodoItems,
-  dedupeTodoItems,
   ensureTodoLabels,
   synthesizeFromPlanTitle,
   normalizeStepText,
@@ -63,7 +62,19 @@ import {
   getHeaderText,
   formatTimestamp,
   shortId,
+  itemStatus,
+  isDone,
+  setTodoStatus,
+  todoRef,
+  applyTodoUpdate,
+  formatTodoLine,
+  buildTodoContextBlock,
+  buildTodoFooter,
+  formatAmbiguity,
+  shouldRemind,
+  type TodoStatus,
   type TodoItem,
+  type TodoUpdateEntry,
 } from "./utils.ts";
 import {
   isGitRepo,
@@ -312,6 +323,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let todoItems: TodoItem[] = [];
   // Plan file the current todo list was derived from (drives merge vs replace).
   let todoPlanPath: string | undefined;
+  // ── Reminder throttle + staleness tracking (passive enforcement layer) ──
+  let turnsSinceLastTodoWrite = 0;
+  let turnsSinceLastReminder = 0;
+  let mutatedSinceLastTodoWrite = false;
+  let lastRefMisses: { refs: string[] } | undefined;
+  let todoStale = false;
+  let footerInjectedThisTurn = false;
+  let lastStaleNoticeAt: number | undefined;
   let toolsBeforePlanMode: string[] | undefined;
   // Track the model active in Default mode so it can be restored when
   // returning from Plan/Build (otherwise the role model leaks into Default).
@@ -409,9 +428,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // alias for clarity: Build is the off-state of Plan
   const getBuildTools = getNormalTools;
 
-  /** Display label for a todo row (plan-faithful when available). */
+  /** Reset reminder/staleness tracking after a successful todo write. */
+  function onTodoWrite() {
+    turnsSinceLastTodoWrite = 0;
+    mutatedSinceLastTodoWrite = false;
+    todoStale = false;
+  }
+
+  /** Display ref for a todo row (stable canonical GLOBAL step). */
   function todoLabel(it: TodoItem, index: number): string {
-    return it.label || String(it.step || index + 1);
+    return todoRef(it) || String(it.step || index + 1);
   }
 
   /**
@@ -436,7 +462,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
       rows.push({ item, index });
     });
-    const firstUndone = todoItems.findIndex((t) => !t.completed);
+    const firstUndone = todoItems.findIndex(
+      (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+    );
     const anchorIndex = firstUndone < 0 ? 0 : firstUndone;
     let startRow = rows.findIndex((r) => r.item && r.index === anchorIndex);
     if (startRow < 0) startRow = 0;
@@ -451,16 +479,24 @@ export default function workflowExtension(pi: ExtensionAPI) {
         );
       }
       const item = row.item as TodoItem;
-      const label = todoLabel(item, row.index);
-      const isCurrent = row.index === anchorIndex && !item.completed;
-      const prefix = isCurrent
-        ? theme.fg("accent", "▶ ")
-        : item.completed
-          ? theme.fg("success", "☑ ")
-          : theme.fg("dim", "☐ ");
-      const body = `${label}. ${item.text}`;
+      const ref = todoLabel(item, row.index);
+      const status = itemStatus(item);
+      const isCurrent = row.index === anchorIndex && !isDone(item);
+      const prefix =
+        isCurrent || status === "in_progress"
+          ? theme.fg("accent", "▶ ")
+          : status === "completed"
+            ? theme.fg("success", "☑ ")
+            : status === "cancelled"
+              ? theme.fg("dim", "✖ ")
+              : theme.fg("dim", "☐ ");
+      const labelPart =
+        item.label !== undefined && String(item.label) !== ref
+          ? theme.fg("muted", ` (${item.label})`)
+          : "";
+      const body = `${ref}. ${item.text}${labelPart}`;
       let styled: string;
-      if (item.completed) {
+      if (isDone(item)) {
         styled = theme.fg("muted", theme.strikethrough(body));
       } else if (isCurrent && mode === "build") {
         styled = theme.fg("accent", body);
@@ -481,23 +517,28 @@ export default function workflowExtension(pi: ExtensionAPI) {
   function updateStatus(ctx: ExtensionContext) {
     const roleLabel = activeRoleLabel();
     const suffix = roleLabel ? ` | ${roleLabel}` : "";
-    const done = todoItems.filter((t) => t.completed).length;
+    const staleMarker = todoStale ? " ⚠" : "";
+    const done = todoItems.filter((t) => isDone(t)).length;
     const total = todoItems.length;
     if (workflowMode === "build") {
       const label =
-        total > 0 ? `▶ build ${done}/${total}${suffix}` : `▶ build${suffix}`;
+        total > 0
+          ? `▶ build ${done}/${total}${staleMarker}${suffix}`
+          : `▶ build${suffix}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", label));
     } else if (workflowMode === "plan") {
       const base = plannotatorActive
         ? "⏸ plan — reviewing in browser"
         : "⏸ plan";
       const label =
-        total > 0 ? `${base} ${done}/${total}${suffix}` : `${base}${suffix}`;
+        total > 0
+          ? `${base} ${done}/${total}${staleMarker}${suffix}`
+          : `${base}${suffix}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (total > 0) {
       ctx.ui.setStatus(
         "workflow",
-        ctx.ui.theme.fg("muted", `◦ ${done}/${total}${suffix}`),
+        ctx.ui.theme.fg("muted", `◦ ${done}/${total}${staleMarker}${suffix}`),
       );
     } else {
       ctx.ui.setStatus("workflow", undefined);
@@ -811,12 +852,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   /**
    * Load plan steps from a plan file and merge them into the todo list.
-   * Same plan file → completion state is preserved; a different plan → replace.
+   * Same plan file → completion state is preserved (status-aware merge,
+   * agent-added items kept); a different plan → replace.
    */
   function loadTodosFromPlan(
     planPath: string,
     cwd: string,
-  ): { count: number; replaced: boolean } {
+  ): { count: number; replaced: boolean; preserved: number } {
     let extracted: TodoItem[] = [];
     try {
       const abs = path.isAbsolute(planPath)
@@ -832,7 +874,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
     if (extracted.length === 0)
-      return { count: todoItems.length, replaced: false };
+      return { count: todoItems.length, replaced: false, preserved: 0 };
     const samePlan = (() => {
       try {
         return (
@@ -844,13 +886,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     })();
     if (samePlan) {
-      todoItems = mergeTodoItems(todoItems, extracted).items;
+      const merged = mergeTodoItems(todoItems, extracted);
+      todoItems = merged.items;
       todoPlanPath = planPath;
-      return { count: todoItems.length, replaced: false };
+      return {
+        count: todoItems.length,
+        replaced: false,
+        preserved: merged.preserved,
+      };
     }
     todoItems = ensureTodoLabels(extracted);
     todoPlanPath = planPath;
-    return { count: todoItems.length, replaced: true };
+    return { count: todoItems.length, replaced: true, preserved: 0 };
   }
 
   async function enterBuildModeFromPlan(
@@ -1289,16 +1336,58 @@ export default function workflowExtension(pi: ExtensionAPI) {
     name: "workflow_todo",
     label: "Workflow Todo",
     description:
-      "Manage the plan todo list. Actions: list, add (text, label?, group?), toggle (step | label), sync (re-read the current plan), clear.",
+      "Manage the plan todo list. Steps are numbered GLOBALLY 1..N — use these numbers as refs. Actions: list, update (send the COMPLETE list; items you omit are removed), done/pending (set one item's status by ref), add (new ad-hoc item), toggle, sync (re-read the plan file), clear.",
+    promptGuidelines: [
+      "workflow_todo: send the COMPLETE todo list to `update`; a step you omit is removed.",
+      "workflow_todo: mark a step `completed` IMMEDIATELY after finishing it (never batch completions at the end).",
+      "workflow_todo: keep exactly one step `in_progress`; set it before starting a step and clear it when that step is done.",
+      "workflow_todo: never mark a step `completed` unless the work is fully done (Claude Code rule: never based on intent).",
+      "workflow_todo: reference steps by their GLOBAL number (shown before the text), never the plan's per-phase label.",
+    ],
     parameters: Type.Object({
-      action: StringEnum(["list", "add", "toggle", "sync", "clear"] as const),
+      action: StringEnum([
+        "list",
+        "update",
+        "done",
+        "pending",
+        "add",
+        "toggle",
+        "sync",
+        "clear",
+      ] as const),
+      todos: Type.Optional(
+        Type.Array(
+          Type.Object({
+            ref: Type.Optional(
+              Type.String({
+                description:
+                  "GLOBAL step ref of an existing item (optional for new items)",
+              }),
+            ),
+            text: Type.Optional(
+              Type.String({
+                description: "Step text (used when no ref given)",
+              }),
+            ),
+            status: Type.Optional(
+              Type.String({
+                description:
+                  '"pending" | "in_progress" | "completed" | "cancelled"',
+              }),
+            ),
+          }),
+        ),
+      ),
       text: Type.Optional(Type.String({ description: "Todo text (for add)" })),
       step: Type.Optional(
-        Type.Number({ description: "Step number (for toggle)" }),
+        Type.Number({
+          description: "GLOBAL step ref (for done/pending/toggle)",
+        }),
       ),
       label: Type.Optional(
         Type.String({
-          description: 'Plan label, e.g. "2" or "1.1" (for add/toggle)',
+          description:
+            'Plan label, e.g. "2" or "1.1" (fallback when no step ref)',
         }),
       ),
       group: Type.Optional(
@@ -1306,21 +1395,28 @@ export default function workflowExtension(pi: ExtensionAPI) {
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const renderList = (items: TodoItem[]) =>
+        items.length
+          ? `Steps are numbered GLOBALLY 1..${items.length}:
+` +
+            items
+              .map((t) => {
+                const g = t.group ? `[${t.group}] ` : "";
+                return `${g}${formatTodoLine(t)}`;
+              })
+              .join("\n")
+          : "(empty)";
+      const refError = (ref: string, resolved: any) =>
+        resolved.ambiguous
+          ? formatAmbiguity(resolved.ambiguous, ref)
+          : `Todo "${ref}" not found. Valid refs: ${todoItems.map((t) => todoRef(t)).join(", ") || "(none)"}`;
       switch (params.action) {
         case "list":
           return {
             content: [
               {
                 type: "text",
-                text: todoItems.length
-                  ? todoItems
-                      .map((t) => {
-                        const label = t.label || String(t.step);
-                        const g = t.group ? `[${t.group}] ` : "";
-                        return `[${t.completed ? "x" : " "}] ${g}${label}. ${t.text}`;
-                      })
-                      .join("\n")
-                  : "No todos",
+                text: renderList(todoItems),
               },
             ],
             details: {
@@ -1329,6 +1425,96 @@ export default function workflowExtension(pi: ExtensionAPI) {
               nextStep: todoItems.length + 1,
             } as TodoDetails,
           };
+        case "update": {
+          const incoming: TodoUpdateEntry[] = (params.todos ?? []).map((t) => ({
+            ref: t.ref,
+            text: t.text,
+            status: t.status as TodoStatus,
+          }));
+          const res = applyTodoUpdate(todoItems, incoming);
+          todoItems = res.items;
+          try {
+            if (currentSessionCtx) {
+              updateStatus(currentSessionCtx);
+              persistState();
+            }
+          } catch (_e) {
+            void _e;
+          }
+          onTodoWrite();
+          const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}.`;
+          return {
+            content: [
+              { type: "text", text: `${summary}\n${renderList(todoItems)}` },
+            ],
+            details: {
+              action: "update",
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+            } as TodoDetails,
+          };
+        }
+        case "done":
+        case "pending": {
+          const ref =
+            params.label !== undefined
+              ? String(params.label)
+              : params.step !== undefined
+                ? String(params.step)
+                : params.text !== undefined
+                  ? String(params.text)
+                  : undefined;
+          if (ref === undefined)
+            return {
+              content: [
+                { type: "text", text: "Error: step or label required" },
+              ],
+              details: {
+                action: params.action,
+                todos: [...todoItems],
+                nextStep: todoItems.length + 1,
+                error: "ref required",
+              } as TodoDetails,
+            };
+          const resolved = resolveTodoRef(todoItems, ref);
+          if (!resolved.item) {
+            return {
+              content: [{ type: "text", text: refError(ref, resolved) }],
+              details: {
+                action: params.action,
+                todos: [...todoItems],
+                nextStep: todoItems.length + 1,
+                error: resolved.ambiguous ? "ambiguous" : "not found",
+              } as TodoDetails,
+            };
+          }
+          const it = resolved.item;
+          const status: TodoStatus =
+            params.action === "done" ? "completed" : "pending";
+          setTodoStatus(it, status);
+          try {
+            if (currentSessionCtx) {
+              updateStatus(currentSessionCtx);
+              persistState();
+            }
+          } catch (_e) {
+            void _e;
+          }
+          onTodoWrite();
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}`,
+              },
+            ],
+            details: {
+              action: params.action,
+              todos: [...todoItems],
+              nextStep: todoItems.length + 1,
+            } as TodoDetails,
+          };
+        }
         case "add": {
           if (!params.text)
             return {
@@ -1348,7 +1534,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `Already tracked as ${existing.label || existing.step}. ${existing.text}`,
+                  text: `Already tracked as ${todoRef(existing)}. ${existing.text}`,
                 },
               ],
               details: {
@@ -1359,26 +1545,29 @@ export default function workflowExtension(pi: ExtensionAPI) {
               } as TodoDetails,
             };
           }
+          const step = todoItems.reduce((m, t) => Math.max(m, t.step), 0) + 1;
           const item: TodoItem = {
-            step: todoItems.reduce((m, t) => Math.max(m, t.step), 0) + 1,
+            step,
             text,
             completed: false,
-            label: params.label ? String(params.label) : undefined,
+            status: "pending",
+            ref: String(step),
+            label: params.label ? String(params.label) : String(step),
             group: params.group,
             source: "agent",
           };
-          if (!item.label) item.label = String(item.step);
           todoItems.push(item);
           try {
             if (currentSessionCtx) updateStatus(currentSessionCtx);
           } catch (_e) {
             void _e;
           }
+          onTodoWrite();
           return {
             content: [
               {
                 type: "text",
-                text: `Added ${item.label || item.step}. ${item.text}`,
+                text: `Added ${todoRef(item)}. ${item.text}`,
               },
             ],
             details: {
@@ -1409,16 +1598,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
             };
           const resolved = resolveTodoRef(todoItems, ref);
           if (!resolved.item) {
-            const valid = todoItems
-              .map((t) => t.label || String(t.step))
-              .join(", ");
             return {
-              content: [
-                {
-                  type: "text",
-                  text: `Todo "${ref}" ${resolved.ambiguous ? "is ambiguous" : "not found"}. Valid: ${valid || "(none)"}`,
-                },
-              ],
+              content: [{ type: "text", text: refError(ref, resolved) }],
               details: {
                 action: "toggle",
                 todos: [...todoItems],
@@ -1428,7 +1609,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
             };
           }
           const it = resolved.item;
-          it.completed = !it.completed;
+          setTodoStatus(it, isDone(it) ? "pending" : "completed");
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -1437,11 +1618,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
+          onTodoWrite();
           return {
             content: [
               {
                 type: "text",
-                text: `${it.label || it.step}. ${it.text} ${it.completed ? "done" : "pending"}`,
+                text: `${todoRef(it)}. ${it.text} toggled to ${it.completed ? "done" : "pending"}`,
               },
             ],
             details: {
@@ -1474,9 +1656,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
+          onTodoWrite();
+          const preservedNote =
+            loaded.preserved > 0
+              ? ` (kept ${loaded.preserved} agent-added)`
+              : "";
           return {
             content: [
-              { type: "text", text: `Synced ${loaded.count} todos from plan` },
+              {
+                type: "text",
+                text: `Synced ${loaded.count} todos from plan${preservedNote}`,
+              },
             ],
             details: {
               action: "sync",
@@ -1497,6 +1687,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           } catch (_e) {
             void _e;
           }
+          onTodoWrite();
           return {
             content: [{ type: "text", text: `Cleared ${c} todos` }],
             details: { action: "clear", todos: [], nextStep: 1 } as TodoDetails,
@@ -1522,11 +1713,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     description: "Show workflow todos",
     handler: async (_args, ctx) => {
       const list = todoItems.length
-        ? todoItems
-            .map((t, i) => {
-              const label = t.label || String(t.step || i + 1);
+        ? `Steps are numbered GLOBALLY 1..${todoItems.length}:
+` +
+          todoItems
+            .map((t) => {
               const g = t.group ? `[${t.group}] ` : "";
-              return `${g}${label}. ${t.completed ? "✓" : "○"} ${t.text}`;
+              return `${g}${formatTodoLine(t)}`;
             })
             .join("\n")
         : "No todos.";
@@ -3603,6 +3795,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   pi.on("turn_start", async (_event, ctx) => {
+    footerInjectedThisTurn = false;
     if (!currentEntryId) return;
     const cwd = (ctx as any).cwd as string;
     try {
@@ -3681,6 +3874,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
     ensurePlannotatorListeners();
+    // Fresh user prompt → reset the passive reminder cadence. Continuation runs
+    // (triggerTurn/steer/followUp) do not fire this event, so state survives them.
+    turnsSinceLastTodoWrite = 0;
+    turnsSinceLastReminder = 0;
+    mutatedSinceLastTodoWrite = false;
+    footerInjectedThisTurn = false;
     // Stale handoff reset: fresh user prompt means previous gate was dismissed/crashed
     try {
       const fw =
@@ -3731,22 +3930,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n${btwBlock}`,
-          display: false,
-        },
-      } as any;
-    }
-    if (workflowMode === "build" && todoItems.length > 0) {
-      const remaining = todoItems.filter((t) => !t.completed);
-      const list = remaining.map((t) => `${t.step}. ${t.text}`).join("\n");
-      const btwBlock = btwNotes.length
-        ? `\n\n[BTW]: ${btwNotes.join(" | ")}`
-        : "";
-      btwNotes = [];
-      return {
-        message: {
-          customType: "workflow-build-context",
-          content: `[BUILD MODE — executing plan. Full tool access enabled.]\n\nRemaining todos:\n${list}\n\nExecute steps in order. After completing a step, include [DONE:n] in your response and/or call workflow_todo {action:"toggle", step:n}.\nTrack progress via workflow_todo. Abort with Escape (signal) is supported.\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -3770,6 +3954,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // Drop stale workflow context injections; a fresh one is appended below.
     const filtered = (event.messages as any[]).filter((m: any) => {
       if (m.customType === "workflow-build-context") return false;
+      if (m.customType === "workflow-todo-context") return false;
       if (m.customType === "workflow-plan-context") return isPlan;
       if (isPlan) return true;
       if (m.role !== "user") return true;
@@ -3782,24 +3967,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
         );
       return true;
     });
-    // Per-turn build reminder: `before_agent_start` only fires on user prompts,
-    // so auto-continued build runs need their todo context re-injected here.
-    if (workflowMode === "build" && todoItems.length > 0) {
-      const remaining = todoItems.filter((t) => !t.completed);
-      if (remaining.length > 0) {
-        const preview = remaining
-          .slice(0, 6)
-          .map((t) => `${todoLabel(t, t.step - 1)} ${t.text}`)
-          .join("\n");
-        const more =
-          remaining.length > 6 ? `\n… +${remaining.length - 6} more` : "";
+    // Throttled passive reminder (Claude Code cadence) whenever a todo list
+    // exists — any mode. Unresolved refs from the previous turn bypass the
+    // throttle once so the model can learn the right numbers.
+    if (todoItems.length > 0) {
+      const remaining = todoItems.filter(
+        (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+      );
+      const remind = shouldRemind({
+        turnsSinceLastTodoWrite,
+        turnsSinceLastReminder,
+        remaining: remaining.length,
+      });
+      const misses = lastRefMisses?.refs?.length ? lastRefMisses : undefined;
+      if ((remind || misses) && remaining.length > 0) {
         filtered.push({
           role: "custom",
-          customType: "workflow-build-context",
-          content: `[BUILD MODE] Remaining ${remaining.length}/${todoItems.length}:\n${preview}${more}\nAfter finishing a step, include [DONE:<label>] and/or call workflow_todo {action:"toggle", label:"<label>"}.`,
+          customType: "workflow-todo-context",
+          content: buildTodoContextBlock(todoItems, {
+            misses: misses ? { refs: misses.refs } : undefined,
+          }),
           display: false,
           timestamp: Date.now(),
         });
+        turnsSinceLastReminder = 0;
+        if (misses) lastRefMisses = undefined; // consumed
       }
     }
     return { messages: filtered } as any;
@@ -3812,6 +4004,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     const text = getTextContent(event.message as AssistantMessage);
     const result = markCompletedRefs(text, todoItems);
     if (result.unknown.length > 0 || result.ambiguous.length > 0) {
+      lastRefMisses = { refs: [...result.unknown, ...result.ambiguous] };
       try {
         pi.appendEntry("workflow-todo-ref-miss", {
           at: Date.now(),
@@ -3822,6 +4015,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
         void _e;
       }
     }
+    // A mutating workflow_todo tool call also counts as a todo write this turn.
+    const wroteThisTurn =
+      result.marked > 0 ||
+      (event.toolResults ?? []).some(
+        (r: any) =>
+          r.toolName === "workflow_todo" &&
+          !r.isError &&
+          [
+            "update",
+            "done",
+            "pending",
+            "add",
+            "toggle",
+            "sync",
+            "clear",
+          ].includes(r.details?.action),
+      );
+    if (wroteThisTurn) {
+      onTodoWrite();
+      lastRefMisses = undefined;
+    } else {
+      turnsSinceLastTodoWrite += 1;
+    }
+    turnsSinceLastReminder += 1;
     if (result.marked > 0) {
       updateStatus(ctx as any);
       persistState();
@@ -3832,6 +4049,34 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Plan file detection + full render + decision gate
   let lastPlanWritePath: string | null = null;
+
+  // Passive todo footer: first successful mutating tool result of the turn.
+  // (Separate handler so it can patch content without short-circuiting the
+  // plan-write detection handler below — tool_result handlers chain.)
+  pi.on("tool_result", async (event) => {
+    if (
+      !event.isError &&
+      (event.toolName === "edit" ||
+        event.toolName === "write" ||
+        event.toolName === "bash") &&
+      !footerInjectedThisTurn &&
+      todoItems.length > 0
+    ) {
+      const footer = buildTodoFooter(todoItems);
+      if (footer) {
+        const existing = (event.content ?? [])
+          .map((b: any) => (b?.type === "text" ? String(b.text ?? "") : ""))
+          .join("\n");
+        if (!existing.includes("[TODO ")) {
+          footerInjectedThisTurn = true;
+          mutatedSinceLastTodoWrite = true;
+          return {
+            content: [...(event.content ?? []), { type: "text", text: footer }],
+          } as any;
+        }
+      }
+    }
+  });
 
   pi.on("tool_result", async (event, ctx) => {
     if (
@@ -3900,15 +4145,79 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     }
     const runHandoff = async () => {
+      // Plan-file reconciliation (all modes): a `- [x]` tick in the plan file
+      // counts as progress even if the model never called the tool. Merging is
+      // status-aware (never un-completes); agent-added items survive.
+      try {
+        const planCandidate = todoPlanPath ?? currentPlanFile;
+        if (planCandidate && todoItems.length > 0) {
+          const abs = path.isAbsolute(planCandidate)
+            ? planCandidate
+            : path.join((ctx as any).cwd, planCandidate);
+          if (fs.existsSync(abs)) {
+            const planText = fs.readFileSync(abs, "utf8");
+            const planExtracted = extractPlanStepsFromMarkdown(planText);
+            if (planExtracted.length > 0) {
+              const before = todoItems.filter((t) => isDone(t)).length;
+              const merged = mergeTodoItems(todoItems, planExtracted);
+              todoItems = merged.items;
+              const after = todoItems.filter((t) => isDone(t)).length;
+              if (after > before || merged.preserved > 0) {
+                updateStatus(ctx as any);
+                persistState();
+              }
+              if (after > before) onTodoWrite();
+            }
+          }
+        }
+      } catch (_e) {
+        void _e;
+      }
+      // Stale notice (any mode): the run mutated files but recorded no todo
+      // progress. No forced turns — surface it once (30 s dedupe) + ⚠ marker.
+      try {
+        const lastAssistantMsg = [...(event.messages as any[])]
+          .reverse()
+          .find((m: any) => m.role === "assistant");
+        const stopReason = lastAssistantMsg?.stopReason;
+        const aborted = stopReason === "aborted" || stopReason === "error";
+        const remainingCount = todoItems.filter(
+          (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+        ).length;
+        if (
+          todoItems.length > 0 &&
+          remainingCount > 0 &&
+          mutatedSinceLastTodoWrite &&
+          !aborted
+        ) {
+          const now = Date.now();
+          if (!lastStaleNoticeAt || now - lastStaleNoticeAt > 30_000) {
+            lastStaleNoticeAt = now;
+            todoStale = true;
+            try {
+              ctx.ui.notify(
+                `Todo list not updated this run — ${remainingCount} step(s) still unchecked. Run /todos or ask the agent to mark progress.`,
+                "warning",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      } catch (_e) {
+        void _e;
+      }
       // Build completion
       if (workflowMode === "build" && todoItems.length > 0) {
-        const allDone = todoItems.every((t) => t.completed);
+        const allDone = todoItems.every(
+          (t) => isDone(t) || itemStatus(t) === "cancelled",
+        );
         if (allDone) {
           try {
             (pi as any).sendMessage?.(
               {
                 customType: "workflow-complete",
-                content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${t.step}. ${t.text}~~`).join("\n")}`,
+                content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
                 display: true,
               },
               { triggerTurn: false },
@@ -3917,6 +4226,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
             void _e;
           }
           // keep todos for history but stay in build
+          todoStale = false;
           updateStatus(ctx as any);
           persistState();
         }

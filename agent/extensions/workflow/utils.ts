@@ -98,16 +98,73 @@ export function isSafeCommand(command: string): boolean {
   return !isDestructive && isSafe;
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
 export interface TodoItem {
   step: number;
   text: string;
+  /** Legacy boolean flag; kept derived from `status` for old sessions/external readers. */
   completed: boolean;
+  /** Industry-style status. Legacy items derive it from `completed`. */
+  status?: TodoStatus;
+  /** Stable, globally-unique identity ref assigned at creation and never renumbered. */
+  ref?: string;
   /** Plan-faithful label, e.g. "1", "2.3". Legacy items derive it from step. */
   label?: string;
   /** Optional group/phase heading the step belongs to. */
   group?: string;
   /** Where the item came from. */
   source?: "plan" | "agent" | "synthesized";
+}
+
+const TODO_STATUS_RANK: Record<TodoStatus, number> = {
+  completed: 3,
+  in_progress: 2,
+  pending: 1,
+  cancelled: 0,
+};
+
+/** Resolve an item's status; legacy `completed` booleans are backfilled. */
+export function itemStatus(it: TodoItem): TodoStatus {
+  if (it?.status) return it.status;
+  return it?.completed ? "completed" : "pending";
+}
+
+/** True when the item is done. */
+export function isDone(it: TodoItem): boolean {
+  return itemStatus(it) === "completed";
+}
+
+/** Set an item's status and keep the legacy `completed` flag in sync. */
+export function setTodoStatus(it: TodoItem, status: TodoStatus): TodoItem {
+  it.status = status;
+  it.completed = status === "completed";
+  return it;
+}
+
+/**
+ * Merge precedence for two sources disagreeing on status: the more advanced
+ * rank wins (completed > in_progress > pending > cancelled), so a plan-file
+ * `- [x]` can mark an item done but nothing can silently un-complete it.
+ */
+export function mergeStatusByRank(
+  a: TodoStatus | undefined,
+  b: TodoStatus | undefined,
+): TodoStatus {
+  const ra = a ? TODO_STATUS_RANK[a] : 0;
+  const rb = b ? TODO_STATUS_RANK[b] : 0;
+  return rb > ra ? (b as TodoStatus) : ((a ?? "pending") as TodoStatus);
+}
+
+/** Canonical, globally-unique ref for an item (stable across merges). */
+export function todoRef(it: Pick<TodoItem, "ref" | "step">): string {
+  return it?.ref || String(it?.step ?? 0);
+}
+
+/** Numeric value of a ref, if it is an integer (for range math). */
+export function todoRefNumber(ref: string): number | undefined {
+  const n = Number(String(ref ?? "").trim());
+  return Number.isFinite(n) && Number.isInteger(n) ? n : undefined;
 }
 
 /**
@@ -146,14 +203,18 @@ export function todoKey(item: Pick<TodoItem, "text" | "group">): string {
   return g ? `${g}|${t}` : t;
 }
 
-/** Backfill labels/source for items restored from older sessions. */
+/** Backfill labels/ref/status/source for items restored from older sessions. */
 export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
   return (items ?? []).map((it, i) => {
     const step = Number.isFinite(it?.step) ? Number(it.step) : i + 1;
+    const status = itemStatus(it);
     return {
       ...it,
       step,
       label: it?.label || String(step),
+      ref: it?.ref || String(step),
+      status,
+      completed: status === "completed",
       source: it?.source ?? "plan",
     };
   });
@@ -177,18 +238,23 @@ export interface TodoMergeResult {
   added: number;
   removed: number;
   kept: number;
+  /** Number of unmatched `source:"agent"` items preserved from the previous list. */
+  preserved: number;
 }
 
 /**
  * Merge freshly extracted plan steps into the existing list while preserving
  * completion state for steps that are still present. Extracted order wins.
  * Match is by label first (same plan step), then by normalized text.
+ * Matched items keep their stable `ref`; new items get `ref = maxRef+1`;
+ * unmatched `source:"agent"` items are preserved; status merges by rank
+ * (a plan-file `- [x]` can mark an item done, nothing un-completes it).
  */
 export function mergeTodoItems(
   existing: TodoItem[],
   extracted: TodoItem[],
 ): TodoMergeResult {
-  const prev = (existing ?? []).map((p) => ({ ...p }));
+  const prev = ensureTodoLabels(existing ?? []);
   const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
   const byLabel = new Map<string, TodoItem>();
   const byKey = new Map<string, TodoItem>();
@@ -201,6 +267,10 @@ export function mergeTodoItems(
   const used = new Set<TodoItem>();
   let added = 0;
   let kept = 0;
+  let maxRef = prev.reduce(
+    (m, p) => Math.max(m, todoRefNumber(todoRef(p)) ?? 0),
+    0,
+  );
   const items = next.map((n) => {
     const nKey = todoKey(n);
     let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
@@ -214,21 +284,38 @@ export function mergeTodoItems(
     if (match && !used.has(match)) {
       used.add(match);
       kept++;
-      return {
+      const item: TodoItem = {
         ...n,
-        completed: match.completed,
+        ref: n.ref || match.ref || todoRef(match),
+        group: n.group ?? match.group,
         source: n.source ?? match.source,
       };
+      const status = mergeStatusByRank(itemStatus(match), itemStatus(item));
+      setTodoStatus(item, status);
+      item.ref = item.ref || String(++maxRef);
+      return item;
     }
     added++;
-    return n;
+    const item: TodoItem = { ...n, ref: n.ref || String(++maxRef) };
+    if (item.status) item.completed = item.status === "completed";
+    else setTodoStatus(item, item.completed ? "completed" : "pending");
+    return item;
   });
-  items.forEach((it, i) => {
+  // Preserve unmatched agent-added items (progress + ad-hoc steps survive sync).
+  const preserved: TodoItem[] = [];
+  for (const p of prev) {
+    if (used.has(p)) continue;
+    if (p.source === "agent") preserved.push({ ...p });
+  }
+  const all = [...items, ...preserved];
+  all.forEach((it, i) => {
     it.step = i + 1;
     if (!it.label) it.label = String(i + 1);
   });
-  const removed = prev.filter((p) => !used.has(p)).length;
-  return { items, added, removed, kept };
+  const removed = prev.filter(
+    (p) => !used.has(p) && p.source !== "agent",
+  ).length;
+  return { items: all, added, removed, kept, preserved: preserved.length };
 }
 
 export interface TodoRefResolution {
@@ -237,7 +324,11 @@ export interface TodoRefResolution {
   unknown?: string;
 }
 
-/** Resolve a `[DONE:ref]` / toggle reference to a todo item. */
+/** Resolve a `[DONE:ref]` / toggle reference to a todo item.
+ * Precedence: (a) pure integer → canonical `ref`, then positional `step`, then
+ * unique `label`; (b) dotted `N.M` → unique `label`; (c) group-qualified
+ * `Group/Label`, `Label@Group`, `#N`; (d) unique normalized-text match ≥8 chars.
+ */
 export function resolveTodoRef(
   items: TodoItem[],
   ref: string,
@@ -245,29 +336,81 @@ export function resolveTodoRef(
   const list = items ?? [];
   const raw = String(ref ?? "").trim();
   if (!raw) return { unknown: raw };
-  const norm = raw.replace(/[.)]+$/, "");
-  const numeric = Number(norm);
-  let matches = list.filter(
-    (it) => (it.label || String(it.step)).toLowerCase() === norm.toLowerCase(),
-  );
-  if (matches.length === 0 && Number.isFinite(numeric))
-    matches = list.filter((it) => it.step === numeric);
-  if (matches.length === 1) return { item: matches[0] };
-  if (matches.length > 1) return { ambiguous: matches };
-  const needle = norm.toLowerCase();
-  if (needle.length >= 12) {
-    const textMatches = list.filter((it) =>
-      it.text.toLowerCase().includes(needle),
+  let norm = raw.replace(/[.)]+$/, "").trim();
+  const clean = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const unique = (arr: TodoItem[]): TodoRefResolution | null => {
+    if (arr.length === 1) return { item: arr[0] };
+    if (arr.length > 1) return { ambiguous: arr };
+    return null;
+  };
+
+  // `#N` → ref N
+  const hash = norm.match(/^#(\d+)$/);
+  if (hash) norm = hash[1];
+
+  // Group-qualified: "Phase B/2", "2@Phase A"
+  const gq = norm.match(/^(.+)\/(\S+)$/) || norm.match(/^(\S+)@(.+)$/);
+  if (gq) {
+    const g = clean(gq[1]);
+    const l = clean(gq[2]);
+    const inGroup = list.filter((it) => clean(it.group) === g);
+    if (inGroup.length === 0) return { unknown: raw };
+    const byLabel = unique(inGroup.filter((it) => clean(it.label) === l));
+    if (byLabel) return byLabel;
+    const byRef = unique(
+      inGroup.filter((it) => clean(todoRef(it)) === l || todoRef(it) === l),
     );
-    if (textMatches.length === 1) return { item: textMatches[0] };
-    if (textMatches.length > 1) return { ambiguous: textMatches };
+    if (byRef) return byRef;
+    const num = Number(l);
+    if (Number.isFinite(num))
+      return (
+        unique(inGroup.filter((it) => it.step === num)) ?? { unknown: raw }
+      );
+    return { unknown: raw };
+  }
+
+  // Pure integer: canonical ref → positional step → unique label
+  if (/^\d+$/.test(norm)) {
+    const n = Number(norm);
+    const byRef = unique(
+      list.filter((it) => todoRef(it) === norm || todoRef(it) === String(n)),
+    );
+    if (byRef) return byRef;
+    const byStep = unique(list.filter((it) => it.step === n));
+    if (byStep) return byStep;
+    const byLabel = unique(list.filter((it) => clean(it.label) === norm));
+    if (byLabel) return byLabel;
+    // Duplicated per-phase labels (the historical failure): surface them all so
+    // the error can teach the global step numbers.
+    const labeled = list.filter((it) => String(it.label) === norm);
+    if (labeled.length > 0) return { ambiguous: labeled };
+    return { unknown: raw };
+  }
+
+  // Dotted plan label: N.M
+  if (/^\d+\.\d+$/.test(norm)) {
+    const byLabel = unique(list.filter((it) => it.label === norm));
+    if (byLabel) return byLabel;
+  }
+
+  // Unique normalized-text substring (≥8 chars)
+  if (norm.length >= 8) {
+    const needle = clean(norm);
+    const textMatches = list.filter((it) => clean(it.text).includes(needle));
+    const res = unique(textMatches);
+    if (res) return res;
   }
   return { unknown: raw };
 }
 
 /**
  * Leniently parse completion refs from assistant text: `[DONE:3]`,
- * `[DONE: 3.1]`, `[DONE:2-4]`, `[DONE #2]`, `[DONE:1,2]`.
+ * `[DONE: 3.1]`, `[DONE:2-4]`, `[DONE #2]`, `[DONE:1,2]`,
+ * `[DONE:Phase B/2]` (group-qualified).
  */
 export function parseDoneRefs(text: string): string[] {
   const refs: string[] = [];
@@ -286,10 +429,15 @@ export function parseDoneRefs(text: string): string[] {
         continue;
       }
     }
+    const numericParts: string[] = [];
+    let hasNonNumeric = false;
     for (const part of body.split(/[,\s]+/)) {
       const p = part.trim().replace(/[.)]+$/, "");
-      if (/^\d+(?:\.\d+)?$/.test(p)) refs.push(p);
+      if (/^\d+(?:\.\d+)?$/.test(p)) numericParts.push(p);
+      else if (p) hasNonNumeric = true;
     }
+    if (numericParts.length > 0) refs.push(...numericParts);
+    else if (hasNonNumeric) refs.push(body);
   }
   return refs;
 }
@@ -313,7 +461,7 @@ export function markCompletedRefs(
   for (const ref of parseDoneRefs(text)) {
     const res = resolveTodoRef(items, ref);
     if (res.item) {
-      res.item.completed = true;
+      setTodoStatus(res.item, "completed");
       result.marked++;
     } else if (res.ambiguous) {
       result.ambiguous.push(ref);
@@ -335,6 +483,241 @@ export function extractDoneSteps(message: string): number[] {
 export function markCompletedSteps(text: string, items: TodoItem[]): number {
   return markCompletedRefs(text, items).marked;
 }
+
+// ── Wholesale update (industry-style replace) ────────────────────────
+
+export interface TodoUpdateEntry {
+  /** Canonical ref to an existing item (optional for new items). */
+  ref?: string;
+  /** Step text. Exact/normalized match is used when no `ref` is given. */
+  text?: string;
+  status?: TodoStatus;
+}
+
+export interface TodoUpdateResult {
+  items: TodoItem[];
+  added: number;
+  removed: number;
+  kept: number;
+  /** Extra `in_progress` items demoted to `pending` (only one allowed). */
+  normalized: number;
+}
+
+/**
+ * Industry-style replace update (TodoWrite / todowrite / update_plan semantics):
+ * the incoming entries become the new list.
+ *
+ * - Identify existing items by canonical `ref` first, then by normalized text
+ *   (group-insensitive). Matched items keep their `ref` and take the incoming
+ *   status/text. New entries get `ref = maxRef + 1`.
+ * - Omitted items are removed.
+ * - Exactly one item may be `in_progress`; extras are demoted (counted as
+ *   `normalized`).
+ */
+export function applyTodoUpdate(
+  existing: TodoItem[],
+  incoming: TodoUpdateEntry[],
+): TodoUpdateResult {
+  const prev = ensureTodoLabels(existing ?? []);
+  const byRef = new Map<string, TodoItem>();
+  const byTextKey = new Map<string, TodoItem>();
+  for (const p of prev) {
+    const r = todoRef(p);
+    if (r) byRef.set(r.toLowerCase(), p);
+    const k = todoKey({ text: p.text });
+    if (k && !byTextKey.has(k)) byTextKey.set(k, p);
+  }
+  const used = new Set<TodoItem>();
+  const items: TodoItem[] = [];
+  let added = 0;
+  let kept = 0;
+  let maxRef = prev.reduce(
+    (m, p) => Math.max(m, todoRefNumber(todoRef(p)) ?? 0),
+    0,
+  );
+  for (const raw of incoming ?? []) {
+    const text = normalizeStepText(raw?.text ?? "");
+    let match: TodoItem | undefined;
+    if (raw?.ref !== undefined && String(raw.ref).trim()) {
+      match = byRef.get(String(raw.ref).trim().toLowerCase());
+    }
+    if (!match && text) {
+      const k = todoKey({ text });
+      match = k ? byTextKey.get(k) : undefined;
+    }
+    const status = raw?.status ?? "pending";
+    if (match && !used.has(match)) {
+      used.add(match);
+      kept++;
+      const item: TodoItem = {
+        ...match,
+        text: text || match.text,
+        status,
+        completed: status === "completed",
+        source: match.source ?? "agent",
+      };
+      items.push(item);
+    } else {
+      // Skip empty ghost entries (blank text, no ref, already-used ref).
+      if (!text) continue;
+      added++;
+      const item: TodoItem = {
+        step: 0,
+        text,
+        completed: status === "completed",
+        status,
+        ref: String(++maxRef),
+        label: String(maxRef),
+        source: "agent",
+      };
+      items.push(item);
+    }
+  }
+  // Normalize: at most one in_progress.
+  let normalized = 0;
+  let seenInProgress = false;
+  for (const it of items) {
+    if (it.status === "in_progress") {
+      if (seenInProgress) {
+        it.status = "pending";
+        it.completed = false;
+        normalized++;
+      } else {
+        seenInProgress = true;
+      }
+    }
+  }
+  items.forEach((it, i) => {
+    it.step = i + 1;
+  });
+  const removed = prev.filter((p) => !used.has(p)).length;
+  return { items, added, removed, kept, normalized };
+}
+
+// ── Display + reminder builders (pure, exported for tests) ────────────
+
+/** Status glyph for a todo row. */
+export function todoGlyph(it: TodoItem): string {
+  const s = itemStatus(it);
+  return s === "completed"
+    ? "☑"
+    : s === "in_progress"
+      ? "▶"
+      : s === "cancelled"
+        ? "✖"
+        : "☐";
+}
+
+/** One display line: `☑ 6. text (plan label B2)` when the label differs. */
+export function formatTodoLine(
+  it: TodoItem,
+  opts?: { showLabel?: boolean },
+): string {
+  const ref = todoRef(it);
+  const labelPart =
+    opts?.showLabel !== false &&
+    it.label !== undefined &&
+    String(it.label) !== ref
+      ? ` (plan label ${it.label})`
+      : "";
+  return `${todoGlyph(it)} ${ref}. ${it.text}${labelPart}`;
+}
+
+export interface TodoContextBlockOptions {
+  /** Unresolved refs from the previous turn (fed back so the model can fix them). */
+  misses?: { refs: string[] };
+}
+
+/**
+ * The per-turn reminder block (context injection / before_agent_start).
+ * Canonical global refs only; teaches the update protocol.
+ */
+export function buildTodoContextBlock(
+  items: TodoItem[],
+  opts?: TodoContextBlockOptions,
+): string {
+  const list = items ?? [];
+  if (list.length === 0) return "";
+  const done = list.filter((t) => isDone(t)).length;
+  const total = list.length;
+  const remaining = list.filter(
+    (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+  );
+  const current =
+    list.find((t) => itemStatus(t) === "in_progress") ?? remaining[0];
+  const preview = remaining
+    .slice(0, 6)
+    .map((t) => `${todoRef(t)}. ${t.text}`)
+    .join("\n");
+  const more = remaining.length > 6 ? `\n… +${remaining.length - 6} more` : "";
+  const missBlock = opts?.misses?.refs?.length
+    ? `\n\n[REFS UNRESOLVED last turn: ${opts.misses.refs.join(", ")} matched multiple steps. Use the GLOBAL STEP numbers below (e.g. step ${current ? todoRef(current) : "N"}).]`
+    : "";
+  return [
+    `[TODO LIST] ${done}/${total} done. Steps are numbered GLOBALLY 1..${total}; use these GLOBAL STEP numbers as refs.`,
+    current
+      ? `Current/next: ${todoRef(current)}. ${current.text}`
+      : "All steps done.",
+    `Remaining:\n${preview}${more}`,
+    `Finish a step → workflow_todo {action:"update", todos:[…COMPLETE LIST…]}, or {action:"done", step:${current ? todoRef(current) : "<N>"}}, or [DONE:${current ? todoRef(current) : "<N>"}].`,
+    `After finishing a step, mark it in the SAME turn. Never leave it unchecked.`,
+    missBlock,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** One-line footer appended to successful mutating tool results. */
+export function buildTodoFooter(items: TodoItem[]): string {
+  const list = items ?? [];
+  if (list.length === 0) return "";
+  const done = list.filter((t) => isDone(t)).length;
+  const total = list.length;
+  const remaining = list.filter(
+    (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+  );
+  if (remaining.length === 0) return "";
+  const current =
+    list.find((t) => itemStatus(t) === "in_progress") ?? remaining[0];
+  return `[TODO ${done}/${total} — sync status now: if the step you just worked on (${todoRef(current)}. ${current.text.slice(0, 50)}) is finished, call workflow_todo {action:"done", step:${todoRef(current)}} or [DONE:${todoRef(current)}].]`;
+}
+
+/** Ambiguity error that teaches the global step numbers. */
+export function formatAmbiguity(items: TodoItem[], ref: string): string {
+  const list = items ?? [];
+  if (list.length === 0)
+    return `Todo "${ref}" is ambiguous but no items match.`;
+  const lines = list
+    .slice(0, 12)
+    .map((t) => `${todoRef(t)}. ${t.text}`)
+    .join("\n");
+  const more = list.length > 12 ? `\n… +${list.length - 12} more` : "";
+  return `Todo "${ref}" is ambiguous (matches ${list.length} items). Use the GLOBAL STEP numbers:\n${lines}${more}`;
+}
+
+export interface RemindState {
+  turnsSinceLastTodoWrite: number;
+  turnsSinceLastReminder: number;
+  remaining: number;
+}
+
+/** Claude Code-style throttled cadence: no reminder until enough turns have
+ * passed since both the last todo write and the last reminder. */
+export function shouldRemind(state: RemindState): boolean {
+  const s = state ?? {
+    turnsSinceLastTodoWrite: 0,
+    turnsSinceLastReminder: 0,
+    remaining: 0,
+  };
+  return (
+    s.remaining > 0 &&
+    s.turnsSinceLastTodoWrite >= TURNS_SINCE_WRITE &&
+    s.turnsSinceLastReminder >= TURNS_BETWEEN_REMINDERS
+  );
+}
+
+export const TURNS_SINCE_WRITE = 3;
+export const TURNS_BETWEEN_REMINDERS = 3;
 
 // ── Plan extraction (section-scoped) ─────────────────────────────
 

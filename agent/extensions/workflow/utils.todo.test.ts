@@ -19,7 +19,19 @@ import {
   resolveTodoRef,
   markCompletedRefs,
   synthesizeFromPlanTitle,
+  itemStatus,
+  setTodoStatus,
+  mergeStatusByRank,
+  todoRef,
+  applyTodoUpdate,
+  formatTodoLine,
+  buildTodoContextBlock,
+  buildTodoFooter,
+  formatAmbiguity,
+  shouldRemind,
+  TURNS_SINCE_WRITE,
   type TodoItem,
+  type TodoUpdateEntry,
 } from "./utils.ts";
 
 const FORMATTING_PLAN = `# Plan: Add document formatting tools (Word + PowerPoint)
@@ -281,7 +293,7 @@ test("parseDoneRefs is lenient", () => {
   assert.deepEqual(parseDoneRefs("[DONE:999]"), ["999"]);
 });
 
-test("resolveTodoRef + markCompletedRefs", () => {
+test("resolveTodoRef + markCompletedRefs (canonical ref → step → label → text)", () => {
   const items: TodoItem[] = [
     {
       step: 1,
@@ -292,23 +304,271 @@ test("resolveTodoRef + markCompletedRefs", () => {
     { step: 2, text: "Wire the manifest", completed: false, label: "1.1" },
     { step: 3, text: "Wire the manifest", completed: false, label: "2.1" },
   ];
-  assert.equal(resolveTodoRef(items, "1.1").item?.step, 2);
-  assert.equal(resolveTodoRef(items, "Create Word").unknown, "Create Word");
-  assert.equal(
-    resolveTodoRef(items, "Create Word format_range tool").item?.step,
-    1,
-  );
-  assert.equal(resolveTodoRef(items, "999").unknown, "999");
+  const legacy = ensureTodoLabels(items);
+  // Dotted label resolves by label.
+  assert.equal(resolveTodoRef(legacy, "1.1").item?.step, 2);
+  // Canonical ref wins (integer = global step).
+  assert.equal(resolveTodoRef(legacy, "1").item?.step, 1);
+  assert.equal(resolveTodoRef(legacy, "999").unknown, "999");
 
-  const res = markCompletedRefs("[DONE:1.1] [DONE:2.1] [DONE:99]", items);
+  const res = markCompletedRefs("[DONE:1.1] [DONE:2.1] [DONE:99]", legacy);
   assert.equal(res.marked, 2);
   assert.deepEqual(res.unknown, ["99"]);
-  assert.equal(items[1].completed, true);
-  assert.equal(items[2].completed, true);
-  assert.equal(items[0].completed, false);
+  assert.equal(legacy[1].completed, true);
+  assert.equal(legacy[2].completed, true);
+  assert.equal(legacy[0].completed, false);
+  assert.equal(itemStatus(legacy[1]), "completed");
 });
 
-test("mergeTodoItems preserves completion for the same plan, replaces on a new one", () => {
+test("duplicate per-phase labels are unambiguous via canonical refs", () => {
+  // Phase numbering copied from 2026-09-12-context-overflow-compaction-recovery.md:
+  // Phase 1: steps 1..4, Phase 2: 1..6, ... (labels repeat across phases).
+  const raw: TodoItem[] = [
+    {
+      step: 1,
+      text: "P1 - Context tokens",
+      completed: false,
+      label: "1",
+      group: "Phase 1",
+      source: "plan",
+    },
+    {
+      step: 2,
+      text: "P1 - Guards/meter",
+      completed: false,
+      label: "2",
+      group: "Phase 1",
+      source: "plan",
+    },
+    {
+      step: 3,
+      text: "P1 - Failure classification",
+      completed: false,
+      label: "3",
+      group: "Phase 1",
+      source: "plan",
+    },
+    {
+      step: 4,
+      text: "P1 - Tests",
+      completed: false,
+      label: "4",
+      group: "Phase 1",
+      source: "plan",
+    },
+    {
+      step: 5,
+      text: "P2 - Pure engine",
+      completed: false,
+      label: "1",
+      group: "Phase 2",
+      source: "plan",
+    },
+    {
+      step: 6,
+      text: "P2 - Rewrite runCompactCommand",
+      completed: false,
+      label: "2",
+      group: "Phase 2",
+      source: "plan",
+    },
+    {
+      step: 7,
+      text: "P2 - Bound summarization",
+      completed: false,
+      label: "3",
+      group: "Phase 2",
+      source: "plan",
+    },
+  ];
+  const items = ensureTodoLabels(raw);
+  // The historical failure: `[DONE:1]` matched 2 items by label.
+  assert.equal(resolveTodoRef(items, "1").item?.step, 1);
+  assert.equal(resolveTodoRef(items, "2").item?.step, 2);
+  // Higher-number labels that repeat earlier phases still resolve by ref.
+  assert.equal(resolveTodoRef(items, "6").item?.step, 6);
+  // Group-qualified refs work.
+  assert.equal(
+    resolveTodoRef(items, "Phase 2/1")?.item?.step,
+    5,
+    "group-qualified label resolves inside the phase",
+  );
+  const res = markCompletedRefs("[DONE:1] [DONE:6] [DONE:13]", items);
+  assert.equal(res.marked, 2);
+  assert.equal(items[0].completed, true);
+  assert.equal(items[5].completed, true);
+  assert.deepEqual(res.unknown, ["13"]);
+});
+
+test("ambiguity teaches global step numbers", () => {
+  const items = ensureTodoLabels([
+    {
+      step: 1,
+      text: "A",
+      completed: false,
+      label: "1",
+      group: "Phase 1",
+      source: "plan",
+    },
+    {
+      step: 2,
+      text: "B",
+      completed: false,
+      label: "1",
+      group: "Phase 2",
+      source: "plan",
+    },
+  ]);
+  const msg = formatAmbiguity(items, "1");
+  assert.match(msg, /ambiguous/);
+  assert.match(msg, /GLOBAL STEP/);
+  assert.match(msg, /1\. A/);
+  assert.match(msg, /2\. B/);
+});
+
+test("status backfill + setTodoStatus + mergeStatusByRank", () => {
+  const legacy = ensureTodoLabels([
+    { step: 1, text: "Done", completed: true } as TodoItem,
+  ]);
+  assert.equal(legacy[0].status, "completed");
+  assert.equal(itemStatus(legacy[0]), "completed");
+  assert.equal(todoRef(legacy[0]), "1");
+
+  const it = { step: 1, text: "X", completed: false } as TodoItem;
+  assert.equal(itemStatus(it), "pending");
+  setTodoStatus(it, "in_progress");
+  assert.equal(itemStatus(it), "in_progress");
+  assert.equal(it.completed, false);
+  setTodoStatus(it, "completed");
+  assert.equal(it.completed, true);
+
+  assert.equal(mergeStatusByRank("completed", "pending"), "completed");
+  assert.equal(mergeStatusByRank("pending", "completed"), "completed");
+  assert.equal(mergeStatusByRank("pending", "pending"), "pending");
+  assert.equal(mergeStatusByRank("cancelled", "pending"), "pending");
+});
+
+test("applyTodoUpdate replaces the whole list (industry semantics)", () => {
+  const prev = ensureTodoLabels([
+    { step: 1, text: "Create X", completed: false, label: "1", source: "plan" },
+    { step: 2, text: "Create Y", completed: true, label: "2", source: "plan" },
+    {
+      step: 3,
+      text: "Agent extra",
+      completed: false,
+      label: "3",
+      source: "agent",
+    },
+  ]);
+  const incoming: TodoUpdateEntry[] = [
+    { ref: "1", status: "completed" },
+    { ref: "3", text: "Agent extra (renamed)", status: "in_progress" },
+    { text: "Brand new", status: "pending" },
+  ];
+  const res = applyTodoUpdate(prev, incoming);
+  assert.equal(res.kept, 2, "Create X + Agent extra matched by ref");
+  assert.equal(res.added, 1, "Brand new appended");
+  assert.equal(res.removed, 1, "Create Y omitted → removed");
+  const byStep = new Map(res.items.map((it) => [it.step, it]));
+  assert.equal(byStep.get(1)?.completed, true);
+  assert.equal(byStep.get(1)?.ref, "1", "matched item keeps its stable ref");
+  assert.equal(byStep.get(2)?.text, "Agent extra (renamed)");
+  assert.equal(byStep.get(2)?.status, "in_progress");
+  assert.equal(byStep.get(3)?.text, "Brand new");
+  assert.ok(byStep.get(3)?.ref, "new item gets a ref");
+});
+
+test("applyTodoUpdate normalizes extra in_progress items", () => {
+  const prev = ensureTodoLabels([
+    { step: 1, text: "A", completed: false, label: "1", source: "plan" },
+    { step: 2, text: "B", completed: false, label: "2", source: "plan" },
+  ]);
+  const res = applyTodoUpdate(prev, [
+    { ref: "1", status: "in_progress" },
+    { ref: "2", status: "in_progress" },
+  ]);
+  assert.equal(res.normalized, 1);
+  assert.equal(
+    res.items.filter((it) => it.status === "in_progress").length,
+    1,
+    "exactly one in_progress after normalization",
+  );
+});
+
+test("builders render canonical global refs", () => {
+  const items = ensureTodoLabels([
+    { step: 1, text: "Create X", completed: true, label: "1", source: "plan" },
+    {
+      step: 2,
+      text: "Add --port parsing",
+      completed: false,
+      label: "1",
+      group: "Phase 2",
+      source: "plan",
+    },
+  ]);
+  assert.match(formatTodoLine(items[0]), /^☑ 1\./);
+  assert.match(formatTodoLine(items[1]), /^☐ 2\./);
+  assert.match(formatTodoLine(items[1]), /\(plan label 1\)/);
+
+  const block = buildTodoContextBlock(items);
+  assert.match(block, /1\/2 done/);
+  assert.match(block, /GLOBALLY/);
+  assert.match(block, /GLOBAL STEP/);
+  assert.match(block, /\[DONE:2\]/);
+
+  const withMisses = buildTodoContextBlock(items, { misses: { refs: ["1"] } });
+  assert.match(withMisses, /REFS UNRESOLVED/);
+
+  const footer = buildTodoFooter(items);
+  assert.match(footer, /^\[TODO 1\/2/);
+  assert.match(footer, /\[DONE:2\]/);
+});
+
+test("shouldRemind throttles like Claude Code", () => {
+  assert.equal(
+    shouldRemind({
+      turnsSinceLastTodoWrite: TURNS_SINCE_WRITE - 1,
+      turnsSinceLastReminder: 10,
+      remaining: 2,
+    }),
+    false,
+    "too soon since last todo write",
+  );
+  assert.equal(
+    shouldRemind({
+      turnsSinceLastTodoWrite: TURNS_SINCE_WRITE,
+      turnsSinceLastReminder: TURNS_SINCE_WRITE - 1,
+      remaining: 2,
+    }),
+    false,
+    "too soon since last reminder",
+  );
+  assert.equal(
+    shouldRemind({
+      turnsSinceLastTodoWrite: TURNS_SINCE_WRITE,
+      turnsSinceLastReminder: 5,
+      remaining: 0,
+    }),
+    false,
+    "nothing remaining",
+  );
+  assert.equal(
+    shouldRemind({
+      turnsSinceLastTodoWrite: TURNS_SINCE_WRITE,
+      turnsSinceLastReminder: 5,
+      remaining: 2,
+    }),
+    true,
+  );
+});
+
+test("parseDoneRefs accepts group-qualified refs", () => {
+  assert.deepEqual(parseDoneRefs("[DONE:Phase 2/1]"), ["Phase 2/1"]);
+  assert.deepEqual(parseDoneRefs("[DONE:1,2]"), ["1", "2"]);
+});
+
+test("mergeTodoItems preserves completion, refs and agent-added items", () => {
   const existing: TodoItem[] = [
     { step: 1, text: "Create X", completed: true, label: "1", source: "plan" },
     { step: 2, text: "Create Y", completed: false, label: "2", source: "plan" },
@@ -326,10 +586,12 @@ test("mergeTodoItems preserves completion for the same plan, replaces on a new o
   ];
   const merged = mergeTodoItems(existing, reExtracted);
   assert.equal(merged.kept, 2);
-  assert.equal(merged.items[0].completed, true);
+  assert.equal(merged.preserved, 1, "agent item survives the merge");
+  assert.equal(merged.items[0].completed, true, "completed never un-completes");
   assert.equal(merged.items[1].completed, false);
-  assert.equal(merged.items.length, 2);
-  assert.equal(merged.removed, 1);
+  assert.equal(merged.items[2].text, "Agent extra");
+  assert.equal(merged.items.length, 3);
+  assert.equal(merged.removed, 0);
 
   const replaced = mergeTodoItems(existing, [
     {
@@ -343,6 +605,30 @@ test("mergeTodoItems preserves completion for the same plan, replaces on a new o
   assert.equal(replaced.added, 1);
   assert.equal(replaced.items[0].text, "Brand new");
   assert.equal(replaced.items[0].completed, false);
+});
+
+test("mergeTodoItems honors plan-file - [x] ticks via status rank", () => {
+  const existing = ensureTodoLabels([
+    {
+      step: 1,
+      text: "Pending step",
+      completed: false,
+      label: "1",
+      source: "plan",
+    },
+  ]);
+  const ticked = ensureTodoLabels([
+    {
+      step: 1,
+      text: "Pending step",
+      completed: true,
+      label: "1",
+      source: "plan",
+    },
+  ]);
+  const merged = mergeTodoItems(existing, ticked);
+  assert.equal(merged.items[0].completed, true);
+  assert.equal(itemStatus(merged.items[0]), "completed");
 });
 
 test("synthesizeFromPlanTitle", () => {
