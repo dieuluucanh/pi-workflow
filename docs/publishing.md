@@ -30,6 +30,7 @@ The scripts are dependency-free Node ESM and run from the repo root.
 ## Release a version
 
 ```bash
+npm run release:status                # read-only: manifest versions vs the npm registry
 npm run verify                        # optional: run the gate on all four packages
 npm run release -- --dry-run          # plan only: versions, changelogs, tarballs
 npm run release                       # interactive: pick packages, then bump types
@@ -73,6 +74,45 @@ npm run release -- --packages workflow,autocompact --bump none --yes
 | `--branch name` | branch to release from (default `main`) |
 | `--npm-user name` | required npm user (default `dieulc`, or `RELEASE_NPM_USER`) |
 | `--yes`, `-y` | non-interactive; requires `--packages` and `--bump` (not needed with `--continue`) |
+
+## Publish status
+
+`npm run release:status` (`scripts/status.mjs`) is a **read-only** report: it never writes,
+publishes, tags, or prompts. For every package it compares the manifest version with the
+registry — `latest` dist-tag, all dist-tags, publish date, deprecation flags — and prints a
+drift verdict.
+
+```bash
+npm run release:status                        # human table
+npm run release:status -- --json              # machine-readable report
+npm run release:status -- --check             # exit 1 on problems, 2 if a query failed
+npm run release:status -- --packages workflow
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| `in-sync` | the manifest version is published and is the `latest` dist-tag |
+| `never-published` | nothing of the package is on the registry |
+| `local-ahead` | the manifest version is newer than `latest` and not published yet |
+| `local-behind` | the registry has a newer version than this checkout |
+| `published-not-latest` | the manifest version is on npm but is not the `latest` dist-tag |
+| `local-not-published` | the manifest version is missing and cannot be compared to `latest` |
+| `invalid-version` | the manifest version is not semver |
+| `registry-error` | the registry could not be queried (offline, mirror, rate limit) |
+
+- **Exit codes:** `0` by default (informational). With `--check`: `1` when any package is
+  never-published, drifts, or has a deprecated current version; `2` when a registry query
+  failed — an unknown state never passes a gate silently. Use it in a pre-push hook or before
+  a release when you want failure semantics.
+- **Fresh repo:** before the first publish every package reports `never-published`, so
+  `--check` exits 1 until a release lands. That is the intended meaning (“not released yet”),
+  not a bug.
+- The registry comes from `npm config get registry` (override with `--registry <url>` for
+diagnostics against a mirror). Queries are one packument request per package, in parallel,
+with an `npm view --json` fallback that honors `~/.npmrc` auth. Deprecated *older* versions and
+a prerelease `latest` are reported as notes, never as failures.
+- `--json` emits a versioned schema (`schemaVersion: 1`) with `registry`, `identity`,
+per-package `distTags` / `publishedAt` / `problems` / `notes`, and an overall `ok`.
 
 ## First publish (bootstrap)
 
@@ -223,15 +263,20 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | Published, but the package is not on pi.dev | The gallery crawls npm's search index, and new packages can be skipped for hours — sometimes days. Re-check with `npm run gallery -- --wait 900`; still missing after ~24 h → publish a patch bump (a metadata touch forces re-indexing), see [Gallery listing (pi.dev)](#gallery-listing-pidev). |
 | Gallery card shows an older version | npm's index has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
 | `npm run gallery` reports `ineligible` | The manifest keywords lack `pi-package`. Add it (plus `publishConfig.access: "public"` and a `pi` manifest — `npm run verify` enforces all three) and release a new version. |
+| `npm run release:status` reports every package as `never-published` | Expected before the first publish. Each package flips to `in-sync` once its release lands. |
+| `npm run release:status` reports `local-ahead` | The manifest version is not on npm yet. Publish it: `npm run release -- --packages <pkg> --bump none --yes` publishes the current version as-is. |
+| `npm run release:status -- --check` exits 2 | A registry query failed (offline, mirror, rate limit) — the state is unknown, not “in sync”. Re-run when reachable; check `npm config get registry` if it keeps failing. |
 
 ## Layout
 
 ```text
 scripts/
 ├─ verify-packages.mjs    # pre-publish gate (also: npm run verify)
+├─ release.mjs            # release tool (also: npm run release)
+├─ status.mjs             # read-only publish-state report (also: npm run release:status)
 ├─ check-gallery.mjs      # pi.dev listing check (also: npm run gallery)
-├─ check-gallery.test.mjs # parser tests (also: npm test)
-└─ release.mjs            # release tool (also: npm run release)
+├─ check-gallery.test.mjs # gallery parser tests (also: npm test)
+└─ status.test.mjs        # status report tests (also: npm test)
 agent/extensions/<pkg>/
 ├─ package.json          # name, version, pi manifest, files[], publishConfig
 ├─ README.md             # npm + GitHub page

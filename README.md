@@ -96,6 +96,7 @@ Releases are cut locally with one script. Versions are **independent per package
 
 ```bash
 npm login                      # once per machine (npm user: dieulc)
+npm run release:status         # read-only: manifest versions vs the npm registry
 npm run verify                 # gate: all four packages
 npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
 npm run release                # interactive: pick packages + bump type
@@ -129,12 +130,14 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 
 ```text
 ~/.pi/  (this repo — dotfiles + release tooling, not itself a package)
-├─ package.json              ← private; scripts: verify, release
+├─ package.json              ← private; scripts: verify, release, release:status, gallery, test
 ├─ README.md, LICENSE
 ├─ docs/publishing.md        ← release reference
 ├─ scripts/
 │  ├─ verify-packages.mjs    ← pre-publish gate
-│  └─ release.mjs            ← version + changelog + publish + tag
+│  ├─ release.mjs            ← version + changelog + publish + tag
+│  ├─ status.mjs             ← read-only npm publish-state report
+│  └─ check-gallery.mjs      ← pi.dev listing check
 ├─ .gitignore
 └─ agent/
    ├─ settings.json / .example
