@@ -512,7 +512,7 @@ function publish(targets) {
           '  ↳ if npm reported 403 "Two-factor authentication or granular access token\n' +
             '    with bypass 2fa enabled is required": the configured npm auth cannot\n' +
             '    write. Create a granular token with "Bypass 2FA" enabled at\n' +
-            '    npmjs.com → Access Tokens, or log in interactively (removing the token)\n' +
+            "    npmjs.com → Access Tokens, or log in interactively (removing the token)\n" +
             "    and retry with an OTP. See docs/publishing.md → Troubleshooting.",
         );
       }

@@ -142,7 +142,10 @@ function decodeEntities(text) {
     (whole, body) => {
       if (body.startsWith("#")) {
         const hex = body[1] === "x" || body[1] === "X";
-        const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+        const code = Number.parseInt(
+          hex ? body.slice(2) : body.slice(1),
+          hex ? 16 : 10,
+        );
         return Number.isFinite(code) && code > 0 && code <= 0x10ffff
           ? String.fromCodePoint(code)
           : whole;
@@ -205,7 +208,10 @@ async function fetchGallery(name, timeoutMs) {
     const res = await fetch(url, {
       redirect: "follow",
       signal: AbortSignal.timeout(timeoutMs * 1000),
-      headers: { accept: "text/html", "user-agent": "pi-release-gallery-check" },
+      headers: {
+        accept: "text/html",
+        "user-agent": "pi-release-gallery-check",
+      },
     });
     const body = await res.text();
     return { url, status: res.status, body };
