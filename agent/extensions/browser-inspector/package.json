@@ -1,9 +1,14 @@
 {
-  "name": "browser-inspector",
-  "version": "1.0.0",
+  "name": "@dieulc/browser-inspector",
+  "version": "0.1.0",
   "description": "Pi extension: inspect browser DevTools (console, network, performance) via CDP",
   "type": "module",
   "main": "src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dieuluucanh/pi-workflow",
+    "directory": "agent/extensions/browser-inspector"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -12,9 +17,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["pi-package", "browser", "devtools", "cdp", "inspector"],
+  "license": "MIT",
   "dependencies": {
     "chrome-launcher": "^1.2.1",
     "chrome-remote-interface": "^0.34.0",

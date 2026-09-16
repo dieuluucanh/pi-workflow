@@ -98,31 +98,873 @@ export function isSafeCommand(command: string): boolean {
   return !isDestructive && isSafe;
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
 export interface TodoItem {
   step: number;
   text: string;
+  /** Legacy boolean flag; kept derived from `status` for old sessions/external readers. */
   completed: boolean;
+  /** Industry-style status. Legacy items derive it from `completed`. */
+  status?: TodoStatus;
+  /** Stable, globally-unique identity ref assigned at creation and never renumbered. */
+  ref?: string;
+  /** Plan-faithful label, e.g. "1", "2.3". Legacy items derive it from step. */
+  label?: string;
+  /** Optional group/phase heading the step belongs to. */
+  group?: string;
+  /** Where the item came from. */
+  source?: "plan" | "agent" | "synthesized";
 }
 
-export function cleanStepText(text: string): string {
-  let cleaned = text
-    .replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(
-      /^(Use|Run|Execute|Create|Write|Read|Check|Verify|Update|Modify|Add|Remove|Delete|Install)\s+(the\s+)?/i,
-      "",
-    )
+const TODO_STATUS_RANK: Record<TodoStatus, number> = {
+  completed: 3,
+  in_progress: 2,
+  pending: 1,
+  cancelled: 0,
+};
+
+/** Resolve an item's status; legacy `completed` booleans are backfilled. */
+export function itemStatus(it: TodoItem): TodoStatus {
+  if (it?.status) return it.status;
+  return it?.completed ? "completed" : "pending";
+}
+
+/** True when the item is done. */
+export function isDone(it: TodoItem): boolean {
+  return itemStatus(it) === "completed";
+}
+
+/** Set an item's status and keep the legacy `completed` flag in sync. */
+export function setTodoStatus(it: TodoItem, status: TodoStatus): TodoItem {
+  it.status = status;
+  it.completed = status === "completed";
+  return it;
+}
+
+/**
+ * Merge precedence for two sources disagreeing on status: the more advanced
+ * rank wins (completed > in_progress > pending > cancelled), so a plan-file
+ * `- [x]` can mark an item done but nothing can silently un-complete it.
+ */
+export function mergeStatusByRank(
+  a: TodoStatus | undefined,
+  b: TodoStatus | undefined,
+): TodoStatus {
+  const ra = a ? TODO_STATUS_RANK[a] : 0;
+  const rb = b ? TODO_STATUS_RANK[b] : 0;
+  return rb > ra ? (b as TodoStatus) : ((a ?? "pending") as TodoStatus);
+}
+
+/** Canonical, globally-unique ref for an item (stable across merges). */
+export function todoRef(it: Pick<TodoItem, "ref" | "step">): string {
+  return it?.ref || String(it?.step ?? 0);
+}
+
+/** Numeric value of a ref, if it is an integer (for range math). */
+export function todoRefNumber(ref: string): number | undefined {
+  const n = Number(String(ref ?? "").trim());
+  return Number.isFinite(n) && Number.isInteger(n) ? n : undefined;
+}
+
+/**
+ * Normalize step text for display and identity. Strips markdown emphasis
+ * (including orphan `**` left by partially consumed bold) and collapses
+ * whitespace. Deliberately does NOT strip imperative verbs — the todo list
+ * must mirror the plan's wording.
+ */
+export function normalizeStepText(text: string): string {
+  let cleaned = String(text ?? "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/__(.+?)__/g, "$1")
+    .replace(/\*{1,2}/g, "")
     .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[:\-\u2013\u2014]\s*$/, "")
     .trim();
-  if (cleaned.length > 0)
-    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   if (cleaned.length > 200) cleaned = `${cleaned.slice(0, 197)}...`;
   return cleaned;
 }
 
-export function extractTodoItems(message: string): TodoItem[] {
+/** @deprecated kept for compatibility; use normalizeStepText. */
+export function cleanStepText(text: string): string {
+  return normalizeStepText(text);
+}
+
+/** Stable identity key for dedupe/merge (case/punctuation-insensitive). */
+export function todoKey(item: Pick<TodoItem, "text" | "group">): string {
+  const norm = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const g = norm(item.group);
+  const t = norm(item.text);
+  return g ? `${g}|${t}` : t;
+}
+
+/**
+ * Backfill labels/ref/status/source for items restored from older sessions.
+ * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ * array order, so persisted lists with inflated refs (e.g. 17..23 written by
+ * an older build) heal on restore. Plan labels are preserved as display
+ * metadata and default to the position when absent.
+ */
+export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
+  return (items ?? []).map((it, i) => {
+    const step = i + 1;
+    // Preserve the original positional label for legacy rows without a label.
+    const originalStep = Number.isFinite(it?.step) ? Number(it.step) : step;
+    const status = itemStatus(it);
+    return {
+      ...it,
+      step,
+      label: it?.label || String(originalStep),
+      ref: String(step),
+      status,
+      completed: status === "completed",
+      source: it?.source ?? "plan",
+    };
+  });
+}
+
+/** Stable dedupe — first occurrence wins. */
+export function dedupeTodoItems(items: TodoItem[]): TodoItem[] {
+  const seen = new Set<string>();
+  const out: TodoItem[] = [];
+  for (const it of items ?? []) {
+    const key = todoKey(it);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+export interface TodoMergeResult {
+  items: TodoItem[];
+  added: number;
+  removed: number;
+  kept: number;
+  /** Number of unmatched `source:"agent"` items preserved from the previous list. */
+  preserved: number;
+}
+
+/**
+ * Merge freshly extracted plan steps into the existing list while preserving
+ * completion state for steps that are still present. Extracted order wins.
+ *
+ * Match order: exact `todoKey` (text+group) first, then — for existing
+ * `source:"plan"` rows — the plan label (group-aware, collision-safe), so a
+ * step whose wording the model rewrote in `workflow_todo update` still
+ * reunites with its plan row instead of being duplicated. On a label match the
+ * extracted text is authoritative and status merges by rank (a plan-file
+ * `- [x]` can mark an item done, nothing un-completes it). Unmatched
+ * `source:"agent"` items are preserved.
+ *
+ * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ * the returned list order, so displayed numbers always equal `todoRef`.
+ */
+export function mergeTodoItems(
+  existing: TodoItem[],
+  extracted: TodoItem[],
+): TodoMergeResult {
+  const prev = ensureTodoLabels(existing ?? []);
+  const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
+  const normLabel = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const byLabel = new Map<string, TodoItem[]>();
+  const byKey = new Map<string, TodoItem>();
+  for (const p of prev) {
+    const l = normLabel(p.label || String(p.step));
+    if (l) {
+      const arr = byLabel.get(l);
+      if (arr) arr.push(p);
+      else byLabel.set(l, [p]);
+    }
+    const k = todoKey(p);
+    if (k && !byKey.has(k)) byKey.set(k, p);
+  }
+  const used = new Set<TodoItem>();
+  let added = 0;
+  let kept = 0;
+  /**
+   * Collision-safe plan-label match for a re-extracted step. Only existing
+   * `source:"plan"` rows are eligible; when duplicate labels exist across
+   * phases the group must disambiguate (otherwise the label is not trusted).
+   */
+  const matchByPlanLabel = (n: TodoItem): TodoItem | undefined => {
+    const l = normLabel(n.label);
+    if (!l) return undefined;
+    const cands = (byLabel.get(l) ?? []).filter(
+      (p) => !used.has(p) && p.source === "plan",
+    );
+    if (cands.length === 0) return undefined;
+    if (cands.length === 1) return cands[0];
+    const ng = normLabel(n.group);
+    const grouped = cands.filter((p) => normLabel(p.group) === ng);
+    return grouped.length === 1 ? grouped[0] : undefined;
+  };
+  const items = next.map((n) => {
+    const nKey = todoKey(n);
+    let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
+    if (match && used.has(match)) match = undefined;
+    if (!match) match = matchByPlanLabel(n);
+    if (match && !used.has(match)) {
+      used.add(match);
+      kept++;
+      const item: TodoItem = {
+        ...n,
+        group: n.group ?? match.group,
+        source: n.source ?? match.source,
+      };
+      const status = mergeStatusByRank(itemStatus(match), itemStatus(item));
+      setTodoStatus(item, status);
+      return item;
+    }
+    added++;
+    const item: TodoItem = { ...n };
+    if (item.status) item.completed = item.status === "completed";
+    else setTodoStatus(item, item.completed ? "completed" : "pending");
+    return item;
+  });
+  // Preserve unmatched agent-added items (progress + ad-hoc steps survive sync).
+  const preserved: TodoItem[] = [];
+  for (const p of prev) {
+    if (used.has(p)) continue;
+    if (p.source === "agent") preserved.push({ ...p });
+  }
+  const all = [...items, ...preserved];
+  all.forEach((it, i) => {
+    it.step = i + 1;
+    it.ref = String(i + 1);
+    if (!it.label) it.label = String(i + 1);
+  });
+  const removed = prev.filter(
+    (p) => !used.has(p) && p.source !== "agent",
+  ).length;
+  return { items: all, added, removed, kept, preserved: preserved.length };
+}
+
+export interface TodoRefResolution {
+  item?: TodoItem;
+  ambiguous?: TodoItem[];
+  unknown?: string;
+}
+
+/** Resolve a `[DONE:ref]` / toggle reference to a todo item.
+ * Precedence: (a) pure integer → canonical `ref`, then positional `step`, then
+ * unique `label`; (b) dotted `N.M` → unique `label`; (c) group-qualified
+ * `Group/Label`, `Label@Group`, `#N`; (d) unique normalized-text match ≥8 chars.
+ */
+export function resolveTodoRef(
+  items: TodoItem[],
+  ref: string,
+): TodoRefResolution {
+  const list = items ?? [];
+  const raw = String(ref ?? "").trim();
+  if (!raw) return { unknown: raw };
+  let norm = raw.replace(/[.)]+$/, "").trim();
+  const clean = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const unique = (arr: TodoItem[]): TodoRefResolution | null => {
+    if (arr.length === 1) return { item: arr[0] };
+    if (arr.length > 1) return { ambiguous: arr };
+    return null;
+  };
+
+  // `#N` → ref N
+  const hash = norm.match(/^#(\d+)$/);
+  if (hash) norm = hash[1];
+
+  // Group-qualified: "Phase B/2", "2@Phase A"
+  const gq = norm.match(/^(.+)\/(\S+)$/) || norm.match(/^(\S+)@(.+)$/);
+  if (gq) {
+    const g = clean(gq[1]);
+    const l = clean(gq[2]);
+    const inGroup = list.filter((it) => clean(it.group) === g);
+    if (inGroup.length === 0) return { unknown: raw };
+    const byLabel = unique(inGroup.filter((it) => clean(it.label) === l));
+    if (byLabel) return byLabel;
+    const byRef = unique(
+      inGroup.filter((it) => clean(todoRef(it)) === l || todoRef(it) === l),
+    );
+    if (byRef) return byRef;
+    const num = Number(l);
+    if (Number.isFinite(num))
+      return (
+        unique(inGroup.filter((it) => it.step === num)) ?? { unknown: raw }
+      );
+    return { unknown: raw };
+  }
+
+  // Pure integer: canonical ref → positional step → unique label
+  if (/^\d+$/.test(norm)) {
+    const n = Number(norm);
+    const byRef = unique(
+      list.filter((it) => todoRef(it) === norm || todoRef(it) === String(n)),
+    );
+    if (byRef) return byRef;
+    const byStep = unique(list.filter((it) => it.step === n));
+    if (byStep) return byStep;
+    const byLabel = unique(list.filter((it) => clean(it.label) === norm));
+    if (byLabel) return byLabel;
+    // Duplicated per-phase labels (the historical failure): surface them all so
+    // the error can teach the global step numbers.
+    const labeled = list.filter((it) => String(it.label) === norm);
+    if (labeled.length > 0) return { ambiguous: labeled };
+    return { unknown: raw };
+  }
+
+  // Dotted plan label: N.M
+  if (/^\d+\.\d+$/.test(norm)) {
+    const byLabel = unique(list.filter((it) => it.label === norm));
+    if (byLabel) return byLabel;
+  }
+
+  // Unique normalized-text substring (≥8 chars)
+  if (norm.length >= 8) {
+    const needle = clean(norm);
+    const textMatches = list.filter((it) => clean(it.text).includes(needle));
+    const res = unique(textMatches);
+    if (res) return res;
+  }
+  return { unknown: raw };
+}
+
+/**
+ * Leniently parse completion refs from assistant text: `[DONE:3]`,
+ * `[DONE: 3.1]`, `[DONE:2-4]`, `[DONE #2]`, `[DONE:1,2]`,
+ * `[DONE:Phase B/2]` (group-qualified).
+ */
+export function parseDoneRefs(text: string): string[] {
+  const refs: string[] = [];
+  if (!text) return refs;
+  const re = /\[DONE\s*[:#]?\s*([^\]]+)\]/gi;
+  for (const m of text.matchAll(re)) {
+    const body = String(m[1] ?? "").trim();
+    if (!body) continue;
+    const range = body.match(/^(\d+)\s*(?:-|\u2013|\u2014|\.\.)\s*(\d+)$/);
+    if (range) {
+      const a = Number(range[1]);
+      const b = Number(range[2]);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        for (let i = lo; i <= hi && i - lo < 200; i++) refs.push(String(i));
+        continue;
+      }
+    }
+    const numericParts: string[] = [];
+    let hasNonNumeric = false;
+    for (const part of body.split(/[,\s]+/)) {
+      const p = part.trim().replace(/[.)]+$/, "");
+      if (/^\d+(?:\.\d+)?$/.test(p)) numericParts.push(p);
+      else if (p) hasNonNumeric = true;
+    }
+    if (numericParts.length > 0) refs.push(...numericParts);
+    else if (hasNonNumeric) refs.push(body);
+  }
+  return refs;
+}
+
+export interface MarkCompletedResult {
+  marked: number;
+  unknown: string[];
+  ambiguous: string[];
+}
+
+/** Mark items completed from `[DONE:ref]` tags. Only sets true. */
+export function markCompletedRefs(
+  text: string,
+  items: TodoItem[],
+): MarkCompletedResult {
+  const result: MarkCompletedResult = {
+    marked: 0,
+    unknown: [],
+    ambiguous: [],
+  };
+  for (const ref of parseDoneRefs(text)) {
+    const res = resolveTodoRef(items, ref);
+    if (res.item) {
+      setTodoStatus(res.item, "completed");
+      result.marked++;
+    } else if (res.ambiguous) {
+      result.ambiguous.push(ref);
+    } else {
+      result.unknown.push(ref);
+    }
+  }
+  return result;
+}
+
+/** Legacy numeric API retained for compatibility. */
+export function extractDoneSteps(message: string): number[] {
+  return parseDoneRefs(message)
+    .map(Number)
+    .filter((n) => Number.isFinite(n));
+}
+
+/** Legacy API retained for compatibility. */
+export function markCompletedSteps(text: string, items: TodoItem[]): number {
+  return markCompletedRefs(text, items).marked;
+}
+
+// ── Wholesale update (industry-style replace) ────────────────────────
+
+export interface TodoUpdateEntry {
+  /** Canonical ref to an existing item (optional for new items). */
+  ref?: string;
+  /** Step text. Exact/normalized match is used when no `ref` is given. */
+  text?: string;
+  status?: TodoStatus;
+}
+
+export interface TodoUpdateResult {
+  items: TodoItem[];
+  added: number;
+  removed: number;
+  kept: number;
+  /** Extra `in_progress` items demoted to `pending` (only one allowed). */
+  normalized: number;
+  /** Non-fatal resolution notes (refs matched by label/text or added as new). */
+  warnings: string[];
+}
+
+/**
+ * Industry-style replace update (TodoWrite / todowrite / update_plan semantics):
+ * the incoming entries become the new list.
+ *
+ * - Identify existing items by canonical `ref` first, then by normalized text
+ *   (group-insensitive), then leniently via `resolveTodoRef` (plan label /
+ *   group-qualified ref / unique text). A non-empty `ref` that had to be
+ *   resolved leniently, or that matched nothing, is reported in `warnings`.
+ * - Omitted items are removed; new entries are appended.
+ * - Exactly one item may be `in_progress`; extras are demoted (counted as
+ *   `normalized`).
+ * - Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ *   the returned list order, so displayed numbers always equal `todoRef`.
+ */
+export function applyTodoUpdate(
+  existing: TodoItem[],
+  incoming: TodoUpdateEntry[],
+): TodoUpdateResult {
+  const prev = ensureTodoLabels(existing ?? []);
+  const byRef = new Map<string, TodoItem>();
+  const byTextKey = new Map<string, TodoItem>();
+  for (const p of prev) {
+    const r = todoRef(p);
+    if (r) byRef.set(r.toLowerCase(), p);
+    const k = todoKey({ text: p.text });
+    if (k && !byTextKey.has(k)) byTextKey.set(k, p);
+  }
+  const used = new Set<TodoItem>();
   const items: TodoItem[] = [];
-  // Try multiple header patterns: strict Plan:\n, "# Plan:" heading, or "Plan:" with trailing title
+  const warnings: string[] = [];
+  const short = (s: string) => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
+  let added = 0;
+  let kept = 0;
+  for (const raw of incoming ?? []) {
+    const text = normalizeStepText(raw?.text ?? "");
+    const rawRef =
+      raw?.ref !== undefined && String(raw.ref).trim()
+        ? String(raw.ref).trim()
+        : undefined;
+    let match: TodoItem | undefined;
+    let matchedBy: "ref" | "label" | "text" | undefined;
+    if (rawRef) {
+      match = byRef.get(rawRef.toLowerCase());
+      if (match) matchedBy = "ref";
+    }
+    if (!match && text) {
+      const k = todoKey({ text });
+      match = k ? byTextKey.get(k) : undefined;
+      if (match) matchedBy = "text";
+    }
+    if (!match && rawRef) {
+      const resolved = resolveTodoRef(prev, rawRef);
+      if (resolved.item && !used.has(resolved.item)) {
+        match = resolved.item;
+        matchedBy = "label";
+      }
+    }
+    if (match && used.has(match)) match = undefined;
+    const status = raw?.status ?? "pending";
+    if (match) {
+      used.add(match);
+      kept++;
+      if (rawRef && matchedBy !== "ref")
+        warnings.push(
+          `ref "${rawRef}" not found; matched "${short(match.text)}" by ${matchedBy ?? "text"}`,
+        );
+      const item: TodoItem = {
+        ...match,
+        text: text || match.text,
+        status,
+        completed: status === "completed",
+        source: match.source ?? "agent",
+      };
+      items.push(item);
+    } else {
+      // Skip empty ghost entries (blank text, no ref, already-used ref).
+      if (!text) continue;
+      added++;
+      if (rawRef)
+        warnings.push(
+          `ref "${rawRef}" not found; added "${short(text)}" as a new step`,
+        );
+      const item: TodoItem = {
+        step: 0,
+        text,
+        completed: status === "completed",
+        status,
+        source: "agent",
+      };
+      items.push(item);
+    }
+  }
+  // Normalize: at most one in_progress.
+  let normalized = 0;
+  let seenInProgress = false;
+  for (const it of items) {
+    if (it.status === "in_progress") {
+      if (seenInProgress) {
+        it.status = "pending";
+        it.completed = false;
+        normalized++;
+      } else {
+        seenInProgress = true;
+      }
+    }
+  }
+  items.forEach((it, i) => {
+    it.step = i + 1;
+    it.ref = String(i + 1);
+    if (!it.label) it.label = String(i + 1);
+  });
+  const removed = prev.filter((p) => !used.has(p)).length;
+  return { items, added, removed, kept, normalized, warnings };
+}
+
+// ── Display + reminder builders (pure, exported for tests) ────────────
+
+/** Status glyph for a todo row. */
+export function todoGlyph(it: TodoItem): string {
+  const s = itemStatus(it);
+  return s === "completed"
+    ? "☑"
+    : s === "in_progress"
+      ? "▶"
+      : s === "cancelled"
+        ? "✖"
+        : "☐";
+}
+
+/** One display line: `☑ 6. text (plan label B2)` when the label differs. */
+export function formatTodoLine(
+  it: TodoItem,
+  opts?: { showLabel?: boolean },
+): string {
+  const ref = todoRef(it);
+  const labelPart =
+    opts?.showLabel !== false &&
+    it.label !== undefined &&
+    String(it.label) !== ref
+      ? ` (plan label ${it.label})`
+      : "";
+  return `${todoGlyph(it)} ${ref}. ${it.text}${labelPart}`;
+}
+
+/**
+ * Numbered list for model-facing messages (handoff preview, execute prompt).
+ * Uses each row's canonical global ref, so the numbers shown always match the
+ * refs `workflow_todo` resolves. Single source for such lists.
+ */
+export function formatTodoNumberedList(
+  items: TodoItem[],
+  opts?: { glyph?: boolean },
+): string {
+  return (items ?? [])
+    .map((it) =>
+      opts?.glyph
+        ? `${todoGlyph(it)} ${todoRef(it)}. ${it.text}`
+        : `${todoRef(it)}. ${it.text}`,
+    )
+    .join("\n");
+}
+
+export interface TodoContextBlockOptions {
+  /** Unresolved refs from the previous turn (fed back so the model can fix them). */
+  misses?: { refs: string[] };
+}
+
+/**
+ * The per-turn reminder block (context injection / before_agent_start).
+ * Canonical global refs only; teaches the update protocol.
+ */
+export function buildTodoContextBlock(
+  items: TodoItem[],
+  opts?: TodoContextBlockOptions,
+): string {
+  const list = items ?? [];
+  if (list.length === 0) return "";
+  const done = list.filter((t) => isDone(t)).length;
+  const total = list.length;
+  const remaining = list.filter(
+    (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+  );
+  const current =
+    list.find((t) => itemStatus(t) === "in_progress") ?? remaining[0];
+  const preview = remaining
+    .slice(0, 6)
+    .map((t) => `${todoRef(t)}. ${t.text}`)
+    .join("\n");
+  const more = remaining.length > 6 ? `\n… +${remaining.length - 6} more` : "";
+  const missBlock = opts?.misses?.refs?.length
+    ? `\n\n[REFS UNRESOLVED last turn: ${opts.misses.refs.join(", ")} matched multiple steps. Use the GLOBAL STEP numbers below (e.g. step ${current ? todoRef(current) : "N"}).]`
+    : "";
+  return [
+    `[TODO LIST] ${done}/${total} done. Steps are numbered GLOBALLY 1..${total}; use these GLOBAL STEP numbers as refs.`,
+    current
+      ? `Current/next: ${todoRef(current)}. ${current.text}`
+      : "All steps done.",
+    `Remaining:\n${preview}${more}`,
+    `Finish a step → workflow_todo {action:"update", todos:[…COMPLETE LIST…]}, or {action:"done", step:${current ? todoRef(current) : "<N>"}}, or [DONE:${current ? todoRef(current) : "<N>"}].`,
+    `After finishing a step, mark it in the SAME turn. Never leave it unchecked.`,
+    missBlock,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** One-line footer appended to successful mutating tool results. */
+export function buildTodoFooter(items: TodoItem[]): string {
+  const list = items ?? [];
+  if (list.length === 0) return "";
+  const done = list.filter((t) => isDone(t)).length;
+  const total = list.length;
+  const remaining = list.filter(
+    (t) => !isDone(t) && itemStatus(t) !== "cancelled",
+  );
+  if (remaining.length === 0) return "";
+  const current =
+    list.find((t) => itemStatus(t) === "in_progress") ?? remaining[0];
+  return `[TODO ${done}/${total} — sync status now: if the step you just worked on (${todoRef(current)}. ${current.text.slice(0, 50)}) is finished, call workflow_todo {action:"done", step:${todoRef(current)}} or [DONE:${todoRef(current)}].]`;
+}
+
+/** Ambiguity error that teaches the global step numbers. */
+export function formatAmbiguity(items: TodoItem[], ref: string): string {
+  const list = items ?? [];
+  if (list.length === 0)
+    return `Todo "${ref}" is ambiguous but no items match.`;
+  const lines = list
+    .slice(0, 12)
+    .map((t) => `${todoRef(t)}. ${t.text}`)
+    .join("\n");
+  const more = list.length > 12 ? `\n… +${list.length - 12} more` : "";
+  return `Todo "${ref}" is ambiguous (matches ${list.length} items). Use the GLOBAL STEP numbers:\n${lines}${more}`;
+}
+
+export interface RemindState {
+  turnsSinceLastTodoWrite: number;
+  turnsSinceLastReminder: number;
+  remaining: number;
+}
+
+/** Claude Code-style throttled cadence: no reminder until enough turns have
+ * passed since both the last todo write and the last reminder. */
+export function shouldRemind(state: RemindState): boolean {
+  const s = state ?? {
+    turnsSinceLastTodoWrite: 0,
+    turnsSinceLastReminder: 0,
+    remaining: 0,
+  };
+  return (
+    s.remaining > 0 &&
+    s.turnsSinceLastTodoWrite >= TURNS_SINCE_WRITE &&
+    s.turnsSinceLastReminder >= TURNS_BETWEEN_REMINDERS
+  );
+}
+
+export const TURNS_SINCE_WRITE = 3;
+export const TURNS_BETWEEN_REMINDERS = 3;
+
+// ── Plan extraction (section-scoped) ─────────────────────────────
+
+const EXCLUDED_SECTION_RE =
+  /^(context|decisions?|exploration(\s+summary)?|risks?|verification|notes?|root\s+cause|background|summary|alternatives?|open\s+questions?|references?|appendix)\b/i;
+
+function headingMatch(line: string): { level: number; title: string } | null {
+  const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+  if (!m) return null;
+  return { level: m[1].length, title: m[2].trim() };
+}
+
+/** Step-shaped heading: `### 1. Title`, `### Step 2: Title`. */
+function stepFromHeading(line: string): { label: string; text: string } | null {
+  const m = line.match(
+    /^(#{3,6})\s*(?:(\d+(?:\.\d+)?)[.)]\s+|Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s+)(.+?)\s*$/i,
+  );
+  if (!m) return null;
+  const label = m[2] ?? m[3];
+  const text = normalizeStepText(m[4] ?? "");
+  if (!label || text.length <= 3) return null;
+  return { label, text };
+}
+
+/** Bold step paragraph: `**Step 1.1: Scaffold**`. */
+function stepFromBold(line: string): { label: string; text: string } | null {
+  const m = line.match(
+    /^\s*\*\*Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s*(.+?)\*\*\s*$/i,
+  );
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { label: m[1], text };
+}
+
+/** Numbered list item: `1. Title`. */
+function stepFromList(line: string): { label: string; text: string } | null {
+  const m = line.match(/^\s*(\d+(?:\.\d+)?)[.)]\s+(.+?)\s*$/);
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { label: m[1], text };
+}
+
+/** Checkbox item: `- [ ] Title` / `- [x] Title`. */
+function stepFromCheckbox(
+  line: string,
+): { text: string; completed: boolean } | null {
+  const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.+?)\s*$/);
+  if (!m) return null;
+  const text = normalizeStepText(m[2]);
+  if (text.length <= 3) return null;
+  return { text, completed: m[1].toLowerCase() === "x" };
+}
+
+function parseStepsFromLines(lines: string[]): TodoItem[] {
+  type RawStep = {
+    label?: string;
+    text: string;
+    completed?: boolean;
+    group?: string;
+  };
+  let usedExplicit = false;
+  for (const line of lines) {
+    if (stepFromHeading(line) || stepFromBold(line)) {
+      usedExplicit = true;
+      break;
+    }
+  }
+  let numberedCount = 0;
+  if (!usedExplicit) {
+    for (const line of lines) if (stepFromList(line)) numberedCount++;
+  }
+  const useNumberedList = !usedExplicit && numberedCount >= 2;
+  const raw: RawStep[] = [];
+  let group: string | undefined;
+  for (const line of lines) {
+    const bold = stepFromBold(line);
+    if (bold) {
+      raw.push({ ...bold, group });
+      continue;
+    }
+    const heading = headingMatch(line);
+    if (heading) {
+      const step = stepFromHeading(line);
+      if (step) {
+        raw.push({ ...step, group });
+        continue;
+      }
+      const title = heading.title;
+      if (heading.level >= 3 && !EXCLUDED_SECTION_RE.test(title)) group = title;
+      continue;
+    }
+    if (useNumberedList) {
+      const list = stepFromList(line);
+      if (list) {
+        raw.push({ ...list, group });
+      }
+    }
+  }
+  if (!usedExplicit && !useNumberedList) {
+    for (const line of lines) {
+      const cb = stepFromCheckbox(line);
+      if (cb) raw.push({ text: cb.text, completed: cb.completed });
+    }
+  }
+  const items: TodoItem[] = raw.map((r, i) => ({
+    step: i + 1,
+    text: r.text,
+    completed: !!r.completed,
+    label: r.label,
+    group: r.group,
+    source: "plan" as const,
+  }));
+  const deduped = dedupeTodoItems(items);
+  deduped.forEach((it, i) => {
+    it.step = i + 1;
+    if (!it.label) it.label = String(i + 1);
+  });
+  return deduped;
+}
+
+/**
+ * Extract plan steps from a plan markdown file. Section-scoped: only the
+ * `## Plan Steps` section is parsed (fallback: step-shaped headings across
+ * the document, skipping Context/Decisions/Exploration/Risks/Verification).
+ * Labels and phase groups are preserved. Verification is never extracted.
+ */
+export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
+  if (!md) return [];
+  const lines = md.split(/\r?\n/);
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = headingMatch(lines[i]);
+    if (!h || h.level < 2 || h.level > 4) continue;
+    if (/plan\s+steps/i.test(h.title)) {
+      start = i + 1;
+      level = h.level;
+      break;
+    }
+  }
+  let section: string[];
+  if (start >= 0) {
+    let end = lines.length;
+    for (let i = start; i < lines.length; i++) {
+      const h = headingMatch(lines[i]);
+      if (h && h.level <= level && !/plan\s+steps/i.test(h.title)) {
+        end = i;
+        break;
+      }
+    }
+    section = lines.slice(start, end);
+  } else {
+    section = [];
+    let skipping = false;
+    for (const line of lines) {
+      const h = headingMatch(line);
+      if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
+      else if (h && skipping) continue;
+      if (!skipping) section.push(line);
+    }
+  }
+  return parseStepsFromLines(section);
+}
+
+/**
+ * Extract plan steps from assistant chat text (used when no plan file exists).
+ * Finds a `Plan:` header, then parses section-scoped steps.
+ */
+export function extractTodoItems(message: string): TodoItem[] {
+  if (!message) return [];
   let headerIdx = -1;
   let headerLen = 0;
   const strict = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
@@ -142,80 +984,27 @@ export function extractTodoItems(message: string): TodoItem[] {
       }
     }
   }
-  if (headerIdx === -1) return items;
-  const planSection = message.slice(headerIdx + headerLen);
-  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+\*{0,2}([^\n]+)/gm;
-  for (const match of planSection.matchAll(numberedPattern)) {
-    const text = match[2]
-      .trim()
-      .replace(/\*{1,2}$/, "")
-      .trim();
-    if (
-      text.length > 5 &&
-      !text.startsWith("`") &&
-      !text.startsWith("/") &&
-      !text.startsWith("-")
-    ) {
-      const cleaned = cleanStepText(text);
-      if (cleaned.length > 3)
-        items.push({ step: items.length + 1, text: cleaned, completed: false });
-    }
+  if (headerIdx === -1) return [];
+  const body = message.slice(headerIdx + headerLen).split(/\r?\n/);
+  const filtered: string[] = [];
+  let skipping = false;
+  for (const line of body) {
+    const h = headingMatch(line);
+    if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
+    else if (h && skipping) continue;
+    if (!skipping) filtered.push(line);
   }
-  return items;
+  return parseStepsFromLines(filtered);
 }
 
-export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
-  const items = extractTodoItems(md);
-  if (items.length > 0) return items;
-  // Tolerant heading search: any heading containing "Plan Steps" (case-insensitive)
-  const headingMatch = md.match(/^#+\s*.*Plan Steps.*$/im);
-  let section: string;
-  if (headingMatch && headingMatch.index !== undefined) {
-    section = md.slice(headingMatch.index);
-  } else {
-    // Also accept "## 4) Plan Steps" style via broader search
-    const altIdx = md.search(/^##+\s*.*Plan Steps/im);
-    section = altIdx >= 0 ? md.slice(altIdx) : md;
-  }
-  const numberedPattern = /^\s*(?:#{1,4}\s*)?(\d+)[.)]\s+(.+)$/gm;
-  for (const match of section.matchAll(numberedPattern)) {
-    const text = cleanStepText(match[2].trim());
-    if (text.length > 3)
-      items.push({ step: items.length + 1, text, completed: false });
-  }
-  // Second pass: "### Step N: Title" or "#### 1. Title" style when numbered pattern yields zero
-  if (items.length === 0) {
-    const stepHeaderPattern =
-      /^\s*#{3,4}\s*Step\s*\d+\s*[:\-\u2014]?\s*(.+)$/gim;
-    for (const m of section.matchAll(stepHeaderPattern)) {
-      const text = cleanStepText(m[1].trim());
-      if (text.length > 3)
-        items.push({ step: items.length + 1, text, completed: false });
-    }
-  }
-  // Last resort: if still zero and section is whole file, try loose numbered pattern on full md but filtered to short list context
-  if (items.length === 0 && section === md) {
-    // Avoid capturing unrelated numbered lists by requiring at least 2 items; otherwise leave empty for caller to synthesize
-  }
-  return items;
-}
-
-export function extractDoneSteps(message: string): number[] {
-  const steps: number[] = [];
-  for (const match of message.matchAll(/\[DONE:(\d+)\]/gi)) {
-    const step = Number(match[1]);
-    if (Number.isFinite(step)) steps.push(step);
-  }
-  return steps;
-}
-
-export function markCompletedSteps(text: string, items: TodoItem[]): number {
-  const doneSteps = extractDoneSteps(text);
-  for (const step of doneSteps) {
-    const item = items.find((t) => t.step === step);
-    if (item) item.completed = true;
-  }
-  return doneSteps.length;
+/** Single placeholder step from a plan title when no steps could be parsed. */
+export function synthesizeFromPlanTitle(md: string): TodoItem | null {
+  const src = String(md ?? "");
+  const m = src.match(/^#\s+Plan[:\s]+(.+)$/im) || src.match(/^#\s+(.+)$/m);
+  if (!m) return null;
+  const text = normalizeStepText(m[1]).slice(0, 120);
+  if (!text) return null;
+  return { step: 1, text, completed: false, label: "1", source: "synthesized" };
 }
 
 export function isPlanWritePath(p: string, cwd: string): boolean {
