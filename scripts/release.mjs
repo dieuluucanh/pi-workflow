@@ -85,7 +85,9 @@ function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
-    throw new ReleaseError(`cannot read ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new ReleaseError(
+      `cannot read ${file}: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -105,10 +107,15 @@ function parseArgs(argv) {
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--packages") opts.packages = String(argv[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (arg === "--packages")
+      opts.packages = String(argv[++i] ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     else if (arg === "--bump") opts.bump = String(argv[++i] ?? "").trim();
     else if (arg === "--branch") opts.branch = String(argv[++i] ?? "").trim();
-    else if (arg === "--npm-user") opts.npmUser = String(argv[++i] ?? "").trim();
+    else if (arg === "--npm-user")
+      opts.npmUser = String(argv[++i] ?? "").trim();
     else if (arg === "--dry-run") opts.dryRun = true;
     else if (arg === "--continue") opts.continue = true;
     else if (arg === "--no-push") opts.noPush = true;
@@ -117,10 +124,14 @@ function parseArgs(argv) {
     else throw new ReleaseError(`unknown argument: ${arg}`);
   }
   if (opts.bump && !BUMP_KINDS.includes(opts.bump)) {
-    throw new ReleaseError(`--bump must be one of ${BUMP_KINDS.join("|")} (got ${opts.bump})`);
+    throw new ReleaseError(
+      `--bump must be one of ${BUMP_KINDS.join("|")} (got ${opts.bump})`,
+    );
   }
   if (opts.yes && (!opts.packages || !opts.bump) && !opts.continue) {
-    throw new ReleaseError("--yes requires --packages and --bump (or use --continue)");
+    throw new ReleaseError(
+      "--yes requires --packages and --bump (or use --continue)",
+    );
   }
   return opts;
 }
@@ -128,7 +139,11 @@ function parseArgs(argv) {
 function discoverPackages() {
   return fs
     .readdirSync(EXT_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && fs.existsSync(path.join(EXT_DIR, e.name, "package.json")))
+    .filter(
+      (e) =>
+        e.isDirectory() &&
+        fs.existsSync(path.join(EXT_DIR, e.name, "package.json")),
+    )
     .map((e) => {
       const dir = path.join(EXT_DIR, e.name);
       const pkg = readJson(path.join(dir, "package.json"));
@@ -141,7 +156,9 @@ function selectPackages(all, filter) {
   if (!filter) return all;
   const unknown = filter.filter((f) => !all.some((p) => p.short === f));
   if (unknown.length) {
-    throw new ReleaseError(`unknown package(s): ${unknown.join(", ")} (known: ${all.map((p) => p.short).join(", ")})`);
+    throw new ReleaseError(
+      `unknown package(s): ${unknown.join(", ")} (known: ${all.map((p) => p.short).join(", ")})`,
+    );
   }
   return all.filter((p) => filter.includes(p.short));
 }
@@ -151,7 +168,8 @@ function selectPackages(all, filter) {
 function bumpVersion(version, kind) {
   if (kind === "none") return version;
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(version);
-  if (!match) throw new ReleaseError(`cannot bump non-semver version "${version}"`);
+  if (!match)
+    throw new ReleaseError(`cannot bump non-semver version "${version}"`);
   let major = Number(match[1]);
   let minor = Number(match[2]);
   let patch = Number(match[3]);
@@ -216,7 +234,7 @@ function changelogSection(version, commits, date) {
   for (const commit of commits) {
     const match = CONVENTIONAL_RE.exec(commit.subject);
     const type = match ? match[1].toLowerCase() : "other";
-    const text = match ? (match[4] || commit.subject) : commit.subject;
+    const text = match ? match[4] || commit.subject : commit.subject;
     const key = buckets.has(type) ? type : "other";
     buckets.get(key).push(`- ${text} (${commit.hash})`);
   }
@@ -236,7 +254,8 @@ function prependChangelog(file, section) {
   let rest = "";
   if (fs.existsSync(file)) {
     let existing = fs.readFileSync(file, "utf8");
-    if (existing.startsWith(CHANGELOG_HEADER)) existing = existing.slice(CHANGELOG_HEADER.length);
+    if (existing.startsWith(CHANGELOG_HEADER))
+      existing = existing.slice(CHANGELOG_HEADER.length);
     rest = existing.replace(/^\n+/, "");
   }
   const body = `${CHANGELOG_HEADER}\n${section}\n${rest ? `\n${rest.trimEnd()}\n` : "\n"}`;
@@ -246,8 +265,12 @@ function prependChangelog(file, section) {
 function writeVersion(dir, version) {
   const file = path.join(dir, "package.json");
   const source = fs.readFileSync(file, "utf8");
-  const updated = source.replace(/^(\s*"version":\s*)"[^"]*"/m, `$1"${version}"`);
-  if (updated === source) throw new ReleaseError(`could not update the version field in ${file}`);
+  const updated = source.replace(
+    /^(\s*"version":\s*)"[^"]*"/m,
+    `$1"${version}"`,
+  );
+  if (updated === source)
+    throw new ReleaseError(`could not update the version field in ${file}`);
   fs.writeFileSync(file, updated);
 }
 
@@ -259,8 +282,13 @@ async function ask(rl, question) {
 
 async function promptPackages(rl, all) {
   console.log("\nPackages:");
-  all.forEach((p, i) => console.log(`  ${i + 1}) ${p.short.padEnd(18)} ${p.name} @ ${p.version}`));
-  const answer = await ask(rl, '\nSelect packages (numbers, comma-separated; "all"; or "none"): ');
+  all.forEach((p, i) =>
+    console.log(`  ${i + 1}) ${p.short.padEnd(18)} ${p.name} @ ${p.version}`),
+  );
+  const answer = await ask(
+    rl,
+    '\nSelect packages (numbers, comma-separated; "all"; or "none"): ',
+  );
   if (answer === "all") return all;
   if (!answer || answer === "none") return [];
   const picked = answer
@@ -272,7 +300,10 @@ async function promptPackages(rl, all) {
 
 async function promptBump(rl, pkg) {
   for (;;) {
-    const answer = await ask(rl, `  Bump for ${pkg.short} (current ${pkg.version}) [patch/minor/major/none] (patch): `);
+    const answer = await ask(
+      rl,
+      `  Bump for ${pkg.short} (current ${pkg.version}) [patch/minor/major/none] (patch): `,
+    );
     const kind = answer || "patch";
     if (BUMP_KINDS.includes(kind)) return kind;
     console.log(`    ✗ expected one of ${BUMP_KINDS.join(", ")}`);
@@ -289,30 +320,51 @@ async function promptConfirm(rl, question) {
 function preflight(opts) {
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   if (nodeMajor < MIN_NODE_MAJOR) {
-    throw new ReleaseError(`Node >= ${MIN_NODE_MAJOR} required (running ${process.versions.node})`);
+    throw new ReleaseError(
+      `Node >= ${MIN_NODE_MAJOR} required (running ${process.versions.node})`,
+    );
   }
 
-  const branch = out(must(git(["rev-parse", "--abbrev-ref", "HEAD"]), "git rev-parse"));
+  const branch = out(
+    must(git(["rev-parse", "--abbrev-ref", "HEAD"]), "git rev-parse"),
+  );
   if (branch !== opts.branch) {
-    throw new ReleaseError(`must release from "${opts.branch}" (currently on "${branch}")`);
+    throw new ReleaseError(
+      `must release from "${opts.branch}" (currently on "${branch}")`,
+    );
   }
 
   const status = must(git(["status", "--porcelain"]), "git status");
-  if (out(status)) throw new ReleaseError("working tree is not clean — commit or stash first");
+  if (out(status))
+    throw new ReleaseError("working tree is not clean — commit or stash first");
 
-  must(git(["fetch", "origin", opts.branch]), `git fetch origin ${opts.branch}`);
-  const behind = out(must(git(["rev-list", "--count", `HEAD..origin/${opts.branch}`]), "git rev-list"));
+  must(
+    git(["fetch", "origin", opts.branch]),
+    `git fetch origin ${opts.branch}`,
+  );
+  const behind = out(
+    must(
+      git(["rev-list", "--count", `HEAD..origin/${opts.branch}`]),
+      "git rev-list",
+    ),
+  );
   if (Number(behind) > 0) {
-    throw new ReleaseError(`branch is ${behind} commit(s) behind origin/${opts.branch} — pull first`);
+    throw new ReleaseError(
+      `branch is ${behind} commit(s) behind origin/${opts.branch} — pull first`,
+    );
   }
 
   if (opts.dryRun) {
-    console.log(`Preflight ok — branch ${branch} (dry run, npm auth not checked)\n`);
+    console.log(
+      `Preflight ok — branch ${branch} (dry run, npm auth not checked)\n`,
+    );
   } else {
     const who = npm(["whoami"], ROOT);
     const user = out(who);
     if (who.status !== 0 || user !== opts.npmUser) {
-      throw new ReleaseError(`npm auth check failed: expected user "${opts.npmUser}", got "${user || "not logged in"}"`);
+      throw new ReleaseError(
+        `npm auth check failed: expected user "${opts.npmUser}", got "${user || "not logged in"}"`,
+      );
     }
     console.log(`Preflight ok — branch ${branch}, npm user ${user}\n`);
   }
@@ -323,10 +375,16 @@ function preflight(opts) {
 function verify(packages) {
   const list = packages.map((p) => p.short).join(",");
   console.log(`Verifying ${list} …`);
-  const res = run(process.execPath, [path.join(ROOT, "scripts", "verify-packages.mjs"), "--packages", list], ROOT, {
-    capture: false,
-  });
-  if (res.status !== 0) throw new ReleaseError("verification failed — nothing was changed");
+  const res = run(
+    process.execPath,
+    [path.join(ROOT, "scripts", "verify-packages.mjs"), "--packages", list],
+    ROOT,
+    {
+      capture: false,
+    },
+  );
+  if (res.status !== 0)
+    throw new ReleaseError("verification failed — nothing was changed");
 }
 
 function planTargets(packages, opts) {
@@ -337,7 +395,9 @@ function planTargets(packages, opts) {
     const version = bumpVersion(pkg.version, kind);
     const published = isPublished(pkg.name, version);
     if (published && !opts.continue) {
-      throw new ReleaseError(`${pkg.name}@${version} is already published — bump the version`);
+      throw new ReleaseError(
+        `${pkg.name}@${version} is already published — bump the version`,
+      );
     }
     targets.push({
       ...pkg,
@@ -358,7 +418,11 @@ function prepareChangelogs(targets, opts) {
     // "Initial release." line beats replaying the whole path history.
     const fromTag = lastTagFor(target.name);
     target.section = fromTag
-      ? changelogSection(target.nextVersion, commitsFor(target.dir, fromTag), date)
+      ? changelogSection(
+          target.nextVersion,
+          commitsFor(target.dir, fromTag),
+          date,
+        )
       : initialSection(target.nextVersion, date);
     if (!opts.dryRun) {
       prependChangelog(path.join(target.dir, "CHANGELOG.md"), target.section);
@@ -382,7 +446,9 @@ function publish(targets) {
   const failed = [];
   for (const target of targets) {
     if (target.skipPublish) {
-      console.log(`Already on npm, skipping publish: ${target.name}@${target.nextVersion}`);
+      console.log(
+        `Already on npm, skipping publish: ${target.name}@${target.nextVersion}`,
+      );
       done.push(target);
       continue;
     }
@@ -391,7 +457,9 @@ function publish(targets) {
     if (res.status === 0) {
       done.push(target);
     } else {
-      console.log(`✗ npm publish failed for ${target.name}@${target.nextVersion}`);
+      console.log(
+        `✗ npm publish failed for ${target.name}@${target.nextVersion}`,
+      );
       failed.push(target);
     }
   }
@@ -404,7 +472,10 @@ function tagAndPush(targets, opts) {
     if (tagExists(target.tag)) {
       console.log(`Tag already exists, skipping: ${target.tag}`);
     } else {
-      must(git(["tag", "-a", target.tag, "-m", target.tag]), `git tag ${target.tag}`);
+      must(
+        git(["tag", "-a", target.tag, "-m", target.tag]),
+        `git tag ${target.tag}`,
+      );
       console.log(`Tagged ${target.tag}`);
     }
     tags.push(target.tag);
@@ -412,14 +483,17 @@ function tagAndPush(targets, opts) {
 
   if (opts.noPush) {
     console.log("\n--no-push set — commit and tags are local only. Push with:");
-    console.log(`  git push origin ${opts.branch} && git push origin ${tags.join(" ")}`);
+    console.log(
+      `  git push origin ${opts.branch} && git push origin ${tags.join(" ")}`,
+    );
     return;
   }
 
   must(git(["push", "origin", opts.branch]), "git push (branch)");
   must(git(["push", "origin", ...tags]), "git push (tags)");
   console.log(`\nPushed ${opts.branch} and ${tags.length} tag(s).`);
-  for (const target of targets) console.log(`  ✓ ${target.name}@${target.nextVersion}`);
+  for (const target of targets)
+    console.log(`  ✓ ${target.name}@${target.nextVersion}`);
 }
 
 // ── main ───────────────────────────────────────────────────────────────────
@@ -467,7 +541,10 @@ async function main() {
   } else {
     // Any real release without --yes is confirmed interactively, even when
     // --packages/--bump were supplied. Publishing must always be explicit.
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
     try {
       if (!selected.length) {
         selected = await promptPackages(rl, all);
@@ -487,7 +564,12 @@ async function main() {
         return `  ${p.name.padEnd(28)} ${p.version} → ${bumpVersion(p.version, kind)}`;
       });
       console.log("\nPlan:\n" + plan.join("\n"));
-      if (!(await promptConfirm(rl, "\nProceed with verify, publish, tag and push? (y/N): "))) {
+      if (
+        !(await promptConfirm(
+          rl,
+          "\nProceed with verify, publish, tag and push? (y/N): ",
+        ))
+      ) {
         console.log("Aborted.");
         return;
       }
@@ -508,15 +590,24 @@ async function main() {
   if (opts.dryRun) {
     console.log("\n── Dry run plan ──────────────────────────────────────────");
     for (const t of targets) {
-      const action = t.skipPublish ? "already published (skip)" : `publish ${t.nextVersion}`;
-      console.log(`\n${t.name}\n  version: ${t.version} → ${t.nextVersion}\n  action:  ${action}\n  tag:     ${t.tag}`);
+      const action = t.skipPublish
+        ? "already published (skip)"
+        : `publish ${t.nextVersion}`;
+      console.log(
+        `\n${t.name}\n  version: ${t.version} → ${t.nextVersion}\n  action:  ${action}\n  tag:     ${t.tag}`,
+      );
       console.log(
         t.section
-          ? t.section.split("\n").map((l) => `  ${l}`).join("\n")
+          ? t.section
+              .split("\n")
+              .map((l) => `  ${l}`)
+              .join("\n")
           : "  (continue mode — no new changelog)",
       );
     }
-    console.log("\nDry run complete — nothing was written, published, or tagged.");
+    console.log(
+      "\nDry run complete — nothing was written, published, or tagged.",
+    );
     return;
   }
 
@@ -526,7 +617,9 @@ async function main() {
   if (done.length) {
     tagAndPush(done, opts);
   } else {
-    console.log("\nNothing was published — no tags were created and nothing was pushed.");
+    console.log(
+      "\nNothing was published — no tags were created and nothing was pushed.",
+    );
   }
 
   if (failed.length) {
@@ -541,13 +634,18 @@ async function main() {
 
   console.log("\nRelease complete:");
   for (const t of done) {
-    console.log(`  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`);
+    console.log(
+      `  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`,
+    );
   }
-  console.log("\nPackages appear in the pi.dev gallery shortly after the first publish.");
+  console.log(
+    "\nPackages appear in the pi.dev gallery shortly after the first publish.",
+  );
 }
 
 const invokedDirectly =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (invokedDirectly) {
   main().catch((err) => {

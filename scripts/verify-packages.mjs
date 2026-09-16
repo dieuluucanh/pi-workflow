@@ -29,7 +29,10 @@ const NPM_SPEC =
       // argument escaping sane and avoids Node's DEP0190 shell-args warning.
       { cmd: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", "npm"] }
     : { cmd: "npm", args: [] };
-const BUILTINS = new Set([...builtinModules, ...builtinModules.map((m) => `node:${m}`)]);
+const BUILTINS = new Set([
+  ...builtinModules,
+  ...builtinModules.map((m) => `node:${m}`),
+]);
 const PEER_PACKAGES = new Set(["typebox"]);
 
 const FROM_RE = /\bfrom\s+["']([^"']+)["']/g;
@@ -52,7 +55,9 @@ function runNpm(args, cwd, opts = {}) {
 }
 
 function tail(text, lines = 8) {
-  const all = String(text ?? "").trim().split(/\r?\n/);
+  const all = String(text ?? "")
+    .trim()
+    .split(/\r?\n/);
   return all.slice(-lines).join("\n");
 }
 
@@ -81,7 +86,9 @@ function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
-    throw new Error(`cannot read JSON from ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(
+      `cannot read JSON from ${file}: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -100,15 +107,29 @@ function parsePackJson(stdout) {
 // ── checks ─────────────────────────────────────────────────────────────────
 
 function checkManifest(dir, pkg, errors) {
-  const need = (cond, msg) => { if (!cond) errors.push(msg); };
+  const need = (cond, msg) => {
+    if (!cond) errors.push(msg);
+  };
   const shortName = path.basename(dir);
 
-  need(/^@dieulc\//.test(pkg.name ?? ""), `name must be scoped @dieulc/* (got ${pkg.name})`);
-  need(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version ?? ""), `version must be semver (got ${pkg.version})`);
+  need(
+    /^@dieulc\//.test(pkg.name ?? ""),
+    `name must be scoped @dieulc/* (got ${pkg.name})`,
+  );
+  need(
+    /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version ?? ""),
+    `version must be semver (got ${pkg.version})`,
+  );
   need(pkg.private !== true, "package must not be private");
   need(pkg.license === "MIT", `license must be MIT (got ${pkg.license})`);
-  need(pkg.publishConfig?.access === "public", 'publishConfig.access must be "public"');
-  need(Array.isArray(pkg.keywords) && pkg.keywords.includes("pi-package"), 'keywords must include "pi-package"');
+  need(
+    pkg.publishConfig?.access === "public",
+    'publishConfig.access must be "public"',
+  );
+  need(
+    Array.isArray(pkg.keywords) && pkg.keywords.includes("pi-package"),
+    'keywords must include "pi-package"',
+  );
   need(
     pkg.repository?.directory === `agent/extensions/${shortName}`,
     `repository.directory must be "agent/extensions/${shortName}" (got ${pkg.repository?.directory})`,
@@ -120,15 +141,27 @@ function checkManifest(dir, pkg, errors) {
   const entries = Array.isArray(pkg.pi?.extensions) ? pkg.pi.extensions : [];
   need(entries.length > 0, "pi.extensions must list at least one entry");
   for (const entry of entries) {
-    need(fs.existsSync(path.join(dir, entry)), `pi.extensions entry does not exist: ${entry}`);
+    need(
+      fs.existsSync(path.join(dir, entry)),
+      `pi.extensions entry does not exist: ${entry}`,
+    );
   }
   for (const skill of pkg.pi?.skills ?? []) {
-    need(fs.existsSync(path.join(dir, skill)), `pi.skills entry does not exist: ${skill}`);
+    need(
+      fs.existsSync(path.join(dir, skill)),
+      `pi.skills entry does not exist: ${skill}`,
+    );
   }
 
-  need(Array.isArray(pkg.files) && pkg.files.length > 0, "files[] must be a non-empty array");
+  need(
+    Array.isArray(pkg.files) && pkg.files.length > 0,
+    "files[] must be a non-empty array",
+  );
   for (const f of pkg.files ?? []) {
-    need(fs.existsSync(path.join(dir, f)), `files[] entry does not exist: ${f}`);
+    need(
+      fs.existsSync(path.join(dir, f)),
+      `files[] entry does not exist: ${f}`,
+    );
   }
 
   return entries;
@@ -151,7 +184,8 @@ function checkImports(dir, pkg, errors) {
         }
         continue;
       }
-      const isPeer = spec.startsWith("@earendil-works/") || PEER_PACKAGES.has(spec);
+      const isPeer =
+        spec.startsWith("@earendil-works/") || PEER_PACKAGES.has(spec);
       const declared = isPeer ? peers.has(spec) : deps.has(spec);
       if (!declared) {
         errors.push(
@@ -167,7 +201,9 @@ function checkScripts(dir, pkg, errors) {
     if (!pkg.scripts?.[script]) continue;
     const res = runNpm(["run", script], dir);
     if (res.status !== 0) {
-      errors.push(`\`npm run ${script}\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`);
+      errors.push(
+        `\`npm run ${script}\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+      );
     }
   }
 }
@@ -175,7 +211,9 @@ function checkScripts(dir, pkg, errors) {
 function checkPack(dir, pkg, errors) {
   const res = runNpm(["pack", "--dry-run", "--json"], dir);
   if (res.status !== 0) {
-    errors.push(`\`npm pack --dry-run --json\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`);
+    errors.push(
+      `\`npm pack --dry-run --json\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+    );
     return 0;
   }
   const parsed = parsePackJson(res.stdout);
@@ -187,16 +225,20 @@ function checkPack(dir, pkg, errors) {
   const has = (re) => files.some((f) => re.test(f));
 
   for (const f of files) {
-    if (f.includes("node_modules/")) errors.push(`tarball must not contain node_modules: ${f}`);
-    if (TEST_FILE_RE.test(f)) errors.push(`tarball must not contain test files: ${f}`);
-    if (f === "package-lock.json") errors.push("tarball must not contain package-lock.json");
+    if (f.includes("node_modules/"))
+      errors.push(`tarball must not contain node_modules: ${f}`);
+    if (TEST_FILE_RE.test(f))
+      errors.push(`tarball must not contain test files: ${f}`);
+    if (f === "package-lock.json")
+      errors.push("tarball must not contain package-lock.json");
   }
   if (!has(/^README\.md$/i)) errors.push("tarball is missing README.md");
   if (!has(/^LICENSE/i)) errors.push("tarball is missing LICENSE");
 
   for (const entry of pkg.pi?.extensions ?? []) {
     const normalized = entry.replace(/^\.\//, "").replace(/\\/g, "/");
-    if (!files.includes(normalized)) errors.push(`tarball is missing the pi.extensions entry: ${normalized}`);
+    if (!files.includes(normalized))
+      errors.push(`tarball is missing the pi.extensions entry: ${normalized}`);
   }
 
   return files.length;
@@ -221,7 +263,9 @@ function checkLoad(dir, entries, errors) {
       { timeout: 60_000 },
     );
     if (res.status !== 0) {
-      errors.push(`load smoke test failed for ${entry}:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`);
+      errors.push(
+        `load smoke test failed for ${entry}:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+      );
     }
   }
 }
@@ -232,7 +276,11 @@ function main() {
   const argv = process.argv.slice(2);
   let filter = null;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--packages") filter = String(argv[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (argv[i] === "--packages")
+      filter = String(argv[++i] ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     else if (argv[i] === "--help" || argv[i] === "-h") {
       console.log("Usage: node scripts/verify-packages.mjs [--packages a,b,c]");
       return 0;
@@ -244,13 +292,19 @@ function main() {
 
   const known = fs
     .readdirSync(EXT_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && fs.existsSync(path.join(EXT_DIR, e.name, "package.json")))
+    .filter(
+      (e) =>
+        e.isDirectory() &&
+        fs.existsSync(path.join(EXT_DIR, e.name, "package.json")),
+    )
     .map((e) => e.name)
     .sort();
   if (filter) {
     const unknown = filter.filter((f) => !known.includes(f));
     if (unknown.length) {
-      console.error(`unknown package(s): ${unknown.join(", ")} (known: ${known.join(", ")})`);
+      console.error(
+        `unknown package(s): ${unknown.join(", ")} (known: ${known.join(", ")})`,
+      );
       return 2;
     }
   }
@@ -271,12 +325,16 @@ function main() {
 
     results.push({ name, version: pkg.version, packed, errors });
     const status = errors.length ? "FAIL" : "ok";
-    console.log(`── ${name} @ ${pkg.version} — ${status} (${packed} files packed)`);
+    console.log(
+      `── ${name} @ ${pkg.version} — ${status} (${packed} files packed)`,
+    );
     for (const err of errors) console.log(`     ✗ ${err}`);
   }
 
   const failed = results.filter((r) => r.errors.length);
-  console.log(`\n${results.length - failed.length}/${results.length} package(s) passed`);
+  console.log(
+    `\n${results.length - failed.length}/${results.length} package(s) passed`,
+  );
   if (failed.length) {
     console.error(`FAILED: ${failed.map((r) => r.name).join(", ")}`);
     return 1;
