@@ -486,6 +486,7 @@ function publish(targets) {
   // timeouts…). Failures are reported at the end with a --continue hint.
   const done = [];
   const failed = [];
+  let authHinted = false;
   for (const target of targets) {
     if (target.skipPublish) {
       console.log(
@@ -502,6 +503,19 @@ function publish(targets) {
       console.log(
         `✗ npm publish failed for ${target.name}@${target.nextVersion}`,
       );
+      if (!authHinted) {
+        authHinted = true;
+        // npm does not fall back to an interactive OTP prompt when a token is
+        // configured, so a read-only / non-bypass granular token in ~/.npmrc
+        // always fails this way — the credential, not the package, is at fault.
+        console.log(
+          '  ↳ if npm reported 403 "Two-factor authentication or granular access token\n' +
+            '    with bypass 2fa enabled is required": the configured npm auth cannot\n' +
+            '    write. Create a granular token with "Bypass 2FA" enabled at\n' +
+            '    npmjs.com → Access Tokens, or log in interactively (removing the token)\n' +
+            "    and retry with an OTP. See docs/publishing.md → Troubleshooting.",
+        );
+      }
       failed.push(target);
     }
   }

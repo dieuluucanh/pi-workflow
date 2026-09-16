@@ -16,7 +16,12 @@ Each package is published **independently**: its own version, its own tag (`@die
 ## Prerequisites
 
 - Node ≥ 22.19 (Pi's own requirement; the scripts check the major version)
-- npm CLI logged in as `dieulc` — verify with `npm whoami`
+- npm CLI authenticated as `dieulc` — `npm whoami` must print `dieulc` **and** the credential must be able to write:
+  either a **granular access token with "Bypass 2FA" enabled** (needed for the unattended
+  `--yes` flow), or an interactive `npm login` session, where npm prompts for the OTP during
+  `npm publish`. A granular token *without* Bypass 2FA authenticates fine but can never publish —
+  npm does not fall back to an OTP prompt for token auth, so the publish fails with a 403 even in a
+  terminal.
 - A clean working tree on the release branch (`main`)
 - `git`, with `origin` reaching `github.com/dieuluucanh/pi-workflow`
 
@@ -109,6 +114,8 @@ The script is a convenience; the underlying commands remain valid. From the repo
 cd agent/extensions/workflow
 npm pack --dry-run          # inspect the tarball first
 npm publish                 # publishConfig.access handles public access
+# with 2FA and no bypass-2FA token:
+npm publish --otp=123456
 cd ../../..
 git tag -a "@dieulc/workflow@0.2.0" -m "@dieulc/workflow@0.2.0"
 git push origin main && git push origin "@dieulc/workflow@0.2.0"
@@ -206,7 +213,8 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | `npm auth check failed` | `npm login` (the expected user is `dieulc`). |
 | `<pkg>@<version> is already published` | The registry already has that version; choose a bump or use `--continue`. |
 | `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
-| `npm publish` returns 403 | First publish of a scoped package must be public — handled by `publishConfig.access`; check you are logged in as a member of the `@dieulc` scope. |
+| `npm publish` returns 403 | Two different causes — read the message. *`403 Forbidden - PUT … you do not have permission`*: first publish of a scoped package must be public (handled by `publishConfig.access`) — check you are a member of the `@dieulc` scope. *`Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages`*: see the row below. |
+| 403 `Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages` | The configured npm credential cannot write, and npm does **not** prompt for an OTP when a token is configured — so this fails even in an interactive terminal (observed with a read-only/without-bypass granular token in `~/.npmrc`). Fix: create a **Granular Access Token** with *Bypass 2FA* enabled (npmjs.com → Access Tokens → Generate New Token; give it read+write on `@dieulc` or all packages) and put it in `~/.npmrc`. Alternative: `npm logout` / remove the token, `npm login`, then publish interactively with `npm publish --otp=<code>` (npm also reads the code from `NPM_CONFIG_OTP`). After fixing the credential, resume with `npm run release -- --continue`. |
 | 403 `… may not perform this action` when unpublishing or deprecating | Destructive registry actions require an interactive 2FA session; a bypass-2FA granular token is refused. Use the npm website or `npm login` interactively. |
 | `npm publish` rejected right after an unpublish | npm blocks new versions of a fully unpublished package name for 24 hours. Wait, then `npm run release -- --continue`. |
 | Run ends with `publish failed for <pkg>` | The other packages were published, tagged and pushed. Rerun `npm run release -- --continue` to finish the failed one. |

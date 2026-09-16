@@ -23,6 +23,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXT_DIR = path.join(ROOT, "agent", "extensions");
+// npm normalises a bare GitHub URL to this form on publish and warns otherwise.
+const REPOSITORY_URL = "git+https://github.com/dieuluucanh/pi-workflow.git";
 const NPM_SPEC =
   process.platform === "win32"
     ? // npm is a .cmd shim on Windows; spawn it through cmd.exe. shell:false keeps
@@ -133,6 +135,11 @@ function checkManifest(dir, pkg, errors) {
   need(
     pkg.repository?.directory === `agent/extensions/${shortName}`,
     `repository.directory must be "agent/extensions/${shortName}" (got ${pkg.repository?.directory})`,
+  );
+  // npm normalises this form itself and warns on every publish otherwise.
+  need(
+    pkg.repository?.url === REPOSITORY_URL,
+    `repository.url must be "${REPOSITORY_URL}" (got ${pkg.repository?.url})`,
   );
   need(fs.existsSync(path.join(dir, "README.md")), "README.md is missing");
   need(fs.existsSync(path.join(dir, "LICENSE")), "LICENSE is missing");

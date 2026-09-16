@@ -8,7 +8,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dieuluucanh/pi-workflow",
+    "url": "git+https://github.com/dieuluucanh/pi-workflow.git",
     "directory": "agent/extensions/server-logs"
   },
   "bugs": {
