@@ -293,13 +293,17 @@ function prependChangelog(file, section) {
 function writeVersion(dir, version) {
   const file = path.join(dir, "package.json");
   const source = fs.readFileSync(file, "utf8");
-  const updated = source.replace(
-    /^(\s*"version":\s*)"[^"]*"/m,
-    `$1"${version}"`,
-  );
-  if (updated === source)
-    throw new ReleaseError(`could not update the version field in ${file}`);
+  const versionField = /^(\s*"version":\s*)"[^"]*"/m;
+  // `--bump none` (the documented first-publish / resume path) publishes the
+  // version already in the manifest, so the file is legitimately unchanged.
+  // Only a missing version field is an error.
+  if (!versionField.test(source)) {
+    throw new ReleaseError(`could not find the version field in ${file}`);
+  }
+  const updated = source.replace(versionField, `$1"${version}"`);
+  if (updated === source) return false;
   fs.writeFileSync(file, updated);
+  return true;
 }
 
 // ── prompts ────────────────────────────────────────────────────────────────
