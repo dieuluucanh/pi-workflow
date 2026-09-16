@@ -97,6 +97,8 @@ Other recovery notes:
 - **Publish succeeded, push failed** — rerun with `--continue`; the registry check skips the published versions and the tags get pushed.
 - **Wrong version committed, nothing published yet** — fix the `package.json` version, `git commit --amend`, and rerun with `--bump none`.
 - **Wrong version already published** — you cannot overwrite it. Bump again (`--bump patch`) and publish; then deprecate the bad version with `npm deprecate @dieulc/<pkg>@<version> "message"`.
+- **An accidental version was published and you want it gone** — unpublishing is destructive, irreversible, and 2FA-gated: `npm unpublish <pkg>@<version>` is refused for bypass-2FA tokens ("Granular access tokens that bypass two-factor authentication may not perform this action"), so use the npm website (package → Settings → Unpublish) or an interactive `npm login` first. A published `name@version` can never be reused, and fully unpublishing a name blocks publishing new versions of it for 24 hours. Clean the repo side too: `git push origin :refs/tags/<tag>`, `git revert <release commit>`.
+- **One package cannot be published (24h name block, transient 403, OTP timeout)** — the script still publishes the rest and tags/pushes those, then reports the failure at the end. Rerun `npm run release -- --continue` once the blocker is gone; it skips versions already on npm and tags what is missing.
 
 ## Manual fallback (single package)
 
@@ -148,6 +150,9 @@ Packages that carry the `pi-package` keyword appear in the gallery at <https://p
 | `<pkg>@<version> is already published` | The registry already has that version; choose a bump or use `--continue`. |
 | `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
 | `npm publish` returns 403 | First publish of a scoped package must be public — handled by `publishConfig.access`; check you are logged in as a member of the `@dieulc` scope. |
+| 403 `… may not perform this action` when unpublishing or deprecating | Destructive registry actions require an interactive 2FA session; a bypass-2FA granular token is refused. Use the npm website or `npm login` interactively. |
+| `npm publish` rejected right after an unpublish | npm blocks new versions of a fully unpublished package name for 24 hours. Wait, then `npm run release -- --continue`. |
+| Run ends with `publish failed for <pkg>` | The other packages were published, tagged and pushed. Rerun `npm run release -- --continue` to finish the failed one. |
 | npm asks for an OTP | Expected with 2FA; the publish step inherits the terminal, so type the code when prompted. |
 | Extension does not load after install | `pi --verbose`; confirm the `pi.extensions` path is in the tarball (`npm pack --dry-run`). |
 
