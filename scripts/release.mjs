@@ -462,6 +462,16 @@ function prepareChangelogs(targets, opts) {
 function commitRelease(targets) {
   const summary = targets.map((t) => `${t.name}@${t.nextVersion}`).join(", ");
   must(git(["add", "-A"]), "git add");
+  // A resumed release (--continue after an interrupted publish) finds the
+  // manifests and changelogs already committed by the first run — committing
+  // again would fail with "nothing to commit" and wedge the recovery path.
+  const staged = out(
+    must(git(["diff", "--cached", "--name-only"]), "git diff --cached"),
+  );
+  if (!staged) {
+    console.log(`Nothing to commit — ${summary} is already recorded.`);
+    return;
+  }
   must(git(["commit", "-m", `chore(release): ${summary}`]), "git commit");
   console.log(`Committed: chore(release): ${summary}`);
 }
