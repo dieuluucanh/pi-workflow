@@ -375,35 +375,30 @@ function commitRelease(targets) {
 }
 
 function publish(targets) {
-  const done = []; // "name@version" for the summary
-  const doneNames = new Set();
+  // Attempt every target: one package being unpublishable must not block the
+  // others' tags/pushes (npm's 24h name-reuse block, transient 403s, OTP
+  // timeouts…). Failures are reported at the end with a --continue hint.
+  const done = [];
+  const failed = [];
   for (const target of targets) {
     if (target.skipPublish) {
       console.log(`Already on npm, skipping publish: ${target.name}@${target.nextVersion}`);
-      done.push(`${target.name}@${target.nextVersion}`);
-      doneNames.add(target.name);
+      done.push(target);
       continue;
     }
     console.log(`\nPublishing ${target.name}@${target.nextVersion} …`);
     const res = npm(["publish"], target.dir, { capture: false });
-    if (res.status !== 0) {
-      const remaining = targets
-        .filter((t) => !doneNames.has(t.name))
-        .map((t) => t.short)
-        .join(",");
-      throw new ReleaseError(
-        `npm publish failed for ${target.name}@${target.nextVersion}\n` +
-          `  Published so far: ${done.length ? done.join(", ") : "none"}\n` +
-          `  Resume with: npm run release -- --continue --packages ${remaining}`,
-      );
+    if (res.status === 0) {
+      done.push(target);
+    } else {
+      console.log(`✗ npm publish failed for ${target.name}@${target.nextVersion}`);
+      failed.push(target);
     }
-    done.push(`${target.name}@${target.nextVersion}`);
-    doneNames.add(target.name);
   }
-  return done;
+  return { done, failed };
 }
 
-function tagAndPush(targets, opts, published) {
+function tagAndPush(targets, opts) {
   const tags = [];
   for (const target of targets) {
     if (tagExists(target.tag)) {
@@ -424,7 +419,7 @@ function tagAndPush(targets, opts, published) {
   must(git(["push", "origin", opts.branch]), "git push (branch)");
   must(git(["push", "origin", ...tags]), "git push (tags)");
   console.log(`\nPushed ${opts.branch} and ${tags.length} tag(s).`);
-  for (const target of published) console.log(`  ✓ ${target}`);
+  for (const target of targets) console.log(`  ✓ ${target.name}@${target.nextVersion}`);
 }
 
 // ── main ───────────────────────────────────────────────────────────────────
@@ -526,11 +521,26 @@ async function main() {
   }
 
   commitRelease(targets);
-  const published = publish(targets);
-  tagAndPush(targets, opts, published);
+  const { done, failed } = publish(targets);
+
+  if (done.length) {
+    tagAndPush(done, opts);
+  } else {
+    console.log("\nNothing was published — no tags were created and nothing was pushed.");
+  }
+
+  if (failed.length) {
+    console.log("\nNot published:");
+    for (const t of failed) console.log(`  ✗ ${t.name}@${t.nextVersion}`);
+    throw new ReleaseError(
+      `publish failed for ${failed.map((t) => t.name).join(", ")}\n` +
+        "  Resume with: npm run release -- --continue\n" +
+        "  (--continue skips versions already on npm, publishes the rest, then tags and pushes everything.)",
+    );
+  }
 
   console.log("\nRelease complete:");
-  for (const t of targets) {
+  for (const t of done) {
     console.log(`  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`);
   }
   console.log("\nPackages appear in the pi.dev gallery shortly after the first publish.");
