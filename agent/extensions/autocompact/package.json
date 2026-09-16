@@ -1,6 +1,6 @@
 {
   "name": "@dieulc/autocompact",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "type": "module",
   "private": false,
   "keywords": ["pi-package", "autocompact", "compaction", "context-management"],
