@@ -250,7 +250,34 @@ function changelogSection(version, commits, date) {
   return lines.join("\n").trimEnd();
 }
 
+const SECTION_VERSION_RE = /^##\s*\[([^\]]+)\]/;
+
+function sectionVersion(section) {
+  const match = SECTION_VERSION_RE.exec(String(section).trimStart());
+  return match ? match[1] : null;
+}
+
 function prependChangelog(file, section) {
+  const version = sectionVersion(section);
+
+  // Idempotent: a re-run (or `--continue` after an aborted release) must not add
+  // a second section for the same version — only the date would differ.
+  if (version && fs.existsSync(file)) {
+    const documented = fs
+      .readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .some((line) => {
+        const match = SECTION_VERSION_RE.exec(line.trim());
+        return match ? match[1] === version : false;
+      });
+    if (documented) {
+      console.log(
+        `  ↺ ${path.relative(ROOT, file)} already documents ${version} — leaving it unchanged.`,
+      );
+      return false;
+    }
+  }
+
   let rest = "";
   if (fs.existsSync(file)) {
     let existing = fs.readFileSync(file, "utf8");
@@ -260,6 +287,7 @@ function prependChangelog(file, section) {
   }
   const body = `${CHANGELOG_HEADER}\n${section}\n${rest ? `\n${rest.trimEnd()}\n` : "\n"}`;
   fs.writeFileSync(file, body);
+  return true;
 }
 
 function writeVersion(dir, version) {
@@ -496,6 +524,30 @@ function tagAndPush(targets, opts) {
     console.log(`  ✓ ${target.name}@${target.nextVersion}`);
 }
 
+// Advisory only: the pi.dev gallery is a crawl of the npm search index filtered
+// by the `pi-package` keyword (there is no registration step), so a freshly
+// published version can legitimately be missing for minutes — sometimes much
+// longer. Never fail a completed release over it.
+function galleryCheck(targets) {
+  if (!targets.length) return;
+  console.log("\npi.dev gallery:");
+  run(
+    process.execPath,
+    [
+      path.join(ROOT, "scripts", "check-gallery.mjs"),
+      "--packages",
+      targets.map((t) => t.short).join(","),
+      "--warn-only",
+    ],
+    ROOT,
+    { capture: false },
+  );
+  console.log(
+    "Indexing is a crawl, not a push — if a package is missing above:\n" +
+      "  npm run gallery -- --wait 900",
+  );
+}
+
 // ── main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -638,9 +690,7 @@ async function main() {
       `  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`,
     );
   }
-  console.log(
-    "\nPackages appear in the pi.dev gallery shortly after the first publish.",
-  );
+  galleryCheck(done);
 }
 
 const invokedDirectly =
