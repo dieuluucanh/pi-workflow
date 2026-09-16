@@ -449,6 +449,16 @@ async function main() {
     return;
   }
 
+  // Any real release without --yes must be confirmed interactively. Failing
+  // here (before preflight) keeps unattended invocations from touching git,
+  // the registry, or the manifests at all.
+  const interactive = !opts.yes && !opts.dryRun && !opts.continue;
+  if (interactive && !process.stdin.isTTY) {
+    throw new ReleaseError(
+      "stdin is not a TTY — pass --yes for an unattended release, or --dry-run to preview",
+    );
+  }
+
   preflight(opts);
 
   const all = discoverPackages();
@@ -457,13 +467,19 @@ async function main() {
   if (opts.continue) {
     if (!selected.length) selected = all;
     console.log("Continue mode: publishing current package.json versions.\n");
-  } else if (!selected.length) {
+  } else if (opts.dryRun || opts.yes) {
+    // Unattended: --yes was validated above; --dry-run changes nothing anyway.
+  } else {
+    // Any real release without --yes is confirmed interactively, even when
+    // --packages/--bump were supplied. Publishing must always be explicit.
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
-      selected = await promptPackages(rl, all);
       if (!selected.length) {
-        console.log("Nothing selected — nothing to do.");
-        return;
+        selected = await promptPackages(rl, all);
+        if (!selected.length) {
+          console.log("Nothing selected — nothing to do.");
+          return;
+        }
       }
       if (!opts.bump) {
         console.log("\nBump type:");
@@ -476,7 +492,7 @@ async function main() {
         return `  ${p.name.padEnd(28)} ${p.version} → ${bumpVersion(p.version, kind)}`;
       });
       console.log("\nPlan:\n" + plan.join("\n"));
-      if (!opts.yes && !(await promptConfirm(rl, "\nProceed with verify, publish, tag and push? (y/N): "))) {
+      if (!(await promptConfirm(rl, "\nProceed with verify, publish, tag and push? (y/N): "))) {
         console.log("Aborted.");
         return;
       }
