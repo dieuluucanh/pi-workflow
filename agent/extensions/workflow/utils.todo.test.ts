@@ -25,6 +25,7 @@ import {
   todoRef,
   applyTodoUpdate,
   formatTodoLine,
+  formatTodoNumberedList,
   buildTodoContextBlock,
   buildTodoFooter,
   formatAmbiguity,
@@ -471,11 +472,13 @@ test("applyTodoUpdate replaces the whole list (industry semantics)", () => {
   assert.equal(res.removed, 1, "Create Y omitted → removed");
   const byStep = new Map(res.items.map((it) => [it.step, it]));
   assert.equal(byStep.get(1)?.completed, true);
-  assert.equal(byStep.get(1)?.ref, "1", "matched item keeps its stable ref");
+  assert.equal(byStep.get(1)?.ref, "1", "refs are canonical positions 1..N");
   assert.equal(byStep.get(2)?.text, "Agent extra (renamed)");
   assert.equal(byStep.get(2)?.status, "in_progress");
+  assert.equal(byStep.get(2)?.ref, "2");
   assert.equal(byStep.get(3)?.text, "Brand new");
-  assert.ok(byStep.get(3)?.ref, "new item gets a ref");
+  assert.equal(byStep.get(3)?.ref, "3", "new item gets a compacted ref");
+  assert.deepEqual(res.warnings, []);
 });
 
 test("applyTodoUpdate normalizes extra in_progress items", () => {
@@ -598,7 +601,7 @@ test("mergeTodoItems preserves completion, refs and agent-added items", () => {
       step: 1,
       text: "Brand new",
       completed: false,
-      label: "1",
+      label: "9",
       source: "plan",
     },
   ]);
@@ -636,4 +639,231 @@ test("synthesizeFromPlanTitle", () => {
   assert.equal(synth?.text, "Some title");
   assert.equal(synth?.source, "synthesized");
   assert.equal(synthesizeFromPlanTitle("no title here"), null);
+});
+
+// ── Regression: plan → build ref duplication (2026-09-15 office session) ──
+
+test("same-plan merge reunites model-rewritten steps by plan label (no duplicates)", () => {
+  const plan = extractPlanStepsFromMarkdown(
+    `# Plan: x
+
+## Plan Steps
+
+### 1. Create the widget
+### 2. Wire the widget
+### 3. Verify the widget
+`,
+  );
+  assert.equal(plan.length, 3);
+  const state = ensureTodoLabels(plan);
+  // The model rewrites the wording in workflow_todo update, keeping refs.
+  const rewritten = applyTodoUpdate(state, [
+    { ref: "1", text: "Create the widget component", status: "completed" },
+    { ref: "2", text: "Wire the widget into the app", status: "in_progress" },
+    { ref: "3", text: "Verify the widget works", status: "pending" },
+  ]);
+  assert.equal(rewritten.kept, 3);
+  assert.equal(rewritten.added, 0);
+  assert.equal(rewritten.removed, 0);
+  // A plan re-extraction must match by label and must not append duplicates.
+  const merged = mergeTodoItems(rewritten.items, plan);
+  assert.equal(merged.kept, 3);
+  assert.equal(merged.added, 0);
+  assert.equal(merged.removed, 0);
+  assert.equal(merged.items.length, 3);
+  assert.deepEqual(
+    merged.items.map((it) => it.ref),
+    ["1", "2", "3"],
+  );
+  assert.deepEqual(
+    merged.items.map((it) => it.text),
+    plan.map((p) => p.text),
+  );
+  assert.deepEqual(
+    merged.items.map((it) => it.status),
+    ["completed", "in_progress", "pending"],
+  );
+});
+
+test("plan → rewording update → same-plan merge → build update keeps 1..10", () => {
+  const md = ["# Plan: ten", "", "## Plan Steps", ""];
+  for (let i = 1; i <= 10; i++) md.push(`### ${i}. Step ${i} of the plan`);
+  const plan = extractPlanStepsFromMarkdown(md.join("\n"));
+  assert.equal(plan.length, 10);
+  let items = ensureTodoLabels(plan);
+  // Plan mode: the model rewrites wording using the refs shown (1..10).
+  const first = applyTodoUpdate(
+    items,
+    plan.map((p) => ({
+      ref: p.label as string,
+      text: `${p.text} — refined`,
+      status: "pending" as const,
+    })),
+  );
+  assert.equal(first.added, 0);
+  items = first.items;
+  // agent_end plan-file reconciliation (plan mode, then build approval).
+  items = mergeTodoItems(items, plan).items;
+  items = mergeTodoItems(items, plan).items;
+  assert.equal(items.length, 10);
+  // Build: the model sends the same positional refs again.
+  const second = applyTodoUpdate(
+    items,
+    plan.map((p, i) => ({
+      ref: String(i + 1),
+      text: `${p.text} — build`,
+      status: i === 0 ? ("in_progress" as const) : ("pending" as const),
+    })),
+  );
+  assert.equal(second.added, 0);
+  assert.equal(second.kept, 10);
+  assert.equal(second.items.length, 10);
+  assert.deepEqual(
+    second.items.map((t) => t.ref),
+    plan.map((_, i) => String(i + 1)),
+  );
+});
+
+test("unknown ref resolves leniently with warnings", () => {
+  const items = ensureTodoLabels([
+    {
+      step: 1,
+      text: "Create the API",
+      completed: false,
+      label: "1.1",
+      source: "plan",
+    },
+    {
+      step: 2,
+      text: "Wire the API",
+      completed: false,
+      label: "1.2",
+      source: "plan",
+    },
+  ]);
+  const res = applyTodoUpdate(items, [
+    { text: "Create the API", status: "pending" },
+    { ref: "1.2", text: "Wire the API", status: "completed" },
+  ]);
+  assert.equal(res.kept, 2);
+  assert.equal(res.added, 0);
+  assert.equal(res.removed, 0);
+  assert.equal(res.items[1].status, "completed");
+  assert.equal(res.warnings.length, 1);
+  assert.match(res.warnings[0], /1\.2/);
+  assert.match(res.warnings[0], /not found/);
+
+  const ghost = applyTodoUpdate(items, [
+    { ref: "99", text: "Ghost step", status: "pending" },
+  ]);
+  assert.equal(ghost.added, 1);
+  assert.equal(ghost.items.length, 1);
+  assert.deepEqual(
+    ghost.items.map((t) => t.ref),
+    ["1"],
+  );
+  assert.equal(ghost.warnings.length, 1);
+  assert.match(ghost.warnings[0], /99/);
+});
+
+test("ensureTodoLabels compacts inflated refs back to 1..N", () => {
+  const healed = ensureTodoLabels([
+    {
+      step: 1,
+      text: "A",
+      completed: false,
+      ref: "17",
+      label: "17",
+      source: "agent",
+    },
+    {
+      step: 2,
+      text: "B",
+      completed: false,
+      ref: "18",
+      label: "18",
+      source: "agent",
+    },
+    {
+      step: 3,
+      text: "C",
+      completed: false,
+      ref: "23",
+      label: "23",
+      source: "agent",
+    },
+  ]);
+  assert.deepEqual(
+    healed.map((t) => t.ref),
+    ["1", "2", "3"],
+  );
+  assert.deepEqual(
+    healed.map((t) => t.step),
+    [1, 2, 3],
+  );
+  // Plan labels are preserved as display metadata.
+  assert.deepEqual(
+    healed.map((t) => t.label),
+    ["17", "18", "23"],
+  );
+});
+
+test("formatTodoNumberedList uses canonical refs", () => {
+  const items = ensureTodoLabels([
+    {
+      step: 5,
+      text: "A",
+      completed: false,
+      ref: "9",
+      label: "1.1",
+      source: "plan",
+    },
+    {
+      step: 6,
+      text: "B",
+      completed: true,
+      ref: "10",
+      label: "1.2",
+      source: "plan",
+    },
+  ]);
+  assert.equal(formatTodoNumberedList(items), "1. A\n2. B");
+  assert.equal(
+    formatTodoNumberedList(items, { glyph: true }),
+    "☐ 1. A\n☑ 2. B",
+  );
+});
+
+test("refs are always 1..N and unique after merge/update", () => {
+  const plan = extractPlanStepsFromMarkdown(
+    `# Plan: x
+
+## Plan Steps
+
+### 1. Alpha step
+### 2. Bravo step
+### 3. Charlie step
+`,
+  );
+  const assertCompact = (list: TodoItem[]) => {
+    assert.deepEqual(
+      list.map((t) => t.ref),
+      list.map((_, i) => String(i + 1)),
+    );
+    assert.equal(new Set(list.map((t) => t.ref)).size, list.length);
+    assert.deepEqual(
+      list.map((t) => t.step),
+      list.map((_, i) => i + 1),
+    );
+  };
+  let items = ensureTodoLabels(plan);
+  assertCompact(items);
+  items = applyTodoUpdate(items, [
+    { ref: "2", text: "B renamed", status: "completed" },
+    { text: "Ad-hoc", status: "pending" },
+  ]).items;
+  assertCompact(items);
+  items = mergeTodoItems(items, plan).items;
+  assertCompact(items);
+  assert.equal(items.length, 4); // A, B, C + preserved ad-hoc agent item
 });

@@ -203,16 +203,24 @@ export function todoKey(item: Pick<TodoItem, "text" | "group">): string {
   return g ? `${g}|${t}` : t;
 }
 
-/** Backfill labels/ref/status/source for items restored from older sessions. */
+/**
+ * Backfill labels/ref/status/source for items restored from older sessions.
+ * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ * array order, so persisted lists with inflated refs (e.g. 17..23 written by
+ * an older build) heal on restore. Plan labels are preserved as display
+ * metadata and default to the position when absent.
+ */
 export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
   return (items ?? []).map((it, i) => {
-    const step = Number.isFinite(it?.step) ? Number(it.step) : i + 1;
+    const step = i + 1;
+    // Preserve the original positional label for legacy rows without a label.
+    const originalStep = Number.isFinite(it?.step) ? Number(it.step) : step;
     const status = itemStatus(it);
     return {
       ...it,
       step,
-      label: it?.label || String(step),
-      ref: it?.ref || String(step),
+      label: it?.label || String(originalStep),
+      ref: String(step),
       status,
       completed: status === "completed",
       source: it?.source ?? "plan",
@@ -245,10 +253,17 @@ export interface TodoMergeResult {
 /**
  * Merge freshly extracted plan steps into the existing list while preserving
  * completion state for steps that are still present. Extracted order wins.
- * Match is by label first (same plan step), then by normalized text.
- * Matched items keep their stable `ref`; new items get `ref = maxRef+1`;
- * unmatched `source:"agent"` items are preserved; status merges by rank
- * (a plan-file `- [x]` can mark an item done, nothing un-completes it).
+ *
+ * Match order: exact `todoKey` (text+group) first, then — for existing
+ * `source:"plan"` rows — the plan label (group-aware, collision-safe), so a
+ * step whose wording the model rewrote in `workflow_todo update` still
+ * reunites with its plan row instead of being duplicated. On a label match the
+ * extracted text is authoritative and status merges by rank (a plan-file
+ * `- [x]` can mark an item done, nothing un-completes it). Unmatched
+ * `source:"agent"` items are preserved.
+ *
+ * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ * the returned list order, so displayed numbers always equal `todoRef`.
  */
 export function mergeTodoItems(
   existing: TodoItem[],
@@ -256,47 +271,62 @@ export function mergeTodoItems(
 ): TodoMergeResult {
   const prev = ensureTodoLabels(existing ?? []);
   const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
-  const byLabel = new Map<string, TodoItem>();
+  const normLabel = (s: string | undefined) =>
+    String(s ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const byLabel = new Map<string, TodoItem[]>();
   const byKey = new Map<string, TodoItem>();
   for (const p of prev) {
-    const label = p.label || String(p.step);
-    byLabel.set(label.toLowerCase(), p);
+    const l = normLabel(p.label || String(p.step));
+    if (l) {
+      const arr = byLabel.get(l);
+      if (arr) arr.push(p);
+      else byLabel.set(l, [p]);
+    }
     const k = todoKey(p);
-    if (k) byKey.set(k, p);
+    if (k && !byKey.has(k)) byKey.set(k, p);
   }
   const used = new Set<TodoItem>();
   let added = 0;
   let kept = 0;
-  let maxRef = prev.reduce(
-    (m, p) => Math.max(m, todoRefNumber(todoRef(p)) ?? 0),
-    0,
-  );
+  /**
+   * Collision-safe plan-label match for a re-extracted step. Only existing
+   * `source:"plan"` rows are eligible; when duplicate labels exist across
+   * phases the group must disambiguate (otherwise the label is not trusted).
+   */
+  const matchByPlanLabel = (n: TodoItem): TodoItem | undefined => {
+    const l = normLabel(n.label);
+    if (!l) return undefined;
+    const cands = (byLabel.get(l) ?? []).filter(
+      (p) => !used.has(p) && p.source === "plan",
+    );
+    if (cands.length === 0) return undefined;
+    if (cands.length === 1) return cands[0];
+    const ng = normLabel(n.group);
+    const grouped = cands.filter((p) => normLabel(p.group) === ng);
+    return grouped.length === 1 ? grouped[0] : undefined;
+  };
   const items = next.map((n) => {
     const nKey = todoKey(n);
     let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
-    if (!match && n.label) {
-      const cand = byLabel.get(n.label.toLowerCase());
-      // Label fallback only when the text is unchanged (group may have been
-      // renamed); never carry completion onto a differently-worded step.
-      if (cand && todoKey({ text: cand.text }) === todoKey({ text: n.text }))
-        match = cand;
-    }
+    if (match && used.has(match)) match = undefined;
+    if (!match) match = matchByPlanLabel(n);
     if (match && !used.has(match)) {
       used.add(match);
       kept++;
       const item: TodoItem = {
         ...n,
-        ref: n.ref || match.ref || todoRef(match),
         group: n.group ?? match.group,
         source: n.source ?? match.source,
       };
       const status = mergeStatusByRank(itemStatus(match), itemStatus(item));
       setTodoStatus(item, status);
-      item.ref = item.ref || String(++maxRef);
       return item;
     }
     added++;
-    const item: TodoItem = { ...n, ref: n.ref || String(++maxRef) };
+    const item: TodoItem = { ...n };
     if (item.status) item.completed = item.status === "completed";
     else setTodoStatus(item, item.completed ? "completed" : "pending");
     return item;
@@ -310,6 +340,7 @@ export function mergeTodoItems(
   const all = [...items, ...preserved];
   all.forEach((it, i) => {
     it.step = i + 1;
+    it.ref = String(i + 1);
     if (!it.label) it.label = String(i + 1);
   });
   const removed = prev.filter(
@@ -501,6 +532,8 @@ export interface TodoUpdateResult {
   kept: number;
   /** Extra `in_progress` items demoted to `pending` (only one allowed). */
   normalized: number;
+  /** Non-fatal resolution notes (refs matched by label/text or added as new). */
+  warnings: string[];
 }
 
 /**
@@ -508,11 +541,14 @@ export interface TodoUpdateResult {
  * the incoming entries become the new list.
  *
  * - Identify existing items by canonical `ref` first, then by normalized text
- *   (group-insensitive). Matched items keep their `ref` and take the incoming
- *   status/text. New entries get `ref = maxRef + 1`.
- * - Omitted items are removed.
+ *   (group-insensitive), then leniently via `resolveTodoRef` (plan label /
+ *   group-qualified ref / unique text). A non-empty `ref` that had to be
+ *   resolved leniently, or that matched nothing, is reported in `warnings`.
+ * - Omitted items are removed; new entries are appended.
  * - Exactly one item may be `in_progress`; extras are demoted (counted as
  *   `normalized`).
+ * - Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
+ *   the returned list order, so displayed numbers always equal `todoRef`.
  */
 export function applyTodoUpdate(
   existing: TodoItem[],
@@ -529,26 +565,43 @@ export function applyTodoUpdate(
   }
   const used = new Set<TodoItem>();
   const items: TodoItem[] = [];
+  const warnings: string[] = [];
+  const short = (s: string) => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
   let added = 0;
   let kept = 0;
-  let maxRef = prev.reduce(
-    (m, p) => Math.max(m, todoRefNumber(todoRef(p)) ?? 0),
-    0,
-  );
   for (const raw of incoming ?? []) {
     const text = normalizeStepText(raw?.text ?? "");
+    const rawRef =
+      raw?.ref !== undefined && String(raw.ref).trim()
+        ? String(raw.ref).trim()
+        : undefined;
     let match: TodoItem | undefined;
-    if (raw?.ref !== undefined && String(raw.ref).trim()) {
-      match = byRef.get(String(raw.ref).trim().toLowerCase());
+    let matchedBy: "ref" | "label" | "text" | undefined;
+    if (rawRef) {
+      match = byRef.get(rawRef.toLowerCase());
+      if (match) matchedBy = "ref";
     }
     if (!match && text) {
       const k = todoKey({ text });
       match = k ? byTextKey.get(k) : undefined;
+      if (match) matchedBy = "text";
     }
+    if (!match && rawRef) {
+      const resolved = resolveTodoRef(prev, rawRef);
+      if (resolved.item && !used.has(resolved.item)) {
+        match = resolved.item;
+        matchedBy = "label";
+      }
+    }
+    if (match && used.has(match)) match = undefined;
     const status = raw?.status ?? "pending";
-    if (match && !used.has(match)) {
+    if (match) {
       used.add(match);
       kept++;
+      if (rawRef && matchedBy !== "ref")
+        warnings.push(
+          `ref "${rawRef}" not found; matched "${short(match.text)}" by ${matchedBy ?? "text"}`,
+        );
       const item: TodoItem = {
         ...match,
         text: text || match.text,
@@ -561,13 +614,15 @@ export function applyTodoUpdate(
       // Skip empty ghost entries (blank text, no ref, already-used ref).
       if (!text) continue;
       added++;
+      if (rawRef)
+        warnings.push(
+          `ref "${rawRef}" not found; added "${short(text)}" as a new step`,
+        );
       const item: TodoItem = {
         step: 0,
         text,
         completed: status === "completed",
         status,
-        ref: String(++maxRef),
-        label: String(maxRef),
         source: "agent",
       };
       items.push(item);
@@ -589,9 +644,11 @@ export function applyTodoUpdate(
   }
   items.forEach((it, i) => {
     it.step = i + 1;
+    it.ref = String(i + 1);
+    if (!it.label) it.label = String(i + 1);
   });
   const removed = prev.filter((p) => !used.has(p)).length;
-  return { items, added, removed, kept, normalized };
+  return { items, added, removed, kept, normalized, warnings };
 }
 
 // ── Display + reminder builders (pure, exported for tests) ────────────
@@ -621,6 +678,24 @@ export function formatTodoLine(
       ? ` (plan label ${it.label})`
       : "";
   return `${todoGlyph(it)} ${ref}. ${it.text}${labelPart}`;
+}
+
+/**
+ * Numbered list for model-facing messages (handoff preview, execute prompt).
+ * Uses each row's canonical global ref, so the numbers shown always match the
+ * refs `workflow_todo` resolves. Single source for such lists.
+ */
+export function formatTodoNumberedList(
+  items: TodoItem[],
+  opts?: { glyph?: boolean },
+): string {
+  return (items ?? [])
+    .map((it) =>
+      opts?.glyph
+        ? `${todoGlyph(it)} ${todoRef(it)}. ${it.text}`
+        : `${todoRef(it)}. ${it.text}`,
+    )
+    .join("\n");
 }
 
 export interface TodoContextBlockOptions {

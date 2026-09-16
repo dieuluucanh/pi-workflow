@@ -68,6 +68,7 @@ import {
   todoRef,
   applyTodoUpdate,
   formatTodoLine,
+  formatTodoNumberedList,
   buildTodoContextBlock,
   buildTodoFooter,
   formatAmbiguity,
@@ -331,6 +332,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let todoStale = false;
   let footerInjectedThisTurn = false;
   let lastStaleNoticeAt: number | undefined;
+  // Path+content hash of the last plan-file reconciliation (skip no-op merges).
+  let lastReconcileKey: string | undefined;
   let toolsBeforePlanMode: string[] | undefined;
   // Track the model active in Default mode so it can be restored when
   // returning from Plan/Build (otherwise the role model leaks into Default).
@@ -851,6 +854,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
   void togglePlanMode;
 
   /**
+   * Cheap content key for plan-file reconciliation dedupe (resolved path +
+   * length + hash). A byte-identical plan is not re-merged; a `- [x]` tick
+   * changes the content, so tick reconciliation still runs.
+   */
+  function planReconcileKey(absPath: string, text: string): string {
+    let h = 0;
+    for (let i = 0; i < text.length; i++) {
+      h = (h * 31 + text.charCodeAt(i)) | 0;
+    }
+    return `${path.resolve(absPath)}|${text.length}|${h}`;
+  }
+
+  /**
    * Load plan steps from a plan file and merge them into the todo list.
    * Same plan file → completion state is preserved (status-aware merge,
    * agent-added items kept); a different plan → replace.
@@ -978,12 +994,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
       });
     try {
-      const remainingList = todoItems
-        .map((t) => `${t.step}. ${t.text}`)
-        .join("\n");
-      const todoListText = todoItems
-        .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-        .join("\n");
+      const remainingList = formatTodoNumberedList(todoItems);
+      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
       const planTodoListMessage = {
         customType: "workflow-todo-list",
         content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
@@ -991,7 +1003,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       };
       const firstTodo = todoItems[0];
       const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}\nAfter completing a step, include a [DONE:n] tag in your response.`;
+      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
       (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
       (pi as any).sendMessage?.(
         {
@@ -1024,9 +1036,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     lastReviewId = null;
     persistState();
     try {
-      const todoListText = todoItems
-        .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-        .join("\n");
+      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
       const planTodoListMessage = {
         customType: "workflow-todo-list",
         content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
@@ -1329,6 +1339,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     action: string;
     todos: TodoItem[];
     nextStep: number;
+    warnings?: string[];
     error?: string;
   }
 
@@ -1443,14 +1454,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
           }
           onTodoWrite();
           const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}.`;
+          const warningText = res.warnings.length
+            ? `\nWarnings:\n${res.warnings.map((w) => `- ${w}`).join("\n")}`
+            : "";
           return {
             content: [
-              { type: "text", text: `${summary}\n${renderList(todoItems)}` },
+              {
+                type: "text",
+                text: `${summary}${warningText}\n${renderList(todoItems)}`,
+              },
             ],
             details: {
               action: "update",
               todos: [...todoItems],
               nextStep: todoItems.length + 1,
+              warnings: res.warnings,
             } as TodoDetails,
           };
         }
@@ -4156,17 +4174,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
             : path.join((ctx as any).cwd, planCandidate);
           if (fs.existsSync(abs)) {
             const planText = fs.readFileSync(abs, "utf8");
-            const planExtracted = extractPlanStepsFromMarkdown(planText);
-            if (planExtracted.length > 0) {
-              const before = todoItems.filter((t) => isDone(t)).length;
-              const merged = mergeTodoItems(todoItems, planExtracted);
-              todoItems = merged.items;
-              const after = todoItems.filter((t) => isDone(t)).length;
-              if (after > before || merged.preserved > 0) {
-                updateStatus(ctx as any);
-                persistState();
+            const key = planReconcileKey(abs, planText);
+            if (key !== lastReconcileKey) {
+              lastReconcileKey = key;
+              const planExtracted = extractPlanStepsFromMarkdown(planText);
+              if (planExtracted.length > 0) {
+                const before = todoItems.filter((t) => isDone(t)).length;
+                const merged = mergeTodoItems(todoItems, planExtracted);
+                todoItems = merged.items;
+                const after = todoItems.filter((t) => isDone(t)).length;
+                if (after > before || merged.preserved > 0) {
+                  updateStatus(ctx as any);
+                  persistState();
+                }
+                if (after > before) onTodoWrite();
               }
-              if (after > before) onTodoWrite();
             }
           }
         }
@@ -4265,18 +4287,26 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
       }
       let planExtracted: TodoItem[] = [];
+      let planAbs: string | undefined;
+      let planTextForReconcile = "";
       if (planCandidate) {
         try {
           const abs = path.isAbsolute(planCandidate)
             ? planCandidate
             : path.join((ctx as any).cwd, planCandidate);
           const planText = fs.readFileSync(abs, "utf8");
+          planAbs = abs;
+          planTextForReconcile = planText;
           planExtracted = extractPlanStepsFromMarkdown(planText);
           if (!lastPlanWritePath) lastPlanWritePath = abs;
         } catch (_e) {
           void _e;
         }
       }
+      const planKey =
+        planAbs && planTextForReconcile
+          ? planReconcileKey(planAbs, planTextForReconcile)
+          : undefined;
       if (planExtracted.length > 0) {
         const samePlan = (() => {
           try {
@@ -4290,7 +4320,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
           }
         })();
         if (samePlan) {
-          todoItems = mergeTodoItems(todoItems, planExtracted).items;
+          // Skip when the earlier all-modes reconciliation already merged this
+          // exact plan content; a `- [x]` tick changes the key and re-merges.
+          if (!(planKey && planKey === lastReconcileKey)) {
+            if (planKey) lastReconcileKey = planKey;
+            todoItems = mergeTodoItems(todoItems, planExtracted).items;
+          }
         } else {
           todoItems = ensureTodoLabels(planExtracted);
           if (planCandidate) todoPlanPath = planCandidate;
@@ -4524,7 +4559,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!hasUI && planTextForRender && !awaitingDecision) {
         try {
           const preview = planTextForRender.slice(0, 4000);
-          const list = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
+          const list = formatTodoNumberedList(todoItems);
           const content = plannotatorActive
             ? `**Plan ready** (${todoItems.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
             : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`;
@@ -4923,19 +4958,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
             enterBuildModeFromPlan(ctx as any, resolvedPlan);
             updateStatus(ctx as any);
             try {
-              const remainingList = todoItems
-                .map((t) => `${t.step}. ${t.text}`)
-                .join("\n");
-              const todoListText = todoItems
-                .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-                .join("\n");
+              const remainingList = formatTodoNumberedList(todoItems);
+              const todoListText = formatTodoNumberedList(todoItems, {
+                glyph: true,
+              });
               const planTodoListMessage = {
                 customType: "workflow-todo-list",
                 content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
                 display: true,
               };
               const firstTodo = todoItems[0];
-              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:n] tag in your response.`;
+              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
               (pi as any).sendMessage?.(planTodoListMessage, {
                 deliverAs: "followUp",
               });
@@ -4960,9 +4993,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   "",
                 );
                 if (refinement?.trim()) {
-                  const todoListText = todoItems
-                    .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-                    .join("\n");
+                  const todoListText = formatTodoNumberedList(todoItems, {
+                    glyph: true,
+                  });
                   const planTodoListMessage = {
                     customType: "workflow-todo-list",
                     content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
