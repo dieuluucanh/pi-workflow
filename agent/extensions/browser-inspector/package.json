@@ -4,27 +4,56 @@
   "description": "Pi extension: inspect browser DevTools (console, network, performance) via CDP",
   "type": "module",
   "main": "src/index.ts",
+  "private": false,
+  "keywords": ["pi-package", "browser", "devtools", "cdp", "inspector"],
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/dieuluucanh/pi-workflow",
     "directory": "agent/extensions/browser-inspector"
   },
+  "bugs": {
+    "url": "https://github.com/dieuluucanh/pi-workflow/issues"
+  },
+  "homepage": "https://github.com/dieuluucanh/pi-workflow#readme",
   "pi": {
     "extensions": [
       "./src/index.ts"
+    ],
+    "skills": [
+      "./SKILL.md"
     ]
   },
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "files": [
+    "src/",
+    "extension/",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
-  "keywords": ["pi-package", "browser", "devtools", "cdp", "inspector"],
-  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
     "chrome-launcher": "^1.2.1",
     "chrome-remote-interface": "^0.34.0",
     "ws": "^8.21.3"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
-    "@types/ws": "^8.18.1"
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "typebox": "1.3.7",
+    "@types/node": "^20.19.43",
+    "@types/ws": "^8.18.1",
+    "typescript": "5.5.4"
   }
 }

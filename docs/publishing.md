@@ -1,304 +1,166 @@
-# Pi Extensions — Publishing & Development Guide
+# Publishing & Releasing
 
-Step-by-step guide for publishing, installing, and developing the four Pi extensions in this repository.
+How the four `@dieulc/*` Pi extensions in this repo are verified and published to npm.
 
----
+| Package | Directory | Published to |
+| --- | --- | --- |
+| `@dieulc/workflow` | `agent/extensions/workflow` | <https://www.npmjs.com/package/@dieulc/workflow> |
+| `@dieulc/autocompact` | `agent/extensions/autocompact` | <https://www.npmjs.com/package/@dieulc/autocompact> |
+| `@dieulc/server-logs` | `agent/extensions/server-logs` | <https://www.npmjs.com/package/@dieulc/server-logs> |
+| `@dieulc/browser-inspector` | `agent/extensions/browser-inspector` | <https://www.npmjs.com/package/@dieulc/browser-inspector> |
 
-## Table of Contents
+Each package is published **independently**: its own version, its own tag (`@dieulc/workflow@0.2.0`), its own `CHANGELOG.md`. The repo root (`@dieulc/pi-workflow`) is `"private": true` and is **never published** — it is the dotfiles repo plus the release tooling.
 
-- [Packages Overview](#packages-overview)
-- [Prerequisites](#prerequisites)
-- [Production: Publish to npm](#production-publish-to-npm)
-- [Production: Install via pi](#production-install-via-pi)
-- [Development: Local setup](#development-local-setup)
-- [Development: Testing changes](#development-testing-changes)
-- [Versioning](#versioning)
-- [Troubleshooting](#troubleshooting)
-
----
-
-## Packages Overview
-
-| Package | npm name | Description |
-| --------- | ---------- | ------------- |
-| workflow | `@dieulc/workflow` | Plan↔Build mode, questionnaire, subagent explore, todos, checkpoint rewind |
-| autocompact | `@dieulc/autocompact` | Intelligent session context compaction, plan/todo-aware summarization |
-| server-logs | `@dieulc/server-logs` | Docker & systemd log inspection tools (remote SSH or local) |
-| browser-inspector | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP (console, network, performance) |
-
----
+> **Local releases, by design.** Publishing happens on this machine with `npm publish` under the logged-in `dieulc` account. That keeps the flow to one command, but it means npm **provenance attestations are not generated** (those require a CI/OIDC publisher). Everything else — semver bumps, per-package changelogs, version↔tag symmetry, idempotent publishing — already matches the shape a CI publisher needs, so trusted publishing can be added later without changing this workflow.
 
 ## Prerequisites
 
-- Node.js ≥ 20
-- npm CLI (logged in: `npm login`)
-- Pi CLI installed (`npm i -g @earendil-works/pi-coding-agent`)
+- Node ≥ 22.19 (Pi's own requirement; the scripts check the major version)
+- npm CLI logged in as `dieulc` — verify with `npm whoami`
+- A clean working tree on the release branch (`main`)
+- `git`, with `origin` reaching `github.com/dieuluucanh/pi-workflow`
 
-Verify npm login:
+The scripts are dependency-free Node ESM and run from the repo root.
 
-```bash
-npm whoami
-# should print: dieulc
-```
-
----
-
-## Production: Publish to npm
-
-Run these from the **repository root** (`C:/Users/Lenovo/.pi`).
-
-### Dry run (verify tarball contents without publishing)
+## Release a version
 
 ```bash
-# workflow
-cd agent/extensions/workflow && npm pack --dry-run && cd ../../..
-
-# autocompact
-cd agent/extensions/autocompact && npm pack --dry-run && cd ../../..
-
-# server-logs
-cd agent/extensions/server-logs && npm pack --dry-run && cd ../../..
-
-# browser-inspector
-cd agent/extensions/browser-inspector && npm pack --dry-run && cd ../../..
+npm run verify                        # optional: run the gate on all four packages
+npm run release -- --dry-run          # plan only: versions, changelogs, tarballs
+npm run release                       # interactive: pick packages, then bump types
 ```
 
-Check the output — verify `files` list includes the right `.ts`/`.md` files and excludes tests/build artifacts.
-
-### Publish (all four)
+Non-interactive:
 
 ```bash
-# 1. @dieulc/workflow
-cd agent/extensions/workflow && npm publish --access public && cd ../../..
+# one package, minor bump, no prompts
+npm run release -- --packages workflow --bump minor --yes
 
-# 2. @dieulc/autocompact
-cd agent/extensions/autocompact && npm publish --access public && cd ../../..
+# several packages, same bump kind
+npm run release -- --packages workflow,autocompact --bump patch --yes
 
-# 3. @dieulc/server-logs
-cd agent/extensions/server-logs && npm publish --access public && cd ../../..
-
-# 4. @dieulc/browser-inspector
-cd agent/extensions/browser-inspector && npm publish --access public && cd ../../..
+# publish the versions currently in the manifests (first release, or resuming)
+npm run release -- --packages workflow,autocompact --bump none --yes
 ```
 
-> `--access public` is required for scoped `@dieulc/*` packages on first publish.
+### What the script does
 
-### One-liner (all four in sequence)
+1. **Preflight** — Node major check; current branch must equal `--branch` (default `main`); working tree must be clean; `git fetch` and refuse to continue if the branch is behind `origin`; `npm whoami` must be `dieulc` (override with `--npm-user`; skipped in `--dry-run`).
+2. **Resolve** — compute each selected package's next version from the bump kind, and query the registry. If `name@version` is already published the release aborts (so you cannot accidentally re-publish).
+3. **Verify** — run `scripts/verify-packages.mjs` for the selection: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, and a load smoke test of every `pi.extensions` entry.
+4. **Changelog** — for each package, collect commits since that package's previous tag (`git log --no-merges … -- <package dir>`), group them by conventional type, and prepend a `## [version] - YYYY-MM-DD` section to that package's `CHANGELOG.md`.
+5. **Bump** — write the new version into the package's `package.json`.
+6. **Commit** — one commit: `chore(release): @dieulc/workflow@0.2.0, @dieulc/autocompact@0.1.1`.
+7. **Publish** — `npm publish` in each package directory, in turn. Output is inherited so npm's 2FA/OTP prompt works. `publishConfig.access: "public"` in each manifest supplies public access for the scoped names.
+8. **Tag** — annotated tag per package: `git tag -a @dieulc/workflow@0.2.0`.
+9. **Push** — `git push origin <branch>` then `git push origin <tag> …`.
+
+### Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--packages a,b` | packages to release (short directory names). Default: interactive picker |
+| `--bump kind` | `patch` \| `minor` \| `major` \| `none`. Default: interactive, per package |
+| `--dry-run` | run preflight + verify and print versions/changelogs/tags; writes, publishes and tags nothing |
+| `--continue` | resume: publish current manifest versions that are missing from the registry, then create missing tags and push |
+| `--no-push` | stop after tagging; prints the push commands |
+| `--branch name` | branch to release from (default `main`) |
+| `--npm-user name` | required npm user (default `dieulc`, or `RELEASE_NPM_USER`) |
+| `--yes`, `-y` | non-interactive; requires `--packages` and `--bump` (not needed with `--continue`) |
+
+## First publish (bootstrap)
+
+The packages ship with version `0.1.0`. For the initial publish use `--bump none` so the current version is published as-is:
 
 ```bash
-for dir in workflow autocompact server-logs browser-inspector; do \
-  echo "--- Publishing @dieulc/$dir ---" && \
-  cd agent/extensions/$dir && npm publish --access public && cd ../../..; \
-done
+git switch main && git pull
+npm login                 # once per machine
+npm whoami                # dieulc
+npm run release -- --packages workflow,autocompact,server-logs,browser-inspector --bump none --yes
 ```
 
-### Verify on npm
+Afterwards, each day-to-day release should bump a version; because Pi compares the installed version against npm's latest, **a change without a version bump never reaches users** (`pi update --extensions` would skip it).
+
+## Recovering from an interrupted release
+
+Publishing is the only step that touches the network, and it runs before tagging/pushing. If it fails part-way (network drop, OTP timeout, permission error), the version bump and changelog commit are already in place, so resume with:
 
 ```bash
-npm view @dieulc/workflow
-npm view @dieulc/autocompact
-npm view @dieulc/server-logs
-npm view @dieulc/browser-inspector
+npm run release -- --continue
 ```
 
----
+`--continue` uses the versions already written to the manifests, skips anything already on the registry, publishes the rest, then creates any missing tags and pushes. Running it again after a fully successful release is a no-op.
 
-## Production: Install via pi
+Other recovery notes:
 
-End users install with the Pi CLI:
+- **Tag exists, version not published** — `--continue` publishes the manifest version (tag existence does not block it).
+- **Publish succeeded, push failed** — rerun with `--continue`; the registry check skips the published versions and the tags get pushed.
+- **Wrong version committed, nothing published yet** — fix the `package.json` version, `git commit --amend`, and rerun with `--bump none`.
+- **Wrong version already published** — you cannot overwrite it. Bump again (`--bump patch`) and publish; then deprecate the bad version with `npm deprecate @dieulc/<pkg>@<version> "message"`.
+
+## Manual fallback (single package)
+
+The script is a convenience; the underlying commands remain valid. From the repo root:
 
 ```bash
-# Individual packages
-pi install npm:@dieulc/workflow
-pi install npm:@dieulc/autocompact
-pi install npm:@dieulc/server-logs
-pi install npm:@dieulc/browser-inspector
-
-# All at once
-pi install npm:@dieulc/workflow npm:@dieulc/autocompact npm:@dieulc/server-logs npm:@dieulc/browser-inspector
+cd agent/extensions/workflow
+npm pack --dry-run          # inspect the tarball first
+npm publish                 # publishConfig.access handles public access
+cd ../../..
+git tag -a "@dieulc/workflow@0.2.0" -m "@dieulc/workflow@0.2.0"
+git push origin main && git push origin "@dieulc/workflow@0.2.0"
 ```
 
-Pinned version (recommended for stability):
+Always run `npm run verify -- --packages <pkg>` first — it catches the mistakes that manual publishing would otherwise push to the registry.
+
+## Verifying an install
 
 ```bash
-pi install npm:@dieulc/workflow@0.1.0
+npm view @dieulc/workflow version
+pi -e npm:@dieulc/workflow          # isolated load test
+pi install npm:@dieulc/workflow     # real install
+pi list
 ```
 
-Manage installed packages:
+To test without disturbing your own Pi config, point the config dir at a scratch location:
 
 ```bash
-pi list                     # show installed packages
-pi update --extensions      # update all packages
-pi update npm:@dieulc/workflow  # update one package
-pi remove npm:@dieulc/workflow  # uninstall
+PI_CODING_AGENT_DIR=/tmp/pi-verify pi -e npm:@dieulc/workflow
 ```
 
----
+Packages that carry the `pi-package` keyword appear in the gallery at <https://pi.dev/packages> shortly after publishing.
 
-## Development: Local setup
+## Versioning policy
 
-### Clone and link (for active development)
-
-```bash
-# From anywhere — clone the repo
-git clone https://github.com/dieuluucanh/pi-workflow.git ~/.pi
-
-# The extensions are auto-discovered from:
-#   ~/.pi/agent/extensions/workflow/index.ts
-#   ~/.pi/agent/extensions/autocompact/extensions/autocompact.ts
-#   ~/.pi/agent/extensions/server-logs/index.ts
-#   ~/.pi/agent/extensions/browser-inspector/src/index.ts
-```
-
-### Local override via settings (without cloning into ~/.pi)
-
-If your extensions live elsewhere, point pi to them in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "extensions": [
-    "/path/to/pi-workflow/agent/extensions/workflow",
-    "/path/to/pi-workflow/agent/extensions/autocompact",
-    "/path/to/pi-workflow/agent/extensions/server-logs",
-    "/path/to/pi-workflow/agent/extensions/browser-inspector"
-  ]
-}
-```
-
-Or use the `-e` flag for a one-off test:
-
-```bash
-pi -e ./agent/extensions/workflow/index.ts
-pi -e ./agent/extensions/server-logs/index.ts
-```
-
-### Install dependencies (browser-inspector only)
-
-`browser-inspector` has npm dependencies that must be installed:
-
-```bash
-cd agent/extensions/browser-inspector && npm install
-```
-
-The other three extensions have no runtime dependencies (only `peerDependencies` for pi internals).
-
----
-
-## Development: Testing changes
-
-### Type-check
-
-```bash
-cd agent/extensions/workflow && npx tsc --noEmit -p tsconfig.json
-cd agent/extensions/autocompact && npx tsc --noEmit -p tsconfig.json
-cd agent/extensions/server-logs && npx tsc --noEmit
-```
-
-### Run tests
-
-```bash
-cd agent/extensions/workflow && npm test
-```
-
-### Hot reload in pi
-
-Extensions in `~/.pi/agent/extensions/` are hot-reloadable:
-
-```
-/reload
-```
-
-This reloads all extensions without restarting pi.
-
-### Quick iteration cycle
-
-1. Edit the `.ts` file
-2. In pi, run `/reload`
-3. Test the behavior
-4. Repeat
-
----
-
-## Versioning
-
-Follow semver. For pre-1.0 packages, breaking changes bump minor:
-
-```bash
-# Patch (bug fix)
-cd agent/extensions/workflow && npm version patch && npm publish --access public
-
-# Minor (new feature, backward-compatible)
-cd agent/extensions/workflow && npm version minor && npm publish --access public
-
-# Major (breaking change)
-cd agent/extensions/workflow && npm version major && npm publish --access public
-```
-
-Update all four together:
-
-```bash
-for dir in workflow autocompact server-logs browser-inspector; do \
-  cd agent/extensions/$dir && npm version patch && cd ../../..; \
-done
-
-for dir in workflow autocompact server-logs browser-inspector; do \
-  cd agent/extensions/$dir && npm publish --access public && cd ../../..; \
-done
-```
-
----
+- **Independent versions** per package. Release only what changed.
+- **Semver.** While a package is `0.x`, breaking changes bump the **minor** and features/fixes bump the **patch** (`0.1.0 → 0.2.0` for a break, `→ 0.1.1` for a fix). Reaching `1.0.0` is a deliberate decision per package.
+- Changelog entries are generated from commit subjects. Conventional prefixes (`feat:`, `fix:`, `docs:` …) are grouped into sections; anything else lands under "Other changes". Use `type: message` in commits for a useful changelog.
+- Tags are annotated and named `<npm name>@<version>` (e.g. `@dieulc/server-logs@0.3.0`).
 
 ## Troubleshooting
 
-### `npm publish` fails with 403
+| Symptom | Cause / fix |
+| --- | --- |
+| `must release from "main"` | You are on another branch. Release from `main`, or rehearse with `--branch dev`. |
+| `working tree is not clean` | Commit or stash first. The release commit must capture exactly the released state. |
+| `branch is N commit(s) behind origin/main` | `git pull` first. |
+| `npm auth check failed` | `npm login` (the expected user is `dieulc`). |
+| `<pkg>@<version> is already published` | The registry already has that version; choose a bump or use `--continue`. |
+| `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
+| `npm publish` returns 403 | First publish of a scoped package must be public — handled by `publishConfig.access`; check you are logged in as a member of the `@dieulc` scope. |
+| npm asks for an OTP | Expected with 2FA; the publish step inherits the terminal, so type the code when prompted. |
+| Extension does not load after install | `pi --verbose`; confirm the `pi.extensions` path is in the tarball (`npm pack --dry-run`). |
 
-- Ensure `npm whoami` returns `dieulc`
-- Ensure the package name matches the npm scope you own
-- First publish of a scoped package requires `--access public`
+## Layout
 
-### Extension not loading in pi
-
-- Check the file is in a trusted location (`~/.pi/agent/extensions/`)
-- Run `/reload` after adding/editing
-- Check pi logs for import errors: `pi --verbose`
-
-### `tsc` type errors
-
-- Ensure `peerDependencies` are satisfied — pi bundles `@earendil-works/*` and `typebox` at runtime
-- For local dev, install dev deps: `npm install` in the extension directory
-
-### browser-inspector CDP connection issues
-
-- Requires `chrome-launcher` and `chrome-remote-interface` — run `npm install` first
-- Chrome must be launched with `--remote-debugging-port` or via the extension's launcher
-
----
-
-## File Structure Reference
-
-```
-~/.pi/                                    # repo root (or any clone location)
-├── package.json                          # root meta-package (not published)
-├── agent/extensions/
-│   ├── workflow/
-│   │   ├── package.json                  # @dieulc/workflow
-│   │   ├── index.ts                      # entry point
-│   │   ├── utils.ts                      # todo extraction, plan parsing
-│   │   ├── checkpoint.ts                 # git shadow checkpoint
-│   │   ├── roles.ts                      # plan/build mode roles
-│   │   └── utils.todo.test.ts            # tests
-│   ├── autocompact/
-│   │   ├── package.json                  # @dieulc/autocompact
-│   │   ├── extensions/autocompact.ts     # entry point
-│   │   └── prompts/autocompact-summary.md
-│   ├── server-logs/
-│   │   ├── package.json                  # @dieulc/server-logs
-│   │   ├── index.ts                      # entry point (docker/systemd tools)
-│   │   └── SKILL.md                      # companion skill docs
-│   └── browser-inspector/
-│       ├── package.json                  # @dieulc/browser-inspector
-│       ├── src/index.ts                  # entry point (CDP tools)
-│       └── extension/                    # chrome extension files
-│           ├── background.js
-│           └── panel.js
+```text
+scripts/
+├─ verify-packages.mjs   # pre-publish gate (also: npm run verify)
+└─ release.mjs           # release tool (also: npm run release)
+agent/extensions/<pkg>/
+├─ package.json          # name, version, pi manifest, files[], publishConfig
+├─ README.md             # npm + GitHub page
+├─ LICENSE
+├─ CHANGELOG.md          # created/updated by the release script
+└─ <entry>.ts            # shipped as source — Pi loads TypeScript directly
 ```

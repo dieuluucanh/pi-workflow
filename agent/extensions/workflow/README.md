@@ -15,12 +15,13 @@ Plan↔Build mode, questionnaire, subagent explore, todos and shadow-checkpoint 
 ## Install
 
 ```bash
-pi install npm:@dieulc/workflow              # npm (when published)
-pi install git:github.com/dieuluucanh/pi-workflow  # git (bundled via root wrapper)
-pi -e ./agent/extensions/workflow/index.ts   # temp (one run)
+pi install npm:@dieulc/workflow            # latest
+pi install npm:@dieulc/workflow@0.1.0      # pinned
+pi install -l npm:@dieulc/workflow         # project-local (.pi/settings.json)
+pi -e npm:@dieulc/workflow                 # try without installing
 ```
 
-Bundled with the dotfiles root wrapper `@dieulc/pi-workflow` — `pi install npm:@dieulc/pi-workflow` loads both workflow + autocompact.
+Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workflow`. Requires Pi on Node ≥ 22.19; the Pi core packages (`@earendil-works/*`, `typebox`) are provided by Pi at runtime and declared as peer dependencies.
 
 ## Commands
 
@@ -48,3 +49,18 @@ See `index.ts`, `checkpoint.ts` (shadow bare-repo), `utils.ts` (safe-command gat
 - **Update**: `workflow_todo {action:"update", todos:[{ref?, text?, status?}]}` replaces the whole list — TodoWrite/todowrite/update_plan semantics. A `ref` is resolved by canonical ref, then normalized text, then leniently by plan label / group-qualified ref / unique text; a ref that had to be resolved leniently (or matched nothing and was added) is reported under `Warnings:` in the tool result. `done`/`pending` are idempotent single-item sets; `toggle` is a convenience flip; `add` appends an ad-hoc item; `sync` re-extracts the plan file, matches steps by exact text then by plan label (so model-rewritten wording reunites instead of duplicating), **preserves agent-added items** (reported as `kept N agent-added`) and never un-completes (status rank merge); `clear` empties.
 - **Reminder cadence** (Claude Code-style throttle): a hidden `[TODO LIST]` context block is injected only when `turnsSinceLastTodoWrite ≥ TURNS_SINCE_WRITE` **and** `turnsSinceLastReminder ≥ TURNS_BETWEEN_REMINDERS` (`=3`). Unresolved `[DONE:…]` refs from the previous turn bypass the throttle once so the model learns the right numbers. A one-line `[TODO …]` footer is appended to the first successful `edit`/`write`/`bash` result of each turn.
 - **Stale notice (no forced turns)**: if a run mutated files but recorded no todo progress, the user gets one `⚠` status marker + a `ctx.ui.notify` (30 s dedupe); plan-file `- [x]` ticks are reconciled at `agent_end` in all modes, skipped when the plan content is unchanged (path+hash guard). No auto-completion — the list is never marked done based on intent. Legacy lists that already contain duplicate rows are not auto-merged; run `/todos clear` (or approve a new plan) to reset.
+
+## Development
+
+```bash
+cd agent/extensions/workflow
+npm install
+npm run typecheck   # tsc --noEmit
+npm test            # node --test utils.todo.test.ts
+```
+
+Plain TypeScript, no build step — Pi loads `index.ts` directly (via jiti). From the repo root, `npm run verify` checks this package's manifest, tarball contents, tests and load path before a release. Live reload: edit the `.ts` file and run `/reload` in Pi.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
