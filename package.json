@@ -2,46 +2,20 @@
   "name": "@dieulc/pi-workflow",
   "version": "0.1.0",
   "type": "module",
-  "private": false,
-  "keywords": ["pi-package", "workflow", "autocompact", "pi-workflow", "dotfiles"],
-  "description": "Portable Pi dotfiles — workflow + autocompact + sane defaults. Clone to ~/.pi or pi install.",
+  "private": true,
+  "keywords": ["pi", "dotfiles", "workflow", "autocompact", "server-logs", "browser-inspector"],
+  "description": "Portable Pi dotfiles — four independently published extensions, sane defaults, and the local release tooling for them.",
   "license": "MIT",
+  "scripts": {
+    "verify": "node scripts/verify-packages.mjs",
+    "release": "node scripts/release.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/dieuluucanh/pi-workflow"
   },
-  "pi": {
-    "extensions": [
-      "./agent/extensions/workflow/index.ts",
-      "./agent/extensions/autocompact/extensions/autocompact.ts"
-    ]
+  "bugs": {
+    "url": "https://github.com/dieuluucanh/pi-workflow/issues"
   },
-  "files": [
-    "agent/extensions/workflow/index.ts",
-    "agent/extensions/workflow/utils.ts",
-    "agent/extensions/workflow/checkpoint.ts",
-    "agent/extensions/workflow/README.md",
-    "agent/extensions/autocompact/extensions/autocompact.ts",
-    "agent/extensions/autocompact/prompts/autocompact-summary.md",
-    "agent/extensions/autocompact/README.md",
-    "agent/agents/",
-    "agent/settings.json",
-    "agent/settings.json.example",
-    "agent/keybindings.json",
-    "agent/plannotator.json",
-    "agent/trust.json.example",
-    "README.md"
-  ],
-  "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
-    "@types/node": "^20.19.43",
-    "typescript": "5.5.4"
-  }
+  "homepage": "https://github.com/dieuluucanh/pi-workflow#readme"
 }

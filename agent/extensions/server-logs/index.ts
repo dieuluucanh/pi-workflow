@@ -33,6 +33,7 @@ interface SshConfig {
 }
 
 let sshConfig: SshConfig | null = null;
+let sessionCtx: ExtensionContext | null = null;
 
 // ---------------------------------------------------------------------------
 // Execution backend: routes through SSH when configured, else runs locally
@@ -83,14 +84,14 @@ function execCommand(
 	cwd: string,
 	opts: ExecOptions = {},
 ): Promise<ExecResult> {
-	const useSsh = sshConfig !== null;
-	const fullCommand = useSsh
-		? `cd ${JSON.stringify(sshConfig.remoteCwd)} && ${command}`
+	const cfg = sshConfig;
+	const fullCommand = cfg
+		? `cd ${JSON.stringify(cfg.remoteCwd)} && ${command}`
 		: command;
 
 	return new Promise((resolve, reject) => {
-		const child = useSsh
-			? spawn("ssh", [sshConfig!.remote, fullCommand], {
+		const child = cfg
+			? spawn("ssh", [cfg.remote, fullCommand], {
 					stdio: ["ignore", "pipe", "pipe"],
 				})
 			: spawn("bash", ["-c", `cd ${JSON.stringify(cwd)} && ${command}`], {
@@ -462,6 +463,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- Lifecycle -----------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
+		sessionCtx = ctx;
 		const arg = pi.getFlag("ssh") as string | undefined;
 		if (arg) {
 			if (arg.includes(":")) {
@@ -498,6 +500,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		ctx.ui?.setStatus("server-logs", undefined);
+		sessionCtx?.ui?.setStatus("server-logs", undefined);
+		sessionCtx = null;
 	});
 }

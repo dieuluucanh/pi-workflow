@@ -6,29 +6,36 @@
   "keywords": ["pi-package", "autocompact", "compaction", "context-management"],
   "description": "Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-aware summarization, cheap model override, and rich UX.",
   "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/dieuluucanh/pi-workflow",
     "directory": "agent/extensions/autocompact"
   },
+  "bugs": {
+    "url": "https://github.com/dieuluucanh/pi-workflow/issues"
+  },
+  "homepage": "https://github.com/dieuluucanh/pi-workflow#readme",
   "pi": {
     "extensions": ["./extensions/autocompact.ts"]
   },
-  "files": ["extensions/", "prompts/", "README.md"],
+  "files": ["extensions/", "prompts/", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {},
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.84.4",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
-    "@earendil-works/pi-tui": "0.84.4",
-    "typebox": "1.3.7",
     "@types/node": "^20.19.43",
     "typescript": "5.5.4"
   }

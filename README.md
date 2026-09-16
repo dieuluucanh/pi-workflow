@@ -1,27 +1,57 @@
 # pi-workflow — Portable Pi Dotfiles
 
-Custom Pi extensions **workflow** + **autocompact**, sane defaults, and external packages — reproducible on any machine via `git clone` → `~/.pi` or `pi install`.
+Four independently published Pi extensions, sane defaults, and the local release tooling for them — reproducible on any machine via `git clone` → `~/.pi`.
+
+Each extension is its own npm package (install just what you want):
+
+[![@dieulc/workflow](https://img.shields.io/npm/v/@dieulc/workflow?label=%40dieulc%2Fworkflow)](https://www.npmjs.com/package/@dieulc/workflow)
+[![@dieulc/autocompact](https://img.shields.io/npm/v/@dieulc/autocompact?label=%40dieulc%2Fautocompact)](https://www.npmjs.com/package/@dieulc/autocompact)
+[![@dieulc/server-logs](https://img.shields.io/npm/v/@dieulc/server-logs?label=%40dieulc%2Fserver-logs)](https://www.npmjs.com/package/@dieulc/server-logs)
+[![@dieulc/browser-inspector](https://img.shields.io/npm/v/@dieulc/browser-inspector?label=%40dieulc%2Fbrowser-inspector)](https://www.npmjs.com/package/@dieulc/browser-inspector)
 
 [![pi-package](https://img.shields.io/badge/pi--package-blue)](https://pi.dev/packages)
 
 ## What is included
 
-| Path | Description |
-| --- | --- |
-| `agent/extensions/workflow/` | Plan↔Build mode, questionnaire (1–4 Qs, dedup), subagent `explore`, `workflow_todo`, `/rewind` shadow-checkpoint, Plannotator bridge |
-| `agent/extensions/autocompact/` | Intelligent compaction: plan/todo-aware summary, 70% pre-warming, cheap model override, `/autocompact` |
-| `agent/settings.json` | `packages: ["npm:pi-lens","npm:pi-web-access","npm:@plannotator/pi-extension"]`, theme, enabledModels |
-| `agent/keybindings.json` | Disables `tui.input.tab` (autocomplete conflict) |
-| `agent/plannotator.json` | `planning` phase tool gate + status label |
-| `agent/agents/planner.md`, `scout.md` | Agent presets |
-| `agent/extensions/*/package.json` | Publishable `pi-package` manifests (`@dieulc/workflow`, `@dieulc/autocompact`) |
-| Root `package.json` `@dieulc/pi-workflow` | Wrapper that re-exports both extensions via `pi.extensions` |
+| Path | npm package | Description |
+| --- | --- | --- |
+| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, questionnaire (1–4 Qs, dedup), subagent `explore`, `workflow_todo`, `/rewind` shadow-checkpoint, Plannotator bridge |
+| `agent/extensions/autocompact/` | `@dieulc/autocompact` | Intelligent compaction: plan/todo-aware summary, 70% pre-warming, cheap model override, `/autocompact` |
+| `agent/extensions/server-logs/` | `@dieulc/server-logs` | Docker + systemd log inspection tools (remote SSH or local) |
+| `agent/extensions/browser-inspector/` | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP: console, network, screenshots (fresh browser or real session) |
+| `agent/settings.json` | — | Shared config: `packages`, theme, enabled models |
+| `agent/keybindings.json` | — | Disables `tui.input.tab` (autocomplete conflict) |
+| `agent/plannotator.json` | — | `planning` phase tool gate + status label |
+| `agent/agents/planner.md`, `scout.md` | — | Agent presets |
+| `scripts/` | — | `verify-packages.mjs` (pre-publish gate) + `release.mjs` (release tooling) |
 
-External packages auto-install via `settings.json` `packages` on first trusted startup.
+External packages listed in `agent/settings.json` auto-install on first trusted startup.
+
+> This repo root is **not** a Pi package and is not published (`"private": true`). Install the extensions individually, or clone the repo for the dotfiles.
 
 ## Install
 
-### Option A — Git clone (primary, dotfiles)
+### A — The extensions (npm)
+
+```bash
+pi install npm:@dieulc/workflow
+pi install npm:@dieulc/autocompact
+pi install npm:@dieulc/server-logs
+pi install npm:@dieulc/browser-inspector
+
+# pinned, for reproducible installs
+pi install npm:@dieulc/workflow@0.1.0
+
+# project-local (writes .pi/settings.json for team sharing)
+pi install -l npm:@dieulc/workflow
+
+# try without installing
+pi -e npm:@dieulc/workflow
+```
+
+Manage them with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workflow`.
+
+### B — The dotfiles (git clone)
 
 This repo **is** `~/.pi`. Clone it directly:
 
@@ -29,102 +59,92 @@ This repo **is** `~/.pi`. Clone it directly:
 # fresh machine (no ~/.pi yet)
 git clone https://github.com/dieuluucanh/pi-workflow ~/.pi
 
-# if ~/.pi already exists, clone elsewhere and point env
+# if ~/.pi already exists, clone elsewhere and point the env var
 git clone https://github.com/dieuluucanh/pi-workflow ~/pi-workflow
 PI_CODING_AGENT_DIR=~/pi-workflow/agent pi
 # or move: mv ~/.pi ~/.pi.bak && git clone ... ~/.pi
 ```
 
-First `pi` run prompts to **trust** the project — approve. Missing `npm:` packages (`pi-lens` etc.) install automatically. Use `/reload` to hot-reload extensions.
+First `pi` run prompts to **trust** the project — approve. Missing `npm:` packages (`pi-lens` etc.) install automatically. `/reload` hot-reloads extensions.
 
-Update dotfiles:
-
-```bash
-cd ~/.pi && git pull
-pi update --extensions   # updates pi-lens etc.
-```
-
-### Option B — Pi package (npm / git)
-
-No clone needed — `pi` fetches packages itself:
-
-```bash
-# via npm (once published)
-pi install npm:@dieulc/workflow
-pi install npm:@dieulc/autocompact
-# or the wrapper that bundles both + dotfiles defaults
-pi install npm:@dieulc/pi-workflow
-
-# via git (works today, no npm publish needed)
-pi install git:github.com/dieuluucanh/pi-workflow
-
-# ad-hoc try without installing
-pi -e npm:@dieulc/workflow
-pi -e git:github.com/dieuluucanh/pi-workflow
-```
-
-Project-local (`-l`): `pi install -l npm:@dieulc/workflow` writes to `.pi/settings.json` for team sharing. `pi list` / `pi remove` / `pi update --extensions` manage packages.
-
-> **Pick one** — don't both `git clone` to `~/.pi` *and* `pi install git:...` the same repo on the same machine (you'd get two copies: `~/.pi/agent/extensions` vs `~/.pi/agent/git/...`). They deduplicate by URL identity.
+> **Pick one per machine.** Cloning to `~/.pi` loads the extensions from source; installing the npm packages too would load duplicates. The clone is the development path, npm is the user path.
 
 ## Updating
 
-- Dotfiles: `git pull` in `~/.pi`
-- Packages: `pi update --extensions` (global), `pi update --all` (pi + packages + git refs), or pinned bump: `pi install npm:@dieulc/workflow@0.2.0`
+- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.2.0` to pin)
+- Dotfiles: `cd ~/.pi && git pull`, then `pi update --extensions`
 
-## Developing extensions
+## Developing
 
 ```bash
 cd ~/.pi
-# typecheck
-npx tsc --noEmit -p agent/extensions/workflow/tsconfig.json
-npx tsc --noEmit -p agent/extensions/autocompact/tsconfig.json
-# dry-run tarball contents
-npm pack --dry-run                         # root wrapper
-npm pack --dry-run -w agent/extensions/workflow 2>&1 | head -30
-npm pack --dry-run --prefix agent/extensions/autocompact
 
-# live reload
-# edit agent/extensions/workflow/index.ts then in pi: /reload
+# pre-publish gate: manifest, imports, tarball contents, tests, load smoke test
+npm run verify
+npm run verify -- --packages workflow,server-logs
+
+# per-package checks
+(cd agent/extensions/workflow && npm run typecheck && npm test)
+(cd agent/extensions/browser-inspector && npm run typecheck)
 ```
 
-Publish (maintainer):
+Extensions load directly from `agent/extensions/*` — edit the `.ts` file and run `/reload` in Pi. No build step.
+
+## Releasing
+
+Releases are cut locally with one script. Versions are **independent per package**, git tags look like `@dieulc/workflow@0.2.0`, and each package keeps its own `CHANGELOG.md` generated from commits since its previous tag.
 
 ```bash
-npm login
-npm publish --access public --prefix agent/extensions/workflow
-npm publish --access public --prefix agent/extensions/autocompact
-npm publish --access public   # root wrapper
-git tag v0.1.0 && git push origin v0.1.0
+npm login                      # once per machine (npm user: dieulc)
+npm run verify                 # gate: all four packages
+npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
+npm run release                # interactive: pick packages + bump type
+
+# non-interactive
+npm run release -- --packages workflow,autocompact --bump minor --yes
 ```
+
+What a release does: preflight (clean tree, `main`, npm auth) → verify → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
+
+- `--bump none` publishes the current version (first publish).
+- `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.
+- `--no-push` stops before `git push`.
+
+See [`docs/publishing.md`](docs/publishing.md) for the full reference and recovery paths.
 
 ## Secrets & machine-local files
 
 These are **ignored** (never committed) and regenerated per machine:
 
-- `agent/auth.json` — credentials (empty `{}` in repo, ignored)
+- `agent/auth.json` — credentials
 - `agent/models-store.json` — model catalog cache (regenerated via `pi update --models`)
-- `agent/trust.json` — saved trust decisions (created on trust prompt) — template at `agent/trust.json.example`
-- `agent/sessions/`, `agent/checkpoints/`, `plans/`, `.pi/plans/`, `web-search-cache/`, `**/node_modules/`, `**/.cache/`, `nul`
+- `agent/trust.json` — saved trust decisions — template at `agent/trust.json.example`
+- `agent/sessions/`, `agent/checkpoints/`, `plans/`, `.pi/plans/`, `web-search-cache/`, `**/node_modules/`, `**/.cache/`, `nul`, `*.tgz`
 
 Intentional config stays tracked: `agent/settings.json` (+ `settings.json.example`), `agent/keybindings.json`, `agent/plannotator.json`, `agent/agents/*.md`, `agent/extensions/**`.
 
-If you fork, check `agent/settings.json` doesn't contain private `enabledModels` tokens you don't want public — `settings.json.example` is the safe template.
+If you fork, check `agent/settings.json` doesn't contain private `enabledModels` values you don't want public — `settings.json.example` is the safe template.
 
 ## Layout
 
-```
-~/.pi/  (this repo)
-├─ package.json              ← wrapper @dieulc/pi-workflow (pi.extensions → agent/…)
-├─ README.md
-├─ .gitignore                ← ignores caches, sessions, auth, trust
+```text
+~/.pi/  (this repo — dotfiles + release tooling, not itself a package)
+├─ package.json              ← private; scripts: verify, release
+├─ README.md, LICENSE
+├─ docs/publishing.md        ← release reference
+├─ scripts/
+│  ├─ verify-packages.mjs    ← pre-publish gate
+│  └─ release.mjs            ← version + changelog + publish + tag
+├─ .gitignore
 └─ agent/
    ├─ settings.json / .example
    ├─ keybindings.json, plannotator.json, trust.json.example
    ├─ agents/planner.md, scout.md
    ├─ extensions/
-   │  ├─ workflow/ (index.ts, utils.ts, checkpoint.ts, README.md, package.json @dieulc/workflow)
-   │  └─ autocompact/ (extensions/autocompact.ts, prompts/, README.md, package.json @dieulc/autocompact)
+   │  ├─ workflow/        (@dieulc/workflow)
+   │  ├─ autocompact/     (@dieulc/autocompact)
+   │  ├─ server-logs/     (@dieulc/server-logs)
+   │  └─ browser-inspector/ (@dieulc/browser-inspector)
    ├─ npm/   ← generated (ignored except .gitignore)
    ├─ sessions/, checkpoints/ ← ignored
    └─ bin/fd.exe, rg.exe
@@ -132,4 +152,4 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 
 ## License
 
-MIT — see `LICENSE` if present (extensions inherit MIT).
+MIT — see [LICENSE](./LICENSE).

@@ -15,17 +15,27 @@
     "url": "https://github.com/dieuluucanh/pi-workflow",
     "directory": "agent/extensions/workflow"
   },
+  "bugs": {
+    "url": "https://github.com/dieuluucanh/pi-workflow/issues"
+  },
+  "homepage": "https://github.com/dieuluucanh/pi-workflow#readme",
   "pi": {
     "extensions": ["./index.ts"]
   },
   "files": [
     "index.ts",
     "utils.ts",
-    "utils.todo.test.ts",
     "checkpoint.ts",
     "roles.ts",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {},
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

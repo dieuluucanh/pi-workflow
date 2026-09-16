@@ -14,10 +14,13 @@ Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-
 ## Install
 
 ```bash
-pi install npm:@dieulc/autocompact        # npm (when published)
-pi install git:github.com/dieuluucanh/pi-workflow  # git (bundled)
-pi -e ./extensions/autocompact.ts         # temp (one run)
+pi install npm:@dieulc/autocompact            # latest
+pi install npm:@dieulc/autocompact@0.1.0      # pinned
+pi install -l npm:@dieulc/autocompact         # project-local (.pi/settings.json)
+pi -e npm:@dieulc/autocompact                 # try without installing
 ```
+
+Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/autocompact`. Requires Pi on Node ≥ 22.19; the Pi core packages (`@earendil-works/*`, `typebox`) are provided by Pi at runtime and declared as peer dependencies.
 
 ## Settings
 
@@ -51,3 +54,17 @@ Add to `~/.pi/agent/settings.json` or `<project>/.pi/settings.json`:
 2. **Overflow**: Supplies smarter summary via `session_before_compact` when `reason:"overflow"`
 3. **Idle pre-warming**: On `agent_settled`, if context > 70%, triggers proactive compaction
 4. **Summarization**: Uses structured prompt with plan/todo extraction + cumulative file tracking
+
+## Development
+
+```bash
+cd agent/extensions/autocompact
+npm install
+npm run typecheck   # tsc --noEmit
+```
+
+Plain TypeScript, no build step — Pi loads `extensions/autocompact.ts` directly (via jiti). From the repo root, `npm run verify` checks this package's manifest, tarball contents and load path before a release. Live reload: edit the `.ts` file and run `/reload` in Pi.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

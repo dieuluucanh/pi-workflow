@@ -18,6 +18,8 @@
  *   pi -e ./browser-inspector/src/index.ts --browser-inspector --browser-url https://example.com
  */
 
+/// <reference path="./types.d.ts" />
+
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -513,7 +515,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			url: Type.String({ description: "URL to navigate to" }),
 		}),
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			if (!cdp && !realSessionActive) {
 				return {
 					content: [
@@ -777,7 +779,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			if (!cdp) {
 				return {
 					content: [
@@ -999,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
 
 async function closeBrowser(
 	ctx: any,
-): Promise<{ content: { type: string; text: string }[]; details: any }> {
+): Promise<{ content: { type: "text"; text: string }[]; details: any }> {
 	let message: string;
 	try {
 		if (cdp) {

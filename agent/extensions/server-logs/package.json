@@ -11,6 +11,10 @@
     "url": "https://github.com/dieuluucanh/pi-workflow",
     "directory": "agent/extensions/server-logs"
   },
+  "bugs": {
+    "url": "https://github.com/dieuluucanh/pi-workflow/issues"
+  },
+  "homepage": "https://github.com/dieuluucanh/pi-workflow#readme",
   "pi": {
     "extensions": ["./index.ts"],
     "skills": ["./SKILL.md"]
@@ -18,14 +22,21 @@
   "files": [
     "index.ts",
     "SKILL.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
   "dependencies": {},
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
