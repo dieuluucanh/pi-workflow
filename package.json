@@ -1,6 +1,6 @@
 {
   "name": "@dieulc/pi-workflow",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "type": "module",
   "private": true,
   "keywords": ["pi", "dotfiles", "workflow", "autocompact", "server-logs", "browser-inspector"],
