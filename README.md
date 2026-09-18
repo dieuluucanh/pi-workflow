@@ -107,8 +107,9 @@ npm run release -- --packages workflow,autocompact --bump minor --yes
 
 What a release does: preflight (clean tree, `main`, npm auth) → verify → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
 
-- `--bump none` publishes the current version (first publish).
+- `--bump none` publishes the current version as-is (first publish, or resuming).
 - `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.
+- A package whose target version is already on npm is **skipped, never fatal** — the rest of the batch is still published, tagged and pushed, and a missing tag for an already-published version is repaired. Add a bump to actually release it again, and always pass flags after `--` (`npm run release -- --continue`).
 - `--no-push` stops before `git push`.
 
 See [`docs/publishing.md`](docs/publishing.md) for the full reference and recovery paths.

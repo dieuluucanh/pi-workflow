@@ -46,7 +46,12 @@ const GROUPS = [
 const CHANGELOG_HEADER =
   "# Changelog\n\nAll notable changes to this package are documented in this file.\n";
 
-class ReleaseError extends Error {}
+class ReleaseError extends Error {
+  constructor(message, exitCode = 1) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
 
 // ── process helpers ────────────────────────────────────────────────────────
 
@@ -92,6 +97,42 @@ function readJson(file) {
 }
 
 // ── arguments & discovery ──────────────────────────────────────────────────
+
+// npm parses `npm run release <flags>` itself: only arguments after `--` reach
+// the script. When npm swallows one of our flags it exports it into the child
+// environment as npm_config_<name> instead, and the script would silently fall
+// back to its default mode — that is how a `--continue` resume once turned into
+// an interactive bump prompt. Detect it and say exactly what to type.
+const NPM_CONSUMED_FLAGS = [
+  "continue",
+  "packages",
+  "bump",
+  "dry_run",
+  "yes",
+  "branch",
+  "npm_user",
+];
+
+function npmConsumedFlags(argv = process.argv.slice(2)) {
+  const hits = [];
+  for (const name of NPM_CONSUMED_FLAGS) {
+    const value = process.env[`npm_config_${name}`];
+    // npm sets every config it knows, so only a value that actually came from
+    // the command line counts (a plain "false"/"0" is the default).
+    if (!value || /^(false|0|undefined|null)$/i.test(value)) continue;
+    const flag = `--${name.replace(/_/g, "-")}`;
+    const passed = argv.includes(flag) || (name === "yes" && argv.includes("-y"));
+    if (!passed) hits.push(flag);
+  }
+  // `--no-push` is the one flag npm normalizes into `push=false`.
+  if (
+    process.env.npm_config_push === "false" &&
+    !process.argv.slice(2).includes("--no-push")
+  ) {
+    hits.push("--no-push");
+  }
+  return hits;
+}
 
 function parseArgs(argv) {
   const opts = {
@@ -193,9 +234,32 @@ function tagExists(tag) {
   return git(["rev-parse", "-q", "--verify", `refs/tags/${tag}`]).status === 0;
 }
 
-function isPublished(name, version) {
-  const res = npm(["view", `${name}@${version}`, "version"], ROOT);
-  return res.status === 0 && out(res).length > 0;
+// Three distinct answers, never two. `npm view <name>@<version> version` exits 0
+// with the version when it exists; a missing version and a fully unpublished
+// package name both come back as E404 (the latter with "Unpublished on …");
+// everything else (offline, 5xx, auth, rate limit, empty output) is *unknown*.
+// "unknown" must never be read as "not published": a wrong "not published"
+// leads to a doomed publish, a wrong "published" to a silently skipped release.
+function classifyNpmView(res) {
+  const text = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
+  if (res?.status === 0) return out(res).length > 0 ? "published" : "unknown";
+  if (/E404|404 Not Found|Unpublished on/i.test(text)) return "absent";
+  return "unknown";
+}
+
+function publishState(name, version) {
+  return classifyNpmView(npm(["view", `${name}@${version}`, "version"], ROOT));
+}
+
+// The interactive picker and planTargets ask about the same package; one
+// registry round-trip per name@version is enough for a whole run.
+function memoizedProbe(probe = publishState) {
+  const cache = new Map();
+  return (name, version) => {
+    const key = `${name}@${version}`;
+    if (!cache.has(key)) cache.set(key, probe(name, version));
+    return cache.get(key);
+  };
 }
 
 function lastTagFor(name) {
@@ -252,41 +316,55 @@ function changelogSection(version, commits, date) {
 
 const SECTION_VERSION_RE = /^##\s*\[([^\]]+)\]/;
 
+// Git checks these files out with CRLF on Windows (`core.autocrlf=true` in this
+// repo, no .gitattributes), while this script writes LF. Comparing raw text
+// against an LF header therefore failed on every second release and prepended a
+// second "# Changelog" header — normalize before any comparison or write.
+function normalizeEol(text) {
+  return String(text ?? "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n");
+}
+
 function sectionVersion(section) {
   const match = SECTION_VERSION_RE.exec(String(section).trimStart());
   return match ? match[1] : null;
 }
 
+function documentsVersion(text, version) {
+  return normalizeEol(text)
+    .split("\n")
+    .some((line) => {
+      const match = SECTION_VERSION_RE.exec(line.trim());
+      return match ? match[1] === version : false;
+    });
+}
+
+/** Pure: the new changelog body with `section` on top of `existingText`. */
+function composeChangelog(existingText, section) {
+  // Leading blank lines (and a BOM) must not defeat the header check, or the
+  // header would be prepended a second time.
+  let existing = normalizeEol(existingText).replace(/^\n+/, "");
+  if (existing.startsWith(CHANGELOG_HEADER))
+    existing = existing.slice(CHANGELOG_HEADER.length);
+  const rest = existing.replace(/^\n+/, "");
+  return `${CHANGELOG_HEADER}\n${section}\n${rest ? `\n${rest.trimEnd()}\n` : "\n"}`;
+}
+
 function prependChangelog(file, section) {
   const version = sectionVersion(section);
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
 
   // Idempotent: a re-run (or `--continue` after an aborted release) must not add
   // a second section for the same version — only the date would differ.
-  if (version && fs.existsSync(file)) {
-    const documented = fs
-      .readFileSync(file, "utf8")
-      .split(/\r?\n/)
-      .some((line) => {
-        const match = SECTION_VERSION_RE.exec(line.trim());
-        return match ? match[1] === version : false;
-      });
-    if (documented) {
-      console.log(
-        `  ↺ ${path.relative(ROOT, file)} already documents ${version} — leaving it unchanged.`,
-      );
-      return false;
-    }
+  if (version && existing !== null && documentsVersion(existing, version)) {
+    console.log(
+      `  ↺ ${path.relative(ROOT, file)} already documents ${version} — leaving it unchanged.`,
+    );
+    return false;
   }
 
-  let rest = "";
-  if (fs.existsSync(file)) {
-    let existing = fs.readFileSync(file, "utf8");
-    if (existing.startsWith(CHANGELOG_HEADER))
-      existing = existing.slice(CHANGELOG_HEADER.length);
-    rest = existing.replace(/^\n+/, "");
-  }
-  const body = `${CHANGELOG_HEADER}\n${section}\n${rest ? `\n${rest.trimEnd()}\n` : "\n"}`;
-  fs.writeFileSync(file, body);
+  fs.writeFileSync(file, composeChangelog(existing ?? "", section));
   return true;
 }
 
@@ -312,11 +390,21 @@ async function ask(rl, question) {
   return (await rl.question(question)).trim();
 }
 
-async function promptPackages(rl, all) {
+function stateNote(state) {
+  if (state === "published") return "already on npm";
+  if (state === "absent") return "not on npm";
+  return "publish state unknown";
+}
+
+async function promptPackages(rl, all, probe) {
   console.log("\nPackages:");
-  all.forEach((p, i) =>
-    console.log(`  ${i + 1}) ${p.short.padEnd(18)} ${p.name} @ ${p.version}`),
-  );
+  all.forEach((p, i) => {
+    console.log(
+      `  ${i + 1}) ${p.short.padEnd(18)} ${p.name} @ ${p.version}  (${stateNote(
+        probe(p.name, p.version),
+      )})`,
+    );
+  });
   const answer = await ask(
     rl,
     '\nSelect packages (numbers, comma-separated; "all"; or "none"): ',
@@ -330,13 +418,18 @@ async function promptPackages(rl, all) {
   return all.filter((_, i) => picked.includes(i + 1));
 }
 
-async function promptBump(rl, pkg) {
+async function promptBump(rl, pkg, probe) {
+  const state = probe(pkg.name, pkg.version);
+  // Pressing Enter on an already-published package means "release nothing this
+  // time": skipping is the honest default, not a pointless patch bump. An
+  // unknown publish state keeps the old default, and is reported as blocked.
+  const fallback = state === "published" ? "none" : "patch";
   for (;;) {
     const answer = await ask(
       rl,
-      `  Bump for ${pkg.short} (current ${pkg.version}) [patch/minor/major/none] (patch): `,
+      `  Bump for ${pkg.short} (current ${pkg.version}, ${stateNote(state)}) [patch/minor/major/none] (${fallback}): `,
     );
-    const kind = answer || "patch";
+    const kind = answer || fallback;
     if (BUMP_KINDS.includes(kind)) return kind;
     console.log(`    ✗ expected one of ${BUMP_KINDS.join(", ")}`);
   }
@@ -419,24 +512,68 @@ function verify(packages) {
     throw new ReleaseError("verification failed — nothing was changed");
 }
 
-function planTargets(packages, opts) {
+/**
+ * The release decision for one package, as a pure function of the bump kind and
+ * the registry state — no npm, no git, so it is unit-testable.
+ *
+ *   published + "none"                → skip        (nothing to do: already released)
+ *   published + patch|minor|major     → skip        (flagged: that version is taken,
+ *                                                   the manifest is probably behind)
+ *   absent                            → publish
+ *   unknown                           → blocked     (never publish, never skip blindly)
+ *
+ * Only `skip` with tagEligible is a clean outcome; `blocked` and a bump
+ * collision are reported as problems at the end of the run.
+ */
+function classifyTargetState({ kind, nextVersion, state }) {
+  if (state === "unknown") {
+    return {
+      status: "blocked",
+      reason: "registry query failed",
+      tagEligible: false,
+    };
+  }
+  if (state === "published") {
+    return kind === "none"
+      ? {
+          status: "skip",
+          reason: `already on npm at ${nextVersion} — no bump requested`,
+          tagEligible: true,
+        }
+      : {
+          status: "skip",
+          reason: `${nextVersion} is already on npm — bump further`,
+          tagEligible: false,
+        };
+  }
+  return { status: "publish", reason: "not on npm", tagEligible: true };
+}
+
+function decideTarget({ version, kind, state, nextVersion = bumpVersion(version, kind) }) {
+  return { nextVersion, ...classifyTargetState({ kind, nextVersion, state }) };
+}
+
+function planTargets(packages, opts, probe = publishState) {
   const targets = [];
   for (const pkg of packages) {
     // Interactive runs set pkg.bump per package; --bump overrides all of them.
     const kind = opts.continue ? "none" : (opts.bump ?? pkg.bump ?? "none");
-    const version = bumpVersion(pkg.version, kind);
-    const published = isPublished(pkg.name, version);
-    if (published && !opts.continue) {
-      throw new ReleaseError(
-        `${pkg.name}@${version} is already published — bump the version`,
-      );
-    }
+    const nextVersion = bumpVersion(pkg.version, kind);
+    const decision = decideTarget({
+      version: pkg.version,
+      kind,
+      nextVersion,
+      state: probe(pkg.name, nextVersion),
+    });
     targets.push({
       ...pkg,
       bumpKind: kind,
-      nextVersion: version,
-      skipPublish: published,
-      tag: tagFor(pkg.name, version),
+      nextVersion,
+      status: decision.status,
+      reason: decision.reason,
+      tagEligible: decision.tagEligible,
+      skipPublish: decision.status !== "publish",
+      tag: tagFor(pkg.name, nextVersion),
     });
   }
   return targets;
@@ -484,20 +621,32 @@ function publish(targets) {
   // Attempt every target: one package being unpublishable must not block the
   // others' tags/pushes (npm's 24h name-reuse block, transient 403s, OTP
   // timeouts…). Failures are reported at the end with a --continue hint.
+  //
+  // Publishable targets are published; already-published ones are skipped but
+  // stay in `done` when their manifest version is what is on npm (that is how a
+  // published-but-untagged version gets its tag repaired); targets whose
+  // publish state is unknown are never touched — the caller reports them.
+  const published = [];
   const done = [];
   const failed = [];
   let authHinted = false;
   for (const target of targets) {
+    if (target.status === "blocked") continue;
     if (target.skipPublish) {
       console.log(
         `Already on npm, skipping publish: ${target.name}@${target.nextVersion}`,
       );
-      done.push(target);
+      if (target.tagEligible) done.push(target);
+      else
+        console.log(
+          `  ↳ no tag created for ${target.tag} — that version is not what the manifest points at`,
+        );
       continue;
     }
     console.log(`\nPublishing ${target.name}@${target.nextVersion} …`);
     const res = npm(["publish"], target.dir, { capture: false });
     if (res.status === 0) {
+      published.push(target);
       done.push(target);
     } else {
       console.log(
@@ -519,7 +668,7 @@ function publish(targets) {
       failed.push(target);
     }
   }
-  return { done, failed };
+  return { published, done, failed };
 }
 
 function tagAndPush(targets, opts) {
@@ -576,6 +725,23 @@ function galleryCheck(targets) {
   );
 }
 
+// ── plan reporting ─────────────────────────────────────────────────────────
+
+function actionLabel(target) {
+  return target.status === "publish"
+    ? `publish (${target.reason})`
+    : `${target.status} (${target.reason})`;
+}
+
+function printPlan(targets) {
+  console.log("\nPlan:");
+  for (const t of targets) {
+    console.log(
+      `  ${t.name.padEnd(28)} ${t.version} → ${t.nextVersion}   ${actionLabel(t)}`,
+    );
+  }
+}
+
 // ── main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -588,11 +754,17 @@ async function main() {
         "  --packages a,b     packages to release (default: interactive)",
         "  --bump kind        patch | minor | major | none (default: interactive)",
         "  --dry-run          verify and print the plan; change nothing",
-        "  --continue         resume: skip published versions, tag and push the rest",
+        "  --continue         resume: publish what is missing, tag and push the rest",
         "  --no-push          stop before git push",
         "  --branch name      branch to release from (default: main)",
         "  --npm-user name    required npm user (default: dieulc)",
         "  --yes, -y          non-interactive (requires --packages and --bump)",
+        "",
+        "Flags must follow `--`: `npm run release -- --continue`.",
+        "A package whose target version is already on npm is skipped, never fatal:",
+        "  --bump none + published                  → skip (exit 0)",
+        "  patch|minor|major onto a published version → skip, exit 1 at the end",
+        "  registry unreachable                     → blocked, nothing published, exit 1",
       ].join("\n"),
     );
     return;
@@ -602,6 +774,17 @@ async function main() {
   // here (before preflight) keeps unattended invocations from touching git,
   // the registry, or the manifests at all.
   const interactive = !opts.yes && !opts.dryRun && !opts.continue;
+
+  const consumed = npmConsumedFlags();
+  if (consumed.length) {
+    throw new ReleaseError(
+      `${consumed.join(", ")} reached npm, not this script (npm exports them as npm_config_*).\n` +
+        '  npm only forwards arguments after "--"\n' +
+        `  Re-run: npm run release -- ${consumed.join(" ")}`,
+      2,
+    );
+  }
+
   if (interactive && !process.stdin.isTTY) {
     throw new ReleaseError(
       "stdin is not a TTY — pass --yes for an unattended release, or --dry-run to preview",
@@ -610,8 +793,13 @@ async function main() {
 
   preflight(opts);
 
+  // One registry round-trip per name@version for the whole run: the interactive
+  // prompts, the printed plan and the publish decision share one answer.
+  const probe = memoizedProbe();
+
   const all = discoverPackages();
   let selected = selectPackages(all, opts.packages);
+  let targets = null;
 
   if (opts.continue) {
     if (!selected.length) selected = all;
@@ -627,7 +815,7 @@ async function main() {
     });
     try {
       if (!selected.length) {
-        selected = await promptPackages(rl, all);
+        selected = await promptPackages(rl, all, probe);
         if (!selected.length) {
           console.log("Nothing selected — nothing to do.");
           return;
@@ -636,14 +824,13 @@ async function main() {
       if (!opts.bump) {
         console.log("\nBump type:");
         for (const pkg of selected) {
-          pkg.bump = await promptBump(rl, pkg);
+          pkg.bump = await promptBump(rl, pkg, probe);
         }
       }
-      const plan = selected.map((p) => {
-        const kind = opts.bump ?? p.bump;
-        return `  ${p.name.padEnd(28)} ${p.version} → ${bumpVersion(p.version, kind)}`;
-      });
-      console.log("\nPlan:\n" + plan.join("\n"));
+      // The registry state is already known (and memoized) here, so confirm
+      // against the real plan — including what will be skipped and why.
+      targets = planTargets(selected, opts, probe);
+      printPlan(targets);
       if (
         !(await promptConfirm(
           rl,
@@ -662,19 +849,44 @@ async function main() {
   if (opts.bump && !opts.continue) {
     for (const pkg of selected) pkg.bump = opts.bump;
   }
-  const targets = planTargets(selected, opts);
+  if (!targets) {
+    if (!selected.length) {
+      console.log("Nothing selected — nothing to do.");
+      return;
+    }
+    targets = planTargets(selected, opts, probe);
+    printPlan(targets);
+  }
 
-  verify(targets);
-  prepareChangelogs(targets, opts);
+  const publishable = targets.filter((t) => t.status === "publish");
+  const skipped = targets.filter((t) => t.status === "skip");
+  // A skip whose tag is not eligible is a bump collision: the version it would
+  // be tagged as is already on npm, but it is not what the manifest points at.
+  const collisions = skipped.filter((t) => !t.tagEligible);
+  const blocked = targets.filter((t) => t.status === "blocked");
+
+  if (!publishable.length) {
+    const notes = [];
+    if (skipped.length) notes.push(`${skipped.length} already on npm`);
+    if (blocked.length)
+      notes.push(`${blocked.length} with an unknown publish state`);
+    console.log(`\nNothing to publish — ${notes.join(", ")}.`);
+    if (skipped.length)
+      console.log(
+        "Tags for already-published versions are still checked and repaired.",
+      );
+  }
+
+  // Only what is actually going to be published is verified, changelogged and
+  // committed: a skipped package's files must stay untouched, and an unrelated
+  // broken package must not block the rest of the batch.
+  if (publishable.length) verify(publishable);
+  prepareChangelogs(publishable, opts);
 
   if (opts.dryRun) {
-    console.log("\n── Dry run plan ──────────────────────────────────────────");
-    for (const t of targets) {
-      const action = t.skipPublish
-        ? "already published (skip)"
-        : `publish ${t.nextVersion}`;
+    for (const t of publishable) {
       console.log(
-        `\n${t.name}\n  version: ${t.version} → ${t.nextVersion}\n  action:  ${action}\n  tag:     ${t.tag}`,
+        `\n${t.name} ${t.version} → ${t.nextVersion}  (tag ${t.tag})`,
       );
       console.log(
         t.section
@@ -685,14 +897,19 @@ async function main() {
           : "  (continue mode — no new changelog)",
       );
     }
+    if (collisions.length || blocked.length) {
+      console.log(
+        `\n⚠ ${collisions.length} bump collision(s), ${blocked.length} unknown publish state(s) — a real run would skip those packages and exit 1.`,
+      );
+    }
     console.log(
       "\nDry run complete — nothing was written, published, or tagged.",
     );
     return;
   }
 
-  commitRelease(targets);
-  const { done, failed } = publish(targets);
+  if (publishable.length) commitRelease(publishable);
+  const { published, done, failed } = publish(targets);
 
   if (done.length) {
     tagAndPush(done, opts);
@@ -702,23 +919,65 @@ async function main() {
     );
   }
 
-  if (failed.length) {
-    console.log("\nNot published:");
-    for (const t of failed) console.log(`  ✗ ${t.name}@${t.nextVersion}`);
-    throw new ReleaseError(
-      `publish failed for ${failed.map((t) => t.name).join(", ")}\n` +
-        "  Resume with: npm run release -- --continue\n" +
-        "  (--continue skips versions already on npm, publishes the rest, then tags and pushes everything.)",
+  if (published.length) {
+    console.log("\nRelease complete:");
+    for (const t of published) {
+      console.log(
+        `  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`,
+      );
+    }
+  } else if (done.length) {
+    console.log(
+      "\nNothing published this run — already-published versions were tagged and pushed.",
     );
   }
 
-  console.log("\nRelease complete:");
-  for (const t of done) {
-    console.log(
-      `  ${t.name}@${t.nextVersion}  https://www.npmjs.com/package/${t.name}/v/${t.nextVersion}`,
+  galleryCheck(published);
+
+  if (failed.length) {
+    console.log("\nNot published (npm publish failed):");
+    for (const t of failed) console.log(`  ✗ ${t.name}@${t.nextVersion}`);
+  }
+  if (collisions.length) {
+    console.log("\nSkipped (target version already on npm — bump further):");
+    for (const t of collisions) {
+      console.log(
+        `  ⚠ ${t.name}: ${t.nextVersion} is on npm but the manifest says ${t.version}`,
+      );
+    }
+  }
+  if (blocked.length) {
+    console.log("\nNot published (publish state unknown):");
+    for (const t of blocked) console.log(`  ⚠ ${t.name} — ${t.reason}`);
+  }
+
+  const problems = [];
+  if (failed.length)
+    problems.push(`publish failed for ${failed.map((t) => t.name).join(", ")}`);
+  if (collisions.length)
+    problems.push(
+      `bump collides with a published version: ${collisions
+        .map((t) => `${t.name}@${t.nextVersion}`)
+        .join(", ")}`,
+    );
+  if (blocked.length)
+    problems.push(
+      `publish state unknown: ${blocked.map((t) => t.name).join(", ")}`,
+    );
+  if (problems.length) {
+    throw new ReleaseError(
+      `${problems.join("\n  ")}\n` +
+        (failed.length
+          ? "  Resume the failed package(s) with: npm run release -- --continue\n"
+          : "") +
+        (collisions.length
+          ? "  A colliding bump usually means this checkout is behind the registry — check `npm run release:status`, then bump further or pull.\n"
+          : "") +
+        (blocked.length
+          ? "  Nothing was published for the unknown-state package(s) — re-run when the registry is reachable.\n"
+          : ""),
     );
   }
-  galleryCheck(done);
 }
 
 const invokedDirectly =
@@ -728,6 +987,21 @@ const invokedDirectly =
 if (invokedDirectly) {
   main().catch((err) => {
     console.error(`\n✗ ${err instanceof Error ? err.message : String(err)}`);
-    process.exitCode = 1;
+    process.exitCode = err instanceof ReleaseError ? err.exitCode : 1;
   });
 }
+
+// Exported for scripts/release.test.mjs: the decision rules and the registry
+// classification are pure, so they are tested without npm, git or a registry.
+export {
+  classifyNpmView,
+  classifyTargetState,
+  composeChangelog,
+  decideTarget,
+  documentsVersion,
+  normalizeEol,
+  npmConsumedFlags,
+  planTargets,
+  publishState,
+  stateNote,
+};

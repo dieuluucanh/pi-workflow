@@ -11,7 +11,7 @@
     "release": "node scripts/release.mjs",
     "release:status": "node scripts/status.mjs",
     "gallery": "node scripts/check-gallery.mjs",
-    "test": "node --test scripts/check-gallery.test.mjs scripts/status.test.mjs"
+    "test": "node --test scripts/check-gallery.test.mjs scripts/status.test.mjs scripts/release.test.mjs"
   },
   "repository": {
     "type": "git",
