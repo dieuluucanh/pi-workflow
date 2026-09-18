@@ -8,6 +8,7 @@
   "license": "MIT",
   "scripts": {
     "release:verify": "node scripts/verify-packages.mjs",
+    "verify": "node scripts/verify-packages.mjs",
     "release": "node scripts/release.mjs",
     "release:status": "node scripts/status.mjs",
     "gallery": "node scripts/check-gallery.mjs",
