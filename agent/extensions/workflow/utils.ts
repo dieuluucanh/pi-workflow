@@ -1,6 +1,8 @@
 /**
  * Shared utils for workflow extension — copied from plan-mode example
- * Pure functions, testable.
+ * Pure functions, testable. Deliberately dependency-free (no Pi / pi-tui
+ * imports) so it stays loadable in plain Node tests. TUI composition helpers
+ * live in review-pane.ts instead.
  */
 
 const DESTRUCTIVE_PATTERNS = [
@@ -1200,4 +1202,616 @@ export function isUserInteractionEntry(e: any): boolean {
   )
     return true;
   return false;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Review Mode — pure helpers
+//
+// Review Mode (see review.ts) audits Plan Mode's plan and rewrites it. The
+// helpers below are the deterministic part: they never call a model and never
+// touch the Pi SDK, so they are fully unit-testable.
+// ══════════════════════════════════════════════════════════════════════
+
+/** Markdown heading that separates the human plan from Review Mode's changelog. */
+export const REVIEW_CHANGELOG_HEADING = "## Review changes";
+/** Markdown heading appended when Review Mode could not clear its findings. */
+export const REVIEW_UNRESOLVED_HEADING = "## Unresolved findings";
+
+/** How a reviewer finding was resolved by the rewrite. */
+export type ReviewDisposition = "accepted" | "rejected" | "deferred";
+
+/**
+ * Severity tiers used for the changelog and for deciding whether the
+ * self-verification pass runs. Thresholds mirror the house style used by
+ * other Pi reviewers (severity 1-10, confidence 0-100).
+ */
+export type ReviewTier = "Critical" | "Important" | "Minor" | "Info";
+
+/** A single reviewer finding. */
+export interface ReviewFinding {
+  id: string;
+  /** 1-10, higher is worse. */
+  severity: number;
+  /** 0-100. */
+  confidence: number;
+  /** Short category label, e.g. "correctness", "framework-alignment". */
+  category: string;
+  /** Repo-relative path, when the finding is anchored to a file. */
+  file?: string;
+  /** e.g. "42" or "42-58". */
+  lineRange?: string;
+  summary: string;
+  rationale: string;
+  disposition: ReviewDisposition;
+}
+
+/** Tier for a finding, using severity first and confidence as the gate. */
+export function reviewFindingTier(f: {
+  severity: number;
+  confidence: number;
+}): ReviewTier {
+  const sev = Number(f?.severity) || 0;
+  const conf = Number(f?.confidence) || 0;
+  if (sev >= 8 && conf >= 70) return "Critical";
+  if (sev >= 5 && conf >= 60) return "Important";
+  if (sev >= 3 && conf >= 50) return "Minor";
+  return "Info";
+}
+
+/** True when a severity tier is high enough to warrant the verify pass. */
+export function reviewNeedsVerification(findings: ReviewFinding[]): boolean {
+  if (!Array.isArray(findings)) return false;
+  return findings.some(
+    (f) => Number(f?.severity) >= 5 && Number(f?.confidence) >= 60,
+  );
+}
+
+const TIER_ICON: Record<ReviewTier, string> = {
+  Critical: "🔴",
+  Important: "🟡",
+  Minor: "🔵",
+  Info: "⚪",
+};
+
+const TIER_ORDER: ReviewTier[] = ["Critical", "Important", "Minor", "Info"];
+
+function escapeRegExpChars(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findingLocation(f: ReviewFinding): string {
+  if (!f?.file) return "";
+  return f.lineRange ? `\`${f.file}:${f.lineRange}\`` : `\`${f.file}\``;
+}
+
+function oneLine(s: string): string {
+  return String(s ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Render the changelog that gets appended to the reviewed plan so the user can
+ * see exactly what Review Mode changed and why. Deterministic and pure.
+ */
+export function renderReviewChangelog(
+  findings: ReviewFinding[],
+  meta?: { modelLabel?: string; verdict?: string; originalLength?: number },
+): string {
+  const list = Array.isArray(findings) ? findings.filter(Boolean) : [];
+  const lines: string[] = [];
+
+  if (meta?.modelLabel || meta?.verdict) {
+    const bits: string[] = [];
+    if (meta?.modelLabel) bits.push(`reviewer \`${meta.modelLabel}\``);
+    if (meta?.verdict) bits.push(`verdict **${meta.verdict}**`);
+    if (bits.length) lines.push(bits.join(" · "), "");
+  }
+
+  if (list.length === 0) {
+    lines.push("No findings — the plan was submitted unchanged.");
+    return lines.join("\n").trimEnd();
+  }
+
+  const accepted = list.filter((f) => f.disposition === "accepted");
+  const rejected = list.filter((f) => f.disposition === "rejected");
+  const deferred = list.filter((f) => f.disposition === "deferred");
+
+  const counts: string[] = [];
+  if (accepted.length) counts.push(`${accepted.length} addressed`);
+  if (rejected.length) counts.push(`${rejected.length} rejected`);
+  if (deferred.length) counts.push(`${deferred.length} deferred`);
+  lines.push(`**Findings:** ${counts.join(", ") || "none"}`);
+  lines.push("");
+
+  if (accepted.length) {
+    lines.push("### Addressed", "");
+    for (const tier of TIER_ORDER) {
+      const group = accepted.filter((f) => reviewFindingTier(f) === tier);
+      if (!group.length) continue;
+      lines.push(`**${tier}**`, "");
+      for (const f of group) {
+        const loc = findingLocation(f);
+        lines.push(
+          `- ${TIER_ICON[tier]} ${loc ? loc + " — " : ""}${oneLine(f.summary)} _(severity ${f.severity}, confidence ${f.confidence}%, ${oneLine(f.category) || "general"})_`,
+        );
+        const why = oneLine(f.rationale);
+        if (why) lines.push(`  - ${why}`);
+      }
+      lines.push("");
+    }
+  }
+
+  if (deferred.length) {
+    lines.push("### Deferred", "");
+    for (const f of deferred) {
+      const loc = findingLocation(f);
+      lines.push(
+        `- ⏸ ${loc ? loc + " — " : ""}${oneLine(f.summary)} _(severity ${f.severity}, confidence ${f.confidence}%)_`,
+      );
+      const why = oneLine(f.rationale);
+      if (why) lines.push(`  - ${why}`);
+    }
+    lines.push("");
+  }
+
+  if (rejected.length) {
+    lines.push("### Rejected by the reviewer", "");
+    for (const f of rejected) {
+      const loc = findingLocation(f);
+      lines.push(`- ❌ ${loc ? loc + " — " : ""}${oneLine(f.summary)}`);
+      const why = oneLine(f.rationale);
+      if (why) lines.push(`  - ${why}`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n").trimEnd();
+}
+
+/**
+ * Strip any previously appended Review Mode appendix from a plan.
+ * Returns the plan body exactly as the author wrote it.
+ */
+export function stripReviewAppendix(planText: string): string {
+  const text = String(planText ?? "");
+  if (!text) return "";
+  let cut = -1;
+  for (const heading of [REVIEW_CHANGELOG_HEADING, REVIEW_UNRESOLVED_HEADING]) {
+    const re = new RegExp(`^${escapeRegExpChars(heading)}\\s*$`, "m");
+    const hit = text.search(re);
+    if (hit !== -1 && (cut === -1 || hit < cut)) cut = hit;
+  }
+  if (cut === -1) return text;
+  // Also drop a `---` horizontal rule immediately preceding the appendix.
+  return text.slice(0, cut).replace(/\n+---\s*\n*$/, "\n");
+}
+
+/**
+ * Append (or replace) the Review Mode changelog section. Idempotent: calling
+ * it twice with the same changelog yields the same result.
+ */
+export function appendReviewChangelog(
+  planText: string,
+  changelog: string,
+): string {
+  const base = stripReviewAppendix(planText).replace(/\s+$/, "");
+  const body = String(changelog ?? "").trim();
+  if (!body) return base + "\n";
+  return `${base}\n\n---\n\n${REVIEW_CHANGELOG_HEADING}\n\n${body}\n`;
+}
+
+/**
+ * Content hash of a plan body, ignoring any Review Mode appendix so a re-review
+ * of the same revision is detected instead of re-triggering forever.
+ * FNV-1a over whitespace-normalized text; stable across platforms.
+ */
+export function planHash(planText: string): string {
+  const normalized = stripReviewAppendix(planText)
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < normalized.length; i++) {
+    h ^= normalized.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+// ── ANSI-aware text layout for the dual-pane view ─────────────────────
+//
+// These live here (dependency-free) rather than in review-pane.ts so they can
+// be unit-tested without loading pi-tui, and so the pane module adds no new
+// dependency surface to the package.
+
+/** CSI / OSC / single-char escape sequences. */
+const ANSI_SEQUENCE_RE =
+  /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/;
+
+/** Remove ANSI/OSC escapes, preserving visible text. */
+export function stripAnsi(s: string): string {
+  return String(s ?? "").replace(
+    /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g,
+    "",
+  );
+}
+
+/**
+ * Rough East-Asian-wide / emoji test. Deliberately coarse: one column of drift
+ * on an exotic glyph is invisible next to a 100%-wide overlay, and a full
+ * Unicode wcwidth table is not worth its weight here.
+ */
+function isWideCodePoint(cp: number): boolean {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  );
+}
+
+/** Display width of a string, ignoring ANSI escapes and counting wide glyphs as 2. */
+export function displayWidth(s: string): number {
+  let w = 0;
+  for (const ch of stripAnsi(s)) {
+    const cp = ch.codePointAt(0) ?? 0;
+    w += isWideCodePoint(cp) ? 2 : 1;
+  }
+  return w;
+}
+
+/**
+ * Truncate to a display width, preserving ANSI escapes that appear before the
+ * cut and appending a reset so a truncated coloured line cannot bleed its
+ * colour into the next column.
+ */
+export function truncateAnsi(s: string, width: number, ellipsis = "…"): string {
+  const str = String(s ?? "");
+  if (width <= 0) return "";
+  if (displayWidth(str) <= width) return str;
+  const ellipsisWidth = displayWidth(ellipsis);
+  const budget = Math.max(0, width - ellipsisWidth);
+  let out = "";
+  let used = 0;
+  let i = 0;
+  while (i < str.length) {
+    const rest = str.slice(i);
+    const esc = rest.match(ANSI_SEQUENCE_RE);
+    if (esc && esc.index === 0) {
+      out += esc[0];
+      i += esc[0].length;
+      continue;
+    }
+    const cp = str.codePointAt(i);
+    if (cp === undefined) break;
+    const ch = String.fromCodePoint(cp);
+    const cw = isWideCodePoint(cp) ? 2 : 1;
+    if (used + cw > budget) break;
+    out += ch;
+    used += cw;
+    i += ch.length;
+  }
+  return `${out}\x1b[0m${ellipsis}`;
+}
+
+/** Pad or truncate one line to exactly `width` display columns. */
+export function padAnsi(s: string, width: number): string {
+  const str = String(s ?? "");
+  if (width <= 0) return "";
+  const w = displayWidth(str);
+  if (w > width) return truncateAnsi(str, width);
+  if (w === width) return str;
+  return str + " ".repeat(width - w);
+}
+
+/**
+ * Compose two rendered line buffers into side-by-side rows.
+ *
+ * This is how the Review Workspace gets a real two-column layout on pi's
+ * default TUI: `HStack`/`VStack` constrained regions only work on the
+ * experimental `tuiMode: "fullscreen"` alt-screen (see pi-tui's README), so the
+ * panes are composed manually and each column owns its own scroll offset.
+ */
+export function composeTwoColumn(
+  left: string[],
+  right: string[],
+  leftWidth: number,
+  rightWidth: number,
+  gap = 2,
+): string[] {
+  const rows = Math.max(left.length, right.length);
+  const gapStr = " ".repeat(Math.max(0, gap));
+  const out: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    out.push(
+      padAnsi(left[i] ?? "", leftWidth) +
+        gapStr +
+        padAnsi(right[i] ?? "", rightWidth),
+    );
+  }
+  return out;
+}
+
+export interface ViewportSlice {
+  lines: string[];
+  /** Clamped offset actually used. */
+  offset: number;
+  maxOffset: number;
+}
+
+/**
+ * Clamp a scroll offset and slice a viewport out of a line buffer.
+ * `followEnd` pins the view to the newest content (live streaming).
+ */
+export function sliceViewport(
+  lines: string[],
+  offset: number,
+  height: number,
+  followEnd = false,
+): ViewportSlice {
+  const all = Array.isArray(lines) ? lines : [];
+  const h = Math.max(0, Math.trunc(height) || 0);
+  const maxOffset = Math.max(0, all.length - h);
+  const requested = followEnd ? maxOffset : Math.trunc(offset) || 0;
+  const off = Math.max(0, Math.min(maxOffset, requested));
+  return {
+    lines: h === 0 ? [] : all.slice(off, off + h),
+    offset: off,
+    maxOffset,
+  };
+}
+
+// ── Context pruning for the reviewer session ────────────────────────
+
+export interface PruneReviewContextOptions {
+  /** Max characters kept per string field. Longer values are elided. */
+  maxToolResultChars?: number;
+  /** Max entries handed to the reviewer (most recent are kept). */
+  maxEntries?: number;
+}
+
+const REVIEW_PRUNE_MAX_DEPTH = 6;
+
+/** Extension-injected entries that must not leak into the reviewer's context. */
+function isReviewDroppedEntry(e: any): boolean {
+  if (!e || typeof e !== "object") return true;
+  const ct = typeof e.customType === "string" ? e.customType : "";
+  return ct.startsWith("workflow");
+}
+
+/**
+ * Tool calls carried by an assistant message entry.
+ *
+ * Real session format (docs/session-format.md):
+ *   { type: "message", message: { role: "assistant",
+ *       content: [{ type: "toolCall", id, name, arguments }] } }
+ * The top-level `input` shape is also accepted because the Plan Mode handoff
+ * already probes it (`e?.input?.path`) and older entries may carry it.
+ */
+function collectToolCalls(e: any): Array<{ name?: string; args?: any }> {
+  const out: Array<{ name?: string; args?: any }> = [];
+  const blocks = e?.message?.content;
+  if (!Array.isArray(blocks)) return out;
+  for (const b of blocks) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type !== "toolCall" && b.type !== "tool_use") continue;
+    out.push({
+      name: typeof b.name === "string" ? b.name : undefined,
+      args: b.arguments ?? b.input,
+    });
+  }
+  return out;
+}
+
+/** Plan-file path written by an entry, if it is a plan write. */
+function entryPlanWritePath(e: any): string | undefined {
+  const candidates: unknown[] = [
+    e?.input?.path,
+    e?.input?.file_path,
+    e?.data?.planFile,
+  ];
+  for (const call of collectToolCalls(e)) {
+    if (call.name !== "write" && call.name !== "edit") continue;
+    const a = call.args;
+    if (a && typeof a === "object") {
+      candidates.push((a as any).path, (a as any).file_path);
+    }
+  }
+  for (const cand of candidates) {
+    if (typeof cand !== "string") continue;
+    const norm = cand.replace(/\\/g, "/").toLowerCase();
+    if (norm.includes(".pi/plans/")) return cand;
+  }
+  return undefined;
+}
+
+function shrinkReviewString(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s;
+  return `${s.slice(0, maxChars)}\n… [review context: ${s.length - maxChars} chars elided]`;
+}
+
+/** Recursively clone a value, eliding any string longer than maxChars. */
+function shrinkReviewNode(node: any, maxChars: number, depth = 0): any {
+  if (typeof node === "string") return shrinkReviewString(node, maxChars);
+  if (depth >= REVIEW_PRUNE_MAX_DEPTH) return node;
+  if (Array.isArray(node))
+    return node.map((n) => shrinkReviewNode(n, maxChars, depth + 1));
+  if (node && typeof node === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node)) {
+      out[k] = shrinkReviewNode(v, maxChars, depth + 1);
+    }
+    return out;
+  }
+  return node;
+}
+
+/**
+ * Build the conversation history handed to the reviewer session.
+ *
+ * - drops workflow-injected entries (plan/todo context markers, handoff notes)
+ * - elides oversized tool results so the reviewer's window is spent on reasoning
+ * - stops at the plan-file write: anything the author did *after* writing the
+ *   plan is not part of the plan under review
+ * - keeps the most recent `maxEntries` when the result is still too long
+ *
+ * Never throws; malformed entries are skipped.
+ */
+export function pruneContextEntriesForReview(
+  entries: unknown,
+  opts: PruneReviewContextOptions = {},
+): any[] {
+  const maxChars = Number.isFinite(opts.maxToolResultChars)
+    ? Math.max(200, Number(opts.maxToolResultChars))
+    : 4000;
+  const maxEntries = Number.isFinite(opts.maxEntries)
+    ? Math.max(1, Number(opts.maxEntries))
+    : 120;
+  if (!Array.isArray(entries)) return [];
+  const kept: any[] = [];
+  try {
+    for (const e of entries) {
+      if (isReviewDroppedEntry(e)) continue;
+      kept.push(shrinkReviewNode(e, maxChars));
+      if (entryPlanWritePath(e)) break;
+    }
+  } catch {
+    /* keep whatever was collected */
+  }
+  return kept.length > maxEntries ? kept.slice(kept.length - maxEntries) : kept;
+}
+
+/**
+ * Validate a reviewer-submitted plan before it replaces the author's plan.
+ *
+ * Returns a list of human-readable problems; empty means valid.
+ *
+ * The length guard exists so a degenerate rewrite cannot silently discard the
+ * plan (a stub that looks authoritative but carries no plan).
+ *
+ * Why the bounds are deliberately generous and asymmetric: two of the review
+ * criteria REQURE the length to change. "Requirement coverage" findings add
+ * whole steps, and "simplicity" findings delete them. A tight ±60% window (the
+ * obvious first guess) would reject exactly the reviews that are doing their
+ * job. So the bounds only catch catastrophes: a stub (below `minRatio`) or an
+ * accidental paste / wholesale plan substitution (above `maxRatio`). Everything
+ * in between is the reviewer legitimately doing its work, and every change is
+ * still made visible to the user through the `## Review changes` appendix.
+ */
+export function validateReviewedPlan(
+  planMarkdown: unknown,
+  originalMarkdown: unknown,
+  opts: { minRatio?: number; maxRatio?: number } = {},
+): string[] {
+  const problems: string[] = [];
+  const next = typeof planMarkdown === "string" ? planMarkdown : "";
+  const prev = typeof originalMarkdown === "string" ? originalMarkdown : "";
+  const minRatio = opts.minRatio ?? 0.25;
+  const maxRatio = opts.maxRatio ?? 4;
+
+  if (!next.trim()) {
+    problems.push("planMarkdown is empty");
+    return problems;
+  }
+  if (!/^#{1,6}\s+\S/m.test(next)) {
+    problems.push("planMarkdown contains no markdown heading");
+  }
+  const prevBody = stripReviewAppendix(prev);
+  if (prevBody.trim().length > 0) {
+    const ratio = next.length / prevBody.length;
+    if (ratio < minRatio)
+      problems.push(
+        `planMarkdown is too short (${Math.round(ratio * 100)}% of the original; minimum ${Math.round(minRatio * 100)}%) — resubmit the complete plan rather than a summary`,
+      );
+    if (ratio > maxRatio)
+      problems.push(
+        `planMarkdown is unexpectedly long (${Math.round(ratio * 100)}% of the original; maximum ${Math.round(maxRatio * 100)}%) — this looks like a pasted document rather than an adjustment of the original plan`,
+      );
+  }
+  return problems;
+}
+
+// ── Rendering the shared context for the reviewer's prompt ───────────
+
+function contentBlocksToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const b of content) {
+    if (!b || typeof b !== "object") continue;
+    const block = b as Record<string, unknown>;
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    } else if (block.type === "image") {
+      parts.push("[image]");
+    } else if (block.type === "toolCall" || block.type === "tool_use") {
+      const name = typeof block.name === "string" ? block.name : "tool";
+      const args = (block.arguments ?? block.input) as
+        | Record<string, unknown>
+        | undefined;
+      const hint =
+        args && typeof args === "object"
+          ? String(args.path ?? args.file_path ?? args.command ?? "")
+              .slice(0, 120)
+              .replace(/\s+/g, " ")
+          : "";
+      parts.push(`[tool call: ${name}${hint ? ` ${hint}` : ""}]`);
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Render the pruned Plan Mode history into a plain-text block for the
+ * reviewer's first prompt.
+ *
+ * Why the prompt rather than the session manager: `SessionManager.inMemory()`
+ * only accepts pre-existing entries from Pi 0.85.1 onward, and this package
+ * declares `peerDependencies: { "@earendil-works/pi-coding-agent": "*" }`.
+ * Passing entries to a 0.84.x runtime would be silently ignored, handing the
+ * reviewer an empty context — a silent failure. Rendering into the prompt
+ * works identically on every supported version and is explicit about what the
+ * reviewer can and cannot see.
+ *
+ * Never throws.
+ */
+export function renderReviewContextBlock(
+  entries: unknown,
+  opts: { maxChars?: number } = {},
+): string {
+  const maxChars = Number.isFinite(opts.maxChars)
+    ? Math.max(1000, Number(opts.maxChars))
+    : 60_000;
+  if (!Array.isArray(entries) || entries.length === 0) return "";
+  const lines: string[] = [];
+  try {
+    for (const raw of entries) {
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      const msg = e.message as Record<string, unknown> | undefined;
+      if (!msg) continue;
+      const role = typeof msg.role === "string" ? msg.role : "unknown";
+      const text = contentBlocksToText(msg.content).trim();
+      if (!text) continue;
+      if (role === "user") lines.push(`### User\n${text}`);
+      else if (role === "assistant") lines.push(`### Plan Mode\n${text}`);
+      else if (role === "toolResult" || role === "tool") {
+        const tool = typeof msg.toolName === "string" ? msg.toolName : "tool";
+        lines.push(`### Tool result (${tool})\n${text}`);
+      }
+    }
+  } catch {
+    /* return what we have */
+  }
+  let out = lines.join("\n\n");
+  if (out.length > maxChars) {
+    out = `${out.slice(0, maxChars)}\n\n… [context truncated at ${maxChars} chars]`;
+  }
+  return out;
 }

@@ -35,5 +35,18 @@
   },
   "hideThinkingBlock": true,
   "enableInstallTelemetry": false,
-  "doubleEscapeAction": "none"
+  "doubleEscapeAction": "none",
+  "workflow": {
+    "reviewMode": {
+      "enabled": true,
+      "parallel": true,
+      "rounds": 1,
+      "passes": 2,
+      "verify": true,
+      "autoOpenPane": true,
+      "fallbackOnError": "skip",
+      "exploreBudget": 3,
+      "timeoutMs": 600000
+    }
+  }
 }

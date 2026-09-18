@@ -3,7 +3,7 @@
  *
  * Role registry with one model per role.
  *
- * - Built-in roles: planner / explorer / builder (extensible via roles.json)
+ * - Built-in roles: planner / explorer / builder / reviewer (extensible via roles.json)
  * - Persistence: ~/.pi/agent/roles.json (user) + <cwd>/.pi/roles.json (project override)
  * - Config: roles.json holds exactly one {provider, id, thinking} per role
  * - v2 schema: legacy v1 `modelPool` files are discarded and reseeded
@@ -49,7 +49,19 @@ export interface RoleConfig {
 }
 
 export const ROLE_CONFIG_VERSION = 2;
-export const BUILT_IN_ROLES = ["planner", "explorer", "builder"] as const;
+export const BUILT_IN_ROLES = [
+  "planner",
+  "explorer",
+  "builder",
+  "reviewer",
+] as const;
+
+/**
+ * Role that Review Mode runs in its own in-process child session.
+ * Deliberately NOT wired into MODE_ROLE_MAP: the parent session must never
+ * switch to this model (Review Mode has its own session).
+ */
+export const REVIEW_ROLE_NAME = "reviewer";
 
 export const VALID_THINKING_LEVELS: ThinkingLevel[] = [
   "off",
@@ -111,6 +123,22 @@ export function seedDefaultRoles(): Role[] {
         "You are in BUILDER role. Implement the assigned task following the plan. Reason lightly. Ask if blocked.",
       builtIn: true,
     },
+    {
+      // Seeded with a DIFFERENT model than planner so Review Mode brings a
+      // genuinely independent perspective (see docs: Review Mode).
+      name: "reviewer",
+      description:
+        "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
+      model: {
+        provider: "opencode-go",
+        id: "muse-spark-1.3-contributor",
+        thinking: "xhigh",
+      },
+      tools: ["read", "grep", "find", "ls"],
+      systemPromptAddendum:
+        "You are in REVIEWER role. Independently audit the plan. Always align with the existing project framework and industry best practice. Flag divergence from established conventions. Do not write code.",
+      builtIn: true,
+    },
   ];
 }
 
@@ -141,7 +169,10 @@ function readJsonFile(fp: string): any | undefined {
   }
 }
 
-function sanitizeModel(m: any, fallbackThinking: ThinkingLevel): RoleModel | undefined {
+function sanitizeModel(
+  m: any,
+  fallbackThinking: ThinkingLevel,
+): RoleModel | undefined {
   if (!m || typeof m.provider !== "string" || typeof m.id !== "string")
     return undefined;
   if (!m.provider.trim() || !m.id.trim()) return undefined;
@@ -224,16 +255,16 @@ export function loadRoleConfig(cwd?: string): RoleConfig {
     if (raw === undefined) {
       // first run — seed file
       seedUserFile(fp, base);
-    } else if (!isCurrentVersion(raw)) {
-      // legacy v1 (modelPool) or unknown version — reset to defaults
-      seedUserFile(fp, base);
-    } else {
+    } else if (isCurrentVersion(raw)) {
       base.roles = mergeRoles(base.roles, (raw as any).roles);
       if (
         typeof (raw as any).activeRole === "string" ||
         (raw as any).activeRole === null
       )
         base.activeRole = (raw as any).activeRole;
+    } else {
+      // legacy v1 (modelPool) or unknown version — reset to defaults
+      seedUserFile(fp, base);
     }
   } catch {
     /* fall through with defaults */
@@ -300,6 +331,7 @@ const ROLE_ICONS: Record<string, string> = {
   planner: "🧠",
   explorer: "🔍",
   builder: "🔨",
+  reviewer: "🧪",
 };
 
 export function roleIcon(name: string): string {
@@ -309,7 +341,9 @@ export function roleIcon(name: string): string {
 export function formatRolesForDisplay(config: RoleConfig): string {
   const lines: string[] = [];
   lines.push("Model Roles (one model per role):");
-  lines.push(`  Active: ${config.activeRole ?? "auto (plan→planner, build→builder)"}`);
+  lines.push(
+    `  Active: ${config.activeRole ?? "auto (plan→planner, build→builder)"}`,
+  );
   lines.push("");
   for (const r of config.roles) {
     lines.push(

@@ -73,6 +73,9 @@ import {
   buildTodoFooter,
   formatAmbiguity,
   shouldRemind,
+  pruneContextEntriesForReview,
+  stripReviewAppendix,
+  REVIEW_UNRESOLVED_HEADING,
   type TodoStatus,
   type TodoItem,
   type TodoUpdateEntry,
@@ -96,12 +99,28 @@ import {
   parseModelRef,
   isValidThinkingLevel,
   roleIcon,
+  BUILT_IN_ROLES,
+  REVIEW_ROLE_NAME,
   VALID_THINKING_LEVELS,
   type RoleConfig,
   type Role,
   type RoleModel,
   type ThinkingLevel,
 } from "./roles.ts";
+import {
+  applySubmittedPlan,
+  planHash,
+  readReviewModeConfig,
+  resolveReviewPrompt,
+  reviewStateSummary,
+  writeReviewModeConfig,
+  writeReviewPrompt,
+  ReviewTranscript,
+  type ReviewFinding,
+  type ReviewState,
+} from "./review.ts";
+import { createReviewRuntime, type ReviewRuntime } from "./review-runtime.ts";
+import { openReviewPane } from "./review-pane.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -559,6 +578,575 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════
+  // Review Mode — an independent reviewer that audits Plan Mode
+  //
+  // Everything here is gated by `reviewEnabled()`. When Review Mode is off
+  // (the default) none of this runs and the plan/build flow is unchanged.
+  // ══════════════════════════════════════════════════════════════════
+
+  let reviewRuntime: ReviewRuntime | undefined;
+  let reviewState: ReviewState | undefined;
+  /** Hash of the plan revision already reviewed, so a re-emit does not re-review. */
+  let lastReviewedPlanHash: string | undefined;
+  /** 1-based round within the current user-feedback cycle. */
+  let reviewRound = 0;
+  /** Findings carried into the next round so the reviewer can verify fixes. */
+  let reviewPreviousFindings: ReviewFinding[] | undefined;
+  /** Closes the dual-pane overlay, if open (assigned by review-pane). */
+  let closeReviewPane: (() => void) | undefined;
+
+  const REVIEW_STATUS_WIDGET = "workflow-review-status";
+
+  function reviewAgentDir(): string {
+    try {
+      return getAgentDir();
+    } catch {
+      return path.join(os.homedir(), ".pi", "agent");
+    }
+  }
+
+  function reviewCwd(): string {
+    return currentSessionCtx?.cwd ?? process.cwd();
+  }
+
+  function reviewConfigNow() {
+    try {
+      return readReviewModeConfig(reviewCwd(), reviewAgentDir());
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The single gate every Review Mode code path checks. */
+  function reviewEnabled(): boolean {
+    try {
+      return reviewConfigNow()?.config.enabled === true;
+    } catch {
+      return false;
+    }
+  }
+
+  function notifyReview(
+    message: string,
+    level: "info" | "warning" | "error" = "info",
+  ): void {
+    try {
+      currentSessionCtx?.ui.notify(`Review Mode: ${message}`, level);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Status strip: a compact line above the editor while a review runs. */
+  function updateReviewStatus(ctx: ExtensionContext): void {
+    try {
+      if (!reviewEnabled() || !reviewState) {
+        ctx.ui.setWidget(REVIEW_STATUS_WIDGET, undefined);
+        return;
+      }
+      const summary = reviewStateSummary(reviewState);
+      ctx.ui.setWidget(REVIEW_STATUS_WIDGET, (_tui: any, theme: any) => ({
+        render: (w: number) => [
+          truncateToWidth(
+            theme.fg("muted", summary),
+            Math.max(10, Number(w) || 40),
+            "…",
+          ),
+        ],
+        invalidate: () => {},
+        dispose: () => {},
+      }));
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Read-only reconnaissance for the reviewer, reusing the existing explorer
+   * subagent machinery (same spawn path as the `explore` tool) but pinned to
+   * the explorer role's model and a strictly read-only tool set.
+   */
+  function runReviewExplore(
+    task: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return (async () => {
+      const cwd = reviewCwd();
+      const agents = discoverAgents(cwd);
+      const base = agents.find((a) => a.name === "scout") ?? agents[0];
+      const explorerRole = getRole(roleConfig, "explorer");
+      const m = explorerRole?.model;
+      const agent: AgentConfig = {
+        name: base?.name ?? "review-scout",
+        description: base?.description ?? "Read-only reconnaissance",
+        tools: ["read", "grep", "find", "ls"],
+        systemPrompt:
+          base?.systemPrompt ??
+          "You are a READ-ONLY reconnaissance agent. Answer the question with file:line evidence. Never write files. Be concise.",
+        filePath: base?.filePath ?? "",
+      };
+      if (m) agent.model = `${m.provider}/${m.id}`;
+      if (m?.thinking) agent.thinking = m.thinking;
+
+      const res = await runSingleAgent(cwd, agent, task, signal);
+      const out = getFinalOutput(res.messages);
+      if (!out && res.exitCode !== 0) {
+        throw new Error(
+          res.stderr.slice(0, 400) || `explore exited ${res.exitCode}`,
+        );
+      }
+      return out || "(no findings)";
+    })();
+  }
+
+  /** Lazily construct the runtime so nothing is allocated when Review is off. */
+  function ensureReviewRuntime(): ReviewRuntime {
+    if (reviewRuntime) return reviewRuntime;
+    const cwd = reviewCwd();
+    const agentDir = reviewAgentDir();
+    reviewRuntime = createReviewRuntime({
+      cwd,
+      agentDir,
+      config: () => reviewConfigNow()?.config,
+      reviewerModel: () => {
+        const reviewer = getRole(roleConfig, REVIEW_ROLE_NAME);
+        if (reviewer?.model) return reviewer.model;
+        // Graceful degradation: fall back to the planner model rather than
+        // silently running no review at all.
+        const planner = getRole(roleConfig, "planner");
+        return planner?.model;
+      },
+      findModel: (provider: string, id: string) =>
+        (currentSessionCtx as any)?.modelRegistry?.find?.(provider, id),
+      planPath: () => currentPlanFile,
+      readPlan: () => {
+        const p = currentPlanFile;
+        if (!p) return undefined;
+        try {
+          const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+          return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : undefined;
+        } catch (_e) {
+          void _e;
+          return undefined;
+        }
+      },
+      contextEntries: () => {
+        try {
+          const branch =
+            (currentSessionCtx?.sessionManager as any)?.getBranch?.() ?? [];
+          return pruneContextEntriesForReview(branch);
+        } catch (_e) {
+          void _e;
+          return [];
+        }
+      },
+      runExplore: (task: string, signal?: AbortSignal) =>
+        runReviewExplore(task, signal),
+      writePlan: (input: any) =>
+        applySubmittedPlan({
+          ...input,
+          cwd,
+          pi: pi as any,
+          notify: (m: string, l?: "info" | "warning" | "error") =>
+            notifyReview(m, l ?? "info"),
+        }),
+      log: (m: string, l?: "info" | "warning" | "error") =>
+        notifyReview(m, l ?? "info"),
+      notify: (m: string, l?: "info" | "warning" | "error") =>
+        notifyReview(m, l ?? "info"),
+      promptText: () => resolveReviewPrompt(cwd, agentDir).text,
+      onState: (s: ReviewState | undefined) => {
+        reviewState = s;
+        if (currentSessionCtx) updateReviewStatus(currentSessionCtx);
+      },
+    });
+    return reviewRuntime;
+  }
+
+  /**
+   * Run one Review step over the plan text. Returns the plan to hand to the
+   * user: the reviewer's rewrite on success, or the author's plan unchanged on
+   * any failure (config.fallbackOnError = "skip" — a broken reviewer must never
+   * block the plan).
+   */
+  async function runReviewStep(
+    planText: string,
+    ctx: ExtensionContext,
+  ): Promise<string> {
+    const cfg = reviewConfigNow()?.config;
+    if (!cfg?.enabled) return planText;
+
+    // Already reviewed this exact revision — do not re-review on re-emit.
+    if (planHash(planText) === lastReviewedPlanHash) return planText;
+
+    reviewRound += 1;
+    if (reviewRound > cfg.rounds) {
+      // Round cap reached: hand over with the outstanding findings visible.
+      const unresolved = (reviewState?.findings ?? []).filter(
+        (f) => f.disposition !== "rejected",
+      );
+      if (unresolved.length === 0) return planText;
+      const appendix = [
+        "",
+        "---",
+        "",
+        REVIEW_UNRESOLVED_HEADING,
+        "",
+        `Review Mode reached its round limit (${cfg.rounds}) with these items still open:`,
+        "",
+        ...unresolved.map(
+          (f) =>
+            `- (severity ${f.severity}) ${f.summary}${
+              f.rationale ? ` — ${f.rationale}` : ""
+            }`,
+        ),
+        "",
+      ].join("\n");
+      return `${stripReviewAppendix(planText).replace(/\s+$/, "")}\n${appendix}`;
+    }
+
+    try {
+      const rt = ensureReviewRuntime();
+      const res = await rt.runRound({
+        planText,
+        planPath: currentPlanFile ?? "",
+        round: reviewRound,
+        previousFindings: reviewPreviousFindings,
+      });
+      reviewState = res.state;
+      updateReviewStatus(ctx);
+      if (res.ok) {
+        lastReviewedPlanHash = res.planHash;
+        const keep = res.state.findings.filter(
+          (f) => f.disposition !== "rejected",
+        );
+        reviewPreviousFindings = keep.length > 0 ? keep : undefined;
+        return res.planText;
+      }
+      notifyReview(
+        `review skipped (${res.reason ?? "unavailable"}) — handing over the plan unreviewed`,
+        "warning",
+      );
+      return planText;
+    } catch (e: any) {
+      notifyReview(
+        `review failed (${String(e?.message ?? e)}) — handing over the plan unreviewed`,
+        "warning",
+      );
+      return planText;
+    }
+  }
+
+  /** Stop the reviewer and clear all Review Mode state. Never throws. */
+  async function teardownReview(): Promise<void> {
+    try {
+      await reviewRuntime?.teardown();
+    } catch (_e) {
+      void _e;
+    }
+    reviewRuntime = undefined;
+    reviewState = undefined;
+    lastReviewedPlanHash = undefined;
+    reviewRound = 0;
+    reviewPreviousFindings = undefined;
+    try {
+      closeReviewPane?.();
+    } catch (_e) {
+      void _e;
+    }
+    closeReviewPane = undefined;
+    try {
+      currentSessionCtx?.ui.setWidget(REVIEW_STATUS_WIDGET, undefined);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  // ── Review Mode: plan mirror + Review Workspace pane + commands ───
+
+  /**
+   * Mirror of the Plan Mode transcript for the left pane.
+   *
+   * Fed only while Review Mode is enabled, so when Review is off (the default)
+   * there is no buffering cost and no extra event work at all.
+   */
+  const planMirror = new ReviewTranscript(500);
+
+  function mirrorIfReviewEnabled(event: unknown): void {
+    if (!reviewEnabled()) return;
+    try {
+      planMirror.ingest(event);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  pi.on("message_update", async (event) => {
+    mirrorIfReviewEnabled(event);
+  });
+  pi.on("tool_execution_start", async (event) => {
+    mirrorIfReviewEnabled(event);
+  });
+  pi.on("tool_execution_end", async (event) => {
+    mirrorIfReviewEnabled(event);
+  });
+
+  /** Open or close the dual-pane Review Workspace overlay. */
+  function toggleReviewPane(): void {
+    if (closeReviewPane) {
+      try {
+        closeReviewPane();
+      } catch (_e) {
+        void _e;
+      }
+      closeReviewPane = undefined;
+      return;
+    }
+    const ctx = currentSessionCtx;
+    if (!ctx) {
+      notifyReview("no active session to attach the pane to", "warning");
+      return;
+    }
+    if (!reviewEnabled()) {
+      notifyReview(
+        "Review Mode is off — enable it with /review-mode on to open the pane",
+        "warning",
+      );
+      return;
+    }
+    const rt = ensureReviewRuntime();
+    try {
+      const ctrl = openReviewPane(ctx, {
+        planLabel: () =>
+          currentPlanFile ? path.basename(currentPlanFile) : "(no plan yet)",
+        modelLabel: () => {
+          if (reviewState?.modelLabel) return reviewState.modelLabel;
+          const r = getRole(roleConfig, REVIEW_ROLE_NAME);
+          return r?.model ? formatModelRef(r.model) : "unconfigured";
+        },
+        statusLine: () => reviewStateSummary(reviewState) || "idle",
+        planLines: () => planMirror.toDisplayLines(),
+        reviewLines: () => rt.getTranscript(),
+        onAbort: () => {
+          void rt.abortRound();
+          notifyReview("aborted the in-flight review round", "warning");
+        },
+        onClosed: () => {
+          closeReviewPane = undefined;
+        },
+      });
+      closeReviewPane = () => ctrl.close();
+    } catch (e: any) {
+      notifyReview(
+        `could not open the pane: ${String(e?.message ?? e)}`,
+        "warning",
+      );
+    }
+  }
+
+  pi.registerCommand("review-mode", {
+    description:
+      "Toggle Review Mode (independent reviewer that audits and rewrites plans): /review-mode on|off|status",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = reviewAgentDir();
+      const sub = String(args || "")
+        .trim()
+        .toLowerCase();
+
+      if (!sub || sub === "status") {
+        const resolved = readReviewModeConfig(cwd, agentDir);
+        const c = resolved.config;
+        const model = getRole(roleConfig, REVIEW_ROLE_NAME);
+        const lines = [
+          `Review Mode: ${c.enabled ? "ENABLED" : "disabled"}`,
+          `  reviewer model : ${model?.model ? `${formatModelRef(model.model)} (${model.model.thinking})` : "unconfigured — /role set reviewer <provider/model>"}`,
+          `  prompt         : ${resolveReviewPrompt(cwd, agentDir).source}`,
+          `  parallel       : ${c.parallel}   rounds: ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
+          `  explore budget : ${c.exploreBudget}   timeout: ${Math.round(c.timeoutMs / 1000)}s`,
+          `  sources        : global=${resolved.sources.global} project=${resolved.sources.project}`,
+          `  runtime        : ${reviewRuntime?.isAlive() ? "session active" : "not started"}`,
+          `  pane           : ${closeReviewPane ? "open" : "closed"}`,
+          "",
+          "Usage: /review-mode on|off [global|project] | /review-mode status | /review-prompt | /review-pane | /review-status | /review",
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      if (sub !== "on" && sub !== "off") {
+        ctx.ui.notify("Usage: /review-mode on|off|status", "info");
+        return;
+      }
+
+      const scopeArg = String(args || "")
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)[1];
+      const scope: "global" | "project" =
+        scopeArg === "project" ? "project" : "global";
+      const enable = sub === "on";
+
+      const res = writeReviewModeConfig(scope, cwd, agentDir, {
+        enabled: enable,
+      });
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Could not write review settings: ${res.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+
+      if (enable) {
+        ctx.ui.notify(
+          `Review Mode ENABLED (${scope}) — the reviewer starts with Plan mode and audits the plan before you see it.\nSettings: ${res.path}`,
+          "info",
+        );
+        updateReviewStatus(ctx as any);
+        return;
+      }
+
+      // Disabling: stop everything and restore the pre-Review behaviour.
+      await teardownReview();
+      ctx.ui.notify(
+        `Review Mode disabled (${scope}) — plan/build flow is back to single-agent.\nSettings: ${res.path}`,
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("review-prompt", {
+    description:
+      "Edit the reviewer's guidance (framework alignment / best practice) used by Review Mode",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = reviewAgentDir();
+      const resolved = resolveReviewPrompt(cwd, agentDir);
+      const scope: "global" | "project" =
+        String(args || "")
+          .trim()
+          .toLowerCase() === "global"
+          ? "global"
+          : "project";
+      if (!(ctx as any)?.hasUI) {
+        ctx.ui.notify(
+          `Reviewer guidance (${resolved.source}):\n\n${resolved.text}`,
+          "info",
+        );
+        return;
+      }
+      const edited = await (ctx as any).ui.editor(
+        `Reviewer guidance (${scope}) — plain markdown`,
+        resolved.text,
+      );
+      if (edited === undefined || edited === null) {
+        ctx.ui.notify("Review prompt unchanged.", "info");
+        return;
+      }
+      const w = writeReviewPrompt(scope, String(edited), cwd, agentDir);
+      ctx.ui.notify(
+        w.ok
+          ? `Reviewer guidance saved (${scope}): ${w.path}`
+          : `Could not save reviewer guidance: ${w.error ?? "unknown error"}`,
+        w.ok ? "info" : "error",
+      );
+    },
+  });
+
+  pi.registerCommand("review-pane", {
+    description:
+      "Open/close the Review Workspace — Plan Mode transcript (left) and reviewer transcript (right)",
+    handler: async () => toggleReviewPane(),
+  });
+
+  pi.registerCommand("review-status", {
+    description: "Show Review Mode state, findings and any error",
+    handler: async (_args, ctx) => {
+      const s = reviewState;
+      if (!s) {
+        ctx.ui.notify(
+          reviewEnabled()
+            ? "Review Mode is enabled but no review has run yet."
+            : "Review Mode is disabled (/review-mode on to enable).",
+          "info",
+        );
+        return;
+      }
+      const lines = [
+        reviewStateSummary(s),
+        `  phase   : ${s.phase}   round: ${s.round}   pass: ${s.pass}`,
+        `  model   : ${s.modelLabel}`,
+        `  plan    : ${s.planPath ?? "(unknown)"}  hash ${s.planHash}`,
+        `  explore : ${s.exploreUsed} subagent(s)   tokens≈${s.tokenEstimate ?? "n/a"}`,
+        s.verdict ? `  verdict : ${s.verdict}` : "",
+        s.error ? `  error   : ${s.error}` : "",
+        ...s.findings.map(
+          (f) =>
+            `  - [${f.disposition}] sev ${f.severity}/conf ${f.confidence} ${f.summary}`,
+        ),
+      ].filter(Boolean);
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("review", {
+    description:
+      "Run one Review round against the current plan file now (works outside plan mode)",
+    handler: async (_args, ctx) => {
+      if (!reviewEnabled()) {
+        ctx.ui.notify(
+          "Review Mode is disabled — /review-mode on to enable.",
+          "warning",
+        );
+        return;
+      }
+      const planPath = currentPlanFile;
+      if (!planPath) {
+        ctx.ui.notify(
+          "No plan file yet — write one to .pi/plans/ first.",
+          "warning",
+        );
+        return;
+      }
+      let text: string | undefined;
+      try {
+        const abs = path.isAbsolute(planPath)
+          ? planPath
+          : path.join((ctx as any).cwd ?? process.cwd(), planPath);
+        text = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : undefined;
+      } catch (_e) {
+        void _e;
+      }
+      if (!text) {
+        ctx.ui.notify(`Plan file not readable: ${planPath}`, "warning");
+        return;
+      }
+      lastReviewedPlanHash = undefined; // force a fresh review
+      reviewRound = 0;
+      const rewritten = await runReviewStep(text, ctx as any);
+      ctx.ui.notify(
+        rewritten === text
+          ? "Review finished — no usable rewrite (plan left unchanged)."
+          : "Review finished — plan rewritten and saved.",
+        "info",
+      );
+    },
+  });
+
+  try {
+    pi.registerShortcut(
+      "ctrl+shift+r" as any,
+      {
+        description: "Open/close the Review Workspace pane",
+        handler: async () => toggleReviewPane(),
+      } as any,
+    );
+  } catch (_e) {
+    void _e;
+  }
+
   // ── Mode → role model alignment (plan=planner, build=builder) ──────
   const MODE_ROLE_MAP: Record<WorkflowMode, string> = {
     plan: "planner",
@@ -768,6 +1356,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
+    // Review Mode: start the reviewer IN PARALLEL with plan exploration so it can
+    // study the repository independently while Plan Mode works. Deliberately not
+    // awaited — starting the reviewer must never delay the user's prompt.
+    if (reviewEnabled()) {
+      void ensureReviewRuntime()
+        .ensureStarted()
+        .then((ok) => {
+          if (ok) notifyReview("reviewer started in parallel", "info");
+        })
+        .catch(() => {});
+    }
     updateStatus(ctx);
     persistState();
   }
@@ -804,6 +1403,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     updateStatus(ctx);
     persistState();
+    // Tab-to-Build leaves Plan+Review behind; release the reviewer session.
+    await teardownReview();
   }
 
   async function setDefaultMode(ctx: ExtensionContext) {
@@ -922,6 +1523,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
   ) {
     workflowMode = "build";
     syncLegacyFlags();
+    // Approve path: both Plan and Review modes are now off in favour of Build.
+    await teardownReview();
     currentPlanFile = planPath;
     pi.setActiveTools(
       toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
@@ -1034,6 +1637,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
     awaitingDecision = false;
     lastHandoffAt = undefined;
     lastReviewId = null;
+    // Feedback cycle: the next plan revision gets a fresh review round, and the
+    // outstanding findings are carried forward so the reviewer can confirm they
+    // were actually addressed rather than re-raising them.
+    reviewRound = 0;
+    lastReviewedPlanHash = undefined;
     persistState();
     try {
       const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
@@ -1475,13 +2083,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
         case "done":
         case "pending": {
           const ref =
-            params.label !== undefined
-              ? String(params.label)
-              : params.step !== undefined
-                ? String(params.step)
-                : params.text !== undefined
-                  ? String(params.text)
-                  : undefined;
+            params.label === undefined
+              ? params.step === undefined
+                ? params.text === undefined
+                  ? undefined
+                  : String(params.text)
+                : String(params.step)
+              : String(params.label);
           if (ref === undefined)
             return {
               content: [
@@ -1597,11 +2205,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         case "toggle": {
           const ref =
-            params.label !== undefined
-              ? String(params.label)
-              : params.step !== undefined
-                ? String(params.step)
-                : undefined;
+            params.label === undefined
+              ? params.step === undefined
+                ? undefined
+                : String(params.step)
+              : String(params.label);
           if (ref === undefined)
             return {
               content: [
@@ -1773,8 +2381,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx.ui.notify(msg, "info");
       };
 
-      // Bare /role → interactive config screen (3 blocks: planner /
-      // explorer / builder + custom roles). Headless → text summary.
+      // Bare /role → interactive config screen (one block per role:
+      // planner / explorer / builder / reviewer + custom roles).
+      // Headless → text summary.
       if (!sub) {
         if ((ctx as any)?.hasUI) {
           await openRolePicker(ctx as any);
@@ -1924,7 +2533,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (sub === "reset") {
         roleConfig = defaultRoleConfig();
         saveAndSync(
-          "Roles reset to defaults — one model per role (planner/explorer/builder).",
+          "Roles reset to defaults — one model per role (planner/explorer/builder/reviewer).",
         );
         return;
       }
@@ -2037,9 +2646,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   function orderedRoleTabs(): Role[] {
+    // Built-in roles first in their declared order, then custom roles.
+    // Driven by BUILT_IN_ROLES so adding a role never needs a second edit here.
     const rank = (name: string) => {
-      const i = ["planner", "explorer", "builder"].indexOf(name.toLowerCase());
-      return i === -1 ? 99 : i;
+      const i = (BUILT_IN_ROLES as readonly string[]).indexOf(
+        name.toLowerCase(),
+      );
+      return i === -1 ? BUILT_IN_ROLES.length : i;
     };
     return [...roleConfig.roles].sort((a, b) => rank(a.name) - rank(b.name));
   }
@@ -3668,6 +4281,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     ctx.ui.setStatus("workflow", undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
+    // Release the reviewer session (and its custom tools) on shutdown so a
+    // reload or quit never leaves an orphaned in-process session behind.
+    await teardownReview();
     currentSessionCtx = null;
   });
 
@@ -3943,12 +4559,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
         : "";
       btwNotes = []; // consume
       const today = getUtcDatePrefix();
+      // One neutral line only: Plan Mode must NOT see the reviewer's prompt,
+      // findings, or transcript (requirement: Plan cannot see Review's context).
+      const reviewNote = reviewEnabled()
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer will audit this plan and may rewrite it before the user sees it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
+        : "";
       return {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -4555,6 +5176,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
       } catch (_e) {
         void _e;
       }
+
+      // ── Review Mode: audit (and possibly rewrite) the plan before the user
+      // sees it. Runs inside runHandoff, so the existing handoffInFlight mutex
+      // already serialises it. On any failure the author's plan is kept.
+      if (planTextForRender && reviewEnabled()) {
+        try {
+          notifyReview("auditing the plan before handoff…", "info");
+          planTextForRender = await runReviewStep(
+            planTextForRender,
+            ctx as ExtensionContext,
+          );
+        } catch (_e) {
+          void _e;
+        }
+      }
       // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
       if (!hasUI && planTextForRender && !awaitingDecision) {
         try {
@@ -4611,6 +5247,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   payload: {
                     planContent: planTextForRender!,
                     planFilePath: planPath,
+                    // Provenance so the browser/inline view can show that this
+                    // plan was independently reviewed (and by what).
+                    reviewSummary: reviewState
+                      ? {
+                          modelLabel: reviewState.modelLabel,
+                          round: reviewState.round,
+                          verdict: reviewState.verdict,
+                          findings: reviewState.findings.length,
+                        }
+                      : undefined,
                   },
                   respond: (res: any) => {
                     if (!settled) {

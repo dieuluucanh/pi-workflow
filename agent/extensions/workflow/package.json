@@ -1,13 +1,13 @@
 {
   "name": "@dieulc/workflow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "private": false,
-  "keywords": ["pi-package", "workflow", "plan-mode", "questionnaire", "rewind"],
-  "description": "Plan↔Build mode, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
+  "keywords": ["pi-package", "workflow", "plan-mode", "review-mode", "questionnaire", "rewind"],
+  "description": "Plan↔Build mode with an independent Review Mode reviewer, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
   "license": "MIT",
   "scripts": {
-    "test": "node --test utils.todo.test.ts",
+    "test": "node --test utils.todo.test.ts review.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "repository": {
@@ -27,6 +27,10 @@
     "utils.ts",
     "checkpoint.ts",
     "roles.ts",
+    "review.ts",
+    "review-tools.ts",
+    "review-runtime.ts",
+    "review-pane.ts",
     "README.md",
     "LICENSE"
   ],
