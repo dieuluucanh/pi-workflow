@@ -73,7 +73,7 @@ test("classifyNpmView: a fully unpublished package name means absent", () => {
       status: 1,
       stdout: "",
       stderr:
-        'npm error code E404\nnpm error 404 Unpublished on 2026-09-16T04:16:14.175Z\nnpm error 404  The requested resource \'@dieulc/autocompact\' could not be found',
+        "npm error code E404\nnpm error 404 Unpublished on 2026-09-16T04:16:14.175Z\nnpm error 404  The requested resource '@dieulc/autocompact' could not be found",
     }),
     "absent",
   );
@@ -161,8 +161,11 @@ test("decideTarget: a non-semver manifest version still raises", () => {
 
 test("classifyTargetState: continue mode is the none-bump path", () => {
   assert.equal(
-    classifyTargetState({ kind: "none", nextVersion: "0.2.0", state: "published" })
-      .status,
+    classifyTargetState({
+      kind: "none",
+      nextVersion: "0.2.0",
+      state: "published",
+    }).status,
     "skip",
   );
 });
@@ -176,14 +179,19 @@ test("planTargets: three published packages no longer abort the fourth", () => {
     pkg("server-logs"),
     pkg("workflow"),
   ];
-  const targets = planTargets(selected, { bump: "none", continue: false }, (name) =>
-    name === "@dieulc/autocompact" ? "absent" : "published",
+  const targets = planTargets(
+    selected,
+    { bump: "none", continue: false },
+    (name) => (name === "@dieulc/autocompact" ? "absent" : "published"),
   );
 
   const publishable = targets.filter((t) => t.status === "publish");
   const skipped = targets.filter((t) => t.status === "skip");
 
-  assert.deepEqual(publishable.map((t) => t.name), ["@dieulc/autocompact"]);
+  assert.deepEqual(
+    publishable.map((t) => t.name),
+    ["@dieulc/autocompact"],
+  );
   assert.equal(skipped.length, 3);
   // Published-but-skipped targets stay tag-eligible (missing-tag repair) and
   // none of them is dropped from the plan.
@@ -193,10 +201,14 @@ test("planTargets: three published packages no longer abort the fourth", () => {
 
 test("planTargets: the probe is asked about the *next* version", () => {
   const asked = [];
-  planTargets([pkg("workflow")], { bump: "minor", continue: false }, (name, version) => {
-    asked.push(`${name}@${version}`);
-    return "absent";
-  });
+  planTargets(
+    [pkg("workflow")],
+    { bump: "minor", continue: false },
+    (name, version) => {
+      asked.push(`${name}@${version}`);
+      return "absent";
+    },
+  );
   assert.deepEqual(asked, ["@dieulc/workflow@0.3.0"]);
 });
 
@@ -232,7 +244,8 @@ const SECTION_020 = "## [0.2.0] - 2026-09-18\n\nInitial release.";
 const SECTION_010 = "## [0.1.0] - 2026-09-16\n\nInitial release.";
 
 function countHeaders(text) {
-  return text.split("\n").filter((line) => line.trim() === "# Changelog").length;
+  return text.split("\n").filter((line) => line.trim() === "# Changelog")
+    .length;
 }
 
 test("composeChangelog: a fresh file gets exactly one header", () => {

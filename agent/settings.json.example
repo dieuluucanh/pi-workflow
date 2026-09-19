@@ -23,5 +23,18 @@
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "muse-spark-1.2-contributor"
+  "defaultModel": "muse-spark-1.2-contributor",
+  "workflow": {
+    "reviewMode": {
+      "enabled": false,
+      "parallel": true,
+      "rounds": 1,
+      "passes": 2,
+      "verify": true,
+      "autoOpenPane": true,
+      "fallbackOnError": "skip",
+      "exploreBudget": 3,
+      "timeoutMs": 600000
+    }
+  }
 }

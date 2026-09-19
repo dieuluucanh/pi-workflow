@@ -121,7 +121,8 @@ function npmConsumedFlags(argv = process.argv.slice(2)) {
     // the command line counts (a plain "false"/"0" is the default).
     if (!value || /^(false|0|undefined|null)$/i.test(value)) continue;
     const flag = `--${name.replace(/_/g, "-")}`;
-    const passed = argv.includes(flag) || (name === "yes" && argv.includes("-y"));
+    const passed =
+      argv.includes(flag) || (name === "yes" && argv.includes("-y"));
     if (!passed) hits.push(flag);
   }
   // `--no-push` is the one flag npm normalizes into `push=false`.
@@ -549,7 +550,12 @@ function classifyTargetState({ kind, nextVersion, state }) {
   return { status: "publish", reason: "not on npm", tagEligible: true };
 }
 
-function decideTarget({ version, kind, state, nextVersion = bumpVersion(version, kind) }) {
+function decideTarget({
+  version,
+  kind,
+  state,
+  nextVersion = bumpVersion(version, kind),
+}) {
   return { nextVersion, ...classifyTargetState({ kind, nextVersion, state }) };
 }
 
