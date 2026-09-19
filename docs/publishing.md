@@ -30,6 +30,7 @@ The scripts are dependency-free Node ESM and run from the repo root.
 ## Release a version
 
 ```bash
+npm run release:status                # read-only: manifest versions vs the npm registry
 npm run verify                        # optional: run the gate on all four packages
 npm run release -- --dry-run          # plan only: versions, changelogs, tarballs
 npm run release                       # interactive: pick packages, then bump types
@@ -47,19 +48,38 @@ npm run release -- --packages workflow,autocompact --bump patch --yes
 
 # publish the versions currently in the manifests (first release, or resuming)
 npm run release -- --packages workflow,autocompact --bump none --yes
+
+# mix freely: already-published packages are skipped, the rest are published
+npm run release -- --packages workflow,autocompact,server-logs,browser-inspector --bump none --yes
 ```
 
 ### What the script does
 
 1. **Preflight** — Node major check; current branch must equal `--branch` (default `main`); working tree must be clean; `git fetch` and refuse to continue if the branch is behind `origin`; `npm whoami` must be `dieulc` (override with `--npm-user`; skipped in `--dry-run`).
-2. **Resolve** — compute each selected package's next version from the bump kind, and query the registry. If `name@version` is already published the release aborts (so you cannot accidentally re-publish).
-3. **Verify** — run `scripts/verify-packages.mjs` for the selection: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, and a load smoke test of every `pi.extensions` entry.
-4. **Changelog** — for each package, collect commits since that package's previous tag (`git log --no-merges … -- <package dir>`), group them by conventional type, and prepend a `## [version] - YYYY-MM-DD` section to that package's `CHANGELOG.md`.
+2. **Resolve** — compute each selected package's next version from the bump kind, and query the registry (one `npm view <name>@<version> version` per package). A version that is already on npm is **skipped, never fatal**: the rest of the batch is still verified, published, tagged and pushed. See [Skipping already-published packages](#skipping-already-published-packages).
+3. **Verify** — run `scripts/verify-packages.mjs` for the packages that are actually going to be published: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, and a load smoke test of every `pi.extensions` entry.
+4. **Changelog** — for each package being published, collect commits since that package's previous tag (`git log --no-merges … -- <package dir>`), group them by conventional type, and prepend a `## [version] - YYYY-MM-DD` section to that package's `CHANGELOG.md`.
 5. **Bump** — write the new version into the package's `package.json`.
-6. **Commit** — one commit: `chore(release): @dieulc/workflow@0.2.0, @dieulc/autocompact@0.1.1`.
+6. **Commit** — one commit for the released packages: `chore(release): @dieulc/workflow@0.2.0, @dieulc/autocompact@0.1.1`.
 7. **Publish** — `npm publish` in each package directory, in turn. Output is inherited so npm's 2FA/OTP prompt works. `publishConfig.access: "public"` in each manifest supplies public access for the scoped names.
 8. **Tag** — annotated tag per package: `git tag -a @dieulc/workflow@0.2.0`.
 9. **Push** — `git push origin <branch>` then `git push origin <tag> …`.
+
+### Skipping already-published packages
+
+A batch is not all-or-nothing. Each selected package is classified against the registry *after* the
+bump is resolved, and the plan prints what will happen to it:
+
+| Target version | Outcome | What happens | Exit code |
+| --- | --- | --- | --- |
+| not on npm | `publish` | verified, changelogged, `npm publish`, tagged, pushed | 0 |
+| on npm, no bump requested (`none`) | `skip` | nothing is published; a tag that is missing for that version is still created and pushed | 0 |
+| on npm, explicit `patch`/`minor`/`major` collides | `skip` | that package is left alone (the checkout is probably behind the registry) — the others still run | 1 at the end |
+| registry unreachable | `blocked` | nothing is published for it: a failed lookup is never read as “not published” — the others still run | 1 at the end |
+
+Only the `publish` targets are verified, changelogged and committed, so a skipped package's files are
+never touched and one unrelated failure can never block the rest of the batch. Every skip is printed
+with its reason; `npm run release:status` stays the read-only way to inspect drift.
 
 ### Flags
 
@@ -68,11 +88,51 @@ npm run release -- --packages workflow,autocompact --bump none --yes
 | `--packages a,b` | packages to release (short directory names). Default: interactive picker |
 | `--bump kind` | `patch` \| `minor` \| `major` \| `none`. Default: interactive, per package |
 | `--dry-run` | run preflight + verify and print versions/changelogs/tags; writes, publishes and tags nothing |
-| `--continue` | resume: publish current manifest versions that are missing from the registry, then create missing tags and push |
+| `--continue` | resume: publish current manifest versions that are missing from the registry, then create missing tags and push. For the packages that are already published it is equivalent to `--bump none`. |
 | `--no-push` | stop after tagging; prints the push commands |
 | `--branch name` | branch to release from (default `main`) |
 | `--npm-user name` | required npm user (default `dieulc`, or `RELEASE_NPM_USER`) |
 | `--yes`, `-y` | non-interactive; requires `--packages` and `--bump` (not needed with `--continue`) |
+| `--` | **required before the script's flags**: `npm run release -- --continue`. npm parses everything before `--` itself, so `npm run release --continue` reaches npm, not the script. The script detects the swallowed flags (`npm_config_*`) and exits 2 with the corrected command instead of silently running in interactive mode. |
+
+## Publish status
+
+`npm run release:status` (`scripts/status.mjs`) is a **read-only** report: it never writes,
+publishes, tags, or prompts. For every package it compares the manifest version with the
+registry — `latest` dist-tag, all dist-tags, publish date, deprecation flags — and prints a
+drift verdict.
+
+```bash
+npm run release:status                        # human table
+npm run release:status -- --json              # machine-readable report
+npm run release:status -- --check             # exit 1 on problems, 2 if a query failed
+npm run release:status -- --packages workflow
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| `in-sync` | the manifest version is published and is the `latest` dist-tag |
+| `never-published` | nothing of the package is on the registry |
+| `local-ahead` | the manifest version is newer than `latest` and not published yet |
+| `local-behind` | the registry has a newer version than this checkout |
+| `published-not-latest` | the manifest version is on npm but is not the `latest` dist-tag |
+| `local-not-published` | the manifest version is missing and cannot be compared to `latest` |
+| `invalid-version` | the manifest version is not semver |
+| `registry-error` | the registry could not be queried (offline, mirror, rate limit) |
+
+- **Exit codes:** `0` by default (informational). With `--check`: `1` when any package is
+  never-published, drifts, or has a deprecated current version; `2` when a registry query
+  failed — an unknown state never passes a gate silently. Use it in a pre-push hook or before
+  a release when you want failure semantics.
+- **Fresh repo:** before the first publish every package reports `never-published`, so
+  `--check` exits 1 until a release lands. That is the intended meaning (“not released yet”),
+  not a bug.
+- The registry comes from `npm config get registry` (override with `--registry <url>` for
+diagnostics against a mirror). Queries are one packument request per package, in parallel,
+with an `npm view --json` fallback that honors `~/.npmrc` auth. Deprecated *older* versions and
+a prerelease `latest` are reported as notes, never as failures.
+- `--json` emits a versioned schema (`schemaVersion: 1`) with `registry`, `identity`,
+per-package `distTags` / `publishedAt` / `problems` / `notes`, and an overall `ok`.
 
 ## First publish (bootstrap)
 
@@ -84,6 +144,10 @@ npm login                 # once per machine
 npm whoami                # dieulc
 npm run release -- --packages workflow,autocompact,server-logs,browser-inspector --bump none --yes
 ```
+
+The same command is the recovery path for a partially published batch: the packages that are already
+on npm are reported as `skip`, and only the missing ones are published — which is also how a missing
+tag for an already-published version gets repaired.
 
 Afterwards, each day-to-day release should bump a version; because Pi compares the installed version against npm's latest, **a change without a version bump never reaches users** (`pi update --extensions` would skip it).
 
@@ -101,6 +165,7 @@ Other recovery notes:
 
 - **Tag exists, version not published** — `--continue` publishes the manifest version (tag existence does not block it).
 - **Publish succeeded, push failed** — rerun with `--continue`; the registry check skips the published versions and the tags get pushed.
+- **You asked for no bump on a package that is already published** — that is not an error: the plan prints `skip (already on npm at <version> — no bump requested)`, the other packages are released normally, and the run exits 0. A tag that is missing for the already-published version is created and pushed in the same run.
 - **Wrong version committed, nothing published yet** — fix the `package.json` version, `git commit --amend`, and rerun with `--bump none`.
 - **Wrong version already published** — you cannot overwrite it. Bump again (`--bump patch`) and publish; then deprecate the bad version with `npm deprecate @dieulc/<pkg>@<version> "message"`.
 - **An accidental version was published and you want it gone** — unpublishing is destructive, irreversible, and 2FA-gated: `npm unpublish <pkg>@<version>` is refused for bypass-2FA tokens ("Granular access tokens that bypass two-factor authentication may not perform this action"), so use the npm website (package → Settings → Unpublish) or an interactive `npm login` first. A published `name@version` can never be reused, and fully unpublishing a name blocks publishing new versions of it for 24 hours. Clean the repo side too: `git push origin :refs/tags/<tag>`, `git revert <release commit>`.
@@ -211,7 +276,11 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | `working tree is not clean` | Commit or stash first. The release commit must capture exactly the released state. |
 | `branch is N commit(s) behind origin/main` | `git pull` first. |
 | `npm auth check failed` | `npm login` (the expected user is `dieulc`). |
-| `<pkg>@<version> is already published` | The registry already has that version; choose a bump or use `--continue`. |
+| `<pkg>@<version> is already published — bump the version` | **Removed** — that message no longer aborts a batch. A version already on npm is skipped; see [Skipping already-published packages](#skipping-already-published-packages). |
+| Plan line `skip (already on npm at <version> — no bump requested)` | Intended: that package needed no release. Nothing was published for it, the run exits 0, and a missing tag is repaired. Pass a bump to release it again. |
+| Plan line `skip (<version> is already on npm — bump further)` + exit 1 | An explicit bump landed on a published version, so nothing was published for that package (the others were). The checkout is usually behind the registry: `git pull`, check `npm run release:status`, then bump further. |
+| Plan line `blocked (registry query failed)` + exit 1 | The registry could not be queried (offline, mirror, rate limit, auth). Nothing was published for that package — deliberately: an unreadable state is never treated as “not published”. Re-run when it is reachable. |
+| `--continue reached npm, not this script` (exit 2) | The flags were typed without `--`, so npm consumed them. Run `npm run release -- --continue`. |
 | `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
 | `npm publish` returns 403 | Two different causes — read the message. *`403 Forbidden - PUT … you do not have permission`*: first publish of a scoped package must be public (handled by `publishConfig.access`) — check you are a member of the `@dieulc` scope. *`Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages`*: see the row below. |
 | 403 `Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages` | The configured npm credential cannot write, and npm does **not** prompt for an OTP when a token is configured — so this fails even in an interactive terminal (observed with a read-only/without-bypass granular token in `~/.npmrc`). Fix: create a **Granular Access Token** with *Bypass 2FA* enabled (npmjs.com → Access Tokens → Generate New Token; give it read+write on `@dieulc` or all packages) and put it in `~/.npmrc`. Alternative: `npm logout` / remove the token, `npm login`, then publish interactively with `npm publish --otp=<code>` (npm also reads the code from `NPM_CONFIG_OTP`). After fixing the credential, resume with `npm run release -- --continue`. |
@@ -223,15 +292,20 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | Published, but the package is not on pi.dev | The gallery crawls npm's search index, and new packages can be skipped for hours — sometimes days. Re-check with `npm run gallery -- --wait 900`; still missing after ~24 h → publish a patch bump (a metadata touch forces re-indexing), see [Gallery listing (pi.dev)](#gallery-listing-pidev). |
 | Gallery card shows an older version | npm's index has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
 | `npm run gallery` reports `ineligible` | The manifest keywords lack `pi-package`. Add it (plus `publishConfig.access: "public"` and a `pi` manifest — `npm run verify` enforces all three) and release a new version. |
+| `npm run release:status` reports every package as `never-published` | Expected before the first publish. Each package flips to `in-sync` once its release lands. |
+| `npm run release:status` reports `local-ahead` | The manifest version is not on npm yet. Publish it: `npm run release -- --packages <pkg> --bump none --yes` publishes the current version as-is. |
+| `npm run release:status -- --check` exits 2 | A registry query failed (offline, mirror, rate limit) — the state is unknown, not “in sync”. Re-run when reachable; check `npm config get registry` if it keeps failing. |
 
 ## Layout
 
 ```text
 scripts/
 ├─ verify-packages.mjs    # pre-publish gate (also: npm run verify)
+├─ release.mjs            # release tool (also: npm run release)
+├─ status.mjs             # read-only publish-state report (also: npm run release:status)
 ├─ check-gallery.mjs      # pi.dev listing check (also: npm run gallery)
-├─ check-gallery.test.mjs # parser tests (also: npm test)
-└─ release.mjs            # release tool (also: npm run release)
+├─ check-gallery.test.mjs # gallery parser tests (also: npm test)
+└─ status.test.mjs        # status report tests (also: npm test)
 agent/extensions/<pkg>/
 ├─ package.json          # name, version, pi manifest, files[], publishConfig
 ├─ README.md             # npm + GitHub page

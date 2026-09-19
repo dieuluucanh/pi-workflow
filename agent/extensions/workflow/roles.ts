@@ -3,10 +3,11 @@
  *
  * Role registry with one model per role.
  *
- * - Built-in roles: planner / explorer / builder (extensible via roles.json)
+ * - Built-in roles: planner / explorer / builder / reviewer (extensible via roles.json)
  * - Persistence: ~/.pi/agent/roles.json (user) + <cwd>/.pi/roles.json (project override)
  * - Config: roles.json holds exactly one {provider, id, thinking} per role
- * - v2 schema: legacy v1 `modelPool` files are discarded and reseeded
+ * - v2 schema: legacy v1 `modelPool` files are ignored (in-memory defaults
+ *   are used and the file is never rewritten)
  */
 
 import * as fs from "node:fs";
@@ -49,7 +50,19 @@ export interface RoleConfig {
 }
 
 export const ROLE_CONFIG_VERSION = 2;
-export const BUILT_IN_ROLES = ["planner", "explorer", "builder"] as const;
+export const BUILT_IN_ROLES = [
+  "planner",
+  "explorer",
+  "builder",
+  "reviewer",
+] as const;
+
+/**
+ * Role that Review Mode runs in its own in-process child session.
+ * Deliberately NOT wired into MODE_ROLE_MAP: the parent session must never
+ * switch to this model (Review Mode has its own session).
+ */
+export const REVIEW_ROLE_NAME = "reviewer";
 
 export const VALID_THINKING_LEVELS: ThinkingLevel[] = [
   "off",
@@ -111,6 +124,22 @@ export function seedDefaultRoles(): Role[] {
         "You are in BUILDER role. Implement the assigned task following the plan. Reason lightly. Ask if blocked.",
       builtIn: true,
     },
+    {
+      // Seeded with a DIFFERENT model than planner so Review Mode brings a
+      // genuinely independent perspective (see docs: Review Mode).
+      name: "reviewer",
+      description:
+        "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
+      model: {
+        provider: "opencode-go",
+        id: "muse-spark-1.3-contributor",
+        thinking: "xhigh",
+      },
+      tools: ["read", "grep", "find", "ls"],
+      systemPromptAddendum:
+        "You are in REVIEWER role. Independently audit the plan. Always align with the existing project framework and industry best practice. Flag divergence from established conventions. Do not write code.",
+      builtIn: true,
+    },
   ];
 }
 
@@ -132,16 +161,59 @@ export function projectRolesPath(cwd: string): string {
   return path.join(cwd, CONFIG_DIR_NAME, "roles.json");
 }
 
-function readJsonFile(fp: string): any | undefined {
+function fileFingerprint(fp: string): string {
   try {
-    if (!fs.existsSync(fp)) return undefined;
-    return JSON.parse(fs.readFileSync(fp, "utf8"));
-  } catch {
-    return undefined;
+    const st = fs.statSync(fp);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch (e: unknown) {
+    const code = (e as { code?: string } | undefined)?.code;
+    return code === "ENOENT" ? "missing" : "unreadable";
   }
 }
 
-function sanitizeModel(m: any, fallbackThinking: ThinkingLevel): RoleModel | undefined {
+/** Optional path overrides (tests); production reads the real agent/cwd files. */
+export interface RoleConfigPathOverrides {
+  userPath?: string;
+  projectPath?: string;
+}
+
+/**
+ * Cheap change detector for the two roles files (existence + mtime + size).
+ * Compare two fingerprints to decide whether a reload is needed. Never throws.
+ */
+export function rolesFingerprint(
+  cwd?: string,
+  overrides?: RoleConfigPathOverrides,
+): string {
+  const user = fileFingerprint(overrides?.userPath ?? userRolesPath());
+  const projectPath =
+    overrides?.projectPath ?? (cwd ? projectRolesPath(cwd) : undefined);
+  const project = projectPath ? fileFingerprint(projectPath) : "n/a";
+  return `user:${user}|project:${project}`;
+}
+
+interface JsonFileRead {
+  exists: boolean;
+  raw?: unknown;
+  error?: string;
+}
+
+function readJsonFileDetailed(fp: string): JsonFileRead {
+  if (!fs.existsSync(fp)) return { exists: false };
+  try {
+    return { exists: true, raw: JSON.parse(fs.readFileSync(fp, "utf8")) };
+  } catch (e: unknown) {
+    return {
+      exists: true,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+function sanitizeModel(
+  m: any,
+  fallbackThinking: ThinkingLevel,
+): RoleModel | undefined {
   if (!m || typeof m.provider !== "string" || typeof m.id !== "string")
     return undefined;
   if (!m.provider.trim() || !m.id.trim()) return undefined;
@@ -156,8 +228,8 @@ function sanitizeModel(m: any, fallbackThinking: ThinkingLevel): RoleModel | und
 
 function sanitizeRole(r: any): Role | undefined {
   if (!r || typeof r.name !== "string" || !r.name.trim()) return undefined;
-  // v2 schema only — legacy v1 `modelPool` arrays are rejected so the
-  // file gets reseeded with single-model defaults (reset, no migration).
+  // v2 schema only — legacy v1 `modelPool` entries are ignored (the role
+  // falls back to its built-in default; the file itself is left untouched).
   if (Array.isArray((r as any).modelPool)) return undefined;
   const model = sanitizeModel((r as any).model, "medium");
   if (!model) return undefined;
@@ -201,61 +273,93 @@ function mergeRoles(base: Role[], rawRoles: unknown): Role[] {
   return [...byName.values()];
 }
 
-function seedUserFile(fp: string, base: RoleConfig): void {
-  try {
-    fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, JSON.stringify(base, null, 2), "utf8");
-  } catch {
-    /* best effort */
-  }
+/** Result of {@link loadRoleConfigDetailed}. */
+export interface LoadedRoleConfig {
+  config: RoleConfig;
+  /** True when neither the user nor a project file supplied usable roles. */
+  usedDefaults: boolean;
+  /** Why the user file was skipped (missing / unreadable / legacy). */
+  reason?: string;
+  /** Fingerprint of the roles files at read time (see rolesFingerprint). */
+  fingerprint: string;
 }
 
 /**
- * Load merged role config: user file + project override (per-role replace).
- * v1 `modelPool` files (or any non-v2 version) are discarded and reseeded
- * with single-model defaults. Never throws — falls back to in-memory
- * defaults on corrupt config.
+ * Load the merged role config (user file + project override, per-role replace).
+ *
+ * Non-destructive by design: a missing, unreadable, corrupt, or legacy
+ * `roles.json` is never rewritten. In-memory defaults are used instead and the
+ * reason is reported via `usedDefaults`/`reason`, so callers can warn without
+ * risking the user's file. Never throws.
  */
-export function loadRoleConfig(cwd?: string): RoleConfig {
+export function loadRoleConfigDetailed(
+  cwd?: string,
+  overrides?: RoleConfigPathOverrides,
+): LoadedRoleConfig {
   const base = defaultRoleConfig();
-  try {
-    const fp = userRolesPath();
-    const raw = readJsonFile(fp);
-    if (raw === undefined) {
-      // first run — seed file
-      seedUserFile(fp, base);
-    } else if (!isCurrentVersion(raw)) {
-      // legacy v1 (modelPool) or unknown version — reset to defaults
-      seedUserFile(fp, base);
-    } else {
-      base.roles = mergeRoles(base.roles, (raw as any).roles);
+  const fingerprint = rolesFingerprint(cwd, overrides);
+  let reason: string | undefined;
+  let userUsable = false;
+
+  const userPath = overrides?.userPath ?? userRolesPath();
+  const userRead = readJsonFileDetailed(userPath);
+  if (!userRead.exists) {
+    reason = `no roles.json at ${userPath} — using in-memory defaults`;
+  } else if (userRead.error) {
+    reason = `roles.json is not valid JSON (${userRead.error}) — using in-memory defaults`;
+  } else if (!isCurrentVersion(userRead.raw)) {
+    const v = (userRead.raw as { version?: unknown } | undefined)?.version;
+    reason = `incompatible roles.json${
+      v === undefined ? "" : ` (version ${String(v)})`
+    } — using in-memory defaults`;
+  } else {
+    base.roles = mergeRoles(base.roles, (userRead.raw as any).roles);
+    if (
+      typeof (userRead.raw as any).activeRole === "string" ||
+      (userRead.raw as any).activeRole === null
+    ) {
+      base.activeRole = (userRead.raw as any).activeRole;
+    }
+    userUsable = true;
+  }
+
+  // Project override: per-role replace + activeRole if present. A bad or
+  // legacy project file is ignored and never rewritten (it is user-owned).
+  let projectUsable = false;
+  const projectPath =
+    overrides?.projectPath ?? (cwd ? projectRolesPath(cwd) : undefined);
+  if (projectPath) {
+    const projectRead = readJsonFileDetailed(projectPath);
+    if (
+      projectRead.exists &&
+      !projectRead.error &&
+      isCurrentVersion(projectRead.raw)
+    ) {
+      base.roles = mergeRoles(base.roles, (projectRead.raw as any).roles);
       if (
-        typeof (raw as any).activeRole === "string" ||
-        (raw as any).activeRole === null
-      )
-        base.activeRole = (raw as any).activeRole;
-    }
-  } catch {
-    /* fall through with defaults */
-  }
-  // project override: per-role replace + activeRole if present.
-  // Legacy project files are ignored (never reseeded — user-owned).
-  try {
-    if (cwd) {
-      const praw = readJsonFile(projectRolesPath(cwd));
-      if (praw && typeof praw === "object" && isCurrentVersion(praw)) {
-        base.roles = mergeRoles(base.roles, (praw as any).roles);
-        if (
-          typeof (praw as any).activeRole === "string" ||
-          (praw as any).activeRole === null
-        )
-          base.activeRole = (praw as any).activeRole;
+        typeof (projectRead.raw as any).activeRole === "string" ||
+        (projectRead.raw as any).activeRole === null
+      ) {
+        base.activeRole = (projectRead.raw as any).activeRole;
       }
+      projectUsable = true;
     }
-  } catch {
-    /* ignore project errors */
   }
-  return base;
+
+  return {
+    config: base,
+    usedDefaults: !userUsable && !projectUsable,
+    ...(reason === undefined ? {} : { reason }),
+    fingerprint,
+  };
+}
+
+/** Convenience wrapper returning just the config. Never throws. */
+export function loadRoleConfig(
+  cwd?: string,
+  overrides?: RoleConfigPathOverrides,
+): RoleConfig {
+  return loadRoleConfigDetailed(cwd, overrides).config;
 }
 
 export function saveRoleConfig(
@@ -300,6 +404,7 @@ const ROLE_ICONS: Record<string, string> = {
   planner: "🧠",
   explorer: "🔍",
   builder: "🔨",
+  reviewer: "🧪",
 };
 
 export function roleIcon(name: string): string {
@@ -309,7 +414,9 @@ export function roleIcon(name: string): string {
 export function formatRolesForDisplay(config: RoleConfig): string {
   const lines: string[] = [];
   lines.push("Model Roles (one model per role):");
-  lines.push(`  Active: ${config.activeRole ?? "auto (plan→planner, build→builder)"}`);
+  lines.push(
+    `  Active: ${config.activeRole ?? "auto (plan→planner, build→builder)"}`,
+  );
   lines.push("");
   for (const r of config.roles) {
     lines.push(

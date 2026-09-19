@@ -96,6 +96,7 @@ Releases are cut locally with one script. Versions are **independent per package
 
 ```bash
 npm login                      # once per machine (npm user: dieulc)
+npm run release:status         # read-only: manifest versions vs the npm registry
 npm run verify                 # gate: all four packages
 npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
 npm run release                # interactive: pick packages + bump type
@@ -106,8 +107,9 @@ npm run release -- --packages workflow,autocompact --bump minor --yes
 
 What a release does: preflight (clean tree, `main`, npm auth) → verify → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
 
-- `--bump none` publishes the current version (first publish).
+- `--bump none` publishes the current version as-is (first publish, or resuming).
 - `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.
+- A package whose target version is already on npm is **skipped, never fatal** — the rest of the batch is still published, tagged and pushed, and a missing tag for an already-published version is repaired. Add a bump to actually release it again, and always pass flags after `--` (`npm run release -- --continue`).
 - `--no-push` stops before `git push`.
 
 See [`docs/publishing.md`](docs/publishing.md) for the full reference and recovery paths.
@@ -129,12 +131,14 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 
 ```text
 ~/.pi/  (this repo — dotfiles + release tooling, not itself a package)
-├─ package.json              ← private; scripts: verify, release
+├─ package.json              ← private; scripts: verify, release, release:status, gallery, test
 ├─ README.md, LICENSE
 ├─ docs/publishing.md        ← release reference
 ├─ scripts/
 │  ├─ verify-packages.mjs    ← pre-publish gate
-│  └─ release.mjs            ← version + changelog + publish + tag
+│  ├─ release.mjs            ← version + changelog + publish + tag
+│  ├─ status.mjs             ← read-only npm publish-state report
+│  └─ check-gallery.mjs      ← pi.dev listing check
 ├─ .gitignore
 └─ agent/
    ├─ settings.json / .example

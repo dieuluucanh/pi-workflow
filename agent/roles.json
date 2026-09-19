@@ -42,6 +42,23 @@
       "tools": [],
       "systemPromptAddendum": "You are in BUILDER role. Implement the assigned task following the plan. Reason lightly. Ask if blocked.",
       "builtIn": true
+    },
+    {
+      "name": "reviewer",
+      "description": "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
+      "model": {
+        "provider": "opencode-go",
+        "id": "deepseek-v4.1-flash",
+        "thinking": "xhigh"
+      },
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "systemPromptAddendum": "You are in REVIEWER role. Independently audit the plan. Always align with the existing project framework and industry best practice. Flag divergence from established conventions. Do not write code.",
+      "builtIn": true
     }
   ],
   "activeRole": null

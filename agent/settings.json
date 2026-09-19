@@ -7,7 +7,7 @@
     "npm:@plannotator/pi-extension",
     "npm:pi-memory",
     "npm:@dieulc/pi-office-protocol@0.3.0",
-    "npm:@dieulc/pi-office-bridge@latest"
+    "npm:@dieulc/pi-office-bridge@^0.5.0"
   ],
   "enabledModels": [
     "opencode-go/muse-spark-1.2-contributor",
@@ -35,5 +35,16 @@
   },
   "hideThinkingBlock": true,
   "enableInstallTelemetry": false,
-  "doubleEscapeAction": "none"
+  "doubleEscapeAction": "none",
+  "workflow": {
+    "reviewMode": {
+      "enabled": true,
+      "rounds": 1,
+      "passes": 2,
+      "verify": true,
+      "fallbackOnError": "skip",
+      "exploreBudget": 3,
+      "timeoutMs": 0
+    }
+  }
 }
