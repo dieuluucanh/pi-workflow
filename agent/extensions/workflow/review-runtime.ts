@@ -9,7 +9,7 @@
  *   ensureStarted()            create the reviewer session (idempotent)
  *   ├─ gate.reset()            fresh pass-1 slots
  *   ├─ prompt(PASS_1_PROMPT)   review criteria + plan + context + guidance
- *   ├─ await submit + passDone (bounded by timeoutMs — never hangs, risk R7)
+ *   ├─ await submit + passDone (settle race; optional timeoutMs cap)
  *   ├─ gate.reset()
  *   ├─ prompt(PASS_2_PROMPT)   only when verify is on AND pass 1 was material
  *   └─ await passDone
@@ -33,17 +33,32 @@ import {
   type CreateReviewSessionResult,
   type ReviewChildSession,
   type ReviewModeConfig,
+  type ReviewPassResult,
   type ReviewPhase,
   type ReviewRoundGate,
   type ReviewRoundResult,
   type ReviewSdkLoader,
   type ReviewState,
   type ReviewSubmitPayloadLike,
+  type ReviewTranscriptOp,
   type ReviewVerdict,
   ReviewTranscript as Transcript,
 } from "./review.ts";
 import { createReviewTools } from "./review-tools.ts";
 import { renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
+
+/** Event `type` from a child-session event, or "" for junk. Never throws. */
+function readEventType(event: unknown): string {
+  const type = (event as { type?: unknown } | undefined)?.type;
+  return typeof type === "string" ? type : "";
+}
+
+/**
+ * Bound for the pre-pass "wait for the previous run to settle" step in
+ * unlimited mode. Without a deadline this is the only thing stopping a hung
+ * earlier run from blocking pass 1 before the settle race is even armed.
+ */
+const SETTLE_IN_FLIGHT_FALLBACK_MS = 60_000;
 
 /** What the runtime needs from the parent extension. */
 export interface ReviewRuntimeDeps {
@@ -84,6 +99,12 @@ export interface ReviewRuntimeDeps {
   notify: (message: string, level?: "info" | "warning" | "error") => void;
   /** Fired on every state transition (drives the status strip). */
   onState?: (state: ReviewState | undefined) => void;
+  /**
+   * Fired for every transcript op the reviewer produces, so the parent can
+   * stream the review into the main Pi transcript. Best-effort: a throwing
+   * callback must never affect the review.
+   */
+  onTranscriptOps?: (ops: ReviewTranscriptOp[]) => void;
   /** Injected in tests. */
   loadSdk?: ReviewSdkLoader;
 }
@@ -103,11 +124,20 @@ export interface ReviewRuntime {
   runRound(input: RunRoundInput): Promise<ReviewRoundResult>;
   /** Current state snapshot. */
   getState(): ReviewState | undefined;
-  /** Right-pane lines. */
+  /** Reviewer transcript lines (feeds the main-transcript stream). */
   getTranscript(): string[];
   isAlive(): boolean;
-  /** Cancel the in-flight review but keep the session (used by the pane's `x`). */
+  /** True while `runRound` is in flight — used to route prompt input. */
+  isRoundActive(): boolean;
+  /** Cancel the in-flight review but keep the session. */
   abortRound(): Promise<void>;
+  /**
+   * Deliver a message the user typed while Review Mode was the active mode.
+   *
+   * Returns false when it could not be delivered, so the caller can fall back to
+   * the plan agent rather than swallowing the message into the void.
+   */
+  sendUserMessage(text: string, images?: unknown[]): Promise<boolean>;
   /** Abort and release everything (approve / reload / shutdown). */
   teardown(): Promise<void>;
 }
@@ -182,8 +212,9 @@ export function buildPass1Prompt(input: {
     "   original structure preserved, no `Review changes` section — it is generated).",
     "2. `review_pass_done` with your verdict and the same findings.",
     "",
-    "You cannot run tests, builds, or linters, and you cannot write any file other",
-    "than the plan. Say what you could not verify instead of assuming it passes.",
+    "You may run read-only and test/lint/typecheck commands, but you cannot build or",
+    "write any file other than the plan. Say what you could not verify instead of",
+    "assuming it passes.",
   );
 
   return parts.join("\n");
@@ -246,6 +277,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let gate: ReviewRoundGate = createReviewRoundGate();
   let starting: Promise<boolean> | undefined;
   let abortController: AbortController | undefined;
+  /** True while `runRound` is in flight (gates prompt routing). */
+  let roundActive = false;
 
   const config = (): ReviewModeConfig => {
     try {
@@ -268,6 +301,195 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     if (!transcript) transcript = new Transcript();
     return transcript;
   };
+
+  /**
+   * Completed reviewer runs (`agent_settled`). A pass is over when either its
+   * `review_pass_done` or the end of its run arrives — see `runPass()`.
+   */
+  let settleCount = 0;
+  let settleWaiters: Array<() => void> = [];
+
+  /**
+   * Mark that a reviewer run has fully settled.
+   *
+   * `agent_settled` — not `agent_end` — is the reliable "this pass is over"
+   * signal: it is emitted after every post-run continuation (provider retry,
+   * auto-compaction), so a pass is never judged finished while Pi is still
+   * working on it.
+   */
+  function noteSettled(): void {
+    settleCount += 1;
+    for (const resolve of settleWaiters.splice(0)) {
+      try {
+        resolve();
+      } catch {
+        /* a waiter must never break the settle path */
+      }
+    }
+  }
+
+  /**
+   * Resolve `true` when a run settles after `baseline`; `false` on timeout or
+   * abort. Edge-tolerant, like `ReviewRoundGate`: a settle that already
+   * happened resolves immediately.
+   */
+  function waitForSettle(
+    baseline: number,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (settleCount > baseline) return Promise.resolve(true);
+    if (signal?.aborted) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter = () => finish(true);
+      const remove = () => {
+        const i = settleWaiters.indexOf(waiter);
+        if (i >= 0) settleWaiters.splice(i, 1);
+      };
+      const onAbort = () => finish(false);
+      const finish = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        remove();
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      };
+      if (
+        typeof timeoutMs === "number" &&
+        Number.isFinite(timeoutMs) &&
+        timeoutMs > 0
+      ) {
+        timer = setTimeout(() => finish(false), Math.trunc(timeoutMs));
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      settleWaiters.push(waiter);
+    });
+  }
+
+  /**
+   * Wait for any in-flight reviewer run to end before starting a pass, so the
+   * settle the pass then races belongs to THAT pass rather than the previous
+   * one (a reviewer that calls `review_pass_done` keeps streaming until its
+   * turn ends).
+   */
+  async function settleInFlight(
+    deadline: number | undefined,
+    rc: AbortController,
+  ): Promise<void> {
+    if (!session || !session.isStreaming()) return;
+    // Unlimited mode still needs a bound here: a hung previous run must not
+    // block pass 1 forever before the settle race is even armed.
+    const waitMs =
+      deadline === undefined
+        ? SETTLE_IN_FLIGHT_FALLBACK_MS
+        : Math.max(1, deadline - Date.now());
+    await waitForSettle(settleCount, waitMs, rc.signal);
+  }
+
+  /** Abort the reviewer's in-flight run. Best-effort; never throws. */
+  async function abortChild(): Promise<void> {
+    try {
+      await session?.abort();
+    } catch {
+      /* cancellation is best-effort */
+    }
+  }
+
+  function errorText(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  /** Why a pass stopped waiting. */
+  type PassStop = "passDone" | "settled" | "timeout" | "aborted" | "error";
+
+  interface PassOutcome {
+    submitted: ReviewSubmitPayloadLike | undefined;
+    passDone: ReviewPassResult | undefined;
+    stop: PassStop;
+    /** Set only when `stop === "error"`. */
+    error?: unknown;
+  }
+
+  /**
+   * Drive one pass to a terminal state.
+   *
+   * The terminal state is whichever comes first of:
+   *   - `review_pass_done` (the reviewer completed the protocol), or
+   *   - the reviewer's run settling (`agent_settled`), or
+   *   - the round deadline, or
+   *   - the caller aborting,
+   *   - a prompt/follow-up failure such as a rejected preflight.
+   *
+   * Racing the settle is what makes a silent reviewer fail in seconds instead
+   * of waiting out `timeoutMs`: `session.prompt()` resolves when the run ends,
+   * so a `review_pass_done` that has not arrived by then never will. The send
+   * itself is never awaited unguarded — the deadline covers the run too.
+   */
+  async function runPass(
+    pass: 1 | 2,
+    deadline: number | undefined,
+    rc: AbortController,
+    send: () => Promise<void>,
+  ): Promise<PassOutcome> {
+    const baseline = settleCount;
+    // undefined ⇒ no cap (default): the pass ends on passDone/settle/abort/error.
+    const remaining = (): number | undefined =>
+      deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
+    let sendError: unknown;
+
+    const stop = await new Promise<PassStop>((resolve) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => finish("aborted");
+      const finish = (s: PassStop): void => {
+        if (done) return;
+        done = true;
+        if (timer !== undefined) clearTimeout(timer);
+        rc.signal.removeEventListener("abort", onAbort);
+        resolve(s);
+      };
+      if (rc.signal.aborted) {
+        finish("aborted");
+        return;
+      }
+      const cap = remaining();
+      if (cap !== undefined) timer = setTimeout(() => finish("timeout"), cap);
+      rc.signal.addEventListener("abort", onAbort, { once: true });
+      void gate.waitForPassDone(remaining(), rc.signal).then((result) => {
+        if (result) finish("passDone");
+      });
+      void waitForSettle(baseline, remaining(), rc.signal).then((did) => {
+        if (did) finish("settled");
+      });
+      void send().catch((e: unknown) => {
+        sendError = e;
+        finish("error");
+      });
+    });
+
+    const submitted = gate.lastSubmitted();
+    const passDone = gate.lastPassDone();
+    if (stop === "timeout") {
+      const capMs = Math.max(1000, config().timeoutMs);
+      deps.log(
+        `Review Mode pass ${pass} hit its ${Math.round(
+          capMs / 1000,
+        )}s limit — continuing with ${
+          submitted ? "the submitted plan" : "the author's plan"
+        }.`,
+        "warning",
+      );
+    }
+    return {
+      submitted,
+      passDone,
+      stop,
+      ...(sendError === undefined ? {} : { error: sendError }),
+    };
+  }
 
   async function ensureStarted(): Promise<boolean> {
     if (session) return true;
@@ -384,13 +606,43 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           return false;
         }
 
+        // One line per session, so "the reviewer has no tools" is visible
+        // immediately instead of only after a failed pass (see /review-status).
+        if (created.activeTools) {
+          deps.log(
+            `Review Mode: reviewer tools active — ${created.activeTools.join(", ")}`,
+            "info",
+          );
+        }
+
         session = created.session;
         ensureTranscript();
+        const child = created.session;
         session.subscribe((event) => {
+          let ops: ReviewTranscriptOp[] = [];
           try {
-            ensureTranscript().ingest(event);
+            ops = ensureTranscript().ingest(event);
           } catch {
             /* a malformed event must not break the review */
+          }
+          if (ops.length > 0) {
+            try {
+              deps.onTranscriptOps?.(ops);
+            } catch {
+              /* streaming to the main transcript is display-only: never fatal */
+            }
+          }
+          const type = readEventType(event);
+          if (type === "agent_settled") {
+            noteSettled();
+          } else if (type === "agent_end") {
+            // Fallback for a runtime without `agent_settled`: a retry or a
+            // compaction continuation continues after agent_end, so only count
+            // the event once the session is really idle — and only for the
+            // session that is still current.
+            setTimeout(() => {
+              if (session === child && !child.isStreaming()) noteSettled();
+            }, 0);
           }
         });
         return true;
@@ -405,28 +657,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
     })();
     return starting;
-  }
-
-  /** Wait for one pass to finish, bounded by the configured timeout. */
-  async function awaitPass(
-    pass: 1 | 2,
-    rc: AbortController,
-  ): Promise<{
-    submitted: ReviewSubmitPayloadLike | undefined;
-    done: boolean;
-  }> {
-    const timeout = Math.max(1000, config().timeoutMs);
-    const passDone = await gate.waitForPassDone(timeout, rc.signal);
-    const submitted = gate.lastSubmitted();
-    if (!passDone) {
-      deps.log(
-        `Review Mode pass ${pass} timed out after ${Math.round(timeout / 1000)}s — continuing with ${
-          submitted ? "the submitted plan" : "the author's plan"
-        }.`,
-        "warning",
-      );
-    }
-    return { submitted, done: Boolean(passDone) };
   }
 
   async function runRound(input: RunRoundInput): Promise<ReviewRoundResult> {
@@ -467,16 +697,23 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     };
 
     try {
+      roundActive = true;
+      // A review with nowhere to submit can only fail: do not spend a run on it.
+      if (!input.planPath) {
+        return fail("no plan path — the reviewer has nowhere to submit");
+      }
+
       const ready = await ensureStarted();
       if (!ready || !session) {
         return fail("reviewer session unavailable");
       }
+      const child = session;
 
       if (!state || state.planHash !== hash || state.phase === "done") {
         state = createReviewState({
           planHash: hash,
           planPath: input.planPath,
-          modelLabel: session.modelLabel,
+          modelLabel: child.modelLabel,
           round: input.round,
           now: started,
         });
@@ -487,8 +724,19 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
       abortController = new AbortController();
       const rc = abortController;
+      // 0 (default) = no cap. A configured cap is the outer safety net; the
+      // settle race below still ends a silent pass quickly either way.
+      const limitMs = cfg.timeoutMs > 0 ? cfg.timeoutMs : undefined;
+      const deadline = limitMs !== undefined ? started + limitMs : undefined;
+      if (limitMs === undefined) {
+        deps.log(
+          "Review Mode: no time limit configured — each pass ends when the reviewer submits or its run settles.",
+          "info",
+        );
+      }
 
       // ── Pass 1 ──────────────────────────────────────────────────────
+      await settleInFlight(deadline, rc);
       gate.reset();
       const pass1Prompt = buildPass1Prompt({
         planPath: input.planPath,
@@ -501,16 +749,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         verify: cfg.verify && cfg.passes > 1,
       });
 
-      try {
-        await session.prompt(pass1Prompt);
-      } catch (e: unknown) {
-        return fail(
-          `could not prompt the reviewer: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
+      const p1 = await runPass(1, deadline, rc, () =>
+        child.prompt(pass1Prompt),
+      );
 
-      const p1 = await awaitPass(1, rc);
-      if (rc.signal.aborted) {
+      if (p1.stop === "error") {
+        await abortChild();
+        return fail(`could not prompt the reviewer: ${errorText(p1.error)}`);
+      }
+      if (p1.stop === "aborted" || rc.signal.aborted) {
+        await abortChild();
         if (state) state.phase = "aborted";
         return {
           ok: false,
@@ -522,7 +770,24 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         };
       }
       if (!p1.submitted) {
-        return fail("the reviewer did not submit a plan", originalPlan);
+        // The run is over (or out of time) and nothing reached the plan file.
+        // Fail now — waiting longer cannot produce a submission.
+        await abortChild();
+        return fail(
+          p1.stop === "timeout"
+            ? `the reviewer did not finish within ${Math.round((limitMs ?? 0) / 1000)}s and submitted no plan`
+            : "the reviewer finished without submitting a plan — it has no write path unless review_submit_plan succeeds",
+          originalPlan,
+        );
+      }
+      if (p1.stop === "timeout") {
+        // The protocol completed, the run did not: stop paying for it, but keep
+        // the submission — never discard real work over a slow model.
+        deps.log(
+          "Review Mode pass 1 exceeded its time limit after submitting — using the submitted plan.",
+          "warning",
+        );
+        await abortChild();
       }
 
       let finalPlan = p1.submitted.planText;
@@ -535,6 +800,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
       if (wantVerify) {
         setPhase("verifying");
+        await settleInFlight(deadline, rc);
         gate.reset();
         const pass2Prompt = buildPass2Prompt({
           planPath: input.planPath,
@@ -542,19 +808,19 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           rewrittenPlan: p1.submitted.planBody,
           findings: state?.findings ?? [],
         });
-        try {
-          await session.followUp(pass2Prompt);
-          const p2 = await awaitPass(2, rc);
-          if (p2.submitted) finalPlan = p2.submitted.planText;
-        } catch (e: unknown) {
+        const p2 = await runPass(2, deadline, rc, () =>
+          child.followUp(pass2Prompt),
+        );
+        if (p2.error !== undefined) {
           // Verification is an enhancement: never lose pass 1's plan over it.
           deps.log(
-            `Review Mode verification pass failed (${
-              e instanceof Error ? e.message : String(e)
-            }) — keeping pass 1's plan.`,
+            `Review Mode verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
             "warning",
           );
+        } else if (p2.submitted) {
+          finalPlan = p2.submitted.planText;
         }
+        if (p2.stop === "timeout") await abortChild();
       }
 
       if (state) {
@@ -581,6 +847,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       );
     } finally {
       abortController = undefined;
+      roundActive = false;
     }
   }
 
@@ -596,6 +863,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
     },
     isAlive: () => Boolean(session),
+    isRoundActive: () => roundActive,
     async abortRound() {
       try {
         abortController?.abort();
@@ -604,6 +872,37 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         /* cancellation is best-effort */
       }
       if (state && state.phase !== "done") state.phase = "aborted";
+    },
+    async sendUserMessage(text: string, images?: unknown[]): Promise<boolean> {
+      if (!session) return false;
+      const trimmed = String(text ?? "").trim();
+      if (!trimmed) return false;
+      try {
+        // SAFETY: the child is an SDK `AgentSession`. `ReviewChildSession` is a
+        // deliberately narrow structural type that only declares what the review
+        // round itself needs (prompt/followUp/abort/subscribe), so `steer` and
+        // `isStreaming` have to be re-declared here. Both are feature-detected
+        // below before use, so the widening cannot cause a missing-method call.
+        const child = session as unknown as {
+          isStreaming?: boolean;
+          steer?: (message: string) => Promise<void>;
+          prompt: (message: string, options?: unknown) => Promise<void>;
+        };
+        const hasImages = Array.isArray(images) && images.length > 0;
+        if (child.isStreaming === true && typeof child.steer === "function") {
+          // Mid-pass: steer rather than queueing a whole new turn.
+          await child.steer(trimmed);
+        } else {
+          await child.prompt(trimmed, hasImages ? { images } : undefined);
+        }
+        return true;
+      } catch (e: any) {
+        deps.notify(
+          `could not deliver your message to the reviewer (${String(e?.message ?? e)}); it went to the plan agent instead`,
+          "warning",
+        );
+        return false;
+      }
     },
     async teardown() {
       try {

@@ -4,9 +4,9 @@
  * Run with: npm test   (node --test, type-stripping — no build step)
  *
  * These cover the deterministic surface: config/prompt resolution, plan
- * hashing and the changelog, submission validation, context pruning, the
- * ANSI-aware pane layout, finding sanitisation, the pass gate, and the
- * "Review Mode off ⇒ nothing happens" guarantee.
+ * hashing and the changelog, submission validation, context pruning, finding
+ * sanitisation, the pass gate, and the "Review Mode off ⇒ nothing happens"
+ * guarantee.
  */
 
 import { test } from "node:test";
@@ -17,9 +17,7 @@ import * as path from "node:path";
 
 import {
   appendReviewChangelog,
-  composeTwoColumn,
-  displayWidth,
-  padAnsi,
+  getUtcDatePrefix,
   planHash,
   pruneContextEntriesForReview,
   renderReviewChangelog,
@@ -28,10 +26,7 @@ import {
   REVIEW_UNRESOLVED_HEADING,
   reviewFindingTier,
   reviewNeedsVerification,
-  sliceViewport,
-  stripAnsi,
   stripReviewAppendix,
-  truncateAnsi,
   validateReviewedPlan,
   type ReviewFinding,
 } from "./utils.ts";
@@ -54,12 +49,19 @@ import {
   reviewIsActive,
   reviewPhaseLabel,
   sanitizeFindings,
+  shouldRouteInputToReviewer,
   reviewStateSummary,
   writeReviewModeConfig,
   writeReviewPrompt,
   ReviewTranscript,
   translateReviewEvent,
+  formatActionLabel,
+  formatReviewStatusLines,
+  parseReviewTimeoutArg,
+  timeoutSourceOf,
+  type ReviewStatusInput,
   REVIEW_BUILTIN_TOOLS,
+  reviewToolAllowlist,
   MAX_REVIEW_LINES,
 } from "./review.ts";
 
@@ -71,8 +73,6 @@ import {
   createReviewTools,
   resolveBashToolDefinitionBuilder,
 } from "./review-tools.ts";
-
-import { paneColumnWidths } from "./review-pane.ts";
 import {
   buildPass1Prompt,
   buildPass2Prompt,
@@ -136,6 +136,7 @@ test("review config: defaults are safe (off, 1 round, verify on)", () => {
   assert.equal(c.passes, 2);
   assert.equal(c.verify, true);
   assert.equal(c.fallbackOnError, "skip");
+  assert.equal(c.timeoutMs, 0, "no wall-clock cap by default");
   assert.deepEqual(c, { ...DEFAULT_REVIEW_MODE_CONFIG });
 });
 
@@ -144,12 +145,12 @@ test("review config: clamps out-of-range numbers", () => {
     rounds: 99,
     passes: 9,
     exploreBudget: 500,
-    timeoutMs: 1,
+    timeoutMs: -5,
   });
   assert.equal(c.rounds, 5);
   assert.equal(c.passes, 2);
   assert.equal(c.exploreBudget, 8);
-  assert.equal(c.timeoutMs, 30_000);
+  assert.equal(c.timeoutMs, 0, "below the minimum clamps to unlimited");
   const low = coerceReviewModeConfig({ rounds: -3, timeoutMs: 1e12 });
   assert.equal(low.rounds, 1);
   assert.equal(low.timeoutMs, 3_600_000);
@@ -169,6 +170,28 @@ test("review config: project overrides global field-by-field", () => {
   assert.equal(merged.enabled, true, "unset project field keeps global");
   assert.equal(merged.rounds, 2, "project wins where set");
   assert.equal(merged.verify, false, "global kept where project silent");
+});
+
+test("review config: removed pane/parallel keys are ignored", () => {
+  const c = coerceReviewModeConfig({
+    enabled: true,
+    parallel: false,
+    autoOpenPane: false,
+    paneEnabled: false,
+    reserveRows: 12,
+  });
+  assert.equal(c.enabled, true);
+  assert.equal(c.rounds, DEFAULT_REVIEW_MODE_CONFIG.rounds);
+  assert.equal(c.fallbackOnError, "skip");
+  assert.deepEqual(Object.keys(c).sort(), [
+    "enabled",
+    "exploreBudget",
+    "fallbackOnError",
+    "passes",
+    "rounds",
+    "timeoutMs",
+    "verify",
+  ]);
 });
 
 test("review config: extractReviewModeRaw handles junk", () => {
@@ -222,6 +245,114 @@ test("review config: write preserves unrelated settings keys", () => {
   assert.equal(after.workflow.other, 1, "sibling workflow keys preserved");
   assert.equal(after.workflow.reviewMode.enabled, true);
   assert.equal(after.workflow.reviewMode.rounds, 3);
+});
+
+test("review config: timeout provenance is project > global > default", () => {
+  assert.equal(timeoutSourceOf(undefined, undefined), "default");
+  assert.equal(timeoutSourceOf({ rounds: 2 }, undefined), "default");
+  assert.equal(
+    timeoutSourceOf(true, undefined),
+    "default",
+    "boolean shorthand carries no fields",
+  );
+  assert.equal(timeoutSourceOf({ timeoutMs: 0 }, undefined), "global");
+  assert.equal(timeoutSourceOf({ timeoutMs: 0 }, { verify: false }), "global");
+  assert.equal(
+    timeoutSourceOf({ timeoutMs: 0 }, { timeoutMs: 600000 }),
+    "project",
+  );
+
+  const { cwd, agentDir } = tmpProject();
+  writeReviewModeConfig("global", cwd, agentDir, { timeoutMs: 600000 });
+  let r = readReviewModeConfig(cwd, agentDir);
+  assert.equal(r.config.timeoutMs, 600000);
+  assert.equal(r.sources.timeout, "global");
+  assert.equal(r.sources.global, true);
+  assert.equal(r.sources.project, false);
+
+  writeReviewModeConfig("project", cwd, agentDir, { timeoutMs: 0 });
+  r = readReviewModeConfig(cwd, agentDir);
+  assert.equal(r.config.timeoutMs, 0);
+  assert.equal(r.sources.timeout, "project");
+  assert.equal(r.sources.project, true);
+});
+
+test("review config: a fragment without timeoutMs keeps the unlimited default", () => {
+  assert.equal(DEFAULT_REVIEW_MODE_CONFIG.timeoutMs, 0);
+  assert.equal(coerceReviewModeConfig({ enabled: true }).timeoutMs, 0);
+  assert.equal(
+    mergeReviewModeConfig({ rounds: 2 }, { verify: false }).timeoutMs,
+    0,
+  );
+});
+
+test("parseReviewTimeoutArg: unlimited/seconds accepted, junk rejected", () => {
+  for (const [raw, ms] of [
+    ["unlimited", 0],
+    ["off", 0],
+    ["none", 0],
+    ["0", 0],
+    [" 90 ", 90_000],
+    ["600", 600_000],
+    ["3600", 3_600_000],
+  ] as const) {
+    assert.deepEqual(
+      parseReviewTimeoutArg(raw),
+      { ok: true, timeoutMs: ms },
+      raw,
+    );
+  }
+  for (const bad of ["", "   ", "-1", "1.5", "3601", "abc", "1h", "1e3"]) {
+    const parsed = parseReviewTimeoutArg(bad);
+    assert.equal(parsed.ok, false, `${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+const statusInput = (
+  over: Partial<ReviewStatusInput> = {},
+): ReviewStatusInput => ({
+  enabled: true,
+  config: { ...DEFAULT_REVIEW_MODE_CONFIG, timeoutMs: 0 },
+  timeoutSource: "default",
+  reviewer: { provider: "opencode-go", id: "glm-5.3-flash", thinking: "xhigh" },
+  promptSource: "/agent/review-prompt.md",
+  sources: { global: true, project: false },
+  runtime: "not started",
+  ...over,
+});
+
+test("formatReviewStatusLines: no flow row, timeout provenance, usage", () => {
+  const text = formatReviewStatusLines(statusInput()).join("\n");
+  assert.ok(!/flow|parallel/i.test(text), "no flow/parallel wording may survive");
+  assert.ok(text.includes("reviewer model : opencode-go/glm-5.3-flash (xhigh)"));
+  assert.ok(text.includes("timeout: unlimited (default)"));
+  assert.ok(text.includes("runtime        : not started"));
+  assert.ok(text.includes("/review-mode timeout <seconds|unlimited>"));
+  assert.ok(!text.includes("cap set in"));
+
+  const globalPinned = formatReviewStatusLines(
+    statusInput({
+      timeoutSource: "global",
+      config: { ...DEFAULT_REVIEW_MODE_CONFIG, timeoutMs: 600_000 },
+    }),
+  ).join("\n");
+  assert.ok(globalPinned.includes("timeout: 600s (global settings)"));
+  assert.ok(globalPinned.includes("600s cap set in global settings"));
+
+  const projectPinned = formatReviewStatusLines(
+    statusInput({
+      timeoutSource: "project",
+      config: { ...DEFAULT_REVIEW_MODE_CONFIG, timeoutMs: 600_000 },
+    }),
+  ).join("\n");
+  assert.ok(projectPinned.includes("timeout: 600s (project settings)"));
+  assert.ok(projectPinned.includes("600s cap set in project settings"));
+
+  const unconfigured = formatReviewStatusLines(
+    statusInput({ enabled: false, reviewer: undefined }),
+  ).join("\n");
+  assert.ok(unconfigured.startsWith("Review Mode: disabled"));
+  assert.ok(unconfigured.includes("unconfigured — /role set reviewer"));
 });
 
 // ══ Step 3: reviewer prompt ═══════════════════════════════════════════
@@ -494,58 +625,6 @@ test("renderReviewContextBlock: caps total size", () => {
   assert.ok(block.includes("context truncated"));
 });
 
-test("ANSI-aware layout: exact column widths, no colour bleed", () => {
-  const RED = "\x1b[31m";
-  const RST = "\x1b[0m";
-  assert.equal(displayWidth(`${RED}hello${RST}`), 5);
-  assert.equal(displayWidth("日本語"), 6);
-  assert.equal(displayWidth("🔍"), 2);
-  assert.equal(stripAnsi(`${RED}x${RST}`), "x");
-  assert.equal(displayWidth(padAnsi("ab", 6)), 6);
-  assert.equal(displayWidth(padAnsi("abcdefghij", 5)), 5);
-  assert.ok(truncateAnsi(`${RED}abcdefghij${RST}`, 4).includes("\x1b[0m"));
-
-  const { left: lw, right: rw, gap } = paneColumnWidths(80);
-  const rows = composeTwoColumn(
-    [`${RED}left-1${RST}`, "left-2", "", "日本語"],
-    ["right-1", `${RED}right-2-is-long${RST}`, "right-3", "right-4"],
-    lw,
-    rw,
-    gap,
-  );
-  assert.equal(rows.length, 4);
-  for (const row of rows) {
-    assert.equal(
-      displayWidth(row),
-      lw + gap + rw,
-      "every composed row must be exactly left+gap+right wide",
-    );
-  }
-});
-
-test("paneColumnWidths never overflow the terminal", () => {
-  for (const w of [10, 40, 80, 120, 200]) {
-    const c = paneColumnWidths(w);
-    assert.ok(c.left >= 8 && c.right >= 8);
-    if (w >= 40) assert.ok(c.left + c.gap + c.right <= w);
-  }
-});
-
-test("sliceViewport: clamps, follows the end, tolerates junk", () => {
-  const src = Array.from({ length: 100 }, (_, i) => `line-${i}`);
-  assert.deepEqual(sliceViewport(src, 10, 3).lines, [
-    "line-10",
-    "line-11",
-    "line-12",
-  ]);
-  assert.equal(sliceViewport(src, 999, 5).offset, 95);
-  assert.equal(sliceViewport(src, -5, 5).offset, 0);
-  assert.equal(sliceViewport(src, 0, 5, true).lines[4], "line-99");
-  assert.equal(sliceViewport(src, 0, 0).lines.length, 0);
-  assert.equal(sliceViewport(["a", "b"], 0, 10).lines.length, 2);
-  assert.equal(sliceViewport([], 0, 5).lines.length, 0);
-});
-
 // ══ Step 5: state + findings sanitisation ═════════════════════════════
 
 test("sanitizeFindings: clamps ranges, drops junk, defaults disposition", () => {
@@ -605,38 +684,152 @@ test("review state: creation, summary, phase helpers", () => {
   assert.equal(reviewElapsedMs(s, 9_999_999), 4200);
 });
 
+test("shouldRouteInputToReviewer: only a live, enabled round takes the prompt", () => {
+  const cases: Array<[boolean, boolean, boolean, boolean]> = [
+    [true, true, true, true],
+    [true, true, false, false],
+    [true, false, true, false],
+    [false, true, true, false],
+    [false, false, false, false],
+  ];
+  for (const [
+    reviewEnabled,
+    reviewActive,
+    hasReviewerSession,
+    expected,
+  ] of cases) {
+    assert.equal(
+      shouldRouteInputToReviewer({
+        reviewEnabled,
+        reviewActive,
+        hasReviewerSession,
+      }),
+      expected,
+      `enabled=${reviewEnabled} active=${reviewActive} session=${hasReviewerSession}`,
+    );
+  }
+});
+
+test("REGRESSION: with Review Mode off, input routing is inert", () => {
+  for (const reviewActive of [true, false]) {
+    for (const hasReviewerSession of [true, false]) {
+      assert.equal(
+        shouldRouteInputToReviewer({
+          reviewEnabled: false,
+          reviewActive,
+          hasReviewerSession,
+        }),
+        false,
+      );
+    }
+  }
+});
+
 // ══ Step 16: transcript ═══════════════════════════════════════════════
 
-test("translateReviewEvent: coalescable deltas, tools, drops plumbing", () => {
+test("translateReviewEvent: drops prose/thinking, surfaces action headers", () => {
+  // Prose and reasoning are deliberately not streamed to the main transcript.
   assert.deepEqual(
     translateReviewEvent({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "hi" },
     }),
-    [{ op: "append", kind: "text", text: "hi" }],
+    [],
   );
-  assert.equal(
+  assert.deepEqual(
     translateReviewEvent({
       type: "message_update",
-      assistantMessageEvent: { type: "text_delta", delta: "" },
-    }).length,
-    0,
+      assistantMessageEvent: { type: "thinking_delta", delta: "hmm" },
+    }),
+    [],
+  );
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "message_start",
+      message: { role: "assistant" },
+    }),
+    [],
   );
   assert.equal(translateReviewEvent({ type: "queue_update" }).length, 0);
   assert.equal(translateReviewEvent({ type: "compaction_start" }).length, 0);
-  assert.ok(
-    translateReviewEvent({
+
+  const labels = new Map<string, string>();
+  const start = translateReviewEvent(
+    {
       type: "tool_execution_start",
+      toolCallId: "c1",
       toolName: "read",
-    })[0].text.includes("read"),
+      args: { path: "src/app.ts" },
+    },
+    labels,
   );
-  assert.ok(
-    translateReviewEvent({
+  assert.deepEqual(start, [
+    { op: "new", kind: "tool", text: "▸ read: src/app.ts" },
+  ]);
+  assert.equal(labels.get("c1"), "read: src/app.ts");
+
+  const end = translateReviewEvent(
+    {
       type: "tool_execution_end",
+      toolCallId: "c1",
       toolName: "read",
-      isError: true,
-    })[0].text.includes("failed"),
+      isError: false,
+    },
+    labels,
   );
+  assert.deepEqual(end, [
+    { op: "new", kind: "tool", text: "▸ read: src/app.ts ok" },
+  ]);
+  assert.equal(labels.has("c1"), false, "the label map entry is consumed");
+
+  // An end event with an unknown toolCallId falls back to the tool name.
+  const unknown = translateReviewEvent(
+    {
+      type: "tool_execution_end",
+      toolCallId: "nope",
+      toolName: "grep",
+      isError: true,
+    },
+    labels,
+  );
+  assert.deepEqual(unknown, [
+    { op: "new", kind: "tool", text: "▸ grep failed" },
+  ]);
+});
+
+test("formatActionLabel: key argument, truncation, junk input", () => {
+  assert.equal(
+    formatActionLabel("read", { path: "src/app.ts" }),
+    "read: src/app.ts",
+  );
+  assert.equal(
+    formatActionLabel("review_bash", { command: "git log -5\nmore" }),
+    "review_bash: git log -5",
+  );
+  assert.equal(
+    formatActionLabel("grep", { pattern: "TODO", path: "src" }),
+    "grep: TODO (src)",
+  );
+  assert.equal(
+    formatActionLabel("review_submit_plan", { verdict: "approve", findings: [] }),
+    "review_submit_plan: verdict approve · 0 findings",
+  );
+  assert.equal(
+    formatActionLabel("review_pass_done", { pass: 2, verdict: "revise" }),
+    "review_pass_done: pass 2 · verdict revise",
+  );
+  assert.equal(
+    formatActionLabel("review_explore", {
+      tasks: [{ task: "check X" }, { task: "check Y" }],
+    }),
+    "review_explore: 2 tasks — check X",
+  );
+  assert.equal(formatActionLabel("read", {}), "read");
+  assert.equal(formatActionLabel(undefined, undefined), "tool");
+  assert.equal(formatActionLabel(42, null), "tool");
+  const long = formatActionLabel("review_bash", { command: "x".repeat(500) });
+  assert.ok(long.length <= 100, `label is truncated (${long.length})`);
+  assert.ok(long.endsWith("…"));
 });
 
 test("translateReviewEvent: never throws on malformed events", () => {
@@ -653,34 +846,39 @@ test("translateReviewEvent: never throws on malformed events", () => {
   }
 });
 
-test("ReviewTranscript: coalesces, bounds and clears", () => {
+test("ReviewTranscript: buffers action headers, bounds and clears", () => {
   const t = new ReviewTranscript(10);
   for (const d of ["Hello", " ", "world"]) {
-    t.ingest({
-      type: "message_update",
-      assistantMessageEvent: { type: "text_delta", delta: d },
-    });
+    assert.deepEqual(
+      t.ingest({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: d },
+      }),
+      [],
+    );
   }
-  assert.equal(t.size, 1, "deltas coalesce into one line");
-  assert.equal(t.toLines()[0].text, "Hello world");
+  assert.equal(t.size, 0, "prose never reaches the buffer");
 
   t.ingest({
-    type: "message_update",
-    assistantMessageEvent: { type: "thinking_delta", delta: "hmm" },
+    type: "tool_execution_start",
+    toolCallId: "a",
+    toolName: "read",
+    args: { path: "a.ts" },
   });
-  assert.equal(t.size, 2, "kind switch starts a new line");
+  t.ingest({
+    type: "tool_execution_start",
+    toolCallId: "b",
+    toolName: "ls",
+    args: { path: "src" },
+  });
+  assert.equal(t.size, 2, "each start is its own header line");
+  assert.deepEqual(t.toDisplayLines(), ["▸ read: a.ts", "▸ ls: src"]);
 
-  const fresh = new ReviewTranscript(10);
-  fresh.ingest({
-    type: "message_update",
-    assistantMessageEvent: { type: "text_delta", delta: "a\nb\nc" },
-  });
-  assert.deepEqual(
-    fresh.toDisplayLines(),
-    ["a", "b", "c"],
-    "newlines split for display only",
-  );
-  assert.equal(fresh.size, 1, "but stay one buffered line");
+  const coalesced = new ReviewTranscript(10);
+  coalesced.apply({ op: "append", kind: "tool", text: "▸ one" });
+  coalesced.apply({ op: "append", kind: "tool", text: " + two" });
+  assert.equal(coalesced.size, 1, "same-kind appends coalesce");
+  assert.equal(coalesced.toLines()[0].text, "▸ one + two");
 
   const bounded = new ReviewTranscript(5);
   for (let i = 0; i < 20; i++) {
@@ -747,7 +945,6 @@ test("review_bash: refuses every mutation vector, allows reads", async () => {
     "npm install left-pad",
     "git commit -m x",
     "git push",
-    "node --test",
   ]) {
     const r = await call(bad);
     assert.equal(r.isError, true, `${bad} must be refused`);
@@ -761,10 +958,11 @@ test("review_bash: refuses every mutation vector, allows reads", async () => {
     "git diff HEAD",
     "rg TODO src",
     "cat package.json",
+    "node --test",
   ]) {
     assert.equal((await call(good)).isError, undefined);
   }
-  assert.equal(ran.length, 5);
+  assert.equal(ran.length, 6);
 });
 
 test("review_bash: reports shell failures instead of throwing", async () => {
@@ -1077,7 +1275,10 @@ test("applySubmittedPlan: writes Plan Mode's own path, guards .pi/plans", () => 
   const notes: string[] = [];
   const pi = { appendEntry: (t: string, d?: unknown) => entries.push([t, d]) };
 
-  const rel = path.join(".pi", "plans", "2026-09-18-csv.md");
+  // Date-dependent on purpose: the plan path must be today's, so a stale
+  // prefix is corrected to today (never a hard-coded date, which went stale).
+  const today = getUtcDatePrefix();
+  const rel = path.join(".pi", "plans", `${today}-csv.md`);
   const r = applySubmittedPlan({
     cwd,
     planPath: rel,
@@ -1092,7 +1293,7 @@ test("applySubmittedPlan: writes Plan Mode's own path, guards .pi/plans", () => 
     notify: (m) => notes.push(m),
   });
   assert.equal(r.ok, true);
-  assert.equal(path.basename(r.path), "2026-09-18-csv.md");
+  assert.equal(path.basename(r.path), `${today}-csv.md`);
   assert.ok(
     fs.existsSync(path.join(cwd, rel)),
     "nested dir created and file written",
@@ -1115,7 +1316,7 @@ test("applySubmittedPlan: writes Plan Mode's own path, guards .pi/plans", () => 
     pi,
   });
   assert.equal(stale.corrected, true);
-  assert.equal(path.basename(stale.path), "2026-09-18-csv.md");
+  assert.equal(path.basename(stale.path), `${today}-csv.md`);
 
   // Defense in depth: never write outside .pi/plans/.
   for (const escape of ["src/app.ts", "notes.md", path.join("..", "evil.md")]) {
@@ -1236,13 +1437,20 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
     },
   };
 
+  const customTools = [
+    { name: "review_bash" },
+    { name: "review_explore" },
+    { name: "review_submit_plan" },
+    { name: "review_pass_done" },
+  ];
+
   const res = await createReviewSession({
     cwd: "/proj",
     agentDir: "/agent",
     modelRef: { provider: "p", id: "m", thinking: "xhigh" },
     findModel: () => ({}),
     reviewPrompt: "USER GUIDANCE",
-    customTools: [{ name: "review_bash" }],
+    customTools,
     loadSdk: async () => sdk as never,
   });
 
@@ -1260,14 +1468,23 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
     true,
   );
   assert.deepEqual(captured.loaderOpts?.appendSystemPrompt, ["USER GUIDANCE"]);
-  assert.deepEqual(
-    captured.sessionOpts?.tools,
-    [...REVIEW_BUILTIN_TOOLS],
-    "read-only built-ins",
-  );
-  assert.ok(!(captured.sessionOpts?.tools as string[]).includes("edit"));
-  assert.ok(!(captured.sessionOpts?.tools as string[]).includes("write"));
-  assert.ok(!(captured.sessionOpts?.tools as string[]).includes("bash"));
+  // The allowlist MUST carry the reviewer's own tools: `tools` filters custom
+  // tools too, so a built-ins-only list silently removes review_submit_plan and
+  // every review ends in a fallback (the bug this test guards).
+  const allowlist = captured.sessionOpts?.tools as string[];
+  assert.deepEqual(allowlist, reviewToolAllowlist(customTools));
+  for (const name of REVIEW_BUILTIN_TOOLS) {
+    assert.ok(allowlist.includes(name), `${name} stays enabled`);
+  }
+  for (const tool of customTools) {
+    assert.ok(
+      allowlist.includes(tool.name),
+      `${tool.name} must be in the allowlist or the SDK filters it out`,
+    );
+  }
+  assert.ok(!allowlist.includes("edit"));
+  assert.ok(!allowlist.includes("write"));
+  assert.ok(!allowlist.includes("bash"));
   assert.equal(
     captured.markerDuringCreate,
     "1",
@@ -1278,6 +1495,129 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
     undefined,
     "marker restored after create",
   );
+});
+
+test("reviewToolAllowlist: built-ins plus every custom tool, junk-tolerant", () => {
+  assert.deepEqual(reviewToolAllowlist([]), [...REVIEW_BUILTIN_TOOLS]);
+  assert.deepEqual(reviewToolAllowlist(undefined), [...REVIEW_BUILTIN_TOOLS]);
+  assert.deepEqual(
+    reviewToolAllowlist([
+      { name: "review_submit_plan" },
+      { name: "review_pass_done" },
+    ]),
+    [...REVIEW_BUILTIN_TOOLS, "review_submit_plan", "review_pass_done"],
+  );
+  // Duplicates collapse; junk never becomes a tool name.
+  assert.deepEqual(
+    reviewToolAllowlist([
+      { name: "read" },
+      { name: "  " },
+      { name: 7 },
+      null,
+      42,
+      {},
+    ]),
+    [...REVIEW_BUILTIN_TOOLS],
+  );
+});
+
+/**
+ * An SDK stub that applies Pi's REAL allowlist rule (built-ins and custom tools
+ * are filtered by `tools`) and reports the survivors via getActiveToolNames.
+ */
+function allowlistSdk(activeOverride?: string[]): {
+  requested: () => string[];
+  sdk: unknown;
+} {
+  let requested: string[] = [];
+  const sdk = {
+    ModelRuntime: { create: async () => ({}) },
+    DefaultResourceLoader: class {
+      async reload() {}
+    },
+    SessionManager: { inMemory: () => ({}) },
+    createAgentSession: async (opts: {
+      tools?: string[];
+      customTools?: Array<{ name: string }>;
+    }) => {
+      requested = [...(opts.tools ?? [])];
+      const allow = new Set(requested);
+      const active =
+        activeOverride ??
+        [
+          ...FAKE_BUILTIN_TOOLS,
+          ...(opts.customTools ?? []).map((t) => t.name),
+        ].filter((n) => allow.has(n));
+      return {
+        session: {
+          subscribe: () => () => {},
+          prompt: async () => {},
+          followUp: async () => {},
+          abort: async () => {},
+          isStreaming: false,
+          getActiveToolNames: () => active.slice(),
+          bindExtensions: async () => {},
+        },
+      };
+    },
+  };
+  return { requested: () => requested, sdk };
+}
+
+const REVIEW_TOOL_NAMES = [
+  "review_bash",
+  "review_explore",
+  "review_submit_plan",
+  "review_pass_done",
+];
+
+test("REGRESSION: the reviewer's tools survive the session tool allowlist", async () => {
+  const { requested, sdk } = allowlistSdk();
+  const res = await createReviewSession({
+    cwd: "/p",
+    agentDir: "/a",
+    modelRef: { provider: "p", id: "m", thinking: "high" },
+    findModel: () => ({}),
+    reviewPrompt: "x",
+    customTools: REVIEW_TOOL_NAMES.map((name) => ({ name })),
+    loadSdk: async () => sdk as never,
+  });
+
+  assert.equal(res.ok, true, res.error);
+  for (const name of [...REVIEW_BUILTIN_TOOLS, ...REVIEW_TOOL_NAMES]) {
+    assert.ok(
+      requested().includes(name),
+      `${name} must be in the tools allowlist`,
+    );
+    assert.ok(
+      res.activeTools?.includes(name),
+      `${name} must be active in the child session`,
+    );
+  }
+  // Reverting to a built-ins-only allowlist makes the stub drop the reviewer's
+  // tools, so every assertion above fails — i.e. this reproduces the bug.
+  assert.equal(
+    res.activeTools?.length,
+    REVIEW_BUILTIN_TOOLS.length + REVIEW_TOOL_NAMES.length,
+  );
+});
+
+test("createReviewSession: fails fast when the SDK drops a reviewer tool", async () => {
+  const { sdk } = allowlistSdk([...REVIEW_BUILTIN_TOOLS]);
+  const res = await createReviewSession({
+    cwd: "/p",
+    agentDir: "/a",
+    modelRef: { provider: "p", id: "m", thinking: "high" },
+    findModel: () => ({}),
+    reviewPrompt: "x",
+    customTools: REVIEW_TOOL_NAMES.map((name) => ({ name })),
+    loadSdk: async () => sdk as never,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.session, undefined);
+  assert.match(res.error ?? "", /not active/);
+  assert.match(res.error ?? "", /review_submit_plan/);
 });
 
 test("createReviewSession: reports failures instead of throwing", async () => {
@@ -1405,8 +1745,17 @@ interface FakeCapture {
   prompts: string[];
   followUps: string[];
   tools: Record<string, { execute: (...args: unknown[]) => Promise<unknown> }>;
+  /** The `tools` allowlist the runtime passed to createAgentSession. */
+  toolAllowlist: string[];
+  /** Tool names the child session reports as enabled. */
+  activeTools: string[];
+  /** How many times the child's `abort()` was called. */
+  aborts: number;
   unsubscribeCount: number;
 }
+
+/** Built-in tool names the SDK registers before the allowlist is applied. */
+const FAKE_BUILTIN_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
 
 /**
  * A fake SDK whose "model" invokes the real review tools.
@@ -1414,6 +1763,12 @@ interface FakeCapture {
  * This exercises the genuine orchestration path — tool wiring, the round gate,
  * the pass 1 → pass 2 advance, the fallback on timeout, and teardown — without
  * a provider, a network call, or a real child session.
+ *
+ * It also reproduces the SDK behaviour that caused the "reviewer can never
+ * submit" bug (see `reviewToolAllowlist`): `tools` is a GLOBAL allowlist applied
+ * to built-in AND custom tools, and `getActiveToolNames()` reports the result.
+ * Finishing a run emits `agent_settled`, exactly like a real session does after
+ * its post-run continuations, so the runtime's settle detection is exercised.
  */
 function fakeSdk(script: {
   pass1?: (c: FakeCapture) => Promise<void>;
@@ -1424,6 +1779,9 @@ function fakeSdk(script: {
     prompts: [],
     followUps: [],
     tools: {},
+    toolAllowlist: [],
+    activeTools: [],
+    aborts: 0,
     unsubscribeCount: 0,
   };
   const sdk = {
@@ -1437,28 +1795,97 @@ function fakeSdk(script: {
       execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
     }),
     createAgentSession: async (opts: {
+      tools?: string[];
       customTools?: Array<{ name: string }>;
     }) => {
       if (script.shouldThrowOnCreate) throw new Error("session create failed");
+      capture.toolAllowlist = [...(opts.tools ?? [])];
       for (const t of opts.customTools ?? []) {
         capture.tools[t.name] = t as never;
       }
+      // Pi's real rule: only names in `tools` survive, built-in or custom.
+      const allow = opts.tools ? new Set(opts.tools) : undefined;
+      const registered = new Set<string>([
+        ...FAKE_BUILTIN_TOOLS,
+        ...Object.keys(capture.tools),
+      ]);
+      capture.activeTools = [...registered].filter(
+        (n) => !allow || allow.has(n),
+      );
+
+      const listeners: Array<(event: unknown) => void> = [];
+      const emit = (event: unknown): void => {
+        for (const l of [...listeners]) l(event);
+      };
       return {
         session: {
-          subscribe: () => {
+          subscribe: (listener: (event: unknown) => void) => {
             capture.unsubscribeCount += 1;
-            return () => {};
+            listeners.push(listener);
+            return () => {
+              const i = listeners.indexOf(listener);
+              if (i >= 0) listeners.splice(i, 1);
+            };
           },
           prompt: async (text: string) => {
             capture.prompts.push(text);
-            await script.pass1?.(capture);
+            emit({
+              type: "tool_execution_start",
+              toolCallId: "t1",
+              toolName: "read",
+              args: { path: "plan.md" },
+            });
+            emit({
+              type: "tool_execution_end",
+              toolCallId: "t1",
+              toolName: "read",
+              isError: false,
+            });
+            emit({
+              type: "message_update",
+              assistantMessageEvent: {
+                type: "text_delta",
+                delta: "reviewing…\n",
+              },
+            });
+            try {
+              await script.pass1?.(capture);
+            } finally {
+              emit({ type: "agent_settled" });
+            }
           },
           followUp: async (text: string) => {
             capture.followUps.push(text);
-            await script.pass2?.(capture);
+            emit({
+              type: "tool_execution_start",
+              toolCallId: "t2",
+              toolName: "grep",
+              args: { pattern: "TODO" },
+            });
+            emit({
+              type: "tool_execution_end",
+              toolCallId: "t2",
+              toolName: "grep",
+              isError: false,
+            });
+            emit({
+              type: "message_update",
+              assistantMessageEvent: {
+                type: "text_delta",
+                delta: "verifying…\n",
+              },
+            });
+            try {
+              await script.pass2?.(capture);
+            } finally {
+              emit({ type: "agent_settled" });
+            }
           },
-          abort: async () => {},
+          abort: async () => {
+            capture.aborts += 1;
+          },
           isStreaming: false,
+          getActiveToolNames: () => capture.activeTools.slice(),
           bindExtensions: async () => {},
         },
       };
@@ -1473,6 +1900,7 @@ function runtimeDeps(
     config?: Record<string, unknown>;
     reviewerModel?: unknown;
     onState?: (s: unknown) => void;
+    onTranscriptOps?: (ops: unknown[]) => void;
   } = {},
 ) {
   const writes: Array<{ planText: string; verdict: string; round: number }> =
@@ -1483,11 +1911,9 @@ function runtimeDeps(
     agentDir: "/agent",
     config: () => ({
       enabled: true,
-      parallel: true,
       rounds: 1,
       passes: 2,
       verify: true,
-      autoOpenPane: true,
       fallbackOnError: "skip" as const,
       exploreBudget: 3,
       timeoutMs: 5000,
@@ -1513,8 +1939,18 @@ function runtimeDeps(
     promptText: () => "Always align with the existing project framework.",
     loadSdk: async () => sdk as never,
   };
-  if (over.onState) {
-    return { deps: { ...deps, onState: over.onState }, writes, logs };
+  if (over.onState || over.onTranscriptOps) {
+    return {
+      deps: {
+        ...deps,
+        ...(over.onState ? { onState: over.onState } : {}),
+        ...(over.onTranscriptOps
+          ? { onTranscriptOps: over.onTranscriptOps }
+          : {}),
+      },
+      writes,
+      logs,
+    };
   }
   return { deps, writes, logs };
 }
@@ -1619,6 +2055,77 @@ test("runtime: full round wires all tools, verifies, and returns the rewrite", a
   assert.equal(rt.getState(), undefined);
 });
 
+test("runtime: isRoundActive tracks the round, not the session", async () => {
+  const { sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+
+  assert.equal(rt.isRoundActive(), false, "idle before any round");
+  const round = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(rt.isRoundActive(), true, "active while runRound is in flight");
+  await round;
+  assert.equal(rt.isRoundActive(), false, "cleared once the round returns");
+  assert.equal(rt.isAlive(), true, "the session survives the round");
+  await rt.teardown();
+});
+
+test("runtime: transcript ops stream to the parent; a throwing sink is harmless", async () => {
+  const { sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const seen: Array<{ op?: string; kind?: string; text?: string }> = [];
+  const good = runtimeDeps(sdk, {
+    onTranscriptOps: (ops) => seen.push(...(ops as typeof seen)),
+  });
+  const rtGood = createReviewRuntime(good.deps as never);
+  const res = await rtGood.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(res.ok, true);
+  assert.ok(seen.length > 0, "the parent received transcript ops");
+  assert.ok(
+    seen.some((op) => op.op === "new" && op.kind === "tool"),
+    "action headers are surfaced",
+  );
+  assert.ok(
+    !seen.some((op) => op.kind === "text" || op.kind === "thinking"),
+    "prose and reasoning never reach the parent",
+  );
+  assert.ok(
+    rtGood.getTranscript().join("\n").includes("read: plan.md"),
+    "the transcript buffer is fed with the action header",
+  );
+  await rtGood.teardown();
+
+  const bad = runtimeDeps(sdk, {
+    onTranscriptOps: () => {
+      throw new Error("sink boom");
+    },
+  });
+  const rtBad = createReviewRuntime(bad.deps as never);
+  const res2 = await rtBad.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(
+    res2.ok,
+    true,
+    "a throwing display sink must not break the review",
+  );
+  await rtBad.teardown();
+});
+
 test("runtime: skips verification when findings are low severity or verify is off", async () => {
   const lowFinding = { ...HIGH_FINDING, severity: 3, confidence: 40 };
   const lowScript = fakeSdk({
@@ -1676,9 +2183,40 @@ test("runtime: skips verification when findings are low severity or verify is of
   );
 });
 
-test("runtime: a silent reviewer falls back to the author's plan, bounded (R7)", async () => {
+test("runtime: a reviewer that ends its run without submitting fails fast, not after the timeout", async () => {
   const silent = fakeSdk({ pass1: async () => {} });
+  // A long timeout proves the failure comes from the run settling, not a clock.
   const { deps, logs } = runtimeDeps(silent.sdk, {
+    config: { timeoutMs: 60_000 },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const t0 = Date.now();
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.equal(res.ok, false);
+  assert.equal(res.fallback, true);
+  assert.equal(
+    res.planText,
+    ORIGINAL_PLAN,
+    "author's plan is preserved verbatim",
+  );
+  assert.ok(elapsed < 1000, `settled immediately (took ${elapsed}ms)`);
+  assert.match(res.reason ?? "", /without submitting/);
+  assert.ok(
+    !logs.some((l) => l.includes("timed out") || l.includes("hit its")),
+    "no timeout is burned on a run that already ended",
+  );
+  assert.ok(silent.capture.aborts >= 1, "the abandoned run is cancelled");
+});
+
+test("runtime: a hung reviewer run is bounded by timeoutMs and aborted", async () => {
+  const hung = fakeSdk({ pass1: () => new Promise<void>(() => {}) });
+  const { deps, logs } = runtimeDeps(hung.sdk, {
     config: { timeoutMs: 1200 },
   });
   const rt = createReviewRuntime(deps as never);
@@ -1688,18 +2226,76 @@ test("runtime: a silent reviewer falls back to the author's plan, bounded (R7)",
     planPath: "p.md",
     round: 1,
   });
+  const elapsed = Date.now() - t0;
+
   assert.equal(res.ok, false);
   assert.equal(res.fallback, true);
-  assert.equal(
-    res.planText,
-    ORIGINAL_PLAN,
-    "author's plan is preserved verbatim",
-  );
-  assert.ok(Date.now() - t0 < 4000, "no hang");
+  assert.equal(res.planText, ORIGINAL_PLAN);
   assert.ok(
-    logs.some((l) => l.includes("timed out")),
-    "timeout is reported",
+    elapsed >= 900 && elapsed < 5000,
+    `bounded by the timeout (took ${elapsed}ms)`,
   );
+  assert.match(res.reason ?? "", /did not finish within/);
+  assert.ok(logs.some((l) => l.includes("hit its")), "the limit is reported");
+  assert.ok(hung.capture.aborts >= 1, "the stalled run is cancelled");
+});
+
+test("runtime: a submission made before a stalled run is still used", async () => {
+  const stalled = fakeSdk({
+    pass1: async (c) => {
+      await c.tools.review_submit_plan.execute(
+        "1",
+        {
+          planMarkdown: REWRITTEN_PLAN,
+          findings: [],
+          verdict: "approve",
+          summary: "sound",
+        },
+        undefined,
+        undefined,
+        {},
+      );
+      await new Promise<void>(() => {}); // the model never ends its turn
+    },
+  });
+  const { deps, logs } = runtimeDeps(stalled.sdk, {
+    config: { timeoutMs: 1200, verify: false },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.fallback, false);
+  assert.ok(
+    res.planText.includes("Result<string, ExportError>"),
+    "the submitted plan is used, not the author's",
+  );
+  assert.ok(
+    logs.some((l) => l.includes("exceeded its time limit after submitting")),
+    "the slow pass is reported",
+  );
+  assert.ok(stalled.capture.aborts >= 1, "the run is cancelled after handing off");
+});
+
+test("runtime: a round with no plan path never starts the reviewer", async () => {
+  const unused = fakeSdk({});
+  const { deps } = runtimeDeps(unused.sdk);
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "",
+    round: 1,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.fallback, true);
+  assert.match(res.reason ?? "", /no plan path/);
+  assert.equal(unused.capture.prompts.length, 0, "no reviewer run is spent");
+  assert.equal(rt.isAlive(), false);
 });
 
 test("runtime: missing reviewer model and failed session creation both fall back cleanly", async () => {
@@ -1728,7 +2324,7 @@ test("runtime: missing reviewer model and failed session creation both fall back
 });
 
 test("runtime: abort releases a waiting round without losing the author's plan", async () => {
-  const silent = fakeSdk({ pass1: async () => {} });
+  const silent = fakeSdk({ pass1: () => new Promise<void>(() => {}) });
   const { deps } = runtimeDeps(silent.sdk, { config: { timeoutMs: 8000 } });
   const rt = createReviewRuntime(deps as never);
   const running = rt.runRound({
@@ -1741,6 +2337,57 @@ test("runtime: abort releases a waiting round without losing the author's plan",
   const res = await running;
   assert.equal(res.ok, false);
   assert.equal(res.fallback, true);
+});
+
+test("runtime: with no cap a hung reviewer never auto-fails; abort still ends the round", async () => {
+  const hung = fakeSdk({ pass1: () => new Promise<void>(() => {}) });
+  const { deps, logs } = runtimeDeps(hung.sdk, { config: { timeoutMs: 0 } });
+  const rt = createReviewRuntime(deps as never);
+  let settled = false;
+  const running = rt
+    .runRound({ planText: ORIGINAL_PLAN, planPath: "p.md", round: 1 })
+    .then((r) => {
+      settled = true;
+      return r;
+    });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(settled, false, "no timer fires when the cap is disabled");
+  assert.ok(
+    logs.some((l) => l.includes("no time limit configured")),
+    "unlimited mode is reported",
+  );
+  await rt.abortRound();
+  const res = await running;
+  assert.equal(res.ok, false);
+  assert.equal(res.fallback, true);
+  assert.equal(res.planText, ORIGINAL_PLAN, "the author's plan is kept");
+  assert.ok(hung.capture.aborts >= 1, "the stalled run is cancelled");
+});
+
+test("review gate: a wait with no timeout resolves only when the pass ends", async () => {
+  const gate = createReviewRoundGate();
+  let resolved = false;
+  const waiting = gate.waitForPassDone(undefined).then((r) => {
+    resolved = true;
+    return r;
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(resolved, false, "no timer can resolve an uncapped wait");
+  gate.notifyPassDone({
+    pass: 1,
+    verdict: "approve",
+    findings: [],
+    at: Date.now(),
+  });
+  const result = await waiting;
+  assert.equal(result?.verdict, "approve");
+
+  const timed = createReviewRoundGate();
+  assert.equal(
+    await timed.waitForPassDone(20),
+    undefined,
+    "a configured cap still expires the wait",
+  );
 });
 
 test("buildPass1Prompt / buildPass2Prompt contain the contract, not the reviewer's private context", () => {

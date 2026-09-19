@@ -1,103 +1,19 @@
 /**
  * Shared utils for workflow extension — copied from plan-mode example
  * Pure functions, testable. Deliberately dependency-free (no Pi / pi-tui
- * imports) so it stays loadable in plain Node tests. TUI composition helpers
- * live in review-pane.ts instead.
+ * imports) so it stays loadable in plain Node tests.
  */
 
-const DESTRUCTIVE_PATTERNS = [
-  /\brm\b/i,
-  /\brmdir\b/i,
-  /\bmv\b/i,
-  /\bcp\b/i,
-  /\bmkdir\b/i,
-  /\btouch\b/i,
-  /\bchmod\b/i,
-  /\bchown\b/i,
-  /\bchgrp\b/i,
-  /\bln\b/i,
-  /\btee\b/i,
-  /\btruncate\b/i,
-  /\bdd\b/i,
-  /\bshred\b/i,
-  /(^|[^<])>(?!>)/,
-  />>/,
-  /\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
-  /\byarn\s+(add|remove|install|publish)/i,
-  /\bpnpm\s+(add|remove|install|publish)/i,
-  /\bpip\s+(install|uninstall)/i,
-  /\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
-  /\bbrew\s+(install|uninstall|upgrade)/i,
-  /\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
-  /\bsudo\b/i,
-  /\bsu\b/i,
-  /\bkill\b/i,
-  /\bpkill\b/i,
-  /\bkillall\b/i,
-  /\breboot\b/i,
-  /\bshutdown\b/i,
-  /\bsystemctl\s+(start|stop|restart|enable|disable)/i,
-  /\bservice\s+\S+\s+(start|stop|restart)/i,
-  /\b(vim?|nano|emacs|code|subl)\b/i,
-];
+import { isCommandAllowedForRole } from "./permissions.ts";
 
-const SAFE_PATTERNS = [
-  /^\s*cat\b/,
-  /^\s*head\b/,
-  /^\s*tail\b/,
-  /^\s*less\b/,
-  /^\s*more\b/,
-  /^\s*grep\b/,
-  /^\s*find\b/,
-  /^\s*ls\b/,
-  /^\s*pwd\b/,
-  /^\s*echo\b/,
-  /^\s*printf\b/,
-  /^\s*wc\b/,
-  /^\s*sort\b/,
-  /^\s*uniq\b/,
-  /^\s*diff\b/,
-  /^\s*file\b/,
-  /^\s*stat\b/,
-  /^\s*du\b/,
-  /^\s*df\b/,
-  /^\s*tree\b/,
-  /^\s*which\b/,
-  /^\s*whereis\b/,
-  /^\s*type\b/,
-  /^\s*env\b/,
-  /^\s*printenv\b/,
-  /^\s*uname\b/,
-  /^\s*whoami\b/,
-  /^\s*id\b/,
-  /^\s*date\b/,
-  /^\s*cal\b/,
-  /^\s*uptime\b/,
-  /^\s*ps\b/,
-  /^\s*top\b/,
-  /^\s*htop\b/,
-  /^\s*free\b/,
-  /^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get)/i,
-  /^\s*git\s+ls-/i,
-  /^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
-  /^\s*yarn\s+(list|info|why|audit)/i,
-  /^\s*node\s+--version/i,
-  /^\s*python\s+--version/i,
-  /^\s*curl\s/i,
-  /^\s*wget\s+-O\s*-/i,
-  /^\s*jq\b/,
-  /^\s*sed\s+-n/i,
-  /^\s*awk\b/,
-  /^\s*rg\b/,
-  /^\s*fd\b/,
-  /^\s*bat\b/,
-  /^\s*eza\b/,
-];
-
+/**
+ * Backward-compatible alias for Plan Mode's command policy (read-only plus
+ * test/lint/typecheck). New code should call
+ * `isCommandAllowedForRole(role, command)` from `./permissions.ts` directly so
+ * the role is explicit.
+ */
 export function isSafeCommand(command: string): boolean {
-  const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
-  const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
-  return !isDestructive && isSafe;
+  return isCommandAllowedForRole("planner", command);
 }
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
@@ -1417,154 +1333,6 @@ export function planHash(planText: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
-}
-
-// ── ANSI-aware text layout for the dual-pane view ─────────────────────
-//
-// These live here (dependency-free) rather than in review-pane.ts so they can
-// be unit-tested without loading pi-tui, and so the pane module adds no new
-// dependency surface to the package.
-
-/** CSI / OSC / single-char escape sequences. */
-const ANSI_SEQUENCE_RE =
-  /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/;
-
-/** Remove ANSI/OSC escapes, preserving visible text. */
-export function stripAnsi(s: string): string {
-  return String(s ?? "").replace(
-    /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g,
-    "",
-  );
-}
-
-/**
- * Rough East-Asian-wide / emoji test. Deliberately coarse: one column of drift
- * on an exotic glyph is invisible next to a 100%-wide overlay, and a full
- * Unicode wcwidth table is not worth its weight here.
- */
-function isWideCodePoint(cp: number): boolean {
-  return (
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe6f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x1f300 && cp <= 0x1faff) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-  );
-}
-
-/** Display width of a string, ignoring ANSI escapes and counting wide glyphs as 2. */
-export function displayWidth(s: string): number {
-  let w = 0;
-  for (const ch of stripAnsi(s)) {
-    const cp = ch.codePointAt(0) ?? 0;
-    w += isWideCodePoint(cp) ? 2 : 1;
-  }
-  return w;
-}
-
-/**
- * Truncate to a display width, preserving ANSI escapes that appear before the
- * cut and appending a reset so a truncated coloured line cannot bleed its
- * colour into the next column.
- */
-export function truncateAnsi(s: string, width: number, ellipsis = "…"): string {
-  const str = String(s ?? "");
-  if (width <= 0) return "";
-  if (displayWidth(str) <= width) return str;
-  const ellipsisWidth = displayWidth(ellipsis);
-  const budget = Math.max(0, width - ellipsisWidth);
-  let out = "";
-  let used = 0;
-  let i = 0;
-  while (i < str.length) {
-    const rest = str.slice(i);
-    const esc = rest.match(ANSI_SEQUENCE_RE);
-    if (esc && esc.index === 0) {
-      out += esc[0];
-      i += esc[0].length;
-      continue;
-    }
-    const cp = str.codePointAt(i);
-    if (cp === undefined) break;
-    const ch = String.fromCodePoint(cp);
-    const cw = isWideCodePoint(cp) ? 2 : 1;
-    if (used + cw > budget) break;
-    out += ch;
-    used += cw;
-    i += ch.length;
-  }
-  return `${out}\x1b[0m${ellipsis}`;
-}
-
-/** Pad or truncate one line to exactly `width` display columns. */
-export function padAnsi(s: string, width: number): string {
-  const str = String(s ?? "");
-  if (width <= 0) return "";
-  const w = displayWidth(str);
-  if (w > width) return truncateAnsi(str, width);
-  if (w === width) return str;
-  return str + " ".repeat(width - w);
-}
-
-/**
- * Compose two rendered line buffers into side-by-side rows.
- *
- * This is how the Review Workspace gets a real two-column layout on pi's
- * default TUI: `HStack`/`VStack` constrained regions only work on the
- * experimental `tuiMode: "fullscreen"` alt-screen (see pi-tui's README), so the
- * panes are composed manually and each column owns its own scroll offset.
- */
-export function composeTwoColumn(
-  left: string[],
-  right: string[],
-  leftWidth: number,
-  rightWidth: number,
-  gap = 2,
-): string[] {
-  const rows = Math.max(left.length, right.length);
-  const gapStr = " ".repeat(Math.max(0, gap));
-  const out: string[] = [];
-  for (let i = 0; i < rows; i++) {
-    out.push(
-      padAnsi(left[i] ?? "", leftWidth) +
-        gapStr +
-        padAnsi(right[i] ?? "", rightWidth),
-    );
-  }
-  return out;
-}
-
-export interface ViewportSlice {
-  lines: string[];
-  /** Clamped offset actually used. */
-  offset: number;
-  maxOffset: number;
-}
-
-/**
- * Clamp a scroll offset and slice a viewport out of a line buffer.
- * `followEnd` pins the view to the newest content (live streaming).
- */
-export function sliceViewport(
-  lines: string[],
-  offset: number,
-  height: number,
-  followEnd = false,
-): ViewportSlice {
-  const all = Array.isArray(lines) ? lines : [];
-  const h = Math.max(0, Math.trunc(height) || 0);
-  const maxOffset = Math.max(0, all.length - h);
-  const requested = followEnd ? maxOffset : Math.trunc(offset) || 0;
-  const off = Math.max(0, Math.min(maxOffset, requested));
-  return {
-    lines: h === 0 ? [] : all.slice(off, off + h),
-    offset: off,
-    maxOffset,
-  };
 }
 
 // ── Context pruning for the reviewer session ────────────────────────

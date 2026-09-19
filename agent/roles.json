@@ -48,7 +48,7 @@
       "description": "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
       "model": {
         "provider": "opencode-go",
-        "id": "muse-spark-1.3-contributor",
+        "id": "glm-5.3-flash",
         "thinking": "xhigh"
       },
       "tools": [

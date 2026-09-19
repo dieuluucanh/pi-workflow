@@ -45,7 +45,6 @@ import {
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  isSafeCommand,
   extractTodoItems,
   extractPlanStepsFromMarkdown,
   markCompletedRefs,
@@ -81,6 +80,14 @@ import {
   type TodoUpdateEntry,
 } from "./utils.ts";
 import {
+  WORKFLOW_ROLE_ENV,
+  isCommandAllowedForRole,
+  policyForRole,
+  resolveSessionRole,
+  subagentEnv,
+  type WorkflowRole,
+} from "./permissions.ts";
+import {
   isGitRepo,
   isGitRepoSync,
   createCheckpoint,
@@ -91,7 +98,8 @@ import {
 } from "./checkpoint.ts";
 import {
   defaultRoleConfig,
-  loadRoleConfig,
+  loadRoleConfigDetailed,
+  rolesFingerprint,
   saveRoleConfig,
   getRole,
   formatRolesForDisplay,
@@ -109,18 +117,30 @@ import {
 } from "./roles.ts";
 import {
   applySubmittedPlan,
+  formatReviewStatusLines,
+  formatReviewTimeoutLabel,
+  parseReviewTimeoutArg,
   planHash,
   readReviewModeConfig,
   resolveReviewPrompt,
   reviewStateSummary,
+  shouldRouteInputToReviewer,
   writeReviewModeConfig,
   writeReviewPrompt,
-  ReviewTranscript,
   type ReviewFinding,
   type ReviewState,
+  type ReviewTranscriptOp,
 } from "./review.ts";
 import { createReviewRuntime, type ReviewRuntime } from "./review-runtime.ts";
-import { openReviewPane } from "./review-pane.ts";
+import {
+  createReviewBandGate,
+  createReviewLineBuffer,
+  registerReviewEntryRenderers,
+  REVIEW_MODE_ENTRY_TYPE,
+  REVIEW_TRANSCRIPT_ENTRY_TYPE,
+  type ReviewLineBuffer,
+  type ReviewModeBandData,
+} from "./review-ui.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -158,6 +178,8 @@ interface AgentConfig {
   thinking?: string;
   systemPrompt: string;
   filePath: string;
+  /** Workflow role the spawned child is gated as (e.g. "explorer"). */
+  role?: WorkflowRole;
 }
 function discoverAgents(cwd: string): AgentConfig[] {
   const agents: AgentConfig[] = [];
@@ -260,6 +282,9 @@ async function runSingleAgent(
         cwd,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
+        // Carry the role into the child so its workflow extension gates bash
+        // with the same policy the parent applies (see permissions.ts).
+        env: subagentEnv(process.env, agent.role),
       },
     );
     // Track for cleanup on session_shutdown — prevents orphaned subagents
@@ -336,6 +361,9 @@ function getFinalOutput(messages: any[]): string {
 // ── Main Extension ───────────────────────────────────────────────────
 
 export default function workflowExtension(pi: ExtensionAPI) {
+  // Review Mode streams the reviewer's output into the main transcript as
+  // display-only entries. Registering once here keeps /reload idempotent.
+  registerReviewEntryRenderers(pi);
   type WorkflowMode = "plan" | "build";
   let workflowMode: WorkflowMode | null = null;
   // overlay guard: true while any ctx.ui.custom overlay is active (questionnaire/rewind/decision gate)
@@ -380,12 +408,44 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Model roles state ──────────────────────────────────────────
   let roleConfig: RoleConfig = defaultRoleConfig();
   let roleConfigLoadedFor: string | undefined;
+  let roleConfigLoadedFingerprint: string | undefined;
+  /** Reason the last load fell back to in-memory defaults (warn once). */
+  let roleConfigFallbackReason: string | undefined;
+  let roleConfigFallbackNotified = false;
+
+  /**
+   * The single roles accessor. Reloads when the working directory changes or
+   * either roles.json changes on disk (mtime/size), so a `/role` edit made in
+   * another window is picked up without a `/reload`. Non-destructive: a bad or
+   * missing file is never overwritten (see loadRoleConfigDetailed).
+   */
   function ensureRoleConfig(cwd?: string): RoleConfig {
-    if (roleConfigLoadedFor === undefined) {
-      roleConfig = loadRoleConfig(cwd);
-      roleConfigLoadedFor = cwd ?? "";
+    const key = cwd ?? "";
+    const fingerprint = rolesFingerprint(key);
+    if (
+      roleConfigLoadedFor === key &&
+      roleConfigLoadedFingerprint === fingerprint
+    ) {
+      return roleConfig;
     }
+    const loaded = loadRoleConfigDetailed(key);
+    roleConfig = loaded.config;
+    roleConfigLoadedFor = key;
+    roleConfigLoadedFingerprint = fingerprint;
+    roleConfigFallbackReason = loaded.usedDefaults ? loaded.reason : undefined;
+    roleConfigFallbackNotified = false;
     return roleConfig;
+  }
+
+  /** Surface a roles fallback once per load, when a ctx is available. */
+  function notifyRoleConfigFallback(ctx?: ExtensionContext): void {
+    if (!roleConfigFallbackReason || roleConfigFallbackNotified) return;
+    roleConfigFallbackNotified = true;
+    try {
+      ctx?.ui.notify(`Roles: ${roleConfigFallbackReason}`, "warning");
+    } catch (_e) {
+      void _e;
+    }
   }
   function activeRoleLabel(): string {
     if (roleConfig.activeRole)
@@ -593,8 +653,117 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let reviewRound = 0;
   /** Findings carried into the next round so the reviewer can verify fixes. */
   let reviewPreviousFindings: ReviewFinding[] | undefined;
-  /** Closes the dual-pane overlay, if open (assigned by review-pane). */
-  let closeReviewPane: (() => void) | undefined;
+
+  // ── Review Mode: main-transcript stream ──────────────────────────
+  /** Coalesces reviewer ops into transcript entries; created on first use. */
+  let reviewEntryBuffer: ReviewLineBuffer | undefined;
+  let reviewFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Lines already appended to the transcript (bounded so it cannot flood). */
+  let reviewEmittedLines = 0;
+  let reviewTruncationNoted = false;
+  /** Suppresses a band identical to the newest one (Tab cycles / re-runs). */
+  const reviewBandGate = createReviewBandGate();
+  const REVIEW_FLUSH_MS = 400;
+  const MAX_REVIEW_EMITTED_LINES = 600;
+
+  function reviewStream(): ReviewLineBuffer {
+    if (!reviewEntryBuffer) reviewEntryBuffer = createReviewLineBuffer();
+    return reviewEntryBuffer;
+  }
+
+  /** Reviewer model label for the mode band (best-effort). */
+  function reviewModelLabel(): string {
+    ensureRoleConfig(reviewCwd());
+    const r = getRole(roleConfig, REVIEW_ROLE_NAME);
+    return r?.model ? formatModelRef(r.model) : "unconfigured";
+  }
+
+  /** Append a colored Plan/Review/Review-done band to the main transcript. */
+  function emitReviewBand(data: ReviewModeBandData): void {
+    if (!reviewBandGate.accept(data)) return; // identical to the newest band
+    try {
+      pi.appendEntry(REVIEW_MODE_ENTRY_TYPE, { ...data, at: Date.now() });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Flush buffered reviewer lines into one display-only transcript entry.
+   * `force` finalizes a still-growing line (round end / teardown).
+   */
+  function flushReviewEntries(force = false): void {
+    const buffer = reviewEntryBuffer;
+    if (!buffer) return;
+    let lines = force ? buffer.flush() : buffer.takeComplete();
+    if (lines.length === 0) return;
+    if (reviewEmittedLines >= MAX_REVIEW_EMITTED_LINES) {
+      if (!reviewTruncationNoted) {
+        reviewTruncationNoted = true;
+        try {
+          pi.appendEntry(REVIEW_TRANSCRIPT_ENTRY_TYPE, {
+            at: Date.now(),
+            lines: [
+              {
+                kind: "notice",
+                text: "… review output truncated in the transcript — see /review-status for the full findings",
+              },
+            ],
+          });
+        } catch (_e) {
+          void _e;
+        }
+      }
+      buffer.clear();
+      return;
+    }
+    const room = MAX_REVIEW_EMITTED_LINES - reviewEmittedLines;
+    const capped = lines.slice(0, room);
+    reviewEmittedLines += capped.length;
+    try {
+      pi.appendEntry(REVIEW_TRANSCRIPT_ENTRY_TYPE, {
+        at: Date.now(),
+        lines: capped,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Throttle flushes so a token stream cannot spam the transcript. */
+  function scheduleReviewFlush(): void {
+    if (reviewFlushTimer !== undefined) return;
+    reviewFlushTimer = setTimeout(() => {
+      reviewFlushTimer = undefined;
+      flushReviewEntries();
+    }, REVIEW_FLUSH_MS);
+    // Do not keep the process alive just for a display flush.
+    (reviewFlushTimer as { unref?: () => void })?.unref?.();
+  }
+
+  /** Buffer reviewer ops and schedule a throttled flush. */
+  function pushReviewOps(ops: ReviewTranscriptOp[]): void {
+    const buffer = reviewStream();
+    for (const op of ops) buffer.push(op);
+    scheduleReviewFlush();
+  }
+
+  /** Append a synthetic line (e.g. a note the user routed to the reviewer). */
+  function pushReviewNote(kind: "user" | "notice", text: string): void {
+    reviewStream().pushLine(kind, text);
+    flushReviewEntries(true);
+  }
+
+  /** Clear stream state (teardown / mode switch). */
+  function resetReviewStream(): void {
+    if (reviewFlushTimer !== undefined) {
+      clearTimeout(reviewFlushTimer);
+      reviewFlushTimer = undefined;
+    }
+    reviewEntryBuffer = undefined;
+    reviewEmittedLines = 0;
+    reviewTruncationNoted = false;
+  }
 
   const REVIEW_STATUS_WIDGET = "workflow-review-status";
 
@@ -685,6 +854,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           base?.systemPrompt ??
           "You are a READ-ONLY reconnaissance agent. Answer the question with file:line evidence. Never write files. Be concise.",
         filePath: base?.filePath ?? "",
+        role: "explorer",
       };
       if (m) agent.model = `${m.provider}/${m.id}`;
       if (m?.thinking) agent.thinking = m.thinking;
@@ -705,11 +875,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (reviewRuntime) return reviewRuntime;
     const cwd = reviewCwd();
     const agentDir = reviewAgentDir();
+    ensureRoleConfig(cwd);
     reviewRuntime = createReviewRuntime({
       cwd,
       agentDir,
       config: () => reviewConfigNow()?.config,
       reviewerModel: () => {
+        ensureRoleConfig(cwd);
         const reviewer = getRole(roleConfig, REVIEW_ROLE_NAME);
         if (reviewer?.model) return reviewer.model;
         // Graceful degradation: fall back to the planner model rather than
@@ -760,6 +932,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         reviewState = s;
         if (currentSessionCtx) updateReviewStatus(currentSessionCtx);
       },
+      onTranscriptOps: (ops) => pushReviewOps(ops),
     });
     return reviewRuntime;
   }
@@ -786,6 +959,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const unresolved = (reviewState?.findings ?? []).filter(
         (f) => f.disposition !== "rejected",
       );
+      emitReviewBand({
+        mode: "review-done",
+        reason: `round limit (${cfg.rounds}) reached`,
+      });
       if (unresolved.length === 0) return planText;
       const appendix = [
         "",
@@ -806,6 +983,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       return `${stripReviewAppendix(planText).replace(/\s+$/, "")}\n${appendix}`;
     }
 
+    emitReviewBand({
+      mode: "review",
+      round: reviewRound,
+      modelLabel: reviewModelLabel(),
+    });
+
     try {
       const rt = ensureReviewRuntime();
       const res = await rt.runRound({
@@ -814,6 +997,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         round: reviewRound,
         previousFindings: reviewPreviousFindings,
       });
+      flushReviewEntries(true);
       reviewState = res.state;
       updateReviewStatus(ctx);
       if (res.ok) {
@@ -822,18 +1006,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
           (f) => f.disposition !== "rejected",
         );
         reviewPreviousFindings = keep.length > 0 ? keep : undefined;
+        emitReviewBand({ mode: "review-done", verdict: res.state.verdict });
         return res.planText;
       }
       notifyReview(
         `review skipped (${res.reason ?? "unavailable"}) — handing over the plan unreviewed`,
         "warning",
       );
+      emitReviewBand({
+        mode: "review-done",
+        reason: res.reason ?? "unavailable",
+      });
       return planText;
     } catch (e: any) {
       notifyReview(
         `review failed (${String(e?.message ?? e)}) — handing over the plan unreviewed`,
         "warning",
       );
+      emitReviewBand({
+        mode: "review-done",
+        reason: `failed: ${String(e?.message ?? e)}`,
+      });
       return planText;
     }
   }
@@ -850,12 +1043,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
     lastReviewedPlanHash = undefined;
     reviewRound = 0;
     reviewPreviousFindings = undefined;
-    try {
-      closeReviewPane?.();
-    } catch (_e) {
-      void _e;
-    }
-    closeReviewPane = undefined;
+    flushReviewEntries(true);
+    resetReviewStream();
     try {
       currentSessionCtx?.ui.setWidget(REVIEW_STATUS_WIDGET, undefined);
     } catch (_e) {
@@ -863,129 +1052,115 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   }
 
-  // ── Review Mode: plan mirror + Review Workspace pane + commands ───
-
-  /**
-   * Mirror of the Plan Mode transcript for the left pane.
-   *
-   * Fed only while Review Mode is enabled, so when Review is off (the default)
-   * there is no buffering cost and no extra event work at all.
-   */
-  const planMirror = new ReviewTranscript(500);
-
-  function mirrorIfReviewEnabled(event: unknown): void {
-    if (!reviewEnabled()) return;
-    try {
-      planMirror.ingest(event);
-    } catch (_e) {
-      void _e;
-    }
-  }
-
-  pi.on("message_update", async (event) => {
-    mirrorIfReviewEnabled(event);
-  });
-  pi.on("tool_execution_start", async (event) => {
-    mirrorIfReviewEnabled(event);
-  });
-  pi.on("tool_execution_end", async (event) => {
-    mirrorIfReviewEnabled(event);
-  });
-
-  /** Open or close the dual-pane Review Workspace overlay. */
-  function toggleReviewPane(): void {
-    if (closeReviewPane) {
-      try {
-        closeReviewPane();
-      } catch (_e) {
-        void _e;
-      }
-      closeReviewPane = undefined;
-      return;
-    }
-    const ctx = currentSessionCtx;
-    if (!ctx) {
-      notifyReview("no active session to attach the pane to", "warning");
-      return;
-    }
-    if (!reviewEnabled()) {
-      notifyReview(
-        "Review Mode is off — enable it with /review-mode on to open the pane",
-        "warning",
-      );
-      return;
-    }
-    const rt = ensureReviewRuntime();
-    try {
-      const ctrl = openReviewPane(ctx, {
-        planLabel: () =>
-          currentPlanFile ? path.basename(currentPlanFile) : "(no plan yet)",
-        modelLabel: () => {
-          if (reviewState?.modelLabel) return reviewState.modelLabel;
-          const r = getRole(roleConfig, REVIEW_ROLE_NAME);
-          return r?.model ? formatModelRef(r.model) : "unconfigured";
-        },
-        statusLine: () => reviewStateSummary(reviewState) || "idle",
-        planLines: () => planMirror.toDisplayLines(),
-        reviewLines: () => rt.getTranscript(),
-        onAbort: () => {
-          void rt.abortRound();
-          notifyReview("aborted the in-flight review round", "warning");
-        },
-        onClosed: () => {
-          closeReviewPane = undefined;
-        },
-      });
-      closeReviewPane = () => ctrl.close();
-    } catch (e: any) {
-      notifyReview(
-        `could not open the pane: ${String(e?.message ?? e)}`,
-        "warning",
-      );
-    }
-  }
-
   pi.registerCommand("review-mode", {
     description:
-      "Toggle Review Mode (independent reviewer that audits and rewrites plans): /review-mode on|off|status",
+      "Toggle Review Mode (independent reviewer that audits and rewrites plans): /review-mode on|off|status|timeout",
     handler: async (args, ctx) => {
       const cwd = (ctx as any)?.cwd ?? process.cwd();
       const agentDir = reviewAgentDir();
-      const sub = String(args || "")
+      // Self-sufficient: never render a role that was never loaded from disk.
+      ensureRoleConfig(cwd);
+      notifyRoleConfigFallback(ctx as ExtensionContext);
+      const tokens = String(args || "")
         .trim()
-        .toLowerCase();
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "").toLowerCase();
+      // Scope is any explicit `global`/`project` token after the subcommand.
+      const scopeFor = (
+        fallback: "global" | "project",
+      ): "global" | "project" => {
+        for (const t of tokens.slice(1)) {
+          if (t === "global" || t === "project") return t;
+        }
+        return fallback;
+      };
 
       if (!sub || sub === "status") {
         const resolved = readReviewModeConfig(cwd, agentDir);
         const c = resolved.config;
-        const model = getRole(roleConfig, REVIEW_ROLE_NAME);
-        const lines = [
-          `Review Mode: ${c.enabled ? "ENABLED" : "disabled"}`,
-          `  reviewer model : ${model?.model ? `${formatModelRef(model.model)} (${model.model.thinking})` : "unconfigured — /role set reviewer <provider/model>"}`,
-          `  prompt         : ${resolveReviewPrompt(cwd, agentDir).source}`,
-          `  parallel       : ${c.parallel}   rounds: ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
-          `  explore budget : ${c.exploreBudget}   timeout: ${Math.round(c.timeoutMs / 1000)}s`,
-          `  sources        : global=${resolved.sources.global} project=${resolved.sources.project}`,
-          `  runtime        : ${reviewRuntime?.isAlive() ? "session active" : "not started"}`,
-          `  pane           : ${closeReviewPane ? "open" : "closed"}`,
-          "",
-          "Usage: /review-mode on|off [global|project] | /review-mode status | /review-prompt | /review-pane | /review-status | /review",
-        ];
-        ctx.ui.notify(lines.join("\n"), "info");
+        const model = getRole(roleConfig, REVIEW_ROLE_NAME)?.model;
+        ctx.ui.notify(
+          formatReviewStatusLines({
+            enabled: c.enabled,
+            config: c,
+            timeoutSource: resolved.sources.timeout,
+            reviewer: model
+              ? {
+                  provider: model.provider,
+                  id: model.id,
+                  thinking: model.thinking,
+                }
+              : undefined,
+            promptSource: resolveReviewPrompt(cwd, agentDir).source,
+            sources: {
+              global: resolved.sources.global,
+              project: resolved.sources.project,
+            },
+            runtime: reviewRuntime?.isRoundActive()
+              ? "reviewing"
+              : reviewRuntime?.isAlive()
+                ? "session active"
+                : "not started",
+          }).join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "timeout") {
+        const scope = scopeFor("global");
+        const rawValue = tokens
+          .slice(1)
+          .find((t) => t !== "global" && t !== "project");
+        if (rawValue === undefined) {
+          const resolved = readReviewModeConfig(cwd, agentDir);
+          ctx.ui.notify(
+            [
+              `Review Mode timeout: ${formatReviewTimeoutLabel(
+                resolved.config.timeoutMs,
+                resolved.sources.timeout,
+              )}`,
+              "Usage: /review-mode timeout <seconds|unlimited> [global|project]",
+            ].join("\n"),
+            "info",
+          );
+          return;
+        }
+        const parsed = parseReviewTimeoutArg(rawValue);
+        if (!parsed.ok) {
+          ctx.ui.notify(`Invalid timeout: ${parsed.error}`, "warning");
+          return;
+        }
+        const written = writeReviewModeConfig(scope, cwd, agentDir, {
+          timeoutMs: parsed.timeoutMs,
+        });
+        if (!written.ok) {
+          ctx.ui.notify(
+            `Could not write review settings: ${written.error ?? "unknown error"}`,
+            "error",
+          );
+          return;
+        }
+        ctx.ui.notify(
+          `Review Mode timeout → ${formatReviewTimeoutLabel(
+            parsed.timeoutMs,
+            scope,
+          )} (${scope})\nSettings: ${written.path}`,
+          "info",
+        );
         return;
       }
 
       if (sub !== "on" && sub !== "off") {
-        ctx.ui.notify("Usage: /review-mode on|off|status", "info");
+        ctx.ui.notify(
+          "Usage: /review-mode on|off [global|project] | status | timeout <seconds|unlimited> [global|project]",
+          "info",
+        );
         return;
       }
 
-      const scopeArg = String(args || "")
-        .trim()
-        .toLowerCase()
-        .split(/\s+/)[1];
-      const scope: "global" | "project" =
-        scopeArg === "project" ? "project" : "global";
+      const scope = scopeFor("global");
       const enable = sub === "on";
 
       const res = writeReviewModeConfig(scope, cwd, agentDir, {
@@ -1001,7 +1176,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
       if (enable) {
         ctx.ui.notify(
-          `Review Mode ENABLED (${scope}) — the reviewer starts with Plan mode and audits the plan before you see it.\nSettings: ${res.path}`,
+          `Review Mode ENABLED (${scope}) — after Plan Mode finishes, an independent reviewer audits the plan and hands it to Plannotator.\nSettings: ${res.path}`,
           "info",
         );
         updateReviewStatus(ctx as any);
@@ -1053,12 +1228,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
         w.ok ? "info" : "error",
       );
     },
-  });
-
-  pi.registerCommand("review-pane", {
-    description:
-      "Open/close the Review Workspace — Plan Mode transcript (left) and reviewer transcript (right)",
-    handler: async () => toggleReviewPane(),
   });
 
   pi.registerCommand("review-status", {
@@ -1135,17 +1304,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
     },
   });
 
-  try {
-    pi.registerShortcut(
-      "ctrl+shift+r" as any,
-      {
-        description: "Open/close the Review Workspace pane",
-        handler: async () => toggleReviewPane(),
-      } as any,
-    );
-  } catch (_e) {
-    void _e;
-  }
 
   // ── Mode → role model alignment (plan=planner, build=builder) ──────
   const MODE_ROLE_MAP: Record<WorkflowMode, string> = {
@@ -1162,6 +1320,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     workflowMode: WorkflowMode;
   } | null = null;
 
+  /**
+   * Mode setters accept `quiet` so keyboard cycling (Tab / Ctrl+Alt+P) never
+   * writes to the chat transcript — the footer status reports the mode instead.
+   * Explicit commands call them without options.
+   */
+  interface ModeSwitchOptions {
+    quiet?: boolean;
+  }
+
   /** Pure helper for tests: resolve which RoleModel plan/build will switch to. */
   function resolveModeModel(
     cfg: RoleConfig,
@@ -1175,7 +1342,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     return { role, model: role.model };
   }
 
-  async function applyModeModel(ctx: ExtensionContext): Promise<boolean> {
+  async function applyModeModel(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ): Promise<boolean> {
     if (!workflowMode) return false;
     try {
       ensureRoleConfig((ctx as any)?.cwd ?? ctx.cwd);
@@ -1201,14 +1371,34 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     const { role, model: m } = resolved;
     let fromLabel = "";
+    let current: any = null;
     try {
-      const cur =
+      current =
         (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
-      if (cur?.provider && cur?.id) fromLabel = `${cur.provider}/${cur.id}`;
-      else if ((pi as any)?.model?.provider)
-        fromLabel = `${(pi as any).model.provider}/${(pi as any).model.id}`;
+      if (current?.provider && current?.id) {
+        fromLabel = `${current.provider}/${current.id}`;
+      } else if ((pi as any)?.model?.provider) {
+        current = (pi as any).model;
+        fromLabel = `${current.provider}/${current.id}`;
+      }
     } catch (_e) {
       void _e;
+    }
+    // Already on the target model: no switch, no announcement. A changed
+    // thinking level is still reconciled so the role's setting is not lost.
+    if (
+      current?.provider &&
+      current.provider === m.provider &&
+      current.id === m.id
+    ) {
+      try {
+        if (m.thinking && isValidThinkingLevel(m.thinking)) {
+          (pi as any).setThinkingLevel?.(m.thinking);
+        }
+      } catch (_e) {
+        void _e;
+      }
+      return true;
     }
     let found: any;
     try {
@@ -1250,10 +1440,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       at: Date.now(),
       workflowMode,
     };
-    ctx.ui.notify(
-      `Workflow ${workflowMode}: model → ${m.provider}/${m.id} (${m.thinking})`,
-      "info",
-    );
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        `Workflow ${workflowMode}: model → ${m.provider}/${m.id} (${m.thinking})`,
+        "info",
+      );
+    }
     return true;
   }
 
@@ -1277,8 +1469,36 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   /** Restore the model that was active the last time Default mode was left. */
-  async function restoreDefaultModel(ctx: ExtensionContext): Promise<void> {
+  async function restoreDefaultModel(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ): Promise<void> {
     if (!defaultModel) return;
+    // No-op restore: the remembered model is already active.
+    let current: any = null;
+    try {
+      current =
+        (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+    } catch (_e) {
+      void _e;
+    }
+    if (
+      current?.provider &&
+      current.provider === defaultModel.provider &&
+      current.id === defaultModel.id
+    ) {
+      try {
+        if (
+          defaultModel.thinking &&
+          isValidThinkingLevel(defaultModel.thinking)
+        ) {
+          (pi as any).setThinkingLevel?.(defaultModel.thinking);
+        }
+      } catch (_e) {
+        void _e;
+      }
+      return;
+    }
     let found: any;
     try {
       const reg = (ctx as any)?.modelRegistry;
@@ -1295,10 +1515,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       ) {
         (pi as any).setThinkingLevel?.(defaultModel.thinking);
       }
-      ctx.ui.notify(
-        `Default mode: model → ${defaultModel.provider}/${defaultModel.id}${defaultModel.thinking ? ` (${defaultModel.thinking})` : ""}`,
-        "info",
-      );
+      if (!opts?.quiet) {
+        ctx.ui.notify(
+          `Default mode: model → ${defaultModel.provider}/${defaultModel.id}${defaultModel.thinking ? ` (${defaultModel.thinking})` : ""}`,
+          "info",
+        );
+      }
     } catch (_e) {
       void _e;
     }
@@ -1325,7 +1547,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } as any);
   }
 
-  async function setPlanMode(ctx: ExtensionContext) {
+  async function setPlanMode(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
         "Already in Plan mode — read-only. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
@@ -1340,10 +1565,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
     pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
-    ctx.ui.notify(
-      "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
-      "info",
-    );
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
+        "info",
+      );
+    }
     try {
       fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
         recursive: true,
@@ -1352,26 +1579,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
     try {
-      await applyModeModel(ctx);
+      await applyModeModel(ctx, opts);
     } catch (_e) {
       void _e;
     }
-    // Review Mode: start the reviewer IN PARALLEL with plan exploration so it can
-    // study the repository independently while Plan Mode works. Deliberately not
-    // awaited — starting the reviewer must never delay the user's prompt.
-    if (reviewEnabled()) {
-      void ensureReviewRuntime()
-        .ensureStarted()
-        .then((ok) => {
-          if (ok) notifyReview("reviewer started in parallel", "info");
-        })
-        .catch(() => {});
-    }
+    // No PLAN band: the footer status already shows the mode, and a band here
+    // broke Pi's status-line dedupe on every Tab cycle (see plan 2026-09-19).
     updateStatus(ctx);
     persistState();
   }
 
-  async function setBuildMode(ctx: ExtensionContext) {
+  async function setBuildMode(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ) {
     if (workflowMode === "build") {
       ctx.ui.notify(
         "Already in Build mode — full access. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
@@ -1392,12 +1613,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (todoItems.length === 0 && currentPlanFile) {
       loadTodosFromPlan(currentPlanFile, ctx.cwd);
     }
-    ctx.ui.notify(
-      "Build mode — full access restored. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
-      "info",
-    );
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        "Build mode — full access restored. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
+        "info",
+      );
+    }
     try {
-      await applyModeModel(ctx);
+      await applyModeModel(ctx, opts);
     } catch (_e) {
       void _e;
     }
@@ -1407,7 +1630,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     await teardownReview();
   }
 
-  async function setDefaultMode(ctx: ExtensionContext) {
+  async function setDefaultMode(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ) {
     if (workflowMode === null) {
       ctx.ui.notify(
         "Already in Default mode — no workflow. Press Tab or /plan to switch to Plan.",
@@ -1430,22 +1656,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // Restore the model that was active in Default mode (don't leak the
     // Build/Plan role model into Default).
     try {
-      await restoreDefaultModel(ctx);
+      await restoreDefaultModel(ctx, opts);
     } catch (_e) {
       void _e;
     }
     updateStatus(ctx);
     persistState();
-    ctx.ui.notify(
-      "Default mode — workflow off, full access. Press Tab to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
-      "info",
-    );
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        "Default mode — workflow off, full access. Press Tab to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
+        "info",
+      );
+    }
   }
 
   async function cycleWorkflowMode(ctx: ExtensionContext) {
-    if (workflowMode === null) await setPlanMode(ctx);
-    else if (workflowMode === "plan") await setBuildMode(ctx);
-    else await setDefaultMode(ctx); // "build" → null (default)
+    // Keyboard cycling is silent: no chat line, no band. The footer status is
+    // the confirmation (see plan 2026-09-19).
+    const opts: ModeSwitchOptions = { quiet: true };
+    if (workflowMode === null) await setPlanMode(ctx, opts);
+    else if (workflowMode === "plan") await setBuildMode(ctx, opts);
+    else await setDefaultMode(ctx, opts); // "build" → null (default)
   }
 
   // legacy alias for backward compat
@@ -3148,7 +3379,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           try {
             const res = await runSingleAgent(
               job.cwd ?? cwd,
-              ag,
+              ag.role ? ag : { ...ag, role: "explorer" },
               job.task,
               signal,
             );
@@ -4071,6 +4302,29 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Also allow /btw via input event when typed as message prefix
   pi.on("input", async (event, _ctx) => {
+    // Input follows the ACTIVE mode: while a review round is in flight the
+    // reviewer is the active agent, so the prompt is delivered there. Delivery
+    // failures fall through to the plan agent — a message is never swallowed.
+    if (typeof event.text === "string" && event.text.trim().length > 0) {
+      const rt = reviewRuntime;
+      if (
+        shouldRouteInputToReviewer({
+          reviewEnabled: reviewEnabled(),
+          reviewActive: rt?.isRoundActive() === true,
+          hasReviewerSession: rt?.isAlive() === true,
+        })
+      ) {
+        try {
+          const delivered = await rt!.sendUserMessage(event.text, event.images);
+          if (delivered) {
+            pushReviewNote("user", `you → reviewer: ${event.text.trim()}`);
+            return { action: "handled" } as any;
+          }
+        } catch (_e) {
+          void _e;
+        }
+      }
+    }
     if (typeof event.text === "string" && event.text.startsWith("/btw ")) {
       const note = event.text.slice(5).trim();
       if (note) {
@@ -4089,6 +4343,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
+    // Roles are file-backed; load them up-front so every read path (status,
+    // band label, reviewer runtime) sees the real config even in a fresh
+    // session that has no persisted workflow entry yet.
+    try {
+      ensureRoleConfig((ctx as any)?.cwd);
+      notifyRoleConfigFallback(ctx as ExtensionContext);
+    } catch (_e) {
+      void _e;
+    }
     // restore state from custom entries (supports both legacy enabled/executing and new mode field)
     try {
       const entries = ctx.sessionManager.getBranch();
@@ -4193,6 +4456,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
           typeof e.data?.ref === "string"
         ) {
           checkpoints.set(e.data.entryId, e.data.ref);
+        }
+        // Seed the band gate with the newest band on the branch so a reload
+        // cannot re-emit an entry that is already the last thing shown.
+        if (e.type === "custom" && e.customType === REVIEW_MODE_ENTRY_TYPE) {
+          reviewBandGate.seed(e.data as ReviewModeBandData);
         }
       }
     } catch (_e) {
@@ -4321,12 +4589,34 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // Block edits/writes + bash gating
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
-    if (event.toolName === "bash" && workflowMode === "plan") {
+    // Resolve the role per call: an env-carried role (spawned subagent) wins,
+    // then the workflow mode (plan → planner, build → builder). Read lazily —
+    // `workflowMode` is null while the extension body is evaluated and changes
+    // on every Tab/mode switch.
+    const gateRole: WorkflowRole | undefined = resolveSessionRole({
+      envRole: process.env[WORKFLOW_ROLE_ENV],
+      workflowMode,
+    });
+    const gatePolicy = gateRole ? policyForRole(gateRole) : undefined;
+    const restricted =
+      gatePolicy !== undefined && gatePolicy.commandClass !== "full";
+
+    // PowerShell syntax cannot be classified by the POSIX allowlist: fail closed.
+    if (restricted && event.toolName === "powershell") {
+      return {
+        block: true,
+        reason: `${gateRole} role: the powershell tool is blocked (use bash with allowlisted read-only/verify commands, or /build for unrestricted access).`,
+      } as any;
+    }
+
+    if (restricted && gateRole && event.toolName === "bash") {
       const cmd = (event.input as any).command as string;
-      // Narrow exception: allow mkdir -p .pi/plans as fallback for ensuring directory exists.
-      // Bash writes via >, >>, tee, cp, mv stay blocked — plan file must use write tool (Claude Code parity).
+      // Narrow planner-only exception: allow mkdir -p .pi/plans as a fallback
+      // for ensuring the plans directory exists. Bash writes via >, >>, tee,
+      // cp, mv stay blocked — the plan file must use the write tool.
       const lower = cmd.toLowerCase();
       const isMkdirPlans =
+        gateRole === "planner" &&
         /^\s*mkdir\s+(-p\s+)?/i.test(cmd) &&
         (lower.includes(".pi/plans") || lower.includes(".pi\\plans"));
       if (isMkdirPlans) {
@@ -4339,10 +4629,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         return;
       }
-      if (!isSafeCommand(cmd)) {
+      if (!isCommandAllowedForRole(gateRole, cmd)) {
+        const planHint =
+          gateRole === "planner"
+            ? ' Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.'
+            : "";
         return {
           block: true,
-          reason: `Plan mode: command blocked (not allowlisted). Use /build or Tab to switch to Build mode. Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.\nCommand: ${cmd}`,
+          reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}).${planHint} Use /build or Tab for unrestricted access.\nCommand: ${cmd}`,
         } as any;
       }
     }
@@ -4396,6 +4690,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
       } catch (_e) {
         void _e;
       }
+    }
+    // Non-planner restricted roles (e.g. an explorer subagent whose custom
+    // agent definition requests write) are read-only: block edit/write.
+    if (
+      restricted &&
+      gateRole !== "planner" &&
+      (event.toolName === "edit" || event.toolName === "write")
+    ) {
+      return {
+        block: true,
+        reason: `${gateRole} role: ${event.toolName} blocked — this role is read-only.`,
+      } as any;
     }
     // In build mode, ensure todos exist before first real edit
     if (
@@ -4562,13 +4868,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
       // One neutral line only: Plan Mode must NOT see the reviewer's prompt,
       // findings, or transcript (requirement: Plan cannot see Review's context).
       const reviewNote = reviewEnabled()
-        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer will audit this plan and may rewrite it before the user sees it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and may rewrite it before you see it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
         : "";
       return {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
-- bash limited to read-only allowlist (no >, >>, mkdir outside .pi/plans). Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
+- bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File writes/redirects/installs, mkdir outside .pi/plans and the powershell tool stay blocked. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
 - Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },

@@ -7,9 +7,10 @@
  *
  * Permission model — Review Mode is read-only except for one write path:
  *
- *   review_bash         read-only shell, gated by the same `isSafeCommand`
- *                       allowlist Plan Mode uses (no redirects, no rm/mv/cp,
- *                       no sudo, no package installs, no git mutations)
+ *   review_bash         read-only + verify shell, gated by the same role policy
+ *                       Plan Mode uses via `isCommandAllowedForRole("reviewer", …)`
+ *                       (no redirects, no rm/mv/cp, no sudo, no installs, no git
+ *                       mutations; test/lint/typecheck runners are allowed)
  *   review_explore      read-only subagents, capped by exploreBudget
  *   review_submit_plan  the single write path: writes the reviewed plan
  *   review_pass_done    ends a pass with a verdict (no side effects)
@@ -22,11 +23,11 @@
 import { Type, type TSchema } from "typebox";
 import {
     appendReviewChangelog,
-    isSafeCommand,
     renderReviewChangelog,
     validateReviewedPlan,
     type ReviewFinding,
 } from "./utils.ts";
+import { isCommandAllowedForRole } from "./permissions.ts";
 import type {
     PiCodingAgentSdk,
     ReviewPassResult,
@@ -57,10 +58,11 @@ export type BashToolDefinitionBuilder = (cwd: string) => {
 /**
  * `review_bash` — the reviewer's only shell access.
  *
- * The gate is `isSafeCommand` from utils.ts, which is exactly what Plan Mode's
- * `tool_call` hook uses, so Review Mode inherits Plan Mode's permissions rather
- * than defining its own. A refused command is never executed: the wrapper
- * returns before delegating to Pi's shell backend.
+ * The gate is `isCommandAllowedForRole("reviewer", …)` from permissions.ts —
+ * the same role policy Plan Mode's `tool_call` hook applies to the planner, so
+ * Review Mode inherits Plan Mode's permissions rather than defining its own. A
+ * refused command is never executed: the wrapper returns before delegating to
+ * Pi's shell backend.
  *
  * Execution itself is delegated to Pi's `createBashToolDefinition`, so shell
  * selection (bash on POSIX, the platform shell on Windows), output truncation,
@@ -82,7 +84,7 @@ export function createReviewBashTool(
         name: "review_bash",
         label: "Review Bash (read-only)",
         description:
-            "Run a READ-ONLY shell command to inspect the repository (git log/diff/status, ls, cat, rg, node --test, etc). Mutating commands — redirects, rm, mv, cp, chmod, sudo, package installs, git add/commit/push — are refused by the harness. You cannot write files with this tool; use review_submit_plan to submit the revised plan.",
+            "Run a READ-ONLY or VERIFY shell command to inspect and check the repository (git log/diff/status, ls, cat, rg, npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo clippy). Mutating commands — redirects, rm, mv, cp, chmod, sudo, package installs/builds, git add/commit/push — are refused by the harness. You cannot write files with this tool; use review_submit_plan to submit the revised plan.",
         parameters: inner.parameters,
         async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
             // SAFETY: Pi invokes ToolDefinition.execute as
@@ -111,7 +113,7 @@ export function createReviewBashTool(
                 };
             }
 
-            if (!isSafeCommand(command)) {
+            if (!isCommandAllowedForRole("reviewer", command)) {
                 deps.log(
                     `Review Mode refused a read-only violation: ${command.slice(0, 120)}`,
                     "warning",
@@ -121,11 +123,13 @@ export function createReviewBashTool(
                         {
                             type: "text",
                             text: [
-                                "review_bash: REFUSED — this command is not on the read-only allowlist.",
+                                "review_bash: REFUSED — this command is not on the read-only/verify allowlist.",
                                 "",
-                                "Review Mode has Plan Mode's permissions: no file writes, no redirects",
-                                "(> and >>), no rm/mv/cp/mkdir/touch/chmod, no sudo, no package installs,",
-                                "no git add/commit/push/checkout. Do not try to work around this.",
+                                "Review Mode has Plan Mode's permissions: read-only inspection plus",
+                                "test/lint/typecheck commands (npm test, npm run lint/typecheck, eslint,",
+                                "tsc --noEmit, node --test, pytest, cargo clippy). No file writes, no",
+                                "redirects (> and >>), no rm/mv/cp/mkdir/touch/chmod, no sudo, no package",
+                                "installs or builds, no git add/commit/push/checkout. Do not work around this.",
                                 "",
                                 "If you need to change the plan, call review_submit_plan.",
                             ].join("\n"),

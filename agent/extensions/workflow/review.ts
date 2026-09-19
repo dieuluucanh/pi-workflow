@@ -53,7 +53,6 @@ export const REVIEW_MODE_KEY = "reviewMode";
 /** Custom entry type used to persist review state across reload/resume. */
 export const REVIEW_ENTRY_TYPE = "workflow-review";
 export const REVIEW_SUBMITTED_ENTRY_TYPE = "workflow-review-submitted";
-export const REVIEW_HANDOFF_ENTRY_TYPE = "workflow-review-handoff";
 
 // ── Step 2: Review Mode configuration ────────────────────────────────
 
@@ -62,38 +61,32 @@ export type ReviewFallbackOnError = "skip" | "block";
 export interface ReviewModeConfig {
   /** Master toggle. When false every Review Mode code path is a no-op. */
   enabled: boolean;
-  /**
-   * true  → spawn the reviewer when Plan Mode starts and let it explore
-   *         concurrently; its review pass fires when the plan file lands.
-   * false → start the reviewer only when the plan is ready (sequential).
-   */
-  parallel: boolean;
   /** Max Review↔Plan rounds per user-feedback cycle. */
   rounds: number;
   /** 1 = review + rewrite only. 2 = review + rewrite, then self-verify. */
   passes: number;
   /** Run the self-verification pass (only when pass 1 found severity >= 5). */
   verify: boolean;
-  /** Open the dual-pane overlay automatically when a review starts. */
-  autoOpenPane: boolean;
   /** What to do if the reviewer model is unavailable or the review fails. */
   fallbackOnError: ReviewFallbackOnError;
   /** Max `review_explore` subagents per review round (cost ceiling). */
   exploreBudget: number;
-  /** Wall-clock cap for a single review round, in milliseconds. */
+  /**
+   * Optional wall-clock cap for a single review round, in milliseconds.
+   * 0 = unlimited (default). When unlimited, a pass ends on
+   * `review_pass_done`, the run settling, an abort, or a prompt error.
+   */
   timeoutMs: number;
 }
 
 export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   enabled: false,
-  parallel: true,
   rounds: 1,
   passes: 2,
   verify: true,
-  autoOpenPane: true,
   fallbackOnError: "skip",
   exploreBudget: 3,
-  timeoutMs: 10 * 60 * 1000,
+  timeoutMs: 0,
 };
 
 const ROUNDS_MIN = 1;
@@ -102,7 +95,7 @@ const PASSES_MIN = 1;
 const PASSES_MAX = 2;
 const EXPLORE_MIN = 0;
 const EXPLORE_MAX = 8;
-const TIMEOUT_MIN = 30_000;
+const TIMEOUT_MIN = 0;
 const TIMEOUT_MAX = 3_600_000;
 
 /** A JSON object parsed from an untrusted source (settings file, fragment). */
@@ -150,11 +143,9 @@ export function coerceReviewModeConfig(
       : base.fallbackOnError;
   return {
     enabled: asBool(r.enabled, base.enabled),
-    parallel: asBool(r.parallel, base.parallel),
     rounds: clampInt(r.rounds, ROUNDS_MIN, ROUNDS_MAX, base.rounds),
     passes: clampInt(r.passes, PASSES_MIN, PASSES_MAX, base.passes),
     verify: asBool(r.verify, base.verify),
-    autoOpenPane: asBool(r.autoOpenPane, base.autoOpenPane),
     fallbackOnError,
     exploreBudget: clampInt(
       r.exploreBudget,
@@ -227,7 +218,34 @@ function readJsonSafe(fp: string): JsonObject | undefined {
 export interface ResolvedReviewConfig {
   config: ReviewModeConfig;
   /** Which files contributed (for /review-mode status and debugging). */
-  sources: { global: boolean; project: boolean };
+  sources: {
+    global: boolean;
+    project: boolean;
+    /** Which scope supplied the effective `timeoutMs` value. */
+    timeout: ReviewConfigScopeSource;
+  };
+}
+
+/** Which settings scope supplied a field's effective value. */
+export type ReviewConfigScopeSource = "default" | "global" | "project";
+
+/**
+ * Which raw fragment supplied the effective `timeoutMs`: the project
+ * fragment when it carries the key, else the global fragment, else the
+ * built-in default. Pure and total.
+ */
+export function timeoutSourceOf(
+  globalRaw: RawReviewModeSetting | undefined,
+  projectRaw: RawReviewModeSetting | undefined,
+): ReviewConfigScopeSource {
+  const hasTimeoutKey = (raw: unknown): boolean =>
+    Boolean(raw) &&
+    typeof raw === "object" &&
+    !Array.isArray(raw) &&
+    Object.prototype.hasOwnProperty.call(raw, "timeoutMs");
+  if (hasTimeoutKey(projectRaw)) return "project";
+  if (hasTimeoutKey(globalRaw)) return "global";
+  return "default";
 }
 
 /**
@@ -241,15 +259,15 @@ export function readReviewModeConfig(
   const paths = reviewConfigPaths(cwd, agentDir);
   const globalSettings = readJsonSafe(paths.global);
   const projectSettings = readJsonSafe(paths.project);
-  const config = mergeReviewModeConfig(
-    extractReviewModeRaw(globalSettings),
-    extractReviewModeRaw(projectSettings),
-  );
+  const globalRaw = extractReviewModeRaw(globalSettings);
+  const projectRaw = extractReviewModeRaw(projectSettings);
+  const config = mergeReviewModeConfig(globalRaw, projectRaw);
   return {
     config,
     sources: {
-      global: extractReviewModeRaw(globalSettings) !== undefined,
-      project: extractReviewModeRaw(projectSettings) !== undefined,
+      global: globalRaw !== undefined,
+      project: projectRaw !== undefined,
+      timeout: timeoutSourceOf(globalRaw, projectRaw),
     },
   };
 }
@@ -300,6 +318,109 @@ export function writeReviewModeConfig(
       error: e instanceof Error ? e.message : String(e),
     };
   }
+}
+
+// ── Status helpers (pure) ────────────────────────────────────────────
+
+/** Parsed `/review-mode timeout` value. */
+export type ParsedReviewTimeout =
+  | { ok: true; timeoutMs: number }
+  | { ok: false; error: string };
+
+/**
+ * Parse a `/review-mode timeout` argument: `unlimited`/`off`/`none`/`0` mean
+ * no cap; otherwise whole seconds in 1..3600. Never throws.
+ */
+export function parseReviewTimeoutArg(raw: unknown): ParsedReviewTimeout {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (!s)
+    return { ok: false, error: "missing value — use <seconds|unlimited>" };
+  if (s === "unlimited" || s === "off" || s === "none" || s === "0") {
+    return { ok: true, timeoutMs: 0 };
+  }
+  if (!/^\d+$/.test(s)) {
+    return {
+      ok: false,
+      error: `invalid timeout "${String(raw).trim()}" — use <seconds|unlimited>`,
+    };
+  }
+  const secs = Number(s);
+  if (secs < 1 || secs * 1000 > TIMEOUT_MAX) {
+    return {
+      ok: false,
+      error: `timeout must be 0 (unlimited) or 1-${TIMEOUT_MAX / 1000} seconds`,
+    };
+  }
+  return { ok: true, timeoutMs: secs * 1000 };
+}
+
+/** The historical default that older settings files pinned explicitly. */
+const LEGACY_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** `unlimited (default)` / `600s (global settings)` / `… (project settings)`. */
+export function formatReviewTimeoutLabel(
+  timeoutMs: number,
+  source: ReviewConfigScopeSource,
+): string {
+  const value =
+    timeoutMs === 0 ? "unlimited" : `${Math.round(timeoutMs / 1000)}s`;
+  const from = source === "default" ? "default" : `${source} settings`;
+  return `${value} (${from})`;
+}
+
+/** Everything the `/review-mode status` block renders. */
+export interface ReviewStatusInput {
+  enabled: boolean;
+  config: ReviewModeConfig;
+  /** Which scope supplied `config.timeoutMs`. */
+  timeoutSource: ReviewConfigScopeSource;
+  /** Effective reviewer model, when the reviewer role is configured. */
+  reviewer?: { provider: string; id: string; thinking: string };
+  /** Resolved reviewer prompt source (path or built-in label). */
+  promptSource: string;
+  /** Whether each settings file carries a `workflow.reviewMode` fragment. */
+  sources: { global: boolean; project: boolean };
+  /** `reviewing` | `session active` | `not started`. */
+  runtime: string;
+}
+
+/**
+ * Build the `/review-mode status` block. Pure so the exact rows are testable;
+ * notably there is no `flow` row — Review Mode is always sequential.
+ */
+export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
+  const c = input.config;
+  const model = input.reviewer;
+  const lines = [
+    `Review Mode: ${input.enabled ? "ENABLED" : "disabled"}`,
+    `  reviewer model : ${
+      model
+        ? `${model.provider}/${model.id} (${model.thinking})`
+        : "unconfigured — /role set reviewer <provider/model>"
+    }`,
+    `  prompt         : ${input.promptSource}`,
+    `  rounds         : ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
+    `  explore budget : ${c.exploreBudget}   timeout: ${formatReviewTimeoutLabel(
+      c.timeoutMs,
+      input.timeoutSource,
+    )}`,
+  ];
+  if (
+    input.timeoutSource !== "default" &&
+    c.timeoutMs === LEGACY_REVIEW_TIMEOUT_MS
+  ) {
+    lines.push(
+      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review-mode timeout unlimited removes it`,
+    );
+  }
+  lines.push(
+    `  sources        : global=${input.sources.global} project=${input.sources.project}`,
+    `  runtime        : ${input.runtime}`,
+    `  transcript     : streamed into the main Pi transcript`,
+    "",
+    "Usage: /review-mode on|off [global|project] | /review-mode status | /review-mode timeout <seconds|unlimited> [global|project] | /review-prompt | /review-status | /review",
+  );
+  return lines;
 }
 
 // ── Step 3: Review prompt resolution ─────────────────────────────────
@@ -553,7 +674,7 @@ export function reviewPhaseLabel(phase: ReviewPhase): string {
   }
 }
 
-/** True while the reviewer is actively working (used to gate the overlay). */
+/** True while the reviewer is actively working (used to gate live review UI). */
 export function reviewIsActive(phase: ReviewPhase): boolean {
   return (
     phase === "starting" ||
@@ -561,6 +682,28 @@ export function reviewIsActive(phase: ReviewPhase): boolean {
     phase === "reviewing" ||
     phase === "verifying" ||
     phase === "rewriting"
+  );
+}
+
+/**
+ * Decide where a typed prompt goes while Review Mode may be running.
+ *
+ * Input follows the ACTIVE mode, not a focused pane: only a live review round
+ * pulls the prompt to the reviewer, so a plan sitting in Plannotator (or any
+ * non-review moment) still sends messages to the plan agent. A reviewer session
+ * must also exist — otherwise the message would vanish into a session that
+ * cannot answer it. The caller still falls back to the plan agent when delivery
+ * fails, so a message is never swallowed.
+ */
+export function shouldRouteInputToReviewer(input: {
+  reviewEnabled: boolean;
+  reviewActive: boolean;
+  hasReviewerSession: boolean;
+}): boolean {
+  return (
+    input.reviewEnabled === true &&
+    input.reviewActive === true &&
+    input.hasReviewerSession === true
   );
 }
 
@@ -799,8 +942,10 @@ export function applySubmittedPlan(
  * That matters because a fast reviewer can call `review_submit_plan` and
  * `review_pass_done` in the same turn, before the orchestrator awaits.
  *
- * Every wait is bounded by a timeout and an AbortSignal, so a reviewer that
- * never calls its tools cannot hang the plan handoff (risk R7).
+ * Every wait is bounded by an AbortSignal and, when a positive timeout is
+ * configured, a wall-clock timer. With the default timeout of 0 (unlimited) a
+ * silent reviewer is still caught by the run-settle race in review-runtime.ts,
+ * so the handoff cannot hang on a reviewer that simply finished.
  */
 export interface ReviewRoundGate {
   /** Clear both slots for a new round/pass. */
@@ -810,11 +955,11 @@ export interface ReviewRoundGate {
   lastSubmitted(): ReviewSubmitPayloadLike | undefined;
   lastPassDone(): ReviewPassResult | undefined;
   waitForSubmit(
-    timeoutMs: number,
+    timeoutMs?: number,
     signal?: AbortSignal,
   ): Promise<ReviewSubmitPayloadLike | undefined>;
   waitForPassDone(
-    timeoutMs: number,
+    timeoutMs?: number,
     signal?: AbortSignal,
   ): Promise<ReviewPassResult | undefined>;
 }
@@ -835,24 +980,30 @@ export interface ReviewSubmitPayloadLike {
 function deferredWait<T>(
   current: () => T | undefined,
   register: (resolve: (value: T | undefined) => void) => void,
-  timeoutMs: number,
+  timeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<T | undefined> {
   const existing = current();
   if (existing !== undefined) return Promise.resolve(existing);
   return new Promise<T | undefined>((resolve) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (value: T | undefined) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
-    const timer = setTimeout(
-      () => finish(undefined),
-      Math.max(1, Math.trunc(timeoutMs)),
-    );
+    // No timer when the cap is disabled (0 / undefined) — the caller's own
+    // settle race and AbortSignal are then the only ways out.
+    if (
+      typeof timeoutMs === "number" &&
+      Number.isFinite(timeoutMs) &&
+      timeoutMs > 0
+    ) {
+      timer = setTimeout(() => finish(undefined), Math.trunc(timeoutMs));
+    }
     const onAbort = () => finish(undefined);
     signal?.addEventListener("abort", onAbort, { once: true });
     register(finish);
@@ -936,54 +1087,119 @@ function eventRecord(event: unknown): Record<string, unknown> | undefined {
   return event as Record<string, unknown>;
 }
 
+/** Longest rendered action label before it is elided. */
+export const MAX_ACTION_LABEL = 100;
+
+function firstLine(s: string): string {
+  const i = s.indexOf("\n");
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
+function truncateLabel(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * Human-readable header for a tool call: the tool name plus a short, safe
+ * excerpt of its key argument (`▸ read src/app.ts`, `▸ review_bash: git log -5`).
+ * Never includes large payloads (e.g. the submitted plan), and never throws.
+ */
+export function formatActionLabel(toolName: unknown, args: unknown): string {
+  const name =
+    typeof toolName === "string" && toolName.trim()
+      ? toolName.trim()
+      : "tool";
+  const a: Record<string, unknown> =
+    args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const str = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() ? v.trim() : undefined;
+
+  let detail: string | undefined;
+  if (name === "review_bash" || name === "bash") {
+    const cmd = str(a.command);
+    if (cmd) detail = firstLine(cmd);
+  } else if (name === "read" || name === "write" || name === "edit") {
+    detail = str(a.path) ?? str(a.file_path);
+  } else if (name === "grep" || name === "find") {
+    const pattern = str(a.pattern) ?? str(a.query);
+    const where = str(a.path) ?? str(a.glob);
+    detail = pattern ? (where ? `${pattern} (${where})` : pattern) : where;
+  } else if (name === "ls") {
+    detail = str(a.path);
+  } else if (name === "review_explore") {
+    const tasks = Array.isArray(a.tasks) ? a.tasks : [];
+    if (tasks.length > 0) {
+      const first = str((tasks[0] as Record<string, unknown>)?.task);
+      detail = `${tasks.length} task${tasks.length === 1 ? "" : "s"}${
+        first ? ` — ${first}` : ""
+      }`;
+    }
+  } else if (name === "review_submit_plan") {
+    const verdict = str(a.verdict) ?? "revise";
+    const findings = Array.isArray(a.findings) ? a.findings.length : 0;
+    detail = `verdict ${verdict} · ${findings} finding${
+      findings === 1 ? "" : "s"
+    }`;
+  } else if (name === "review_pass_done") {
+    const pass = a.pass === 2 ? 2 : 1;
+    detail = `pass ${pass} · verdict ${str(a.verdict) ?? "revise"}`;
+  } else {
+    // Unknown tool: fall back to the first short string argument, if any.
+    for (const v of Object.values(a)) {
+      const s = str(v);
+      if (s) {
+        detail = firstLine(s);
+        break;
+      }
+    }
+  }
+
+  const label = detail ? `${name}: ${detail}` : name;
+  return truncateLabel(label, MAX_ACTION_LABEL);
+}
+
 /**
  * Translate one child-session event into transcript operations.
  *
- * Only the event kinds that make a readable review transcript are surfaced;
- * token accounting, queue churn and compaction internals are dropped so the pane
- * shows reasoning, tool use and status rather than plumbing.
+ * Only the event kinds that make a readable review transcript are surfaced.
+ * Assistant prose (`text_delta`) and reasoning (`thinking_delta`) are
+ * deliberately dropped: the main transcript shows the header of each action
+ * plus the REVIEW SUMMARY card, not a token stream (see review-ui.ts). Tool
+ * accounting, queue churn and compaction internals are dropped too.
+ *
+ * `toolLabels` is owned by the stateful caller (`ReviewTranscript`): the end
+ * event carries no args, so the start event registers `toolCallId → label` and
+ * the end event consumes it. Pure otherwise; junk input never throws.
  */
-export function translateReviewEvent(event: unknown): ReviewTranscriptOp[] {
+export function translateReviewEvent(
+  event: unknown,
+  toolLabels?: Map<string, string>,
+): ReviewTranscriptOp[] {
   const e = eventRecord(event);
   if (!e) return [];
   const type = typeof e.type === "string" ? e.type : "";
 
-  if (type === "message_update") {
-    const inner = eventRecord(e.assistantMessageEvent);
-    const innerType = typeof inner?.type === "string" ? inner.type : "";
-    if (innerType === "text_delta") {
-      const delta = typeof inner?.delta === "string" ? inner.delta : "";
-      return delta ? [{ op: "append", kind: "text", text: delta }] : [];
-    }
-    if (innerType === "thinking_delta") {
-      const delta = typeof inner?.delta === "string" ? inner.delta : "";
-      return delta ? [{ op: "append", kind: "thinking", text: delta }] : [];
-    }
-    return [];
-  }
-
-  if (type === "message_start") {
-    const msg = eventRecord(e.message);
-    const role = typeof msg?.role === "string" ? msg.role : "";
-    if (role === "assistant") {
-      return [{ op: "new", kind: "text", text: "" }];
-    }
-    return [];
-  }
+  if (type === "message_update") return [];
 
   if (type === "tool_execution_start") {
     const name = typeof e.toolName === "string" ? e.toolName : "tool";
-    return [{ op: "new", kind: "tool", text: `▸ ${name}` }];
+    const label = formatActionLabel(name, e.args);
+    const id = typeof e.toolCallId === "string" ? e.toolCallId : "";
+    if (id && toolLabels) toolLabels.set(id, label);
+    return [{ op: "new", kind: "tool", text: `▸ ${label}` }];
   }
 
   if (type === "tool_execution_end") {
     const name = typeof e.toolName === "string" ? e.toolName : "tool";
+    const id = typeof e.toolCallId === "string" ? e.toolCallId : "";
+    const known = id && toolLabels ? toolLabels.get(id) : undefined;
+    if (id && toolLabels) toolLabels.delete(id);
     const failed = e.isError === true;
     return [
       {
         op: "new",
         kind: "tool",
-        text: `▸ ${name} ${failed ? "failed" : "ok"}`,
+        text: `▸ ${known ?? name} ${failed ? "failed" : "ok"}`,
       },
     ];
   }
@@ -1013,6 +1229,8 @@ export function translateReviewEvent(event: unknown): ReviewTranscriptOp[] {
  */
 export class ReviewTranscript {
   private lines: ReviewTranscriptLine[] = [];
+  /** `toolCallId → label` so the end event can repeat the start's header. */
+  private readonly toolLabels = new Map<string, string>();
   /**
    * Assigned in the body rather than declared as a constructor parameter
    * property: `npm test` runs `node --test` on this file directly, and Node's
@@ -1043,7 +1261,7 @@ export class ReviewTranscript {
 
   /** Translate and apply a raw session event. Returns the applied ops. */
   ingest(event: unknown, now: number = Date.now()): ReviewTranscriptOp[] {
-    const ops = translateReviewEvent(event);
+    const ops = translateReviewEvent(event, this.toolLabels);
     for (const op of ops) this.apply(op, now);
     return ops;
   }
@@ -1094,19 +1312,20 @@ export const REVIEW_SYSTEM_PROMPT = [
   "you are auditing was produced by a different agent (Plan Mode). Your value comes",
   "from a genuinely independent perspective, not from agreeing with it.",
   "",
-  "You are READ-ONLY. You cannot edit files, run mutating shell commands, or install",
-  "anything. Your single write action is submitting the revised plan through the",
-  "`review_submit_plan` tool.",
+  "You are READ-ONLY. You cannot edit files, run mutating shell commands, install",
+  "anything, or build. You may run test/lint/typecheck commands. Your single write",
+  "action is submitting the revised plan through the `review_submit_plan` tool.",
   "",
   "## Tools",
   "",
   "- `read`, `grep`, `find`, `ls` — inspect the repository freely. Always verify a",
   "  claim about the codebase with these before you rely on it.",
-  "- `review_bash` — a READ-ONLY shell limited to an allowlist (ls, cat, rg, fd,",
-  "  jq, diff, stat, git status/log/diff/show/branch, node --version, ...).",
-  "  Mutating commands and redirects are refused. Note: you CANNOT run tests,",
-  "  builds, or linters — that is a deliberate parity with Plan Mode's",
-  "  permissions. Verify a plan's claims by READING code, not by executing it.",
+  "- `review_bash` — a READ-ONLY/VERIFY shell on the same role allowlist Plan Mode",
+  "  uses (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch, npm",
+  "  test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo",
+  "  clippy, ...). Mutating commands, redirects, installs and builds are refused.",
+  "  Verify a plan's claims by reading the code and, where useful, by running its",
+  "  tests or linters — but never assert that something passes unless you ran it.",
   "- `review_explore` — delegate focused read-only reconnaissance to subagents.",
   "- `review_submit_plan` — submit the final rewritten plan. This is the ONLY way",
   "  your work reaches the user. A review that never submits is a failed review.",
@@ -1124,8 +1343,9 @@ export const REVIEW_SYSTEM_PROMPT = [
   "   `review_submit_plan`.",
   "5. End the pass with `review_pass_done`.",
   "",
-  "You cannot execute tests or builds, so never assert that something 'passes'.",
-  "Instead state what the plan should verify and how, and flag unverifiable claims.",
+  "You may run test/lint/typecheck commands, but not builds. Never assert that",
+  "something 'passes' unless you actually ran it; otherwise state what the plan",
+  "should verify and how, and flag unverifiable claims.",
   "",
   "## Restraint",
   "",
@@ -1146,8 +1366,40 @@ export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
 
 export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
-/** Built-in tool names the reviewer may call. Read-only by construction. */
+/**
+ * Built-in tool names the reviewer may call. Read-only by construction.
+ *
+ * This is a BASE, not the whole tool set: Pi's `createAgentSession({ tools })`
+ * option is a GLOBAL allowlist applied to built-in AND custom tools alike
+ * (`dist/core/sdk.js`: `allowedToolNames = options.tools ?? ...`, then
+ * `dist/core/agent-session.js`: `allCustomTools = [...].filter(tool =>
+ * isAllowedTool(tool.definition.name))`). Passing only these names silently
+ * drops `review_submit_plan`, i.e. the reviewer loses its only write path.
+ * Always build the session's allowlist with `reviewToolAllowlist()`.
+ */
 export const REVIEW_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
+
+/**
+ * The exact `tools` allowlist the reviewer child session must be created with:
+ * the read-only built-ins PLUS every custom tool the caller registered.
+ *
+ * Load-bearing, not cosmetic — see `REVIEW_BUILTIN_TOOLS`. A custom tool whose
+ * name is missing from this list is filtered out of the child's tool registry
+ * before the model can ever see it, which is how the reviewer ends up unable to
+ * submit a plan while still looking "started".
+ *
+ * Pure and total: tolerant of junk entries and duplicate names.
+ */
+export function reviewToolAllowlist(customTools: unknown): string[] {
+  const names = new Set<string>(REVIEW_BUILTIN_TOOLS);
+  if (Array.isArray(customTools)) {
+    for (const tool of customTools) {
+      const name = (tool as { name?: unknown } | undefined)?.name;
+      if (typeof name === "string" && name.trim()) names.add(name.trim());
+    }
+  }
+  return [...names];
+}
 
 /**
  * A live reviewer session, narrowed to what Review Mode actually uses.
@@ -1199,6 +1451,8 @@ export interface CreateReviewSessionResult {
   ok: boolean;
   session?: ReviewChildSession;
   modelLabel: string;
+  /** Tool names the child actually has enabled, when the SDK exposes them. */
+  activeTools?: string[];
   error?: string;
 }
 
@@ -1211,6 +1465,24 @@ export interface CreateReviewSessionResult {
  * process as the parent — leaving it set would leak into a later `/reload`.
  */
 export const REVIEW_CHILD_MARKER_ENV = "PI_WORKFLOW_REVIEW_CHILD";
+
+/**
+ * Read the session's enabled tool names, when the SDK exposes them.
+ * Returns `undefined` (not `[]`) when the accessor is missing OR throws, so a
+ * caller can tell "cannot verify" apart from a verifiably empty tool set.
+ */
+function readActiveToolNames(session: unknown): string[] | undefined {
+  try {
+    const get = (session as { getActiveToolNames?: unknown } | undefined)
+      ?.getActiveToolNames;
+    if (typeof get !== "function") return undefined;
+    const names = (get as () => unknown).call(session);
+    if (!Array.isArray(names)) return undefined;
+    return names.filter((n): n is string => typeof n === "string");
+  } catch {
+    return undefined;
+  }
+}
 
 function wrapAgentSession(
   raw: unknown,
@@ -1353,6 +1625,11 @@ export async function createReviewSession(
       id: sessionId,
     });
 
+    // MUST include the custom tool names: `tools` is an allowlist that filters
+    // custom tools too, so a built-ins-only list would silently remove
+    // `review_submit_plan` and make every review fail (see REVIEW_BUILTIN_TOOLS).
+    const expectedTools = reviewToolAllowlist(options.customTools);
+
     process.env[REVIEW_CHILD_MARKER_ENV] = "1";
     let created: { session?: unknown; modelFallbackMessage?: string };
     try {
@@ -1362,7 +1639,7 @@ export async function createReviewSession(
         modelRuntime,
         model,
         thinkingLevel: options.modelRef.thinking as never,
-        tools: [...REVIEW_BUILTIN_TOOLS],
+        tools: expectedTools,
         customTools: options.customTools as never,
         resourceLoader: loader,
         sessionManager,
@@ -1382,6 +1659,24 @@ export async function createReviewSession(
       };
     }
 
+    // Defence in depth: assert the SDK really enabled the reviewer's tools.
+    // Without `review_submit_plan` a review can only ever end in a fallback, so
+    // failing here (instantly, with the missing names) beats a 10-minute pass
+    // that silently cannot succeed. Feature-detected: an SDK that does not
+    // expose the accessor is trusted rather than blocked.
+    const activeTools = readActiveToolNames(created.session);
+    if (activeTools) {
+      const missing = expectedTools.filter((n) => !activeTools.includes(n));
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          modelLabel,
+          activeTools,
+          error: `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
+        };
+      }
+    }
+
     // Bind in print mode so the child's UI context is explicitly non-interactive.
     // Best-effort: a binding failure is not fatal because the child has no extensions.
     try {
@@ -1396,6 +1691,7 @@ export async function createReviewSession(
     return {
       ok: true,
       modelLabel,
+      ...(activeTools ? { activeTools } : {}),
       session: wrapAgentSession(created.session, modelLabel, sessionId),
     };
   } catch (e: unknown) {

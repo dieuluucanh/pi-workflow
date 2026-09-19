@@ -20,13 +20,17 @@
   "include": [
     "./index.ts",
     "./utils.ts",
+    "./permissions.ts",
     "./checkpoint.ts",
     "./roles.ts",
+    "./roles.test.ts",
     "./review.ts",
     "./review-tools.ts",
     "./review-runtime.ts",
-    "./review-pane.ts",
-    "./review.test.ts"
+    "./review-ui.ts",
+    "./review.test.ts",
+    "./review-ui.test.ts",
+    "./permissions.test.ts"
   ],
   "exclude": ["node_modules"]
 }
