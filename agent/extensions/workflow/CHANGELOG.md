@@ -4,6 +4,55 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — command policy: `/dev/null` unblocked, verified write/exec holes closed
+
+- **`2>/dev/null` is no longer treated as a file write.** `hasForbiddenSyntax`
+  refused every `>` that was not fd duplication, so a Plan Mode
+  `ls ~/…/docs/ 2>/dev/null || ls <path>` was refused even though `ls` is
+  allowlisted: the null device is a bit bucket, not a file. Redirections whose
+  target is exactly `/dev/null` (`>`, `>>`, `1>`, `2>`, `2>>`, `&>`, `&>>`, with
+  or without a space) are now subtracted before the file-redirect check, and the
+  new `forbiddenSyntaxReason()` names the failing construct. `/dev/null.txt`,
+  `/dev/nullx`, `/dev/null/../f` and `2>NUL` are still writes and still refused.
+- **Refusals now explain themselves.** New `explainCommandRefusal(role, command)`
+  is the single source of truth; `isCommandAllowedForRole` is defined as "no
+  refusal", so a message can never describe a policy the gate no longer
+  enforces. The Plan Mode gate and `review_bash` print the reason
+  (`forbidden-syntax` / `destructive-pattern` / `blocked-flag` /
+  `segment-class`) plus a concrete suggestion.
+- **`sed`/`awk` are Builder-only.** Their programs are code: GNU sed's `e`
+  command and awk's pipe-to-command both ran arbitrary shell from an allowed
+  "read-only" command (`sed -n 'e echo X' f`, `awk 'BEGIN{print "x" | "sh"}'`),
+  and `sed -n -i` / `awk -i inplace` wrote files in place. All four were
+  verified by execution before the fix.
+- **Snapshot/update flags can no longer be smuggled through a wrapper.**
+  `npm test -- -u`, `npm run test -- -u`, `yarn`/`pnpm test -u`,
+  `node --test --test-update-snapshots` and `node --run test -- -u` are refused;
+  the bare runners already were. The matcher also covers `-update`/`--update`.
+- **Arbitrary output paths and exec flags from verify tools are refused.**
+  `eslint -o`/`--output-file`, `jest`/`vitest --outputFile`, `pytest
+  --junit-xml`/`--cache-clear`, `go test -coverprofile`/`-exec`,
+  `mypy --install-types` and `ruff check --add-noqa` could write a chosen path
+  or execute a program; a long-option spelling gap (`--output-file` did not
+  match `--output`) was the root cause for the first.
+- **`git -c <key>=<value>` is refused.** Config values can select programs git
+  executes (`core.fsmonitor`, `core.pager`, `credential.helper`); `git -C <dir>`
+  (plain chdir) is still allowed. Multi-word values were only blocked by a
+  tokenizer accident, so this is now an explicit rule.
+- **curl's method/write spellings are complete.** `--request
+  POST|PUT|DELETE|PATCH|CONNECT`, `--json`, `--data-raw`, `--form-string` and
+  `--output-dir` are refused like their short forms.
+- **Added out of the same audit** (previously refused although harmless):
+  `git show-ref`/`check-ref-format`/`diff-tree`, bare `npm run`/`yarn run`
+  (lists scripts), `node --run <allowlisted script>`, and `base64`, `man`, `ss`,
+  `netstat`, `lsof`. `timeout …` and `VAR=value cmd` prefixes remain refused
+  (deliberate, separate decision); the quote-insensitive keyword denylist is
+  unchanged, so `rg "cp" f` is still refused.
+- Tests: `permissions.test.ts` grows from 11 to 15 tests — the null-device
+  matrix, every closed hole with its repro, the newly allowlisted reads,
+  `forbiddenSyntaxReason`, and `explainCommandRefusal` including the invariant
+  that the gate and the explanation can never disagree. 129/129 passing.
+
 ### Fixed — role config loading (stale reviewer model)
 
 - **Root cause of the stale reviewer model.** `roleConfig` is a module cache

@@ -43,7 +43,8 @@
       "passes": 2,
       "verify": true,
       "fallbackOnError": "skip",
-      "exploreBudget": 3
+      "exploreBudget": 3,
+      "timeoutMs": 0
     }
   }
 }

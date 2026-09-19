@@ -98,7 +98,7 @@ Plan Mode and Review Mode share one role-based command policy (`permissions.ts`)
 | Tool | Purpose |
 | --- | --- |
 | `read`, `grep`, `find`, `ls` | Inspect the repository |
-| `review_bash` | Shell access on the same role policy Plan Mode uses: read-only inspection plus **test/lint/typecheck** runners (`npm test`, `npm run lint/typecheck`, `eslint`, `tsc --noEmit`, `node --test`, `pytest`, `cargo clippy`, …). No redirects, no `rm`/`mv`/`cp`/`mkdir`/`touch`, no `sudo`, no package installs, no builds, no `git add/commit/push` |
+| `review_bash` | Shell access on the same role policy Plan Mode uses: read-only inspection plus **test/lint/typecheck** runners (`npm test`, `npm run lint/typecheck`, `eslint`, `tsc --noEmit`, `node --test`, `pytest`, `cargo clippy`, …). No file redirects (`2>/dev/null` and `2>&1` are allowed), no `sed`/`awk`, no `rm`/`mv`/`cp`/`mkdir`/`touch`, no `sudo`, no package installs, no builds, no `git add/commit/push` |
 | `review_explore` | Read-only reconnaissance subagents on the **explorer** role's model, capped by `exploreBudget` per round |
 | `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<slug>.md` |
 | `review_pass_done` | Ends a pass with a verdict (refused if nothing was submitted) |
@@ -112,11 +112,11 @@ The policy classifies commands into three classes and maps them to roles:
 | explorer | read-only | none | `explore` / `review_explore` subagents |
 | builder | full (unrestricted) | all | Build Mode / normal sessions |
 
-- **read-only** — inspection only (`ls`, `cat`, `rg`, `git log/blame/ls-files`, `docker logs`, `journalctl`, …).
-- **verify** — the above plus `npm test`, `npm run lint|typecheck|check`, `eslint`, `tsc --noEmit`, `node --test`, `pytest`, `mypy`, `go vet`, `cargo clippy`, … Runners that rewrite (`--fix`, `--write`, `-u`/`--update`, `--watch`) and build commands (`npm run build`) stay blocked.
+- **read-only** — inspection only (`ls`, `cat`, `rg`, `git log/blame/ls-files/show-ref`, `npm run` / `yarn run` with no script argument (lists them), `docker logs`, `journalctl`, `base64`, `ss`, `netstat`, `lsof`, …). `sed`/`awk` are deliberately **not** read-only — their programs are code — so they are Builder-only.
+- **verify** — the above plus `npm test`, `npm run lint|typecheck|check`, `eslint`, `tsc --noEmit`, `node --test`, `npm run`/`node --run` with an allowlisted script, `pytest`, `mypy`, `go vet`, `cargo clippy`, … Runners that rewrite (`--fix`, `--write`, `-u`/`-w`/`--update`, `--test-update-snapshots`, `--watch`) — including through a wrapper such as `npm test -- -u` — and arbitrary output-path flags (`eslint -o`, `jest --outputFile`) stay blocked, as do build commands (`npm run build`).
 - **full** — no gate (Builder and normal sessions only).
 
-Compound commands are checked segment-by-segment with quote awareness, so `git status && npm test` and `npm test 2>&1 | tail -50` work while `curl … | sh`, `$(…)`, backticks, heredocs and file redirects are refused. Explorer subagents run as separate `pi` processes and carry their role in `PI_WORKFLOW_ROLE`, so the same policy gates their `bash` too. The `powershell` tool is refused for every non-builder role, since its syntax cannot be classified by the POSIX allowlist.
+Compound commands are checked segment-by-segment with quote awareness, so `git status && npm test` and `npm test 2>/dev/null | tail -50` work while `curl … | sh`, `$(…)`, backticks, heredocs, `sed`/`awk` and file redirects to anything other than `/dev/null` are refused. Refusals name the rule that failed (`explainCommandRefusal`), so a blocked command explains what to change. Explorer subagents run as separate `pi` processes and carry their role in `PI_WORKFLOW_ROLE`, so the same policy gates their `bash` too. The `powershell` tool is refused for every non-builder role, since its syntax cannot be classified by the POSIX allowlist.
 
 The built-in `bash`, `edit` and `write` tools are never given to the reviewer at all.
 

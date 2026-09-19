@@ -48,7 +48,7 @@
       "description": "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
       "model": {
         "provider": "opencode-go",
-        "id": "glm-5.3-flash",
+        "id": "deepseek-v4.1-flash",
         "thinking": "xhigh"
       },
       "tools": [

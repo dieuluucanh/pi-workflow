@@ -13,6 +13,8 @@ import {
   WORKFLOW_ROLE_ENV,
   commandClassOf,
   describeRolePolicy,
+  explainCommandRefusal,
+  forbiddenSyntaxReason,
   hasForbiddenSyntax,
   isCommandAllowedForRole,
   isWorkflowRole,
@@ -191,6 +193,17 @@ test("permissions: quoted pipes do not split segments", () => {
 
 test("permissions: hasForbiddenSyntax allows fd duplication, denies exec syntax", () => {
   assert.equal(hasForbiddenSyntax("npm test 2>&1"), false);
+  // Redirecting to the null device is not a file write.
+  assert.equal(hasForbiddenSyntax("npm test 2>/dev/null"), false);
+  assert.equal(hasForbiddenSyntax("npm test >/dev/null"), false);
+  assert.equal(hasForbiddenSyntax("npm test &>/dev/null"), false);
+  assert.equal(hasForbiddenSyntax("npm test 2>>/dev/null"), false);
+  assert.equal(hasForbiddenSyntax("npm test 2> /dev/null | tail -5"), false);
+  // ...but a real file that merely starts with /dev/null still counts.
+  assert.equal(hasForbiddenSyntax("npm test > /dev/null.txt"), true);
+  assert.equal(hasForbiddenSyntax("npm test 2>/dev/nullx"), true);
+  assert.equal(hasForbiddenSyntax("npm test > /dev/null/../tmp/f"), true);
+  assert.equal(hasForbiddenSyntax("npm test 2>NUL"), true);
   assert.equal(hasForbiddenSyntax("npm test > out.txt"), true);
   assert.equal(hasForbiddenSyntax("echo $(whoami)"), true);
   assert.equal(hasForbiddenSyntax("echo `whoami`"), true);
@@ -208,6 +221,17 @@ test("permissions: commandClassOf reports the weakest sufficient class", () => {
   assert.equal(commandClassOf("frobnicate --x"), "full");
   assert.equal(commandClassOf("rm -rf x"), "full");
   assert.equal(commandClassOf(""), "full");
+  // Interpreters whose programs are code are never read-only.
+  assert.equal(commandClassOf("sed -n '1,20p' f"), "full");
+  assert.equal(commandClassOf("awk '{print $1}' f"), "full");
+  // Newly allowlisted reads and closed write vectors.
+  assert.equal(commandClassOf("npm run"), "read-only");
+  assert.equal(commandClassOf("node --run test"), "verify");
+  assert.equal(commandClassOf("git show-ref"), "read-only");
+  assert.equal(commandClassOf("git -c core.abbrev=8 log"), "full");
+  assert.equal(commandClassOf("eslint -o out.txt src"), "full");
+  assert.equal(commandClassOf("npm test -- -u"), "full");
+  assert.equal(commandClassOf("node --test --test-update-snapshots t.js"), "full");
 });
 
 test("permissions: resolveSessionRole prefers env, then mode", () => {
@@ -250,5 +274,152 @@ test("permissions: role helpers and policy shape", () => {
   for (const role of ["planner", "reviewer", "explorer", "builder"] as const) {
     assert.equal(ROLE_POLICIES[role].role, role);
     assert.ok(ROLE_POLICIES[role].description.length > 0);
+  }
+});
+
+test("permissions: /dev/null redirects and the newly allowlisted reads pass", () => {
+  const readOnly = [
+    "ls package.json 2>/dev/null",
+    "ls package.json >/dev/null",
+    "ls package.json &>/dev/null",
+    "ls package.json 2>>/dev/null",
+    "rg TODO src 2>/dev/null | head -5",
+    "git status 2>/dev/null && git log -1",
+    "git show-ref",
+    "git check-ref-format --branch main",
+    "git diff-tree HEAD",
+    "npm run",
+    "yarn run",
+    "base64 package.json",
+    "man ls",
+    "ss -tulpn",
+    "netstat -an",
+    "lsof -i",
+  ];
+  for (const cmd of readOnly) {
+    assert.equal(allowed("planner", cmd), true, `planner should allow: ${cmd}`);
+    assert.equal(allowed("reviewer", cmd), true, `reviewer should allow: ${cmd}`);
+    assert.equal(allowed("explorer", cmd), true, `explorer should allow: ${cmd}`);
+  }
+  const verify = [
+    "npm test 2>/dev/null | tail -50",
+    "node --run test 2>/dev/null",
+  ];
+  for (const cmd of verify) {
+    assert.equal(allowed("planner", cmd), true, `planner should allow: ${cmd}`);
+    assert.equal(allowed("reviewer", cmd), true, `reviewer should allow: ${cmd}`);
+    assert.equal(allowed("explorer", cmd), false, `explorer must deny: ${cmd}`);
+  }
+});
+
+test("permissions: verified write/exec holes stay closed for every restricted role", () => {
+  const no = [
+    // Interpreter programs are code: GNU sed `e`, sed/awk in-place, awk pipes.
+    "sed -n 'e echo pwned' package.json",
+    "sed -n -i 's/a/b/' package.json",
+    "sed -i 's/a/b/' package.json",
+    "awk -i inplace 'BEGIN{print 1}' package.json",
+    `awk 'BEGIN{print "echo pwned" | "sh"}' package.json`,
+    // Snapshot/update flags reachable through a wrapper.
+    "npm test -- -u",
+    "npm run test -- -u",
+    "npm run test:unit -- -u",
+    "yarn test -u",
+    "pnpm test -u",
+    "node --test --test-update-snapshots test.js",
+    "node --run test -- -u",
+    // Arbitrary output paths / exec from verify-class tools.
+    "eslint -o out.txt src",
+    "eslint --output-file out.txt src",
+    "jest --outputFile=out.json",
+    "vitest --outputFile out.json",
+    "python -m pytest --junit-xml=out.xml",
+    "pytest --cache-clear",
+    "go test -coverprofile=c.out ./...",
+    "go test -exec sh ./...",
+    "mypy --install-types",
+    "python -m mypy --install-types",
+    "ruff check --add-noqa .",
+    // git config injection (`-c` values select programs git runs).
+    "git -c core.pager=wc log",
+    "git -c core.abbrev=8 status",
+    // curl method/write spellings that the old rules missed.
+    "curl --request POST http://host",
+    "curl --json '{}' http://host",
+    // Only `/dev/null` is a bit bucket; every other target is still a write.
+    "ls > out.txt",
+    "ls &> out.txt",
+    "ls 2> out.txt",
+    "ls >> out.txt",
+    "ls > /dev/null.txt",
+    "ls 2>/dev/nullx",
+    "ls > /dev/null/../tmp/f",
+  ];
+  for (const cmd of no) {
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      assert.equal(allowed(role, cmd), false, `${role} should deny: ${cmd}`);
+    }
+  }
+});
+
+test("permissions: forbiddenSyntaxReason names the failing construct", () => {
+  assert.equal(forbiddenSyntaxReason("ls x 2>/dev/null"), null);
+  assert.equal(forbiddenSyntaxReason("ls x 2>&1"), null);
+  assert.equal(forbiddenSyntaxReason(""), null);
+  assert.match(String(forbiddenSyntaxReason("ls > out.txt")), /file redirect/);
+  assert.match(
+    String(forbiddenSyntaxReason("echo $(whoami)")),
+    /command substitution/,
+  );
+  assert.match(String(forbiddenSyntaxReason("echo `x`")), /backtick/);
+  assert.match(String(forbiddenSyntaxReason("cat <<EOF")), /heredoc/);
+  assert.match(
+    String(forbiddenSyntaxReason("diff <(a) <(b)")),
+    /process substitution/,
+  );
+  assert.match(String(forbiddenSyntaxReason("ls &")), /background/);
+});
+
+test("permissions: explainCommandRefusal mirrors the gate and names the rule", () => {
+  assert.equal(explainCommandRefusal("builder", "rm -rf /"), null);
+  assert.equal(explainCommandRefusal("planner", "ls -la"), null);
+
+  assert.equal(
+    explainCommandRefusal("planner", "   ")?.kind,
+    "empty",
+  );
+
+  const redirect = explainCommandRefusal("planner", "cat f > out.txt");
+  assert.equal(redirect?.kind, "forbidden-syntax");
+  assert.match(redirect?.detail ?? "", /file redirect/);
+  assert.match(redirect?.suggestion ?? "", /2>\/dev\/null/);
+
+  const destructive = explainCommandRefusal("planner", "npm install left-pad");
+  assert.equal(destructive?.kind, "destructive-pattern");
+  assert.match(destructive?.detail ?? "", /install/);
+
+  const flag = explainCommandRefusal("planner", "eslint --fix src");
+  assert.equal(flag?.kind, "blocked-flag");
+  assert.match(flag?.detail ?? "", /--fix/);
+
+  const segment = explainCommandRefusal("planner", "sed -n '1,5p' f");
+  assert.equal(segment?.kind, "segment-class");
+  assert.equal(segment?.segment, "sed -n '1,5p' f");
+  assert.match(segment?.suggestion ?? "", /may run/);
+
+  // The gate IS "no refusal", so the two can never disagree.
+  for (const cmd of [
+    "ls -la",
+    "rm -rf x",
+    "cat f > o",
+    "sed -n '1,5p' f",
+    "ls x 2>/dev/null",
+    "npm test -- -u",
+  ]) {
+    assert.equal(
+      isCommandAllowedForRole("planner", cmd),
+      explainCommandRefusal("planner", cmd) === null,
+      `gate and explanation disagree for: ${cmd}`,
+    );
   }
 });

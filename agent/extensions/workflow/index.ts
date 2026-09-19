@@ -81,7 +81,7 @@ import {
 } from "./utils.ts";
 import {
   WORKFLOW_ROLE_ENV,
-  isCommandAllowedForRole,
+  explainCommandRefusal,
   policyForRole,
   resolveSessionRole,
   subagentEnv,
@@ -4629,14 +4629,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         return;
       }
-      if (!isCommandAllowedForRole(gateRole, cmd)) {
+      const refusal = explainCommandRefusal(gateRole, cmd);
+      if (refusal) {
         const planHint =
-          gateRole === "planner"
+          gateRole === "planner" && refusal.kind === "forbidden-syntax"
             ? ' Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.'
             : "";
+        const hint = refusal.suggestion
+          ? ` ${refusal.suggestion}`
+          : " Use /build or Tab for unrestricted access.";
         return {
           block: true,
-          reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}).${planHint} Use /build or Tab for unrestricted access.\nCommand: ${cmd}`,
+          reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}) — ${refusal.detail}.${hint}${planHint}\nCommand: ${cmd}`,
         } as any;
       }
     }
@@ -4874,7 +4878,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
-- bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File writes/redirects/installs, mkdir outside .pi/plans and the powershell tool stay blocked. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
+- bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File redirects (> and >>) to real files, installs, sed/awk, mkdir outside .pi/plans and the powershell tool stay blocked — but 2>/dev/null and 2>&1 are allowed. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
 - Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
