@@ -277,13 +277,33 @@ async function fetchGallery(name, timeoutMs) {
 }
 
 function isPublished(name, version, dir) {
-  const res = runNpm(["view", `${name}@${version}`, "version"], dir);
+  const res = runNpm(
+    ["view", "--prefer-online", `${name}@${version}`, "version"],
+    dir,
+  );
   return res.status === 0 && out(res).length > 0;
 }
 
 function latestPublished(name, dir) {
-  const res = runNpm(["view", name, "version"], dir);
+  const res = runNpm(["view", "--prefer-online", name, "version"], dir);
   return res.status === 0 ? out(res) : null;
+}
+
+// A version that was just published can take a moment to resolve on the
+// registry, and the release flow queries the registry seconds earlier (its
+// "not on npm" plan), which populates npm's local packument cache. Without
+// --prefer-online (above) plus a couple of retries, the advisory gallery check
+// that runs immediately after `npm publish` would claim the new version is
+// missing and tell the user to publish it again.
+const PUBLISH_CHECK_RETRIES = 2;
+const PUBLISH_CHECK_DELAY_MS = 5000;
+
+async function isPublishedWithRetry(pkg) {
+  for (let attempt = 0; ; attempt++) {
+    if (isPublished(pkg.name, pkg.version, pkg.dir)) return true;
+    if (attempt >= PUBLISH_CHECK_RETRIES) return false;
+    await sleep(PUBLISH_CHECK_DELAY_MS);
+  }
 }
 
 // ── checks ─────────────────────────────────────────────────────────────────
@@ -305,7 +325,7 @@ async function checkPackage(pkg, opts) {
     notes: [],
   };
 
-  base.published = eligible ? isPublished(pkg.name, pkg.version, pkg.dir) : false;
+  base.published = eligible ? await isPublishedWithRetry(pkg) : false;
 
   let fetchStatus = 0;
   let fetchError = null;
@@ -346,7 +366,7 @@ async function checkPackage(pkg, opts) {
     );
   } else if (base.status === "missing") {
     base.notes.push(
-      `not on the npm registry yet — publish it: npm run release -- --packages ${pkg.short} --bump none --yes`,
+      `not on the npm registry yet — if you just published, npm may still be propagating; otherwise publish it: npm run release -- --packages ${pkg.short} --bump none --yes`,
     );
   } else if (base.status === "unreachable") {
     base.notes.push(
