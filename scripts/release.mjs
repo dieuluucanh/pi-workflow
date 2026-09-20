@@ -707,10 +707,11 @@ function tagAndPush(targets, opts) {
     console.log(`  ✓ ${target.name}@${target.nextVersion}`);
 }
 
-// Advisory only: the pi.dev gallery is a crawl of the npm search index filtered
-// by the `pi-package` keyword (there is no registration step), so a freshly
-// published version can legitimately be missing for minutes — sometimes much
-// longer. Never fail a completed release over it.
+// Advisory only. pi.dev builds its gallery catalog from npm's search results
+// for the `pi-package` keyword, and it ingests only a bounded, score-ranked
+// slice of them (npm's search API rolls over past `from=5000`), so a published
+// package can stay out of the catalog for a long time — republishing does not
+// reliably change it. Never fail a completed release over it.
 function galleryCheck(targets) {
   if (!targets.length) return;
   console.log("\npi.dev gallery:");
@@ -726,8 +727,10 @@ function galleryCheck(targets) {
     { capture: false },
   );
   console.log(
-    "Indexing is a crawl, not a push — if a package is missing above:\n" +
-      "  npm run gallery -- --wait 900",
+    "Catalog membership is decided by npm's search ranking, not by publishing —\n" +
+      "if a package is missing above, see docs/publishing.md (“A published package\n" +
+      "is missing from the catalog”) and re-check with:\n" +
+      "  npm run gallery -- --packages <short>",
   );
 }
 

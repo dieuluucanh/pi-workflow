@@ -138,7 +138,7 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 │  ├─ verify-packages.mjs    ← pre-publish gate
 │  ├─ release.mjs            ← version + changelog + publish + tag
 │  ├─ status.mjs             ← read-only npm publish-state report
-│  └─ check-gallery.mjs      ← pi.dev listing check
+│  └─ check-gallery.mjs      ← pi.dev gallery-catalog membership check
 ├─ .gitignore
 └─ agent/
    ├─ settings.json / .example

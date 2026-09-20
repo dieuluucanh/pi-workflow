@@ -34,7 +34,7 @@ npm run release:status                # read-only: manifest versions vs the npm 
 npm run verify                        # optional: run the gate on all four packages
 npm run release -- --dry-run          # plan only: versions, changelogs, tarballs
 npm run release                       # interactive: pick packages, then bump types
-npm run gallery                       # after publishing: are they listed on pi.dev?
+npm run gallery                       # after publishing: are they in the pi.dev gallery catalog?
 ```
 
 Non-interactive:
@@ -203,19 +203,44 @@ To test without disturbing your own Pi config, point the config dir at a scratch
 PI_CODING_AGENT_DIR=/tmp/pi-verify pi -e npm:@dieulc/workflow
 ```
 
-Packages that carry the `pi-package` keyword are listed in the gallery at <https://pi.dev/packages> — see [Gallery listing (pi.dev)](#gallery-listing-pidev) for the crawl mechanics, the `npm run gallery` check, and what to do when a package does not show up.
+Packages that carry the `pi-package` keyword are *eligible* for the gallery at <https://pi.dev/packages>, but pi.dev ingests only a bounded, score-ranked slice of them — see [Gallery listing (pi.dev)](#gallery-listing-pidev) for the crawl mechanics, the `npm run gallery` check, and what to do when a package does not show up.
 
 ## Gallery listing (pi.dev)
 
-The gallery is a **crawl of the npm search index filtered by the `pi-package` keyword**. There is no
-registration step, no submission form and no dashboard: publishing a package whose npm metadata
-carries that keyword *is* the registration. All four packages ship `"keywords": ["pi-package", …]`,
+The gallery is **not a registry you publish into**. pi.dev builds its catalog from npm's search
+results for the `pi-package` keyword and ingests only a bounded, score-ranked slice of them: npm's
+search API serves pages only up to `from=5000` (further offsets silently roll over to page 1), so
+roughly half of today's ~10,200 matching packages are unreachable to the crawler, and ranking is
+dominated by download traction. All four packages ship `"keywords": ["pi-package", …]`,
 `publishConfig.access: "public"` and a `pi` manifest, and `npm run verify` fails if any of those is
-missing — so a release is gallery-eligible the moment `npm publish` succeeds.
+missing — but that makes a release **eligible, not catalogued**.
 
-Each card (<https://pi.dev/packages/@dieulc/workflow>) carries the author, downloads/month, age,
-type badges (`extension`, `skill`), the `pi install npm:<name>` line, the README and the parsed `pi`
-manifest. <https://pi.dev/packages?name=dieulc> filters by name, description or author; `?type=` and
+What tells the two apart:
+
+- **The catalog filter** — `https://pi.dev/packages?name=<name>` returns a card only when the package
+  is in the catalog. This is the ground truth for “searchable/displayed on pi.dev”.
+- **The detail page's `Downloads` row** — pi.dev renders `https://pi.dev/packages/<name>` for any
+  published Pi package, so the page existing is *not* proof of listing. Its Downloads value comes
+  from the crawled catalog snapshot: a number (`441/mo · 247/wk`) means catalogued, `not available`
+  means **no catalog record** — even when the package has real npm downloads, and even when a new
+  version was published minutes ago.
+- **“Recently published”** is a view over that same catalog snapshot: a fresh publish appears there
+  only if the package already has a catalog record.
+
+Two upstream defects combine (both outside this repo):
+
+1. **A bounded slice.** The crawler can only page npm's search results to `from=5000`, so everything
+   ranked below the slice boundary is invisible ([pi#7885](https://github.com/earendil-works/pi/issues/7885)).
+2. **Stale search-index records.** The npm search index refreshes a package's download figures when
+   it is published and can then freeze them. Measured 2026-09-20: `@dieulc/autocompact`,
+   `@dieulc/browser-inspector` and `@dieulc/server-logs` had real downloads of 175, 107 and 110 per
+   month (`api.npmjs.org`) while the search index still reported 51, 0 and 0 — pinning their search
+   score near zero and keeping them out of the slice, while `@dieulc/pi-office-bridge` (441/247,
+   refreshed by its Sep 19 publish) is catalogued.
+
+Each catalog card carries the author, downloads/month, age, type badges (`extension`, `skill`), the
+`pi install npm:<name>` line, the README and the parsed `pi` manifest.
+<https://pi.dev/packages?name=dieulc> filters by name, description or author; `?type=` and
 `?sort=recent` narrow it further.
 
 ### Checking it
@@ -223,43 +248,61 @@ manifest. <https://pi.dev/packages?name=dieulc> filters by name, description or 
 ```bash
 npm run gallery                       # all four packages, one shot
 npm run gallery -- --packages workflow
-npm run gallery -- --wait 900         # poll until listed (default: 30 s between attempts)
+npm run gallery -- --wait 900         # keep polling (default: 30 s between attempts)
 npm run gallery -- --json             # machine-readable
 ```
 
-The check asks both sides — npm and pi.dev — so "not indexed yet" is never confused with "publish
-failed":
+The check reads pi.dev's package detail page and classifies its `Downloads` row, so “published” is
+never confused with “in the gallery catalog”:
 
 | Status | Meaning |
 | --- | --- |
-| `ok` | on npm and listed, showing the version the manifest declares |
+| `ok` | on npm and in the gallery catalog, showing the version the manifest declares |
 | `missing` | not on the npm registry — run the release |
-| `pending` | on npm, pi.dev has not indexed it yet (the crawler is behind) |
-| `stale` | listed, but the card still shows an older version |
-| `ineligible` | manifest keywords lack `pi-package` — it can never be listed |
-| `unreachable` | the pi.dev request failed (network blip); retried automatically |
+| `not-indexed` | published and installable, but pi.dev has no catalog record (the detail page shows `Downloads: not available`) — the bounded, score-ranked crawl has not picked it up |
+| `stale` | in the catalog, but the card still shows an older version |
+| `ineligible` | manifest keywords lack `pi-package` — it can never be catalogued |
+| `unreachable` | the pi.dev request failed, or the `Downloads` row is unreadable (markup drift); retried automatically |
 
 The exit code is 0 only when every selected package is `ok`. `npm run release` calls the same check
-in `--warn-only` mode after a successful publish, so a slow crawl never fails a release.
+in `--warn-only` mode after a successful publish, so a package missing from the catalog never fails a
+release.
 
 ### When a package does not show up
 
-Indexing lag is normal and highly variable — usually minutes, occasionally days:
+`not-indexed` is not a lag you can wait out — the catalog only ingests packages that rank inside the
+reachable slice. The levers, in order:
 
-- Wait, then `npm run gallery -- --wait 900`.
-- If it is still missing after ~24 h, npm's search index has skipped it. That is a known upstream gap
-  ([pi#7885](https://github.com/earendil-works/pi/issues/7885),
-  [pi#6991](https://github.com/earendil-works/pi/issues/6991)) and it **only self-heals on a new
-  publish** — bump a patch and publish again:
+1. **Confirm the state** (the check prints the URL): `https://pi.dev/packages?name=<urlencoded-name>`
+   shows no card, and the detail page's `Downloads` row says `not available`.
+2. **Republish so npm re-indexes the package** — the search index refreshes a package's record on
+   publish, and the three packages above are carrying figures from their first hours:
 
-  ```bash
-  npm run release -- --packages autocompact --bump patch --yes
-  npm run gallery -- --packages autocompact --wait 900
-  ```
+   ```bash
+   npm run release -- --packages autocompact --bump patch --yes
+   npm run gallery -- --packages autocompact
+   ```
 
-  In pi#6991 the skipped package became visible ~2.5 h after exactly such a metadata-touch publish.
-- Never try to re-publish an existing version to "refresh" it — npm rejects it. The version bump is
-  what triggers re-indexing.
+   Compare the refreshed search-index record with reality:
+
+   ```bash
+   curl -s "https://registry.npmjs.org/-/v1/search?text=keywords%3Api-package%20%40dieulc%2Fautocompact" --url-query size=5
+   curl -s "https://api.npmjs.org/downloads/point/last-month/@dieulc/autocompact"
+   ```
+
+   Once the index's `downloads.monthly/weekly` match the real numbers, the score rises and the next
+   crawl can pick the package up — re-check `?name=` and `npm run gallery` after ~2–4 h, then ~24 h.
+   This worked for one reported package ([pi#6991](https://github.com/earendil-works/pi/issues/6991),
+   ~2.5 h after a metadata touch) and did **not** work for others
+   ([pi#7987](https://github.com/earendil-works/pi/issues/7987),
+   [pi#8830](https://github.com/earendil-works/pi/issues/8830)) — treat it as a measured attempt, not
+   a guaranteed fix.
+3. **Real downloads are the durable lever.** Ranking is dominated by download traction; a package
+   with a few hundred installs a month clears the slice boundary. Nothing in `package.json`
+   substitutes for that.
+
+`npm publish` never overwrites an existing version, so “refreshing” always means a new version —
+which is exactly what the republish step above does.
 
 ## Versioning policy
 
@@ -289,8 +332,8 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | Run ends with `publish failed for <pkg>` | The other packages were published, tagged and pushed. Rerun `npm run release -- --continue` to finish the failed one. |
 | npm asks for an OTP | Expected with 2FA; the publish step inherits the terminal, so type the code when prompted. |
 | Extension does not load after install | `pi --verbose`; confirm the `pi.extensions` path is in the tarball (`npm pack --dry-run`). |
-| Published, but the package is not on pi.dev | The gallery crawls npm's search index, and new packages can be skipped for hours — sometimes days. Re-check with `npm run gallery -- --wait 900`; still missing after ~24 h → publish a patch bump (a metadata touch forces re-indexing), see [Gallery listing (pi.dev)](#gallery-listing-pidev). |
-| Gallery card shows an older version | npm's index has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
+| Published, but the package is not in the gallery | The catalog ingests only a bounded, score-ranked slice of npm's `pi-package` search results, so an installable package can stay uncatalogued. `npm run gallery` reports `not-indexed` for it; follow [When a package does not show up](#when-a-package-does-not-show-up) (republish so npm re-indexes it, then verify). |
+| Gallery card shows an older version | The catalog snapshot has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
 | `npm run gallery` reports `ineligible` | The manifest keywords lack `pi-package`. Add it (plus `publishConfig.access: "public"` and a `pi` manifest — `npm run verify` enforces all three) and release a new version. |
 | `npm run release:status` reports every package as `never-published` | Expected before the first publish. Each package flips to `in-sync` once its release lands. |
 | `npm run release:status` reports `local-ahead` | The manifest version is not on npm yet. Publish it: `npm run release -- --packages <pkg> --bump none --yes` publishes the current version as-is. |
@@ -303,7 +346,7 @@ scripts/
 ├─ verify-packages.mjs    # pre-publish gate (also: npm run verify)
 ├─ release.mjs            # release tool (also: npm run release)
 ├─ status.mjs             # read-only publish-state report (also: npm run release:status)
-├─ check-gallery.mjs      # pi.dev listing check (also: npm run gallery)
+├─ check-gallery.mjs      # pi.dev gallery catalog membership check (also: npm run gallery)
 ├─ check-gallery.test.mjs # gallery parser tests (also: npm test)
 └─ status.test.mjs        # status report tests (also: npm test)
 agent/extensions/<pkg>/

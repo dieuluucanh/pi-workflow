@@ -3,16 +3,25 @@
  * check-gallery.mjs — confirm that published Pi extensions are listed on pi.dev.
  *
  * The gallery at https://pi.dev/packages is a crawl of the npm search index
- * filtered by the `pi-package` keyword. There is no registration step, no
- * submission form and no dashboard: publishing a package whose npm metadata
- * carries that keyword *is* the registration. So the only way to know whether a
- * release is listed is to ask pi.dev.
+ * filtered by the `pi-package` keyword — but only a bounded, score-ranked slice
+ * of it. npm's `/v1/search` serves results only up to ~`from=5000` (further
+ * offsets silently roll over to page 1), so roughly half of the matching
+ * packages are unreachable, and ranking is dominated by download traction. A
+ * published package can therefore be installable, carry the keyword, and even
+ * have a working detail page while pi.dev has no catalog record for it.
+ *
+ * The detail page is NOT proof of listing: pi.dev renders it for any npm
+ * package that looks like a Pi package. What distinguishes a catalogued
+ * package is its `Downloads` row — pi.dev fills it only from its own crawled
+ * catalog snapshot, so `not available` means "no catalog row" (invisible in the
+ * gallery search and in "Recently published"), while a numeric value
+ * (`441/mo · 247/wk`) means the gallery has it.
  *
  * Checks, per package:
  *   a) eligibility — the manifest declares the `pi-package` keyword
  *   b) publication — `npm view <name>@<version>` resolves on the registry
- *   c) listing     — GET https://pi.dev/packages/<name> (200 = listed, 404 = not)
- *   d) freshness   — the version on the gallery card equals the manifest version
+ *   c) catalogue   — the detail page's `Downloads` row (>0/number = catalogued)
+ *   d) freshness   — the version on the catalog card equals the manifest version
  *
  * Usage:
  *   npm run gallery                          # all packages, one shot
@@ -196,6 +205,49 @@ export function parseGalleryPage(html) {
   };
 }
 
+/**
+ * Classify the pi.dev detail page's `Downloads` row.
+ *
+ * pi.dev renders that row from its own crawled catalog snapshot (built from
+ * npm's search results for `keywords:pi-package`), not from npm's download
+ * counters. `not available` therefore means "pi.dev has no catalog record for
+ * this package", even when the package has real downloads on npm.
+ *
+ * @param {string|null|undefined} downloads
+ * @returns {"listed"|"unlisted"|"unknown"}
+ */
+export function galleryMembership(downloads) {
+  if (downloads == null) return "unknown";
+  const value = String(downloads).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!value) return "unknown";
+  if (value === "not available") return "unlisted";
+  return /\d/.test(value) ? "listed" : "unknown";
+}
+
+/**
+ * Decide the status for one package from already-collected facts (pure, so the
+ * decision table stays unit-testable without network access).
+ *
+ * @param {{eligible: boolean, published: boolean, membership: "listed"|"unlisted"|"unknown"|null, version: string, galleryVersion: string|null}} facts
+ * @returns {"ineligible"|"missing"|"not-indexed"|"ok"|"stale"|"unreachable"}
+ */
+export function classifyGalleryStatus({
+  eligible,
+  published,
+  membership,
+  version,
+  galleryVersion,
+}) {
+  if (!eligible) return "ineligible";
+  if (!published) return "missing";
+  if (membership === "unlisted") return "not-indexed";
+  if (membership === "listed" && galleryVersion) {
+    return galleryVersion === version ? "ok" : "stale";
+  }
+  // Fetch failed, no detail grid, or a Downloads row we cannot read.
+  return "unreachable";
+}
+
 export function galleryUrl(name) {
   // Scoped names stay unencoded in the path — that is how pi.dev links them
   // (`/packages/@dieulc/pi-office-bridge`).
@@ -237,11 +289,15 @@ function latestPublished(name, dir) {
 // ── checks ─────────────────────────────────────────────────────────────────
 
 async function checkPackage(pkg, opts) {
+  const eligible = pkg.keywords.includes("pi-package");
   const base = {
     short: pkg.short,
     name: pkg.name,
     version: pkg.version,
     url: galleryUrl(pkg.name),
+    listed: null,
+    membership: null,
+    downloads: null,
     gallery: null,
     published: false,
     latest: null,
@@ -249,66 +305,79 @@ async function checkPackage(pkg, opts) {
     notes: [],
   };
 
-  if (!pkg.keywords.includes("pi-package")) {
-    base.status = "ineligible";
-    base.notes.push(
-      'manifest keywords must include "pi-package" — that keyword is the only gallery registration',
-    );
-    return base;
+  base.published = eligible ? isPublished(pkg.name, pkg.version, pkg.dir) : false;
+
+  let fetchStatus = 0;
+  let fetchError = null;
+  if (eligible && base.published) {
+    let res = await fetchGallery(pkg.name, opts.timeout);
+    for (let attempt = 0; attempt < opts.retries && res.status === 0; attempt++) {
+      await sleep(1000 * (attempt + 1));
+      res = await fetchGallery(pkg.name, opts.timeout);
+    }
+
+    fetchStatus = res.status;
+    fetchError = res.error ?? null;
+
+    if (res.status !== 0) {
+      const page = parseGalleryPage(res.body);
+      base.gallery = page;
+      // 404 (or a non-package 200 page) means pi.dev has no record of it; a
+      // detail page with a numeric Downloads row means the catalog has it.
+      if (res.status === 200 && page.listed) {
+        base.membership = galleryMembership(page.downloads);
+        base.listed = base.membership === "listed";
+        base.downloads = page.downloads;
+      }
+    }
   }
 
-  base.published = isPublished(pkg.name, pkg.version, pkg.dir);
-  if (!base.published) {
-    base.status = "missing";
+  base.status = classifyGalleryStatus({
+    eligible,
+    published: base.published,
+    membership: base.membership,
+    version: pkg.version,
+    galleryVersion: base.gallery?.version ?? null,
+  });
+
+  if (base.status === "ineligible") {
+    base.notes.push(
+      'manifest keywords must include "pi-package" — the gallery catalog is built from npm search results for that keyword',
+    );
+  } else if (base.status === "missing") {
     base.notes.push(
       `not on the npm registry yet — publish it: npm run release -- --packages ${pkg.short} --bump none --yes`,
     );
-  }
-
-  let res = await fetchGallery(pkg.name, opts.timeout);
-  for (let attempt = 0; attempt < opts.retries && res.status === 0; attempt++) {
-    await sleep(1000 * (attempt + 1));
-    res = await fetchGallery(pkg.name, opts.timeout);
-  }
-
-  if (res.status === 0) {
-    base.status = base.published ? "unreachable" : base.status;
-    base.notes.push(`pi.dev request failed: ${res.error ?? "unknown error"}`);
-    return base;
-  }
-
-  const page = parseGalleryPage(res.body);
-  base.gallery = page;
-
-  if (res.status !== 200 || !page.listed) {
-    // 404 (or a non-package 200 page) means the crawler has not indexed it yet.
-    base.status = base.published ? "pending" : base.status;
-    if (base.published) {
-      base.notes.push(
-        "on npm, not in the gallery yet — the gallery crawls npm every few minutes",
-      );
-      base.notes.push(
-        "re-check: npm run gallery -- --wait 900   (still missing after ~24h? publish a metadata touch: npm run release -- --packages " +
-          `${pkg.short} --bump patch --yes)`,
-      );
-    }
-    return base;
-  }
-
-  if (page.version !== pkg.version) {
-    base.status = "stale";
+  } else if (base.status === "unreachable") {
+    base.notes.push(
+      fetchStatus === 0
+        ? `pi.dev request failed: ${fetchError ?? "unknown error"}`
+        : 'pi.dev detail page has no recognisable "Downloads" row — the page markup may have changed',
+    );
+  } else if (base.status === "not-indexed") {
+    base.notes.push(
+      'published and installable, but pi.dev has no gallery-catalog record for it — its detail page shows "Downloads: not available"',
+    );
+    base.notes.push(
+      "the catalog is built from npm search results for keywords:pi-package, and pi.dev ingests only a bounded, score-ranked slice of them (npm's search API rolls over past from=5000, so roughly half of the matching packages are out of reach); low download traction or a stale npm search-index record keeps a package below that slice",
+    );
+    base.notes.push(
+      "publishing a new version does not reliably change this — the slice is score-ranked (see earendil-works/pi#6991, #7849, #7885, #7987, #8830)",
+    );
+    base.notes.push(
+      `check by hand: ${GALLERY_BASE}/packages?name=${encodeURIComponent(pkg.name)}`,
+    );
+  } else if (base.status === "stale") {
     base.latest = latestPublished(pkg.name, pkg.dir);
     base.notes.push(
-      `gallery shows ${page.version}, manifest says ${pkg.version}${
+      `catalog shows ${base.gallery?.version ?? "?"}, manifest says ${pkg.version}${
         base.latest && base.latest !== pkg.version
           ? ` (npm latest: ${base.latest})`
           : ""
-      } — the crawler lags until the new version's metadata is indexed`,
+      } — the catalog card lags until the new version's metadata is indexed`,
     );
-    return base;
   }
 
-  base.status = "ok";
   return base;
 }
 
@@ -325,7 +394,8 @@ const HELP = [
   "  --warn-only        always exit 0 (used by release.mjs)",
   "  --help, -h         show this help",
   "",
-  "Exit codes: 0 all listed · 1 not eligible/published/listed yet or stale · 2 usage error",
+  "Statuses: ok · stale · not-indexed (published, no gallery-catalog record) · missing · ineligible · unreachable",
+  "Exit codes: 0 every package is in the pi.dev gallery catalog · 1 not eligible/published/catalogued, or the catalog shows another version · 2 usage error",
 ].join("\n");
 
 function parseArgs(argv) {
@@ -350,13 +420,23 @@ function parseArgs(argv) {
   return opts;
 }
 
+function catalogDetail(r) {
+  return [
+    `catalog: ${r.gallery?.version ?? "?"}`,
+    r.downloads ? r.downloads : null,
+    r.gallery?.published ? `published ${r.gallery.published}` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
 const STATUS_DETAIL = {
-  ok: (r) =>
-    `gallery: ${r.gallery?.version ?? "?"}${r.gallery?.published ? `, published ${r.gallery.published}` : ""}`,
+  ok: catalogDetail,
+  stale: catalogDetail,
+  "not-indexed": () =>
+    "published, but not in the pi.dev gallery catalog (detail page: Downloads: not available)",
   missing: () => "not published on npm",
-  pending: () => "published, not indexed by pi.dev yet",
-  stale: (r) => `gallery: ${r.gallery?.version ?? "?"}`,
-  unreachable: () => "pi.dev request failed",
+  unreachable: () => "pi.dev detail page unreadable",
   ineligible: () => 'keywords missing "pi-package"',
 };
 
@@ -369,10 +449,10 @@ function report(results) {
   }
   const failed = results.filter((r) => r.status !== "ok");
   console.log(
-    `\n${results.length - failed.length}/${results.length} package(s) listed on pi.dev`,
+    `\n${results.length - failed.length}/${results.length} package(s) in the pi.dev gallery catalog`,
   );
   if (failed.length) {
-    console.log(`Not listed: ${failed.map((r) => r.name).join(", ")}`);
+    console.log(`Not in the catalog: ${failed.map((r) => r.name).join(", ")}`);
   }
 }
 
@@ -412,7 +492,7 @@ async function main() {
     const outstanding = results.filter((r) => r.status !== "ok");
     if (!outstanding.length || !opts.wait || Date.now() >= deadline) break;
     const stillWaiting = outstanding.some((r) =>
-      ["pending", "unreachable"].includes(r.status),
+      ["not-indexed", "unreachable"].includes(r.status),
     );
     if (!stillWaiting) break; // stale/missing/ineligible never fix themselves by waiting
     if (!opts.json) {
