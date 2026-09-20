@@ -2,6 +2,10 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.3.1] - 2026-09-20
+
+- No user-facing changes recorded.
+
 ## [Unreleased]
 
 ### Fixed — command policy: `/dev/null` unblocked, verified write/exec holes closed

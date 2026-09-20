@@ -1,6 +1,6 @@
 {
   "name": "@dieulc/workflow",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "private": false,
   "keywords": ["pi-package", "workflow", "plan-mode", "review-mode", "questionnaire", "rewind"],
