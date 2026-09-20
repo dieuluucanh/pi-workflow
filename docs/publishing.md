@@ -203,45 +203,26 @@ To test without disturbing your own Pi config, point the config dir at a scratch
 PI_CODING_AGENT_DIR=/tmp/pi-verify pi -e npm:@dieulc/workflow
 ```
 
-Packages that carry the `pi-package` keyword are *eligible* for the gallery at <https://pi.dev/packages>, but pi.dev ingests only a bounded, score-ranked slice of them — see [Gallery listing (pi.dev)](#gallery-listing-pidev) for the crawl mechanics, the `npm run gallery` check, and what to do when a package does not show up.
+Packages that carry the `pi-package` keyword are *eligible* for the gallery at <https://pi.dev/packages>, but pi.dev ingests only a bounded, popularity-ranked slice of them — see [gallery-membership.md](gallery-membership.md) for the crawl mechanics, the measured evidence, and what to do when a package does not show up.
 
 ## Gallery listing (pi.dev)
 
 The gallery is **not a registry you publish into**. pi.dev builds its catalog from npm's search
-results for the `pi-package` keyword and ingests only a bounded, score-ranked slice of them: npm's
-search API serves pages only up to `from=5000` (further offsets silently roll over to page 1), so
-roughly half of today's ~10,200 matching packages are unreachable to the crawler, and ranking is
-dominated by download traction. All four packages ship `"keywords": ["pi-package", …]`,
-`publishConfig.access: "public"` and a `pi` manifest, and `npm run verify` fails if any of those is
-missing — but that makes a release **eligible, not catalogued**.
+results for the `pi-package` keyword and ingests only a bounded, popularity-ranked slice of them, so a
+successful publish makes a package **eligible, not catalogued**. The mechanics, the measured evidence,
+the hypotheses that have been ruled out and the escalation path live in
+[gallery-membership.md](gallery-membership.md); two facts matter for day-to-day releases:
 
-What tells the two apart:
+- **A gallery row is best-effort.** Nothing in `package.json` puts a package in, and a republish only
+  helps when it happens to refresh the package's npm search-index record — sometimes it does,
+  sometimes it does not.
+- **Absence is common.** When measured on 2026-09-20 the catalog held 5,374 rows against 10,255 npm
+  `keywords:pi-package` matches, so roughly 4,900 eligible packages had no catalog row at all.
 
-- **The catalog filter** — `https://pi.dev/packages?name=<name>` returns a card only when the package
-  is in the catalog. This is the ground truth for “searchable/displayed on pi.dev”.
-- **The detail page's `Downloads` row** — pi.dev renders `https://pi.dev/packages/<name>` for any
-  published Pi package, so the page existing is *not* proof of listing. Its Downloads value comes
-  from the crawled catalog snapshot: a number (`441/mo · 247/wk`) means catalogued, `not available`
-  means **no catalog record** — even when the package has real npm downloads, and even when a new
-  version was published minutes ago.
-- **“Recently published”** is a view over that same catalog snapshot: a fresh publish appears there
-  only if the package already has a catalog record.
-
-Two upstream defects combine (both outside this repo):
-
-1. **A bounded slice.** The crawler can only page npm's search results to `from=5000`, so everything
-   ranked below the slice boundary is invisible ([pi#7885](https://github.com/earendil-works/pi/issues/7885)).
-2. **Stale search-index records.** The npm search index refreshes a package's download figures when
-   it is published and can then freeze them. Measured 2026-09-20: `@dieulc/autocompact`,
-   `@dieulc/browser-inspector` and `@dieulc/server-logs` had real downloads of 175, 107 and 110 per
-   month (`api.npmjs.org`) while the search index still reported 51, 0 and 0 — pinning their search
-   score near zero and keeping them out of the slice, while `@dieulc/pi-office-bridge` (441/247,
-   refreshed by its Sep 19 publish) is catalogued.
-
-Each catalog card carries the author, downloads/month, age, type badges (`extension`, `skill`), the
-`pi install npm:<name>` line, the README and the parsed `pi` manifest.
-<https://pi.dev/packages?name=dieulc> filters by name, description or author; `?type=` and
-`?sort=recent` narrow it further.
+Every catalog card carries the author, downloads/month, age, type badges (`extension`, `skill`), the
+`pi install npm:<name>` line, the README and the parsed `pi` manifest. <https://pi.dev/packages?name=dieulc>
+filters by name, description or author; `?type=` and `?sort=recent` narrow it further. The filter does
+**not** match the `@scope/name` form — search the scope or the unscoped basename instead.
 
 ### Checking it
 
@@ -249,20 +230,23 @@ Each catalog card carries the author, downloads/month, age, type badges (`extens
 npm run gallery                       # all four packages, one shot
 npm run gallery -- --packages workflow
 npm run gallery -- --wait 900         # keep polling (default: 30 s between attempts)
+npm run gallery -- --diagnose         # explain a verdict: index figures, catalog row, cut-off
 npm run gallery -- --json             # machine-readable
 ```
 
-The check reads pi.dev's package detail page and classifies its `Downloads` row, so “published” is
-never confused with “in the gallery catalog”:
+The check reads **both** pi.dev signals — whether the catalog listing (`?name=…`) has an exact-name
+card, and what the detail page's `Downloads` row says — and only reports a package as `not-indexed`
+when they agree that there is no catalog row. A disagreement, or a page it cannot read, is reported
+as `unreachable` rather than as a confident miss:
 
 | Status | Meaning |
 | --- | --- |
 | `ok` | on npm and in the gallery catalog, showing the version the manifest declares |
 | `missing` | not on the npm registry — run the release |
-| `not-indexed` | published and installable, but pi.dev has no catalog record (the detail page shows `Downloads: not available`) — the bounded, score-ranked crawl has not picked it up |
+| `not-indexed` | published and installable, but pi.dev has no catalog row (the listing has no card and the detail page shows `Downloads: not available`) — the bounded, popularity-ranked crawl has not picked it up |
 | `stale` | in the catalog, but the card still shows an older version |
 | `ineligible` | manifest keywords lack `pi-package` — it can never be catalogued |
-| `unreachable` | the pi.dev request failed, or the `Downloads` row is unreadable (markup drift); retried automatically |
+| `unreachable` | pi.dev could not be read unambiguously (request failed, markup drift, or the two signals disagree); retried automatically |
 
 The exit code is 0 only when every selected package is `ok`. `npm run release` calls the same check
 in `--warn-only` mode after a successful publish, so a package missing from the catalog never fails a
@@ -271,38 +255,33 @@ release.
 ### When a package does not show up
 
 `not-indexed` is not a lag you can wait out — the catalog only ingests packages that rank inside the
-reachable slice. The levers, in order:
+reachable slice. In order:
 
-1. **Confirm the state** (the check prints the URL): `https://pi.dev/packages?name=<urlencoded-name>`
-   shows no card, and the detail page's `Downloads` row says `not available`.
-2. **Republish so npm re-indexes the package** — the search index refreshes a package's record on
-   publish, and the three packages above are carrying figures from their first hours:
+1. **Confirm the state and the reason.**
 
    ```bash
-   npm run release -- --packages autocompact --bump patch --yes
-   npm run gallery -- --packages autocompact
+   npm run gallery -- --packages workflow --diagnose
    ```
 
-   Compare the refreshed search-index record with reality:
-
-   ```bash
-   curl -s "https://registry.npmjs.org/-/v1/search?text=keywords%3Api-package%20%40dieulc%2Fautocompact" --url-query size=5
-   curl -s "https://api.npmjs.org/downloads/point/last-month/@dieulc/autocompact"
-   ```
-
-   Once the index's `downloads.monthly/weekly` match the real numbers, the score rises and the next
-   crawl can pick the package up — re-check `?name=` and `npm run gallery` after ~2–4 h, then ~24 h.
-   This worked for one reported package ([pi#6991](https://github.com/earendil-works/pi/issues/6991),
-   ~2.5 h after a metadata touch) and did **not** work for others
-   ([pi#7987](https://github.com/earendil-works/pi/issues/7987),
-   [pi#8830](https://github.com/earendil-works/pi/issues/8830)) — treat it as a measured attempt, not
-   a guaranteed fix.
-3. **Real downloads are the durable lever.** Ranking is dominated by download traction; a package
-   with a few hundred installs a month clears the slice boundary. Nothing in `package.json`
-   substitutes for that.
+   That prints the package's npm search-index figure and search score, whether the catalog listing has
+   a row, the figure pi.dev stored, and a verdict: `no row (below window)` (its index figure is under
+   the measured cut-off, so the bounded crawl cannot reach it) or `no row (unknown)` (the cut-off does
+   **not** explain it). It also prints the by-hand URL to re-check.
+2. **Never republish solely to force a listing.** A version bump only refreshes the package's
+   search-index record; that is a measured attempt, not a fix, and repeated no-op releases burn
+   versions and tags for nothing. Ship a real release, then re-measure with `--diagnose`.
+3. **Escalate to pi.dev when the diagnosis says `no row` — especially `no row (unknown)`.** Every
+   catalog card links a prefilled **report** action (`package-report.yml`): that is the official channel
+   for “this package is missing”, and an ingest gap is not something this repo can fix.
+   [gallery-membership.md](gallery-membership.md) lists the evidence to include and the upstream issues
+   already on file.
+4. **Real downloads are hygiene, not a proven cure.** Ranking is popularity-led, but the catalog
+   already contains packages with *less* npm traction than ones it skips, so traction cannot be shown
+   to be why a specific package is missing. Promote honestly — self-download loops and CI fetch farms
+   violate npm's terms and misrepresent the package's adoption.
 
 `npm publish` never overwrites an existing version, so “refreshing” always means a new version —
-which is exactly what the republish step above does.
+which is exactly what step 2 cautions against doing for its own sake.
 
 ## Versioning policy
 

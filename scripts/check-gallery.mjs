@@ -11,22 +11,31 @@
  * have a working detail page while pi.dev has no catalog record for it.
  *
  * The detail page is NOT proof of listing: pi.dev renders it for any npm
- * package that looks like a Pi package. What distinguishes a catalogued
- * package is its `Downloads` row — pi.dev fills it only from its own crawled
- * catalog snapshot, so `not available` means "no catalog row" (invisible in the
- * gallery search and in "Recently published"), while a numeric value
- * (`441/mo · 247/wk`) means the gallery has it.
+ * package that looks like a Pi package. A catalog row is what puts a package
+ * into the gallery search and into "Recently published". Two independent
+ * signals are read, and they have to agree:
+ *
+ *   1. membership — an exact-name card in the catalog listing
+ *      (`/packages?name=<pkg>`, walked page by page while the page counter
+ *      says more rows matched)
+ *   2. the detail page's `Downloads` row — pi.dev fills it only from its own
+ *      crawled catalog snapshot, so `not available` means "no catalog row"
+ *      while a numeric value (`441/mo · 247/wk`) means the gallery has it
+ *
+ * A disagreement between the two (or a signal that cannot be read at all) is
+ * reported as `unreachable`, never as a confident "not indexed".
  *
  * Checks, per package:
  *   a) eligibility — the manifest declares the `pi-package` keyword
  *   b) publication — `npm view <name>@<version>` resolves on the registry
- *   c) catalogue   — the detail page's `Downloads` row (>0/number = catalogued)
- *   d) freshness   — the version on the catalog card equals the manifest version
+ *   c) catalogue   — (1) and (2) above agree that a catalog row exists
+ *   d) freshness   — the version on the detail page equals the manifest version
  *
  * Usage:
  *   npm run gallery                          # all packages, one shot
  *   npm run gallery -- --packages workflow   # one package
  *   npm run gallery -- --wait 900            # poll for up to 15 minutes
+ *   npm run gallery -- --diagnose            # explain a verdict (index figures, cut-off)
  *   npm run gallery -- --json                # machine-readable output
  *   npm run gallery -- --warn-only           # never fail (used by release.mjs)
  *   node scripts/check-gallery.mjs --help
@@ -45,6 +54,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXT_DIR = path.join(ROOT, "agent", "extensions");
 const GALLERY_BASE = "https://pi.dev";
+const SEARCH_BASE = "https://registry.npmjs.org/-/v1/search";
 const NPM_SPEC =
   process.platform === "win32"
     ? // npm is a .cmd shim on Windows; spawn it through cmd.exe. shell:false keeps
@@ -59,6 +69,7 @@ const DEFAULTS = {
   retries: 2,
   warnOnly: false,
   json: false,
+  diagnose: false,
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -228,7 +239,12 @@ export function galleryMembership(downloads) {
  * Decide the status for one package from already-collected facts (pure, so the
  * decision table stays unit-testable without network access).
  *
- * @param {{eligible: boolean, published: boolean, membership: "listed"|"unlisted"|"unknown"|null, version: string, galleryVersion: string|null}} facts
+ * `listMember` is the catalog-listing verdict: `true` (exact-name card found),
+ * `false` (listing read completely, no card) or `null` (could not be read).
+ * Leaving it `undefined` keeps the legacy single-signal behaviour, where the
+ * detail page's `Downloads` row is the only evidence.
+ *
+ * @param {{eligible: boolean, published: boolean, membership: "listed"|"unlisted"|"unknown"|null, version: string, galleryVersion: string|null, listMember?: boolean|null}} facts
  * @returns {"ineligible"|"missing"|"not-indexed"|"ok"|"stale"|"unreachable"}
  */
 export function classifyGalleryStatus({
@@ -237,15 +253,127 @@ export function classifyGalleryStatus({
   membership,
   version,
   galleryVersion,
+  listMember,
 }) {
   if (!eligible) return "ineligible";
   if (!published) return "missing";
-  if (membership === "unlisted") return "not-indexed";
-  if (membership === "listed" && galleryVersion) {
-    return galleryVersion === version ? "ok" : "stale";
+
+  const rowSaysMember =
+    membership === "listed" ? true : membership === "unlisted" ? false : null;
+
+  if (listMember === undefined) {
+    // Legacy single-signal path: the detail page's Downloads row alone.
+    if (membership === "unlisted") return "not-indexed";
+    if (membership === "listed" && galleryVersion) {
+      return galleryVersion === version ? "ok" : "stale";
+    }
+    return "unreachable";
   }
-  // Fetch failed, no detail grid, or a Downloads row we cannot read.
-  return "unreachable";
+
+  // Both signals must be readable and must agree before anything is claimed.
+  if (listMember === null || rowSaysMember === null) return "unreachable";
+  if (listMember !== rowSaysMember) return "unreachable";
+  if (!listMember) return "not-indexed";
+  if (!galleryVersion) return "unreachable";
+  return galleryVersion === version ? "ok" : "stale";
+}
+
+/**
+ * Parse the page counter the catalog renders above its grid. Three shapes are
+ * in the wild:
+ *
+ *   `1-4 / 4 (of 5376)`     filtered, one page        → from/to/matched/total
+ *   `5351-5376 / 5376`      last page, matched == total
+ *   `0 / 5374`              nothing matched
+ *
+ * @param {string} text plain text of the counter element
+ * @returns {{from: number, to: number, matched: number, total: number}|null}
+ */
+export function parseCatalogCount(text) {
+  const value = stripTags(text);
+  const ranged = value.match(
+    /^(\d+)\s*[-–—]\s*(\d+)\s*\/\s*(\d+)(?:\s*\(of\s+(\d+)\))?$/i,
+  );
+  if (ranged) {
+    const from = Number.parseInt(ranged[1], 10);
+    const to = Number.parseInt(ranged[2], 10);
+    const matched = Number.parseInt(ranged[3], 10);
+    const total = Number.parseInt(ranged[4] ?? ranged[3], 10);
+    if (![from, to, matched, total].every(Number.isFinite)) return null;
+    return { from, to, matched, total };
+  }
+
+  // `<matched> / <total>` — rendered when there is a single number to show
+  // (`0 / 5374` for no matches).
+  const single = value.match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (single) {
+    const matched = Number.parseInt(single[1], 10);
+    const total = Number.parseInt(single[2], 10);
+    if (![matched, total].every(Number.isFinite)) return null;
+    return { from: 0, to: matched, matched, total };
+  }
+
+  return null;
+}
+
+/**
+ * Extract the cards of a pi.dev catalog listing page.
+ *
+ * This is the authoritative membership test for the gallery: the detail page
+ * (`/packages/<name>`) is rendered on demand for any npm package that looks
+ * like a Pi package, but a card in `/packages?name=<name>` exists only when
+ * pi.dev's crawl actually ingested the package into its catalog. Each card
+ * carries `data-package-downloads` (its crawled npm figure), `data-package-date`
+ * (epoch ms of the version it was ingested with) and `data-package-types`.
+ *
+ * Markup drift must never throw: an unrecognised page comes back with
+ * `recognized: false` so the caller can report `unreachable` instead of
+ * claiming a package is missing.
+ *
+ * @param {string} html
+ * @returns {{recognized: boolean, count: {from: number, to: number, matched: number, total: number}|null, packages: Array<{name: string, downloads: number|null, date: number|null, types: string[]}>}}
+ */
+export function parseCatalogList(html) {
+  const text = String(html ?? "");
+
+  const countMatch = text.match(
+    /<span[^>]*class="[^"]*packages-count[^"]*"[^>]*>([\s\S]*?)<\/span>/,
+  );
+  const count = countMatch ? parseCatalogCount(countMatch[1]) : null;
+
+  const packages = [];
+  const seen = new Set();
+  for (const tag of text.match(/<article\b[^>]*>/g) ?? []) {
+    const attrs = {};
+    for (const [, key, raw] of tag.matchAll(/data-package-([a-z0-9-]+)="([^"]*)"/g)) {
+      attrs[key] = decodeEntities(raw);
+    }
+    if (attrs.card !== "true" || !attrs.name) continue;
+    if (seen.has(attrs.name)) continue;
+    seen.add(attrs.name);
+    const downloads = Number.parseInt(attrs.downloads ?? "", 10);
+    const date = Number.parseInt(attrs.date ?? "", 10);
+    packages.push({
+      name: attrs.name,
+      downloads: Number.isFinite(downloads) ? downloads : null,
+      date: Number.isFinite(date) ? date : null,
+      types: (attrs.types ?? "").split(/[\s,]+/).filter(Boolean),
+    });
+  }
+
+  return { recognized: Boolean(count) || packages.length > 0, count, packages };
+}
+
+/**
+ * Whether a parsed catalog listing contains an exact package name.
+ *
+ * @param {{packages: Array<{name: string}>}|null|undefined} parsed
+ * @param {string} name
+ */
+export function catalogIncludes(parsed, name) {
+  return Boolean(
+    parsed?.packages?.some((entry) => entry.name === name),
+  );
 }
 
 export function galleryUrl(name) {
@@ -254,14 +382,43 @@ export function galleryUrl(name) {
   return `${GALLERY_BASE}/packages/${encodeURI(name)}`;
 }
 
-async function fetchGallery(name, timeoutMs) {
-  const url = galleryUrl(name);
+/**
+ * The catalog listing filtered by a search term. pi.dev matches that term
+ * against a row's name, description and author, and it does **not** match the
+ * full `@scope/name` form of a scoped package, so callers pass the terms from
+ * `catalogListQueries` instead of a raw package name.
+ */
+export function catalogListUrl(term) {
+  return `${GALLERY_BASE}/packages?name=${encodeURIComponent(term)}`;
+}
+
+/**
+ * Candidate `?name=` filter terms for a package, most selective first.
+ *
+ * A scoped row's searchable text contains its publisher, so the scope on its own
+ * usually selects that author's handful of packages (`dieulc` → `1-4 / 4`) — a
+ * single page that both finds the row and proves its absence. The unscoped
+ * basename is the fallback hook (it always matches the package's own name).
+ *
+ * @param {string} name
+ * @returns {string[]}
+ */
+export function catalogListQueries(name) {
+  const value = String(name ?? "").trim();
+  const slash = value.indexOf("/");
+  if (!value.startsWith("@") || slash < 1) return value ? [value] : [];
+  const scope = value.slice(1, slash);
+  const base = value.slice(slash + 1);
+  return base ? [scope, base] : [scope];
+}
+
+async function fetchText(url, timeoutMs, accept = "text/html") {
   try {
     const res = await fetch(url, {
       redirect: "follow",
       signal: AbortSignal.timeout(timeoutMs * 1000),
       headers: {
-        accept: "text/html",
+        accept,
         "user-agent": "pi-release-gallery-check",
       },
     });
@@ -274,6 +431,150 @@ async function fetchGallery(name, timeoutMs) {
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+// A transport failure (status 0) is retried a couple of times with a widening
+// delay; an HTTP status is a real answer and is never retried.
+async function fetchWithRetry(url, opts, accept = "text/html") {
+  let res = await fetchText(url, opts.timeout, accept);
+  for (let attempt = 0; attempt < opts.retries && res.status === 0; attempt++) {
+    await sleep(1000 * (attempt + 1));
+    res = await fetchText(url, opts.timeout, accept);
+  }
+  return res;
+}
+
+async function fetchJsonOrNull(url, opts) {
+  const res = await fetchWithRetry(url, opts, "application/json");
+  if (res.status !== 200 || !res.body) return null;
+  try {
+    return JSON.parse(res.body);
+  } catch {
+    return null;
+  }
+}
+
+// One pi.dev catalog page holds 50 cards.
+const CATALOG_PAGE_SIZE = 50;
+// A page budget for the `?name=` walk. The filter matches name, description AND
+// author, so a scoped package name normally resolves on page 1; anything longer
+// than this is reported as undecided rather than as "no row".
+const CATALOG_MAX_PAGES = 20;
+
+/**
+ * Whether a walked catalog page leaves more rows unread.
+ *
+ * Driven by the page counter when it is readable (with `0 / N` meaning "nothing
+ * matched"), and by the page size otherwise.
+ *
+ * @param {{packages: Array<unknown>}|null} parsed
+ * @param {{from: number, to: number, matched: number, total: number}|null} count
+ */
+export function catalogHasMorePages(parsed, count) {
+  const rows = parsed?.packages?.length ?? 0;
+  if (!count) return rows >= CATALOG_PAGE_SIZE;
+  if (count.matched === 0) return false;
+  const lastShown = Math.max(count.to, count.from + rows - 1);
+  return count.matched > lastShown;
+}
+
+/**
+ * Walk one `?name=` result set until the exact package name is found or the
+ * whole result set has been read.
+ *
+ * A complete walk that does not contain the exact name is a decisive "not in
+ * the catalog": the row's searchable text starts with the package name, so any
+ * row that exists is matched by at least one of the query terms.
+ *
+ * @returns {Promise<{url: string, query: string, status: number, error: string|null, pages: number, member: boolean|null, found: object|null, count: object|null}>}
+ */
+async function walkCatalogQuery(query, name, opts) {
+  const url = catalogListUrl(query);
+  const base = {
+    url,
+    query,
+    status: 0,
+    error: null,
+    pages: 0,
+    member: null,
+    found: null,
+    count: null,
+  };
+
+  let firstCount = null;
+  for (let page = 1; page <= CATALOG_MAX_PAGES; page++) {
+    const pageUrl = page === 1 ? url : `${url}&page=${page}`;
+    const res = await fetchWithRetry(pageUrl, opts);
+    if (res.status === 0) {
+      return { ...base, status: 0, error: res.error ?? null, pages: page - 1 };
+    }
+    if (res.status !== 200) {
+      return { ...base, status: res.status, pages: page - 1 };
+    }
+
+    const parsed = parseCatalogList(res.body);
+    if (!parsed.recognized) {
+      // Markup drift: claim nothing.
+      return { ...base, status: res.status, pages: page - 1 };
+    }
+    firstCount ??= parsed.count;
+
+    const found = parsed.packages.find((entry) => entry.name === name);
+    if (found) {
+      return {
+        ...base,
+        status: res.status,
+        pages: page,
+        member: true,
+        found,
+        count: firstCount,
+      };
+    }
+
+    if (!catalogHasMorePages(parsed, firstCount)) {
+      // This page was the last one the filter matched: an exact-name miss is
+      // now decisive, not merely "not seen yet".
+      return {
+        ...base,
+        status: res.status,
+        pages: page,
+        member: false,
+        count: firstCount,
+      };
+    }
+  }
+
+  // Ran out of page budget with rows still unread: undecided, not absent.
+  return { ...base, status: 200, pages: CATALOG_MAX_PAGES, count: firstCount };
+}
+
+/**
+ * Look a package up in the pi.dev catalog listing.
+ *
+ * Requests stay sequential and share the caller's timeout. The first query term
+ * that gives a decisive answer (a hit, or a fully walked result set without the
+ * package) ends the walk; otherwise the next term is tried.
+ *
+ * @returns {Promise<{url: string, query: string, status: number, error: string|null, pages: number, member: boolean|null, found: {name: string, downloads: number|null, date: number|null, types: string[]}|null, count: object|null}>}
+ */
+async function fetchCatalogList(name, opts) {
+  const queries = catalogListQueries(name);
+  let last = {
+    url: catalogListUrl(queries[0] ?? name),
+    query: queries[0] ?? name,
+    status: 200,
+    error: null,
+    pages: 0,
+    member: null,
+    found: null,
+    count: null,
+  };
+
+  for (const query of queries) {
+    last = await walkCatalogQuery(query, name, opts);
+    if (last.member !== null) return last;
+  }
+  return last;
 }
 
 function isPublished(name, version, dir) {
@@ -319,6 +620,9 @@ async function checkPackage(pkg, opts) {
     membership: null,
     downloads: null,
     gallery: null,
+    listMember: null,
+    catalogRow: null,
+    catalog: null,
     published: false,
     latest: null,
     status: "pending",
@@ -330,12 +634,8 @@ async function checkPackage(pkg, opts) {
   let fetchStatus = 0;
   let fetchError = null;
   if (eligible && base.published) {
-    let res = await fetchGallery(pkg.name, opts.timeout);
-    for (let attempt = 0; attempt < opts.retries && res.status === 0; attempt++) {
-      await sleep(1000 * (attempt + 1));
-      res = await fetchGallery(pkg.name, opts.timeout);
-    }
-
+    // Signal 1: the detail page's Downloads row.
+    const res = await fetchWithRetry(galleryUrl(pkg.name), opts);
     fetchStatus = res.status;
     fetchError = res.error ?? null;
 
@@ -350,6 +650,19 @@ async function checkPackage(pkg, opts) {
         base.downloads = page.downloads;
       }
     }
+
+    // Signal 2: the catalog listing itself (authoritative membership).
+    const list = await fetchCatalogList(pkg.name, opts);
+    base.catalog = {
+      url: list.url,
+      query: list.query,
+      status: list.status,
+      error: list.error,
+      pages: list.pages,
+      count: list.count,
+    };
+    base.listMember = list.member;
+    base.catalogRow = list.found;
   }
 
   base.status = classifyGalleryStatus({
@@ -358,6 +671,8 @@ async function checkPackage(pkg, opts) {
     membership: base.membership,
     version: pkg.version,
     galleryVersion: base.gallery?.version ?? null,
+    listMember:
+      eligible && base.published ? base.listMember : undefined,
   });
 
   if (base.status === "ineligible") {
@@ -369,23 +684,53 @@ async function checkPackage(pkg, opts) {
       `not on the npm registry yet — if you just published, npm may still be propagating; otherwise publish it: npm run release -- --packages ${pkg.short} --bump none --yes`,
     );
   } else if (base.status === "unreachable") {
-    base.notes.push(
-      fetchStatus === 0
-        ? `pi.dev request failed: ${fetchError ?? "unknown error"}`
-        : 'pi.dev detail page has no recognisable "Downloads" row — the page markup may have changed',
-    );
+    const detailReadable = fetchStatus === 200 && Boolean(base.gallery?.listed);
+    if (fetchStatus === 0) {
+      base.notes.push(
+        `pi.dev detail page request failed: ${fetchError ?? "unknown error"}`,
+      );
+    } else if (!detailReadable) {
+      base.notes.push(
+        'pi.dev detail page has no recognisable "Downloads" row — the page markup may have changed',
+      );
+    }
+
+    if (base.catalog?.status === 0) {
+      base.notes.push(
+        `pi.dev catalog-listing request failed: ${base.catalog.error ?? "unknown error"}`,
+      );
+    } else if (base.catalog && base.catalog.status !== 200) {
+      base.notes.push(
+        `pi.dev catalog listing returned HTTP ${base.catalog.status}`,
+      );
+    } else if (base.listMember === null) {
+      base.notes.push(
+        `pi.dev catalog listing could not be read (markup drift, or more than ${CATALOG_MAX_PAGES} matching pages)`,
+      );
+    } else if (detailReadable && base.listMember === false) {
+      base.notes.push(
+        "the two pi.dev views disagree: the detail page shows download stats while the catalog listing has no row for it — re-run before acting on it",
+      );
+    }
+    if (base.catalog?.url) base.notes.push(`check by hand: ${base.catalog.url}`);
   } else if (base.status === "not-indexed") {
     base.notes.push(
-      'published and installable, but pi.dev has no gallery-catalog record for it — its detail page shows "Downloads: not available"',
+      'published and installable, but pi.dev has no gallery-catalog record for it — the catalog listing has no row and its detail page shows "Downloads: not available"',
     );
     base.notes.push(
-      "the catalog is built from npm search results for keywords:pi-package, and pi.dev ingests only a bounded, score-ranked slice of them (npm's search API rolls over past from=5000, so roughly half of the matching packages are out of reach); low download traction or a stale npm search-index record keeps a package below that slice",
+      "the catalog is built from npm search results for keywords:pi-package, and pi.dev ingests only a bounded slice of them (npm's search API rolls over past from=5000, so roughly half of the matching packages are out of reach)",
     );
     base.notes.push(
-      "publishing a new version does not reliably change this — the slice is score-ranked (see earendil-works/pi#6991, #7849, #7885, #7987, #8830)",
+      "that slice is NOT a pure downloads cut-off: the catalog holds packages with less npm traction than this one, so a missing row can be a per-package ingest gap rather than a ranking outcome — run --diagnose to see which case this is",
     );
     base.notes.push(
-      `check by hand: ${GALLERY_BASE}/packages?name=${encodeURIComponent(pkg.name)}`,
+      "publishing a new version does not reliably change this — the bounded slice and the missing-row cases are tracked upstream (earendil-works/pi#6991, #7849, #7885, #7987, #8830)",
+    );
+    base.notes.push(
+      `run npm run gallery -- --diagnose for the npm search-index figures and the catalog cut-off`,
+    );
+    base.notes.push(
+      `check by hand: ${base.catalog?.url ?? `${GALLERY_BASE}/packages?name=${encodeURIComponent(pkg.name)}`}`,
     );
   } else if (base.status === "stale") {
     base.latest = latestPublished(pkg.name, pkg.dir);
@@ -401,6 +746,228 @@ async function checkPackage(pkg, opts) {
   return base;
 }
 
+// ── diagnose ───────────────────────────────────────────────────────────────
+
+/**
+ * Pure: the fields worth comparing out of one npm search response. Parsing is
+ * defensive — the endpoint is undocumented and its shape may drift.
+ *
+ * @param {unknown} payload parsed JSON of `/-/v1/search`
+ * @param {string} name exact package name to find in the results
+ */
+export function parseSearchRecord(payload, name) {
+  const missing = {
+    found: false,
+    monthly: null,
+    weekly: null,
+    searchScore: null,
+    date: null,
+    version: null,
+    keywords: [],
+  };
+  const objects = Array.isArray(payload?.objects) ? payload.objects : [];
+  const hit = objects.find((entry) => entry?.package?.name === name);
+  if (!hit) return missing;
+  const pkg = hit.package ?? {};
+  const num = (value) => (Number.isFinite(value) ? value : null);
+  return {
+    found: true,
+    monthly: num(hit.downloads?.monthly),
+    weekly: num(hit.downloads?.weekly),
+    searchScore: num(hit.score?.final),
+    date: typeof pkg.date === "string" ? pkg.date : null,
+    version: typeof pkg.version === "string" ? pkg.version : null,
+    keywords: Array.isArray(pkg.keywords) ? pkg.keywords.map(String) : [],
+  };
+}
+
+/**
+ * Pure: the download floor of a catalog page. The catalog is served sorted by
+ * downloads, so its last page holds the lowest figure pi.dev has ingested — the
+ * cut-off a package has to clear to be reached by the crawl.
+ */
+export function parseCatalogCutoff(parsed, page) {
+  const rows = (parsed?.packages ?? []).filter(
+    (entry) => entry.downloads != null,
+  );
+  if (!rows.length) return null;
+  const downloads = rows.map((entry) => entry.downloads);
+  return {
+    page: page ?? null,
+    rows: rows.length,
+    min: Math.min(...downloads),
+    max: Math.max(...downloads),
+    count: parsed?.count ?? null,
+  };
+}
+
+/**
+ * Pure: why a package has (or has not) a catalog row.
+ *
+ * @param {{listMember: boolean|null, indexMonthly: number|null, cutoff: number|null}} facts
+ * @returns {"member"|"no row (below window)"|"no row (unknown)"}
+ */
+export function diagnoseVerdict({ listMember, indexMonthly, cutoff }) {
+  if (listMember === true) return "member";
+  if (listMember === null) return "no row (unknown)";
+  if (indexMonthly != null && cutoff != null && indexMonthly < cutoff) {
+    return "no row (below window)";
+  }
+  return "no row (unknown)";
+}
+
+async function fetchSearchRecord(name, opts) {
+  const payload = await fetchJsonOrNull(
+    `${SEARCH_BASE}?text=${encodeURIComponent(name)}&size=1`,
+    opts,
+  );
+  return payload ? parseSearchRecord(payload, name) : null;
+}
+
+async function fetchKeywordMatchCount(opts) {
+  const payload = await fetchJsonOrNull(
+    `${SEARCH_BASE}?text=${encodeURIComponent("keywords:pi-package")}&size=1`,
+    opts,
+  );
+  return Number.isFinite(payload?.total) ? payload.total : null;
+}
+
+/**
+ * Read the catalog's own cut-off: fetch the first page to learn its size, then
+ * its last page (page number computed from the counter, never hardcoded).
+ */
+async function fetchCatalogCutoff(opts) {
+  const first = await fetchWithRetry(`${GALLERY_BASE}/packages`, opts);
+  if (first.status !== 200) return null;
+  const parsed = parseCatalogList(first.body);
+  const count = parsed.count;
+  if (!count?.total) return null;
+  const pageSize = parsed.packages.length || count.to - count.from + 1;
+  const lastPage = Math.max(1, Math.ceil(count.total / Math.max(1, pageSize)));
+  if (lastPage === 1) return parseCatalogCutoff(parsed, 1);
+
+  const tail = await fetchWithRetry(
+    `${GALLERY_BASE}/packages?page=${lastPage}`,
+    opts,
+  );
+  if (tail.status !== 200) return null;
+  return parseCatalogCutoff(parseCatalogList(tail.body), lastPage);
+}
+
+/** Collect the diagnose table for the checked packages (sequential requests). */
+async function collectDiagnose(results, opts) {
+  const cutoff = await fetchCatalogCutoff(opts);
+  const keywordMatches = await fetchKeywordMatchCount(opts);
+
+  const packages = [];
+  for (const r of results) {
+    const index = await fetchSearchRecord(r.name, opts);
+    packages.push({
+      short: r.short,
+      name: r.name,
+      version: r.version,
+      status: r.status,
+      listMember: r.listMember ?? null,
+      catalogRow: r.catalogRow ?? null,
+      catalogPages: r.catalog?.pages ?? 0,
+      index,
+      verdict: diagnoseVerdict({
+        listMember: r.listMember ?? null,
+        indexMonthly: index?.monthly ?? null,
+        cutoff: cutoff?.min ?? null,
+      }),
+    });
+  }
+
+  const sorted = [...packages].sort((a, b) => {
+    const av = a.index?.monthly;
+    const bv = b.index?.monthly;
+    if (av == null && bv == null) return a.name.localeCompare(b.name);
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return bv - av;
+  });
+
+  return {
+    measuredAt: new Date().toISOString(),
+    cutoff,
+    keywordMatches,
+    catalogTotal: cutoff?.count?.total ?? null,
+    packages: sorted,
+  };
+}
+
+function catalogMemberLabel(listMember) {
+  if (listMember === true) return "yes";
+  if (listMember === false) return "no";
+  return "?";
+}
+
+function printDiagnose(diag) {
+  const header = ["package", "index/mo", "score", "row", "row/mo", "verdict"];
+  const rows = diag.packages.map((p) => [
+    p.name,
+    p.index?.monthly != null ? String(p.index.monthly) : "?",
+    p.index?.searchScore != null ? p.index.searchScore.toFixed(1) : "?",
+    catalogMemberLabel(p.listMember),
+    p.catalogRow?.downloads != null ? String(p.catalogRow.downloads) : "-",
+    p.verdict,
+  ]);
+  const widths = header.map((cell, i) =>
+    Math.max(cell.length, ...rows.map((row) => row[i].length)),
+  );
+  const line = (cells) =>
+    cells.map((cell, i) => cell.padEnd(widths[i])).join("  ").trimEnd();
+
+  console.log(`\nnpm search index vs pi.dev catalog — measured ${diag.measuredAt}`);
+  console.log(line(header));
+  console.log(line(widths.map((width) => "-".repeat(width))));
+  for (const row of rows) console.log(line(row));
+
+  console.log("");
+  if (diag.cutoff) {
+    console.log(
+      `catalog cut-off: ~${diag.cutoff.min}/mo — lowest downloads figure on the catalog's last page (page ${diag.cutoff.page}, ${diag.cutoff.rows} rows, up to ${diag.cutoff.max}/mo)`,
+    );
+  } else {
+    console.log("catalog cut-off: unreadable (pi.dev's catalog page could not be parsed)");
+  }
+  if (diag.catalogTotal != null) console.log(`catalog size: ${diag.catalogTotal} rows`);
+  if (diag.keywordMatches != null) {
+    console.log(
+      `npm matches for keywords:pi-package: ${diag.keywordMatches} package(s)`,
+    );
+  }
+  if (diag.keywordMatches != null && diag.catalogTotal != null) {
+    const unreached = diag.keywordMatches - diag.catalogTotal;
+    if (unreached > 0) {
+      console.log(
+        `not ingested: ~${unreached} matching package(s) have no catalog row`,
+      );
+    }
+  }
+  console.log(
+    '\n"row" is the catalog listing (authoritative membership); "row/mo" is the figure pi.dev stored for it.',
+  );
+  console.log(
+    '"below window" means the package\'s npm search-index download figure sits under the cut-off, so pi.dev\'s bounded crawl does not reach it — see docs/gallery-membership.md.',
+  );
+  const aboveCutoff = diag.packages.filter(
+    (p) =>
+      p.listMember === false &&
+      p.index?.monthly != null &&
+      diag.cutoff?.min != null &&
+      p.index.monthly >= diag.cutoff.min,
+  );
+  if (aboveCutoff.length) {
+    console.log(
+      `"no row (unknown)" with a figure at or above the cut-off means the cut-off does not explain the absence — the catalog holds packages with less traction than ${aboveCutoff
+        .map((p) => p.name)
+        .join(", ")}, so this is a per-package ingest gap: report it (docs/gallery-membership.md → Escalating).`,
+    );
+  }
+}
+
 // ── main ───────────────────────────────────────────────────────────────────
 
 const HELP = [
@@ -410,6 +977,8 @@ const HELP = [
   "  --wait <sec>       keep polling until every package is listed (default: 0 = one shot)",
   "  --interval <sec>   seconds between polling attempts (default: 30)",
   "  --timeout <sec>    pi.dev request timeout (default: 15)",
+  "  --diagnose         explain each verdict: npm search-index figures, catalog row",
+  "                     stats and the catalog's download cut-off",
   "  --json             print JSON instead of the report",
   "  --warn-only        always exit 0 (used by release.mjs)",
   "  --help, -h         show this help",
@@ -433,6 +1002,7 @@ function parseArgs(argv) {
     else if (arg === "--timeout")
       opts.timeout = Number(argv[++i] ?? opts.timeout) || DEFAULTS.timeout;
     else if (arg === "--json") opts.json = true;
+    else if (arg === "--diagnose") opts.diagnose = true;
     else if (arg === "--warn-only") opts.warnOnly = true;
     else if (arg === "--help" || arg === "-h") opts.help = true;
     else throw new UsageError(`unknown argument: ${arg}`);
@@ -444,6 +1014,9 @@ function catalogDetail(r) {
   return [
     `catalog: ${r.gallery?.version ?? "?"}`,
     r.downloads ? r.downloads : null,
+    r.catalogRow?.downloads != null
+      ? `catalog row: ${r.catalogRow.downloads}/mo`
+      : null,
     r.gallery?.published ? `published ${r.gallery.published}` : null,
   ]
     .filter(Boolean)
@@ -454,9 +1027,9 @@ const STATUS_DETAIL = {
   ok: catalogDetail,
   stale: catalogDetail,
   "not-indexed": () =>
-    "published, but not in the pi.dev gallery catalog (detail page: Downloads: not available)",
+    "published, but not in the pi.dev gallery catalog (no catalog row; detail page: Downloads: not available)",
   missing: () => "not published on npm",
-  unreachable: () => "pi.dev detail page unreadable",
+  unreachable: () => "pi.dev could not be read unambiguously",
   ineligible: () => 'keywords missing "pi-package"',
 };
 
@@ -526,7 +1099,16 @@ async function main() {
     await sleep(opts.interval * 1000);
   }
 
-  if (opts.json) {
+  if (opts.diagnose) {
+    // Printed once, after the polling loop has settled on a verdict.
+    const diag = await collectDiagnose(results, opts);
+    if (opts.json) {
+      console.log(JSON.stringify({ packages: results, diagnose: diag }, null, 2));
+    } else {
+      report(results);
+      printDiagnose(diag);
+    }
+  } else if (opts.json) {
     console.log(JSON.stringify(results, null, 2));
   } else {
     report(results);

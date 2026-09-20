@@ -727,10 +727,10 @@ function galleryCheck(targets) {
     { capture: false },
   );
   console.log(
-    "Catalog membership is decided by npm's search ranking, not by publishing —\n" +
-      "if a package is missing above, see docs/publishing.md (“A published package\n" +
-      "is missing from the catalog”) and re-check with:\n" +
-      "  npm run gallery -- --packages <short>",
+    "Catalog membership is decided by pi.dev's ingest of npm's search results, not by\n" +
+      "publishing — if a package is missing above, see docs/publishing.md\n" +
+      "(“When a package does not show up”) and docs/gallery-membership.md, then re-check with:\n" +
+      "  npm run gallery -- --packages <short> --diagnose",
   );
 }
 
