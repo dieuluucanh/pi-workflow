@@ -132,6 +132,7 @@ import {
   type ReviewTranscriptOp,
 } from "./review.ts";
 import { createReviewRuntime, type ReviewRuntime } from "./review-runtime.ts";
+import { findParentProviderSurface } from "./review-providers.ts";
 import {
   createReviewBandGate,
   createReviewLineBuffer,
@@ -891,6 +892,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
       },
       findModel: (provider: string, id: string) =>
         (currentSessionCtx as any)?.modelRegistry?.find?.(provider, id),
+      // Structural probe of the live parent context, evaluated at reviewer
+      // session-creation time. Providers the parent registered (e.g. via an
+      // extension) that the isolated reviewer runtime does not compose yet
+      // are seeded onto it before the session exists; when the probe finds
+      // no surface, nothing is seeded and the preflight reports the escape
+      // hatch. No-op for providers every runtime composes by construction.
+      parentProviders: () => findParentProviderSurface(currentSessionCtx),
       planPath: () => currentPlanFile,
       readPlan: () => {
         const p = currentPlanFile;

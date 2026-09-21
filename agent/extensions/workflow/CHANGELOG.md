@@ -6,7 +6,20 @@ All notable changes to this package are documented in this file.
 
 - No user-facing changes recorded.
 
-## [Unreleased]
+## [0.3.2] - 2026-09-21
+
+### Fixed — Review Mode: any provider works as the reviewer
+
+**The bug.** Every Review Mode round failed for providers that exist only because an extension registered them in the parent session (`pi.registerProvider(...)`): the transcript showed `could not prompt the reviewer: No API key found for <provider>.` even though `/login` had stored a valid credential in `auth.json` and Plan/Build worked fine on the same model. The reviewer session is deliberately created without ambient extensions and with its own fresh model runtime, so the provider layer the parent composes never reached it.
+
+**The fix — layer-agnostic provider seeding** (`review-providers.ts`, new module):
+
+- **Present-probe, not layer names.** Before the reviewer session is created, the parent context is probed for a provider-registration surface (the model registry facade first, then the runtime — feature-detected). Providers the child already composes are skipped: the built-in catalog and `~/.pi/agent/models.json` are loaded by every runtime by construction, so the seeder is a no-op for them — and for any provider source a future Pi version composes globally.
+- **Seed the difference, native-first, fault-isolated.** Every missing provider id is registered on the reviewer runtime — the parent's provider object when there is one, otherwise its config — each in its own try/catch; a broken unrelated provider can never block a review, and a second pass skips already-seeded ids.
+- **Provider-agnostic auth preflight.** After seeding, the reviewer runtime is asked `hasConfiguredAuth(provider) || checkAuth(provider)` for the reviewer model's own provider; on absence the review fails fast with the provider name, the seed report and the escape hatch below, instead of a bare error mid-review.
+- **Defensive failure text.** A pass-1 failure that still carries the bare `No API key found for <provider>.` gains an actionable hint naming `/login <provider>` and the escape hatch — only when the failing provider is the reviewer's own.
+
+**The universal escape hatch** (documented in the README, works for any provider and even on an installed version without this fix): `~/.pi/agent/models.json` is loaded by every runtime, including the reviewer's — add the provider under `"providers"` with `baseUrl`, `apiKey: "$MY_API_KEY"`, `api` and its `models`; a stored `/login` credential always wins over the template. The README gains a "Provider seeding" section (the three-layer taxonomy, why `noExtensions` is deliberate, the probe design) and a troubleshooting entry keyed on the exact transcript text. 17 new tests cover seeding order, the built-in/static skip, native-first registration, per-provider tolerance, the preflight, the missing-surface path and idempotency.
 
 ### Fixed — command policy: `/dev/null` unblocked, verified write/exec holes closed
 

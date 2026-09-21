@@ -22,6 +22,8 @@
  * instructions — the reviewer only supplies judgement.
  */
 
+import * as path from "node:path";
+
 import {
   DEFAULT_REVIEW_MODE_CONFIG,
   createReviewRoundGate,
@@ -44,6 +46,7 @@ import {
   type ReviewVerdict,
   ReviewTranscript as Transcript,
 } from "./review.ts";
+import { appendProviderAuthHint } from "./review-providers.ts";
 import { createReviewTools } from "./review-tools.ts";
 import { renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
 
@@ -71,6 +74,15 @@ export interface ReviewRuntimeDeps {
     | undefined;
   /** Resolve a model from the parent's registry. */
   findModel: (provider: string, id: string) => unknown;
+  /**
+   * Parent-side provider-registration surface for the reviewer runtime, found
+   * with `findParentProviderSurface(ctx)` at session-creation time. Providers
+   * the parent knows that the isolated child does not compose yet are seeded
+   * onto it before `createAgentSession`. Optional: when absent (or when the
+   * probe finds no surface) nothing is seeded and the provider-auth preflight
+   * reports the generic escape hatch instead.
+   */
+  parentProviders?: () => unknown;
   /** Plan path Plan Mode chose (absolute or cwd-relative), if known. */
   planPath: () => string | undefined;
   /** Current plan text on disk, if it exists. */
@@ -594,6 +606,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           // Reuse the already-resolved module instead of importing twice.
           loadSdk: async () => sdk,
         };
+        // Probed lazily, at creation time: the parent context is live here.
+        const parentSurface = deps.parentProviders?.();
+        if (parentSurface !== undefined) {
+          createOptions.parentProviders = parentSurface;
+        }
 
         const created: CreateReviewSessionResult =
           await createReviewSession(createOptions);
@@ -755,7 +772,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
       if (p1.stop === "error") {
         await abortChild();
-        return fail(`could not prompt the reviewer: ${errorText(p1.error)}`);
+        // Safety net for any provider-source gap the preflight could not see:
+        // the bare "No API key found for <provider>." gains the actionable
+        // hint ONLY when the failing provider is the reviewer's own.
+        return fail(
+          `could not prompt the reviewer: ${appendProviderAuthHint(
+            errorText(p1.error),
+            deps.reviewerModel()?.provider,
+            path.join(deps.agentDir, "models.json"),
+          )}`,
+        );
       }
       if (p1.stop === "aborted" || rc.signal.aborted) {
         await abortChild();

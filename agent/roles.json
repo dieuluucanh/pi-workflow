@@ -5,8 +5,8 @@
       "name": "planner",
       "description": "Frontier reasoning model for planning, orchestration, and ambiguous decisions",
       "model": {
-        "provider": "opencode-go",
-        "id": "deepseek-v4.1-flash",
+        "provider": "synthetic",
+        "id": "hf:zai-org/GLM-5.3-Flash",
         "thinking": "xhigh"
       },
       "tools": [],
@@ -17,8 +17,8 @@
       "name": "explorer",
       "description": "Fast, cheap model for read-only codebase exploration, web search, and summarization",
       "model": {
-        "provider": "opencode-go",
-        "id": "mimo-v2.5",
+        "provider": "synthetic",
+        "id": "hf:zai-org/GLM-5.3-Flash",
         "thinking": "medium"
       },
       "tools": [
@@ -35,8 +35,8 @@
       "name": "builder",
       "description": "Capable model for code generation following a plan, with light reasoning",
       "model": {
-        "provider": "opencode-go",
-        "id": "deepseek-v4.1-flash",
+        "provider": "synthetic",
+        "id": "hf:zai-org/GLM-5.3-Flash",
         "thinking": "high"
       },
       "tools": [],
@@ -47,8 +47,8 @@
       "name": "reviewer",
       "description": "Independent auditor for Review Mode — reviews and rewrites plans before the user sees them",
       "model": {
-        "provider": "opencode-go",
-        "id": "deepseek-v4.1-flash",
+        "provider": "synthetic",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
         "thinking": "xhigh"
       },
       "tools": [

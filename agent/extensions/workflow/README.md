@@ -190,6 +190,46 @@ The reviewer is an in-process child session created with `createAgentSession`, a
 
 An environment marker (`PI_WORKFLOW_REVIEW_CHILD`) is set only for the duration of session creation and restored immediately — the child runs in the same process, so leaking it would affect a later `/reload`.
 
+### Provider seeding
+
+The isolation above has one consequence: a provider that exists **only** because an extension registered it in the parent session (`pi.registerProvider(...)`) does not exist in the reviewer's freshly created runtime — every review round would fail with `No API key found for <provider>.` even though `/login` had stored a valid credential.
+
+Pi composes providers from three sources: the **built-in catalog**, the **static `~/.pi/agent/models.json`**, and **extension registrations** on the parent runtime. Only the last one is parent-only. Review Mode bridges it with a **present-probe**, not layer names (`review-providers.ts`):
+
+1. **Probe the parent** for a provider-registration surface: the session's model registry (`ctx.modelRegistry`) first, then the underlying runtime (`ctx.modelRuntime`). Both expose the same three accessors; a future Pi surface is picked up by adding one entry to the probe list.
+2. **Compare with the child.** Providers the child already composes are skipped. The built-in catalog and `~/.pi/agent/models.json` are loaded by *every* runtime by construction, so for them the seeder is a guaranteed no-op — and any future globally-composed provider source is skipped automatically, with zero layer-name drift.
+3. **Seed the difference, native-first.** For every provider the parent knows and the child does not, the seeder registers the parent's provider *object* when there is one, otherwise its config — each in its own try/catch, so a broken unrelated provider can never block a review. Idempotent: already-seeded ids are skipped on a second pass.
+4. **Preflight auth, provider-agnostically.** After seeding and before the session is created, the reviewer runtime is asked `hasConfiguredAuth(provider) || checkAuth(provider)` for the *reviewer model's own* provider. On absence the review fails fast with the provider name, the seed report, and the universal escape hatch below — never the bare mid-review error.
+
+Every bridged method is feature-detected: on a Pi version without a given accessor the seeder degrades to "nothing to seed" and the preflight reports the escape hatch instead of crashing.
+
+**The universal escape hatch (works for any provider, even without this fix):** `~/.pi/agent/models.json` is loaded by every runtime, including the reviewer's:
+
+```json
+{
+  "providers": {
+    "<provider>": {
+      "baseUrl": "https://…/v1",
+      "apiKey": "$MY_API_KEY",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "<model-id>",
+          "name": "<display name>",
+          "reasoning": true,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 65536
+        }
+      ]
+    }
+  }
+}
+```
+
+A stored credential (`/login <provider>` → `auth.json`) always wins over the `apiKey` template, so `$MY_API_KEY` needs no environment variable while you are logged in. Extensions that register the same provider at runtime keep working: their live model list replaces the static one in the parent, so nothing regresses there.
+
 ### Configuration
 
 Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global) or `<cwd>/.pi/settings.json` (project). Project values win field-by-field over global. Writing them preserves every other key in the file.
@@ -222,7 +262,7 @@ Review Mode settings live under `workflow.reviewMode`:
 
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -231,6 +271,22 @@ See `index.ts`, `checkpoint.ts` (shadow bare-repo), `utils.ts` (safe-command gat
 - **Update**: `workflow_todo {action:"update", todos:[{ref?, text?, status?}]}` replaces the whole list — TodoWrite/todowrite/update_plan semantics. A `ref` is resolved by canonical ref, then normalized text, then leniently by plan label / group-qualified ref / unique text; a ref that had to be resolved leniently (or matched nothing and was added) is reported under `Warnings:` in the tool result. `done`/`pending` are idempotent single-item sets; `toggle` is a convenience flip; `add` appends an ad-hoc item; `sync` re-extracts the plan file, matches steps by exact text then by plan label (so model-rewritten wording reunites instead of duplicating), **preserves agent-added items** (reported as `kept N agent-added`) and never un-completes (status rank merge); `clear` empties.
 - **Reminder cadence** (Claude Code-style throttle): a hidden `[TODO LIST]` context block is injected only when `turnsSinceLastTodoWrite ≥ TURNS_SINCE_WRITE` **and** `turnsSinceLastReminder ≥ TURNS_BETWEEN_REMINDERS` (`=3`). Unresolved `[DONE:…]` refs from the previous turn bypass the throttle once so the model learns the right numbers. A one-line `[TODO …]` footer is appended to the first successful `edit`/`write`/`bash` result of each turn.
 - **Stale notice (no forced turns)**: if a run mutated files but recorded no todo progress, the user gets one `⚠` status marker + a `ctx.ui.notify` (30 s dedupe); plan-file `- [x]` ticks are reconciled at `agent_end` in all modes, skipped when the plan content is unchanged (path+hash guard). No auto-completion — the list is never marked done based on intent. Legacy lists that already contain duplicate rows are not auto-merged; run `/todos clear` (or approve a new plan) to reset.
+
+## Troubleshooting
+
+### `No API key found for <provider>.` in a Review Mode round
+
+The transcript shows `Review Mode: … (could not prompt the reviewer: No API key found for <provider>.)`. This means the **reviewer session** could not compose auth for the provider — your login itself is fine (Plan/Build keep working off the same `auth.json`).
+
+The reviewer runs in an isolated session without ambient extensions by design (see [Provider seeding](#provider-seeding)), so a provider registered only by an extension in the parent session is invisible to it unless seeded, and its auth must resolve on its own. Since 0.3.2 the provider is seeded automatically and a missing auth fails fast with a message naming the provider, what the seed found, and the escape hatch.
+
+Fixes, in order of preference:
+
+1. **`/login <provider>`** — a stored credential in `~/.pi/agent/auth.json` is read by every runtime, including the reviewer's. No environment variable needed.
+2. **Static provider in `~/.pi/agent/models.json`** — the universal workaround (works even on an installed version without the seeding fix): add the provider under `"providers"` with `baseUrl`, `apiKey: "$MY_API_KEY"`, `api` and its `models` (template in [Provider seeding](#provider-seeding)).
+3. **`export MY_API_KEY=…`** — only needed when the provider config references `"$MY_API_KEY"` and no credential is stored.
+
+After editing `models.json`, run `/reload` or restart `pi` so every runtime picks it up.
 
 ## Development
 

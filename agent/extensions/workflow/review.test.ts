@@ -78,6 +78,12 @@ import {
   buildPass2Prompt,
   createReviewRuntime,
 } from "./review-runtime.ts";
+import {
+  appendProviderAuthHint,
+  collectMissingChildProviders,
+  findParentProviderSurface,
+  seedChildRuntimeProviders,
+} from "./review-providers.ts";
 
 // ── Fixtures ─────────────────────────────────────────────────────────
 
@@ -1774,6 +1780,10 @@ function fakeSdk(script: {
   pass1?: (c: FakeCapture) => Promise<void>;
   pass2?: (c: FakeCapture) => Promise<void>;
   shouldThrowOnCreate?: boolean;
+  /** Child runtime double handed out by ModelRuntime.create (default {}). */
+  runtime?: unknown;
+  /** Make the child's first prompt reject with this value (preflight-style). */
+  failPrompt1?: unknown;
 }): { capture: FakeCapture; sdk: unknown } {
   const capture: FakeCapture = {
     prompts: [],
@@ -1785,7 +1795,7 @@ function fakeSdk(script: {
     unsubscribeCount: 0,
   };
   const sdk = {
-    ModelRuntime: { create: async () => ({}) },
+    ModelRuntime: { create: async () => script.runtime ?? {} },
     DefaultResourceLoader: class {
       async reload() {}
     },
@@ -1829,6 +1839,7 @@ function fakeSdk(script: {
           },
           prompt: async (text: string) => {
             capture.prompts.push(text);
+            if (script.failPrompt1 !== undefined) throw script.failPrompt1;
             emit({
               type: "tool_execution_start",
               toolCallId: "t1",
@@ -1899,6 +1910,7 @@ function runtimeDeps(
   over: {
     config?: Record<string, unknown>;
     reviewerModel?: unknown;
+    parentProviders?: unknown;
     onState?: (s: unknown) => void;
     onTranscriptOps?: (ops: unknown[]) => void;
   } = {},
@@ -1922,7 +1934,9 @@ function runtimeDeps(
     reviewerModel: () =>
       over.reviewerModel === null
         ? undefined
-        : ({ provider: "p", id: "m", thinking: "xhigh" } as const),
+        : ((over.reviewerModel as
+            | { provider: string; id: string; thinking: string }
+            | undefined) ?? { provider: "p", id: "m", thinking: "xhigh" }),
     findModel: () => ({}),
     planPath: () => ".pi/plans/2026-09-18-csv.md",
     readPlan: () => ORIGINAL_PLAN,
@@ -1939,6 +1953,10 @@ function runtimeDeps(
     promptText: () => "Always align with the existing project framework.",
     loadSdk: async () => sdk as never,
   };
+  if (over.parentProviders !== undefined) {
+    (deps as { parentProviders?: unknown }).parentProviders = () =>
+      over.parentProviders;
+  }
   if (over.onState || over.onTranscriptOps) {
     return {
       deps: {
@@ -2364,6 +2382,79 @@ test("runtime: with no cap a hung reviewer never auto-fails; abort still ends th
   assert.ok(hung.capture.aborts >= 1, "the stalled run is cancelled");
 });
 
+test("runtime: the parent surface reaches the reviewer session via deps", async () => {
+  const child = childRuntimeDouble();
+  const parent = parentSurfaceDouble({
+    ids: ["synthetic"],
+    configs: { synthetic: SYNTHETIC_CONFIG },
+  });
+  const { sdk } = fakeSdk({ runtime: child.runtime });
+  const { deps } = runtimeDeps(sdk, { parentProviders: parent });
+  const rt = createReviewRuntime(deps as never);
+
+  const ok = await rt.ensureStarted();
+  assert.equal(ok, true);
+  assert.ok(
+    child.registered.has("synthetic"),
+    "deps.parentProviders flows into createReviewSession and seeds the child",
+  );
+});
+
+test("runtime: without a parent surface the reviewer still starts (providers unresolved is not fatal at startup)", async () => {
+  const { sdk } = fakeSdk({});
+  const { deps } = runtimeDeps(sdk, {});
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+});
+
+test("runtime: a mid-review provider-auth failure gains the actionable hint", async () => {
+  const failPrompt = new Error(
+    "No API key found for synthetic.\n\nUse /login to log into a provider via OAuth or API key.",
+  );
+  const silent = fakeSdk({ failPrompt1: failPrompt });
+  const { deps } = runtimeDeps(silent.sdk, {
+    reviewerModel: {
+      provider: "synthetic",
+      id: "hf:zai-org/GLM-5.3-Flash",
+      thinking: "xhigh",
+    },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+  assert.equal(res.ok, false);
+  assert.match(
+    res.reason ?? "",
+    /could not prompt the reviewer: No API key found for synthetic\./,
+    "the original error text is kept",
+  );
+  assert.match(res.reason ?? "", /models\.json/, "the escape hatch is named");
+  assert.match(res.reason ?? "", /\/login synthetic/);
+});
+
+test("runtime: a provider-auth failure for a DIFFERENT provider gains no hint", async () => {
+  const silent = fakeSdk({
+    failPrompt1: new Error("No API key found for openai."),
+  });
+  const { deps } = runtimeDeps(silent.sdk, {});
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.reason ?? "", /No API key found for openai\./);
+  assert.equal(
+    (res.reason ?? "").includes("models.json"),
+    false,
+    "an unrelated provider's failure is not decorated",
+  );
+});
+
 test("review gate: a wait with no timeout resolves only when the pass ends", async () => {
   const gate = createReviewRoundGate();
   let resolved = false;
@@ -2422,6 +2513,349 @@ test("buildPass1Prompt / buildPass2Prompt contain the contract, not the reviewer
 });
 
 // ══ Step 37 (automated): Review Mode disabled ⇒ no-op ═════════════════
+
+// ══ Provider seeding: the reviewer runtime composes what the parent knows ══
+
+/**
+ * A child `ModelRuntime` double that records every registration and reports
+ * the provider ids it already composes — exactly the surface the seeder's
+ * present-probe reads.
+ */
+function childRuntimeDouble(options: {
+  /** Ids the child composes BEFORE any seeding (built-ins / models.json). */
+  presentIds?: string[];
+  /** Auth verdict per provider; defaults to "configured" for every id. */
+  hasAuth?: (providerId: string) => boolean;
+  /** Make `registerProvider` throw for this id (per-provider tolerance). */
+  failRegistrationFor?: string;
+} = {}) {
+  const calls: string[] = [];
+  const registered = new Map<string, unknown>();
+  const registeredNative = new Map<string, unknown>();
+  const present = new Set(options.presentIds ?? []);
+  const hasAuth = options.hasAuth ?? (() => true);
+  const runtime = {
+    /** Shared with the return value: every registration appends here. */
+    calls,
+    getRegisteredProviderIds: () => [
+      ...present,
+      ...registered.keys(),
+      ...registeredNative.keys(),
+    ],
+    registerProvider: (id: string, config: unknown) => {
+      calls.push(`registerProvider:${id}`);
+      if (id === options.failRegistrationFor) {
+        throw new Error(`bad registration for ${id}`);
+      }
+      registered.set(id, config);
+    },
+    registerNativeProvider: (provider: { id: string }) => {
+      calls.push(`registerNativeProvider:${provider.id}`);
+      registeredNative.set(provider.id, provider);
+    },
+    hasConfiguredAuth: (providerId: string) => hasAuth(providerId),
+    checkAuth: async (providerId: string) =>
+      hasAuth(providerId) ? { ok: true } : undefined,
+  };
+  return { runtime, calls, registered, registeredNative };
+}
+
+/** A parent-side provider surface double (registry facade or runtime shape). */
+function parentSurfaceDouble(options: {
+  ids: string[];
+  configs?: Record<string, unknown>;
+  natives?: Record<string, unknown>;
+}) {
+  return {
+    getRegisteredProviderIds: () => [...options.ids],
+    getRegisteredProviderConfig: (id: string) => options.configs?.[id],
+    getRegisteredNativeProvider: (id: string) => options.natives?.[id],
+  };
+}
+
+/** An SDK double whose ModelRuntime.create() hands out a given child runtime. */
+function seedingSdk(childRuntime: unknown, calls: string[]) {
+  let sessionOpts: Record<string, unknown> | undefined;
+  const sdk = {
+    ModelRuntime: { create: async () => childRuntime },
+    DefaultResourceLoader: class {
+      async reload() {}
+    },
+    SessionManager: { inMemory: () => ({}) },
+    createAgentSession: async (opts: Record<string, unknown>) => {
+      calls.push("createAgentSession");
+      sessionOpts = opts;
+      return {
+        session: {
+          subscribe: () => () => {},
+          prompt: async () => {},
+          followUp: async () => {},
+          abort: async () => {},
+          isStreaming: false,
+          bindExtensions: async () => {},
+        },
+      };
+    },
+  };
+  return { sdk, sessionOpts: () => sessionOpts };
+}
+
+const SYNTHETIC_CONFIG = {
+  baseUrl: "https://api.synthetic.new/openai/v1",
+  apiKey: "$SYNTHETIC_API_KEY",
+  api: "openai-completions",
+  models: [{ id: "hf:zai-org/GLM-5.3-Flash", name: "zai-org/GLM-5.3-Flash" }],
+};
+
+async function seedingSession(input: {
+  child: unknown;
+  parent: unknown;
+  modelRef?: { provider: string; id: string; thinking: string };
+  findModel?: (provider: string, id: string) => unknown;
+}) {
+  const calls: string[] = input.child && (input.child as { calls?: string[] }).calls
+    ? ((input.child as { calls: string[] }).calls)
+    : [];
+  const { sdk, sessionOpts } = seedingSdk(input.child, calls);
+  const res = await createReviewSession({
+    cwd: "/p",
+    agentDir: "/a",
+    modelRef: input.modelRef ?? {
+      provider: "synthetic",
+      id: "hf:zai-org/GLM-5.3-Flash",
+      thinking: "xhigh",
+    },
+    findModel:
+      input.findModel ??
+      ((provider: string, id: string) => ({ provider, id })),
+    reviewPrompt: "x",
+    customTools: [],
+    parentProviders: input.parent,
+    loadSdk: async () => sdk as never,
+  });
+  return { res, calls, sessionOpts };
+}
+
+test("createReviewSession: seeds missing providers from the parent surface before createAgentSession", async () => {
+  // Child already composes the built-in "anthropic"; the parent knows that,
+  // an extension-registered "synthetic" (missing in the child) and a native
+  // provider. The seeder must register ONLY what is missing, BEFORE the
+  // session is created.
+  const child = childRuntimeDouble({ presentIds: ["anthropic"] });
+  const parent = parentSurfaceDouble({
+    ids: ["synthetic", "anthropic", "native-one"],
+    configs: { synthetic: SYNTHETIC_CONFIG },
+    natives: { "native-one": { id: "native-one" } },
+  });
+  const { res, calls } = await seedingSession({ child: child.runtime, parent });
+
+  assert.equal(res.ok, true, res.error);
+  const firstRegistration = calls.findIndex((c) => c.startsWith("register"));
+  const createAt = calls.indexOf("createAgentSession");
+  assert.ok(
+    firstRegistration !== -1 && createAt !== -1 && firstRegistration < createAt,
+    `registrations must land before createAgentSession (${calls.join(" → ")})`,
+  );
+  assert.ok(
+    calls.includes("registerProvider:synthetic"),
+    `the missing extension provider is registered (${calls.join(", ")})`,
+  );
+  assert.ok(
+    calls.includes("registerNativeProvider:native-one"),
+    `native providers register natively (${calls.join(", ")})`,
+  );
+  assert.equal(
+    calls.includes("registerProvider:anthropic"),
+    false,
+    "a provider the child already composes is never re-registered",
+  );
+});
+
+test("seedChildRuntimeProviders: skips ids the child already composes (the built-in/static no-op path)", () => {
+  const child = childRuntimeDouble({ presentIds: ["synthetic", "other"] });
+  const parent = parentSurfaceDouble({
+    ids: ["synthetic", "other", "missing"],
+    configs: { missing: SYNTHETIC_CONFIG },
+  });
+  const report = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(report.seeded, ["missing"]);
+  assert.deepEqual(report.skippedPresent, ["synthetic", "other"]);
+  assert.deepEqual(report.errors, []);
+  assert.equal(child.calls.includes("registerProvider:synthetic"), false);
+  assert.equal(child.calls.includes("registerProvider:other"), false);
+  assert.deepEqual(child.calls, ["registerProvider:missing"]);
+});
+
+test("seedChildRuntimeProviders: collects the gap without registering anything", () => {
+  const child = childRuntimeDouble({ presentIds: ["a"] });
+  const parent = parentSurfaceDouble({ ids: ["a", "b"], configs: {} });
+  const gap = collectMissingChildProviders(child.runtime, parent);
+  assert.deepEqual(gap.missing, ["b"]);
+  assert.deepEqual(gap.present, ["a"]);
+  assert.equal(child.calls.length, 0, "the scan never mutates the child");
+});
+
+test("seedChildRuntimeProviders: a throwing registration is recorded and the rest still seed", () => {
+  const child = childRuntimeDouble({ failRegistrationFor: "broken" });
+  const parent = parentSurfaceDouble({
+    ids: ["broken", "good"],
+    configs: { broken: {}, good: SYNTHETIC_CONFIG },
+  });
+  const report = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(report.seeded, ["good"], "unrelated ids still seed");
+  assert.equal(report.errors.length, 1);
+  assert.equal(report.errors[0].name, "broken");
+  assert.match(report.errors[0].error, /bad registration for broken/);
+});
+
+test("seedChildRuntimeProviders: native provider objects register natively, not by config", () => {
+  const child = childRuntimeDouble();
+  const parent = parentSurfaceDouble({
+    ids: ["native-one"],
+    natives: { "native-one": { id: "native-one", getModels: () => [] } },
+  });
+  const report = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(report.seeded, ["native-one"]);
+  assert.deepEqual(child.calls, ["registerNativeProvider:native-one"]);
+  assert.ok(child.registeredNative.has("native-one"));
+  assert.equal(child.registered.has("native-one"), false);
+});
+
+test("seedChildRuntimeProviders: an id with no copyable registration is an error, not a crash", () => {
+  const child = childRuntimeDouble();
+  const parent = parentSurfaceDouble({ ids: ["ghost"], configs: {} });
+  const report = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(report.seeded, []);
+  assert.equal(report.errors.length, 1);
+  assert.equal(report.errors[0].name, "ghost");
+  assert.match(report.errors[0].error, /no registration to copy/);
+});
+
+test("seedChildRuntimeProviders: a second pass skips already-seeded ids (idempotent)", () => {
+  const child = childRuntimeDouble();
+  const parent = parentSurfaceDouble({
+    ids: ["synthetic"],
+    configs: { synthetic: SYNTHETIC_CONFIG },
+  });
+  const first = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(first.seeded, ["synthetic"]);
+  const second = seedChildRuntimeProviders(child.runtime, parent);
+  assert.deepEqual(second.seeded, []);
+  assert.deepEqual(second.skippedPresent, ["synthetic"]);
+  assert.deepEqual(second.errors, []);
+  assert.deepEqual(child.calls, ["registerProvider:synthetic"]);
+});
+
+test("seedChildRuntimeProviders: no parent surface is a clean no-op, never a throw", () => {
+  const child = childRuntimeDouble();
+  for (const surface of [undefined, null, {}, 42, "x"]) {
+    const report = seedChildRuntimeProviders(child.runtime, surface);
+    assert.deepEqual(report, { seeded: [], skippedPresent: [], errors: [] });
+  }
+  assert.equal(child.calls.length, 0);
+});
+
+test("findParentProviderSurface: probes the documented surfaces in order, junk-tolerant", () => {
+  const registry = parentSurfaceDouble({ ids: [] });
+  const runtime = parentSurfaceDouble({ ids: [] });
+  assert.equal(
+    findParentProviderSurface({ modelRegistry: registry, modelRuntime: runtime }),
+    registry,
+    "the registry facade is probed first",
+  );
+  assert.equal(findParentProviderSurface({ modelRuntime: runtime }), runtime);
+  assert.equal(findParentProviderSurface(undefined), undefined);
+  assert.equal(findParentProviderSurface(null), undefined);
+  assert.equal(findParentProviderSurface("junk"), undefined);
+  assert.equal(findParentProviderSurface({}), undefined);
+  // A partial surface (id list only) cannot seed anything — not a surface.
+  assert.equal(
+    findParentProviderSurface({
+      modelRegistry: { getRegisteredProviderIds: () => [] },
+    }),
+    undefined,
+  );
+});
+
+test("createReviewSession: a broken unrelated provider registration does not block the review", async () => {
+  const child = childRuntimeDouble({ failRegistrationFor: "broken" });
+  const parent = parentSurfaceDouble({
+    ids: ["broken", "synthetic"],
+    configs: { broken: {}, synthetic: SYNTHETIC_CONFIG },
+  });
+  const { res } = await seedingSession({ child: child.runtime, parent });
+  assert.equal(res.ok, true, res.error);
+  assert.ok(child.registered.has("synthetic"), "the reviewer's provider still seeded");
+});
+
+test("createReviewSession: unconfigured reviewer provider fails fast with the seed report and the escape hatch", async () => {
+  const child = childRuntimeDouble({ hasAuth: () => false });
+  const parent = parentSurfaceDouble({
+    ids: ["synthetic"],
+    configs: { synthetic: SYNTHETIC_CONFIG },
+  });
+  const { res } = await seedingSession({ child: child.runtime, parent });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.session, undefined);
+  assert.match(res.error ?? "", /"synthetic"/, "names the provider");
+  assert.match(res.error ?? "", /seeded into the reviewer runtime/, "reports the seed result");
+  assert.match(res.error ?? "", /models\.json/, "names the generic escape hatch");
+  assert.match(res.error ?? "", /\/login synthetic/);
+  // Seeding happened BEFORE the preflight failed: the provider is registered
+  // on the child even though auth could not be resolved for it.
+  assert.ok(child.registered.has("synthetic"));
+});
+
+test("createReviewSession: no parent surface ⇒ no seeding, preflight still names the escape hatch", async () => {
+  const child = childRuntimeDouble({ hasAuth: () => false });
+  const { res, calls } = await seedingSession({
+    child: child.runtime,
+    parent: undefined,
+  });
+
+  assert.equal(res.ok, false);
+  assert.deepEqual(
+    calls.filter((c) => c.startsWith("register")),
+    [],
+    "nothing is seeded without a parent surface",
+  );
+  assert.match(res.error ?? "", /no provider-registration surface/);
+  assert.match(res.error ?? "", /models\.json/);
+});
+
+test("createReviewSession: a runtime that exposes no auth accessor is trusted, not blocked", async () => {
+  // Old/stubbed SDKs expose neither hasConfiguredAuth nor checkAuth — the
+  // preflight must not block a review it cannot verify.
+  const { res } = await seedingSession({
+    child: { registerProvider: () => {}, registerNativeProvider: () => {} },
+    parent: parentSurfaceDouble({
+      ids: ["synthetic"],
+      configs: { synthetic: SYNTHETIC_CONFIG },
+    }),
+  });
+  assert.equal(res.ok, true, res.error);
+});
+
+test("appendProviderAuthHint: only the reviewer's own provider-auth failure gains the hint", () => {
+  const bare = "No API key found for synthetic.\n\nUse /login to log into a provider via OAuth or API key.";
+  const hinted = appendProviderAuthHint(bare, "synthetic", "C:/agent/models.json");
+  assert.ok(hinted.startsWith(bare), "the original error is kept verbatim");
+  assert.match(hinted, /models\.json/);
+  assert.match(hinted, /\/login synthetic/);
+
+  // A different provider failed than the reviewer's own → no hint.
+  assert.equal(
+    appendProviderAuthHint("No API key found for openai.", "synthetic"),
+    "No API key found for openai.",
+  );
+  // Unrelated errors and absent provider ids are never decorated.
+  assert.equal(appendProviderAuthHint("network unreachable", "synthetic"), "network unreachable");
+  assert.equal(
+    appendProviderAuthHint("No API key found for synthetic.", undefined),
+    "No API key found for synthetic.",
+  );
+});
 
 test("GATING: with Review Mode off, all resolution stays inert", () => {
   const { cwd, agentDir } = tmpProject();

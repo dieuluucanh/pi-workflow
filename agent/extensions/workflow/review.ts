@@ -36,6 +36,13 @@ import {
   type ReviewFinding,
   type ReviewTier,
 } from "./utils.ts";
+import {
+  checkReviewerProviderAuth,
+  isParentProviderSurface,
+  seedChildRuntimeProviders,
+  unconfiguredReviewerProviderMessage,
+  type ProviderSeedResult,
+} from "./review-providers.ts";
 
 // Re-exported so `review.ts` is the single import surface for Review Mode.
 export type { ReviewDisposition, ReviewFinding, ReviewTier };
@@ -1443,6 +1450,23 @@ export interface CreateReviewSessionOptions {
   reviewPrompt: string;
   /** Reviewer-only tools, built by the caller. */
   customTools: unknown[];
+  /**
+   * Parent-side provider-registration surface (structural, feature-detected),
+   * found with `findParentProviderSurface(ctx)` — the session's model registry
+   * facade or its underlying model runtime.
+   *
+   * The reviewer session is deliberately created without ambient extensions,
+   * so a provider registered only in the parent session (e.g. by a provider
+   * extension) does not exist in the reviewer's fresh runtime. When this
+   * surface is given, every provider the parent knows that the child does not
+   * yet compose is registered onto the child BEFORE `createAgentSession` —
+   * natively when the parent has a provider object, otherwise by config.
+   * Absent or surface-less ⇒ nothing is seeded and the provider-auth preflight
+   * (below) reports the generic escape hatch instead. Providers the child
+   * already composes are skipped, so this is a no-op for every provider the
+   * runtime builds in by construction.
+   */
+  parentProviders?: unknown;
   /** Injectable for tests; defaults to a real dynamic import. */
   loadSdk?: ReviewSdkLoader;
 }
@@ -1453,6 +1477,8 @@ export interface CreateReviewSessionResult {
   modelLabel: string;
   /** Tool names the child actually has enabled, when the SDK exposes them. */
   activeTools?: string[];
+  /** What provider seeding did before the session was created, when probed. */
+  providerSeed?: ProviderSeedResult;
   error?: string;
 }
 
@@ -1598,6 +1624,36 @@ export async function createReviewSession(
         error: `could not create a model runtime for the reviewer (auth/model catalog problem): ${
           e instanceof Error ? e.message : String(e)
         }`,
+      };
+    }
+
+    // Seed providers the child does not compose yet (e.g. providers registered
+    // only in the parent session) BEFORE the session exists. Present-probe:
+    // only the difference is registered, native-first, per-provider
+    // fault-isolated — never fatal, never layer-aware.
+    const providerSeed = seedChildRuntimeProviders(
+      modelRuntime,
+      options.parentProviders,
+    );
+
+    // Provider-agnostic auth preflight, mirroring the child session's own
+    // prompt gate: fail fast here — with the seed report and the generic
+    // escape hatch — instead of mid-review with a bare "No API key found".
+    const auth = await checkReviewerProviderAuth(
+      modelRuntime,
+      options.modelRef.provider,
+    );
+    if (!auth.configured) {
+      return {
+        ok: false,
+        modelLabel,
+        providerSeed,
+        error: unconfiguredReviewerProviderMessage({
+          providerId: options.modelRef.provider,
+          seed: providerSeed,
+          parentSurfaceFound: isParentProviderSurface(options.parentProviders),
+          modelsJsonPath: path.join(options.agentDir, "models.json"),
+        }),
       };
     }
 

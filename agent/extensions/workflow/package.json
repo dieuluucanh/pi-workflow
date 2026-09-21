@@ -1,6 +1,6 @@
 {
   "name": "@dieulc/workflow",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "private": false,
   "keywords": ["pi-package", "workflow", "plan-mode", "review-mode", "questionnaire", "rewind"],
@@ -29,6 +29,7 @@
     "roles.ts",
     "permissions.ts",
     "review.ts",
+    "review-providers.ts",
     "review-tools.ts",
     "review-runtime.ts",
     "review-ui.ts",
