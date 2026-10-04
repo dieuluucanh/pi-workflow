@@ -103,6 +103,15 @@ page, and are installable; all four published that morning went to npm within th
 | `@dieulc/browser-inspector` | 107 | 595.5 | 2026-09-20T06:26:26 | 111 | ✅ |
 | `@dieulc/workflow` | **104** | 539.6 | 2026-09-20T06:26:33 | 280 | ❌ **none** |
 
+> **Update 2026-10-04 — the gap self-resolved.** A live probe found `@dieulc/workflow` **catalogued**:
+> `?name=dieulc` returned `1-5 / 5 (of 5355)` including a workflow card (stored 541/mo, "14d ago"),
+> its detail page showed a numeric Downloads row (`541/mo · 24/wk`), and
+> `npm run gallery -- --packages workflow --diagnose` returned verdict **`member`**
+> (npm index 543/mo, score 768.9, cut-off ~122/mo, catalog 5,355 rows, ~5,834 matches not ingested).
+> No report was ever filed; the row appeared without any action on our side. After the same-day
+> publish of `0.3.3` the card kept showing `0.3.1` for a while — ordinary crawl lag, not a
+> membership failure (the checker reports that as `stale`, not `no row`).
+
 Context for the same measurement: `?name=dieulc` returned `1-4 / 4` — the four packages above and
 **no match for `@dieulc/workflow`**. Its exclusion is **not** explained by a download floor:
 
@@ -201,7 +210,7 @@ release.
 
 | Draft | State |
 | --- | --- |
-| Appendix A — `@dieulc/workflow` missing from the catalog | **Held (not filed)** — awaiting explicit go-ahead. Nothing has been posted. |
+| Appendix A — `@dieulc/workflow` missing from the catalog | **Held (not filed)** — awaiting explicit go-ahead. Nothing has been posted. **Moot as of 2026-10-04**: the ingest gap self-resolved and the package is catalogued (see the update note under the evidence table); never filed. |
 | Appendix B — catalog reaches ~half of the matching packages | **Held (not filed)** — awaiting explicit go-ahead. |
 
 Once either is filed, record the issue link, the date and any response in this table and in the daily
