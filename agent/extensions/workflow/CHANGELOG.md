@@ -2,6 +2,24 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.3.3] - 2026-09-22
+
+### Fixed — Review Mode: a dead provider is no longer mislabeled as a missing write path
+
+**The bug.** When the reviewer's model provider started failing mid-review, the round ended with `the reviewer finished without submitting a plan — it has no write path unless review_submit_plan succeeds` — even though the reviewer's tools had been active and working for the entire pass (in the diagnosed incident, ~95 minutes of successful `review_bash`/`read` calls). The real chain: Pi's SDK never rejects `prompt()` on provider errors — it auto-retries (default budget 3, the counter resets on every successful assistant message) and its `finally` always emits `agent_settled`, even when the run died with `stopReason: "error"`. The orchestrator's settled path only checked `!p1.submitted`, never inspected the child's final assistant message, and the transcript translator rendered `auto_retry_start` as a bare "retrying after a provider error", dropping the provider's own message. With the child session in memory, the actual API error was unrecoverable after teardown.
+
+**The fix — capture and surface the real error:**
+
+- **Boundary decoder** (`review.ts`): new `readProviderErrorEvent()` decodes one child event into a typed `ReviewProviderFailure` (`retry` / `exhaust` / `stop` / `none`); `truncateErrorText()` flattens a multi-line provider error into one bounded line (160 chars); `lastAssistantErrorStop()` extracts the error-stop reason from an `agent_end`'s messages.
+- **Capture in the runtime** (`review-runtime.ts`): the child event subscriber records the latest provider failure (message, retry count, timestamp); the slot is cleared at the start of every pass so a stale error can never mislabel a later clean settle.
+- **Honest failure reasons.** Pass 1 settling without a submission now reports `the reviewer's provider failed after N retry attempt(s): <error>` when a provider failure was seen during that pass; the legacy message is kept verbatim for a genuine clean settle without a tool call, and the timeout variant is unchanged. `state.error` carries the reason, so `/review-status` shows the same text.
+- **Live transcript errors.** `auto_retry_start` notices carry the truncated provider message (`retrying after a provider error: 429 …`), a failed `auto_retry_end` renders `reviewer retry budget exhausted: …`, and an `agent_end` that stopped on an error appends an `error` line — a new red `error` line kind in the reviewer pane.
+- **Pass 2 stays best-effort but explains itself.** A verification pass that dies on the provider logs `verification pass failed (provider error after N retry attempt(s): …)` — or `ended without a submission (…)` — and keeps pass 1's plan.
+
+Behaviour deliberately unchanged: the fallback (the author's plan is handed over), the unlimited default timeout, no automatic pass retry, no submit-nudge.
+
+Tests: 7 new cases in `review.test.ts` — `truncateErrorText`, the translator's provider lines, the decoder matrix, and runtime rounds asserting the new reason (including an error-stop run with no retries and the no-leak-into-pass-2 guarantee); the legacy no-submission regression test still passes. The README gains a troubleshooting entry keyed on the new message.
+
 ## [0.3.1] - 2026-09-20
 
 - No user-facing changes recorded.

@@ -288,6 +288,18 @@ Fixes, in order of preference:
 
 After editing `models.json`, run `/reload` or restart `pi` so every runtime picks it up.
 
+### `the reviewer's provider failed after N retry attempt(s): …` in a Review Mode round
+
+The warning reads `review skipped (the reviewer's provider failed after 3 retry attempt(s): 429 Too Many Requests …)` and the reviewer pane shows the provider's error text live. This is the reviewer's **model provider** failing mid-run — its API returned errors until Pi's auto-retry budget (`settings.retry.maxRetries`, default 3) ran out, so the run settled without ever reaching `review_submit_plan`. It is **not** a Review Mode fault and nothing was written; the author's plan is handed over unchanged.
+
+Earlier versions mislabeled this as `the reviewer finished without submitting a plan — it has no write path…`; since 0.3.3 the real provider error is captured from the reviewer session and reported here, in the pane, and via `/review-status` (the old message now appears only when the reviewer genuinely settled without calling `review_submit_plan`).
+
+What to do:
+
+1. **Check the provider** — the truncated message is the provider's own reply (rate limit, quota, overloaded, auth). Retry the review with `/review` once the provider recovers; a review that dies this way can simply be re-run.
+2. **A long review shares one API key with the parent** — planner + reviewer often hit the same key, so a long review can exhaust rate limits. Stagger heavy Plan Mode work or raise the provider's quota.
+3. **Switch the reviewer model** if the failures recur — `/role set reviewer <provider/model>` (see [Review Mode](#review-mode)); pick a model whose provider is currently healthy.
+
 ## Development
 
 ```bash

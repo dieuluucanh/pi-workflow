@@ -253,6 +253,7 @@ const LINE_COLORS: Record<ReviewEntryLineKind, ThemeColor> = {
   finding: "warning",
   notice: "warning",
   status: "muted",
+  error: "error",
   user: "success",
 };
 

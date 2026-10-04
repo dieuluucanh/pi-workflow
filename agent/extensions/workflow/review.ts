@@ -574,7 +574,8 @@ export type ReviewLineKind =
   | "tool"
   | "finding"
   | "notice"
-  | "status";
+  | "status"
+  | "error";
 
 /** One line in the reviewer pane. Kept small: the pane renders these verbatim. */
 export interface ReviewTranscriptLine {
@@ -1106,6 +1107,103 @@ function truncateLabel(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`;
 }
 
+/** Longest provider-error excerpt shown inline in a transcript line. */
+export const MAX_ERROR_TEXT = 160;
+
+/**
+ * One-line excerpt of a provider error message for `notify` and the reviewer
+ * pane. Provider errors are often multi-line JSON blobs; they must become a
+ * single line to survive a transcript entry and a `ui.notify` banner.
+ * Pure and total: empty/undefined input yields "", never throws.
+ */
+export function truncateErrorText(input: unknown, max: number = MAX_ERROR_TEXT): string {
+  const raw = typeof input === "string" ? input : "";
+  const flat = raw.replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const cap = Math.max(1, Math.trunc(max));
+  return flat.length <= cap ? flat : `${flat.slice(0, cap - 1).trimEnd()}…`;
+}
+
+/**
+ * Extract the provider error message when a run stopped on an error: scan an
+ * `agent_end` event's messages from the end for the last assistant message
+ * with `stopReason === "error"`. Structural on purpose — SDK message shapes
+ * are not imported here. Returns undefined for clean runs and junk input.
+ */
+export function lastAssistantErrorStop(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const rec = messages[i] as Record<string, unknown> | null | undefined;
+    if (!rec || typeof rec !== "object") continue;
+    if (rec.role !== "assistant") continue;
+    // Last assistant message reached: a non-error stop means a clean run.
+    if (rec.stopReason !== "error") return undefined;
+    const err = typeof rec.errorMessage === "string" ? rec.errorMessage : "";
+    return err || "unknown provider error";
+  }
+  return undefined;
+}
+
+/**
+ * What a child-session event says about provider health, decoded at the
+ * boundary so callers branch on typed values instead of SDK event shapes:
+ *
+ * - `retry`   → the SDK scheduled another attempt (`auto_retry_start`) and
+ *   reported the provider's error message.
+ * - `exhaust` → the retry budget ran out (`auto_retry_end`, `success: false`);
+ *   the run is about to settle on an error. `message` may be empty when the
+ *   event carries no `finalError` — callers then keep their earlier message.
+ * - `stop`    → the run itself ended with `stopReason === "error"` on its last
+ *   assistant message (auto-retry disabled, or a non-retryable failure).
+ * - `none`    → anything else, including a retry that recovered.
+ */
+export type ReviewProviderFailure =
+  | { kind: "retry"; message: string; retries: number }
+  | { kind: "exhaust"; message: string; retries: number }
+  | { kind: "stop"; message: string }
+  | { kind: "none" };
+
+/** Structural decode of one provider-failure event. Never throws. */
+export function readProviderErrorEvent(
+  event: unknown,
+): ReviewProviderFailure {
+  const e = eventRecord(event);
+  if (!e) return { kind: "none" };
+  const type = typeof e.type === "string" ? e.type : "";
+  if (type === "auto_retry_start") {
+    const message =
+      typeof e.errorMessage === "string" ? e.errorMessage.trim() : "";
+    if (!message) return { kind: "none" };
+    return {
+      kind: "retry",
+      message,
+      retries: readRetryAttempt(e.attempt),
+    };
+  }
+  if (type === "auto_retry_end") {
+    if (e.success !== false) return { kind: "none" };
+    const message = typeof e.finalError === "string" ? e.finalError.trim() : "";
+    return {
+      kind: "exhaust",
+      message,
+      retries: readRetryAttempt(e.attempt),
+    };
+  }
+  if (type === "agent_end") {
+    const message = lastAssistantErrorStop(e.messages);
+    if (message === undefined) return { kind: "none" };
+    return { kind: "stop", message };
+  }
+  return { kind: "none" };
+}
+
+/** Non-negative attempt count from a retry event; 0 when absent or junk. */
+function readRetryAttempt(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.trunc(value)
+    : 0;
+}
+
 /**
  * Human-readable header for a tool call: the tool name plus a short, safe
  * excerpt of its key argument (`▸ read src/app.ts`, `▸ review_bash: git log -5`).
@@ -1177,6 +1275,12 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
  * `toolLabels` is owned by the stateful caller (`ReviewTranscript`): the end
  * event carries no args, so the start event registers `toolCallId → label` and
  * the end event consumes it. Pure otherwise; junk input never throws.
+ *
+ * Provider failures are surfaced with their real (truncated) text: the
+ * `auto_retry_start` notice carries the provider's message, and a failed
+ * `auto_retry_end` or an `agent_end` that stopped on `stopReason === "error"`
+ * appends an `error` line — a dead provider is then visible in the pane during
+ * the review instead of resurfacing later as a mysterious "no plan" failure.
  */
 export function translateReviewEvent(
   event: unknown,
@@ -1214,15 +1318,70 @@ export function translateReviewEvent(
   if (type === "agent_start") {
     return [{ op: "new", kind: "status", text: "reviewer started" }];
   }
+  return providerErrorOps(e, type);
+}
+
+/**
+ * Provider-error events → transcript lines, split out of
+ * `translateReviewEvent` to keep the dispatcher flat:
+ *
+ * - `agent_end`        → status line, plus an `error` line when the run
+ *   stopped on `stopReason === "error"` (auto-retry disabled, or the first
+ *   failure was not retryable).
+ * - `auto_retry_start` → notice carrying the provider's message (truncated).
+ * - `auto_retry_end`   → `error` line when the retry budget is exhausted
+ *   (`success: false`); a recovered retry (`success: true`) stays silent.
+ *
+ * Unknown types and junk fields degrade to empty ops; never throws.
+ */
+function providerErrorOps(
+  e: Record<string, unknown>,
+  type: string,
+): ReviewTranscriptOp[] {
   if (type === "agent_end") {
-    return [{ op: "new", kind: "status", text: "reviewer finished this run" }];
+    const ops: ReviewTranscriptOp[] = [
+      { op: "new", kind: "status", text: "reviewer finished this run" },
+    ];
+    const failed = lastAssistantErrorStop(e.messages);
+    if (failed) {
+      ops.push({
+        op: "new",
+        kind: "error",
+        text: `reviewer run ended on a provider error: ${truncateErrorText(failed)}`,
+      });
+    }
+    return ops;
   }
   if (type === "auto_retry_start") {
+    const msg = typeof e.errorMessage === "string" ? e.errorMessage : "";
     return [
-      { op: "new", kind: "notice", text: "retrying after a provider error" },
+      {
+        op: "new",
+        kind: "notice",
+        text: msg
+          ? `retrying after a provider error: ${truncateErrorText(msg)}`
+          : "retrying after a provider error",
+      },
     ];
   }
-
+  if (type === "auto_retry_end") {
+    // `success: false` ends the retry loop with the provider still failing —
+    // the run is about to settle on an error stop. `success: true` means a
+    // retry recovered; the earlier notice already covers that case.
+    if (e.success === false) {
+      const detail = truncateErrorText(e.finalError);
+      return [
+        {
+          op: "new",
+          kind: "error",
+          text: detail
+            ? `reviewer retry budget exhausted: ${detail}`
+            : "reviewer retry budget exhausted",
+        },
+      ];
+    }
+    return [];
+  }
   return [];
 }
 

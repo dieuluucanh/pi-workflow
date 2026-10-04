@@ -43,6 +43,7 @@ import {
   isReviewEnabled,
   mergeReviewModeConfig,
   planHash as planHashReexported,
+  readProviderErrorEvent,
   readReviewModeConfig,
   resolveReviewPrompt,
   reviewElapsedMs,
@@ -59,6 +60,7 @@ import {
   formatReviewStatusLines,
   parseReviewTimeoutArg,
   timeoutSourceOf,
+  truncateErrorText,
   type ReviewStatusInput,
   REVIEW_BUILTIN_TOOLS,
   reviewToolAllowlist,
@@ -847,9 +849,147 @@ test("translateReviewEvent: never throws on malformed events", () => {
     {},
     { type: 42 },
     { type: "message_update" },
+    { type: "agent_end", messages: "nope" },
+    { type: "agent_end", messages: [null, 42, "x"] },
+    { type: "auto_retry_start", attempt: "two" },
+    { type: "auto_retry_end", success: "false" },
   ]) {
     assert.doesNotThrow(() => translateReviewEvent(junk));
   }
+});
+
+ test("truncateErrorText: one line, bounded, junk-safe", () => {
+  assert.equal(
+    truncateErrorText(
+      "No API key found for synthetic.\nUse /login (see docs/providers.md)",
+    ),
+    "No API key found for synthetic. Use /login (see docs/providers.md)",
+  );
+  const long = truncateErrorText("x".repeat(200));
+  assert.equal(long.length, 160, "bounded to MAX_ERROR_TEXT");
+  assert.ok(long.endsWith("…"));
+  assert.equal(truncateErrorText("   \n\t "), "");
+  assert.equal(truncateErrorText(undefined), "");
+  assert.equal(truncateErrorText({ boom: true }), "");
+  assert.equal(truncateErrorText("abcdefghij", 5), "abcd…");
+});
+
+ test("translateReviewEvent: provider failures surface their real, truncated text", () => {
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "auto_retry_start",
+      attempt: 2,
+      maxAttempts: 3,
+      delayMs: 1000,
+      errorMessage: "No API key for synthetic.\nUse /login.",
+    }),
+    [
+      {
+        op: "new",
+        kind: "notice",
+        text: "retrying after a provider error: No API key for synthetic. Use /login.",
+      },
+    ],
+  );
+  // No message on the event → the legacy plain notice (backward compatible).
+  assert.deepEqual(translateReviewEvent({ type: "auto_retry_start", attempt: 1 }), [
+    { op: "new", kind: "notice", text: "retrying after a provider error" },
+  ]);
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "auto_retry_end",
+      success: false,
+      attempt: 3,
+      finalError: "429 quota exceeded",
+    }),
+    [
+      {
+        op: "new",
+        kind: "error",
+        text: "reviewer retry budget exhausted: 429 quota exceeded",
+      },
+    ],
+  );
+  // A retry that recovered stays silent; the earlier notice covered it.
+  assert.deepEqual(
+    translateReviewEvent({ type: "auto_retry_end", success: true, attempt: 1 }),
+    [],
+  );
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "x" },
+        {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "503 upstream",
+        },
+      ],
+    }),
+    [
+      { op: "new", kind: "status", text: "reviewer finished this run" },
+      {
+        op: "new",
+        kind: "error",
+        text: "reviewer run ended on a provider error: 503 upstream",
+      },
+    ],
+  );
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [], stopReason: "stop" }],
+    }),
+    [{ op: "new", kind: "status", text: "reviewer finished this run" }],
+  );
+});
+
+ test("readProviderErrorEvent: decodes retry/exhaust/stop, junk-safe", () => {
+  assert.deepEqual(
+    readProviderErrorEvent({
+      type: "auto_retry_start",
+      attempt: 2,
+      errorMessage: "503",
+    }),
+    { kind: "retry", message: "503", retries: 2 },
+  );
+  assert.equal(
+    readProviderErrorEvent({ type: "auto_retry_start", attempt: 1 }).kind,
+    "none",
+    "a bare retry without a message carries nothing to record",
+  );
+  assert.deepEqual(
+    readProviderErrorEvent({
+      type: "auto_retry_end",
+      success: false,
+      attempt: 3,
+      finalError: "429 quota",
+    }),
+    { kind: "exhaust", message: "429 quota", retries: 3 },
+  );
+  assert.equal(
+    readProviderErrorEvent({ type: "auto_retry_end", success: true }).kind,
+    "none",
+    "a recovered retry is not a failure",
+  );
+  assert.deepEqual(
+    readProviderErrorEvent({
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "error", errorMessage: "boom" }],
+    }),
+    { kind: "stop", message: "boom" },
+  );
+  assert.equal(
+    readProviderErrorEvent({
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop" }],
+    }).kind,
+    "none",
+  );
+  assert.equal(readProviderErrorEvent(null).kind, "none");
+  assert.equal(readProviderErrorEvent("x").kind, "none");
 });
 
 test("ReviewTranscript: buffers action headers, bounds and clears", () => {
@@ -1758,6 +1898,8 @@ interface FakeCapture {
   /** How many times the child's `abort()` was called. */
   aborts: number;
   unsubscribeCount: number;
+  /** Emit an arbitrary child-session event (provider-error scripts use this). */
+  emit: (event: unknown) => void;
 }
 
 /** Built-in tool names the SDK registers before the allowlist is applied. */
@@ -1793,6 +1935,7 @@ function fakeSdk(script: {
     activeTools: [],
     aborts: 0,
     unsubscribeCount: 0,
+    emit: () => {},
   };
   const sdk = {
     ModelRuntime: { create: async () => script.runtime ?? {} },
@@ -1827,6 +1970,7 @@ function fakeSdk(script: {
       const emit = (event: unknown): void => {
         for (const l of [...listeners]) l(event);
       };
+      capture.emit = emit;
       return {
         session: {
           subscribe: (listener: (event: unknown) => void) => {
@@ -2230,6 +2374,138 @@ test("runtime: a reviewer that ends its run without submitting fails fast, not a
     "no timeout is burned on a run that already ended",
   );
   assert.ok(silent.capture.aborts >= 1, "the abandoned run is cancelled");
+});
+
+test("runtime: a provider failure that ends pass 1 is named in the failure reason", async () => {
+  const dying = fakeSdk({
+    pass1: async (c) => {
+      c.emit({
+        type: "auto_retry_start",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 5,
+        errorMessage:
+          "No API key found for synthetic.\nUse /login (see docs/providers.md)",
+      });
+      c.emit({
+        type: "auto_retry_end",
+        success: false,
+        attempt: 3,
+        finalError: "429 Too Many Requests: quota exceeded",
+      });
+    },
+  });
+  const { deps } = runtimeDeps(dying.sdk, {
+    config: { timeoutMs: 60_000 },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.fallback, true);
+  assert.equal(res.planText, ORIGINAL_PLAN, "author's plan is preserved");
+  assert.match(res.reason ?? "", /provider failed after 3 retry attempt\(s\)/);
+  assert.match(res.reason ?? "", /429 Too Many Requests: quota exceeded/);
+  assert.ok(
+    !(res.reason ?? "").includes("without submitting"),
+    "a dead provider is not mislabeled as a missing write path",
+  );
+  assert.equal(res.state.error, res.reason, "/review-status sees the cause");
+  assert.ok(dying.capture.aborts >= 1, "the dead run is cancelled");
+});
+
+test("runtime: an error-stop agent_end with no retries also names the provider", async () => {
+  const dying = fakeSdk({
+    pass1: async (c) => {
+      c.emit({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "x" },
+          {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "503 upstream connect error",
+          },
+        ],
+      });
+    },
+  });
+  const { deps } = runtimeDeps(dying.sdk, {
+    config: { timeoutMs: 60_000 },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.fallback, true);
+  assert.match(
+    res.reason ?? "",
+    /provider failed after 0 retry attempt\(s\): 503 upstream connect error/,
+  );
+});
+
+test("runtime: a provider error in pass 1 does not leak into a clean pass 2", async () => {
+  const flaky = fakeSdk({
+    pass1: async (c) => {
+      // A transient failure the retry recovered from...
+      c.emit({
+        type: "auto_retry_start",
+        attempt: 1,
+        errorMessage: "429 slow down",
+      });
+      // ...then the reviewer completes the protocol normally.
+      await c.tools.review_submit_plan.execute(
+        "1",
+        {
+          planMarkdown: REWRITTEN_PLAN,
+          findings: [HIGH_FINDING],
+          verdict: "revise",
+          summary: "aligned",
+        },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_pass_done.execute(
+        "2",
+        { pass: 1, verdict: "revise", findings: [HIGH_FINDING] },
+        undefined,
+        undefined,
+        {},
+      );
+    },
+    // Pass 2 settles silently (no submission): verification is best-effort.
+    pass2: async () => {},
+  });
+  const { deps, logs } = runtimeDeps(flaky.sdk, {
+    config: { timeoutMs: 60_000, verify: true, passes: 2 },
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, true, "pass 1's submitted plan still wins");
+  assert.equal(res.fallback, false);
+  assert.ok(
+    res.planText.includes("Result<string, ExportError>"),
+    "the submitted plan is used",
+  );
+  assert.ok(
+    !logs.some((l) => l.includes("ended without a submission")),
+    "pass 1's stale provider error must not accuse pass 2",
+  );
 });
 
 test("runtime: a hung reviewer run is bounded by timeoutMs and aborted", async () => {

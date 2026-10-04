@@ -30,7 +30,9 @@ import {
   createReviewSession,
   createReviewState,
   planHash,
+  readProviderErrorEvent,
   reviewNeedsVerification,
+  truncateErrorText,
   type CreateReviewSessionOptions,
   type CreateReviewSessionResult,
   type ReviewChildSession,
@@ -291,6 +293,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let abortController: AbortController | undefined;
   /** True while `runRound` is in flight (gates prompt routing). */
   let roundActive = false;
+  /**
+   * The reviewer's most recent provider failure, captured live from child
+   * events (`auto_retry_start`, failed `auto_retry_end`, an `agent_end` that
+   * stopped on error). Latest wins. Cleared at the start of every pass so a
+   * stale error can never mislabel a later clean settle (see runRound).
+   */
+  let lastProviderError:
+    | { message: string; retries: number; at: number }
+    | undefined;
+
+  /** Record one provider failure. The message arrives pre-decoded, non-empty. */
+  const noteProviderError = (message: string, retries: number): void => {
+    lastProviderError = {
+      message,
+      retries: Math.max(0, Math.trunc(retries)),
+      at: Date.now(),
+    };
+  };
+
+  /** Drop the captured error when a new pass starts. */
+  const clearProviderError = (): void => {
+    lastProviderError = undefined;
+  };
 
   const config = (): ReviewModeConfig => {
     try {
@@ -650,6 +675,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
             }
           }
           const type = readEventType(event);
+          // Capture provider failures as they happen, so a pass that ends
+          // without a submission can be diagnosed with the reviewer's real
+          // API error instead of a generic "no plan" message (see runRound).
+          try {
+            const failure = readProviderErrorEvent(event);
+            if (failure.kind === "retry") {
+              noteProviderError(failure.message, failure.retries);
+            } else if (failure.kind === "exhaust") {
+              noteProviderError(
+                failure.message ||
+                  lastProviderError?.message ||
+                  "provider error (no detail)",
+                failure.retries || lastProviderError?.retries || 0,
+              );
+            } else if (failure.kind === "stop") {
+              noteProviderError(
+                failure.message,
+                lastProviderError?.retries ?? 0,
+              );
+            }
+          } catch {
+            /* error capture is diagnostics only: never break the review */
+          }
           if (type === "agent_settled") {
             noteSettled();
           } else if (type === "agent_end") {
@@ -755,6 +803,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       // ── Pass 1 ──────────────────────────────────────────────────────
       await settleInFlight(deadline, rc);
       gate.reset();
+      clearProviderError();
       const pass1Prompt = buildPass1Prompt({
         planPath: input.planPath,
         planText: originalPlan,
@@ -799,10 +848,23 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         // The run is over (or out of time) and nothing reached the plan file.
         // Fail now — waiting longer cannot produce a submission.
         await abortChild();
+        if (p1.stop === "timeout") {
+          return fail(
+            `the reviewer did not finish within ${Math.round((limitMs ?? 0) / 1000)}s and submitted no plan`,
+            originalPlan,
+          );
+        }
+        // A provider failure settles the run without a submission — name the
+        // real cause (with the provider's own message) instead of blaming the
+        // write path. The slot only holds errors captured during THIS pass.
+        if (lastProviderError) {
+          return fail(
+            `the reviewer's provider failed after ${lastProviderError.retries} retry attempt(s): ${truncateErrorText(lastProviderError.message)}`,
+            originalPlan,
+          );
+        }
         return fail(
-          p1.stop === "timeout"
-            ? `the reviewer did not finish within ${Math.round((limitMs ?? 0) / 1000)}s and submitted no plan`
-            : "the reviewer finished without submitting a plan — it has no write path unless review_submit_plan succeeds",
+          "the reviewer finished without submitting a plan — it has no write path unless review_submit_plan succeeds",
           originalPlan,
         );
       }
@@ -828,6 +890,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         setPhase("verifying");
         await settleInFlight(deadline, rc);
         gate.reset();
+        clearProviderError();
         const pass2Prompt = buildPass2Prompt({
           planPath: input.planPath,
           originalPlan,
@@ -837,14 +900,28 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const p2 = await runPass(2, deadline, rc, () =>
           child.followUp(pass2Prompt),
         );
+        // Name the provider when the verification pass died on one; pass 2
+        // stays best-effort either way — pass 1's plan is never lost to it.
+        const p2Provider = lastProviderError
+          ? `provider error after ${lastProviderError.retries} retry attempt(s): ${truncateErrorText(lastProviderError.message)}`
+          : undefined;
         if (p2.error !== undefined) {
           // Verification is an enhancement: never lose pass 1's plan over it.
           deps.log(
-            `Review Mode verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
+            p2Provider
+              ? `Review Mode verification pass failed (${p2Provider}; send error: ${errorText(p2.error)}) — keeping pass 1's plan.`
+              : `Review Mode verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
             "warning",
           );
         } else if (p2.submitted) {
           finalPlan = p2.submitted.planText;
+        } else if (p2Provider) {
+          // The run settled without a submission AND a provider error was
+          // seen this pass: say why, then keep going with pass 1's rewrite.
+          deps.log(
+            `Review Mode verification pass ended without a submission (${p2Provider}) — keeping pass 1's plan.`,
+            "warning",
+          );
         }
         if (p2.stop === "timeout") await abortChild();
       }
