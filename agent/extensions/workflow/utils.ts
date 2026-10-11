@@ -1583,3 +1583,63 @@ export function renderReviewContextBlock(
   }
   return out;
 }
+
+// ── Slash-command argument completions (pi-tui contract) ─────────────
+//
+// `CombinedAutocompleteProvider.getSuggestions` (pi-tui dist/autocomplete.js)
+// passes `getArgumentCompletions(argumentText)` the ENTIRE typed argument
+// text after the command name and, on accept, `applyCompletion` replaces
+// that whole argument text with `item.value` (the slash-argument branch:
+// `newLine = beforePrefix + item.value`). So an argument-position item's
+// `value` must be the complete replacement — e.g. `"use <name>"`, never the
+// bare token. Pi's own /mcp extension follows this contract
+// (`value: `${action} ${name}``). `joinArgumentValue` is the single helper
+// that enforces it: it keeps every committed token and appends (or replaces
+// the last partial token with) `token`.
+
+/** One slash-command argument completion item (pi-tui `AutocompleteItem` shape). */
+export interface ArgumentCompletion {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+/**
+ * Build the full-argument replacement `value` for a completion token.
+ *
+ * `prefix` is the typed argument text so far. Tokens separated by whitespace
+ * are "committed"; if `prefix` ends with whitespace the user is starting a
+ * fresh token, so `token` is appended — otherwise it replaces the trailing
+ * partial token. Pure; never throws.
+ *
+ *   joinArgumentValue("use Syn-De", "Syn-Deepseek-v4.1-Flash-Planner")
+ *     → "use Syn-Deepseek-v4.1-Flash-Planner"
+ *   joinArgumentValue("use ", "none") → "use none"
+ *   joinArgumentValue("", "list")     → "list"
+ */
+export function joinArgumentValue(prefix: string, token: string): string {
+  const raw = String(prefix ?? "");
+  const endsWithWs = /\s$/.test(raw);
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const committed = endsWithWs ? parts : parts.slice(0, -1);
+  return [...committed, token].join(" ");
+}
+
+/**
+ * Exact-match suppression for slash-command argument completions: when the
+ * token being typed (`partial`, "" while the prefix ends with whitespace)
+ * already equals the ONLY remaining candidate, return true so the completer
+ * yields null — pi's editor then closes the dropdown and the FIRST Enter
+ * submits instead of being consumed by the completion-accept handler
+ * (editor.js `tui.select.confirm`). Pure.
+ */
+export function suppressExactArgumentMatch(
+  candidates: readonly string[],
+  partial: string,
+): boolean {
+  if (!partial) return false;
+  return (
+    candidates.length === 1 &&
+    candidates[0].toLowerCase() === partial.toLowerCase()
+  );
+}

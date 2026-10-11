@@ -40,6 +40,8 @@ import {
   roleIcon,
 } from "./roles.ts";
 import { COMMIT_CONFIG_DIR, WORKFLOW_SETTINGS_KEY } from "./commit-policy.ts";
+import type { ArgumentCompletion } from "./utils.ts";
+import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -66,7 +68,7 @@ export const PROFILE_CONFIG_VERSION = 1;
 export const MAX_PROFILE_NAME_LENGTH = 40;
 
 /** Reserved words — they collide with `/profile use <name|none>` and `/role use` style keywords. */
-export const RESERVED_PROFILE_NAMES: readonly string[] = ["none", "auto"];
+export const RESERVED_PROFILE_NAMES: readonly string[] = ["none", "auto", "off"];
 
 /** Fallback thinking level when a sanitized model omits an invalid one. */
 const DEFAULT_THINKING: ThinkingLevel = "medium";
@@ -614,4 +616,209 @@ export function writeDefaultProfileSetting(
       error: e instanceof Error ? e.message : String(e),
     };
   }
+}
+
+// ── Argument completions (/profile) ──────────────────────────────────
+
+/** Subcommands that take a profile-name argument (position 2). */
+const PROFILE_NAME_SUBS: ReadonlySet<string> = new Set([
+  "use",
+  "edit",
+  "show",
+  "delete",
+  "default",
+  "rename",
+]);
+
+/** Aliases the /profile handler accepts, mapped to their canonical subcommand. */
+const PROFILE_CMD_ALIASES: Readonly<Record<string, string>> = {
+  activate: "use",
+  config: "edit",
+  remove: "delete",
+  rm: "delete",
+  mv: "rename",
+  new: "create",
+  add: "create",
+};
+
+/** Write-scope descriptions for `/profile default <name> <scope>` completions. */
+const SCOPE_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  global: "write to ~/.pi/agent/settings.json",
+  project: "write to <cwd>/.pi/settings.json",
+};
+
+interface ProfileSubMeta {
+  name: string;
+  /** Takes an argument → completion `value` carries a trailing space. */
+  takesArg: boolean;
+  label: string;
+  description: string;
+}
+
+const PROFILE_SUBS: readonly ProfileSubMeta[] = [
+  {
+    name: "list",
+    takesArg: false,
+    label: "list",
+    description: "show all profiles",
+  },
+  {
+    name: "use",
+    takesArg: true,
+    label: "use <name|none>",
+    description: "activate/deactivate for this session",
+  },
+  {
+    name: "create",
+    takesArg: true,
+    label: "create <name>",
+    description: "create a profile (seeded from current models)",
+  },
+  {
+    name: "edit",
+    takesArg: true,
+    label: "edit <name>",
+    description: "open the tabbed model editor",
+  },
+  {
+    name: "rename",
+    takesArg: true,
+    label: "rename <old> <new>",
+    description: "rename a profile",
+  },
+  {
+    name: "delete",
+    takesArg: true,
+    label: "delete <name>",
+    description: "delete a profile",
+  },
+  {
+    name: "default",
+    takesArg: true,
+    label: "default [name|none] [global|project]",
+    description: "default profile for new sessions",
+  },
+  {
+    name: "show",
+    takesArg: true,
+    label: "show <name>",
+    description: "show one profile's models",
+  },
+];
+
+/** Profile names matching a lowercased partial token, case-insensitively. */
+function profileNameMatches(
+  profiles: readonly Profile[],
+  partial: string,
+): Profile[] {
+  if (!partial) return [...profiles];
+  return profiles.filter((p) =>
+    p.name.toLowerCase().startsWith(partial.toLowerCase()),
+  );
+}
+
+function profileCompletions(
+  profiles: readonly Profile[],
+  join: (token: string) => string,
+): ArgumentCompletion[] {
+  return profiles.map((p) => ({
+    value: join(p.name),
+    label: p.name,
+    ...(p.description ? { description: p.description } : {}),
+  }));
+}
+
+/**
+ * Argument completions for `/profile` (pure; unit-tested in profiles.test.ts).
+ *
+ * `argumentPrefix` is the ENTIRE typed argument text after "/profile " (what
+ * pi's CombinedAutocompleteProvider passes). Per the pi-tui contract, every
+ * returned item's `value` is the complete replacement for that argument text
+ * (`joinArgumentValue`), never a bare token — accepting `"use Syn-De" →
+ * "Syn-…"` would otherwise drop the `use` subcommand (see the /mcp
+ * extension for the reference implementation).
+ *
+ * Returns null when there is nothing useful to offer (unknown subcommand,
+ * `rename <old> <new>` second arg, `create`, …) or when the typed token is
+ * already an exact, unique match (exact-match suppression → the dropdown
+ * closes and the first Enter submits the command).
+ */
+export function profileArgumentCompletions(
+  argumentPrefix: string,
+  profiles: readonly Profile[],
+): ArgumentCompletion[] | null {
+  const raw = String(argumentPrefix ?? "");
+  const join = (token: string) => joinArgumentValue(raw, token);
+
+  // ── Subcommand position: no whitespace typed yet ────────────────────
+  if (!raw.trim() || !/\s/.test(raw)) {
+    const lower = raw.trim().toLowerCase();
+    const matching = PROFILE_SUBS.filter((s) =>
+      s.name.startsWith(lower),
+    );
+    if (matching.length > 0) {
+      return matching.map((s) => ({
+        value: s.takesArg ? `${s.name} ` : s.name,
+        label: s.label,
+        description: s.description,
+      }));
+    }
+    // Bare profile name → `/profile <name>` shows detail (mirrors /role).
+    const names = profileNameMatches(profiles, lower);
+    if (names.length === 0) return null;
+    return profileCompletions(names, join);
+  }
+
+  // ── Argument position ────────────────────────────────────────────────
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const head = tokens[0] ?? "";
+  const canonical = PROFILE_CMD_ALIASES[head.toLowerCase()] ?? head.toLowerCase();
+  const endsWithWs = /\s$/.test(raw);
+  const committedCount = endsWithWs ? tokens.length : tokens.length - 1;
+  const partial = endsWithWs ? "" : (tokens[tokens.length - 1] ?? "");
+
+  let items: ArgumentCompletion[] | null = null;
+
+  if (canonical === "default") {
+    if (committedCount <= 1) {
+      // Second token: profile name | none.
+      const names = profileNameMatches(profiles, partial);
+      const none: ArgumentCompletion[] =
+        "none".startsWith(partial.toLowerCase())
+          ? [{ value: join("none"), label: "none", description: "no profile" }]
+          : [];
+      items = [...profileCompletions(names, join), ...none];
+    } else {
+      // Third token: scope.
+      items = ["global", "project"].flatMap((s) =>
+        s.startsWith(partial.toLowerCase())
+          ? [
+              {
+                value: join(s),
+                label: s,
+                description: SCOPE_DESCRIPTIONS[s],
+              },
+            ]
+          : [],
+      );
+    }
+  } else if (canonical === "rename") {
+    // First arg: existing name; second arg (new name) is free text.
+    if (committedCount <= 1) {
+      items = profileCompletions(profileNameMatches(profiles, partial), join);
+    }
+  } else if (PROFILE_NAME_SUBS.has(canonical)) {
+    const names = profileNameMatches(profiles, partial);
+    const none: ArgumentCompletion[] =
+      canonical === "use" && "none".startsWith(partial.toLowerCase())
+        ? [{ value: join("none"), label: "none", description: "no profile" }]
+        : [];
+    items = [...profileCompletions(names, join), ...none];
+  }
+  // create|new|add (new name is free text), list, unknown → items stays null.
+
+  if (!items || items.length === 0) return null;
+  const candidateTokens = items.map((i) => i.label);
+  if (suppressExactArgumentMatch(candidateTokens, partial)) return null;
+  return items;
 }

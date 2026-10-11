@@ -23,6 +23,7 @@ import {
   armCommitAuthorization,
   coerceCommitPolicyConfig,
   commitConfigPaths,
+  commitPolicyArgumentCompletions,
   decideCommitGate,
   describeCommitPolicyMode,
   extractCommitPolicyRaw,
@@ -575,3 +576,62 @@ test("decideCommitGate: authorization also short-circuits the ask prompt", () =>
   );
 });
 
+
+// ── commitPolicyArgumentCompletions ──────────────────────────────────
+//
+// pi-tui full-argument contract: argument-position values must be the
+// complete replacement for the typed argument text ("ask project", never
+// "project") — otherwise accepting a completion drops the mode token.
+
+test("commitPolicyArgumentCompletions: subcommand position (modes only, trailing space)", () => {
+  assert.deepEqual(commitPolicyArgumentCompletions("")?.map((i) => i.value), [
+    "never ",
+    "ask ",
+    "allow ",
+  ]);
+  assert.deepEqual(commitPolicyArgumentCompletions("n")?.map((i) => i.value), [
+    "never ",
+  ]);
+  // Partial "a" matches two modes → both offered.
+  assert.deepEqual(
+    commitPolicyArgumentCompletions("a")?.map((i) => i.value).sort(),
+    ["allow ", "ask "],
+  );
+  // Scopes are NOT offered before a mode is committed.
+  assert.ok(
+    !commitPolicyArgumentCompletions("")?.some((i) => i.label === "global"),
+  );
+});
+
+test("commitPolicyArgumentCompletions: second token completes the write scope with full values", () => {
+  assert.deepEqual(commitPolicyArgumentCompletions("ask ")?.map((i) => i.value), [
+    "ask global",
+    "ask project",
+  ]);
+  assert.deepEqual(
+    commitPolicyArgumentCompletions("never pro")?.map((i) => i.value),
+    ["never project"],
+  );
+  assert.deepEqual(
+    commitPolicyArgumentCompletions("allow g")?.map((i) => i.value),
+    ["allow global"],
+  );
+});
+
+test("commitPolicyArgumentCompletions: exact-match suppression + unknown modes", () => {
+  assert.equal(
+    commitPolicyArgumentCompletions("never global"),
+    null,
+    "fully-typed scope → dropdown closes so the first Enter submits",
+  );
+  assert.equal(commitPolicyArgumentCompletions("bogus x"), null);
+  assert.equal(commitPolicyArgumentCompletions("status "), null);
+});
+
+test("commitPolicyArgumentCompletions: applyCompletion algebra keeps the mode", () => {
+  const line = "/commit-policy never pro";
+  const prefix = "never pro";
+  const item = commitPolicyArgumentCompletions(prefix)![0];
+  const newLine = line.slice(0, line.length - prefix.length) + item.value;
+  assert.equal(newLine, "/commit-policy never project");
+});

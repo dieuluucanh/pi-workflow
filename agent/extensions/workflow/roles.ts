@@ -13,6 +13,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ArgumentCompletion } from "./utils.ts";
+import {
+  joinArgumentValue,
+  suppressExactArgumentMatch,
+} from "./utils.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -429,4 +434,141 @@ export function formatRolesForDisplay(config: RoleConfig): string {
     "Usage: /role (picker) | /role set <role> <provider/model> [thinking] | /role use <role|auto> | /role add|remove|reset",
   );
   return lines.join("\n");
+}
+
+// ── Argument completions (/role) ─────────────────────────────────────
+
+interface RoleSubMeta {
+  name: string;
+  /** Takes an argument → completion `value` carries a trailing space. */
+  takesArg: boolean;
+  label: string;
+  description: string;
+}
+
+const ROLE_SUBS: readonly RoleSubMeta[] = [
+  { name: "list", takesArg: false, label: "list", description: "show all roles" },
+  {
+    name: "show",
+    takesArg: false,
+    label: "show",
+    description: "show all roles (alias of list)",
+  },
+  {
+    name: "config",
+    takesArg: true,
+    label: "config",
+    description: "open the role config screen (picker)",
+  },
+  {
+    name: "set",
+    takesArg: true,
+    label: "set <role> <provider/model> [thinking]",
+    description: "configure one role's model",
+  },
+  {
+    name: "add",
+    takesArg: true,
+    label: "add <name> [provider/model] [thinking]",
+    description: "add a custom role",
+  },
+  {
+    name: "remove",
+    takesArg: true,
+    label: "remove <name>",
+    description: "remove a custom role",
+  },
+  {
+    name: "reset",
+    takesArg: false,
+    label: "reset",
+    description: "reset roles to defaults",
+  },
+  {
+    name: "use",
+    takesArg: true,
+    label: "use <role|auto>",
+    description: "activate one role for the whole workflow",
+  },
+];
+
+/**
+ * Argument completions for `/role` (pure; unit-tested in roles.test.ts).
+ *
+ * Follows the pi-tui full-argument contract (see `joinArgumentValue` and the
+ * /mcp extension): every returned `value` is the complete replacement for the
+ * typed argument text — `set planner opencode-go/muse-…`, never a bare token.
+ * Positional rules mirror the /role handler:
+ *   - `set` arg1 = existing role names, arg2 = model refs (`provider/id`,
+ *     null when `opts.models` is empty), arg3 = thinking levels;
+ *   - `use` = role names + `auto`;
+ *   - `remove` = role names;
+ *   - `add` arg1 is a NEW name → no completions.
+ * Returns null when nothing useful can be offered, including when the typed
+ * token is already an exact unique match (exact-match suppression — the
+ * dropdown closes so the first Enter submits).
+ */
+export function roleArgumentCompletions(
+  argumentPrefix: string,
+  opts: { roleNames: readonly string[]; models?: readonly string[] },
+): ArgumentCompletion[] | null {
+  const raw = String(argumentPrefix ?? "");
+  const join = (token: string) => joinArgumentValue(raw, token);
+
+  // ── Subcommand position: no whitespace typed yet ────────────────────
+  if (!raw.trim() || !/\s/.test(raw)) {
+    const lower = raw.trim().toLowerCase();
+    const matching = ROLE_SUBS.filter((s) => s.name.startsWith(lower));
+    if (matching.length === 0) return null;
+    return matching.map((s) => ({
+      value: s.takesArg ? `${s.name} ` : s.name,
+      label: s.label,
+      description: s.description,
+    }));
+  }
+
+  // ── Argument position ────────────────────────────────────────────────
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const cmd = (tokens[0] ?? "").toLowerCase();
+  const endsWithWs = /\s$/.test(raw);
+  const committedCount = endsWithWs ? tokens.length : tokens.length - 1;
+  const partial = endsWithWs ? "" : (tokens[tokens.length - 1] ?? "");
+  const matchToken = (t: string) => t.toLowerCase().startsWith(partial.toLowerCase());
+
+  const roleNameItems = (): ArgumentCompletion[] =>
+    opts.roleNames.flatMap((n) =>
+      matchToken(n) ? [{ value: join(n), label: n }] : [],
+    );
+
+  let items: ArgumentCompletion[] | null = null;
+
+  if (cmd === "set") {
+    if (committedCount <= 1) {
+      items = roleNameItems();
+    } else if (committedCount === 2) {
+      items = (opts.models ?? []).flatMap((m) =>
+        matchToken(m) ? [{ value: join(m), label: m }] : [],
+      );
+    } else {
+      items = VALID_THINKING_LEVELS.flatMap((t) =>
+        matchToken(t) ? [{ value: join(t), label: t }] : [],
+      );
+    }
+  } else if (cmd === "use") {
+    items = [
+      ...roleNameItems(),
+      ...("auto".startsWith(partial.toLowerCase())
+        ? [{ value: join("auto"), label: "auto" }]
+        : []),
+    ];
+  } else if (cmd === "remove") {
+    items = roleNameItems();
+  }
+  // add (new name is free text), config, list/show, reset, unknown → null.
+
+  if (!items || items.length === 0) return null;
+  if (suppressExactArgumentMatch(items.map((i) => i.label), partial)) {
+    return null;
+  }
+  return items;
 }

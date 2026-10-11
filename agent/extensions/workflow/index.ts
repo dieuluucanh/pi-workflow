@@ -94,6 +94,7 @@ import {
   COMMIT_FLOW_TTL_MS,
   armCommitAuthorization,
   commitConfigPaths,
+  commitPolicyArgumentCompletions,
   decideCommitGate,
   describeCommitPolicyMode,
   isAuthorizationActive,
@@ -122,6 +123,7 @@ import {
   defaultRoleConfig,
   loadRoleConfigDetailed,
   rolesFingerprint,
+  roleArgumentCompletions,
   saveRoleConfig,
   getRole,
   formatRolesForDisplay,
@@ -145,6 +147,7 @@ import {
   getProfile,
   formatProfilesForDisplay,
   describeProfile,
+  profileArgumentCompletions,
   validateProfileName,
   applyProfileOverlay,
   missingProfileRoles,
@@ -1587,39 +1590,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
       );
       updateStatus(ctx as any);
     },
-    getArgumentCompletions: (prefix: string) => {
-      const flags = [
-        {
-          value: "never",
-          label: "never",
-          description:
-            "agent cannot git add/commit/push — you commit (or /commit)",
-        },
-        {
-          value: "ask",
-          label: "ask",
-          description: "agent may commit; each git commit/push asks first",
-        },
-        {
-          value: "allow",
-          label: "allow",
-          description:
-            "agent may commit freely (per-step during plan execution)",
-        },
-        {
-          value: "global",
-          label: "global",
-          description: "write to ~/.pi/agent/settings.json",
-        },
-        {
-          value: "project",
-          label: "project",
-          description: "write to <cwd>/.pi/settings.json",
-        },
-      ];
-      const filtered = flags.filter((f) => f.value.startsWith(prefix));
-      return filtered.length ? filtered : null;
-    },
+    // pi-tui full-argument contract (see commitPolicyArgumentCompletions):
+    // modes first, then the write scope, with values that replace the whole
+    // typed argument text ("ask project", never bare "project").
+    getArgumentCompletions: (prefix: string) =>
+      commitPolicyArgumentCompletions(prefix),
   });
 
   pi.registerCommand("review-prompt", {
@@ -3042,6 +3017,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("role", {
     description: "Configure one model + thinking per role — opens picker UI",
+    // pi-tui full-argument contract (see roleArgumentCompletions): positional
+    // set/use/remove completions whose values replace the whole typed
+    // argument text ("set planner <provider/model>"), never bare tokens.
+    getArgumentCompletions: (prefix: string) => {
+      // No ctx here — use the live session cwd so project-scope roles.json is
+      // honored, matching the handler's ensureRoleConfig(cwd) key.
+      ensureRoleConfig((currentSessionCtx as any)?.cwd);
+      const models = collectRoleCatalog(currentSessionCtx as any).all.map(
+        (e) => formatModelRef({ provider: e.provider, id: e.id } as RoleModel),
+      );
+      return roleArgumentCompletions(prefix, {
+        roleNames: roleConfig.roles.map((r) => r.name),
+        models,
+      });
+    },
     handler: async (args, ctx) => {
       const cwd = (ctx as any)?.cwd as string | undefined;
       ensureRoleConfig(cwd);
@@ -4553,90 +4543,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Bare profile name → show detail (mirrors /role <name>).
+      // Bare profile name → show detail (mirrors /role <name>). The hint
+      // matters: this branch is where the old completion bug dropped users
+      // who meant `/profile use <name>`.
       const named = getProfile(profilesConfig, sub);
       if (named) {
-        ctx.ui.notify(describeProfile(named), "info");
+        ctx.ui.notify(
+          `${describeProfile(named)}\n\nActivate it with /profile use ${named.name}.`,
+          "info",
+        );
         return;
       }
       ctx.ui.notify(PROFILE_USAGE, "info");
     },
+    // pi-tui contract: argument completions replace the ENTIRE typed argument
+    // text with item.value (see profileArgumentCompletions / utils.joinArgument
+    // Value). The old inline completer returned bare profile names, so
+    // accepting a suggestion rewrote "/profile use X" → "/profile X" and the
+    // command silently showed details instead of activating.
     getArgumentCompletions: (prefix: string) => {
-      ensureProfilesConfig();
-      const subs = [
-        { value: "list", label: "list", description: "show all profiles" },
-        {
-          value: "use",
-          label: "use <name|none>",
-          description: "activate/deactivate for this session",
-        },
-        {
-          value: "create",
-          label: "create <name>",
-          description: "create a profile (seeded from current models)",
-        },
-        {
-          value: "edit",
-          label: "edit <name>",
-          description: "open the tabbed model editor",
-        },
-        {
-          value: "rename",
-          label: "rename <old> <new>",
-          description: "rename a profile",
-        },
-        {
-          value: "delete",
-          label: "delete <name>",
-          description: "delete a profile",
-        },
-        {
-          value: "default",
-          label: "default [name|none] [global|project]",
-          description: "default profile for new sessions",
-        },
-        {
-          value: "show",
-          label: "show <name>",
-          description: "show one profile's models",
-        },
-      ];
-      const lower = String(prefix || "").toLowerCase();
-      if (lower.includes(" ")) {
-        // Completing an argument after a subcommand → profile names where relevant.
-        const cmd = lower.trim().split(/\s+/)[0];
-        const wantsNames =
-          cmd === "use" ||
-          cmd === "edit" ||
-          cmd === "delete" ||
-          cmd === "show" ||
-          cmd === "default";
-        if (!wantsNames) return null;
-        const last = lower.trim().split(/\s+/).pop() ?? "";
-        const names = profilesConfig.profiles
-          .filter((p) => p.name.toLowerCase().startsWith(last))
-          .map((p) => ({
-            value: p.name,
-            label: p.name,
-            description: p.description || undefined,
-          }));
-        return cmd === "use" || cmd === "default"
-          ? [
-              ...names,
-              { value: "none", label: "none", description: "no profile" },
-            ]
-          : names;
-      }
-      const matching = subs.filter((s) => s.value.startsWith(lower));
-      if (matching.length > 0) return matching;
-      const names = profilesConfig.profiles
-        .filter((p) => p.name.toLowerCase().startsWith(lower))
-        .map((p) => ({
-          value: p.name,
-          label: p.name,
-          description: p.description || undefined,
-        }));
-      return names.length ? names : null;
+      // The completion callback gets no ctx — use the live session cwd so
+      // project-scope profiles (<cwd>/.pi/profiles.json) are included and the
+      // profiles cache key matches the handler's (a cwd-less reload could
+      // otherwise deactivate an active project-scope profile).
+      ensureProfilesConfig((currentSessionCtx as any)?.cwd);
+      return profileArgumentCompletions(prefix, profilesConfig.profiles);
     },
   });
 

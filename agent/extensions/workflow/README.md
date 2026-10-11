@@ -69,7 +69,9 @@ A profile is a **named combination of role model settings** — one `{provider, 
 
 **Why**: mix models from different providers in one workflow (frontier planner + cheap explorer), keep one profile per provider to control budget per provider, run concurrent sessions on different providers to work around per-provider concurrency limits, and exploit cheaper starter plans across several providers.
 
-Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-project override at `<cwd>/.pi/profiles.json` (per-profile replace, project wins). Names are case-insensitively unique, ≤ 40 chars, no whitespace (keep them CLI-addressable), and `none`/`auto` are reserved. A missing file is the normal empty state; a corrupt or wrong-version file is never rewritten (warning + in-memory empty config).
+Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-project override at `<cwd>/.pi/profiles.json` (per-profile replace, project wins). Names are case-insensitively unique, ≤ 40 chars, no whitespace (keep them CLI-addressable), and `none`/`auto`/`off` are reserved (`off` is a `/profile use` deactivate keyword, so a profile can never be named it). A missing file is the normal empty state; a corrupt or wrong-version file is never rewritten (warning + in-memory empty config).
+
+**Argument completion** follows pi's full-argument contract (the same one pi's `/mcp` uses): accepting a suggestion replaces the entire typed argument text, so completing `/profile use Syn-␣` inserts `/profile use Syn-Deepseek-…` with the subcommand intact — it never collapses to `/profile <name>`. The dropdown closes (and the first Enter submits) once the typed token is already an exact, unique match. This applies positionally to `/profile` (`use|edit|show|delete|rename <old>|default <name> [global|project]`), `/commit-policy` (`never|ask|allow [global|project]`) and `/role` (`set <role> <provider/model> [thinking]`, `use <role|auto>`, `remove <name>`).
 
 ## Review Mode
 

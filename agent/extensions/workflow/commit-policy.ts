@@ -23,6 +23,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ArgumentCompletion } from "./utils.ts";
+import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
 
 /** Pi's project config directory. Mirrors WORKFLOW_CONFIG_DIR without importing review.ts (which pulls provider modules). */
 export const COMMIT_CONFIG_DIR = ".pi";
@@ -525,4 +527,105 @@ export function writeCommitPolicyConfig(
       error: e instanceof Error ? e.message : String(e),
     };
   }
+}
+
+// ── Argument completions (/commit-policy) ────────────────────────────
+
+/** One /commit-policy subcommand with its usage hint. */
+const COMMIT_POLICY_SUBS: readonly {
+  name: string;
+  label: string;
+  description: string;
+}[] = [
+  {
+    name: "never",
+    label: "never",
+    description: "agent cannot git add/commit/push — you commit (or /commit)",
+  },
+  {
+    name: "ask",
+    label: "ask",
+    description: "agent may commit; each git commit/push asks first",
+  },
+  {
+    name: "allow",
+    label: "allow",
+    description: "agent may commit freely (per-step during plan execution)",
+  },
+];
+
+const COMMIT_POLICY_SCOPES: readonly {
+  token: string;
+  description: string;
+}[] = [
+  { token: "global", description: "write to ~/.pi/agent/settings.json" },
+  { token: "project", description: "write to <cwd>/.pi/settings.json" },
+];
+
+/** commit-policy subcommands take an optional scope → trailing-space values. */
+const COMMIT_POLICY_MODE_TOKENS: ReadonlySet<string> = new Set([
+  "never",
+  "ask",
+  "allow",
+]);
+
+/**
+ * Argument completions for `/commit-policy` (pure; unit-tested in
+ * commit-policy.test.ts).
+ *
+ * Follows the pi-tui full-argument contract (see `joinArgumentValue` and the
+ * /mcp extension): the first token completes a mode, the second token
+ * completes the write scope, and every returned `value` is the complete
+ * replacement for the typed argument text (`"ask project"`, never
+ * `"project"`). Returns null when nothing useful can be offered, including
+ * when the typed token is already an exact unique match (exact-match
+ * suppression — the dropdown closes so the first Enter submits).
+ */
+export function commitPolicyArgumentCompletions(
+  argumentPrefix: string,
+): ArgumentCompletion[] | null {
+  const raw = String(argumentPrefix ?? "");
+  const join = (token: string) => joinArgumentValue(raw, token);
+
+  // ── Subcommand position: no whitespace typed yet ────────────────────
+  if (!raw.trim() || !/\s/.test(raw)) {
+    const lower = raw.trim().toLowerCase();
+    const matching = COMMIT_POLICY_SUBS.filter((s) =>
+      s.name.startsWith(lower),
+    );
+    if (matching.length === 0) return null;
+    return matching.map((s) => ({
+      value: `${s.name} `,
+      label: s.label,
+      description: s.description,
+    }));
+  }
+
+  // ── Argument position: mode already committed → complete the scope ──
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const mode = (tokens[0] ?? "").toLowerCase();
+  if (!COMMIT_POLICY_MODE_TOKENS.has(mode)) return null;
+  const endsWithWs = /\s$/.test(raw);
+  const partial = endsWithWs ? "" : (tokens[tokens.length - 1] ?? "");
+  const items: ArgumentCompletion[] = COMMIT_POLICY_SCOPES.flatMap((s) =>
+    s.token.startsWith(partial.toLowerCase())
+      ? [
+          {
+            value: join(s.token),
+            label: s.token,
+            description: s.description,
+          },
+        ]
+      : [],
+  );
+  if (items.length === 0) return null;
+  if (
+    suppressExactArgumentMatch(
+      items.map((i) => i.label),
+      partial,
+    )
+  ) {
+    return null;
+  }
+  return items;
 }

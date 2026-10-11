@@ -18,6 +18,7 @@ import {
   getRole,
   loadRoleConfig,
   loadRoleConfigDetailed,
+  roleArgumentCompletions,
   rolesFingerprint,
 } from "./roles.ts";
 
@@ -159,4 +160,97 @@ test("roles: loadRoleConfig wrapper matches loadRoleConfigDetailed", () => {
   const detailed = loadRoleConfigDetailed(undefined, { userPath });
   const wrapped = loadRoleConfig(undefined, { userPath });
   assert.deepEqual(wrapped, detailed.config);
+});
+
+// ── roleArgumentCompletions ──────────────────────────────────────────
+//
+// pi-tui full-argument contract: argument-position values must be the
+// complete replacement for the typed argument text ("set planner
+// opencode-go/muse-…", never a bare token) — otherwise accepting a
+// completion drops the already-typed tokens.
+
+const ROLE_FIXTURE = {
+  roleNames: ["planner", "explorer", "builder", "reviewer"],
+  models: [
+    "opencode-go/muse-spark-1.2-contributor",
+    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash",
+  ],
+};
+
+test("roleArgumentCompletions: subcommand position — terminal vs arg-taking values", () => {
+  const all = roleArgumentCompletions("", ROLE_FIXTURE)!;
+  assert.equal(all.find((i) => i.label === "list")!.value, "list");
+  assert.equal(all.find((i) => i.label === "reset")!.value, "reset");
+  assert.equal(all.find((i) => i.label === "use <role|auto>")!.value, "use ");
+  assert.equal(all.find((i) => i.label.startsWith("set "))!.value, "set ");
+  assert.deepEqual(roleArgumentCompletions("us", ROLE_FIXTURE)?.map((i) => i.value), ["use "]);
+  assert.equal(roleArgumentCompletions("bogus", ROLE_FIXTURE), null);
+});
+
+test("roleArgumentCompletions: set — role names, then model refs, then thinking levels", () => {
+  assert.deepEqual(roleArgumentCompletions("set pl", ROLE_FIXTURE)?.map((i) => i.value), [
+    "set planner",
+  ]);
+  assert.deepEqual(
+    roleArgumentCompletions("set planner syn", ROLE_FIXTURE)?.map((i) => i.value),
+    ["set planner synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"],
+  );
+  assert.deepEqual(
+    roleArgumentCompletions("set planner opencode-go/muse-spark-1.2-contributor ", ROLE_FIXTURE)?.map((i) => i.value),
+    [
+      "set planner opencode-go/muse-spark-1.2-contributor off",
+      "set planner opencode-go/muse-spark-1.2-contributor minimal",
+      "set planner opencode-go/muse-spark-1.2-contributor low",
+      "set planner opencode-go/muse-spark-1.2-contributor medium",
+      "set planner opencode-go/muse-spark-1.2-contributor high",
+      "set planner opencode-go/muse-spark-1.2-contributor xhigh",
+      "set planner opencode-go/muse-spark-1.2-contributor max",
+    ],
+  );
+  // arg3 filters by partial and only offers thinking levels.
+  const t3 = roleArgumentCompletions("set planner opencode-go/muse-spark-1.2-contributor hi", ROLE_FIXTURE)!;
+  assert.deepEqual(t3.map((i) => i.value), [
+    "set planner opencode-go/muse-spark-1.2-contributor high",
+  ]);
+});
+
+test("roleArgumentCompletions: set with no models yields null for the model token", () => {
+  assert.equal(
+    roleArgumentCompletions("set planner ", { roleNames: ["planner"] }),
+    null,
+  );
+});
+
+test("roleArgumentCompletions: use — role names + auto; remove — role names; add arg1 free text", () => {
+  assert.deepEqual(
+    roleArgumentCompletions("use rev", ROLE_FIXTURE)?.map((i) => i.value),
+    ["use reviewer"],
+  );
+  assert.ok(roleArgumentCompletions("use ", ROLE_FIXTURE)!.some((i) => i.value === "use auto"));
+  assert.deepEqual(roleArgumentCompletions("remove bu", ROLE_FIXTURE)?.map((i) => i.value), [
+    "remove builder",
+  ]);
+  assert.equal(roleArgumentCompletions("add x", ROLE_FIXTURE), null);
+});
+
+test("roleArgumentCompletions: exact-match suppression closes the dropdown", () => {
+  assert.equal(
+    roleArgumentCompletions("use planner", ROLE_FIXTURE),
+    null,
+    "fully-typed role name → no dropdown",
+  );
+  assert.equal(
+    roleArgumentCompletions("set planner opencode-go/muse-spark-1.2-contributor high", ROLE_FIXTURE),
+    null,
+    "fully-typed thinking level → no dropdown",
+  );
+  assert.ok(roleArgumentCompletions("use pl", ROLE_FIXTURE));
+});
+
+test("roleArgumentCompletions: applyCompletion algebra keeps the committed tokens", () => {
+  const line = "/role set pl";
+  const prefix = "set pl";
+  const item = roleArgumentCompletions(prefix, ROLE_FIXTURE)![0];
+  const newLine = line.slice(0, line.length - prefix.length) + item.value;
+  assert.equal(newLine, "/role set planner");
 });
