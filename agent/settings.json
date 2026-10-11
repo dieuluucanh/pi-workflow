@@ -50,6 +50,7 @@
       "fallbackOnError": "skip",
       "exploreBudget": 3,
       "timeoutMs": 0
-    }
+    },
+    "defaultProfile": "Syn-Deepseek-v4.1-Flash-Planner"
   }
 }

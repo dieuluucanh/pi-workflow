@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "Syn-GLM-5.3-Flash-Planner",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "synthetic",
+          "id": "hf:zai-org/GLM-5.3-Flash",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "synthetic",
+          "id": "hf:zai-org/GLM-5.3-Flash",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "synthetic",
+          "id": "hf:zai-org/GLM-5.3-Flash",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "thinking": "xhigh"
+        }
+      }
+    },
+    {
+      "name": "Syn-Deepseek-v4.1-Flash-Planner",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "synthetic",
+          "id": "hf:zai-org/GLM-5.3-Flash",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "synthetic",
+          "id": "hf:zai-org/GLM-5.3-Flash",
+          "thinking": "xhigh"
+        }
+      }
+    }
+  ]
+}

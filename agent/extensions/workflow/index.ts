@@ -126,6 +126,24 @@ import {
   type ThinkingLevel,
 } from "./roles.ts";
 import {
+  defaultProfileConfig,
+  loadProfilesDetailed,
+  profilesFingerprint,
+  saveProfiles,
+  getProfile,
+  formatProfilesForDisplay,
+  describeProfile,
+  validateProfileName,
+  applyProfileOverlay,
+  missingProfileRoles,
+  readDefaultProfileSetting,
+  writeDefaultProfileSetting,
+  defaultProfileSettingPaths,
+  PROFILE_ROLES,
+  type ProfileConfig,
+  type Profile,
+} from "./profiles.ts";
+import {
   applySubmittedPlan,
   formatReviewStatusLines,
   formatReviewTimeoutLabel,
@@ -473,6 +491,232 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
   }
+
+  // ── Model profiles state (session-scoped activation) ───────────
+  let profilesConfig: ProfileConfig = defaultProfileConfig();
+  let profilesLoadedFor: string | undefined;
+  let profilesLoadedFingerprint: string | undefined;
+  /** Reason the last load skipped the user file — only corrupt/legacy warns. */
+  let profilesFallbackReason: string | undefined;
+  let profilesFallbackSeverity: "info" | "warning" | undefined;
+  let profilesFallbackNotified = false;
+  /** Active profile for THIS session — never global (concurrent sessions each pick their own). */
+  let activeProfileName: string | null = null;
+  /** True once the user picked explicitly in this session; otherwise workflow.defaultProfile applies. */
+  let profileExplicit = false;
+  /** Cache for the effective (profile-overlaid) roles — see effectiveRoles(). */
+  let effectiveRolesCache: {
+    base: RoleConfig;
+    profile: string | null;
+    roles: Role[];
+  } | null = null;
+
+  function invalidateEffectiveRoles(): void {
+    effectiveRolesCache = null;
+  }
+
+  /**
+   * The single profiles accessor, mirroring ensureRoleConfig: reloads when the
+   * working directory changes or either profiles.json changes on disk (mtime/
+   * size), so a `/profile` edit made in another window is picked up without a
+   * `/reload`. Non-destructive: a bad or missing file is never overwritten
+   * (see loadProfilesDetailed). A profile activated in this session that has
+   * vanished from disk is deactivated here (with the fallback warning).
+   */
+  function ensureProfilesConfig(cwd?: string): ProfileConfig {
+    const key = cwd ?? "";
+    const fingerprint = profilesFingerprint(key);
+    if (
+      profilesLoadedFor === key &&
+      profilesLoadedFingerprint === fingerprint
+    ) {
+      return profilesConfig;
+    }
+    const loaded = loadProfilesDetailed(key);
+    profilesConfig = loaded.config;
+    profilesLoadedFor = key;
+    profilesLoadedFingerprint = fingerprint;
+    profilesFallbackReason = loaded.usedDefaults ? loaded.reason : undefined;
+    profilesFallbackSeverity = loaded.usedDefaults
+      ? loaded.severity
+      : undefined;
+    profilesFallbackNotified = false;
+    invalidateEffectiveRoles();
+    // A profile selected in this session may have been deleted/renamed in
+    // another window — fall back to the base roles flow.
+    if (activeProfileName && !getProfile(profilesConfig, activeProfileName)) {
+      activeProfileName = null;
+    }
+    return profilesConfig;
+  }
+
+  /**
+   * Surface a profiles load problem once per load. A MISSING file is the
+   * normal "feature unused" state (info — never notified); only corrupt or
+   * incompatible files warn.
+   */
+  function notifyProfilesFallback(ctx?: ExtensionContext): void {
+    if (!profilesFallbackReason || profilesFallbackNotified) return;
+    profilesFallbackNotified = true;
+    if (profilesFallbackSeverity !== "warning") return;
+    try {
+      ctx?.ui.notify(`Profiles: ${profilesFallbackReason}`, "warning");
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Resolve the session's active profile object (null when none/unknown). */
+  function resolveActiveProfile(): Profile | null {
+    if (!activeProfileName) return null;
+    return getProfile(profilesConfig, activeProfileName) ?? null;
+  }
+
+  /**
+   * The effective roles for THIS session: the file-backed base roles with the
+   * active profile's model overrides applied (see applyProfileOverlay). All
+   * model-RESOLUTION sites read through this; all EDITING sites (/role, role
+   * picker) keep using the base `roleConfig`. With no profile active the
+   * overlay is a shallow copy — behaviour is identical to the roles.json flow.
+   * Cache is keyed by the base config object identity (ensureRoleConfig
+   * reassigns it on file changes) + the active profile name, and invalidated
+   * by ensureProfilesConfig / setActiveProfile.
+   */
+  function effectiveRoles(): Role[] {
+    const base = roleConfig;
+    const profileName = activeProfileName;
+    const cached = effectiveRolesCache;
+    if (cached && cached.base === base && cached.profile === profileName) {
+      return cached.roles;
+    }
+    const roles = applyProfileOverlay(base.roles, resolveActiveProfile());
+    effectiveRolesCache = { base, profile: profileName, roles };
+    return roles;
+  }
+
+  /** getRole over the effective (profile-overlaid) roles. */
+  function getEffectiveRole(name: string): Role | undefined {
+    return getRole({ ...roleConfig, roles: effectiveRoles() }, name);
+  }
+
+  /** Footer label for the active profile ("" when none). */
+  function activeProfileLabel(): string {
+    return activeProfileName ? `⚡ ${activeProfileName}` : "";
+  }
+
+  /**
+   * /role display: the base roles (what /role edits) plus, when a profile is
+   * active, an explicit section naming the profile and its model overrides.
+   * Without a profile this is exactly the plain roles display.
+   */
+  function formatRolesDisplayWithProfile(): string {
+    const base = formatRolesForDisplay(roleConfig);
+    const profile = resolveActiveProfile();
+    if (!profile) return base;
+    const lines: string[] = [
+      base,
+      "",
+      `Active profile: ⚡ ${profile.name}${
+        profile.description ? ` — ${profile.description}` : ""
+      }`,
+    ];
+    for (const roleName of PROFILE_ROLES) {
+      const m = profile.roles[roleName];
+      if (m)
+        lines.push(
+          `  ${roleIcon(roleName)} ${roleName} → ${formatModelRef(m)} (${m.thinking})  (profile override)`,
+        );
+    }
+    lines.push(
+      `  /profile edit ${profile.name} to change the profile • /profile use none to deactivate`,
+    );
+    return lines.join("\n");
+  }
+
+  /** Multi-line notification describing what an activation resolves to. */
+  function profileActivationSummary(name: string): string {
+    const profile = getProfile(profilesConfig, name);
+    if (!profile) return `Profile "${name}" activated.`;
+    const lines = [`Profile ⚡ ${profile.name} activated:`];
+    for (const roleName of PROFILE_ROLES) {
+      const m = profile.roles[roleName];
+      if (m)
+        lines.push(
+          `  ${roleIcon(roleName)} ${roleName} → ${formatModelRef(m)} (${m.thinking})`,
+        );
+    }
+    const missing = missingProfileRoles(profile);
+    if (missing.length) {
+      lines.push(
+        `  ${missing.join(", ")}: base role models (not overridden by this profile)`,
+      );
+    }
+    if (workflowMode) {
+      lines.push(`  Applied to ${workflowMode} mode now; explore/review pick it up on next use.`);
+    } else {
+      lines.push(
+        "  Applies on the next /plan, /build, explore subagent, or review round.",
+      );
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * Activate/deactivate the session's profile. Session-scoped by design — the
+   * state rides the `workflow` session entry (persistState), never a global
+   * file, so two concurrent sessions can run different profiles. When the
+   * session is in plan/build mode the role model is re-applied immediately so
+   * the profile's planner/builder take effect right away; explorer/reviewer
+   * resolution picks the profile up on next subagent/review round.
+   */
+  async function setActiveProfile(
+    ctx: ExtensionContext,
+    name: string | null,
+    opts?: { explicit?: boolean; quiet?: boolean },
+  ): Promise<void> {
+    ensureProfilesConfig((ctx as any)?.cwd);
+    const trimmed = name ? String(name).trim() : null;
+    if (trimmed) {
+      const profile = getProfile(profilesConfig, trimmed);
+      if (!profile) {
+        ctx.ui.notify(
+          `Unknown profile "${trimmed}". Available: ${
+            profilesConfig.profiles.map((p) => p.name).join(", ") ||
+            "(none — /profile create <name>)"
+          }`,
+          "warning",
+        );
+        return;
+      }
+      activeProfileName = profile.name;
+    } else {
+      activeProfileName = null;
+    }
+    profileExplicit = opts?.explicit ?? true;
+    invalidateEffectiveRoles();
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    updateStatus(ctx as any);
+    if (workflowMode) {
+      try {
+        await applyModeModel(ctx as any, { quiet: opts?.quiet });
+      } catch (_e) {
+        void _e;
+      }
+    }
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        activeProfileName
+          ? profileActivationSummary(activeProfileName)
+          : "Profile deactivated — default roles flow active.",
+        "info",
+      );
+    }
+  }
+
   function activeRoleLabel(): string {
     if (roleConfig.activeRole)
       return `${roleIcon(roleConfig.activeRole)} ${roleConfig.activeRole}`;
@@ -623,8 +867,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   function updateStatus(ctx: ExtensionContext) {
+    // Profile prefix (⚡ name) when one is active, then the role label.
+    const profileLabel = activeProfileLabel();
     const roleLabel = activeRoleLabel();
-    const suffix = roleLabel ? ` | ${roleLabel}` : "";
+    const statusParts = [profileLabel, roleLabel].filter(Boolean);
+    const suffix = statusParts.length ? ` | ${statusParts.join(" | ")}` : "";
     // Commit-policy surfacing (workflow.commitPolicy): always visible so the
     // user can see at a glance what the agent may do to git history. Read
     // live so /commit-policy changes show up without a reload.
@@ -719,7 +966,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
   /** Reviewer model label for the mode band (best-effort). */
   function reviewModelLabel(): string {
     ensureRoleConfig(reviewCwd());
-    const r = getRole(roleConfig, REVIEW_ROLE_NAME);
+    ensureProfilesConfig(reviewCwd());
+    const r = getEffectiveRole(REVIEW_ROLE_NAME);
     return r?.model ? formatModelRef(r.model) : "unconfigured";
   }
 
@@ -887,9 +1135,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   ): Promise<string> {
     return (async () => {
       const cwd = reviewCwd();
+      ensureRoleConfig(cwd);
+      ensureProfilesConfig(cwd);
       const agents = discoverAgents(cwd);
       const base = agents.find((a) => a.name === "scout") ?? agents[0];
-      const explorerRole = getRole(roleConfig, "explorer");
+      const explorerRole = getEffectiveRole("explorer");
       const m = explorerRole?.model;
       const agent: AgentConfig = {
         name: base?.name ?? "review-scout",
@@ -927,11 +1177,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       config: () => reviewConfigNow()?.config,
       reviewerModel: () => {
         ensureRoleConfig(cwd);
-        const reviewer = getRole(roleConfig, REVIEW_ROLE_NAME);
+        ensureProfilesConfig(cwd);
+        const reviewer = getEffectiveRole(REVIEW_ROLE_NAME);
         if (reviewer?.model) return reviewer.model;
         // Graceful degradation: fall back to the planner model rather than
         // silently running no review at all.
-        const planner = getRole(roleConfig, "planner");
+        const planner = getEffectiveRole("planner");
         return planner?.model;
       },
       findModel: (provider: string, id: string) =>
@@ -1131,7 +1382,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!sub || sub === "status") {
         const resolved = readReviewModeConfig(cwd, agentDir);
         const c = resolved.config;
-        const model = getRole(roleConfig, REVIEW_ROLE_NAME)?.model;
+        ensureProfilesConfig(cwd);
+        const model = getEffectiveRole(REVIEW_ROLE_NAME)?.model;
         ctx.ui.notify(
           formatReviewStatusLines({
             enabled: c.enabled,
@@ -1507,13 +1759,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (!workflowMode) return false;
     try {
       ensureRoleConfig((ctx as any)?.cwd ?? ctx.cwd);
+      ensureProfilesConfig((ctx as any)?.cwd ?? ctx.cwd);
     } catch (_e) {
       void _e;
     }
-    const resolved = resolveModeModel(roleConfig, workflowMode);
+    // Resolution reads the EFFECTIVE roles (base roles + active profile
+    // overlay); with no profile active this is behaviourally identical to
+    // the base config.
+    const effectiveCfg: RoleConfig = { ...roleConfig, roles: effectiveRoles() };
+    const resolved = resolveModeModel(effectiveCfg, workflowMode);
     if (!resolved) {
-      const targetName = roleConfig.activeRole ?? MODE_ROLE_MAP[workflowMode];
-      const role = targetName ? getRole(roleConfig, targetName) : undefined;
+      const targetName = effectiveCfg.activeRole ?? MODE_ROLE_MAP[workflowMode];
+      const role = targetName ? getRole(effectiveCfg, targetName) : undefined;
       if (targetName && !role) {
         ctx.ui.notify(
           `Workflow ${workflowMode}: role "${targetName}" not found — staying on current model.`,
@@ -1699,6 +1956,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
       awaitingDecisionAt: awaitingDecision ? lastHandoffAt : undefined,
       role: {
         activeRole: roleConfig.activeRole,
+        // Session-scoped profile activation (see setActiveProfile): explicit
+        // picks restore exactly; non-explicit entries re-derive the default.
+        activeProfile: profileExplicit ? activeProfileName : null,
+        profileExplicit,
       },
       defaultModel,
       lastModeSwitch,
@@ -2782,19 +3043,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
           await openRolePicker(ctx as any);
           return;
         }
-        ctx.ui.notify(formatRolesForDisplay(roleConfig), "info");
+        ctx.ui.notify(formatRolesDisplayWithProfile(), "info");
         return;
       }
 
       if (sub === "list" || sub === "show") {
-        ctx.ui.notify(formatRolesForDisplay(roleConfig), "info");
+        ctx.ui.notify(formatRolesDisplayWithProfile(), "info");
         return;
       }
 
       if (sub === "config") {
         if (!(ctx as any)?.hasUI) {
           ctx.ui.notify(
-            formatRolesForDisplay(roleConfig) +
+            formatRolesDisplayWithProfile() +
               "\n\nPicker needs UI — use /role set instead.",
             "info",
           );
@@ -2971,6 +3232,1379 @@ export default function workflowExtension(pi: ExtensionAPI) {
         "Usage: /role (picker) | /role list | /role set <role> <provider/model> [thinking] | /role use <role|auto> | /role add|remove|reset",
         "info",
       );
+    },
+  });
+
+  // ── Model profiles command + management UI ───────────────────────
+  //
+  // A profile is a named combination of role model settings (planner /
+  // explorer / builder / reviewer). Profiles are DEFINED in profiles.json;
+  // ACTIVATION is session-scoped (setActiveProfile) so two concurrent
+  // sessions can run different profiles. /role keeps editing the base roles;
+  // an active profile only overlays models on top (see effectiveRoles()).
+
+  const PROFILE_USAGE =
+    "Usage: /profile (picker) | /profile list | /profile show <name> | " +
+    "/profile use <name|none> | /profile create <name> | /profile edit <name> | " +
+    "/profile rename <old> <new> | /profile delete <name> | " +
+    "/profile default [name|none] [global|project]";
+
+  /** Effective workflow.defaultProfile for display (never throws). */
+  function currentDefaultProfileName(cwd?: string): string | undefined {
+    try {
+      return readDefaultProfileSetting(cwd ?? process.cwd(), getAgentDir())
+        .value;
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
+  /** Seed a new profile from the CURRENT effective roles (base + active profile). */
+  function buildProfileSeed(name: string, description = ""): Profile {
+    const seed: Profile = { name, description, roles: {} };
+    for (const roleName of PROFILE_ROLES) {
+      const m = getEffectiveRole(roleName)?.model;
+      if (m) seed.roles[roleName] = { ...m };
+    }
+    return seed;
+  }
+
+  const listThemeOf = (theme: any) => ({
+    selectedPrefix: (t: string) => theme.fg("accent", t),
+    selectedText: (t: string) => theme.fg("accent", t),
+    description: (t: string) => theme.fg("muted", t),
+    scrollInfo: (t: string) => theme.fg("dim", t),
+    noMatch: (t: string) => theme.fg("warning", t),
+  });
+
+  /** Small confirm overlay (used by /profile delete). True only on explicit Delete. */
+  async function confirmProfileDelete(
+    ctx: ExtensionContext,
+    profile: Profile,
+  ): Promise<boolean> {
+    const result = await ctx.ui.custom<boolean | null>(
+      (tui, theme, _kb, done) => {
+        const list = new SelectList(
+          [
+            {
+              value: "delete",
+              label: `Delete ⚡ ${profile.name}`,
+              description: "remove from profiles.json (cannot be undone)",
+            },
+            {
+              value: "cancel",
+              label: "Cancel",
+              description: "keep the profile",
+            },
+          ],
+          2,
+          listThemeOf(theme),
+        );
+        let cached: string[] | undefined;
+        return {
+          render: (width: number) => {
+            if (cached) return cached;
+            const W = Math.max(1, width);
+            const lines: string[] = [];
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            lines.push(
+              ` ${theme.fg("warning", `Delete profile "${profile.name}"?`)}`,
+            );
+            lines.push("");
+            for (const l of list.render(Math.max(1, W - 2))) lines.push(` ${l}`);
+            lines.push("");
+            lines.push(
+              ` ${theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel")}`,
+            );
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            cached = lines;
+            return lines;
+          },
+          invalidate: () => {
+            cached = undefined;
+          },
+          handleInput: (data: string) => {
+            if (matchesKey(data, Key.escape)) {
+              done(null);
+              return;
+            }
+            if (matchesKey(data, Key.enter)) {
+              done(list.getSelectedItem()?.value === "delete");
+              return;
+            }
+            list.handleInput(data);
+            cached = undefined;
+            tui.requestRender();
+          },
+        };
+      },
+    );
+    return result === true;
+  }
+
+  /**
+   * Free-text profile name entry (Editor overlay, same input pattern as the
+   * questionnaire). Resolves the validated name, or null on cancel/invalid-Esc.
+   */
+  async function inputProfileName(
+    ctx: ExtensionContext,
+    opts: {
+      title: string;
+      initial?: string;
+      /** Names that would collide (case-insensitive), minus any being renamed. */
+      existing?: readonly string[];
+    },
+  ): Promise<string | null> {
+    return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      const editorTheme: EditorTheme = {
+        borderColor: (s) => theme.fg("accent", s),
+        selectList: {
+          selectedPrefix: (t: string) => theme.fg("accent", t),
+          selectedText: (t: string) => theme.fg("accent", t),
+          description: (t: string) => theme.fg("muted", t),
+          scrollInfo: (t: string) => theme.fg("dim", t),
+          noMatch: (t: string) => theme.fg("warning", t),
+        },
+      };
+      const editor = new Editor(tui, editorTheme);
+      if (opts.initial) editor.setText(opts.initial);
+      let error = "";
+      let cached: string[] | undefined;
+      editor.onSubmit = (value: string) => {
+        const check = validateProfileName(String(value ?? ""), opts.existing);
+        if (!check.ok) {
+          error = check.error;
+          cached = undefined;
+          tui.requestRender();
+          return;
+        }
+        done(check.value);
+      };
+      return {
+        render: (width: number) => {
+          if (cached) return cached;
+          const W = Math.max(1, width);
+          const lines: string[] = [];
+          lines.push(theme.fg("accent", "─".repeat(W)));
+          lines.push(
+            ...wrapTextWithAnsi(` ${theme.fg("text", opts.title)}`, W),
+          );
+          if (error)
+            lines.push(
+              ...wrapTextWithAnsi(` ${theme.fg("warning", error)}`, W),
+            );
+          lines.push("");
+          for (const l of editor.render(Math.max(1, W))) lines.push(l);
+          lines.push("");
+          lines.push(` ${theme.fg("dim", "Enter confirm • Esc cancel")}`);
+          lines.push(theme.fg("accent", "─".repeat(W)));
+          cached = lines;
+          return lines;
+        },
+        invalidate: () => {
+          cached = undefined;
+        },
+        handleInput: (data: string) => {
+          if (matchesKey(data, Key.escape)) {
+            done(null);
+            return;
+          }
+          editor.handleInput(data);
+          cached = undefined;
+          tui.requestRender();
+        },
+      };
+    });
+  }
+
+  /**
+   * Profile management picker: activate / none / new / per-profile actions
+   * (edit, rename, delete) and the default-profile entry. Loops so actions
+   * return to the list; every action handles its own persistence.
+   */
+  async function openProfilePicker(ctx: ExtensionContext): Promise<void> {
+    ensureProfilesConfig((ctx as any)?.cwd);
+    ensureRoleConfig((ctx as any)?.cwd);
+    while (true) {
+      const profiles = profilesConfig.profiles;
+      const def = currentDefaultProfileName((ctx as any)?.cwd);
+      const entries: SelectItem[] = [];
+      entries.push({
+        value: "none",
+        label: activeProfileName
+          ? "— none (default roles) —"
+          : "● — none (default roles) —",
+        description: "deactivate any profile; the roles.json flow applies",
+      });
+      for (const p of profiles) {
+        const isActive =
+          activeProfileName?.toLowerCase() === p.name.toLowerCase();
+        const isDefault = def?.toLowerCase() === p.name.toLowerCase();
+        const markers = [
+          isActive ? "● active" : "",
+          isDefault ? "★ default" : "",
+        ]
+          .filter(Boolean)
+          .join(", ");
+        const modelSummary = PROFILE_ROLES.map((r) => {
+          const m = p.roles[r];
+          return m ? `${roleIcon(r)} ${formatModelRef(m)}` : null;
+        })
+          .filter(Boolean)
+          .join(" · ");
+        entries.push({
+          value: p.name,
+          label: `⚡ ${p.name}${markers ? `  (${markers})` : ""}`,
+          description: p.description || modelSummary || undefined,
+        });
+      }
+      entries.push({
+        value: "__new",
+        label: "＋ New profile…",
+        description: "name it, then pick a model per role (like /role)",
+      });
+      entries.push({
+        value: "__default",
+        label: "Default for new sessions…",
+        description: `workflow.defaultProfile — currently: ${def ?? "(none)"}`,
+      });
+
+      const selected = await ctx.ui.custom<string | null>(
+        (tui, theme, _kb, done) => {
+          const list = new SelectList(entries, 10, listThemeOf(theme));
+          let cached: string[] | undefined;
+          return {
+            render: (width: number) => {
+              if (cached) return cached;
+              const W = Math.max(1, width);
+              const lines: string[] = [];
+              lines.push(theme.fg("accent", "─".repeat(W)));
+              lines.push(
+                ` ${theme.fg("text", "Model Profiles")} ${theme.fg(
+                  "muted",
+                  `— active: ${activeProfileName ?? "none (default roles)"}`,
+                )}`,
+              );
+              lines.push("");
+              for (const l of list.render(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+              lines.push("");
+              lines.push(
+                ` ${theme.fg("dim", "Enter: select/action • type to filter • Esc close")}`,
+              );
+              lines.push(theme.fg("accent", "─".repeat(W)));
+              cached = lines;
+              return lines;
+            },
+            invalidate: () => {
+              cached = undefined;
+            },
+            handleInput: (data: string) => {
+              if (matchesKey(data, Key.escape)) {
+                done(null);
+                return;
+              }
+              if (matchesKey(data, Key.enter)) {
+                done(list.getSelectedItem()?.value ?? null);
+                return;
+              }
+              list.handleInput(data);
+              cached = undefined;
+              tui.requestRender();
+            },
+          };
+        },
+      );
+      if (!selected) return; // Esc / closed
+      if (selected === "__new") {
+        const name = await inputProfileName(ctx, {
+          title: "New profile — name (dashes, no spaces):",
+          existing: profilesConfig.profiles.map((p) => p.name),
+        });
+        if (!name) continue;
+        await openProfileEditor(ctx, { createName: name });
+        continue;
+      }
+      if (selected === "__default") {
+        await pickDefaultProfile(ctx);
+        continue;
+      }
+      if (selected === "none") {
+        if (activeProfileName) {
+          await setActiveProfile(ctx as any, null, { explicit: true });
+        } else {
+          ctx.ui.notify("No profile active — default roles flow.", "info");
+        }
+        continue;
+      }
+      // A concrete profile → action menu
+      const profile = getProfile(profilesConfig, selected);
+      if (!profile) continue;
+      const action = await ctx.ui.custom<string | null>(
+        (tui, theme, _kb, done) => {
+          const isActive =
+            activeProfileName?.toLowerCase() === profile.name.toLowerCase();
+          const list = new SelectList(
+            [
+              isActive
+                ? {
+                    value: "deactivate",
+                    label: "Deactivate",
+                    description: "back to default roles (this session)",
+                  }
+                : {
+                    value: "activate",
+                    label: "Activate now",
+                    description:
+                      "session-scoped; plan/build re-apply immediately",
+                  },
+              {
+                value: "edit",
+                label: "Edit models",
+                description: "tabbed editor — model + thinking per role",
+              },
+              {
+                value: "rename",
+                label: "Rename",
+                description: "change the profile name",
+              },
+              {
+                value: "delete",
+                label: "Delete",
+                description: "remove from profiles.json",
+              },
+              { value: "back", label: "Back", description: "return to the profile list" },
+            ],
+            5,
+            listThemeOf(theme),
+          );
+          let cached: string[] | undefined;
+          return {
+            render: (width: number) => {
+              if (cached) return cached;
+              const W = Math.max(1, width);
+              const lines: string[] = [];
+              lines.push(theme.fg("accent", "─".repeat(W)));
+              lines.push(
+                ` ${theme.fg("text", `⚡ ${profile.name}`)}${
+                  profile.description
+                    ? theme.fg("muted", ` — ${profile.description}`)
+                    : ""
+                }`,
+              );
+              lines.push("");
+              for (const l of list.render(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+              lines.push("");
+              lines.push(` ${theme.fg("dim", "Enter select • Esc back")}`);
+              lines.push(theme.fg("accent", "─".repeat(W)));
+              cached = lines;
+              return lines;
+            },
+            invalidate: () => {
+              cached = undefined;
+            },
+            handleInput: (data: string) => {
+              if (matchesKey(data, Key.escape)) {
+                done(null);
+                return;
+              }
+              if (matchesKey(data, Key.enter)) {
+                done(list.getSelectedItem()?.value ?? null);
+                return;
+              }
+              list.handleInput(data);
+              cached = undefined;
+              tui.requestRender();
+            },
+          };
+        },
+      );
+      if (!action || action === "back") continue;
+      if (action === "activate") {
+        await setActiveProfile(ctx as any, profile.name, { explicit: true });
+        continue;
+      }
+      if (action === "deactivate") {
+        await setActiveProfile(ctx as any, null, { explicit: true });
+        continue;
+      }
+      if (action === "edit") {
+        await openProfileEditor(ctx, { name: profile.name });
+        continue;
+      }
+      if (action === "rename") {
+        const newName = await inputProfileName(ctx, {
+          title: `Rename profile "${profile.name}" to:`,
+          initial: profile.name,
+          existing: profilesConfig.profiles
+            .filter((p) => p !== profile)
+            .map((p) => p.name),
+        });
+        if (newName && newName !== profile.name) {
+          const wasActive =
+            activeProfileName?.toLowerCase() === profile.name.toLowerCase();
+          profile.name = newName;
+          if (wasActive) activeProfileName = profile.name;
+          invalidateEffectiveRoles();
+          try {
+            saveProfiles(profilesConfig, "user");
+            ctx.ui.notify(`Profile renamed → ⚡ ${profile.name}.`, "info");
+          } catch (e: any) {
+            ctx.ui.notify(
+              `Renamed in memory but file save failed: ${String(e?.message || e)}`,
+              "warning",
+            );
+          }
+          updateStatus(ctx as any);
+        }
+        continue;
+      }
+      if (action === "delete") {
+        const confirmed = await confirmProfileDelete(ctx, profile);
+        if (!confirmed) continue;
+        const wasActive =
+          activeProfileName?.toLowerCase() === profile.name.toLowerCase();
+        profilesConfig.profiles = profilesConfig.profiles.filter(
+          (p) => p !== profile,
+        );
+        if (wasActive) {
+          activeProfileName = null;
+          invalidateEffectiveRoles();
+        }
+        try {
+          saveProfiles(profilesConfig, "user");
+          ctx.ui.notify(
+            `Profile ⚡ ${profile.name} deleted.${
+              wasActive
+                ? " It was active — default roles flow restored."
+                : ""
+            }`,
+            "info",
+          );
+        } catch (e: any) {
+          ctx.ui.notify(
+            `Deleted in memory but file save failed: ${String(e?.message || e)}`,
+            "warning",
+          );
+        }
+        if (wasActive && workflowMode) {
+          try {
+            await applyModeModel(ctx as any);
+          } catch (_e) {
+            void _e;
+          }
+        }
+        updateStatus(ctx as any);
+        continue;
+      }
+    }
+  }
+
+  /** Picker for the default profile (workflow.defaultProfile) + its scope. */
+  async function pickDefaultProfile(ctx: ExtensionContext): Promise<void> {
+    const cwd = (ctx as any)?.cwd as string | undefined;
+    const current = currentDefaultProfileName(cwd);
+    const entries: SelectItem[] = [
+      {
+        value: "__none",
+        label: "— none —",
+        description: "new sessions start without a profile",
+      },
+      ...profilesConfig.profiles.map((p) => ({
+        value: p.name,
+        label: `⚡ ${p.name}`,
+        description: p.description || undefined,
+      })),
+    ];
+    const name = await ctx.ui.custom<string | null>(
+      (tui, theme, _kb, done) => {
+        const list = new SelectList(entries, 8, listThemeOf(theme));
+        let cached: string[] | undefined;
+        return {
+          render: (width: number) => {
+            if (cached) return cached;
+            const W = Math.max(1, width);
+            const lines: string[] = [];
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            lines.push(
+              ` ${theme.fg("text", "Default profile for new sessions")} ${theme.fg(
+                "muted",
+                `— currently: ${current ?? "(none)"}`,
+              )}`,
+            );
+            lines.push("");
+            for (const l of list.render(Math.max(1, W - 2)))
+              lines.push(` ${l}`);
+            lines.push("");
+            lines.push(` ${theme.fg("dim", "Enter select • Esc cancel")}`);
+            lines.push(theme.fg("accent", "─".repeat(W)));
+            cached = lines;
+            return lines;
+          },
+          invalidate: () => {
+            cached = undefined;
+          },
+          handleInput: (data: string) => {
+            if (matchesKey(data, Key.escape)) {
+              done(null);
+              return;
+            }
+            if (matchesKey(data, Key.enter)) {
+              done(list.getSelectedItem()?.value ?? null);
+              return;
+            }
+            list.handleInput(data);
+            cached = undefined;
+            tui.requestRender();
+          },
+        };
+      },
+    );
+    if (name === null) return;
+    // Keep the scope where the setting currently lives (else global).
+    const resolved = readDefaultProfileSetting(
+      cwd ?? process.cwd(),
+      getAgentDir(),
+    );
+    const scope: "global" | "project" =
+      resolved.sources.effective === "project" ? "project" : "global";
+    const value = name === "__none" ? null : name;
+    const res = writeDefaultProfileSetting(
+      scope,
+      cwd ?? process.cwd(),
+      getAgentDir(),
+      value,
+    );
+    if (!res.ok) {
+      ctx.ui.notify(
+        `Could not write default profile: ${res.error ?? "unknown error"}`,
+        "error",
+      );
+      return;
+    }
+    ctx.ui.notify(
+      value
+        ? `Default profile → ⚡ ${value} (${scope} settings)\nNew sessions without an explicit /profile use start on it.`
+        : `Default profile cleared (${scope} settings).`,
+      "info",
+    );
+    updateStatus(ctx as any);
+  }
+
+  interface StagedProfileModel {
+    provider: string;
+    id: string;
+    thinking: ThinkingLevel;
+  }
+
+  /**
+   * Tabbed profile editor — one tab per built-in role (planner / explorer /
+   * builder / reviewer, mirroring /role) plus two submit tabs: Save &
+   * activate and Save only. Selections stage locally; saving writes
+   * profiles.json (user scope). `createName` creates a new profile seeded
+   * from the current effective roles; `name` edits an existing one.
+   */
+  async function openProfileEditor(
+    ctx: ExtensionContext,
+    opts: { createName?: string; name?: string },
+  ): Promise<void> {
+    ensureProfilesConfig((ctx as any)?.cwd);
+    ensureRoleConfig((ctx as any)?.cwd);
+    const catalog = collectRoleCatalog(ctx);
+    if (catalog.all.length === 0) {
+      ctx.ui.notify(
+        "No models available from connected providers — connect a provider first.",
+        "warning",
+      );
+      return;
+    }
+    const existing = opts.name
+      ? getProfile(profilesConfig, opts.name)
+      : undefined;
+    if (opts.name && !existing) {
+      ctx.ui.notify(`Profile "${opts.name}" no longer exists.`, "warning");
+      return;
+    }
+    const isNew = !existing;
+    const profileName = existing
+      ? existing.name
+      : (opts.createName ?? "").trim();
+    if (!profileName) {
+      ctx.ui.notify("Profile name required.", "warning");
+      return;
+    }
+    const roleMeta = new Map<string, { name: string; description: string }>();
+    for (const roleName of PROFILE_ROLES) {
+      const base = getRole(roleConfig, roleName);
+      roleMeta.set(roleName, {
+        name: roleName,
+        description: base?.description ?? `Role ${roleName}`,
+      });
+    }
+    // Keep the narrow tuple type so profile.roles[roleName] typechecks.
+    const tabIds = [...PROFILE_ROLES];
+    // Stage from the profile (edit) or the current effective roles (create).
+    const staged = new Map<string, StagedProfileModel>();
+    for (const roleName of PROFILE_ROLES) {
+      const src =
+        existing?.roles[roleName] ?? getEffectiveRole(roleName)?.model;
+      staged.set(roleName, {
+        provider: src?.provider ?? "",
+        id: src?.id ?? "",
+        thinking: src?.thinking ?? "medium",
+      });
+    }
+
+    overlayActive = true;
+    let saved: {
+      activate: boolean;
+      staged: Map<string, StagedProfileModel>;
+    } | null = null;
+    try {
+      saved = await ctx.ui.custom<
+        { activate: boolean; staged: Map<string, StagedProfileModel> } | null
+      >((tui, theme, _kb, done) => {
+        let currentTab = 0;
+        let phase: "model" | "thinking" = "model";
+        let showAll = catalog.scoped.length === 0;
+        let cached: string[] | undefined;
+        const themeList = listThemeOf(theme);
+        const isSubmitTab = () => currentTab >= tabIds.length;
+        const isSaveActivate = () => currentTab === tabIds.length;
+        const buildModelItems = (roleName: string): SelectItem[] => {
+          const st = staged.get(roleName)!;
+          const cur = `${st.provider}/${st.id}`;
+          const src = showAll ? catalog.all : catalog.scoped;
+          return src.map((e) => {
+            const ref = `${e.provider}/${e.id}`;
+            const description: string | undefined =
+              ref === cur
+                ? "● selected"
+                : showAll && !e.inScope
+                  ? "all"
+                  : undefined;
+            return { value: ref, label: ref, description };
+          });
+        };
+        const modelLists = new Map<string, SelectList>();
+        const thinkingList = new SelectList(
+          VALID_THINKING_LEVELS.map((t) => ({ value: t, label: t })),
+          Math.min(VALID_THINKING_LEVELS.length, 8),
+          themeList,
+        );
+        const getModelList = (roleName: string): SelectList => {
+          let list = modelLists.get(roleName);
+          if (!list) {
+            list = new SelectList(buildModelItems(roleName), 10, themeList);
+            const st = staged.get(roleName)!;
+            const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
+              (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
+            );
+            if (idx > 0) list.setSelectedIndex(idx);
+            modelLists.set(roleName, list);
+          }
+          return list;
+        };
+        const rebuildModelLists = () => modelLists.clear();
+        const syncThinkingCursor = (roleName: string) => {
+          const st = staged.get(roleName)!;
+          const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
+          if (idx >= 0) thinkingList.setSelectedIndex(idx);
+        };
+        const commitModelSelection = (roleName: string) => {
+          const sel = getModelList(roleName).getSelectedItem();
+          if (!sel) return false;
+          const { provider, id } = parseModelRef(sel.value);
+          if (!provider || !id) return false;
+          const st = staged.get(roleName)!;
+          staged.set(roleName, { ...st, provider, id });
+          return true;
+        };
+        const commitThinkingSelection = (roleName: string) => {
+          const sel = thinkingList.getSelectedItem();
+          if (!sel || !isValidThinkingLevel(sel.value)) return false;
+          const st = staged.get(roleName)!;
+          staged.set(roleName, { ...st, thinking: sel.value });
+          return true;
+        };
+        const advanceFromThinking = () => {
+          if (currentTab < tabIds.length) currentTab++;
+          phase = "model";
+          cached = undefined;
+          tui.requestRender();
+        };
+
+        const handleInput = (data: string) => {
+          if (matchesKey(data, Key.escape)) {
+            if (phase === "thinking" && !isSubmitTab()) {
+              phase = "model";
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+            done(null);
+            return;
+          }
+          if (
+            matchesKey(data, Key.tab) ||
+            matchesKey(data, Key.right) ||
+            matchesKey(data, Key.shift("tab")) ||
+            matchesKey(data, Key.left)
+          ) {
+            const fwd =
+              matchesKey(data, Key.tab) || matchesKey(data, Key.right);
+            const n = tabIds.length + 2;
+            currentTab = fwd
+              ? (currentTab + 1) % n
+              : (currentTab - 1 + n) % n;
+            phase = "model";
+            cached = undefined;
+            tui.requestRender();
+            return;
+          }
+          // Ctrl+O toggles scoped ↔ all models
+          try {
+            if (matchesKey(data, Key.ctrl("o"))) {
+              showAll = !showAll;
+              rebuildModelLists();
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+          } catch (_e) {
+            void _e;
+          }
+          if (isSubmitTab()) {
+            if (matchesKey(data, Key.enter)) {
+              done({ activate: isSaveActivate(), staged: new Map(staged) });
+            }
+            return;
+          }
+          const roleName = tabIds[currentTab];
+          if (matchesKey(data, Key.enter)) {
+            if (phase === "model") {
+              if (!commitModelSelection(roleName)) return;
+              phase = "thinking";
+              syncThinkingCursor(roleName);
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+            if (!commitThinkingSelection(roleName)) return;
+            advanceFromThinking();
+            return;
+          }
+          if (phase === "model") getModelList(roleName).handleInput(data);
+          else thinkingList.handleInput(data);
+          cached = undefined;
+          tui.requestRender();
+        };
+
+        const render = (width: number): string[] => {
+          if (cached) return cached;
+          const lines: string[] = [];
+          const W = Math.max(1, width);
+          const wrap = (s: string) => {
+            const out: string[] = [];
+            for (const line of s.split("\n"))
+              out.push(...wrapTextWithAnsi(line, W));
+            return out;
+          };
+          lines.push(theme.fg("accent", "─".repeat(W)));
+          lines.push(
+            ` ${theme.fg(
+              "text",
+              `${isNew ? "New profile" : "Edit profile"} ⚡ ${profileName}`,
+            )}`,
+          );
+          lines.push("");
+          // Tabs row: one block per role + two submit tabs
+          const chips: string[] = [];
+          for (let i = 0; i < tabIds.length; i++) {
+            const roleName = tabIds[i];
+            const st = staged.get(roleName)!;
+            const base = existing?.roles[roleName];
+            const dirty =
+              !base ||
+              `${st.provider}/${st.id}` !== `${base.provider}/${base.id}` ||
+              st.thinking !== base.thinking;
+            const box = dirty ? "■" : "□";
+            const lbl = ` ${box} ${roleIcon(roleName)} ${roleName} `;
+            chips.push(
+              i === currentTab
+                ? theme.bg("selectedBg", theme.fg("text", lbl))
+                : theme.fg(dirty ? "success" : "muted", lbl),
+            );
+          }
+          const saveActivateLbl = " ✓ Save & activate ";
+          const saveOnlyLbl = " 💾 Save only ";
+          chips.push(
+            isSaveActivate()
+              ? theme.bg("selectedBg", theme.fg("text", saveActivateLbl))
+              : theme.fg("success", saveActivateLbl),
+          );
+          chips.push(
+            currentTab === tabIds.length + 1
+              ? theme.bg("selectedBg", theme.fg("text", saveOnlyLbl))
+              : theme.fg("success", saveOnlyLbl),
+          );
+          lines.push(` ${chips.join("")}`);
+          lines.push("");
+          if (isSubmitTab()) {
+            lines.push(
+              ...wrap(
+                ` ${theme.fg(
+                  "text",
+                  isSaveActivate()
+                    ? "Save & activate — Enter saves and switches this session to the profile; Esc cancels"
+                    : "Save only — Enter saves without activating; Esc cancels",
+                )}`,
+              ),
+            );
+            lines.push("");
+            for (const roleName of tabIds) {
+              const st = staged.get(roleName)!;
+              lines.push(
+                ...wrap(
+                  `  ${theme.fg("muted", `${roleIcon(roleName)} ${roleName}: `)}${theme.fg(
+                    "text",
+                    st.provider
+                      ? `${st.provider}/${st.id} (${st.thinking})`
+                      : "(unset)",
+                  )}`,
+                ),
+              );
+            }
+          } else {
+            const roleName = tabIds[currentTab];
+            const st = staged.get(roleName)!;
+            const meta = roleMeta.get(roleName)!;
+            lines.push(
+              ...wrap(
+                ` ${theme.fg("text", `${roleIcon(roleName)} ${roleName} — ${meta.description}`)}`,
+              ),
+            );
+            lines.push(
+              ...wrap(
+                ` ${theme.fg(
+                  "muted",
+                  `staged: ${
+                    st.provider
+                      ? `${st.provider}/${st.id} (${st.thinking})`
+                      : "(unset)"
+                  }`,
+                )}`,
+              ),
+            );
+            lines.push("");
+            if (phase === "model") {
+              const scopeLabel = showAll
+                ? `all ${String(catalog.all.length)}${catalog.truncated ? "+" : ""}`
+                : `scoped ${String(catalog.scoped.length)}`;
+              const toggleHint =
+                catalog.scoped.length > 0 && !showAll
+                  ? " — Ctrl+O for all"
+                  : "";
+              lines.push(
+                ...wrap(
+                  ` ${theme.fg(
+                    "accent",
+                    `Model (${scopeLabel}${toggleHint}) — type to filter:`,
+                  )}`,
+                ),
+              );
+              for (const l of getModelList(roleName).render(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+            } else {
+              lines.push(
+                ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
+              );
+              for (const l of thinkingList.render(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+            }
+          }
+          lines.push("");
+          lines.push(
+            ...wrap(
+              ` ${theme.fg(
+                "dim",
+                "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+              )}`,
+            ),
+          );
+          lines.push(theme.fg("accent", "─".repeat(W)));
+          cached = lines;
+          return lines;
+        };
+
+        return {
+          render,
+          invalidate: () => {
+            cached = undefined;
+          },
+          handleInput,
+        };
+      });
+    } finally {
+      overlayActive = false;
+    }
+    if (!saved) {
+      ctx.ui.notify(
+        isNew ? "Profile creation cancelled." : "Profile editor cancelled.",
+        "info",
+      );
+      return;
+    }
+    // Validate against registry (warn-only, matching /role set).
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      if (reg && typeof reg.find === "function") {
+        for (const [roleName, st] of saved.staged) {
+          if (
+            st.provider &&
+            st.id &&
+            typeof reg.find === "function" &&
+            !reg.find(st.provider, st.id)
+          )
+            ctx.ui.notify(
+              `Warning: ${st.provider}/${st.id} (${roleName}) not in model registry — saved anyway.`,
+              "warning",
+            );
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
+    // Materialize: create or update the profile, then persist.
+    let profile = existing;
+    if (!profile) {
+      profile = { name: profileName, description: "", roles: {} };
+      profilesConfig.profiles.push(profile);
+    }
+    profile.roles = {};
+    for (const roleName of PROFILE_ROLES) {
+      const st = saved.staged.get(roleName);
+      if (st && st.provider && st.id)
+        profile.roles[roleName] = {
+          provider: st.provider,
+          id: st.id,
+          thinking: st.thinking,
+        };
+    }
+    try {
+      saveProfiles(profilesConfig, "user");
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Profile updated but file save failed: ${String(e?.message || e)}`,
+        "warning",
+      );
+      return;
+    }
+    invalidateEffectiveRoles();
+    updateStatus(ctx as any);
+    if (saved.activate) {
+      await setActiveProfile(ctx as any, profile.name, { explicit: true });
+    } else {
+      ctx.ui.notify(
+        `Profile ⚡ ${profile.name} saved. Activate with /profile use ${profile.name}.`,
+        "info",
+      );
+    }
+  }
+
+  // ── Model profiles command ───────────────────────────────────────
+
+  pi.registerCommand("profile", {
+    description:
+      "Switch or manage model profiles (named role-model combinations) — opens picker UI",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd as string | undefined;
+      ensureRoleConfig(cwd);
+      ensureProfilesConfig(cwd);
+      const parts = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (parts[0] || "").toLowerCase();
+      const rest = parts.slice(1);
+
+      const persistAndNotify = (msg: string): boolean => {
+        try {
+          saveProfiles(profilesConfig, "user");
+        } catch (e: any) {
+          ctx.ui.notify(
+            `Profile updated but file save failed: ${String(e?.message || e)}`,
+            "warning",
+          );
+          return false;
+        }
+        invalidateEffectiveRoles();
+        updateStatus(ctx as any);
+        ctx.ui.notify(msg, "info");
+        return true;
+      };
+
+      // Bare /profile → picker UI (headless → text summary).
+      if (!sub) {
+        if ((ctx as any)?.hasUI) {
+          await openProfilePicker(ctx as any);
+          return;
+        }
+        ctx.ui.notify(
+          formatProfilesForDisplay(
+            profilesConfig,
+            activeProfileName,
+            currentDefaultProfileName(cwd),
+          ),
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "list" || (sub === "show" && !rest[0])) {
+        ctx.ui.notify(
+          formatProfilesForDisplay(
+            profilesConfig,
+            activeProfileName,
+            currentDefaultProfileName(cwd),
+          ),
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "show") {
+        const p = getProfile(profilesConfig, rest[0]);
+        if (!p) {
+          ctx.ui.notify(`Unknown profile "${rest[0]}".`, "warning");
+          return;
+        }
+        ctx.ui.notify(describeProfile(p), "info");
+        return;
+      }
+
+      if (sub === "use" || sub === "activate") {
+        const name = rest[0];
+        if (
+          !name ||
+          (name.toLowerCase() !== "none" &&
+            name.toLowerCase() !== "off" &&
+            !getProfile(profilesConfig, name))
+        ) {
+          ctx.ui.notify(
+            `Usage: /profile use <name|none>. Available: ${
+              profilesConfig.profiles.map((p) => p.name).join(", ") ||
+              "(none — /profile create <name>)"
+            }`,
+            "info",
+          );
+          return;
+        }
+        await setActiveProfile(
+          ctx as any,
+          name.toLowerCase() === "none" || name.toLowerCase() === "off"
+            ? null
+            : name,
+          { explicit: true },
+        );
+        return;
+      }
+
+      if (sub === "create" || sub === "new" || sub === "add") {
+        const rawName = rest[0];
+        if (!rawName) {
+          ctx.ui.notify("Usage: /profile create <name>", "info");
+          return;
+        }
+        const check = validateProfileName(
+          rawName,
+          profilesConfig.profiles.map((p) => p.name),
+        );
+        if (!check.ok) {
+          ctx.ui.notify(`Cannot create profile: ${check.error}`, "warning");
+          return;
+        }
+        if ((ctx as any)?.hasUI) {
+          await openProfileEditor(ctx as any, { createName: check.value });
+          return;
+        }
+        // Headless: create seeded from the current effective roles.
+        const seed = buildProfileSeed(check.value);
+        profilesConfig.profiles.push(seed);
+        persistAndNotify(
+          `Profile ⚡ ${seed.name} created (seeded from the current effective models). Activate with /profile use ${seed.name}.`,
+        );
+        return;
+      }
+
+      if (sub === "edit" || sub === "config") {
+        const name = rest[0];
+        if (!name) {
+          ctx.ui.notify("Usage: /profile edit <name>", "info");
+          return;
+        }
+        const p = getProfile(profilesConfig, name);
+        if (!p) {
+          ctx.ui.notify(
+            `Unknown profile "${name}". Available: ${
+              profilesConfig.profiles.map((q) => q.name).join(", ") || "(none)"
+            }`,
+            "warning",
+          );
+          return;
+        }
+        if (!(ctx as any)?.hasUI) {
+          ctx.ui.notify(describeProfile(p) + "\n\nEditor needs UI.", "info");
+          return;
+        }
+        await openProfileEditor(ctx as any, { name: p.name });
+        return;
+      }
+
+      if (sub === "rename" || sub === "mv") {
+        const [oldName, newName] = rest;
+        if (!oldName || !newName) {
+          ctx.ui.notify("Usage: /profile rename <old> <new>", "info");
+          return;
+        }
+        const p = getProfile(profilesConfig, oldName);
+        if (!p) {
+          ctx.ui.notify(`Unknown profile "${oldName}".`, "warning");
+          return;
+        }
+        const check = validateProfileName(
+          newName,
+          profilesConfig.profiles
+            .filter((q) => q !== p)
+            .map((q) => q.name),
+        );
+        if (!check.ok) {
+          ctx.ui.notify(`Cannot rename: ${check.error}`, "warning");
+          return;
+        }
+        const wasActive =
+          activeProfileName?.toLowerCase() === p.name.toLowerCase();
+        p.name = check.value;
+        if (wasActive) activeProfileName = p.name;
+        invalidateEffectiveRoles();
+        persistAndNotify(
+          `Profile renamed → ⚡ ${p.name}${
+            wasActive ? " (still active in this session)" : ""
+          }`,
+        );
+        const def = readDefaultProfileSetting(
+          cwd ?? process.cwd(),
+          getAgentDir(),
+        );
+        if (def.value && def.value.toLowerCase() === oldName.toLowerCase()) {
+          ctx.ui.notify(
+            `workflow.defaultProfile still points at "${def.value}" — update with /profile default ${p.name}${
+              def.sources.effective === "project" ? " project" : ""
+            }`,
+            "warning",
+          );
+        }
+        return;
+      }
+
+      if (sub === "delete" || sub === "remove" || sub === "rm") {
+        const name = rest[0];
+        if (!name) {
+          ctx.ui.notify("Usage: /profile delete <name>", "info");
+          return;
+        }
+        const p = getProfile(profilesConfig, name);
+        if (!p) {
+          ctx.ui.notify(`Unknown profile "${name}".`, "warning");
+          return;
+        }
+        if ((ctx as any)?.hasUI) {
+          const confirmed = await confirmProfileDelete(ctx as any, p);
+          if (!confirmed) {
+            ctx.ui.notify("Deletion cancelled.", "info");
+            return;
+          }
+        }
+        const wasActive =
+          activeProfileName?.toLowerCase() === p.name.toLowerCase();
+        profilesConfig.profiles = profilesConfig.profiles.filter(
+          (q) => q !== p,
+        );
+        if (wasActive) {
+          activeProfileName = null;
+          invalidateEffectiveRoles();
+        }
+        const savedOk = persistAndNotify(
+          `Profile ⚡ ${p.name} deleted.${
+            wasActive ? " It was active — default roles flow restored." : ""
+          }`,
+        );
+        if (savedOk && wasActive && workflowMode) {
+          try {
+            await applyModeModel(ctx as any);
+            updateStatus(ctx as any);
+          } catch (_e) {
+            void _e;
+          }
+        }
+        return;
+      }
+
+      if (sub === "default") {
+        // /profile default [name|none] [global|project]
+        const target = rest.find(
+          (t) => t.toLowerCase() !== "global" && t.toLowerCase() !== "project",
+        );
+        const scope: "global" | "project" = rest
+          .map((t) => t.toLowerCase())
+          .includes("project")
+          ? "project"
+          : "global";
+        const paths = defaultProfileSettingPaths(
+          cwd ?? process.cwd(),
+          getAgentDir(),
+        );
+        if (!target) {
+          const resolved = readDefaultProfileSetting(
+            cwd ?? process.cwd(),
+            getAgentDir(),
+          );
+          ctx.ui.notify(
+            [
+              `Default profile (workflow.defaultProfile): ${
+                resolved.value ?? "(none)"
+              } (${resolved.sources.effective})`,
+              `Global settings: ${paths.global}`,
+              `Project settings: ${paths.project}`,
+              "New sessions without an explicit /profile use start on the default profile.",
+              "Usage: /profile default <name|none> [global|project]",
+            ].join("\n"),
+            "info",
+          );
+          return;
+        }
+        const value =
+          target.toLowerCase() === "none" || target.toLowerCase() === "off"
+            ? null
+            : target;
+        if (value && !getProfile(profilesConfig, value)) {
+          ctx.ui.notify(
+            `Unknown profile "${value}". Available: ${
+              profilesConfig.profiles.map((q) => q.name).join(", ") || "(none)"
+            }`,
+            "warning",
+          );
+          return;
+        }
+        const res = writeDefaultProfileSetting(
+          scope,
+          cwd ?? process.cwd(),
+          getAgentDir(),
+          value,
+        );
+        if (!res.ok) {
+          ctx.ui.notify(
+            `Could not write default profile: ${res.error ?? "unknown error"}`,
+            "error",
+          );
+          return;
+        }
+        ctx.ui.notify(
+          value
+            ? `Default profile → ⚡ ${value} (${scope} settings)\nNew sessions without an explicit /profile use start on it.`
+            : `Default profile cleared (${scope} settings).`,
+          "info",
+        );
+        updateStatus(ctx as any);
+        return;
+      }
+
+      // Bare profile name → show detail (mirrors /role <name>).
+      const named = getProfile(profilesConfig, sub);
+      if (named) {
+        ctx.ui.notify(describeProfile(named), "info");
+        return;
+      }
+      ctx.ui.notify(PROFILE_USAGE, "info");
+    },
+    getArgumentCompletions: (prefix: string) => {
+      ensureProfilesConfig();
+      const subs = [
+        { value: "list", label: "list", description: "show all profiles" },
+        {
+          value: "use",
+          label: "use <name|none>",
+          description: "activate/deactivate for this session",
+        },
+        {
+          value: "create",
+          label: "create <name>",
+          description: "create a profile (seeded from current models)",
+        },
+        {
+          value: "edit",
+          label: "edit <name>",
+          description: "open the tabbed model editor",
+        },
+        {
+          value: "rename",
+          label: "rename <old> <new>",
+          description: "rename a profile",
+        },
+        {
+          value: "delete",
+          label: "delete <name>",
+          description: "delete a profile",
+        },
+        {
+          value: "default",
+          label: "default [name|none] [global|project]",
+          description: "default profile for new sessions",
+        },
+        {
+          value: "show",
+          label: "show <name>",
+          description: "show one profile's models",
+        },
+      ];
+      const lower = String(prefix || "").toLowerCase();
+      if (lower.includes(" ")) {
+        // Completing an argument after a subcommand → profile names where relevant.
+        const cmd = lower.trim().split(/\s+/)[0];
+        const wantsNames =
+          cmd === "use" ||
+          cmd === "edit" ||
+          cmd === "delete" ||
+          cmd === "show" ||
+          cmd === "default";
+        if (!wantsNames) return null;
+        const last = lower.trim().split(/\s+/).pop() ?? "";
+        const names = profilesConfig.profiles
+          .filter((p) => p.name.toLowerCase().startsWith(last))
+          .map((p) => ({
+            value: p.name,
+            label: p.name,
+            description: p.description || undefined,
+          }));
+        return cmd === "use" || cmd === "default"
+          ? [
+              ...names,
+              { value: "none", label: "none", description: "no profile" },
+            ]
+          : names;
+      }
+      const matching = subs.filter((s) => s.value.startsWith(lower));
+      if (matching.length > 0) return matching;
+      const names = profilesConfig.profiles
+        .filter((p) => p.name.toLowerCase().startsWith(lower))
+        .map((p) => ({
+          value: p.name,
+          label: p.name,
+          description: p.description || undefined,
+        }));
+      return names.length ? names : null;
     },
   });
 
@@ -3240,6 +4874,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
               return out;
             };
             lines.push(theme.fg("accent", "─".repeat(W)));
+            // Profile notice: /role edits the BASE roles; an active profile
+            // overlays models on top (see effectiveRoles).
+            if (activeProfileName) {
+              lines.push(
+                ...wrap(
+                  ` ${theme.fg("warning", `Profile ⚡ ${activeProfileName} active — editing BASE roles; profile overrides apply on top. /profile edit ${activeProfileName} to change the profile.`)}`,
+                ),
+              );
+              lines.push("");
+            }
             // Tabs row: one block per role + Submit
             const chips: string[] = [];
             for (let i = 0; i < tabs.length; i++) {
@@ -3475,7 +5119,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       // Tasks whose agent has no explicit model use the explorer role's
       // single model. Telemetry lands in details.
       ensureRoleConfig(cwd);
-      const explorerRole = getRole(roleConfig, "explorer");
+      ensureProfilesConfig(cwd);
+      // Active profile's explorer model when a profile is active.
+      const explorerRole = getEffectiveRole("explorer");
       const routedMeta: { role: string; model: string; reason: string }[] =
         new Array(jobs.length);
       const routedAgents: (AgentConfig | undefined)[] = new Array(jobs.length);
@@ -4507,10 +6153,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     // Roles are file-backed; load them up-front so every read path (status,
     // band label, reviewer runtime) sees the real config even in a fresh
-    // session that has no persisted workflow entry yet.
+    // session that has no persisted workflow entry yet. Profiles likewise.
     try {
       ensureRoleConfig((ctx as any)?.cwd);
       notifyRoleConfigFallback(ctx as ExtensionContext);
+      ensureProfilesConfig((ctx as any)?.cwd);
+      notifyProfilesFallback(ctx as ExtensionContext);
     } catch (_e) {
       void _e;
     }
@@ -4540,13 +6188,42 @@ export default function workflowExtension(pi: ExtensionAPI) {
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             currentPlanFile = d.planFile;
             // restore role state (file config is source of truth for roles;
-            // session entry carries the latest activeRole)
+            // session entry carries the latest activeRole) and the session's
+            // own profile activation
             try {
               ensureRoleConfig((ctx as any)?.cwd);
+              ensureProfilesConfig((ctx as any)?.cwd);
               const rd = (d as any).role;
               if (rd && typeof rd === "object") {
                 if (typeof rd.activeRole === "string" || rd.activeRole === null)
                   roleConfig.activeRole = rd.activeRole;
+                // Profiles: an explicit pick restores exactly (name or none);
+                // entries without an explicit choice (fresh / pre-profile /
+                // default-seeded) re-derive workflow.defaultProfile below so
+                // a changed default still applies on resume.
+                profileExplicit = rd.profileExplicit === true;
+                if (profileExplicit) {
+                  activeProfileName =
+                    typeof rd.activeProfile === "string"
+                      ? rd.activeProfile
+                      : null;
+                  if (
+                    activeProfileName &&
+                    !getProfile(profilesConfig, activeProfileName)
+                  ) {
+                    try {
+                      (ctx as any).ui?.notify?.(
+                        `Profiles: "${activeProfileName}" no longer exists — default roles flow active.`,
+                        "warning",
+                      );
+                    } catch (_e) {
+                      void _e;
+                    }
+                    activeProfileName = null;
+                  }
+                } else {
+                  activeProfileName = null;
+                }
               }
             } catch (_e) {
               void _e;
@@ -4627,6 +6304,39 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     } catch (_e) {
       void _e;
+    }
+    // Default-profile seeding: sessions without an explicit choice follow
+    // workflow.defaultProfile, re-read at every start/resume so a changed
+    // default applies. Sessions that picked explicitly (or explicitly chose
+    // none) never see the default.
+    if (!profileExplicit) {
+      try {
+        const def = readDefaultProfileSetting(
+          (ctx as any).cwd ?? process.cwd(),
+          getAgentDir(),
+        ).value;
+        if (def) {
+          ensureProfilesConfig((ctx as any)?.cwd);
+          const p = getProfile(profilesConfig, def);
+          if (p) {
+            if (activeProfileName !== p.name) {
+              activeProfileName = p.name;
+              invalidateEffectiveRoles();
+            }
+          } else {
+            try {
+              (ctx as any).ui?.notify?.(
+                `Profiles: default profile "${def}" not found in profiles.json — skipping.`,
+                "warning",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      } catch (_e) {
+        void _e;
+      }
     }
     // auto-enable plan mode if flag set at startup (support both --plan and --workflow-plan)
     const flagPlan =

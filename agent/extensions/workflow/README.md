@@ -12,6 +12,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
 - **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, inline markdown handoff (`ScrollView` → inline scrollback), `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all).
+- **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
 
 ## Install
 
@@ -34,6 +35,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/todos` | Show todo list |
 | `/btw` | Queue note for next turn |
 | `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
+| `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default…. CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]` |
 | `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout |
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
@@ -41,6 +43,33 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review` | Run one review round against the current plan file now |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
+
+## Model Profiles
+
+A profile is a **named combination of role model settings** — one `{provider, id, thinking}` each for planner, explorer, builder and reviewer. Profiles layer on top of Model Roles: role identity (tools, system prompts, custom roles) stays global in `roles.json`; a profile only overrides models while it is active.
+
+```text
+/profile                    # picker: activate / edit / rename / delete / New profile… / Default…
+/profile create budget      # name it, then pick model + thinking per role (same flow as /role)
+/profile use budget         # activate for THIS session (none = back to the roles.json flow)
+/profile edit budget        # re-open the tabbed model editor
+/profile rename budget cheap
+/profile delete budget      # confirm dialog; deleting the active profile falls back to base roles
+/profile default budget     # workflow.defaultProfile — new sessions start on it (global|project)
+```
+
+### Semantics
+
+- **What a profile overrides**: model + thinking for the four built-in roles only. Tools, `systemPromptAddendum` and custom roles are global (roles.json) and are never touched by a profile. Partial profiles are allowed in hand-edited files — roles a profile does not name fall back to the base role model.
+- **Activation is session-scoped.** `/profile use` changes only the current session and rides the session's `workflow` entry, so `/resume` restores it and **two concurrent sessions can run different profiles** — session 1 on a cheap provider, session 2 on a premium one. There is deliberately no global "active profile" file.
+- **Optional default**: `workflow.defaultProfile` (see [Settings](#settings)) seeds sessions that never made an explicit choice; an explicit `/profile use <name|none>` always wins for that session.
+- **Effect**: `/plan` switches to the profile's planner, `/build` to the profile's builder, `explore` subagents run on the profile's explorer, and Review Mode's reviewer session uses the profile's reviewer (planner fallback preserved). Activating while in plan/build re-applies the mode model immediately; in Default mode nothing switches until the next plan/build/explore/review use — the manual chat model is never touched by activation.
+- **`/role` keeps editing the base roles.** With a profile active, the `/role` picker shows a notice and `/role list` prints the profile's overrides; `/profile edit <name>` is the way to change what actually runs.
+- **Fallback**: no profiles (or none active) → the roles.json flow, identical to before profiles existed. A profile referencing a model missing from the registry is warned about at save time and refused at switch time ("staying on current model"), same as `/role`.
+
+**Why**: mix models from different providers in one workflow (frontier planner + cheap explorer), keep one profile per provider to control budget per provider, run concurrent sessions on different providers to work around per-provider concurrency limits, and exploit cheaper starter plans across several providers.
+
+Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-project override at `<cwd>/.pi/profiles.json` (per-profile replace, project wins). Names are case-insensitively unique, ≤ 40 chars, no whitespace (keep them CLI-addressable), and `none`/`auto` are reserved. A missing file is the normal empty state; a corrupt or wrong-version file is never rewritten (warning + in-memory empty config).
 
 ## Review Mode
 
@@ -271,6 +300,20 @@ Known limits (accepted, same trade-off OpenCode/Claude Code make): a configured 
 
 Role config lives in `~/.pi/agent/roles.json` v2 (user) with optional per-project override at `<cwd>/.pi/roles.json` (per-role replace). Each role holds exactly one `{provider, id, thinking}`. v1 `modelPool` files are discarded and reseeded on load. Seeded with defaults on first run. Respects `theme`, `modelRegistry`, and `plannotator` phases from `agent/plannotator.json`.
 
+Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-project override at `<cwd>/.pi/profiles.json` (per-profile replace). Each profile holds `{name, description, roles}` where `roles` maps any of the four built-in role names to one `{provider, id, thinking}` — see [Model Profiles](#model-profiles).
+
+The default profile lives under `workflow.defaultProfile` (global/project precedence like the other workflow settings):
+
+```json
+{
+  "workflow": {
+    "defaultProfile": "cheap"
+  }
+}
+```
+
+`/profile default <name|none> [global|project]` writes this key read-modify-write, preserving every other settings key. Sessions that never picked explicitly (fresh or resumed) re-read it at every start, so changing the default applies to them; an explicit `/profile use` in a session pins that session until changed.
+
 Review Mode settings live under `workflow.reviewMode`:
 
 | Key | Default | Meaning |
@@ -311,7 +354,7 @@ Commit Policy settings live under `workflow.commitPolicy` (same global/project p
 
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -355,7 +398,7 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts review.test.ts review-ui.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts
 ```
 
 Plain TypeScript, no build step — Pi loads `index.ts` directly (via jiti). From the repo root, `npm run verify` checks this package's manifest, tarball contents, tests and load path before a release. Live reload: edit the `.ts` file and run `/reload` in Pi.

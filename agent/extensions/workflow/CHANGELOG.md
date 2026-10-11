@@ -2,6 +2,25 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.5.0] - 2026-10-11
+
+### Added — Model Profiles: named, session-scoped role-model combinations (`/profile`)
+
+**The problem.** Roles fixed ONE model per role, globally. That made three real workflows clumsy: mixing providers inside one session (frontier planner + cheap explorer), keeping a budget per provider (re-pointing four roles back and forth is tedious, so everything rides one key), and working around per-provider concurrency/rate limits — concurrent sessions all shared the same four models, so parallel sessions hammered the same provider.
+
+**The design — profiles as a model-overlay layer on top of roles** (`profiles.ts`, new module, pure/unit-testable like `commit-policy.ts`; `roles.json` v2 is untouched):
+
+- **Storage**: `~/.pi/agent/profiles.json` v1 (user) + `<cwd>/.pi/profiles.json` project override (per-profile replace, project wins, last-wins within a file — same merge discipline as roles). A profile stores `{name, description, roles}` with at most one `{provider, id, thinking}` per built-in role — model + thinking ONLY; tools, system prompts and custom roles stay global in `roles.json`. Non-destructive loader: a missing file is the normal empty state (info), corrupt/wrong-version files warn and fall back to an in-memory empty config and are never rewritten.
+- **Activation is session-scoped by design**: `setActiveProfile` rides the `workflow` session entry (like `activeRole` already does), so `/resume` restores it and **two concurrent sessions can run different profiles** — there is deliberately no global active-profile file. The optional `workflow.defaultProfile` setting (global/project, project wins) seeds sessions that never made an explicit choice; an explicit `/profile use <name|none>` pins that session.
+- **Effective roles**: one cached overlay (`effectiveRoles()` / `getEffectiveRole()` — keyed by base-config object identity + active profile name) feeds every model-RESOLUTION site: plan/build mode switching, Review Mode's reviewer session (planner fallback kept), the reviewer's explore scout, the `explore` tool routing, the review band label and `/review-mode status`. All EDITING sites (`/role`, role picker) keep operating on the base roles — the picker shows a notice while a profile is active and `/role list` prints the profile's overrides, so profile values can never leak into `roles.json`.
+- **`/profile` command**: bare → management picker (activate/deactivate, edit models, rename, delete with a confirm dialog, New profile…, Default for new sessions…); `list`, `show <name>`, `use <name|none>`, `create <name>` (UI: tabbed editor seeded from the current effective models; headless: seeded + saved), `edit <name>` (tabbed planner/explorer/builder/reviewer editor mirroring the role picker — scoped models first, `Ctrl+O` for all, staged selections, **Save & activate** / **Save only** tabs), `rename <old> <new>`, `delete <name>`, `default [name|none] [global|project]` (read-modify-write of `workflow.defaultProfile`, preserving every other settings key). Headless parity for every subcommand; argument completions for subcommands + profile names.
+- **Names**: trimmed, case-insensitively unique, ≤ 40 chars, no whitespace (names stay CLI-addressable), `none`/`auto` reserved. The status line shows `⚡ <profile>` while one is active. Activation in plan/build re-applies the mode model immediately; in Default mode it applies on the next plan/build/explore/review use — the manual chat model is never touched by activation.
+- **Fallback guarantees**: no profile active → the overlay is a shallow copy, so behaviour is identical to the pre-profile roles flow; a profile deleted/renamed in another window deactivates cleanly with a warning; a model missing from the registry is warned at save time and refused at switch time ("staying on current model"), exactly like `/role set`.
+
+Tests: 11 cases in `profiles.test.ts` (loader fallback matrix, user+project merge, sanitizer, name rules, overlay purity + fallback, fingerprint, save round-trip, `workflow.defaultProfile` extract/read/write with other-key preservation). Packaging: `profiles.ts` added to `files[]` (repo gate verifies the tarball), test script and tsconfig include updated.
+
+Breaking: none. `roles.json` stays v2; older sessions resume without profile state and simply follow `workflow.defaultProfile` if set.
+
 ## [0.4.0] - 2026-10-11
 
 ### Added — Commit Policy: user-controlled commit behavior, enforced where commands execute
