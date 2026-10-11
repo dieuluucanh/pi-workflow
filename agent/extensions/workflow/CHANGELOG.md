@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.5.2] - 2026-10-11
+
+### Features
+
+- full-argument slash-command completions for /profile, /role, /commit-policy (ef4178d)
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed — `/commit` was dead under the (default) `never` commit policy
