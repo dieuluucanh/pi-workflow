@@ -89,12 +89,24 @@ import {
   type WorkflowRole,
 } from "./permissions.ts";
 import {
+  COMMIT_AUTH_MAX_COMMITS,
+  COMMIT_AUTH_TTL_MS,
+  COMMIT_FLOW_TTL_MS,
+  armCommitAuthorization,
   commitConfigPaths,
+  decideCommitGate,
   describeCommitPolicyMode,
+  isAuthorizationActive,
+  isCommitConfirmation,
+  isPositiveCommitDecision,
   readCommitPolicyConfig,
+  startCommitFlow,
   stepCommitDecision,
   writeCommitPolicyConfig,
+  type CommitAuthorizationState,
+  type CommitGateHit,
   type CommitPolicyMode,
+  type PendingCommitFlow,
   type StepCommitCandidate,
 } from "./commit-policy.ts";
 import {
@@ -400,11 +412,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let todoItems: TodoItem[] = [];
   // Plan file the current todo list was derived from (drives merge vs replace).
   let todoPlanPath: string | undefined;
-  // Armed while the user-invoked /commit flow's agent turn is running: its
-  // `git commit` bypasses the commit-policy gate (staging already happened
-  // extension-side via piExecGit, outside the tool gate). Cleared on
-  // turn_end/agent_settled so the window stays one turn wide.
-  let commitBypassActive = false;
+  // ── /commit flow authorization ──
+  // The /commit flow is multi-turn (read diff → confirm → commit), so a
+  // single-turn exemption is always disarmed before the commit runs. Instead:
+  //   pendingCommitFlow  — set when /commit injects its agent turn, cleared on
+  //                        the user's confirmation (or a negative/cancel answer),
+  //                        so only THIS flow's questionnaire can arm.
+  //   commitAuthorization — armed only when the user confirms in that
+  //                        questionnaire; exempts ONLY `git commit` (never
+  //                        add/push) until the run settles, bounded by a TTL
+  //                        and a commit cap.
+  // Both are cleared on agent_settled, session_shutdown and session_tree.
+  let pendingCommitFlow: PendingCommitFlow | null = null;
+  let commitAuthorization: CommitAuthorizationState | null = null;
   // ── Deterministic per-step commits (allow mode) ──
   // In 'allow' mode the EXTENSION — not the model — owns commit timing:
   // exactly one commit per batch of newly completed plan steps, made at the
@@ -2532,16 +2552,28 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
     // Inject a user message → triggers an agent turn that proposes + confirms + commits
     const message = buildCommitPrompt(statSummary, stageAll);
-    // Arm the commit-policy bypass for exactly this agent turn: its `git
-    // commit` must run even under policy 'never'. Disarmed on turn_end /
-    // agent_settled, so the window is one turn wide.
-    commitBypassActive = true;
-    if ((pi as any).sendUserMessage) {
-      (pi as any).sendUserMessage(message);
-    } else {
-      (pi as any).sendMessage?.(
-        { customType: "workflow-commit", content: message, display: true },
-        { triggerTurn: true, deliverAs: "followUp" },
+    // Start a commit flow. The exemption is NOT armed here: it is armed only
+    // when the user confirms in THIS flow's questionnaire (see the
+    // questionnaire tool), so an unconfirmed commit stays blocked under any
+    // policy. A flow TTL bounds an abandoned confirmation.
+    pendingCommitFlow = startCommitFlow(Date.now(), COMMIT_FLOW_TTL_MS);
+    commitAuthorization = null;
+    try {
+      if ((pi as any).sendUserMessage) {
+        await (pi as any).sendUserMessage(message);
+      } else {
+        await (pi as any).sendMessage?.(
+          { customType: "workflow-commit", content: message, display: true },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      }
+    } catch (e: any) {
+      // The turn never started → no questionnaire can arm; do not leave a
+      // stale flow behind.
+      pendingCommitFlow = null;
+      ctx.ui.notify(
+        `Failed to start the commit flow: ${String(e?.message ?? e ?? e)}`,
+        "error",
       );
     }
   }
@@ -5801,6 +5833,34 @@ export default function workflowExtension(pi: ExtensionAPI) {
         overlayActive = false;
       }
 
+      // /commit authorization: arm the commit-policy exemption ONLY when the
+      // user confirms THIS flow's commit questionnaire. A cancel (or any
+      // non-confirmation questionnaire) clears the pending flow and arms
+      // nothing, so the policy keeps blocking. Headless never reaches here
+      // (early return above), which is the intended fail-closed behaviour.
+      if (pendingCommitFlow && isCommitConfirmation(questions)) {
+        const cancelled = !result || result.cancelled === true;
+        const answer =
+          !result || result.cancelled ? undefined : result.answers?.[0];
+        if (isPositiveCommitDecision({ cancelled, answer })) {
+          commitAuthorization = armCommitAuthorization({
+            flowId: pendingCommitFlow.id,
+            now: Date.now(),
+            ttlMs: COMMIT_AUTH_TTL_MS,
+            maxCommits: COMMIT_AUTH_MAX_COMMITS,
+          });
+          try {
+            ctx.ui.notify?.(
+              "Commit authorized — this run may commit the staged changes.",
+              "info",
+            );
+          } catch (_e) {
+            void _e;
+          }
+        }
+        pendingCommitFlow = null;
+      }
+
       if (!result || result.cancelled) {
         return {
           content: [{ type: "text", text: "User cancelled questionnaire" }],
@@ -6421,6 +6481,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     ctx.ui.setStatus("workflow", undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
+    // Drop any /commit authorization or flow: a reload/quit must never leave
+    // an exemption armed for whatever runs next.
+    commitAuthorization = null;
+    pendingCommitFlow = null;
     // Release the reviewer session (and its custom tools) on shutdown so a
     // reload or quit never leaves an orphaned in-process session behind.
     await teardownReview();
@@ -6432,6 +6496,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     todoItems = [];
     todoPlanPath = undefined;
     btwNotes = [];
+    // A rewind must not preserve a /commit exemption across branches.
+    commitAuthorization = null;
+    pendingCommitFlow = null;
     try {
       const branch = ctx.sessionManager.getBranch();
       for (const e of branch as any[]) {
@@ -6468,32 +6535,52 @@ export default function workflowExtension(pi: ExtensionAPI) {
    *   allow → automatic per-step commits while a plan todo list is active
    * (the extension owns commit timing — model-initiated git add/commit/push
    * are blocked); outside a plan the model may commit as before. The
-   * user-invoked /commit flow arms `commitBypassActive` so its own `git
-   * commit` runs (staging is extension-side; `push` and `add` are never
-   * bypassed).
+   * user-invoked /commit flow arms `commitAuthorization` ONLY when the user
+   * confirms its questionnaire; that exemption covers just `git commit` for
+   * the rest of the run (staging is extension-side; `push` and `add` are
+   * never exempted).
+   *
+   * The decision itself is the pure `decideCommitGate`; this wrapper supplies
+   * the runtime inputs and renders the block reasons / ask overlay.
    */
   async function commitPolicyGate(
     event: any,
     ctx: any,
     cwd: string,
   ): Promise<{ block: true; reason: string } | undefined> {
-    const policy = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
-    // allow outside a plan: no per-step automation to own commit timing, so
-    // the model keeps its previous freedom.
-    if (policy === "allow" && todoItems.length === 0) return undefined;
     const cmd = String(event?.input?.command ?? "");
     const hit = gitCommitPolicyHit(cmd);
     if (!hit) return undefined;
-    // `add` is only gated in `never` mode; `ask` prompts on commit/push only
-    // (staging alone pollutes nothing).
-    if (policy === "ask" && hit === "add") return undefined;
-    // /commit bypass: only the flow's own `git commit` is exempt — `add` and
-    // `push` are not.
-    if (commitBypassActive && hit === "commit") {
+    const policy = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+    const now = Date.now();
+    const decision = decideCommitGate({
+      policy,
+      hit: hit as CommitGateHit,
+      hasTodos: todoItems.length > 0,
+      auth: commitAuthorization,
+      now,
+    });
+    if (decision === "allow") {
+      // Count a granted `git commit` against the authorization, but only when
+      // the authorization was actually the deciding factor (never/ask, or
+      // allow-with-an-active-plan). `allow` outside a plan is free regardless.
+      const authWasDecisive =
+        hit === "commit" &&
+        commitAuthorization !== null &&
+        !(policy === "allow" && todoItems.length === 0);
+      if (authWasDecisive && commitAuthorization) {
+        const auth = commitAuthorization;
+        if (!isAuthorizationActive(auth, now)) {
+          commitAuthorization = null;
+        } else {
+          const next = { ...auth, commits: auth.commits + 1 };
+          commitAuthorization = next.commits >= next.maxCommits ? null : next;
+        }
+      }
       return undefined;
     }
 
-    if (policy === "never" || policy === "allow") {
+    if (decision === "block") {
       return {
         block: true,
         reason:
@@ -6507,7 +6594,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
               cmd,
       };
     }
-    // policy === "ask" → confirmation overlay. Headless has no one to ask →
+    // decision === "ask" → confirmation overlay. Headless has no one to ask →
     // fail closed rather than commit unbidden.
     const ui = ctx?.ui;
     if (!ui || !ctx.hasUI) {
@@ -6886,9 +6973,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    // Belt-and-braces: the run is over (completed, aborted or errored) — the
-    // /commit bypass must not leak into whatever runs next.
-    commitBypassActive = false;
+    // The run is over (completed, aborted or errored). The /commit flow lives
+    // within one run, so both the armed exemption and any unconfirmed flow are
+    // dropped here — nothing that runs next inherits them.
+    commitAuthorization = null;
+    pendingCommitFlow = null;
     // keep persisted CustomEntry for reload, clear in-memory tombstone only on explicit prune; for now no clear to survive fork
   });
 
@@ -7067,10 +7156,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Track progress (all modes, whenever todos exist)
   pi.on("turn_end", async (event, ctx) => {
-    // Disarm the /commit bypass as soon as any turn ends: the /commit flow's
-    // `git commit` runs as a tool call WITHIN its turn, so this never disarms
-    // too early — and nothing after the turn inherits the exemption.
-    commitBypassActive = false;
+    // NOTE: do NOT disarm the /commit authorization here. `turn_end` fires
+    // after EVERY assistant response, but /commit is multi-turn (read diff →
+    // confirm → commit), so disarming per turn kills the exemption before the
+    // commit turn. Lifetime is the run: `agent_settled` clears it.
     if (todoItems.length === 0) return;
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);

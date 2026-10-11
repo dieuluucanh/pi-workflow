@@ -20,13 +20,19 @@ import {
   COMMIT_POLICY_KEY,
   DEFAULT_COMMIT_POLICY_CONFIG,
   WORKFLOW_SETTINGS_KEY,
+  armCommitAuthorization,
   coerceCommitPolicyConfig,
   commitConfigPaths,
+  decideCommitGate,
   describeCommitPolicyMode,
   extractCommitPolicyRaw,
+  isAuthorizationActive,
+  isCommitConfirmation,
+  isPositiveCommitDecision,
   mergeCommitPolicyConfig,
   modeSourceOf,
   readCommitPolicyConfig,
+  startCommitFlow,
   stepCommitDecision,
   stepCommitMessage,
   writeCommitPolicyConfig,
@@ -412,3 +418,160 @@ test("stepCommitMessage: falls back to label then ref for numbering", () => {
     "step 9: no numbers here",
   );
 });
+
+// ── /commit authorization: flow primitives ───────────────────────────
+
+test("startCommitFlow: fresh id, start/expiry from the ttl", () => {
+  const flow = startCommitFlow(1000, 5000);
+  assert.equal(flow.startedAt, 1000);
+  assert.equal(flow.expiresAt, 6000);
+  assert.match(flow.id, /^commit-1000-\d+$/);
+  assert.notEqual(startCommitFlow(1000, 5000).id, flow.id);
+});
+
+test("armCommitAuthorization: records flow, ttl cap and a zero commit count", () => {
+  const auth = armCommitAuthorization({
+    flowId: "f1",
+    now: 200,
+    ttlMs: 1000,
+    maxCommits: 3,
+  });
+  assert.equal(auth.flowId, "f1");
+  assert.equal(auth.armedAt, 200);
+  assert.equal(auth.expiresAt, 1200);
+  assert.equal(auth.commits, 0);
+  assert.equal(auth.maxCommits, 3);
+});
+
+test("isAuthorizationActive: absent, expired, capped and valid states", () => {
+  assert.equal(isAuthorizationActive(null, 0), false);
+  assert.equal(isAuthorizationActive(undefined, 0), false);
+  const auth = armCommitAuthorization({ flowId: "f", now: 0, ttlMs: 100 });
+  assert.equal(isAuthorizationActive(auth, 99), true);
+  assert.equal(isAuthorizationActive(auth, 100), false); // strict: expiry is exclusive
+  assert.equal(isAuthorizationActive({ ...auth, commits: auth.maxCommits }, 1), false);
+  assert.equal(isAuthorizationActive({ ...auth, commits: auth.maxCommits + 5 }, 1), false);
+});
+
+// ── /commit authorization: confirmation detection ────────────────────
+
+test("isCommitConfirmation: header, canonical question text or option label", () => {
+  assert.equal(isCommitConfirmation([{ header: "Commit" }]), true);
+  assert.equal(isCommitConfirmation([{ header: " commit " }]), true);
+  assert.equal(
+    isCommitConfirmation([{ question: "Proposed commit message:\n\n  x\n\nCommit these staged changes?" }]),
+    true,
+  );
+  assert.equal(
+    isCommitConfirmation([{ options: [{ label: "✅ Commit" }, { label: "❌ Cancel" }] }]),
+    true,
+  );
+});
+
+test("isCommitConfirmation: unrelated questionnaires and garbage are rejected", () => {
+  assert.equal(isCommitConfirmation(undefined), false);
+  assert.equal(isCommitConfirmation([]), false);
+  assert.equal(isCommitConfirmation([{ header: "Scope", question: "Which files?" }]), false);
+  assert.equal(isCommitConfirmation([null as never, {} as never]), false);
+  // "Commit" must match the whole header, not a substring of a longer word.
+  assert.equal(isCommitConfirmation([{ header: "Commitment review" }]), false);
+});
+
+test("isPositiveCommitDecision: cancel never arms, commit/custom text does", () => {
+  assert.equal(isPositiveCommitDecision({ cancelled: true, answer: { answer: "✅ Commit" } }), false);
+  assert.equal(isPositiveCommitDecision({}), false);
+  assert.equal(isPositiveCommitDecision({ answer: {} }), false);
+  assert.equal(isPositiveCommitDecision({ answer: { answer: "" } }), false);
+  assert.equal(isPositiveCommitDecision({ answer: { answer: "❌ Cancel" } }), false);
+  assert.equal(isPositiveCommitDecision({ answer: { answer: "Cancel" } }), false);
+  assert.equal(isPositiveCommitDecision({ answer: { answer: "✅ Commit" } }), true);
+  assert.equal(
+    isPositiveCommitDecision({ answer: { answer: "feat: my message", wasCustom: true } }),
+    true,
+  );
+  // A custom message that merely mentions cancel is still a message → arms.
+  assert.equal(
+    isPositiveCommitDecision({ answer: { answer: "fix: cancel button", wasCustom: true } }),
+    true,
+  );
+});
+
+// ── decideCommitGate: full truth table ───────────────────────────────
+
+function activeAuth(now = 0) {
+  return armCommitAuthorization({ flowId: "f", now, ttlMs: 1000, maxCommits: 3 });
+}
+
+test("decideCommitGate: allow policy outside a plan keeps the model's freedom", () => {
+  assert.equal(
+    decideCommitGate({ policy: "allow", hit: "commit", hasTodos: false, now: 0 }),
+    "allow",
+  );
+  assert.equal(
+    decideCommitGate({ policy: "allow", hit: "push", hasTodos: false, now: 0 }),
+    "allow",
+  );
+});
+
+test("decideCommitGate: allow policy with an active plan blocks the model (extension owns timing)", () => {
+  for (const hit of ["add", "commit", "push"] as const) {
+    assert.equal(
+      decideCommitGate({ policy: "allow", hit, hasTodos: true, now: 0 }),
+      "block",
+    );
+  }
+});
+
+test("decideCommitGate: ask leaves add free but prompts on commit/push", () => {
+  assert.equal(decideCommitGate({ policy: "ask", hit: "add", hasTodos: false, now: 0 }), "allow");
+  assert.equal(decideCommitGate({ policy: "ask", hit: "commit", hasTodos: false, now: 0 }), "ask");
+  assert.equal(decideCommitGate({ policy: "ask", hit: "push", hasTodos: true, now: 0 }), "ask");
+});
+
+test("decideCommitGate REGRESSION: never blocks commit without authorization", () => {
+  assert.equal(decideCommitGate({ policy: "never", hit: "commit", hasTodos: false, now: 0 }), "block");
+  assert.equal(decideCommitGate({ policy: "never", hit: "commit", hasTodos: false, auth: null, now: 0 }), "block");
+});
+
+test("decideCommitGate REGRESSION: never allows commit with an active authorization", () => {
+  assert.equal(
+    decideCommitGate({ policy: "never", hit: "commit", hasTodos: false, auth: activeAuth(0), now: 1 }),
+    "allow",
+  );
+});
+
+test("decideCommitGate: an authorization never exempts add or push", () => {
+  assert.equal(
+    decideCommitGate({ policy: "never", hit: "add", hasTodos: false, auth: activeAuth(0), now: 1 }),
+    "block",
+  );
+  assert.equal(
+    decideCommitGate({ policy: "never", hit: "push", hasTodos: false, auth: activeAuth(0), now: 1 }),
+    "block",
+  );
+});
+
+test("decideCommitGate: expired or capped authorization no longer allows", () => {
+  assert.equal(
+    decideCommitGate({ policy: "never", hit: "commit", hasTodos: false, auth: activeAuth(0), now: 1000 }),
+    "block",
+  );
+  assert.equal(
+    decideCommitGate({
+      policy: "never",
+      hit: "commit",
+      hasTodos: false,
+      auth: { ...activeAuth(0), commits: 3 },
+      now: 1,
+    }),
+    "block",
+  );
+});
+
+test("decideCommitGate: authorization also short-circuits the ask prompt", () => {
+  assert.equal(
+    decideCommitGate({ policy: "ask", hit: "commit", hasTodos: false, auth: activeAuth(0), now: 1 }),
+    "allow",
+  );
+});
+

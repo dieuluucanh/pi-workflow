@@ -2,6 +2,23 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.5.1] - 2026-10-11
+
+### Fixed — `/commit` was dead under the (default) `never` commit policy
+
+**The bug.** 0.4.0's commit-policy gate armed a single-turn exemption (`commitBypassActive`) before injecting the `/commit` agent turn and disarmed it on `turn_end`. But `/commit` is inherently **multi-turn** — read the staged diff → confirm the message in a questionnaire → commit — and `turn_end` fires after *every* assistant response. So the exemption was always gone by the turn that actually ran `git commit`, and `/commit` was blocked under `never` (and under `allow` during a plan) with the policy message.
+
+**The fix — scoped, confirmation-armed authorization.** The exemption is now armed at the user's *decision* instead of before the run:
+
+- `/commit` records a `PendingCommitFlow` and injects its agent turn; nothing is exempted yet.
+- The extension-owned `questionnaire` tool arms a `CommitAuthorizationState` only when the user confirms THIS flow's commit questionnaire (positive answer). ❌ Cancel clears the flow and arms nothing.
+- The authorization exempts **only `git commit`** (`add`/`push` never) and lives until the run settles (`agent_settled`), bounded by a 10-minute TTL and a 10-commit cap; it is also dropped on `session_shutdown` and rewind (`session_tree`). The per-turn disarm is removed.
+- **Fail safe:** no confirmation → no authorization → the policy keeps blocking. Headless sessions never reach the questionnaire, so they still fail closed.
+
+**Testability.** The gate decision is extracted into a pure `decideCommitGate` (`commit-policy.ts`), alongside `startCommitFlow`, `armCommitAuthorization`, `isAuthorizationActive`, `isCommitConfirmation` and `isPositiveCommitDecision`. `commit-policy.test.ts` gains 17 cases covering the full policy × subcommand × todo/auth truth table, TTL/cap expiry, cancel-vs-confirm detection, and the exact regression (never + commit + no auth → block; never + commit + active auth → allow; auth never exempts add/push).
+
+Breaking: none.
+
 ## [0.5.0] - 2026-10-11
 
 ### Added — Model Profiles: named, session-scoped role-model combinations (`/profile`)

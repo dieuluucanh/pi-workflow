@@ -41,7 +41,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
 | `/review` | Run one review round against the current plan file now |
-| `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated |
+| `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 
 ## Model Profiles
@@ -267,7 +267,7 @@ Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global
 
 ## Commit policy
 
-By default the agent **cannot touch your git history**: the tool gate deterministically blocks `git add`, `git commit` and `git push` — including compound commands (`git add -A && git commit -m x`), global-option forms (`git -C path add`) and `powershell` wrappers. You commit manually, or run `/commit` for an AI-summarized, confirmation-gated commit (its own `git commit` runs under a one-turn bypass; `push` is never bypassed). Read-only git (`status`, `log`, `diff`, `branch -a`, `config --get`, …) stays free, and plan mode keeps its stricter read-only rules regardless.
+By default the agent **cannot touch your git history**: the tool gate deterministically blocks `git add`, `git commit` and `git push` — including compound commands (`git add -A && git commit -m x`), global-option forms (`git -C path add`) and `powershell` wrappers. You commit manually, or run `/commit` for an AI-summarized, confirmation-gated commit. Read-only git (`status`, `log`, `diff`, `branch -a`, `config --get`, …) stays free, and plan mode keeps its stricter read-only rules regardless.
 
 The default exists because prompt-only rules are soft: models habitually commit per plan step, and "never commit unless asked" instructions in CLAUDE.md-style files are famously ignored (anthropics/claude-code#58883, #68724, #7029). Claude Code, Codex CLI and OpenCode all treat agent-initiated commits as something to gate or approve — so the policy here is enforced where commands execute, not in prose:
 
@@ -287,6 +287,16 @@ The default exists because prompt-only rules are soft: models habitually commit 
 | `allow` | **Automatic per-step commits.** While a plan todo list is active the extension itself makes exactly **one commit per completed step** (at the `workflow_todo` completion boundary, before the model starts the next step; subject `step N: <step text>`), and the model cannot run `git add`/`commit`/`push` at all. Outside a plan (no todos) the model may commit as before. `/commit` always works |
 
 The status line always shows the active policy (`▶ build 2/5 · commits:never`), so you can see at a glance what the agent may do to history.
+
+### `/commit` under any policy
+
+`/commit` works under `never` and `allow`-during-a-plan because it is the user's own request. The flow is multi-turn (read the staged diff → confirm the message in a questionnaire → commit), so the exemption is **armed at the user's confirmation**, not when the flow starts:
+
+- `/commit` records a *pending flow* and injects its agent turn. Nothing is exempted yet.
+- When the confirmation questionnaire is answered **positively** (✅ Commit, or a custom message), the extension arms a scoped *commit authorization*. Choosing ❌ Cancel clears the flow and arms nothing.
+- The authorization exempts **only `git commit`** — `git add` and `git push` stay blocked — and is valid until the run settles (`agent_settled`), additionally bounded by a 10-minute TTL and a 10-commit cap. It is also dropped on `session_shutdown` and on rewind (`session_tree`).
+
+The confirmation step is required: with no positive answer no authorization exists and the policy keeps blocking. `-a` staging happens extension-side before the flow, outside the tool gate.
 
 ```text
 /commit-policy                # status: mode, which scope supplied it, both settings paths

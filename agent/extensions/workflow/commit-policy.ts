@@ -321,6 +321,176 @@ export function stepCommitDecision(
   };
 }
 
+// ── /commit authorization (scoped exemption from the gate) ───────────
+//
+// The /commit flow is multi-turn (read diff → confirm via questionnaire →
+// commit), so a single-turn exemption is always disarmed before the commit
+// runs. Instead the flow starts a PendingCommitFlow and the authorization is
+// armed only when the user CONFIRMS in the extension-owned questionnaire
+// tool. The authorization is valid until the run settles, bounded by a TTL and
+// a commit cap, and exempts ONLY `git commit` (never `add`/`push`).
+
+/** How long a /commit flow may sit awaiting the user's decision. */
+export const COMMIT_FLOW_TTL_MS = 30 * 60 * 1000;
+
+/** How long an armed authorization stays valid (run-settle is the primary bound). */
+export const COMMIT_AUTH_TTL_MS = 10 * 60 * 1000;
+
+/** Defense-in-depth cap on commits made under one /commit authorization. */
+export const COMMIT_AUTH_MAX_COMMITS = 10;
+
+let commitFlowCounter = 0;
+
+/** A /commit flow awaiting the user's confirmation. */
+export interface PendingCommitFlow {
+  id: string;
+  startedAt: number;
+  expiresAt: number;
+}
+
+/** An armed exemption from the commit gate, created at the user's confirmation. */
+export interface CommitAuthorizationState {
+  flowId: string;
+  armedAt: number;
+  expiresAt: number;
+  commits: number;
+  maxCommits: number;
+}
+
+/** Start a new /commit flow (id is unique within the process). */
+export function startCommitFlow(
+  now: number,
+  ttlMs: number = COMMIT_FLOW_TTL_MS,
+): PendingCommitFlow {
+  commitFlowCounter += 1;
+  return {
+    id: `commit-${now}-${commitFlowCounter}`,
+    startedAt: now,
+    expiresAt: now + ttlMs,
+  };
+}
+
+/** Arm the exemption for one flow. Never throws. */
+export function armCommitAuthorization(input: {
+  flowId: string;
+  now: number;
+  ttlMs?: number;
+  maxCommits?: number;
+}): CommitAuthorizationState {
+  const ttlMs = input.ttlMs ?? COMMIT_AUTH_TTL_MS;
+  return {
+    flowId: input.flowId,
+    armedAt: input.now,
+    expiresAt: input.now + ttlMs,
+    commits: 0,
+    maxCommits: input.maxCommits ?? COMMIT_AUTH_MAX_COMMITS,
+  };
+}
+
+/** True only while an authorization is present, unexpired and under its cap. */
+export function isAuthorizationActive(
+  auth: CommitAuthorizationState | null | undefined,
+  now: number,
+): boolean {
+  if (!auth) return false;
+  if (!(now < auth.expiresAt)) return false;
+  return auth.commits < auth.maxCommits;
+}
+
+/** A normalized questionnaire question (only the fields the detector needs). */
+export interface CommitConfirmationQuestion {
+  question?: string;
+  header?: string;
+  options?: { label?: string; description?: string }[];
+}
+
+/**
+ * Is this questionnaire the /commit confirmation? Signals, in order: the
+ * "Commit" header, the canonical question text, or the "✅ Commit" option
+ * label. Deliberately tolerant — a missed match leaves the policy blocking
+ * (fail safe), so false negatives are a UX regression, false positives a risk.
+ */
+export function isCommitConfirmation(
+  questions: readonly CommitConfirmationQuestion[] | undefined,
+): boolean {
+  if (!Array.isArray(questions)) return false;
+  return questions.some((q) => {
+    if (!q || typeof q !== "object") return false;
+    if (typeof q.header === "string" && /^commit$/i.test(q.header.trim())) {
+      return true;
+    }
+    if (
+      typeof q.question === "string" &&
+      /commit these staged changes/i.test(q.question)
+    ) {
+      return true;
+    }
+    return (q.options ?? []).some(
+      (o: { label?: string; description?: string }) =>
+        typeof o?.label === "string" && /✅\s*commit/i.test(o.label),
+    );
+  });
+}
+
+/** One questionnaire answer, as far as the decision needs to know. */
+export interface CommitConfirmationAnswer {
+  answer?: string;
+  wasCustom?: boolean;
+}
+
+/**
+ * Did the user authorize the commit? Cancel (`cancelled` or a ❌/cancel-only
+ * label) never arms. Freeform text always arms (it is the user's own commit
+ * message) unless it is exactly a cancel token. A canned label arms unless it
+ * reads as cancel without commit.
+ */
+export function isPositiveCommitDecision(input: {
+  cancelled?: boolean;
+  answer?: CommitConfirmationAnswer;
+}): boolean {
+  if (input?.cancelled) return false;
+  const answer = input?.answer;
+  if (!answer) return false;
+  const label = String(answer.answer ?? "").trim();
+  if (!label) return false;
+  const isBareCancel = /^(❌\s*)?cancel[.!]?$/i.test(label);
+  if (isBareCancel) return false;
+  if (answer.wasCustom) return true;
+  if (/\bcancel\b/i.test(label) && !/\bcommit\b/i.test(label)) return false;
+  return true;
+}
+
+/** The commit-policy gate outcome for one tool call. */
+export type CommitGateDecision = "allow" | "block" | "ask";
+
+/** Git subcommands the commit policy gates (mirrors permissions.ts CommitPolicyHit). */
+export type CommitGateHit = "add" | "commit" | "push";
+
+export interface CommitGateInput {
+  policy: CommitPolicyMode;
+  hit: CommitGateHit;
+  hasTodos: boolean;
+  auth?: CommitAuthorizationState | null;
+  now: number;
+}
+
+/**
+ * The pure commit-policy decision. Ordering mirrors the original inline gate:
+ * an `allow` policy with no active plan owns nothing → allow; `ask` keeps
+ * fresh staging free; an armed authorization exempts ONLY `git commit`; then
+ * never/allow block and anything left (`ask`) prompts. Never throws.
+ */
+export function decideCommitGate(input: CommitGateInput): CommitGateDecision {
+  const { policy, hit, hasTodos } = input;
+  if (policy === "allow" && !hasTodos) return "allow";
+  if (policy === "ask" && hit === "add") return "allow";
+  if (hit === "commit" && isAuthorizationActive(input.auth, input.now)) {
+    return "allow";
+  }
+  if (policy === "never" || policy === "allow") return "block";
+  return "ask";
+}
+
 /**
  * Read-modify-write `workflow.commitPolicy` into a settings file, preserving
  * every other key in that file (Pi owns settings.json — we must not clobber it).
