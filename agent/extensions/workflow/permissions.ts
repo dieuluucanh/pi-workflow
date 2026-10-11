@@ -824,6 +824,104 @@ function classifyGit(s: string): CommandClass {
   return GIT_READ_ONLY_SUBCOMMANDS.has(sub) ? "read-only" : "full";
 }
 
+// ── Commit-policy classification ─────────────────────────────────
+
+/** Git subcommands the commit policy gates (`workflow.commitPolicy`). */
+export type CommitPolicyHit = "add" | "commit" | "push";
+
+const COMMIT_POLICY_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "add",
+  "commit",
+  "push",
+]);
+
+/** Global `git` options that take a separate value (`git -C path status`). */
+const GIT_GLOBAL_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  "-C",
+  "--git-dir",
+  "--work-tree",
+  "--namespace",
+  "--super-prefix",
+  "--exec-path",
+]);
+
+/** Global `git` flags that take no value (`git --no-pager log`). */
+const GIT_GLOBAL_FLAG_OPTIONS: ReadonlySet<string> = new Set([
+  "--no-pager",
+  "--paginate",
+  "--no-replace-objects",
+  "--bare",
+  "--no-optional-locks",
+  "--literal-pathspecs",
+  "--html-path",
+  "--man-path",
+  "--info-path",
+  "--version",
+]);
+
+/**
+ * Extract the subcommand a `git …` invocation resolves to, skipping global
+ * options. `null` when no subcommand is found. Mirrors classifyGit's
+ * option-skipping, but deliberately parses *through* `-c key=value` pairs:
+ * a config pair cannot turn a read-only subcommand into a commit, and the
+ * policy classifier must see the real subcommand (`git -c x=y commit`).
+ */
+function gitSubcommandAt(words: string[], gitIndex: number): string | null {
+  let i = gitIndex + 1;
+  while (i < words.length) {
+    const w = unquote(words[i]);
+    if (!w) {
+      i += 1;
+      continue;
+    }
+    if (w === "-c") {
+      i += 2; // -c key=value pair
+      continue;
+    }
+    if (w.startsWith("-c") && w.includes("=")) {
+      i += 1; // fused -ckey=value (defensive; git wants a space)
+      continue;
+    }
+    if (w.startsWith("--") && w.includes("=")) {
+      i += 1; // --git-dir=/x fused form
+      continue;
+    }
+    if (GIT_GLOBAL_VALUE_OPTIONS.has(w)) {
+      i += 2;
+      continue;
+    }
+    if (GIT_GLOBAL_FLAG_OPTIONS.has(w)) {
+      i += 1;
+      continue;
+    }
+    return w.toLowerCase();
+  }
+  return null;
+}
+
+/**
+ * Commit-policy classifier: does this command invoke `git add`, `git commit`
+ * or `git push` — in any segment of a compound command, including wrapper
+ * forms (`env git commit`, `nice -n 5 git add`) and global-option forms
+ * (`git -C path add`, `git.exe push`)? Returns the first matched subcommand,
+ * or null. Fail-closed by design: false positives (an unquoted
+ * `echo git commit`) are acceptable; false negatives are not.
+ */
+export function gitCommitPolicyHit(command: string): CommitPolicyHit | null {
+  if (typeof command !== "string" || !command.trim()) return null;
+  for (const segment of splitCommandSegments(command)) {
+    const words = wordsOf(segment);
+    for (let g = 0; g < words.length; g++) {
+      if (normalizeBinary(words[g]) !== "git") continue;
+      const sub = gitSubcommandAt(words, g);
+      if (sub && COMMIT_POLICY_SUBCOMMANDS.has(sub)) {
+        return sub as CommitPolicyHit;
+      }
+    }
+  }
+  return null;
+}
+
 function classifyDocker(s: string): CommandClass {
   const sub = wordAt(s, 1)?.toLowerCase();
   if (!sub) return "full";

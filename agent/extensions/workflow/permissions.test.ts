@@ -15,6 +15,7 @@ import {
   describeRolePolicy,
   explainCommandRefusal,
   forbiddenSyntaxReason,
+  gitCommitPolicyHit,
   hasForbiddenSyntax,
   isCommandAllowedForRole,
   isWorkflowRole,
@@ -422,4 +423,77 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
       `gate and explanation disagree for: ${cmd}`,
     );
   }
+});
+
+// ── gitCommitPolicyHit (workflow.commitPolicy classifier) ───────────
+
+test("commit-policy hit: direct mutating subcommands", () => {
+  assert.equal(gitCommitPolicyHit("git add -A"), "add");
+  assert.equal(gitCommitPolicyHit("git add -p"), "add");
+  assert.equal(gitCommitPolicyHit("git add ."), "add");
+  assert.equal(gitCommitPolicyHit("git commit -m 'fix: x'"), "commit");
+  assert.equal(gitCommitPolicyHit("git commit -am x"), "commit");
+  assert.equal(gitCommitPolicyHit("git commit --allow-empty"), "commit");
+  assert.equal(gitCommitPolicyHit("git push"), "push");
+  assert.equal(gitCommitPolicyHit("git push origin main"), "push");
+  assert.equal(gitCommitPolicyHit("git push --force-with-lease"), "push");
+});
+
+test("commit-policy hit: no hit for read-only git", () => {
+  assert.equal(gitCommitPolicyHit("git status"), null);
+  assert.equal(gitCommitPolicyHit("git log --oneline -5"), null);
+  assert.equal(gitCommitPolicyHit("git diff HEAD"), null);
+  assert.equal(gitCommitPolicyHit("git show"), null);
+  assert.equal(gitCommitPolicyHit("git stash list"), null);
+  assert.equal(gitCommitPolicyHit("git config --get user.name"), null);
+  assert.equal(gitCommitPolicyHit("git tag -l"), null);
+  assert.equal(gitCommitPolicyHit("git branch -a"), null);
+  assert.equal(gitCommitPolicyHit("git remote -v"), null);
+  // `commit` appearing as a mere argument value must not trip the classifier.
+  assert.equal(gitCommitPolicyHit('git log --grep="git commit"'), null);
+  assert.equal(gitCommitPolicyHit("git log --grep=commit"), null);
+  assert.equal(gitCommitPolicyHit('rg "git commit" src'), null);
+});
+
+test("commit-policy hit: compound commands", () => {
+  assert.equal(gitCommitPolicyHit("git add -A && git commit -m x"), "add");
+  assert.equal(gitCommitPolicyHit("npm test && git commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("git status; git push origin main"), "push");
+  assert.equal(gitCommitPolicyHit("git log | head -5 && git add -u"), "add");
+  assert.equal(gitCommitPolicyHit("ls && git status"), null);
+});
+
+test("commit-policy hit: global options are parsed through", () => {
+  assert.equal(gitCommitPolicyHit("git -C path add -A"), "add");
+  assert.equal(gitCommitPolicyHit("git --no-pager diff"), null);
+  assert.equal(gitCommitPolicyHit("git --git-dir=.git --work-tree=. add ."), "add");
+  assert.equal(gitCommitPolicyHit("git -c core.hooksPath=/dev/null commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("git -c x=y diff"), null);
+  assert.equal(gitCommitPolicyHit("git --no-optional-locks status"), null);
+  assert.equal(gitCommitPolicyHit("git --paginate log"), null);
+});
+
+test("commit-policy hit: binary variants and wrappers", () => {
+  assert.equal(gitCommitPolicyHit("git.exe commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("/usr/bin/git push"), "push");
+  assert.equal(
+    gitCommitPolicyHit('"C:\\Program Files\\Git\\cmd\\git.exe" add .'),
+    "add",
+  );
+  assert.equal(gitCommitPolicyHit("env git commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("nice -n 5 git add -A"), "add");
+  assert.equal(gitCommitPolicyHit("GIT_DIR=. git push"), "push");
+  // Fail-closed false positive is accepted for unquoted echoes.
+  assert.equal(gitCommitPolicyHit("echo git commit"), "commit");
+  // ...but quoted mentions stay clean.
+  assert.equal(gitCommitPolicyHit('echo "git commit"'), null);
+});
+
+test("commit-policy hit: non-git commands and junk", () => {
+  assert.equal(gitCommitPolicyHit(""), null);
+  assert.equal(gitCommitPolicyHit("   "), null);
+  assert.equal(gitCommitPolicyHit("ls -la"), null);
+  assert.equal(gitCommitPolicyHit("npm publish"), null);
+  assert.equal(gitCommitPolicyHit("commit -m x"), null);
+  assert.equal(gitCommitPolicyHit("github-cli push"), null);
 });

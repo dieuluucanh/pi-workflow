@@ -39,6 +39,8 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
 | `/review` | Run one review round against the current plan file now |
+| `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated |
+| `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 
 ## Review Mode
 
@@ -234,6 +236,37 @@ A stored credential (`/login <provider>` → `auth.json`) always wins over the `
 
 Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global) or `<cwd>/.pi/settings.json` (project). Project values win field-by-field over global. Writing them preserves every other key in the file.
 
+## Commit policy
+
+By default the agent **cannot touch your git history**: the tool gate deterministically blocks `git add`, `git commit` and `git push` — including compound commands (`git add -A && git commit -m x`), global-option forms (`git -C path add`) and `powershell` wrappers. You commit manually, or run `/commit` for an AI-summarized, confirmation-gated commit (its own `git commit` runs under a one-turn bypass; `push` is never bypassed). Read-only git (`status`, `log`, `diff`, `branch -a`, `config --get`, …) stays free, and plan mode keeps its stricter read-only rules regardless.
+
+The default exists because prompt-only rules are soft: models habitually commit per plan step, and "never commit unless asked" instructions in CLAUDE.md-style files are famously ignored (anthropics/claude-code#58883, #68724, #7029). Claude Code, Codex CLI and OpenCode all treat agent-initiated commits as something to gate or approve — so the policy here is enforced where commands execute, not in prose:
+
+| Agent | Default commit behavior | Control |
+| --- | --- | --- |
+| Claude Code | never auto-commits | CLAUDE.md rules (soft, documentedly ignored) + PreToolUse hooks (hard) |
+| Codex CLI | approval-gated git mutations | sandbox + `--approval-mode` |
+| OpenCode | no auto-commit | ordered `permission` rules (`git push *` → `deny`), global + project config |
+| Aider | auto-commits every edit | `--no-auto-commits`, `--commit-prompt` (the configurable-commit pole) |
+
+### Modes
+
+| Mode | Meaning |
+| --- | --- |
+| `never` (default) | `git add` / `git commit` / `git push` are blocked with a policy reason that tells the model to leave changes uncommitted for review |
+| `ask` | The agent may commit; every `git commit` / `git push` pops an Allow once / Deny dialog (headless sessions fail closed). `git add` stays free — staging alone pollutes nothing |
+| `allow` | **Automatic per-step commits.** While a plan todo list is active the extension itself makes exactly **one commit per completed step** (at the `workflow_todo` completion boundary, before the model starts the next step; subject `step N: <step text>`), and the model cannot run `git add`/`commit`/`push` at all. Outside a plan (no todos) the model may commit as before. `/commit` always works |
+
+The status line always shows the active policy (`▶ build 2/5 · commits:never`), so you can see at a glance what the agent may do to history.
+
+```text
+/commit-policy                # status: mode, which scope supplied it, both settings paths
+/commit-policy never          # set globally (~/.pi/agent/settings.json)
+/commit-policy allow project  # this repo only (<cwd>/.pi/settings.json)
+```
+
+Known limits (accepted, same trade-off OpenCode/Claude Code make): a configured git alias (e.g. `ci` → `commit`) is not recognized, and exotic obfuscations (`sh -c 'git commit'`) are caught only when the plain text survives. Plan-mode and subagent read-only gating are unaffected by the policy; the shadow-checkpoint rewind commits live in a separate bare repo and never appear in your history.
+
 ## Settings
 
 Role config lives in `~/.pi/agent/roles.json` v2 (user) with optional per-project override at `<cwd>/.pi/roles.json` (per-role replace). Each role holds exactly one `{provider, id, thinking}`. v1 `modelPool` files are discarded and reseeded on load. Seeded with defaults on first run. Respects `theme`, `modelRegistry`, and `plannotator` phases from `agent/plannotator.json`.
@@ -260,9 +293,25 @@ Review Mode settings live under `workflow.reviewMode`:
 
 `"reviewMode": true` is accepted as shorthand for `{ "enabled": true }`.
 
+Commit Policy settings live under `workflow.commitPolicy` (same global/project precedence, project wins field-by-field):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"never"` | `"never"` = gate blocks `git add`/`commit`/`push`; `"ask"` = each `git commit`/`push` asks first; `"allow"` = automatic per-step commits (extension-driven, one per completed step; the model cannot commit during a plan) |
+
+```json
+{
+  "workflow": {
+    "commitPolicy": { "mode": "ask" }
+  }
+}
+```
+
+`"commitPolicy": "ask"` (a bare mode string) is accepted as shorthand for `{ "mode": "ask" }`. Booleans, numbers and unknown modes fall back to the default. `/commit-policy` writes this key read-modify-write, preserving every other settings key.
+
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 

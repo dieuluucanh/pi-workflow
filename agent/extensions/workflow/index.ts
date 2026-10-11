@@ -82,11 +82,21 @@ import {
 import {
   WORKFLOW_ROLE_ENV,
   explainCommandRefusal,
+  gitCommitPolicyHit,
   policyForRole,
   resolveSessionRole,
   subagentEnv,
   type WorkflowRole,
 } from "./permissions.ts";
+import {
+  commitConfigPaths,
+  describeCommitPolicyMode,
+  readCommitPolicyConfig,
+  stepCommitDecision,
+  writeCommitPolicyConfig,
+  type CommitPolicyMode,
+  type StepCommitCandidate,
+} from "./commit-policy.ts";
 import {
   isGitRepo,
   isGitRepoSync,
@@ -372,6 +382,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let todoItems: TodoItem[] = [];
   // Plan file the current todo list was derived from (drives merge vs replace).
   let todoPlanPath: string | undefined;
+  // Armed while the user-invoked /commit flow's agent turn is running: its
+  // `git commit` bypasses the commit-policy gate (staging already happened
+  // extension-side via piExecGit, outside the tool gate). Cleared on
+  // turn_end/agent_settled so the window stays one turn wide.
+  let commitBypassActive = false;
+  // ── Deterministic per-step commits (allow mode) ──
+  // In 'allow' mode the EXTENSION — not the model — owns commit timing:
+  // exactly one commit per batch of newly completed plan steps, made at the
+  // workflow_todo tool_result boundary (the runner awaits tool_result
+  // handlers, so the commit lands before the model starts the next step).
+  // committedStepRefs makes the guarantee idempotent; stepCommitsSeeded
+  // marks pre-existing done steps (session resume, re-executed plan) as
+  // already accounted for so they never trigger a spurious commit.
+  const committedStepRefs = new Set<string>();
+  let stepCommitsSeeded = false;
   // ── Reminder throttle + staleness tracking (passive enforcement layer) ──
   let turnsSinceLastTodoWrite = 0;
   let turnsSinceLastReminder = 0;
@@ -600,14 +625,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
   function updateStatus(ctx: ExtensionContext) {
     const roleLabel = activeRoleLabel();
     const suffix = roleLabel ? ` | ${roleLabel}` : "";
+    // Commit-policy surfacing (workflow.commitPolicy): always visible so the
+    // user can see at a glance what the agent may do to git history. Read
+    // live so /commit-policy changes show up without a reload.
+    let commitMode: CommitPolicyMode = "never";
+    try {
+      commitMode = readCommitPolicyConfig(
+        (ctx as any).cwd ?? process.cwd(),
+        getAgentDir(),
+      ).config.mode;
+    } catch {
+      commitMode = "never";
+    }
+    const policy = ` · commits:${commitMode}`;
     const staleMarker = todoStale ? " ⚠" : "";
     const done = todoItems.filter((t) => isDone(t)).length;
     const total = todoItems.length;
     if (workflowMode === "build") {
       const label =
         total > 0
-          ? `▶ build ${done}/${total}${staleMarker}${suffix}`
-          : `▶ build${suffix}`;
+          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}`
+          : `▶ build${suffix}${policy}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", label));
     } else if (workflowMode === "plan") {
       const base = plannotatorActive
@@ -615,16 +653,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
         : "⏸ plan";
       const label =
         total > 0
-          ? `${base} ${done}/${total}${staleMarker}${suffix}`
-          : `${base}${suffix}`;
+          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}`
+          : `${base}${suffix}${policy}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (total > 0) {
       ctx.ui.setStatus(
         "workflow",
-        ctx.ui.theme.fg("muted", `◦ ${done}/${total}${staleMarker}${suffix}`),
+        ctx.ui.theme.fg(
+          "muted",
+          `◦ ${done}/${total}${staleMarker}${suffix}${policy}`,
+        ),
       );
     } else {
-      ctx.ui.setStatus("workflow", undefined);
+      ctx.ui.setStatus(
+        "workflow",
+        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}`),
+      );
     }
     if (todoItems.length > 0) {
       ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
@@ -1197,6 +1241,112 @@ export default function workflowExtension(pi: ExtensionAPI) {
         `Review Mode disabled (${scope}) — plan/build flow is back to single-agent.\nSettings: ${res.path}`,
         "info",
       );
+    },
+  });
+
+  // ── /commit-policy: view/set the commit policy (workflow.commitPolicy) ──
+  // Available in every mode: it only writes settings JSON; the gate itself
+  // lives in tool_call and plan mode keeps its own stricter rules.
+  pi.registerCommand("commit-policy", {
+    description:
+      "View or set the commit policy (what the agent may git add/commit/push): /commit-policy never|ask|allow [global|project]",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const tokens = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "").toLowerCase();
+      const scope: "global" | "project" =
+        tokens.includes("project") && !tokens.includes("global")
+          ? "project"
+          : "global";
+
+      if (!sub || sub === "status") {
+        const resolved = readCommitPolicyConfig(cwd, agentDir);
+        const paths = commitConfigPaths(cwd, agentDir);
+        const where =
+          resolved.sources.mode === "default"
+            ? "default — no settings file supplies it"
+            : `${resolved.sources.mode} settings`;
+        ctx.ui.notify(
+          [
+            `Commit policy: ${resolved.config.mode} (${where})`,
+            `  ${describeCommitPolicyMode(resolved.config.mode)}`,
+            `Global settings: ${paths.global}`,
+            `Project settings: ${paths.project}`,
+            "Usage: /commit-policy never|ask|allow [global|project]",
+          ].join("\n"),
+          "info",
+        );
+        updateStatus(ctx as any);
+        return;
+      }
+
+      if (sub !== "never" && sub !== "ask" && sub !== "allow") {
+        ctx.ui.notify(
+          [
+            "Usage: /commit-policy never|ask|allow [global|project]",
+            "  never  agent cannot git add/commit/push — you commit (or /commit)",
+            "  ask    agent may commit; each git commit/push asks first",
+            "  allow  agent may commit freely (per-step during plan execution)",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      const res = writeCommitPolicyConfig(scope, cwd, agentDir, {
+        mode: sub as CommitPolicyMode,
+      });
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Could not write commit-policy settings: ${res.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `Commit policy → ${sub} (${scope})\n${describeCommitPolicyMode(
+          sub as CommitPolicyMode,
+        )}\nSettings: ${res.path}`,
+        "info",
+      );
+      updateStatus(ctx as any);
+    },
+    getArgumentCompletions: (prefix: string) => {
+      const flags = [
+        {
+          value: "never",
+          label: "never",
+          description:
+            "agent cannot git add/commit/push — you commit (or /commit)",
+        },
+        {
+          value: "ask",
+          label: "ask",
+          description: "agent may commit; each git commit/push asks first",
+        },
+        {
+          value: "allow",
+          label: "allow",
+          description:
+            "agent may commit freely (per-step during plan execution)",
+        },
+        {
+          value: "global",
+          label: "global",
+          description: "write to ~/.pi/agent/settings.json",
+        },
+        {
+          value: "project",
+          label: "project",
+          description: "write to <cwd>/.pi/settings.json",
+        },
+      ];
+      const filtered = flags.filter((f) => f.value.startsWith(prefix));
+      return filtered.length ? filtered : null;
     },
   });
 
@@ -1845,7 +1995,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       };
       const firstTodo = todoItems[0];
       const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
+      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
       (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
       (pi as any).sendMessage?.(
         {
@@ -2121,6 +2271,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
     // Inject a user message → triggers an agent turn that proposes + confirms + commits
     const message = buildCommitPrompt(statSummary, stageAll);
+    // Arm the commit-policy bypass for exactly this agent turn: its `git
+    // commit` must run even under policy 'never'. Disarmed on turn_end /
+    // agent_settled, so the window is one turn wide.
+    commitBypassActive = true;
     if ((pi as any).sendUserMessage) {
       (pi as any).sendUserMessage(message);
     } else {
@@ -4594,6 +4748,118 @@ export default function workflowExtension(pi: ExtensionAPI) {
     updateStatus(ctx as any);
   });
 
+  // ── Commit policy gate (workflow.commitPolicy) ──────────────────
+
+  /**
+   * Deterministic enforcement of the user's commit policy. Returns a block
+   * result for `git add` / `git commit` / `git push` per the active mode, or
+   * undefined when the command may proceed:
+   *   never → block; ask → confirmation overlay (headless: fail closed);
+   *   allow → automatic per-step commits while a plan todo list is active
+   * (the extension owns commit timing — model-initiated git add/commit/push
+   * are blocked); outside a plan the model may commit as before. The
+   * user-invoked /commit flow arms `commitBypassActive` so its own `git
+   * commit` runs (staging is extension-side; `push` and `add` are never
+   * bypassed).
+   */
+  async function commitPolicyGate(
+    event: any,
+    ctx: any,
+    cwd: string,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    const policy = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+    // allow outside a plan: no per-step automation to own commit timing, so
+    // the model keeps its previous freedom.
+    if (policy === "allow" && todoItems.length === 0) return undefined;
+    const cmd = String(event?.input?.command ?? "");
+    const hit = gitCommitPolicyHit(cmd);
+    if (!hit) return undefined;
+    // `add` is only gated in `never` mode; `ask` prompts on commit/push only
+    // (staging alone pollutes nothing).
+    if (policy === "ask" && hit === "add") return undefined;
+    // /commit bypass: only the flow's own `git commit` is exempt — `add` and
+    // `push` are not.
+    if (commitBypassActive && hit === "commit") {
+      return undefined;
+    }
+
+    if (policy === "never" || policy === "allow") {
+      return {
+        block: true,
+        reason:
+          policy === "never"
+            ? `Commit policy is 'never' (workflow.commitPolicy): \`git ${hit}\` is blocked. ` +
+              "Finish your steps and leave changes uncommitted for user review — the user commits manually or runs /commit. " +
+              `Change the policy with /commit-policy allow.\nCommand: ${cmd}`
+            : `Commit policy is 'allow' with an active plan: a commit is made AUTOMATICALLY after each completed step — do not run \`git ${hit}\` yourself. ` +
+              "Finish the step, mark it done via workflow_todo, and continue; the extension commits it (exactly one commit per step). " +
+              "/commit always works for user-invoked commits.\nCommand: " +
+              cmd,
+      };
+    }
+    // policy === "ask" → confirmation overlay. Headless has no one to ask →
+    // fail closed rather than commit unbidden.
+    const ui = ctx?.ui;
+    if (!ui || !ctx.hasUI) {
+      return {
+        block: true,
+        reason:
+          `Commit policy is 'ask' (workflow.commitPolicy): \`git ${hit}\` needs user approval, ` +
+          "but no interactive UI is available. Leave the change uncommitted and let the user decide.",
+      };
+    }
+    let sel: unknown;
+    try {
+      sel = await ui.select(
+        `Commit policy 'ask': allow \`git ${hit}\`?`,
+        ["Allow once", "Deny"],
+      );
+    } catch {
+      sel = undefined;
+    }
+    if (String(sel ?? "").startsWith("Allow")) return undefined;
+    return {
+      block: true,
+      reason:
+        `Commit policy 'ask': the user declined \`git ${hit}\`. Do not retry — ` +
+        "leave the changes uncommitted for the user.",
+    };
+  }
+
+  /**
+   * Policy-aware commit directive appended to the plan-execute handoff
+   * message. Empty string when the policy cannot be read (a config hiccup
+   * never blocks the handoff itself).
+   */
+  function commitDirectiveLine(ctx: any): string {
+    try {
+      const cwd = ctx?.cwd ?? process.cwd();
+      const mode = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+      switch (mode) {
+        case "never":
+          return (
+            "\n\nCommit policy is 'never' (workflow.commitPolicy): do NOT run `git add`, `git commit`, or `git push`. " +
+            "Complete all steps and leave every change uncommitted for user review — the user commits manually or via /commit."
+          );
+        case "ask":
+          return (
+            "\n\nCommit policy is 'ask' (workflow.commitPolicy): you may commit after each completed step " +
+            "(`git add` + `git commit` with a concise conventional message); each `git commit`/`git push` will prompt the user for approval."
+          );
+        case "allow":
+          return (
+            "\n\nCommit policy is 'allow' (workflow.commitPolicy): do NOT run `git add`, `git commit`, or `git push` yourself — " +
+            "after each completed step the extension automatically makes exactly ONE commit containing the changes so far. " +
+            "Just finish a step, mark it done via workflow_todo, and move to the next step."
+          );
+        default:
+          return "";
+      }
+    } catch {
+      return "";
+    }
+  }
+
   // Block edits/writes + bash gating
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
@@ -4651,6 +4917,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
           reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}) — ${refusal.detail}.${hint}${planHint}\nCommand: ${cmd}`,
         } as any;
       }
+    }
+    // ── Commit policy gate ── Independent of the role gate: it also governs
+    // the unrestricted builder role — that is the point (user-controlled
+    // commit behavior). Plan mode is excluded: planner gating already blocks
+    // every mutating git command. Covers bash and powershell so a powershell
+    // wrapper cannot bypass the policy.
+    if (
+      (event.toolName === "bash" || event.toolName === "powershell") &&
+      workflowMode !== "plan"
+    ) {
+      const policyBlock = await commitPolicyGate(event, ctx, cwd);
+      if (policyBlock) return policyBlock as any;
     }
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
@@ -4735,6 +5013,104 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   // ── Checkpoint lifecycle: track leaf entryId and prompt header ─
+  // ── Deterministic per-step commit executor (allow mode) ──────────
+
+  /** Mark pre-existing done steps (session resume, re-executed plan) as already accounted for. Called once per session. */
+  function seedCommittedStepRefs(): void {
+    if (stepCommitsSeeded) return;
+    stepCommitsSeeded = true;
+    for (const t of todoItems) {
+      if (!isDone(t) || itemStatus(t) === "cancelled") continue;
+      committedStepRefs.add(todoRef(t));
+    }
+  }
+
+  /** Done steps that have not been committed yet (in canonical order). */
+  function uncommittedDoneSteps(): StepCommitCandidate[] {
+    const out: StepCommitCandidate[] = [];
+    for (const t of todoItems) {
+      if (!isDone(t) || itemStatus(t) === "cancelled") continue;
+      const ref = todoRef(t);
+      if (committedStepRefs.has(ref)) continue;
+      out.push({ ref, step: t.step, label: t.label, text: t.text });
+    }
+    return out;
+  }
+
+  /**
+   * Make the automatic per-step commit when the policy calls for it.
+   * Deterministic: driven by the step-completion signal (workflow_todo
+   * tool_result / [DONE:ref] tags), never by model whimsy; the committed
+   * ref set makes it exactly-once per step. Never throws — a commit hiccup
+   * must not break the run.
+   */
+  async function autoCommitCompletedSteps(
+    ctx: any,
+    trigger: string,
+  ): Promise<void> {
+    try {
+      const cwd = ctx?.cwd ?? process.cwd();
+      if (!isGitRepoSync(cwd)) return;
+      seedCommittedStepRefs();
+      const completed = uncommittedDoneSteps();
+      const dirty = await isDirty(pi as any, cwd);
+      const mode = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+      const decision = stepCommitDecision({
+        mode,
+        hasTodos: todoItems.length > 0,
+        dirty,
+        isInRepo: true,
+        completed,
+      });
+      if (!decision.commit) return;
+      const addRes = await piExecGit(["add", "-A"], cwd);
+      if (addRes.exitCode !== 0) {
+        try {
+          ctx?.ui?.notify?.(
+            `Per-step commit failed (git add): ${addRes.stderr.trim()}`,
+            "error",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
+      const commitRes = await piExecGit(["commit", "-m", decision.message], cwd);
+      if (commitRes.exitCode !== 0) {
+        try {
+          ctx?.ui?.notify?.(
+            `Per-step commit failed: ${commitRes.stderr.trim()}`,
+            "error",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
+      for (const ref of decision.refs) committedStepRefs.add(ref);
+      try {
+        ctx?.ui?.notify?.(
+          `Committed ${decision.refs.join(", ")} — ${decision.message}`,
+          "info",
+        );
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        pi.appendEntry("workflow-step-commit", {
+          refs: decision.refs,
+          message: decision.message,
+          trigger,
+          at: Date.now(),
+        });
+      } catch (_e) {
+        void _e;
+      }
+    } catch {
+      // never break the agent run on a commit hiccup
+    }
+  }
+
   pi.on("tool_result", async (_event, ctx) => {
     try {
       const leaf =
@@ -4746,8 +5122,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   });
 
+  // Per-step commit trigger: the runner AWAITS tool_result handlers, so the
+  // commit lands after the step is marked done and BEFORE the model starts
+  // the next step — exactly one commit per step, at the moment of completion.
+  pi.on("tool_result", async (event, ctx) => {
+    try {
+      const ev = event as any;
+      if (ev?.toolName !== "workflow_todo") return;
+      const action = String(ev?.input?.action ?? ev?.details?.action ?? "");
+      if (!action || action === "list" || action === "clear") return;
+      await autoCommitCompletedSteps(ctx, `workflow_todo:${action}`);
+    } catch (_e) {
+      void _e;
+    }
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     footerInjectedThisTurn = false;
+    // Seed the per-step commit ledger once per session: steps already done
+    // (restored sessions, re-executed plans) never trigger a spurious commit.
+    try {
+      seedCommittedStepRefs();
+    } catch (_e) {
+      void _e;
+    }
     if (!currentEntryId) return;
     const cwd = (ctx as any).cwd as string;
     try {
@@ -4778,6 +5176,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
+    // Belt-and-braces: the run is over (completed, aborted or errored) — the
+    // /commit bypass must not leak into whatever runs next.
+    commitBypassActive = false;
     // keep persisted CustomEntry for reload, clear in-memory tombstone only on explicit prune; for now no clear to survive fork
   });
 
@@ -4956,10 +5357,24 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Track progress (all modes, whenever todos exist)
   pi.on("turn_end", async (event, ctx) => {
+    // Disarm the /commit bypass as soon as any turn ends: the /commit flow's
+    // `git commit` runs as a tool call WITHIN its turn, so this never disarms
+    // too early — and nothing after the turn inherits the exemption.
+    commitBypassActive = false;
     if (todoItems.length === 0) return;
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);
     const result = markCompletedRefs(text, todoItems);
+    // Fallback per-step commit for steps completed via [DONE:ref] tags in the
+    // response text (the workflow_todo path already committed at its
+    // tool_result; the committed-ref set makes this a no-op then).
+    if (result.marked > 0) {
+      try {
+        await autoCommitCompletedSteps(ctx, "turn_end:done-tags");
+      } catch (_e) {
+        void _e;
+      }
+    }
     if (result.unknown.length > 0 || result.ambiguous.length > 0) {
       lastRefMisses = { refs: [...result.unknown, ...result.ambiguous] };
       try {
@@ -5516,7 +5931,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const list = formatTodoNumberedList(todoItems);
           const content = plannotatorActive
             ? `**Plan ready** (${todoItems.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
-            : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.`;
+            : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.${commitDirectiveLine(ctx)}`;
           (pi as any).sendMessage?.(
             {
               customType: "workflow-handoff-fallback",
@@ -5932,7 +6347,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 display: true,
               };
               const firstTodo = todoItems[0];
-              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
+              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
               (pi as any).sendMessage?.(planTodoListMessage, {
                 deliverAs: "followUp",
               });
