@@ -206,7 +206,7 @@ try {
   check("7c the guided denial blocks the write", r?.block, true);
   check("7d the reason carries the instruction verbatim", (r?.reason ?? "").includes(INSTRUCTION), true);
   check("7e the reason tells the model not to retry", /Do not retry this write/.test(r?.reason ?? ""), true);
-  check("7f the denial terminates the tool batch", r?.terminate, true);
+  check("7f the denial does NOT terminate the run", "terminate" in (r ?? {}), false);
   check("7g the instruction is delivered as a user message", sent.length, 1);
   check("7h the user message is delivered as a steer", sent[0]?.options?.deliverAs, "steer");
   check("7i the user message carries the instruction", String(sent[0]?.content ?? "").includes(INSTRUCTION), true);
@@ -235,7 +235,7 @@ try {
   check("8a a cancelled dialog still blocks the write", r?.block, true);
   check("8b a cancelled dialog sends no user message", sent.length, 0);
   check("8c a cancelled dialog is not treated as a guided denial", /Do not retry this write/.test(r?.reason ?? ""), false);
-  check("8d a cancelled dialog still terminates the batch", r?.terminate, true);
+  check("8d a cancelled dialog does not terminate the run", "terminate" in (r ?? {}), false);
 
   sent.length = 0;
   r = await call(
@@ -259,7 +259,7 @@ try {
   inputDialogs = 0;
   r = await call(makeCtx("Deny"), "edit", { path: "i.ts" });
   check("9a a plain denial blocks the write", r?.block, true);
-  check("9b a plain denial terminates the tool batch", r?.terminate, true);
+  check("9b a plain denial does not terminate the run", "terminate" in (r ?? {}), false);
   check("9c a plain denial sends no user message", sent.length, 0);
   check("9d a plain denial keeps the classic wording", /the user declined this write/.test(r?.reason ?? ""), true);
   check("9e a plain denial still says 'do not retry'", /Do not retry it\./.test(r?.reason ?? ""), true);

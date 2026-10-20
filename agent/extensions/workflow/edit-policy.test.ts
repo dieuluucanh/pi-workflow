@@ -41,6 +41,7 @@ import {
   readWritePolicyConfig,
   sanitizeWriteInstruction,
   toolAllowKey,
+  writeGateOptions,
   writePolicyArgumentCompletions,
   writePolicyConfigPaths,
   writePolicyModeSourceOf,
@@ -739,9 +740,10 @@ test("writePolicy completions: null for an unknown mode", () => {
 
 // ── guided denial: instruction sanitizing ───────────────────────────
 
-test("sanitizeWriteInstruction: trims and collapses whitespace", () => {
+test("sanitizeWriteInstruction: trims but keeps the user's own line breaks", () => {
   assert.equal(sanitizeWriteInstruction("  hello  "), "hello");
-  assert.equal(sanitizeWriteInstruction("a\n\n\n\nb"), "a\n\nb");
+  // One-shot user prose: blank lines are the user's, not ours to collapse.
+  assert.equal(sanitizeWriteInstruction("a\n\n\n\nb"), "a\n\n\n\nb");
   assert.equal(sanitizeWriteInstruction("\t tab kept \n"), "tab kept");
 });
 
@@ -795,6 +797,31 @@ test("parseWriteGateChoice: unknown, blank and cancelled answers deny", () => {
   assert.equal(parseWriteGateChoice("Something else"), "deny");
 });
 
+test("coupling guard: every real option parses to the intended choice", () => {
+  // The gate renders writeGateOptions() and switches on parseWriteGateChoice(),
+  // so a renamed label would otherwise change behaviour silently. The order
+  // is the dialog's order: Allow once, Always allow, Deny, Deny with instructions.
+  assert.deepEqual(writeGateOptions("path").map(parseWriteGateChoice), [
+    "allow-once",
+    "always",
+    "deny",
+    "deny-with-instructions",
+  ]);
+  assert.deepEqual(writeGateOptions("command").map(parseWriteGateChoice), [
+    "allow-once",
+    "always",
+    "deny",
+    "deny-with-instructions",
+  ]);
+  // The two denial options must stay distinguishable: "Deny with…" is only
+  // matched because it is tested BEFORE the bare "Deny" prefix.
+  assert.equal(
+    parseWriteGateChoice("Deny with instructions…"),
+    "deny-with-instructions",
+  );
+  assert.equal(parseWriteGateChoice("Deny"), "deny");
+});
+
 // ── guided denial: reason + guidance message ────────────────────────
 
 test("buildWriteDenyReason: a plain denial keeps the classic wording", () => {
@@ -842,6 +869,9 @@ test("buildWriteGuidanceMessage: carries the target and the instruction", () => 
   assert.ok(message.includes("C:/work/a.ts"));
   assert.match(message, /write denied/);
   assert.match(message, /instead of retrying that write/);
+  // The prefix is load-bearing: the extension's `input` handler swallows any
+  // user text starting with "/btw ", so the message must never start with it.
+  assert.ok(message.startsWith("[write denied"));
 });
 
 test("buildWriteGuidanceMessage: an empty instruction is sanitized away", () => {

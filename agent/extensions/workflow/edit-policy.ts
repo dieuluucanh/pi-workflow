@@ -726,7 +726,6 @@ export const WRITE_INSTRUCTION_PROMPT_PLACEHOLDER =
  *
  * - normalises CRLF/CR to LF,
  * - strips C0 control characters and DEL (but keeps tab and newline),
- * - collapses runs of 3+ newlines,
  * - trims,
  * - hard-caps at WRITE_INSTRUCTION_MAX_LEN (appending an ellipsis).
  *
@@ -734,19 +733,43 @@ export const WRITE_INSTRUCTION_PROMPT_PLACEHOLDER =
  * answer as a plain denial (fail closed, never an implicit allow).
  */
 export function sanitizeWriteInstruction(raw: unknown): string {
-  if (raw === undefined || raw === null) return "";
-  const text = typeof raw === "string" ? raw : String(raw);
+  const text = String(raw ?? "");
   if (!text) return "";
-  let out = text
+  const out = text
     .replace(/\r\n?/g, "\n")
     // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
-  out = out.replace(/\n{3,}/g, "\n\n").trim();
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "")
+    .trim();
   if (!out) return "";
   if (out.length > WRITE_INSTRUCTION_MAX_LEN) {
-    out = `${out.slice(0, WRITE_INSTRUCTION_MAX_LEN)}…`;
+    return `${out.slice(0, WRITE_INSTRUCTION_MAX_LEN)}…`;
   }
   return out;
+}
+
+/**
+ * The choices the ask dialog offers — the single source of the labels.
+ *
+ * The gate consumes this and `parseWriteGateChoice` below, so a renamed
+ * label can never silently change the gate's behaviour (the unit test maps
+ * every real option through the parser).
+ */
+export function writeGateOptions(
+  kind: "path" | "command",
+): readonly string[] {
+  return kind === "path"
+    ? [
+        "Allow once",
+        "Always allow this path",
+        "Deny",
+        WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+      ]
+    : [
+        "Allow once",
+        "Always allow this command",
+        "Deny",
+        WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+      ];
 }
 
 /** What the ask dialog's answer means. */

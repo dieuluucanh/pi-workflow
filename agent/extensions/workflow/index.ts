@@ -124,7 +124,7 @@ import {
   writePolicyArgumentCompletions,
   writePolicyConfigPaths,
   writeWritePolicyConfig,
-  WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+  writeGateOptions,
   WRITE_INSTRUCTION_PROMPT_PLACEHOLDER,
   WRITE_INSTRUCTION_PROMPT_TITLE,
   type WritePolicyMode,
@@ -6741,7 +6741,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     event: any,
     ctx: any,
     cwd: string,
-  ): Promise<{ block: true; reason: string; terminate?: boolean } | undefined> {
+  ): Promise<{ block: true; reason: string } | undefined> {
     try {
       // Scope: the top-level Default-mode session only.
       //  - Plan mode has its own stricter rules (writes only to .pi/plans/).
@@ -6817,19 +6817,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
 
       const isPathGrant = classification.paths.length > 0;
-      const options = isPathGrant
-        ? [
-            "Allow once",
-            "Always allow this path",
-            "Deny",
-            WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
-          ]
-        : [
-            "Allow once",
-            "Always allow this command",
-            "Deny",
-            WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
-          ];
+      const options = writeGateOptions(isPathGrant ? "path" : "command");
       let sel: unknown;
       try {
         sel = await ui.select(
@@ -6954,11 +6942,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
       return {
         block: true,
         reason,
-        // Stop the tool batch: a denied write must not be followed by
-        // another write attempt in the same turn. The guided path still
-        // delivers the instruction — the queued steer message keeps the run
-        // alive, so the model answers the user's sentence.
-        terminate: true,
+        // NOTE: no `terminate` here. pi consults `terminate` only AFTER the
+        // whole tool batch has run (`executeToolCallsParallel` prepares and
+        // runs every call before `shouldTerminateToolBatch()`), so it cannot
+        // suppress a sibling write in the same batch — it only decides
+        // whether the agent gets ANOTHER LLM turn. With it set, a plain Deny
+        // would end the run with no model acknowledgement at all: a
+        // behaviour change nobody asked for. The guided path gets its next
+        // turn from the queued steer message instead.
       };
     } catch (e: unknown) {
       // Fail closed: a broken policy read must not become an open door.

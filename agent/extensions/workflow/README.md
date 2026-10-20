@@ -366,7 +366,8 @@ The second channel is not redundancy for its own sake: Claude Code shipped the c
 Behaviour worth knowing:
 
 - **Scope: this write only.** The instruction governs the denied call. The next write asks again — nothing is remembered, nothing is persisted (your sentence is never written to `settings.json`; it lives in the transcript and in one audit entry).
-- **A plain Deny now ends the agent's turn.** The denied write is not followed by another write attempt in the same batch. The model does not send a reply, so you type the next instruction. (The guided path differs: the queued user message keeps the session alive, so the model answers your sentence.)
+- **A plain Deny behaves exactly as it always has** — the agent's run is not cut short, and the model keeps its turn. A denial never sets pi's `terminate` flag: that flag is only consulted *after* a whole tool batch has run, so it cannot stop a sibling write — it would only take away the model's next turn.
+- **For a durable "explore only, don't edit yet", use `/plan`.** Plan mode is read-only by design and keeps the agent inside that rule for the whole session; a denial sentence applies to one write.
 - **Cancelling the text box is a plain Deny** — never an implicit allow. An empty or whitespace-only sentence behaves the same way.
 - **Long or noisy input is sanitized**: line endings are normalised, control characters are stripped, and the text is capped at 2000 characters.
 - **One prompt per gated call.** If the model asks for several writes in one turn, each is a separate dialog.

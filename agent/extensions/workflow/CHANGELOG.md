@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-20
 
 ### Added — "Deny with instructions": a guided denial in the write policy
 
@@ -21,15 +21,12 @@ All notable changes to this package are documented in this file.
 - **Cancelling or emptying the text box is a plain Deny** — never an implicit allow. A host without a text dialog falls back the same way (fail closed).
 - **Input is sanitized**: CRLF normalised, control characters stripped, capped at 2000 characters.
 - **The steer channel is skipped while a review round is active**, because the extension's `input` handler routes user text to the reviewer; the tool-result copy still carries the instruction.
-
-### Changed — a plain **Deny** now ends the agent's tool batch
-
-The denial result carries `terminate: true`, so a denied write is not followed by another write attempt in the same turn. The model does not send a reply, so the user types the next instruction. The **guided** path is unaffected: the queued user message keeps the session alive, so the model answers the sentence it was given.
+- **A plain Deny behaves exactly as before**: the denial does not set pi's `terminate` flag, so the agent's run is not cut short. (`terminate` is only consulted after a whole tool batch has run, so it could not suppress a sibling write anyway — it would only remove the model's next turn.)
 
 ### Internal
 
-- `edit-policy.ts` gains the pure, unit-tested helpers behind this feature: `sanitizeWriteInstruction`, `parseWriteGateChoice` (the `"Deny with…"` label is matched **before** the bare `"Deny"`, and an unknown answer fails closed to a denial), `buildWriteDenyReason` and `buildWriteGuidanceMessage`.
-- `edit-policy.test.ts` gains 13 cases; `scripts/verify-write-policy.mjs` gains 29 checks (53 total) covering the instruction dialog, both delivery channels, the audit entry, and the cancelled/empty fallbacks.
+- `edit-policy.ts` gains the pure, unit-tested helpers behind this feature: `writeGateOptions` (the single source of the dialog labels), `sanitizeWriteInstruction`, `parseWriteGateChoice` (the `"Deny with…"` label is matched **before** the bare `"Deny"`, and an unknown answer fails closed to a denial), `buildWriteDenyReason` and `buildWriteGuidanceMessage`.
+- `edit-policy.test.ts` gains 14 cases (including a coupling guard that maps every real option through the parser); `scripts/verify-write-policy.mjs` gains 29 checks (53 total) covering the instruction dialog, both delivery channels, the audit entry, the cancelled/empty fallbacks, and the "no `terminate`" contract.
 
 ## [0.5.2] - 2026-10-11
 
