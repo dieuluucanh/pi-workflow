@@ -2,6 +2,35 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Added — "Deny with instructions": a guided denial in the write policy
+
+**The problem.** The write policy's `ask` mode offered **Allow once** / **Always allow this path** / **Deny**. A plain **Deny** tells the model only that the write was refused — not what the user actually wants — so the model either stops cold or re-proposes the same class of change. The user could not say *"only explore and propose a plan, do not edit files yet"*.
+
+**The feature.** The `ask` dialog now has a fourth choice, **Deny with instructions…**, which opens a one-line text box. The sentence the user types is delivered to the model through **two channels**:
+
+1. **The block reason** (the tool result): the instruction is quoted verbatim, followed by the disposition — *"Do not retry this write. Follow the instruction above. If it cannot be followed, say so and stop."*
+2. **A user message** (`pi.sendUserMessage(..., { deliverAs: "steer" })`): the same sentence is delivered as a real user turn after the current tool batch, before the next model call.
+
+**Why two channels.** Claude Code shipped the comment-on-rejection design and then shipped the bug where the model ignored the comment and kept trying workarounds ([anthropics/claude-code#89231](https://github.com/anthropics/claude-code/issues/89231), [#52824](https://github.com/anthropics/claude-code/issues/52824)). A tool result is a fact the model may reinterpret; a user turn is an instruction it must follow. Cursor and Claude Code now offer the same affordance (*"Reject? Tell what to do differently"*).
+
+**Semantics.**
+
+- **Scope: this write only.** Nothing is persisted — the instruction never reaches `settings.json`; it lives in the transcript and in one `workflow-write-denial` audit entry.
+- **Cancelling or emptying the text box is a plain Deny** — never an implicit allow. A host without a text dialog falls back the same way (fail closed).
+- **Input is sanitized**: CRLF normalised, control characters stripped, capped at 2000 characters.
+- **The steer channel is skipped while a review round is active**, because the extension's `input` handler routes user text to the reviewer; the tool-result copy still carries the instruction.
+
+### Changed — a plain **Deny** now ends the agent's tool batch
+
+The denial result carries `terminate: true`, so a denied write is not followed by another write attempt in the same turn. The model does not send a reply, so the user types the next instruction. The **guided** path is unaffected: the queued user message keeps the session alive, so the model answers the sentence it was given.
+
+### Internal
+
+- `edit-policy.ts` gains the pure, unit-tested helpers behind this feature: `sanitizeWriteInstruction`, `parseWriteGateChoice` (the `"Deny with…"` label is matched **before** the bare `"Deny"`, and an unknown answer fails closed to a denial), `buildWriteDenyReason` and `buildWriteGuidanceMessage`.
+- `edit-policy.test.ts` gains 13 cases; `scripts/verify-write-policy.mjs` gains 29 checks (53 total) covering the instruction dialog, both delivery channels, the audit entry, and the cancelled/empty fallbacks.
+
 ## [0.5.2] - 2026-10-11
 
 ### Features

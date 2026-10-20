@@ -6,7 +6,7 @@
       "description": "Frontier reasoning model for planning, orchestration, and ambiguous decisions",
       "model": {
         "provider": "synthetic",
-        "id": "hf:zai-org/GLM-5.3-Flash",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
         "thinking": "xhigh"
       },
       "tools": [],
@@ -18,7 +18,7 @@
       "description": "Fast, cheap model for read-only codebase exploration, web search, and summarization",
       "model": {
         "provider": "synthetic",
-        "id": "hf:zai-org/GLM-5.3-Flash",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
         "thinking": "medium"
       },
       "tools": [
@@ -36,7 +36,7 @@
       "description": "Capable model for code generation following a plan, with light reasoning",
       "model": {
         "provider": "synthetic",
-        "id": "hf:zai-org/GLM-5.3-Flash",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
         "thinking": "high"
       },
       "tools": [],

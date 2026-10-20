@@ -111,6 +111,25 @@ import {
   type StepCommitCandidate,
 } from "./commit-policy.ts";
 import {
+  buildWriteDenyReason,
+  buildWriteGuidanceMessage,
+  classifyWriteCall,
+  decideWriteGate,
+  describeWritePolicyMode,
+  isWriteCallAllowed,
+  normalizeWritePath,
+  parseWriteGateChoice,
+  readWritePolicyConfig,
+  sanitizeWriteInstruction,
+  writePolicyArgumentCompletions,
+  writePolicyConfigPaths,
+  writeWritePolicyConfig,
+  WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+  WRITE_INSTRUCTION_PROMPT_PLACEHOLDER,
+  WRITE_INSTRUCTION_PROMPT_TITLE,
+  type WritePolicyMode,
+} from "./edit-policy.ts";
+import {
   isGitRepo,
   isGitRepoSync,
   createCheckpoint,
@@ -908,14 +927,29 @@ export default function workflowExtension(pi: ExtensionAPI) {
       commitMode = "never";
     }
     const policy = ` · commits:${commitMode}`;
+    // Write-policy surfacing (workflow.writePolicy): the active file-write
+    // permission, visible at a glance like the commit policy. Read live so a
+    // /write-policy change shows up without a reload. It only applies in
+    // Default mode, so it is omitted in the other modes.
+    let writeMode: WritePolicyMode = "allow";
+    try {
+      writeMode = readWritePolicyConfig(
+        (ctx as any).cwd ?? process.cwd(),
+        getAgentDir(),
+      ).config.mode;
+    } catch {
+      writeMode = "allow";
+    }
+    const writePolicy =
+      workflowMode === null ? ` · writes:${writeMode}` : "";
     const staleMarker = todoStale ? " ⚠" : "";
     const done = todoItems.filter((t) => isDone(t)).length;
     const total = todoItems.length;
     if (workflowMode === "build") {
       const label =
         total > 0
-          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}`
-          : `▶ build${suffix}${policy}`;
+          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`
+          : `▶ build${suffix}${policy}${writePolicy}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", label));
     } else if (workflowMode === "plan") {
       const base = plannotatorActive
@@ -923,21 +957,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
         : "⏸ plan";
       const label =
         total > 0
-          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}`
-          : `${base}${suffix}${policy}`;
+          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`
+          : `${base}${suffix}${policy}${writePolicy}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (total > 0) {
       ctx.ui.setStatus(
         "workflow",
         ctx.ui.theme.fg(
           "muted",
-          `◦ ${done}/${total}${staleMarker}${suffix}${policy}`,
+          `◦ ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`,
         ),
       );
     } else {
       ctx.ui.setStatus(
         "workflow",
-        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}`),
+        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}${writePolicy}`),
       );
     }
     if (todoItems.length > 0) {
@@ -1595,6 +1629,103 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // typed argument text ("ask project", never bare "project").
     getArgumentCompletions: (prefix: string) =>
       commitPolicyArgumentCompletions(prefix),
+  });
+
+  // ── /write-policy: view/set the write permission (workflow.writePolicy) ──
+  // Available in every mode: it only writes settings JSON; the gate itself
+  // lives in tool_call and applies in Default mode only.
+  pi.registerCommand("write-policy", {
+    description:
+      "View or set the write permission (what the agent may modify in Default mode): /write-policy allow|ask|never [global|project]",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const tokens = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "").toLowerCase();
+      const scope: "global" | "project" =
+        tokens.includes("project") && !tokens.includes("global")
+          ? "project"
+          : "global";
+
+      if (!sub || sub === "status") {
+        const resolved = readWritePolicyConfig(cwd, agentDir);
+        const paths = writePolicyConfigPaths(cwd, agentDir);
+        const where =
+          resolved.sources.mode === "default"
+            ? "default — no settings file supplies it"
+            : `${resolved.sources.mode} settings`;
+        const lines = [
+          `Write policy: ${resolved.config.mode} (${where})`,
+          `  ${describeWritePolicyMode(resolved.config.mode)}`,
+          "  Applies to Default mode only — Plan mode is read-only already, /build is the execution escape hatch.",
+        ];
+        if (resolved.config.allowedPaths.length > 0) {
+          lines.push(
+            `Always-allowed paths (${resolved.config.allowedPaths.length}):`,
+            ...resolved.config.allowedPaths.map((p) => `  ${p}`),
+          );
+        }
+        if (resolved.config.allowedCommands.length > 0) {
+          lines.push(
+            `Always-allowed commands (${resolved.config.allowedCommands.length}):`,
+            ...resolved.config.allowedCommands.map((c) => `  ${c}`),
+          );
+        }
+        if (resolved.config.mutatingTools.length > 0) {
+          lines.push(
+            `Extra write tools (${resolved.config.mutatingTools.length}):`,
+            ...resolved.config.mutatingTools.map((t) => `  ${t}`),
+          );
+        }
+        lines.push(
+          `Global settings: ${paths.global}`,
+          `Project settings: ${paths.project}`,
+          "Usage: /write-policy allow|ask|never [global|project]",
+        );
+        ctx.ui.notify(lines.join("\n"), "info");
+        updateStatus(ctx as any);
+        return;
+      }
+
+      if (sub !== "allow" && sub !== "ask" && sub !== "never") {
+        ctx.ui.notify(
+          [
+            "Usage: /write-policy allow|ask|never [global|project]",
+            "  allow  the agent may write files freely in Default mode",
+            "  ask    every file write asks first; granted paths/commands are remembered",
+            "  never  the agent may not write files — you write, or switch to /build",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      const res = writeWritePolicyConfig(scope, cwd, agentDir, {
+        mode: sub as WritePolicyMode,
+      });
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Could not write write-policy settings: ${res.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `Write policy → ${sub} (${scope})\n${describeWritePolicyMode(
+          sub as WritePolicyMode,
+        )}\nSettings: ${res.path}`,
+        "info",
+      );
+      updateStatus(ctx as any);
+    },
+    // pi-tui full-argument contract (see writePolicyArgumentCompletions):
+    // modes first, then the write scope, with values that replace the whole
+    // typed argument text ("ask project", never bare "project").
+    getArgumentCompletions: (prefix: string) =>
+      writePolicyArgumentCompletions(prefix),
   });
 
   pi.registerCommand("review-prompt", {
@@ -6588,6 +6719,258 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Write permission gate (workflow.writePolicy) — Default mode only.
+   *
+   * The Workflow extension's three modes are Plan → Build → Default. Plan
+   * mode is read-only and Build mode is unrestricted by design, but DEFAULT
+   * mode was ALSO unrestricted: `resolveSessionRole()` returns undefined
+   * there, so the tool_call gate has no branch to take and the agent edits
+   * files without asking. This gate is the missing permission knob.
+   *
+   * It is deliberately INDEPENDENT of the role gate and of the commit
+   * policy: those govern *what* a role may do, this governs *whether the
+   * user permits a write at all*.
+   *
+   * Returns a block object when the call must not proceed, undefined when it
+   * may. Never throws — a throwing tool_call handler blocks the tool as a
+   * fail-safe, so every failure path here fails CLOSED with an actionable
+   * reason (the reason is what the model reads).
+   */
+  async function writePolicyGate(
+    event: any,
+    ctx: any,
+    cwd: string,
+  ): Promise<{ block: true; reason: string; terminate?: boolean } | undefined> {
+    try {
+      // Scope: the top-level Default-mode session only.
+      //  - Plan mode has its own stricter rules (writes only to .pi/plans/).
+      //  - Build mode is the deliberate "go ahead" execution escape hatch.
+      //  - A spawned child carries PI_WORKFLOW_ROLE and is already read-only
+      //    through the role gate (and has no UI to answer a prompt).
+      if (workflowMode !== null) return undefined;
+      if (
+        resolveSessionRole({
+          envRole: process.env[WORKFLOW_ROLE_ENV],
+          workflowMode,
+        }) !== undefined
+      ) {
+        return undefined;
+      }
+
+      const resolved = readWritePolicyConfig(cwd, getAgentDir());
+      const config = resolved.config;
+      if (config.mode === "allow") return undefined;
+
+      const classification = classifyWriteCall(
+        event.toolName,
+        event.input,
+        config,
+      );
+      if (!classification.mutating) return undefined;
+
+      // The workflow's own plan directory stays writable in every mode — a
+      // session that leaves Plan mode mid-flow must not be stranded.
+      if (
+        classification.paths.length > 0 &&
+        classification.paths.every((p) => isPlanWritePath(p, cwd))
+      ) {
+        return undefined;
+      }
+
+      const allowed = isWriteCallAllowed(classification, config, cwd);
+      const decision = decideWriteGate({
+        mode: config.mode,
+        mutating: true,
+        allowed,
+      });
+      if (decision === "allow") return undefined;
+
+      const target =
+        classification.paths.length > 0
+          ? classification.paths.join(", ")
+          : (classification.key ?? String(event.toolName));
+      const why = classification.reason
+        ? ` (${classification.reason})`
+        : "";
+
+      if (decision === "block") {
+        return {
+          block: true,
+          reason:
+            `Write policy is 'never' (workflow.writePolicy): the agent may not modify files in Default mode${why}. ` +
+            "Do not retry. Ask the user how to proceed, or tell them to switch to Build mode (/build) — that is the approved-execution path. " +
+            `The user can also change the policy with /write-policy (ask to be prompted, allow to write freely). Target: ${target}`,
+        };
+      }
+
+      // decision === "ask" — prompt the user.
+      const ui = ctx?.ui;
+      if (!ui || !ctx.hasUI) {
+        return {
+          block: true,
+          reason:
+            `Write policy is 'ask' (workflow.writePolicy): writing needs user approval${why}, but no interactive UI is available. ` +
+            "Do not retry. Report what you would change and let the user apply it, or tell them to switch to Build mode (/build). " +
+            `Target: ${target}`,
+        };
+      }
+
+      const isPathGrant = classification.paths.length > 0;
+      const options = isPathGrant
+        ? [
+            "Allow once",
+            "Always allow this path",
+            "Deny",
+            WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+          ]
+        : [
+            "Allow once",
+            "Always allow this command",
+            "Deny",
+            WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+          ];
+      let sel: unknown;
+      try {
+        sel = await ui.select(
+          `Write policy 'ask': allow this write${why}?`,
+          options,
+        );
+      } catch (_e) {
+        void _e;
+        sel = undefined;
+      }
+      const choice = parseWriteGateChoice(sel);
+      if (choice === "allow-once") return undefined;
+
+      if (choice === "always") {
+        // Persist the grant so the same target stops asking. A path grant
+        // stores the absolute path; a command grant stores the command key.
+        const patch = isPathGrant
+          ? {
+              allowedPaths: classification.paths.map((p) =>
+                normalizeWritePath(p, cwd),
+              ),
+            }
+          : { allowedCommands: classification.key ? [classification.key] : [] };
+        const written = writeWritePolicyConfig("global", cwd, getAgentDir(), patch);
+        if (written.ok) {
+          try {
+            (ctx as any).ui?.notify?.(
+              `Write policy: always allowed ${isPathGrant ? classification.paths.join(", ") : classification.key}`,
+              "info",
+            );
+          } catch (_e) {
+            void _e;
+          }
+          return undefined;
+        }
+        // The grant could not be persisted — do not silently allow a write
+        // the user asked to remember. Fall through to the denial below.
+        return {
+          block: true,
+          reason:
+            `Write policy 'ask': could not save the permission grant (${written.error ?? "unknown error"}), so the write was not allowed. ` +
+            `Target: ${target}`,
+        };
+      }
+
+      // ── Denial ──
+      // "Deny with instructions…" lets the user say WHY in one sentence
+      // ("only explore and propose a plan, do not edit files yet"), so the
+      // model can change course instead of stopping cold. The sentence
+      // travels through TWO channels:
+      //   1. the block reason (the tool result the model reads right now), and
+      //   2. a USER message (a steer turn the model must obey).
+      // Anthropic shipped the comment-only version and then shipped the bug
+      // where the model ignored it (anthropics/claude-code#89231, #52824):
+      // a tool result is a fact the model may reinterpret, a user turn is an
+      // instruction it must follow.
+      let instruction = "";
+      if (choice === "deny-with-instructions") {
+        const inputFn = (ui as any).input;
+        if (typeof inputFn === "function") {
+          let typed: unknown;
+          try {
+            typed = await inputFn.call(
+              ui,
+              WRITE_INSTRUCTION_PROMPT_TITLE,
+              WRITE_INSTRUCTION_PROMPT_PLACEHOLDER,
+            );
+          } catch (_e) {
+            void _e;
+            typed = undefined;
+          }
+          instruction = sanitizeWriteInstruction(typed);
+        }
+        // No input dialog, a cancelled dialog, or empty text → plain denial
+        // below. A cancel is never an implicit allow.
+      }
+
+      const reason = buildWriteDenyReason({
+        target,
+        why: classification.reason,
+        instruction,
+      });
+
+      if (instruction) {
+        // Channel 2: a user-role message. `steer` queues it while the agent
+        // is running; it lands after the current tool batch, before the next
+        // model call, as a genuine user turn.
+        //
+        // Guard: while a review round is active the extension's `input`
+        // handler routes incoming user text to the REVIEWER, so steering
+        // here would hand the instruction to the wrong agent. The tool result
+        // still carries it, so skip the steer rather than misroute.
+        const rt = reviewRuntime;
+        const wouldRouteToReviewer = shouldRouteInputToReviewer({
+          reviewEnabled: reviewEnabled(),
+          reviewActive: rt?.isRoundActive() === true,
+          hasReviewerSession: rt?.isAlive() === true,
+        });
+        if (!wouldRouteToReviewer) {
+          try {
+            (pi as any).sendUserMessage?.(
+              buildWriteGuidanceMessage({ target, instruction }),
+              { deliverAs: "steer" },
+            );
+          } catch (_e) {
+            void _e;
+          }
+        }
+        // Audit trail — transcript only (appendEntry is never sent to the LLM).
+        try {
+          pi.appendEntry("workflow-write-denial", {
+            tool: String(event.toolName ?? ""),
+            target,
+            instruction,
+            at: Date.now(),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      }
+
+      return {
+        block: true,
+        reason,
+        // Stop the tool batch: a denied write must not be followed by
+        // another write attempt in the same turn. The guided path still
+        // delivers the instruction — the queued steer message keeps the run
+        // alive, so the model answers the user's sentence.
+        terminate: true,
+      };
+    } catch (e: unknown) {
+      // Fail closed: a broken policy read must not become an open door.
+      return {
+        block: true,
+        reason:
+          `Write policy (workflow.writePolicy) could not be evaluated (${e instanceof Error ? e.message : String(e)}), so the write was blocked. ` +
+          "Do not retry. Ask the user to switch to Build mode (/build) or to fix the policy with /write-policy.",
+      };
+    }
+  }
+
   // Block edits/writes + bash gating
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
@@ -6720,6 +7103,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
         block: true,
         reason: `${gateRole} role: ${event.toolName} blocked — this role is read-only.`,
       } as any;
+    }
+    // ── Write permission gate (workflow.writePolicy) ── Independent of the
+    // role gate and of the commit policy: it governs whether the USER
+    // permits a write at all. It only applies in Default mode — Plan has its
+    // own stricter rules and Build is the approved-execution escape hatch —
+    // and it runs last so it only sees calls nothing else claimed.
+    if (workflowMode === null) {
+      const writeBlock = await writePolicyGate(event, ctx, cwd);
+      if (writeBlock) return writeBlock as any;
     }
     // In build mode, ensure todos exist before first real edit
     if (

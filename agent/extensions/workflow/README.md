@@ -12,6 +12,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
 - **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, inline markdown handoff (`ScrollView` → inline scrollback), `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all).
+- **Write permission** — a user-controlled `allow`/`ask`/`never` permission for file writes in **Default** mode, the mode that is otherwise ungated. `/write-policy` sets it; see [Write permission](#write-permission) below.
 - **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
 
 ## Install
@@ -43,6 +44,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review` | Run one review round against the current plan file now |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
+| `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
 
 ## Model Profiles
 
@@ -308,6 +310,67 @@ The confirmation step is required: with no positive answer no authorization exis
 
 Known limits (accepted, same trade-off OpenCode/Claude Code make): a configured git alias (e.g. `ci` → `commit`) is not recognized, and exotic obfuscations (`sh -c 'git commit'`) are caught only when the plain text survives. Plan-mode and subagent read-only gating are unaffected by the policy; the shadow-checkpoint rewind commits live in a separate bare repo and never appear in your history.
 
+## Write permission
+
+The extension has three modes — **Plan → Build → Default**. Plan mode is read-only and Build mode is unrestricted *by design* (it is the approved-execution path), but **Default mode was also completely unrestricted**: the tool gate has no role to apply there, so the agent edits your files without asking, and it does so inconsistently — sometimes it asks for clarification, sometimes it goes straight to `edit`.
+
+`workflow.writePolicy` closes that gap. It is a **user-controlled permission**, enforced where the tools execute (not in prose — prompt rules are soft and get ignored), and it applies to **Default mode only**:
+
+| Mode | Meaning |
+| --- | --- |
+| `allow` (default) | The agent writes files freely — today's behaviour, and the shipped default so existing installs are unaffected |
+| `ask` | Every file write pops a dialog: **Allow once** / **Always allow this path** (or *this command*) / **Deny** / **Deny with instructions…**. A permanent grant is remembered, so the same target stops asking |
+| `never` | The agent may not write files at all. You apply the changes, or the user switches to `/build` for the approved-execution path |
+
+The status line always shows the active permission (`◦ commits:never · writes:ask`), so you can see at a glance what the agent may touch.
+
+### What is gated
+
+- The `edit` and `write` tools.
+- `bash` commands that may modify files. A command is treated as a write when it is **not provably read-only**: a file redirect (`>`, `>>`), a heredoc or command substitution, a command outside the read-only/verify allowlist (`rm`, `mv`, `cp`, `sed -i`, `npm install`, `git checkout`, interpreters, unknown binaries …), or a write flag on an otherwise-safe command (`eslint --fix`). Read-only commands (`ls`, `cat`, `rg`, `git status`, `npm test`, `tsc --noEmit`) and harmless redirections (`2>/dev/null`, `2>&1`) stay free.
+- `powershell` is always treated as a write — it cannot be classified by the POSIX allowlist, so it fails closed.
+
+`git add` / `git commit` / `git push` are **not** treated as file writes: they touch the index and the object store, not your working tree, and the independent [commit policy](#commit-policy) already governs them.
+
+### Scope and carve-outs
+
+- **Default mode only.** Plan mode keeps its stricter read-only rules (writes only to `.pi/plans/`), and Build mode stays the deliberate "go ahead" escape hatch.
+- **Subagents are unaffected.** A spawned child carries `PI_WORKFLOW_ROLE` and is already read-only through the role gate — and it has no UI to answer a prompt with.
+- **`.pi/plans/` writes stay allowed** in every mode, so a session that leaves Plan mode mid-flow is not stranded.
+- **Third-party write tools need opting in.** `ast_grep_replace` (pi-lens) rewrites files, and the `office_*` tools (pi-office-protocol) write documents; neither is covered by the built-in scope. List them in `mutatingTools` to gate them (see below).
+
+```text
+/write-policy                # status: mode, which scope supplied it, the allowlists
+/write-policy ask            # set globally (~/.pi/agent/settings.json)
+/write-policy never project  # this repo only (<cwd>/.pi/settings.json)
+```
+
+**Headless sessions fail closed** under `ask`: there is nobody to answer the dialog, so the write is blocked with a reason telling the model to report the change instead. `allow` and `never` are unaffected.
+
+### Denying with guidance
+
+A plain **Deny** tells the model only that the write was refused. It does not say what you actually want, so the model either stops cold or re-proposes the same kind of change. **Deny with instructions…** opens a one-line text box, and your sentence steers the model:
+
+```
+Write denied — tell the agent how to proceed
+> only explore and propose a plan, do not edit files yet
+```
+
+The instruction reaches the model through **two channels**, on purpose:
+
+1. **The tool result** — the block reason quotes your sentence verbatim and ends with the disposition (*"Do not retry this write. Follow the instruction above. If it cannot be followed, say so and stop."*).
+2. **A user message** — the same sentence is delivered as a real user turn (`deliverAs: "steer"`), after the current tool batch and before the next model call.
+
+The second channel is not redundancy for its own sake: Claude Code shipped the comment-on-rejection design and then shipped a bug where the model ignored the comment (it kept trying workarounds) — [anthropics/claude-code#89231](https://github.com/anthropics/claude-code/issues/89231), [#52824](https://github.com/anthropics/claude-code/issues/52824). A tool result is a fact the model may reinterpret; a user turn is an instruction it must follow. Cursor and Claude Code now offer the same affordance (*"Reject? Tell what to do differently"*).
+
+Behaviour worth knowing:
+
+- **Scope: this write only.** The instruction governs the denied call. The next write asks again — nothing is remembered, nothing is persisted (your sentence is never written to `settings.json`; it lives in the transcript and in one audit entry).
+- **A plain Deny now ends the agent's turn.** The denied write is not followed by another write attempt in the same batch. The model does not send a reply, so you type the next instruction. (The guided path differs: the queued user message keeps the session alive, so the model answers your sentence.)
+- **Cancelling the text box is a plain Deny** — never an implicit allow. An empty or whitespace-only sentence behaves the same way.
+- **Long or noisy input is sanitized**: line endings are normalised, control characters are stripped, and the text is capped at 2000 characters.
+- **One prompt per gated call.** If the model asks for several writes in one turn, each is a separate dialog.
+
 ## Settings
 
 Role config lives in `~/.pi/agent/roles.json` v2 (user) with optional per-project override at `<cwd>/.pi/roles.json` (per-role replace). Each role holds exactly one `{provider, id, thinking}`. v1 `modelPool` files are discarded and reseeded on load. Seeded with defaults on first run. Respects `theme`, `modelRegistry`, and `plannotator` phases from `agent/plannotator.json`.
@@ -364,9 +427,32 @@ Commit Policy settings live under `workflow.commitPolicy` (same global/project p
 
 `"commitPolicy": "ask"` (a bare mode string) is accepted as shorthand for `{ "mode": "ask" }`. Booleans, numbers and unknown modes fall back to the default. `/commit-policy` writes this key read-modify-write, preserving every other settings key.
 
+Write Permission settings live under `workflow.writePolicy` (same global/project precedence — `mode` is project-over-global, and the allowlists are **unioned** across scopes, because an allowlist is a grant of trust):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"allow"` | `"allow"` = the agent writes freely in Default mode; `"ask"` = every write prompts; `"never"` = writes are blocked (you write, or the user switches to `/build`) |
+| `allowedPaths` | `[]` | Absolute paths the agent may write without being asked again. An entry covers the file itself and everything under it on a directory boundary |
+| `allowedCommands` | `[]` | Command keys the agent may run without being asked again (the mutating shell segment, e.g. `rm -rf build`) |
+| `mutatingTools` | `[]` | Extra tool names to treat as file writes (e.g. `ast_grep_replace`, `office_excel_write_cells`) |
+
+```json
+{
+  "workflow": {
+    "writePolicy": {
+      "mode": "ask",
+      "allowedPaths": ["C:/work/project/src"],
+      "mutatingTools": ["ast_grep_replace"]
+    }
+  }
+}
+```
+
+`"writePolicy": "ask"` (a bare mode string) is accepted as shorthand for `{ "mode": "ask" }`. Booleans, numbers and unknown modes fall back to the default. `/write-policy` writes this key read-modify-write, preserving every other settings key; the three list fields are **additive** — a write never drops the entries already stored (remove one by editing the JSON directly).
+
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -410,8 +496,16 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts
 ```
+
+The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):
+
+```bash
+node --experimental-transform-types scripts/verify-write-policy.mjs
+```
+
+It covers the allow/ask/never modes, the "always allow" grant, and the guided denial (the instruction dialog, the two delivery channels, the audit entry, and the cancelled/empty fallbacks). What it cannot check is the part that matters most: how the real TUI renders the text box, and whether a live model actually obeys your instruction — do those two by hand once.
 
 Plain TypeScript, no build step — Pi loads `index.ts` directly (via jiti). From the repo root, `npm run verify` checks this package's manifest, tarball contents, tests and load path before a release. Live reload: edit the `.ts` file and run `/reload` in Pi.
 

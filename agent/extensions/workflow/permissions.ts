@@ -424,8 +424,14 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /(^|\s)(sh|bash|dash|zsh|fish|ksh|csh|tcsh|pwsh|powershell|cmd|cscript|wscript|perl|ruby)(\.exe)?(\s|$)/i,
 ];
 
-/** Writing/formatting flags that must never reach a verify-class command. */
-const DENIED_FLAG_RE =
+/**
+ * Writing/formatting flags that must never reach a verify-class command.
+ *
+ * Exported for the write policy's command classification (edit-policy.ts):
+ * a verify-class command that carries one of these still rewrites files
+ * (`eslint --fix`), so the write gate must treat it as a write.
+ */
+export const DENIED_FLAG_RE =
   /(^|\s)(--fix|--fix-dry-run|--write|--update|--update-snapshots?|--updateSnapshot|--test-update-snapshots|--watch|--watchAll|--inspect|--inspect-brk|--in-place|--output)(\s|$|=)/i;
 
 /**
@@ -548,6 +554,22 @@ const NULL_DEVICE_REDIRECT_RE =
   /(^|[\s;&|()])(?:[12]|&)?>>?\s*\/dev\/null(?=$|[\s;&|)])/g;
 
 /**
+ * Strip harmless redirection tokens from a command: fd duplications
+ * (`2>&1` / `1>&2`) and null-device targets (`> /dev/null`). Neither writes
+ * a file the user can see, so both are removed before the command is
+ * classified by its first word — otherwise `2>/dev/null ls` would look like
+ * an unknown binary and be treated as a write.
+ *
+ * Exported for the write policy's command classification (edit-policy.ts).
+ */
+export function stripHarmlessRedirects(command: unknown): string {
+  const raw = typeof command === "string" ? command : "";
+  return raw
+    .replace(/\d*>&\d+/g, " ")
+    .replace(NULL_DEVICE_REDIRECT_RE, "$1");
+}
+
+/**
  * Why a command's syntax cannot be classified (`null` = the syntax is fine).
  * Mirrors the order the gate has always used, so a refusal can name the first
  * failing construct instead of only saying "blocked".
@@ -556,9 +578,7 @@ export function forbiddenSyntaxReason(command: unknown): string | null {
   const raw = typeof command === "string" ? command : "";
   // `2>&1` / `1>&2` are fd duplications, not file writes; `/dev/null` targets
   // are a bit bucket, not a file.
-  const scrubbed = raw
-    .replace(/\d*>&\d+/g, " ")
-    .replace(NULL_DEVICE_REDIRECT_RE, "$1");
+  const scrubbed = stripHarmlessRedirects(raw);
   if (scrubbed.replace(/&&/g, " ").includes("&"))
     return "a background `&` (only `&&` chains are allowed)";
   if (raw.includes("$(")) return "command substitution `$(...)`";

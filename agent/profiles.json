@@ -2,22 +2,22 @@
   "version": 1,
   "profiles": [
     {
-      "name": "Syn-GLM-5.3-Flash-Planner",
+      "name": "Opencode-Deepseek-V4.1-Flash",
       "description": "",
       "roles": {
         "planner": {
-          "provider": "synthetic",
-          "id": "hf:zai-org/GLM-5.3-Flash",
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
           "thinking": "xhigh"
         },
         "explorer": {
-          "provider": "synthetic",
-          "id": "hf:zai-org/GLM-5.3-Flash",
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
           "thinking": "medium"
         },
         "builder": {
-          "provider": "synthetic",
-          "id": "hf:zai-org/GLM-5.3-Flash",
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
           "thinking": "high"
         },
         "reviewer": {
@@ -28,7 +28,7 @@
       }
     },
     {
-      "name": "Syn-Deepseek-v4.1-Flash-Planner",
+      "name": "Synthetic-Deepseek-V4.1-Flash",
       "description": "",
       "roles": {
         "planner": {
@@ -38,7 +38,7 @@
         },
         "explorer": {
           "provider": "synthetic",
-          "id": "hf:zai-org/GLM-5.3-Flash",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
           "thinking": "medium"
         },
         "builder": {
@@ -47,8 +47,60 @@
           "thinking": "high"
         },
         "reviewer": {
-          "provider": "synthetic",
-          "id": "hf:zai-org/GLM-5.3-Flash",
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "xhigh"
+        }
+      }
+    },
+    {
+      "name": "Opencode-Contributor",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "xhigh"
+        }
+      }
+    },
+    {
+      "name": "Opencode-Free",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "opencode-go",
+          "id": "minimax-m3.1-flash-free",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "opencode-go",
+          "id": "beam-free",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "opencode-go",
+          "id": "minimax-m3.1-flash-free",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
           "thinking": "xhigh"
         }
       }

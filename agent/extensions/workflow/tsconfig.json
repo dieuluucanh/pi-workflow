@@ -28,6 +28,8 @@
     "./profiles.test.ts",
     "./commit-policy.ts",
     "./commit-policy.test.ts",
+    "./edit-policy.ts",
+    "./edit-policy.test.ts",
     "./review.ts",
     "./review-providers.ts",
     "./review-tools.ts",
