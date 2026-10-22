@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.6.1] - 2026-10-22
 
 ### Fixed — the active tab is marked explicitly, not only by a fill
 
