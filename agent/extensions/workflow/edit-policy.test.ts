@@ -30,6 +30,7 @@ import {
   commandAllowKey,
   commandMayWrite,
   decideWriteGate,
+  describeWriteGateItems,
   describeWritePolicyMode,
   extractWritePolicyRaw,
   isCommandAllowed,
@@ -41,12 +42,20 @@ import {
   readWritePolicyConfig,
   sanitizeWriteInstruction,
   toolAllowKey,
+  writeGateItemFromClassification,
+  writeGateItemsKind,
   writeGateOptions,
+  writeGateAlwaysLabel,
+  writeGateTargetKey,
+  writeGateTargetsLabel,
+  writeGateTitle,
   writePolicyArgumentCompletions,
   writePolicyConfigPaths,
   writePolicyModeSourceOf,
   writeTargetPaths,
   writeWritePolicyConfig,
+  type WriteCallClassification,
+  type WriteGateItem,
   type WritePolicyConfig,
 } from "./edit-policy.ts";
 // WORKFLOW_SETTINGS_KEY lives in commit-policy.ts (edit-policy.ts imports it
@@ -801,18 +810,20 @@ test("coupling guard: every real option parses to the intended choice", () => {
   // The gate renders writeGateOptions() and switches on parseWriteGateChoice(),
   // so a renamed label would otherwise change behaviour silently. The order
   // is the dialog's order: Allow once, Always allow, Deny, Deny with instructions.
-  assert.deepEqual(writeGateOptions("path").map(parseWriteGateChoice), [
-    "allow-once",
-    "always",
-    "deny",
-    "deny-with-instructions",
-  ]);
-  assert.deepEqual(writeGateOptions("command").map(parseWriteGateChoice), [
-    "allow-once",
-    "always",
-    "deny",
-    "deny-with-instructions",
-  ]);
+  for (const kind of [
+    "path",
+    "paths",
+    "command",
+    "commands",
+    "mixed",
+  ] as const) {
+    assert.deepEqual(writeGateOptions(kind).map(parseWriteGateChoice), [
+      "allow-once",
+      "always",
+      "deny",
+      "deny-with-instructions",
+    ]);
+  }
   // The two denial options must stay distinguishable: "Deny with…" is only
   // matched because it is tested BEFORE the bare "Deny" prefix.
   assert.equal(
@@ -878,4 +889,153 @@ test("buildWriteGuidanceMessage: an empty instruction is sanitized away", () => 
   const message = buildWriteGuidanceMessage({ target: "a.ts", instruction: "" });
   assert.ok(!message.includes("undefined"));
   assert.ok(message.includes("a.ts"));
+});
+
+// ── turn-scoped gate helpers ─────────────────────────────────────────
+
+const ASK_CONFIG: WritePolicyConfig = {
+  ...DEFAULT_WRITE_POLICY_CONFIG,
+  mode: "ask",
+};
+
+test("writeGateOptions: the labels state the scope they cover", () => {
+  // One answer covers EVERY gated write of the turn — the label must say so.
+  assert.equal(writeGateOptions("path")[0], "Allow once (this turn)");
+  assert.equal(writeGateOptions("mixed")[0], "Allow once (this turn)");
+  // The "always" label matches the number/kind of the listed writes.
+  assert.equal(writeGateAlwaysLabel("path"), "Always allow this path");
+  assert.equal(writeGateAlwaysLabel("paths"), "Always allow these paths");
+  assert.equal(writeGateAlwaysLabel("command"), "Always allow this command");
+  assert.equal(writeGateAlwaysLabel("commands"), "Always allow these commands");
+  assert.equal(writeGateAlwaysLabel("mixed"), "Always allow these");
+});
+
+test("writeGateTargetKey: a path write keys on its normalized absolute path", () => {
+  const cwd = "C:/work";
+  const rel = classifyWriteCall("edit", { path: "src/a.ts" }, ASK_CONFIG);
+  const abs = classifyWriteCall("edit", { path: "C:/work/src/a.ts" }, ASK_CONFIG);
+  // The same file keys the same way however the model spelled it.
+  assert.equal(
+    writeGateTargetKey("edit", rel, cwd),
+    writeGateTargetKey("edit", abs, cwd),
+  );
+  assert.match(writeGateTargetKey("edit", rel, cwd), /^path:/);
+  // A different file is a different key.
+  const other = classifyWriteCall("edit", { path: "src/b.ts" }, ASK_CONFIG);
+  assert.notEqual(
+    writeGateTargetKey("edit", rel, cwd),
+    writeGateTargetKey("edit", other, cwd),
+  );
+});
+
+test("writeGateTargetKey: a command write keys on its command key", () => {
+  const cwd = "C:/work";
+  const classification = classifyWriteCall(
+    "bash",
+    { command: "rm -rf tmpdir" },
+    ASK_CONFIG,
+  );
+  const key = writeGateTargetKey("bash", classification, cwd);
+  assert.match(key, /^cmd:/);
+  assert.ok(key.includes("rm -rf tmpdir"));
+  // The same command written differently is the same key.
+  const again = classifyWriteCall(
+    "bash",
+    { command: "rm   -rf   tmpdir" },
+    ASK_CONFIG,
+  );
+  assert.equal(key, writeGateTargetKey("bash", again, cwd));
+});
+
+test("writeGateItemFromClassification: a file write carries its path grant", () => {
+  const cwd = "C:/work";
+  const classification = classifyWriteCall(
+    "edit",
+    { path: "src/a.ts" },
+    ASK_CONFIG,
+  );
+  const item = writeGateItemFromClassification("edit", classification, cwd);
+  assert.equal(item.tool, "edit");
+  assert.equal(item.target, "src/a.ts");
+  assert.equal(item.why, "edits src/a.ts");
+  assert.deepEqual(item.grantPaths, ["c:/work/src/a.ts"]);
+  assert.equal(item.grantCommand, undefined);
+});
+
+test("writeGateItemFromClassification: a command write carries its command grant", () => {
+  const cwd = "C:/work";
+  const classification = classifyWriteCall(
+    "bash",
+    { command: "rm -rf tmpdir" },
+    ASK_CONFIG,
+  );
+  const item = writeGateItemFromClassification("bash", classification, cwd);
+  assert.equal(item.target, "rm -rf tmpdir");
+  assert.equal(item.grantPaths, undefined);
+  assert.ok(item.grantCommand);
+  assert.ok(item.key.startsWith("cmd:"));
+});
+
+test("writeGateItemsKind: the kind follows the listed writes", () => {
+  const pathItem: WriteGateItem = {
+    tool: "edit",
+    target: "a.ts",
+    why: "edits a.ts",
+    key: "path:a",
+    grantPaths: ["c:/work/a.ts"],
+  };
+  const commandItem: WriteGateItem = {
+    tool: "bash",
+    target: "rm -rf x",
+    why: "runs a command that may modify files",
+    key: "cmd:rm -rf x",
+    grantCommand: "rm -rf x",
+  };
+  assert.equal(writeGateItemsKind([pathItem]), "path");
+  assert.equal(writeGateItemsKind([pathItem, { ...pathItem, key: "path:b" }]), "paths");
+  assert.equal(writeGateItemsKind([commandItem]), "command");
+  assert.equal(
+    writeGateItemsKind([commandItem, { ...commandItem, key: "cmd:other" }]),
+    "commands",
+  );
+  assert.equal(writeGateItemsKind([pathItem, commandItem]), "mixed");
+});
+
+test("describeWriteGateItems: lists what the answer covers", () => {
+  const items: WriteGateItem[] = [
+    { tool: "edit", target: "src/a.ts", why: "edits src/a.ts", key: "path:a" },
+    { tool: "edit", target: "src/b.ts", why: "edits src/b.ts", key: "path:b" },
+  ];
+  assert.equal(describeWriteGateItems(items), "edits src/a.ts; edits src/b.ts");
+  // An item without a reason falls back to its target.
+  assert.equal(
+    describeWriteGateItems([{ tool: "edit", target: "src/c.ts", key: "path:c" }]),
+    "src/c.ts",
+  );
+});
+
+test("writeGateTargetsLabel: joins the targets for the reason text", () => {
+  const items: WriteGateItem[] = [
+    { tool: "edit", target: "src/a.ts", key: "path:a" },
+    { tool: "edit", target: "src/b.ts", key: "path:b" },
+  ];
+  assert.equal(writeGateTargetsLabel(items), "src/a.ts, src/b.ts");
+});
+
+test("writeGateTitle: one write keeps today's wording, several are listed", () => {
+  const one: WriteGateItem[] = [
+    { tool: "edit", target: "src/a.ts", why: "edits src/a.ts", key: "path:a" },
+  ];
+  assert.equal(
+    writeGateTitle(one),
+    "Write policy 'ask': allow this write (edits src/a.ts)?",
+  );
+  const many: WriteGateItem[] = [
+    ...one,
+    { tool: "edit", target: "src/b.ts", why: "edits src/b.ts", key: "path:b" },
+  ];
+  const title = writeGateTitle(many);
+  assert.match(title, /allow these 2 writes\?/);
+  assert.ok(title.includes("edits src/a.ts"));
+  assert.ok(title.includes("edits src/b.ts"));
 });

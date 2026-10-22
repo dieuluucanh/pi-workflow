@@ -753,23 +753,44 @@ export function sanitizeWriteInstruction(raw: unknown): string {
  * The gate consumes this and `parseWriteGateChoice` below, so a renamed
  * label can never silently change the gate's behaviour (the unit test maps
  * every real option through the parser).
+ *
+ * The labels state the scope they really have, because ONE answer now
+ * covers every gated write of the turn (see the turn-scoped helpers below):
+ * "Allow once (this turn)" allows the writes the dialog listed, and
+ * "Always allow …" persists a grant for every one of them.
  */
 export function writeGateOptions(
-  kind: "path" | "command",
+  kind: WriteGateOptionKind,
 ): readonly string[] {
-  return kind === "path"
-    ? [
-        "Allow once",
-        "Always allow this path",
-        "Deny",
-        WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
-      ]
-    : [
-        "Allow once",
-        "Always allow this command",
-        "Deny",
-        WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
-      ];
+  return [
+    "Allow once (this turn)",
+    writeGateAlwaysLabel(kind),
+    "Deny",
+    WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
+  ];
+}
+
+/**
+ * The "always allow" label for a set of items — singular, plural or mixed.
+ *
+ * The prefix "Always allow" is what `parseWriteGateChoice` matches on, so
+ * every variant parses to the same choice.
+ */
+export function writeGateAlwaysLabel(kind: WriteGateOptionKind): string {
+  switch (kind) {
+    case "path":
+      return "Always allow this path";
+    case "paths":
+      return "Always allow these paths";
+    case "command":
+      return "Always allow this command";
+    case "commands":
+      return "Always allow these commands";
+    case "mixed":
+      return "Always allow these";
+    default:
+      return "Always allow these";
+  }
 }
 
 /** What the ask dialog's answer means. */
@@ -852,6 +873,164 @@ export function buildWriteGuidanceMessage(input: {
     "[write denied — the user asked you to do something different]\n" +
     `The user denied the write to ${target}. Their instruction:\n\n${instruction}\n\n` +
     "Follow the instruction above instead of retrying that write."
+  );
+}
+
+// ── Turn-scoped gate helpers ───────────────────────────────────────────
+//
+// The gate asks ONE question per assistant turn — not one per tool call.
+//
+// WHY: Pi executes an assistant message's tool calls as a BATCH, and the
+// extension's `tool_call` hook runs in the batch's PREPARATION phase: once
+// per call, sequentially, before any tool in the batch runs
+// (pi-agent-core/dist/agent-loop.js → executeToolCallsParallel →
+// prepareToolCall → beforeToolCall). A model that batches two writes to the
+// same file therefore produced two dialogs back to back, with no agent
+// output in between — and the instruction typed into the first one could
+// not reach the model before the second one opened, because a tool result is
+// appended only after the whole batch and a steer message lands only after
+// the turn's tool calls have run. The user had to retype the same sentence.
+//
+// So the gate collects the turn's gated writes, shows them all in one
+// dialog, and applies the answer to every one of them.
+
+/** One gated write covered by a single dialog answer. */
+export interface WriteGateItem {
+  /** The tool that would write (edit, write, bash, powershell, …). */
+  tool: string;
+  /** Human target: the joined paths, or the command/tool key. */
+  target: string;
+  /** Short cause, e.g. "edits src/a.ts". */
+  why?: string;
+  /** Stable key a denial is remembered under (see `writeGateTargetKey`). */
+  key: string;
+  /** Path grants "always allow" would persist for this item. */
+  grantPaths?: string[];
+  /** Command (or tool) grant "always allow" would persist for this item. */
+  grantCommand?: string;
+}
+
+/**
+ * Which "always allow" label fits a set of items.
+ *
+ * "path"/"paths" — every item writes files; "command"/"commands" — every
+ * item runs a command (or a path-less tool, whose grant is stored in the
+ * command list); "mixed" — both in one turn.
+ */
+export type WriteGateOptionKind =
+  | "path"
+  | "paths"
+  | "command"
+  | "commands"
+  | "mixed";
+
+/**
+ * The stable key a denial is remembered under.
+ *
+ * Path writes key on their normalized absolute path(s) (so the same file
+ * keys the same way whatever the model spelled it as), command writes on
+ * their allow-key, and a path-less tool on its tool key.
+ */
+export function writeGateTargetKey(
+  toolName: string,
+  classification: WriteCallClassification,
+  cwd: string,
+): string {
+  const paths = classification.paths
+    .map((p) => normalizeWritePath(p, cwd))
+    .filter((p) => p.length > 0)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (paths.length > 0) return `path:${paths.join("|")}`;
+  if (classification.key) return `cmd:${commandAllowKey(classification.key)}`;
+  return `tool:${toolAllowKey(toolName)}`;
+}
+
+/**
+ * Build the item for one classified call.
+ *
+ * `grantPaths` / `grantCommand` are what "always allow" would persist for
+ * this item: the normalized paths for a file write, the allow-key for a
+ * command or a path-less tool.
+ */
+export function writeGateItemFromClassification(
+  toolName: string,
+  classification: WriteCallClassification,
+  cwd: string,
+): WriteGateItem {
+  const tool = String(toolName ?? "");
+  const rawPaths = classification.paths.filter(
+    (p) => typeof p === "string" && p.trim().length > 0,
+  );
+  const grantPaths = rawPaths
+    .map((p) => normalizeWritePath(p, cwd))
+    .filter((p) => p.length > 0);
+  const item: WriteGateItem = {
+    tool,
+    target: rawPaths.length > 0 ? rawPaths.join(", ") : (classification.key ?? tool),
+    why: classification.reason,
+    key: writeGateTargetKey(tool, classification, cwd),
+  };
+  if (grantPaths.length > 0) item.grantPaths = grantPaths;
+  else if (classification.key) item.grantCommand = classification.key;
+  return item;
+}
+
+/** Which "always allow" label fits a set of items. */
+export function writeGateItemsKind(
+  items: readonly WriteGateItem[],
+): WriteGateOptionKind {
+  const paths = items.filter((i) => (i.grantPaths?.length ?? 0) > 0);
+  const commands = items.filter((i) => Boolean(i.grantCommand));
+  if (paths.length > 0 && commands.length > 0) return "mixed";
+  if (paths.length > 0) return paths.length === 1 ? "path" : "paths";
+  if (commands.length > 0) return commands.length === 1 ? "command" : "commands";
+  return "path";
+}
+
+/**
+ * The human list of the writes a dialog covers:
+ * "edits src/a.ts; edits src/b.ts".
+ */
+export function describeWriteGateItems(
+  items: readonly WriteGateItem[],
+): string {
+  return items
+    .map((item) => {
+      const why = String(item.why ?? "").trim();
+      return why || String(item.target ?? "").trim();
+    })
+    .filter((text) => text.length > 0)
+    .join("; ");
+}
+
+/**
+ * The targets of a set of items, joined for the reason/guidance text:
+ * "src/a.ts, src/b.ts".
+ */
+export function writeGateTargetsLabel(
+  items: readonly WriteGateItem[],
+): string {
+  return items
+    .map((item) => String(item.target ?? "").trim())
+    .filter((text) => text.length > 0)
+    .join(", ");
+}
+
+/**
+ * The dialog title.
+ *
+ * One write keeps today's wording verbatim; several writes are listed, so
+ * the user sees exactly what the answer covers.
+ */
+export function writeGateTitle(items: readonly WriteGateItem[]): string {
+  if (items.length <= 1) {
+    const only = items[0];
+    const why = only?.why ? ` (${only.why})` : "";
+    return `Write policy 'ask': allow this write${why}?`;
+  }
+  return (
+    `Write policy 'ask': allow these ${items.length} writes? ` +
+    `(${describeWriteGateItems(items)})`
   );
 }
 

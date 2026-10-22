@@ -2,6 +2,41 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — the ask dialog asks once per turn, not once per tool call
+
+**The problem.** The write policy's `ask` mode opened a dialog **per gated
+tool call**. Pi runs an assistant message's tool calls as a **batch**, and the
+extension's `tool_call` hook is invoked for *every* call of that batch before
+the first of them runs (`pi-agent-core`: `executeToolCallsParallel` →
+`prepareToolCall` → `beforeToolCall`). So when the model batched two writes to
+one file, the user got **the same question twice, back to back**, with no agent
+output in between — and the sentence typed into the first dialog could not
+reach the model before the second one opened (a tool result is appended only
+after the whole batch, and a steer message lands only after the turn's tool
+calls have run). The user had to select *Deny with instructions…* again and
+retype the same sentence; only the second copy reached the agent.
+
+**The change.**
+
+- **One dialog per assistant turn.** It lists every gated write of that turn
+  (`Write policy 'ask': allow these 2 writes? (edits src/a.ts; edits src/b.ts)`)
+  and one answer applies to all of them. *Allow once* is now **Allow once
+  (this turn)**; *Always allow …* persists a grant for **every** listed target
+  (paths and commands), so none of them asks again.
+- **A denial is remembered for the rest of the run.** A later turn that tries
+  the same target is denied again with the same sentence — **no second dialog,
+  nothing to retype**. The memory ends with the run: the next run asks again.
+- **The instruction is delivered once per turn** (one steer user turn, not one
+  per blocked call), and every blocked call of the turn carries it in its block
+  reason.
+
+**Scope.** The `allow` / `never` modes, the `.pi/plans/` carve-out, the role
+and commit gates, the reviewer routing, the fail-closed headless path and the
+"a denial never sets `terminate`" contract are unchanged. A host that delivers
+no assistant message falls back to one dialog per call.
+
 ## [0.6.1] - 2026-10-22
 
 ### Fixed — the active tab is marked explicitly, not only by a fill

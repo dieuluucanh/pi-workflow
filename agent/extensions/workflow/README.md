@@ -319,15 +319,16 @@ The extension has three modes — **Plan → Build → Default**. Plan mode is r
 | Mode | Meaning |
 | --- | --- |
 | `allow` (default) | The agent writes files freely — today's behaviour, and the shipped default so existing installs are unaffected |
-| `ask` | Every file write pops a dialog: **Allow once** / **Always allow this path** (or *this command*) / **Deny** / **Deny with instructions…**. A permanent grant is remembered, so the same target stops asking |
-| `never` | The agent may not write files at all. You apply the changes, or the user switches to `/build` for the approved-execution path |
+| `ask` | Writes pop a dialog: **Allow once (this turn)** / **Always allow …** (*this path*, *these paths*, *this command*, *these commands*) / **Deny** / **Deny with instructions…**. One dialog covers a whole turn and lists the writes it covers; a permanent grant is remembered, so the same target stops asking |
+| `never` | The agent may not modify your files (`.pi/plans/` excepted). You apply the changes, or the user switches to `/build` for the approved-execution path |
 
 The status line always shows the active permission (`◦ commits:never · writes:ask`), so you can see at a glance what the agent may touch.
 
 ### What is gated
 
 - The `edit` and `write` tools.
-- `bash` commands that may modify files. A command is treated as a write when it is **not provably read-only**: a file redirect (`>`, `>>`), a heredoc or command substitution, a command outside the read-only/verify allowlist (`rm`, `mv`, `cp`, `sed -i`, `npm install`, `git checkout`, interpreters, unknown binaries …), or a write flag on an otherwise-safe command (`eslint --fix`). Read-only commands (`ls`, `cat`, `rg`, `git status`, `npm test`, `tsc --noEmit`) and harmless redirections (`2>/dev/null`, `2>&1`) stay free.
+- `bash` commands that may modify files. A command is treated as a write when it is **not provably read-only**: a file redirect (`>`, `>>`), a heredoc or command substitution, a command outside the read-only/verify allowlist (`rm`, `mv`, `cp`, `sed`, `awk`, `npm install`, `git checkout`, interpreters, unknown binaries …), or a write flag on an otherwise-safe command (`eslint --fix`). Read-only commands (`ls`, `cat`, `rg`, `git status`, `npm test`, `tsc --noEmit`) and harmless redirections (`2>/dev/null`, `2>&1`) stay free.
+- **`sed` and `awk` are gated as potential writes whatever their flags** — their programs are code (GNU sed's `e` command runs a shell command and its `w` command writes a file; awk can `system()` or redirect), so a plain `sed -n '…p' file` asks too. To inspect a file without a prompt use `rg` / `head` / `tail` / `cut` / `column` / `jq`, or the `read` tool — or pick **Always allow this command** to grant that one command permanently.
 - `powershell` is always treated as a write — it cannot be classified by the POSIX allowlist, so it fails closed.
 
 `git add` / `git commit` / `git push` are **not** treated as file writes: they touch the index and the object store, not your working tree, and the independent [commit policy](#commit-policy) already governs them.
@@ -359,18 +360,18 @@ Write denied — tell the agent how to proceed
 The instruction reaches the model through **two channels**, on purpose:
 
 1. **The tool result** — the block reason quotes your sentence verbatim and ends with the disposition (*"Do not retry this write. Follow the instruction above. If it cannot be followed, say so and stop."*).
-2. **A user message** — the same sentence is delivered as a real user turn (`deliverAs: "steer"`), after the current tool batch and before the next model call.
+2. **A user message** — the same sentence is delivered as a real user turn (`deliverAs: "steer"`), after the current tool batch and before the next model call. One user turn per turn, not one per blocked call.
 
 The second channel is not redundancy for its own sake: Claude Code shipped the comment-on-rejection design and then shipped a bug where the model ignored the comment (it kept trying workarounds) — [anthropics/claude-code#89231](https://github.com/anthropics/claude-code/issues/89231), [#52824](https://github.com/anthropics/claude-code/issues/52824). A tool result is a fact the model may reinterpret; a user turn is an instruction it must follow. Cursor and Claude Code now offer the same affordance (*"Reject? Tell what to do differently"*).
 
 Behaviour worth knowing:
 
-- **Scope: this write only.** The instruction governs the denied call. The next write asks again — nothing is remembered, nothing is persisted (your sentence is never written to `settings.json`; it lives in the transcript and in one audit entry).
+- **One dialog per turn, not per call.** Pi runs an assistant message's tool calls as a batch, and the gate is asked about *every* call of that batch before the first of them runs. Asking per call therefore asked the same question twice when the model batched two writes to one file — and the sentence typed into the first dialog could not reach the model before the second one opened (a tool result is only appended after the whole batch, and a user turn lands only after the batch has run). The dialog now lists every write the answer covers, and the answer applies to all of them: **Allow once (this turn)** allows the listed writes of that turn, **Always allow …** persists a grant for every one of them.
+- **A denial is remembered for the rest of the run.** If the agent tries the same write again in a later turn, it is denied again with the same sentence — no second dialog, nothing to retype. The memory ends with the run (the next run asks again). To let that write through sooner, end the run (Esc) and start a new one, or switch to `/build` — the gate only applies in Default mode. Your sentence is never written to `settings.json`; it lives in the transcript and in one audit entry per turn.
 - **A plain Deny behaves exactly as it always has** — the agent's run is not cut short, and the model keeps its turn. A denial never sets pi's `terminate` flag: that flag is only consulted *after* a whole tool batch has run, so it cannot stop a sibling write — it would only take away the model's next turn.
-- **For a durable "explore only, don't edit yet", use `/plan`.** Plan mode is read-only by design and keeps the agent inside that rule for the whole session; a denial sentence applies to one write.
+- **For a durable "explore only, don't edit yet", use `/plan`.** Plan mode is read-only by design and keeps the agent inside that rule for the whole session; a denial sentence applies to the run it was given in.
 - **Cancelling the text box is a plain Deny** — never an implicit allow. An empty or whitespace-only sentence behaves the same way.
 - **Long or noisy input is sanitized**: line endings are normalised, control characters are stripped, and the text is capped at 2000 characters.
-- **One prompt per gated call.** If the model asks for several writes in one turn, each is a separate dialog.
 
 ## Settings
 
@@ -432,10 +433,10 @@ Write Permission settings live under `workflow.writePolicy` (same global/project
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `"allow"` | `"allow"` = the agent writes freely in Default mode; `"ask"` = every write prompts; `"never"` = writes are blocked (you write, or the user switches to `/build`) |
-| `allowedPaths` | `[]` | Absolute paths the agent may write without being asked again. An entry covers the file itself and everything under it on a directory boundary |
-| `allowedCommands` | `[]` | Command keys the agent may run without being asked again (the mutating shell segment, e.g. `rm -rf build`) |
-| `mutatingTools` | `[]` | Extra tool names to treat as file writes (e.g. `ast_grep_replace`, `office_excel_write_cells`) |
+| `mode` | `"allow"` | `"allow"` = the agent writes freely in Default mode; `"ask"` = every write prompts; `"never"` = writes are blocked (`.pi/plans/` excepted — you write, or the user switches to `/build`) |
+| `allowedPaths` | `[]` | Absolute paths the agent may write without being asked again (stored absolute, forward-slashed and lower-cased). An entry covers the file itself and everything under it on a directory boundary |
+| `allowedCommands` | `[]` | Command keys the agent may run without being asked again (the mutating shell segment, e.g. `rm -rf build`). A key is stored **normalised** — trimmed, whitespace collapsed, lower-cased — so a hand-written entry has to match that form |
+| `mutatingTools` | `[]` | Extra tool names to treat as file writes (e.g. `ast_grep_replace`, `office_excel_write_cells`). A grant for a tool **without** a path is stored in `allowedCommands` as `tool:<name>` (e.g. `tool:ast_grep_replace`) |
 
 ```json
 {
@@ -504,9 +505,12 @@ The write policy also has an end-to-end check that drives the real `tool_call` h
 
 ```bash
 node --experimental-transform-types scripts/verify-write-policy.mjs
+# or, equivalently (and the form the repo's own agent can run — the raw
+# `node` binary is outside a read-only role's command allowlist):
+npm run check:policy
 ```
 
-It covers the allow/ask/never modes, the "always allow" grant, and the guided denial (the instruction dialog, the two delivery channels, the audit entry, and the cancelled/empty fallbacks). What it cannot check is the part that matters most: how the real TUI renders the text box, and whether a live model actually obeys your instruction — do those two by hand once.
+It covers the allow/ask/never modes, the "always allow" grant, the guided denial (the instruction dialog, the two delivery channels, the audit entry, and the cancelled/empty fallbacks) and the turn-scoped gate: one dialog per assistant turn, the denial remembered for the run, and a batch grant covering every listed target. What it cannot check is the part that matters most: how the real TUI renders the text box, and whether a live model actually obeys your instruction — do those two by hand once.
 
 Plain TypeScript, no build step — Pi loads `index.ts` directly (via jiti). From the repo root, `npm run verify` checks this package's manifest, tarball contents, tests and load path before a release. Live reload: edit the `.ts` file and run `/reload` in Pi.
 

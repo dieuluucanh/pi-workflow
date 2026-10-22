@@ -42,7 +42,7 @@
   "doubleEscapeAction": "none",
   "workflow": {
     "reviewMode": {
-      "enabled": true,
+      "enabled": false,
       "rounds": 1,
       "passes": 2,
       "verify": true,
@@ -52,9 +52,12 @@
     },
     "defaultProfile": "Opencode-Free",
     "writePolicy": {
-      "mode": "ask",
+      "mode": "allow",
       "allowedPaths": [],
-      "allowedCommands": [],
+      "allowedCommands": [
+        "sed -n '260,340p' docs/multi_gpu.md",
+        "sed -n '395,500p' docs/multi_gpu.md"
+      ],
       "mutatingTools": []
     }
   }

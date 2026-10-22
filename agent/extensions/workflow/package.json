@@ -8,7 +8,8 @@
   "license": "MIT",
   "scripts": {
     "test": "node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:policy": "node --experimental-transform-types scripts/verify-write-policy.mjs"
   },
   "repository": {
     "type": "git",

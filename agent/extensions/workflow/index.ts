@@ -117,16 +117,23 @@ import {
   decideWriteGate,
   describeWritePolicyMode,
   isWriteCallAllowed,
-  normalizeWritePath,
   parseWriteGateChoice,
   readWritePolicyConfig,
   sanitizeWriteInstruction,
   writePolicyArgumentCompletions,
   writePolicyConfigPaths,
   writeWritePolicyConfig,
+  writeGateItemFromClassification,
+  writeGateItemsKind,
   writeGateOptions,
+  writeGateTargetsLabel,
+  writeGateTitle,
   WRITE_INSTRUCTION_PROMPT_PLACEHOLDER,
   WRITE_INSTRUCTION_PROMPT_TITLE,
+  type WriteGateChoice,
+  type WriteGateItem,
+  type WriteCallClassification,
+  type WritePolicyConfig,
   type WritePolicyMode,
 } from "./edit-policy.ts";
 import {
@@ -457,6 +464,34 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // already accounted for so they never trigger a spurious commit.
   const committedStepRefs = new Set<string>();
   let stepCommitsSeeded = false;
+  // ── Write-policy gate state (turn-scoped decisions, run-scoped denials) ──
+  // Pi runs an assistant message's tool calls as ONE batch, and the
+  // extension's tool_call hook runs in the batch's preparation phase — once
+  // per call, before any tool in the batch runs. Asking per call therefore
+  // asked the SAME question twice (two calls to the same path), and the
+  // instruction typed into the first dialog could not reach the model
+  // before the second one opened. The gate now asks once per turn:
+  //   writeGateBatchCalls  — the tool calls of the current assistant
+  //                          message (the turn's batch), captured on
+  //                          message_end; the dialog lists the writes it
+  //                          covers.
+  //   writeGateTurnAnswer  — the answer the user gave for this turn; it
+  //                          applies to every gated call of the turn, so
+  //                          the siblings are never asked again.
+  //   writeGateTurnSteered — whether this turn already delivered the
+  //                          instruction as a user turn (at most one steer
+  //                          per turn).
+  //   writeGateRunDenials  — denials remembered for the rest of the run,
+  //                          keyed by the write's target key, so a later
+  //                          retry is auto-denied (no second dialog) with
+  //                          the same instruction.
+  let writeGateBatchCalls: { name: string; args: unknown }[] = [];
+  /** The tool-call ids of the cached batch — a call outside it starts a new one. */
+  let writeGateBatchCallIds = new Set<string>();
+  let writeGateTurnAnswer: { choice: WriteGateChoice; instruction: string } | null =
+    null;
+  let writeGateTurnSteered = false;
+  const writeGateRunDenials = new Map<string, { instruction: string }>();
   // ── Reminder throttle + staleness tracking (passive enforcement layer) ──
   let turnsSinceLastTodoWrite = 0;
   let turnsSinceLastReminder = 0;
@@ -6299,6 +6334,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
+    // A reloaded/forked session must never inherit a stale write denial.
+    writeGateRunDenials.clear();
+    writeGateTurnAnswer = null;
+    writeGateTurnSteered = false;
+    writeGateBatchCalls = [];
+    writeGateBatchCallIds = new Set();
     // Roles are file-backed; load them up-front so every read path (status,
     // band label, reviewer runtime) sees the real config even in a fresh
     // session that has no persisted workflow entry yet. Profiles likewise.
@@ -6544,6 +6585,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // A write denial is run-scoped; the session is going away, so drop it.
+    writeGateRunDenials.clear();
+    writeGateTurnAnswer = null;
+    writeGateTurnSteered = false;
+    writeGateBatchCalls = [];
+    writeGateBatchCallIds = new Set();
     // Kill any active explore subagents to prevent orphan leaks.
     // Without this, `pi --mode json` children spawned by runSingleAgent
     // (up to 4 concurrent) could survive if VS Code closes the terminal
@@ -6746,6 +6793,88 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   /**
+   * The gated writes of the current assistant turn (the batch), as items the
+   * dialog can list.
+   *
+   * Pi runs an assistant message's tool calls as a batch and prompts the
+   * extension for EVERY call before the first tool of the batch runs, so the
+   * batch is the natural scope of ONE question. The current call is always
+   * part of the list (its arguments may have been rewritten by another
+   * extension's tool_call handler after the assistant message was sealed).
+   */
+  function collectWriteGateItems(
+    currentEvent: any,
+    currentClassification: WriteCallClassification,
+    config: WritePolicyConfig,
+    cwd: string,
+  ): WriteGateItem[] {
+    const items: WriteGateItem[] = [];
+    const seen = new Set<string>();
+    const add = (name: string, classification: WriteCallClassification) => {
+      const item = writeGateItemFromClassification(name, classification, cwd);
+      if (!item.key || seen.has(item.key)) return;
+      seen.add(item.key);
+      items.push(item);
+    };
+    for (const call of writeGateBatchCalls) {
+      const name = String(call.name ?? "");
+      if (!name) continue;
+      const classification = classifyWriteCall(name, call.args, config);
+      if (!classification.mutating) continue;
+      // A granted target is not gated — it never reaches a dialog.
+      if (isWriteCallAllowed(classification, config, cwd)) continue;
+      // The plan directory stays writable in every mode.
+      if (
+        classification.paths.length > 0 &&
+        classification.paths.every((p) => isPlanWritePath(p, cwd))
+      ) {
+        continue;
+      }
+      add(name, classification);
+    }
+    add(String(currentEvent?.toolName ?? ""), currentClassification);
+    return items;
+  }
+
+  /**
+   * Deliver the user's instruction to the model as a USER turn (a steer).
+   *
+   * At most once per assistant turn: the sentence is also quoted in every
+   * blocked call's reason (the tool result), so a turn needs ONE user turn,
+   * not one per blocked call.
+   */
+  function deliverWriteInstruction(
+    items: readonly WriteGateItem[],
+    instruction: string,
+  ): void {
+    if (!instruction || writeGateTurnSteered) return;
+    // Guard: while a review round is active the extension's `input` handler
+    // routes incoming user text to the REVIEWER, so steering here would
+    // hand the instruction to the wrong agent. The tool result still carries
+    // it, so skip the steer rather than misroute.
+    const rt = reviewRuntime;
+    const wouldRouteToReviewer = shouldRouteInputToReviewer({
+      reviewEnabled: reviewEnabled(),
+      reviewActive: rt?.isRoundActive() === true,
+      hasReviewerSession: rt?.isAlive() === true,
+    });
+    if (!wouldRouteToReviewer) {
+      try {
+        (pi as any).sendUserMessage?.(
+          buildWriteGuidanceMessage({
+            target: writeGateTargetsLabel(items) || "the requested write",
+            instruction,
+          }),
+          { deliverAs: "steer" },
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
+    writeGateTurnSteered = true;
+  }
+
+  /**
    * Write permission gate (workflow.writePolicy) — Default mode only.
    *
    * The Workflow extension's three modes are Plan → Build → Default. Plan
@@ -6762,6 +6891,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * may. Never throws — a throwing tool_call handler blocks the tool as a
    * fail-safe, so every failure path here fails CLOSED with an actionable
    * reason (the reason is what the model reads).
+   *
+   * Under `ask` it asks ONE question per assistant turn (see the batch
+   * helpers above) and remembers a denial for the rest of the run.
    */
   async function writePolicyGate(
     event: any,
@@ -6830,7 +6962,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
         };
       }
 
-      // decision === "ask" — prompt the user.
+      // decision === "ask" — ONE question per assistant turn.
+      //
+      // Pi runs an assistant message's tool calls as a batch and prompts the
+      // extension for EVERY call before the first tool of the batch runs
+      // (pi-agent-core: executeToolCallsParallel → prepareToolCall →
+      // beforeToolCall). Asking per call therefore asked the SAME question
+      // twice when the model batched two writes to one path, and the
+      // instruction typed into the first dialog could not reach the model
+      // before the second one opened (a tool result is appended only after
+      // the whole batch, and a steer lands only after the turn's tool calls
+      // have run) — the user had to retype the same sentence.
+      //
+      // So: one dialog per turn, listing every write the answer covers, and
+      // the answer applies to all of them.
       const ui = ctx?.ui;
       if (!ui || !ctx.hasUI) {
         return {
@@ -6842,41 +6987,98 @@ export default function workflowExtension(pi: ExtensionAPI) {
         };
       }
 
-      const isPathGrant = classification.paths.length > 0;
-      const options = writeGateOptions(isPathGrant ? "path" : "command");
+      // The turn's gated writes (the current call at minimum).
+      // A call that is NOT part of the cached batch belongs to a NEW batch
+      // (a host that delivers no assistant message, or a nested tool call):
+      // reset the turn's answer first — a stale answer must never carry
+      // over, or the gate would stop asking altogether.
+      const callId = String(event.toolCallId ?? "");
+      if (!writeGateBatchCallIds.has(callId)) {
+        writeGateTurnAnswer = null;
+        writeGateTurnSteered = false;
+        writeGateBatchCalls = [];
+        writeGateBatchCallIds = new Set();
+      }
+      const items = collectWriteGateItems(event, classification, config, cwd);
+      const currentItem = writeGateItemFromClassification(
+        String(event.toolName ?? ""),
+        classification,
+        cwd,
+      );
+
+      // (a) The user denied this target earlier in THIS RUN → deny again,
+      // silently. The model gets the same sentence; the user is not asked a
+      // second time for the same decision.
+      const remembered = writeGateRunDenials.get(currentItem.key);
+      if (remembered) {
+        deliverWriteInstruction(items, remembered.instruction);
+        return {
+          block: true,
+          reason: buildWriteDenyReason({
+            target,
+            why: classification.reason,
+            instruction: remembered.instruction,
+          }),
+        };
+      }
+
+      // (b) The user already answered for THIS TURN → apply the answer to
+      // every gated call of the turn. No second dialog.
+      if (writeGateTurnAnswer) {
+        const answer = writeGateTurnAnswer;
+        if (answer.choice === "allow-once" || answer.choice === "always") {
+          return undefined;
+        }
+        return {
+          block: true,
+          reason: buildWriteDenyReason({
+            target,
+            why: classification.reason,
+            instruction: answer.instruction,
+          }),
+        };
+      }
+
+      // (c) The first gated call of the turn → ask ONCE.
+      const options = writeGateOptions(writeGateItemsKind(items));
       let sel: unknown;
       try {
-        sel = await ui.select(
-          `Write policy 'ask': allow this write${why}?`,
-          options,
-        );
+        sel = await ui.select(writeGateTitle(items), options);
       } catch (_e) {
         void _e;
         sel = undefined;
       }
       const choice = parseWriteGateChoice(sel);
-      if (choice === "allow-once") return undefined;
+      if (choice === "allow-once") {
+        // Applies to every gated write of this turn — the dialog listed them.
+        writeGateTurnAnswer = { choice, instruction: "" };
+        return undefined;
+      }
 
       if (choice === "always") {
-        // Persist the grant so the same target stops asking. A path grant
-        // stores the absolute path; a command grant stores the command key.
-        const patch = isPathGrant
-          ? {
-              allowedPaths: classification.paths.map((p) =>
-                normalizeWritePath(p, cwd),
-              ),
-            }
-          : { allowedCommands: classification.key ? [classification.key] : [] };
-        const written = writeWritePolicyConfig("global", cwd, getAgentDir(), patch);
+        // Persist a grant for EVERY write the dialog listed, so none of them
+        // asks again. A path grant stores the absolute path; a command (or
+        // path-less tool) grant stores the command key.
+        const allowedPaths: string[] = [];
+        const allowedCommands: string[] = [];
+        for (const item of items) {
+          for (const p of item.grantPaths ?? []) allowedPaths.push(p);
+          if (item.grantCommand) allowedCommands.push(item.grantCommand);
+        }
+        const written = writeWritePolicyConfig("global", cwd, getAgentDir(), {
+          allowedPaths,
+          allowedCommands,
+        });
         if (written.ok) {
           try {
             (ctx as any).ui?.notify?.(
-              `Write policy: always allowed ${isPathGrant ? classification.paths.join(", ") : classification.key}`,
+              `Write policy: always allowed ${writeGateTargetsLabel(items)}`,
               "info",
             );
           } catch (_e) {
             void _e;
           }
+          writeGateTurnAnswer = { choice, instruction: "" };
           return undefined;
         }
         // The grant could not be persisted — do not silently allow a write
@@ -6921,8 +7123,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
         // below. A cancel is never an implicit allow.
       }
 
+      // The answer covers every gated write of this turn.
+      writeGateTurnAnswer = { choice, instruction };
+      // …and the denial is remembered for the REST OF THE RUN, under every
+      // target of this turn: a later retry is auto-denied with the same
+      // sentence instead of asking the user again.
+      for (const item of items) {
+        writeGateRunDenials.set(item.key, { instruction });
+      }
+
       const reason = buildWriteDenyReason({
-        target,
+        target: items.length > 1 ? writeGateTargetsLabel(items) : target,
         why: classification.reason,
         instruction,
       });
@@ -6930,35 +7141,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (instruction) {
         // Channel 2: a user-role message. `steer` queues it while the agent
         // is running; it lands after the current tool batch, before the next
-        // model call, as a genuine user turn.
-        //
-        // Guard: while a review round is active the extension's `input`
-        // handler routes incoming user text to the REVIEWER, so steering
-        // here would hand the instruction to the wrong agent. The tool result
-        // still carries it, so skip the steer rather than misroute.
-        const rt = reviewRuntime;
-        const wouldRouteToReviewer = shouldRouteInputToReviewer({
-          reviewEnabled: reviewEnabled(),
-          reviewActive: rt?.isRoundActive() === true,
-          hasReviewerSession: rt?.isAlive() === true,
-        });
-        if (!wouldRouteToReviewer) {
-          try {
-            (pi as any).sendUserMessage?.(
-              buildWriteGuidanceMessage({ target, instruction }),
-              { deliverAs: "steer" },
-            );
-          } catch (_e) {
-            void _e;
-          }
-        }
-        // Audit trail — transcript only (appendEntry is never sent to the LLM).
+        // model call, as a genuine user turn. ONE per turn, not one per
+        // blocked call.
+        deliverWriteInstruction(items, instruction);
+        // Audit trail — transcript only (appendEntry is never sent to the
+        // LLM). One entry per turn: it records the user's decision, not each
+        // call the decision was applied to.
         try {
           pi.appendEntry("workflow-write-denial", {
             tool: String(event.toolName ?? ""),
             target,
             instruction,
             at: Date.now(),
+            targets: items.map((item) => item.target),
           });
         } catch (_e) {
           void _e;
@@ -7274,8 +7469,45 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   });
 
+  // ── Write-policy gate: the turn's batch ──
+  // Pi prepares and prompts EVERY tool call of an assistant message before
+  // the first tool of that message runs (pi-agent-core's
+  // executeToolCallsParallel → prepareToolCall → beforeToolCall). The tool
+  // calls of the assistant message ARE the turn's batch, so the gate can ask
+  // ONE question that lists every write the answer covers. A new assistant
+  // message is a new batch — hence a new turn, hence a new answer.
+  pi.on("message_end", async (event) => {
+    try {
+      const message = (event as any)?.message;
+      if (!message || message.role !== "assistant") return;
+      const content = Array.isArray(message.content) ? message.content : [];
+      const calls: { name: string; args: unknown }[] = [];
+      const callIds = new Set<string>();
+      for (const block of content) {
+        if (!block || block.type !== "toolCall") continue;
+        calls.push({
+          name: String(block.name ?? ""),
+          args: block.arguments,
+        });
+        if (block.id) callIds.add(String(block.id));
+      }
+      writeGateBatchCalls = calls;
+      writeGateBatchCallIds = callIds;
+      writeGateTurnAnswer = null;
+      writeGateTurnSteered = false;
+    } catch (_e) {
+      void _e;
+    }
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     footerInjectedThisTurn = false;
+    // A new turn = a new answer for the write gate (the batch's own
+    // message_end already resets it; this is the defensive second guard).
+    writeGateTurnAnswer = null;
+    writeGateTurnSteered = false;
+    writeGateBatchCalls = [];
+    writeGateBatchCallIds = new Set();
     // Seed the per-step commit ledger once per session: steps already done
     // (restored sessions, re-executed plans) never trigger a spurious commit.
     try {
@@ -7318,6 +7550,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // dropped here — nothing that runs next inherits them.
     commitAuthorization = null;
     pendingCommitFlow = null;
+    // A write denial is remembered for the REST OF THE RUN, so a later retry
+    // of the same target is auto-denied instead of asking again. The run is
+    // over → the next run asks again.
+    writeGateRunDenials.clear();
+    writeGateTurnAnswer = null;
+    writeGateTurnSteered = false;
+    writeGateBatchCalls = [];
+    writeGateBatchCallIds = new Set();
     // keep persisted CustomEntry for reload, clear in-memory tombstone only on explicit prune; for now no clear to survive fork
   });
 
