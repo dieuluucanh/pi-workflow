@@ -2,6 +2,31 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — the active tab is marked explicitly, not only by a fill
+
+**The problem.** The tab rows (the questionnaire, the profile editor, the role
+config) marked the active tab with a **background fill** only
+(`theme.bg("selectedBg", …)`). A fill is easy to miss in a host that paints it
+in its own palette — the Pi Desktop app renders extension components in its own
+theme, and the fill was nearly invisible there. The reader could not tell
+*which* tab was active, and the `■`/`□` glyphs (answered / unanswered) carried
+the only strong signal in the row.
+
+**The change.** The active tab now carries an explicit `→` marker in the accent
+colour, next to the state glyph, in addition to the fill. The marker replaces
+the two-space indent, so the labels stay aligned:
+
+```text
+→ □ Scope   ■ Tests   ✓ Submit
+  □ Scope   ■ Tests   ✓ Submit
+```
+
+**Scope.** Rendering only: no behaviour, keybinding or answer changes. The
+questionnaire, the profile editor and the role config all use the same marker,
+so every tab row in every surface now says which tab is active.
+
 ## [0.6.0] - 2026-10-20
 
 ### Added — "Deny with instructions": a guided denial in the write policy

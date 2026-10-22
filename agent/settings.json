@@ -25,7 +25,11 @@
     "opencode-go/deepseek-v4.1-flash",
     "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash",
     "synthetic/hf:zai-org/GLM-5.3-Flash",
-    "synthetic/hf:Qwen/Qwen3.8-27B"
+    "synthetic/hf:Qwen/Qwen3.8-27B",
+    "opencode-go/minimax-m3.1-flash-free",
+    "opencode-go/beam-free",
+    "opencode-go/mimo-v2.6-flash",
+    "opencode-go/longcat-2.5-preview-free"
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",

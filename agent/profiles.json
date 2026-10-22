@@ -100,7 +100,7 @@
         },
         "reviewer": {
           "provider": "opencode-go",
-          "id": "deepseek-v4.1-flash",
+          "id": "beam-free",
           "thinking": "xhigh"
         }
       }

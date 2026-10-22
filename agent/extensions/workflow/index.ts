@@ -4187,21 +4187,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
             const lbl = ` ${box} ${roleIcon(roleName)} ${roleName} `;
             chips.push(
               i === currentTab
-                ? theme.bg("selectedBg", theme.fg("text", lbl))
-                : theme.fg(dirty ? "success" : "muted", lbl),
+                ? theme.bg(
+                    "selectedBg",
+                    `${theme.fg("accent", "→")} ${theme.fg("text", lbl)}`,
+                  )
+                : theme.fg(dirty ? "success" : "muted", `  ${lbl}`),
             );
           }
           const saveActivateLbl = " ✓ Save & activate ";
           const saveOnlyLbl = " 💾 Save only ";
           chips.push(
             isSaveActivate()
-              ? theme.bg("selectedBg", theme.fg("text", saveActivateLbl))
-              : theme.fg("success", saveActivateLbl),
+              ? theme.bg(
+                  "selectedBg",
+                  `${theme.fg("accent", "→")} ${theme.fg("text", saveActivateLbl)}`,
+                )
+              : theme.fg("success", `  ${saveActivateLbl}`),
           );
           chips.push(
             currentTab === tabIds.length + 1
-              ? theme.bg("selectedBg", theme.fg("text", saveOnlyLbl))
-              : theme.fg("success", saveOnlyLbl),
+              ? theme.bg(
+                  "selectedBg",
+                  `${theme.fg("accent", "→")} ${theme.fg("text", saveOnlyLbl)}`,
+                )
+              : theme.fg("success", `  ${saveOnlyLbl}`),
           );
           lines.push(` ${chips.join("")}`);
           lines.push("");
@@ -4991,15 +5000,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
               const lbl = ` ${box} ${roleIcon(r.name)} ${r.name} `;
               chips.push(
                 i === currentTab
-                  ? theme.bg("selectedBg", theme.fg("text", lbl))
-                  : theme.fg(dirty ? "success" : "muted", lbl),
+                  ? theme.bg(
+                      "selectedBg",
+                      `${theme.fg("accent", "→")} ${theme.fg("text", lbl)}`,
+                    )
+                  : theme.fg(dirty ? "success" : "muted", `  ${lbl}`),
               );
             }
             const submitLbl = " ✓ Submit ";
             chips.push(
               isSubmitTab()
-                ? theme.bg("selectedBg", theme.fg("text", submitLbl))
-                : theme.fg("success", submitLbl),
+                ? theme.bg(
+                    "selectedBg",
+                    `${theme.fg("accent", "→")} ${theme.fg("text", submitLbl)}`,
+                  )
+                : theme.fg("success", `  ${submitLbl}`),
             );
             lines.push(` ${chips.join("")}`);
             lines.push("");
@@ -5730,17 +5745,28 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 const box = answered ? "■" : "□";
                 const color = answered ? "success" : "muted";
                 const text = ` ${box} ${lbl} `;
+                // The active tab carries an explicit marker, not only the
+                // selection fill. A fill alone is easy to miss in a host that
+                // paints it in its own palette (the desktop app); the marker is
+                // what says "this one" in every surface. The marker replaces
+                // the two-space indent, so the labels stay aligned.
                 const styled = active
-                  ? theme.bg("selectedBg", theme.fg("text", text))
-                  : theme.fg(color as any, text);
+                  ? theme.bg(
+                      "selectedBg",
+                      `${theme.fg("accent", "→")} ${theme.fg("text", text)}`,
+                    )
+                  : theme.fg(color as any, `  ${text}`);
                 tabs.push(`${styled} `);
               }
               const canSubmit = allAnswered();
               const isSubmit = currentTab === questions.length;
               const submitText = " ✓ Submit ";
               const sStyled = isSubmit
-                ? theme.bg("selectedBg", theme.fg("text", submitText))
-                : theme.fg(canSubmit ? "success" : "dim", submitText);
+                ? theme.bg(
+                    "selectedBg",
+                    `${theme.fg("accent", "→")} ${theme.fg("text", submitText)}`,
+                  )
+                : theme.fg(canSubmit ? "success" : "dim", `  ${submitText}`);
               tabs.push(`${sStyled}`);
               // naive join wrapped
               lines.push(` ${tabs.join("")}`);
