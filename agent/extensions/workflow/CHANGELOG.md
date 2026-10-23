@@ -2,7 +2,17 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-23
+
+### Added — per-profile Default-mode model
+
+**The feature.** A profile can now carry its own Default-mode (chat) model
+via an optional `defaultModel` field (`{ provider, id, thinking }`), separate
+from the role models. Switching to a profile that defines one applies it
+immediately in Default mode; the profile editor gains a `default` tab; and
+`sanitizeProfile` also accepts a `roles.default` alias for hand-edited files.
+Display paths (`describeProfile`, the one-line summary, the management UI)
+show the Default-mode model alongside the roles.
 
 ### Fixed — the ask dialog asks once per turn, not once per tool call
 
