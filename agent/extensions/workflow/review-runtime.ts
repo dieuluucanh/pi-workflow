@@ -50,7 +50,7 @@ import {
 } from "./review.ts";
 import { appendProviderAuthHint } from "./review-providers.ts";
 import { createReviewTools } from "./review-tools.ts";
-import { renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
+import { buildPlanDiff, renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
 
 /** Event `type` from a child-session event, or "" for junk. Never throws. */
 function readEventType(event: unknown): string {
@@ -92,6 +92,18 @@ export interface ReviewRuntimeDeps {
   /** Pruned parent context entries (from ctx.sessionManager.getBranch()). */
   contextEntries: () => unknown[];
   /**
+   * Whether the last Planner manifest carried recon summaries (step 8).
+   * When true the reviewer verifies instead of re-exploring: its explore
+   * budget is 0. Optional — absent means "no recon".
+   */
+  hasRecon?: () => boolean;
+  /**
+   * Planner-context manifest (file inventory + recon) for the pass-1 prompt
+   * (step 8). Optional: when absent the reviewer works from the transcript
+   * block alone, as before.
+   */
+  plannerManifest?: () => string;
+  /**
    * Resolved reviewer guidance (review-prompt.md, else the built-in default).
    * A function, not a string: the user can edit the file between rounds.
    */
@@ -129,6 +141,12 @@ export interface RunRoundInput {
   round: number;
   /** Findings from the previous round, so pass 2 can assert they were fixed. */
   previousFindings?: ReviewFinding[];
+  /**
+   * Host abort signal (ESC). When it fires the round stops promptly and the
+   * author's plan is kept — the same outcome as the internal abortRound().
+   * Linked to the round's own controller; detached when the round ends.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ReviewRuntime {
@@ -162,6 +180,8 @@ export function buildPass1Prompt(input: {
   planText: string;
   reviewPrompt: string;
   contextBlock: string;
+  /** Planner-context manifest (step 8): inventory + recon, trusted by default. */
+  manifest?: string;
   previousFindings?: ReviewFinding[];
   round: number;
   totalRounds: number;
@@ -178,13 +198,18 @@ export function buildPass1Prompt(input: {
     input.reviewPrompt,
   ];
 
+  if (input.manifest && input.manifest.trim()) {
+    parts.push("", input.manifest.trim());
+  }
+
   if (input.contextBlock.trim()) {
     parts.push(
       "",
-      "## Shared context from Plan Mode",
+      "## Plan Mode transcript (abridged)",
       "",
-      "This is what the author explored and was asked for. It is background, not",
-      "ground truth — verify anything you rely on against the repository.",
+      "The author's own words and tool spew, truncated for size. Prefer the",
+      "shared-context inventory above; re-read anything you rely on with",
+      "read/grep.",
       "",
       input.contextBlock.trim(),
     );
@@ -209,12 +234,18 @@ export function buildPass1Prompt(input: {
       "The author has revised the plan in response. Confirm whether each was",
       "actually addressed, and say so in your findings rather than re-raising it.",
       "",
-      ...input.previousFindings.map(
-        (f) =>
-          `- [${f.disposition}] ${f.summary}${
-            f.file ? ` (${f.file}${f.lineRange ? `:${f.lineRange}` : ""})` : ""
-          }`,
-      ),
+      ...input.previousFindings.map((f) => {
+        const loc = f.file
+          ? ` (${f.file}${f.lineRange ? `:${f.lineRange}` : ""})`
+          : "";
+        // Step 8: carry the rationale so re-review rounds verify instead of
+        // re-discovering (clipped — the full text lives in the changelog).
+        const why = String(f.rationale ?? "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const clipped = why.length > 200 ? `${why.slice(0, 200)}…` : why;
+        return `- [${f.disposition}] ${f.summary}${loc}${clipped ? ` — ${clipped}` : ""}`;
+      }),
     );
   }
 
@@ -241,22 +272,18 @@ export function buildPass2Prompt(input: {
   rewrittenPlan: string;
   findings: ReviewFinding[];
 }): string {
+  // Step 9: pass 2 checks the rewrite against a diff, not two full plans.
+  const diff = buildPlanDiff(input.originalPlan, input.rewrittenPlan);
   return [
     "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REWRITE]",
     "",
     "You just rewrote the plan and submitted it. Now check your own work. This pass",
     "exists because a rewrite can silently drop a requirement the author cared about.",
     "",
-    "## Original plan (as the author wrote it)",
+    "## What changed (unified diff of your rewrite)",
     "",
-    "```markdown",
-    input.originalPlan,
-    "```",
-    "",
-    "## Your rewrite (currently on disk)",
-    "",
-    "```markdown",
-    input.rewrittenPlan,
+    "```diff",
+    diff,
     "```",
     "",
     "## Findings you reported",
@@ -291,6 +318,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let gate: ReviewRoundGate = createReviewRoundGate();
   let starting: Promise<boolean> | undefined;
   let abortController: AbortController | undefined;
+  /** `provider/id/thinking` the live session was created with (step 10). */
+  let sessionModelKey: string | undefined;
   /** True while `runRound` is in flight (gates prompt routing). */
   let roundActive = false;
   /**
@@ -528,12 +557,53 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     };
   }
 
+  /** Release the child session and its round state (step 10). Never throws. */
+  async function disposeSession(): Promise<void> {
+    try {
+      abortController?.abort();
+      await session?.abort();
+    } catch {
+      /* ignore */
+    }
+    try {
+      session?.dispose();
+    } catch {
+      /* ignore */
+    }
+    session = undefined;
+    state = undefined;
+    transcript = undefined;
+    sessionModelKey = undefined;
+    gate = createReviewRoundGate();
+    abortController = undefined;
+    try {
+      deps.onState?.(undefined);
+    } catch {
+      /* ignore */
+    }
+  }
+
   async function ensureStarted(): Promise<boolean> {
-    if (session) return true;
+    const modelRef = deps.reviewerModel();
+    const modelKey = modelRef
+      ? `${modelRef.provider}/${modelRef.id}/${modelRef.thinking}`
+      : "";
+    if (session) {
+      // Step 10: the session is bound to the model it was created with. A
+      // reviewer switch since then reboots it so the new model audits.
+      if (modelKey && sessionModelKey && modelKey !== sessionModelKey) {
+        deps.log(
+          "Review Mode: reviewer model changed — restarting the reviewer session.",
+          "info",
+        );
+        await disposeSession();
+      } else {
+        return true;
+      }
+    }
     if (starting) return starting;
     starting = (async () => {
       const cfg = config();
-      const modelRef = deps.reviewerModel();
       if (!modelRef) {
         deps.log(
           "Review Mode: no reviewer model configured — run /role set reviewer <provider/model>",
@@ -553,7 +623,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           cwd: deps.cwd,
           log: deps.log,
           explore: {
-            budget: () => config().exploreBudget,
+            // Step 8: Planner recon rides along in the prompt — when it is
+            // present the reviewer verifies instead of re-exploring.
+            budget: () =>
+              (deps.hasRecon?.() ?? false) ? 0 : config().exploreBudget,
             run: (task, signal) => deps.runExplore(task, signal),
             onUsed: (used) => {
               if (state) state.exploreUsed = used;
@@ -658,6 +731,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         }
 
         session = created.session;
+        // Step 10: remember which model this session audits with.
+        sessionModelKey = modelKey;
         ensureTranscript();
         const child = created.session;
         session.subscribe((event) => {
@@ -729,6 +804,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     const hash = planHash(input.planText);
     const started = Date.now();
     const originalPlan = input.planText;
+    // Declared outside the try: a `let` inside the try block would not be
+    // visible in `finally` (block scoping), and the external listener must
+    // always be detached when the round ends.
+    let detachExternal: (() => void) | undefined;
 
     const fail = (
       reason: string,
@@ -789,6 +868,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
       abortController = new AbortController();
       const rc = abortController;
+      // ESC cancels: link the host signal (when the caller threads one
+      // through) to the round's controller, so ESC aborts the pass race,
+      // the settle wait and the send alike. The existing `aborted` branch
+      // below then keeps the session warm and hands back the author's plan.
+      const externalSignal = input.signal;
+      if (externalSignal) {
+        if (externalSignal.aborted) {
+          rc.abort();
+        } else {
+          const onExternalAbort = () => {
+            try {
+              rc.abort();
+            } catch {
+              /* abort is best-effort */
+            }
+          };
+          externalSignal.addEventListener("abort", onExternalAbort, {
+            once: true,
+          });
+          detachExternal = () =>
+            externalSignal.removeEventListener("abort", onExternalAbort);
+        }
+      }
       // 0 (default) = no cap. A configured cap is the outer safety net; the
       // settle race below still ends a silent pass quickly either way.
       const limitMs = cfg.timeoutMs > 0 ? cfg.timeoutMs : undefined;
@@ -808,7 +910,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         planPath: input.planPath,
         planText: originalPlan,
         reviewPrompt: deps.promptText(),
-        contextBlock: renderReviewContextBlock(deps.contextEntries()),
+        contextBlock: renderReviewContextBlock(deps.contextEntries(), {
+          // Step 7 — diet default (settings-overridable).
+          maxChars: config().contextChars,
+        }),
+        // Step 8: inventory + recon so the reviewer verifies, not re-explores.
+        manifest: deps.plannerManifest?.() ?? "",
         previousFindings: input.previousFindings,
         round: input.round,
         totalRounds: cfg.rounds,
@@ -949,6 +1056,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         `review round failed: ${e instanceof Error ? e.message : String(e)}`,
       );
     } finally {
+      try {
+        detachExternal?.();
+      } catch {
+        /* listener cleanup is best-effort */
+      }
       abortController = undefined;
       roundActive = false;
     }
@@ -1008,27 +1120,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
     },
     async teardown() {
-      try {
-        abortController?.abort();
-        await session?.abort();
-      } catch {
-        /* ignore */
-      }
-      try {
-        session?.dispose();
-      } catch {
-        /* ignore */
-      }
-      session = undefined;
-      state = undefined;
-      transcript = undefined;
-      gate = createReviewRoundGate();
-      abortController = undefined;
-      try {
-        deps.onState?.(undefined);
-      } catch {
-        /* ignore */
-      }
+      await disposeSession();
     },
   };
 }

@@ -1174,11 +1174,21 @@ export function reviewFindingTier(f: {
   return "Info";
 }
 
-/** True when a severity tier is high enough to warrant the verify pass. */
+/**
+ * True when a severity tier is high enough to warrant the verify pass.
+ *
+ * Step 9: only accepted findings at severity >= 7 (with confidence >= 60)
+ * trigger self-verification. Lower findings are not worth a second full LLM
+ * turn; empty, low-severity, or rejected-only findings resubmit pass 1's
+ * plan directly.
+ */
 export function reviewNeedsVerification(findings: ReviewFinding[]): boolean {
   if (!Array.isArray(findings)) return false;
   return findings.some(
-    (f) => Number(f?.severity) >= 5 && Number(f?.confidence) >= 60,
+    (f) =>
+      Number(f?.severity) >= 7 &&
+      Number(f?.confidence) >= 60 &&
+      f?.disposition === "accepted",
   );
 }
 
@@ -1283,6 +1293,79 @@ export function renderReviewChangelog(
   }
 
   return lines.join("\n").trimEnd();
+}
+
+/**
+ * Minimal unified diff between two plan texts (step 9).
+ *
+ * Pass 2 only checks "did the rewrite drop a requirement", so it gets a
+ * diff — not two full plans. Prefix/suffix trim with a few context lines
+ * keeps typical localized rewrites at ~1/10th the tokens; a total rewrite
+ * degrades to one hunk (no worse than today). Capped and never throws.
+ */
+export function buildPlanDiff(
+  original: string,
+  revised: string,
+  context = 3,
+): string {
+  const a = String(original ?? "").split("\n");
+  const b = String(revised ?? "").split("\n");
+  if (a.join("\n") === b.join("\n")) return "(no differences)";
+  const ctx = Number.isFinite(context)
+    ? Math.max(0, Math.min(10, Math.trunc(Number(context))))
+    : 3;
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start])
+    start++;
+  let endA = a.length - 1;
+  let endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA--;
+    endB--;
+  }
+  const fromA = Math.max(0, start - ctx);
+  const toA = Math.min(a.length - 1, endA + ctx);
+  const fromB = Math.max(0, start - ctx);
+  const toB = Math.min(b.length - 1, endB + ctx);
+  const out = [
+    "--- original (author)",
+    "+++ rewritten (reviewer)",
+    `@@ -${fromA + 1},${toA - fromA + 1} +${fromB + 1},${toB - fromB + 1} @@`,
+  ];
+  for (let i = fromA; i < start; i++) out.push(`  ${a[i]}`);
+  for (let i = start; i <= endA; i++) out.push(`- ${a[i]}`);
+  for (let i = start; i <= endB; i++) out.push(`+ ${b[i]}`);
+  const tailFrom = Math.max(endA + 1, endB + 1, start);
+  const tailTo = Math.max(toA, toB);
+  const tailSrc = toA - fromA >= toB - fromB ? a : b;
+  for (let i = tailFrom; i <= Math.min(tailTo, tailSrc.length - 1); i++)
+    out.push(`  ${tailSrc[i]}`);
+  const text = out.join("\n");
+  const MAX_DIFF_CHARS = 12_000;
+    return text.length > MAX_DIFF_CHARS
+      ? `${text.slice(0, MAX_DIFF_CHARS)}\n… [diff truncated — the rewrite is large; re-read the plan file]`
+      : text;
+}
+
+/** Outcome of landing a detached background review (steps 5/11). */
+export type ReviewLanding = "updated" | "unchanged" | "stale";
+
+/**
+ * Decide what a landed background review may announce (step 11 contract).
+ * Pure: `diskHash` is the plan file on disk, `inputHash` the reviewed
+ * revision, `finalHash` the reviewer's rewrite. Only `updated` (the disk
+ * holds the rewrite) announces a change; every other outcome keeps the
+ * author's/user's text and stays quiet or defers to a re-run.
+ */
+export function classifyReviewLanding(input: {
+  diskHash?: string;
+  inputHash: string;
+  finalHash: string;
+}): ReviewLanding {
+  if (input.diskHash === undefined) return "unchanged";
+  if (input.diskHash === input.finalHash) return "updated";
+  if (input.diskHash === input.inputHash) return "unchanged";
+  return "stale";
 }
 
 /**
@@ -1436,11 +1519,11 @@ export function pruneContextEntriesForReview(
   opts: PruneReviewContextOptions = {},
 ): any[] {
   const maxChars = Number.isFinite(opts.maxToolResultChars)
-    ? Math.max(200, Number(opts.maxToolResultChars))
-    : 4000;
+    ? Math.min(4000, Math.max(200, Number(opts.maxToolResultChars)))
+    : 1000;
   const maxEntries = Number.isFinite(opts.maxEntries)
-    ? Math.max(1, Number(opts.maxEntries))
-    : 120;
+    ? Math.min(120, Math.max(1, Number(opts.maxEntries)))
+    : 30;
   if (!Array.isArray(entries)) return [];
   const kept: any[] = [];
   try {
@@ -1554,8 +1637,8 @@ export function renderReviewContextBlock(
   opts: { maxChars?: number } = {},
 ): string {
   const maxChars = Number.isFinite(opts.maxChars)
-    ? Math.max(1000, Number(opts.maxChars))
-    : 60_000;
+    ? Math.min(60_000, Math.max(1000, Number(opts.maxChars)))
+    : 15_000;
   if (!Array.isArray(entries) || entries.length === 0) return "";
   const lines: string[] = [];
   try {
@@ -1579,9 +1662,182 @@ export function renderReviewContextBlock(
   }
   let out = lines.join("\n\n");
   if (out.length > maxChars) {
-    out = `${out.slice(0, maxChars)}\n\n… [context truncated at ${maxChars} chars]`;
+    out = `${out.slice(0, maxChars)}\n\n… [context truncated at ${maxChars} chars — re-read anything you rely on with read/grep]`;
   }
   return out;
+}
+
+// ── Planner-context manifest for the reviewer (step 8) ─────────────
+
+/** What `buildPlannerContextManifest` found in the parent branch. */
+export interface PlannerContextManifest {
+  /** Markdown section for the pass-1 prompt ("" when there is nothing). */
+  markdown: string;
+  /** Distinct file paths inventoried. */
+  files: number;
+  /** Explore recon summaries included. */
+  reconResults: number;
+}
+
+export interface BuildPlannerManifestOptions {
+  /** Max files listed in the inventory. */
+  maxFiles?: number;
+  /** Max explore results summarized. */
+  maxReconResults?: number;
+  /** Max chars taken from the tail of each explore result. */
+  maxReconChars?: number;
+  /**
+   * Describe a referenced path (size/mtime/hash token). Return undefined
+   * for paths that cannot be described — the path is still listed.
+   */
+  describeFile?: (path: string) => string | undefined;
+}
+
+const PLANNER_MANIFEST_MAX_FILES = 200;
+const PLANNER_MANIFEST_MAX_RECON = 3;
+const PLANNER_MANIFEST_RECON_CHARS = 700;
+
+/**
+ * Ordered unique `path`/`file_path` arguments from tool calls in the branch.
+ * These are the files Plan Mode touched — the reviewer can trust them
+ * unless a finding cites them (then it re-reads). Never throws.
+ */
+function manifestToolPaths(entries: unknown, maxFiles: number): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const take = (raw: unknown): void => {
+    if (paths.length >= maxFiles) return;
+    if (typeof raw !== "string") return;
+    const p = raw.trim();
+    if (!p || p.length > 500 || seen.has(p)) return;
+    seen.add(p);
+    paths.push(p);
+  };
+  try {
+    if (!Array.isArray(entries)) return paths;
+    for (const e of entries) {
+      if (paths.length >= maxFiles) break;
+      if (!e || typeof e !== "object") continue;
+      const blocks = (e as { message?: { content?: unknown } }).message
+        ?.content;
+      if (!Array.isArray(blocks)) continue;
+      for (const b of blocks) {
+        if (!b || typeof b !== "object") continue;
+        const t = (b as { type?: unknown }).type;
+        if (t !== "toolCall" && t !== "tool_use") continue;
+        const args = (b as { arguments?: unknown; input?: unknown })
+          .arguments ?? (b as { input?: unknown }).input;
+        if (args && typeof args === "object") {
+          take((args as Record<string, unknown>).path);
+          take((args as Record<string, unknown>).file_path);
+        }
+      }
+    }
+  } catch {
+    /* keep what was collected */
+  }
+  return paths;
+}
+
+/**
+ * Tails of the most recent `explore` tool results (Plan Mode recon), newest
+ * first. Conclusions tend to live at the end, so the tail is kept. Never throws.
+ */
+function manifestReconTails(
+  entries: unknown,
+  maxResults: number,
+  maxChars: number,
+): string[] {
+  const tails: string[] = [];
+  try {
+    if (!Array.isArray(entries)) return tails;
+    for (
+      let i = entries.length - 1;
+      i >= 0 && tails.length < maxResults;
+      i--
+    ) {
+      const msg = (entries[i] as { message?: unknown })?.message as
+        | { role?: unknown; toolName?: unknown; content?: unknown }
+        | undefined;
+      if (!msg || msg.role !== "toolResult" || msg.toolName !== "explore")
+        continue;
+      const text = contentBlocksToText(msg.content).trim();
+      if (!text) continue;
+      tails.push(
+        text.length > maxChars ? `…${text.slice(text.length - maxChars)}` : text,
+      );
+    }
+  } catch {
+    /* keep what was collected */
+  }
+  return tails;
+}
+
+/**
+ * Build the Planner-context manifest: a file inventory with change tokens
+ * plus recent explore recon, so the reviewer verifies instead of re-exploring
+ * (plan 2026-10-23, step 8). Takes the RAW branch — pruned entries elide the
+ * explore tails this needs. Pure except for the optional `describeFile`.
+ * Never throws; empty input yields an empty markdown section.
+ */
+export function buildPlannerContextManifest(
+  entries: unknown,
+  opts: BuildPlannerManifestOptions = {},
+): PlannerContextManifest {
+  const empty: PlannerContextManifest = {
+    markdown: "",
+    files: 0,
+    reconResults: 0,
+  };
+  try {
+    const maxFiles = Number.isFinite(opts.maxFiles)
+      ? Math.max(1, Math.min(500, Number(opts.maxFiles)))
+      : PLANNER_MANIFEST_MAX_FILES;
+    const maxRecon = Number.isFinite(opts.maxReconResults)
+      ? Math.max(0, Math.min(10, Number(opts.maxReconResults)))
+      : PLANNER_MANIFEST_MAX_RECON;
+    const maxReconChars = Number.isFinite(opts.maxReconChars)
+      ? Math.max(100, Math.min(8000, Number(opts.maxReconChars)))
+      : PLANNER_MANIFEST_RECON_CHARS;
+    const paths = manifestToolPaths(entries, maxFiles);
+    const recon = manifestReconTails(entries, maxRecon, maxReconChars);
+    if (paths.length === 0 && recon.length === 0) return empty;
+    const lines = [
+      "## Shared context (Planner — trusted unless a finding cites it)",
+      "",
+      "Plan Mode already explored this repository. Trust this inventory and",
+      "these recon summaries for everything they cover; re-read only files a",
+      "finding anchors, plus one or two spot checks.",
+      "",
+    ];
+    if (paths.length > 0) {
+      lines.push(`Files Plan Mode touched (${paths.length}):`, "");
+      for (const p of paths) {
+        let detail = "";
+        try {
+          const d = opts.describeFile?.(p);
+          if (d) detail = ` — ${d}`;
+        } catch {
+          /* a path is still listed without its token */
+        }
+        lines.push(`- \`${p}\`${detail}`);
+      }
+      lines.push("");
+    }
+    if (recon.length > 0) {
+      lines.push(`Planner recon (newest first, ${recon.length}):`, "");
+      recon.forEach((tail, i) => {
+        lines.push(`### Recon ${i + 1}`, "", tail, "");
+      });
+    }
+    return {
+      markdown: lines.join("\n").trimEnd(),
+      files: paths.length,
+      reconResults: recon.length,
+    };
+  } catch {
+    return empty;
+  }
 }
 
 // ── Slash-command argument completions (pi-tui contract) ─────────────

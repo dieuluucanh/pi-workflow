@@ -17,6 +17,9 @@ import * as path from "node:path";
 
 import {
   appendReviewChangelog,
+  buildPlanDiff,
+  buildPlannerContextManifest,
+  classifyReviewLanding,
   getUtcDatePrefix,
   planHash,
   pruneContextEntriesForReview,
@@ -35,6 +38,7 @@ import {
   DEFAULT_REVIEW_MODE_CONFIG,
   DEFAULT_REVIEW_PROMPT,
   applySubmittedPlan,
+  canRunManualReview,
   coerceReviewModeConfig,
   createReviewRoundGate,
   createReviewState,
@@ -144,7 +148,7 @@ test("review config: defaults are safe (off, 1 round, verify on)", () => {
   assert.equal(c.passes, 2);
   assert.equal(c.verify, true);
   assert.equal(c.fallbackOnError, "skip");
-  assert.equal(c.timeoutMs, 0, "no wall-clock cap by default");
+  assert.equal(c.timeoutMs, 300_000, "5-minute cap by default (step 10)");
   assert.deepEqual(c, { ...DEFAULT_REVIEW_MODE_CONFIG });
 });
 
@@ -192,6 +196,9 @@ test("review config: removed pane/parallel keys are ignored", () => {
   assert.equal(c.rounds, DEFAULT_REVIEW_MODE_CONFIG.rounds);
   assert.equal(c.fallbackOnError, "skip");
   assert.deepEqual(Object.keys(c).sort(), [
+    "contextChars",
+    "contextEntries",
+    "contextToolChars",
     "enabled",
     "exploreBudget",
     "fallbackOnError",
@@ -285,12 +292,12 @@ test("review config: timeout provenance is project > global > default", () => {
   assert.equal(r.sources.project, true);
 });
 
-test("review config: a fragment without timeoutMs keeps the unlimited default", () => {
-  assert.equal(DEFAULT_REVIEW_MODE_CONFIG.timeoutMs, 0);
-  assert.equal(coerceReviewModeConfig({ enabled: true }).timeoutMs, 0);
+test("review config: a fragment without timeoutMs keeps the default cap", () => {
+  assert.equal(DEFAULT_REVIEW_MODE_CONFIG.timeoutMs, 300_000);
+  assert.equal(coerceReviewModeConfig({ enabled: true }).timeoutMs, 300_000);
   assert.equal(
     mergeReviewModeConfig({ rounds: 2 }, { verify: false }).timeoutMs,
-    0,
+    300_000,
   );
 });
 
@@ -692,18 +699,27 @@ test("review state: creation, summary, phase helpers", () => {
   assert.equal(reviewElapsedMs(s, 9_999_999), 4200);
 });
 
-test("shouldRouteInputToReviewer: only a live, enabled round takes the prompt", () => {
-  const cases: Array<[boolean, boolean, boolean, boolean]> = [
-    [true, true, true, true],
-    [true, true, false, false],
-    [true, false, true, false],
-    [false, true, true, false],
-    [false, false, false, false],
+test("shouldRouteInputToReviewer: only a live round with an allowed gate takes the prompt", () => {
+  // [enabled, active, session, manualSessionActive, expected]. The gate is
+  // allowed when the persisted flag is on OR a live ad-hoc session exists.
+  const cases: Array<[boolean, boolean, boolean, boolean | undefined, boolean]> = [
+    [true, true, true, undefined, true],
+    [true, true, false, undefined, false],
+    [true, false, true, undefined, false],
+    [false, true, true, undefined, false],
+    [false, false, false, undefined, false],
+    // Ad-hoc session while the flag stays OFF.
+    [false, true, true, true, true],
+    [false, true, true, false, false],
+    [false, false, true, true, false],
+    [false, true, false, true, false],
+    [true, true, true, true, true],
   ];
   for (const [
     reviewEnabled,
     reviewActive,
     hasReviewerSession,
+    manualSessionActive,
     expected,
   ] of cases) {
     assert.equal(
@@ -711,26 +727,45 @@ test("shouldRouteInputToReviewer: only a live, enabled round takes the prompt", 
         reviewEnabled,
         reviewActive,
         hasReviewerSession,
+        manualSessionActive,
       }),
       expected,
-      `enabled=${reviewEnabled} active=${reviewActive} session=${hasReviewerSession}`,
+      `enabled=${reviewEnabled} active=${reviewActive} session=${hasReviewerSession} manual=${manualSessionActive}`,
     );
   }
 });
 
-test("REGRESSION: with Review Mode off, input routing is inert", () => {
+test("REGRESSION: with Review Mode off and no ad-hoc session, input routing is inert", () => {
   for (const reviewActive of [true, false]) {
     for (const hasReviewerSession of [true, false]) {
-      assert.equal(
-        shouldRouteInputToReviewer({
-          reviewEnabled: false,
-          reviewActive,
-          hasReviewerSession,
-        }),
-        false,
-      );
+      for (const manualSessionActive of [undefined, false]) {
+        assert.equal(
+          shouldRouteInputToReviewer({
+            reviewEnabled: false,
+            reviewActive,
+            hasReviewerSession,
+            manualSessionActive,
+          }),
+          false,
+        );
+      }
     }
   }
+});
+
+test("GATING: manual review stays available while automatic review is off", () => {
+  const { cwd, agentDir } = tmpProject();
+  // No settings file at all: manual still available (defaults apply).
+  assert.equal(canRunManualReview(cwd, agentDir), true);
+  assert.equal(isReviewEnabled(cwd, agentDir), false);
+  // Explicitly disabled: automatic off, manual still available.
+  writeReviewModeConfig("global", cwd, agentDir, { enabled: false });
+  assert.equal(isReviewEnabled(cwd, agentDir), false);
+  assert.equal(canRunManualReview(cwd, agentDir), true);
+  // Enabled: both available.
+  writeReviewModeConfig("global", cwd, agentDir, { enabled: true });
+  assert.equal(isReviewEnabled(cwd, agentDir), true);
+  assert.equal(canRunManualReview(cwd, agentDir), true);
 });
 
 // ══ Step 16: transcript ═══════════════════════════════════════════════
@@ -2784,7 +2819,18 @@ test("buildPass1Prompt / buildPass2Prompt contain the contract, not the reviewer
     findings: [HIGH_FINDING],
   });
   assert.ok(p2.includes("PASS 2 of 2"));
-  assert.ok(p2.includes(ORIGINAL_PLAN) && p2.includes(REWRITTEN_PLAN));
+  // Step 9: pass 2 carries a diff, not two full plans.
+  assert.ok(p2.includes("@@"), "pass 2 shows a unified diff");
+  assert.ok(
+    p2.includes("returning Result<string, ExportError>"),
+    "diff shows the changed line",
+  );
+  assert.ok(
+    p2.includes("```diff"),
+    "pass 2 carries the rewrite as a diff block",
+  );
+  assert.ok(!p2.includes(ORIGINAL_PLAN), "no verbatim original plan");
+  assert.ok(!p2.includes(REWRITTEN_PLAN), "no verbatim rewritten plan");
   assert.ok(p2.includes("List anything lost"), "pass 2 asks what was lost");
 });
 
@@ -3147,4 +3193,294 @@ test("GATING: with Review Mode off, all resolution stays inert", () => {
   assert.equal(isReviewEnabled(cwd, agentDir), true);
   writeReviewModeConfig("global", cwd, agentDir, { enabled: false });
   assert.equal(isReviewEnabled(cwd, agentDir), false);
+});
+
+// ══ Plan 2026-10-23 (steps 7–11): fast-path + interactive review ══
+
+test("plan-2026-10-23: verify gate needs severity >= 7 and accepted disposition", () => {
+  const base = { ...HIGH_FINDING }; // sev 9, conf 85, accepted
+  assert.equal(reviewNeedsVerification([base]), true);
+  assert.equal(
+    reviewNeedsVerification([{ ...base, severity: 7, confidence: 60 }]),
+    true,
+    "boundary 7/60 verifies",
+  );
+  assert.equal(
+    reviewNeedsVerification([{ ...base, severity: 6, confidence: 99 }]),
+    false,
+    "severity 6 no longer verifies",
+  );
+  assert.equal(
+    reviewNeedsVerification([{ ...base, confidence: 59 }]),
+    false,
+    "low confidence skips",
+  );
+  assert.equal(
+    reviewNeedsVerification([{ ...base, disposition: "rejected" }]),
+    false,
+    "rejected never verifies",
+  );
+  assert.equal(
+    reviewNeedsVerification([{ ...base, disposition: "deferred" }]),
+    false,
+    "deferred never verifies",
+  );
+  assert.equal(reviewNeedsVerification([]), false);
+  assert.equal(reviewNeedsVerification(undefined as never), false);
+});
+
+test("plan-2026-10-23: buildPlanDiff is a minimal hunk, not two full plans", () => {
+  assert.equal(buildPlanDiff(ORIGINAL_PLAN, ORIGINAL_PLAN), "(no differences)");
+  assert.equal(buildPlanDiff("", ""), "(no differences)");
+  const diff = buildPlanDiff(ORIGINAL_PLAN, REWRITTEN_PLAN);
+  assert.ok(diff.startsWith("--- original (author)"), "unified header");
+  assert.ok(diff.includes("@@"), "hunk header");
+  assert.ok(
+    diff.includes("- 1. Add a CSV serializer in src/export/csv.ts\n"),
+    "removed line present",
+  );
+  assert.ok(
+    diff.includes(
+      "+ 1. Add a CSV serializer in src/export/csv.ts returning Result<string, ExportError>",
+    ),
+    "added line present",
+  );
+  assert.ok(
+    diff.length < ORIGINAL_PLAN.length + REWRITTEN_PLAN.length,
+    "diff is smaller than both full plans",
+  );
+  const big = `${"x".repeat(20000)}\nmid\n${"y".repeat(20000)}`;
+  assert.ok(
+    buildPlanDiff(big, big.replace("mid", "MID")).includes("diff truncated"),
+    "huge rewrites are capped",
+  );
+});
+
+test("plan-2026-10-23: manifest is empty for empty/junk input", () => {
+  for (const junk of [undefined, null, [], {}, "nope", 42]) {
+    const m = buildPlannerContextManifest(junk);
+    assert.equal(m.markdown, "");
+    assert.equal(m.files, 0);
+    assert.equal(m.reconResults, 0);
+  }
+});
+
+test("plan-2026-10-23: manifest inventories tool paths once, with tokens", () => {
+  const entries = [
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", name: "read", arguments: { path: "src/a.ts" } },
+          { type: "toolCall", name: "read", arguments: { path: "src/a.ts" } },
+          {
+            type: "toolCall",
+            name: "grep",
+            arguments: { path: "src", file_path: "src/b.ts" },
+          },
+        ],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: { path: ".pi/plans/x.md" },
+          },
+        ],
+      },
+    },
+  ];
+  const m = buildPlannerContextManifest(entries, {
+    describeFile: (p) => (p.endsWith(".ts") ? "1KB · #deadbeef" : undefined),
+  });
+  assert.equal(m.files, 4, "src/a.ts, src, src/b.ts, .pi/plans/x.md");
+  assert.ok(m.markdown.includes("`src/a.ts` — 1KB · #deadbeef"));
+  assert.ok(m.markdown.includes("`.pi/plans/x.md`"));
+  assert.ok(!m.markdown.includes("#deadbeef", 0) || m.markdown.includes("`src/b.ts` — 1KB"));
+  assert.equal(m.reconResults, 0);
+  const capped = buildPlannerContextManifest(entries, { maxFiles: 2 });
+  assert.equal(capped.files, 2, "inventory honours maxFiles");
+});
+
+test("plan-2026-10-23: manifest keeps newest explore recon first, capped", () => {
+  const toolResult = (toolName: string, text: string) => ({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName,
+      content: [{ type: "text", text }],
+    },
+  });
+  const entries = [
+    toolResult("read", "some file body"),
+    toolResult("explore", "first recon conclusion"),
+    toolResult("explore", `padding ${"z".repeat(5000)} MARKER-TAIL`),
+  ];
+  const m = buildPlannerContextManifest(entries);
+  assert.equal(m.reconResults, 2);
+  assert.ok(m.markdown.includes("MARKER-TAIL"), "tail of oversized recon kept");
+  assert.ok(!m.markdown.includes("padding "), "head of oversized recon elided");
+  assert.ok(
+    m.markdown.indexOf("MARKER-TAIL") < m.markdown.indexOf("first recon"),
+    "newest recon first",
+  );
+  const one = buildPlannerContextManifest(entries, { maxReconResults: 1 });
+  assert.equal(one.reconResults, 1);
+  assert.ok(one.markdown.includes("MARKER-TAIL"));
+  assert.ok(!one.markdown.includes("first recon"));
+});
+
+test("plan-2026-10-23: landing guard never overwrites user edits", () => {
+  const inputHash = planHash(ORIGINAL_PLAN);
+  const finalHash = planHash(REWRITTEN_PLAN);
+  assert.equal(
+    classifyReviewLanding({ diskHash: finalHash, inputHash, finalHash }),
+    "updated",
+  );
+  assert.equal(
+    classifyReviewLanding({ diskHash: inputHash, inputHash, finalHash }),
+    "unchanged",
+    "round-cap appendix and pauses announce nothing new",
+  );
+  assert.equal(
+    classifyReviewLanding({ diskHash: undefined, inputHash, finalHash }),
+    "unchanged",
+    "unreadable disk stays quiet",
+  );
+  assert.equal(
+    classifyReviewLanding({ diskHash: "deadbeef", inputHash, finalHash }),
+    "stale",
+    "user edits since the review are kept",
+  );
+});
+
+test("plan-2026-10-23: host abort (ESC) ends the round but keeps the session warm", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: async () => {
+      await new Promise<void>(() => {}); // hangs: only an abort ends the run
+    },
+  });
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+  const ac = new AbortController();
+  const inFlight = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: ac.signal,
+  });
+  assert.equal(rt.isRoundActive(), true);
+  ac.abort(); // ESC
+  const res = await inFlight;
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "aborted");
+  assert.equal(res.planText, ORIGINAL_PLAN, "author's plan kept");
+  assert.equal(res.fallback, true);
+  assert.ok(capture.aborts >= 1, "the child run was aborted");
+  assert.equal(rt.isRoundActive(), false);
+  assert.equal(rt.isAlive(), true, "pause keeps the session warm");
+  await rt.teardown();
+});
+
+test("plan-2026-10-23: abort then resume reuses the warm session", async () => {
+  let allowSubmit = false;
+  const { sdk } = fakeSdk({
+    pass1: async (c) => {
+      if (!allowSubmit) {
+        await new Promise<void>(() => {}); // hangs until aborted
+        return;
+      }
+      await submitThenFinish(REWRITTEN_PLAN)(c);
+    },
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const creations = { n: 0 };
+  const origCreate = (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession;
+  (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession = async (o) => {
+    creations.n += 1;
+    return origCreate(o);
+  };
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+  assert.equal(creations.n, 1);
+  const ac = new AbortController();
+  const inFlight = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: ac.signal,
+  });
+  ac.abort();
+  const paused = await inFlight;
+  assert.equal(paused.reason, "aborted");
+  assert.equal(creations.n, 1, "no reboot on abort");
+  allowSubmit = true; // /review-resume on the warm session
+  const resumed = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(resumed.ok, true, "resume completes on the warm session");
+  assert.ok(resumed.planText.includes("Result<string, ExportError>"));
+  assert.equal(creations.n, 1, "resume reuses the session");
+  await rt.teardown();
+});
+
+test("plan-2026-10-23: planner manifest is embedded in the pass-1 prompt", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const built = runtimeDeps(sdk);
+  (built.deps as Record<string, unknown>).plannerManifest =
+    () => "## Shared context (Planner — test manifest)\n- `src/a.ts`";
+  const rt = createReviewRuntime(built.deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(res.ok, true);
+  assert.ok(
+    capture.prompts[0].includes("test manifest"),
+    "manifest reaches the reviewer prompt",
+  );
+  await rt.teardown();
+});
+
+test("plan-2026-10-23: reviewer model change reboots the session", async () => {
+  const { sdk } = fakeSdk({});
+  const creations = { n: 0 };
+  const origCreate = (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession;
+  (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession = async (o) => {
+    creations.n += 1;
+    return origCreate(o);
+  };
+  const model = { provider: "p", id: "m", thinking: "xhigh" };
+  const { deps } = runtimeDeps(sdk, { reviewerModel: model });
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+  assert.equal(creations.n, 1);
+  assert.equal(await rt.ensureStarted(), true, "same model reuses the session");
+  assert.equal(creations.n, 1);
+  model.id = "m2"; // /role set reviewer … — applies via reboot
+  assert.equal(await rt.ensureStarted(), true);
+  assert.equal(creations.n, 2, "model change reboots the session");
+  await rt.teardown();
 });

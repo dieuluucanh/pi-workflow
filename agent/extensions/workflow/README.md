@@ -41,7 +41,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
-| `/review` | Run one review round against the current plan file now |
+| `/review` | Run a one-shot review round now — works with Review Mode on or off (mode stays OFF) |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
@@ -77,20 +77,23 @@ Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-
 
 ## Review Mode
 
-An independent second agent supervises the plan before you see it. The flow is strictly **sequential**: Plan Mode finishes, then the reviewer runs, then the reviewed plan goes to Plannotator.
+An independent second agent supervises the plan without freezing your session. The handoff renders **immediately** with the author's plan (marked "review pending") while the reviewer works **in the background**; the plan file is updated when the review lands.
 
 ```text
-Plan Mode (main session) ──plan file──▶ Review Mode (child session, sequential)
-                                              │ rewrites the plan
+Plan Mode (main session) ──plan file──▶ handoff renders at once (author's plan)
+                                              │  ╰─▶ Review Mode (child session, background)
+                                              │         │ rewrites the plan file
+                                              │         ▼
+                                              │      "review landed" notice
                                               ▼
-        Plannotator webview ◀── reviewed plan + `## Review changes`
-                │ approve ──▶ Build Mode
+        Plannotator webview ◀── plan file + `## Review changes`
+                │ approve ──▶ Build Mode (review activity suspends, session stays warm)
                 └─ feedback ──▶ Plan Mode revises ──▶ Review re-reviews
 ```
 
-- **Approve** in Plannotator → Build mode; both Plan and Review shut down.
+- **Approve** in Plannotator → Build mode; review activity suspends but the reviewer session stays warm for the next round.
 - **Feedback** → Plan revises, Review re-reviews the revision, Plannotator reopens.
-- **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit_plan` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the handoff even with no time cap. `timeoutMs` is **off by default (`0` = unlimited)**; set a positive value to re-enable the outer safety net, and a pass that outlives it is aborted — though a plan submitted before the deadline is always kept.
+- **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit_plan` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the round. `timeoutMs` defaults to **5 minutes**; set `0` to opt out into unlimited, and a pass that outlives the cap is aborted — though a plan submitted before the deadline is always kept.
 
 ### Enabling
 
@@ -98,8 +101,9 @@ Plan Mode (main session) ──plan file──▶ Review Mode (child session, se
 /review-mode on              # global (~/.pi/agent/settings.json)
 /review-mode on project      # this repo only (<cwd>/.pi/settings.json)
 /review-mode status
-/review-mode timeout unlimited   # remove the per-pass cap (global)
 /review-mode timeout 600 project # 10-minute cap for this repo only
+/review-mode timeout unlimited   # remove the cap entirely (not recommended)
+/review-mode timeout              # show the current value and where it came from
 ```
 
 Turning the toggle off stops the reviewer and restores the single-agent plan/build flow exactly as it was. Nothing in Review Mode runs while it is disabled.
@@ -115,6 +119,8 @@ Review Mode runs in its own session with its own model, taken from the **`review
 ```
 
 If the reviewer role has no model, Review Mode falls back to the planner model and warns rather than silently doing nothing.
+
+The model is **snapshotted when a round starts**: a `/role` or `/profile` switch mid-round takes effect **next round**, never mid-pass. The mode band, the status widget and `/review-status` name the snapshotted model — the one actually auditing.
 
 Roles load from `~/.pi/agent/roles.json` (with a `<cwd>/.pi/roles.json` project override) **at session start and again whenever either file changes on disk**, so a `/role` change made in another window is picked up without `/reload`. A missing, unreadable, or legacy `roles.json` is never overwritten: the built-in defaults are used in memory and a warning naming the file is shown, leaving it intact. `/review-mode status`, the mode band and the reviewer run all read through the same loader.
 
@@ -162,7 +168,7 @@ The child session is created with an explicit tool allowlist: the read-only buil
 1. **Review + rewrite** — audits the plan against the repository and the guidance, records findings, submits the revised plan.
 2. **Self-verify** — re-reads the original and the rewrite, confirms every accepted finding was actually addressed, and reports anything that was silently dropped. This pass exists because a rewrite can lose a requirement the author cared about.
 
-Pass 2 is skipped when `verify` is false or when pass 1 found nothing at severity ≥ 5.
+Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews resubmit pass 1's plan directly. When pass 2 runs it checks a **unified diff** of the rewrite (not two full plans), so the self-check costs roughly a tenth of the tokens.
 
 ### Every change is visible
 
@@ -207,12 +213,24 @@ These are **display-only custom entries** (`pi.appendEntry` + `pi.registerEntryR
 Input follows the **active mode**, decided automatically — there is nothing to focus or toggle:
 
 - **Plan Mode** → the message goes to the plan agent.
-- **Review Mode** (a review round is in flight) → the message is delivered to the reviewer's session (steered if it is mid-pass) and echoed in the transcript as `you → reviewer`. The plan agent never sees it.
+- **Review Mode** (a review round is in flight) → plain chat **stays with the plan agent**. Use `/review say <message>` to steer the in-flight reviewer explicitly (echoed as `you → reviewer`); `/btw <note>` always queues a note for the next turn, even mid-review.
 - **Neither** (including while the plan sits in Plannotator) → the message goes to the plan agent, so you can still refine the plan.
 
-Delivery to the reviewer is best-effort: if it fails, the message falls through to the plan agent rather than being swallowed.
+Delivery to the reviewer is best-effort: if it fails, the message stays in the plan-agent chat rather than being swallowed.
 
 **Status line.** While a review is running, the status widget above the editor shows the live phase (`🔍 review · pass 2/2 · 3 findings · ● verifying`).
+
+### Controlling a running review
+
+The handoff never waits for the reviewer: it renders immediately with the author's plan (marked "review pending") while the round works in the background, and the plan file is updated when the review lands. A landing only **announces** — it never overwrites edits you made meanwhile; if the plan changed under it you get "landed for an older revision" and keep your text.
+
+- **ESC** (or `/review-pause`) pauses the round and keeps the reviewer session warm.
+- `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause).
+- `/review-abort` stops the round — or discards a paused one. The aborted revision is not auto-reviewed again until the plan changes.
+- `/review say <message>` talks to the in-flight reviewer.
+- `/review-status` shows phase, round, the snapshotted model, findings, and any paused state.
+
+Pausing is in-memory only: a reload starts fresh.
 
 ### Isolation
 
@@ -221,7 +239,7 @@ The reviewer is an in-process child session created with `createAgentSession`, a
 - `DefaultResourceLoader({ noExtensions: true })` — the child cannot load this (or any other) extension, so Review Mode cannot recurse.
 - `SessionManager.inMemory(...)` — no session file is written; the reviewer never touches the parent's history.
 - Its own `ModelRuntime` — no contention with the parent's model state.
-- Plan Mode's conversation is passed as **pruned** prompt context (oversized tool results elided, workflow-injected markers dropped, nothing after the plan write), not by sharing the session.
+- Plan Mode's conversation is passed as **pruned** prompt context (oversized tool results elided, workflow-injected markers dropped, nothing after the plan write), not by sharing the session. A **Planner-context manifest** — a file inventory with size/mtime/hash tokens plus recent `explore` summaries — rides along so the reviewer verifies instead of re-exploring; the transcript block itself is dieted (15K chars) since anything truncated can be re-read with `read`/`grep`.
 
 An environment marker (`PI_WORKFLOW_REVIEW_CHILD`) is set only for the duration of session creation and restored immediately — the child runs in the same process, so leaking it would affect a later `/reload`.
 
@@ -400,13 +418,16 @@ Review Mode settings live under `workflow.reviewMode`:
 | `passes` | `2` | `1` = review+rewrite only; `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |
-| `exploreBudget` | `3` | Max `review_explore` subagents per round (cost ceiling) |
-| `timeoutMs` | `0` | Optional wall-clock cap for a whole pass, run included. `0` = unlimited (default); a pass then ends on `review_pass_done`, run settle, abort or error. A silent reviewer is still caught immediately by the settle race. `/review-mode status` prints the value and the settings file that set it, and `/review-mode timeout <seconds\|unlimited>` changes it without editing JSON |
+| `exploreBudget` | `1` | Max `review_explore` subagents per round (cost ceiling). `0` whenever the Planner manifest already carries `explore` recon — the reviewer then verifies instead of re-exploring |
+| `timeoutMs` | `300000` | Wall-clock cap for a whole round, run included (5 minutes). `0` = unlimited (explicit opt-out); a pass then ends on `review_pass_done`, run settle, abort or error. A silent reviewer is still caught immediately by the settle race. `/review-mode status` prints the value and the settings file that set it, and `/review-mode timeout <seconds\|unlimited>` changes it without editing JSON |
+| `contextChars` | `15000` | Max chars of shared Plan Mode context in the pass-1 prompt (diet default; the reviewer re-reads truncated parts with `read`/`grep`) |
+| `contextEntries` | `30` | Max pruned entries handed to the context renderer |
+| `contextToolChars` | `1000` | Max chars kept per tool-result string when pruning |
 
 ```json
 {
   "workflow": {
-    "reviewMode": { "enabled": true, "rounds": 1, "passes": 2, "exploreBudget": 3 }
+    "reviewMode": { "enabled": true, "rounds": 1, "passes": 2, "exploreBudget": 1 }
   }
 }
 ```

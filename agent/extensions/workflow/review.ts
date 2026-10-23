@@ -79,9 +79,20 @@ export interface ReviewModeConfig {
   /** Max `review_explore` subagents per review round (cost ceiling). */
   exploreBudget: number;
   /**
+   * Max chars of shared Plan Mode context in the pass-1 prompt (step 7).
+   * Diet default keeps the review fast; the truncation marker tells the
+   * reviewer to re-read via read/grep anything it relies on.
+   */
+  contextChars: number;
+  /** Max pruned entries handed to the context renderer. */
+  contextEntries: number;
+  /** Max chars kept per tool-result string when pruning entries. */
+  contextToolChars: number;
+  /**
    * Optional wall-clock cap for a single review round, in milliseconds.
-   * 0 = unlimited (default). When unlimited, a pass ends on
-   * `review_pass_done`, the run settling, an abort, or a prompt error.
+   * 0 = unlimited (explicit opt-out). Default 300_000 (5 minutes, step 10):
+   * a hung reviewer must not hold the handoff forever; the settle race still
+   * ends a silent pass in seconds either way.
    */
   timeoutMs: number;
 }
@@ -92,8 +103,11 @@ export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   passes: 2,
   verify: true,
   fallbackOnError: "skip",
-  exploreBudget: 3,
-  timeoutMs: 0,
+  exploreBudget: 1,
+  timeoutMs: 300_000,
+  contextChars: 15_000,
+  contextEntries: 30,
+  contextToolChars: 1_000,
 };
 
 const ROUNDS_MIN = 1;
@@ -104,6 +118,12 @@ const EXPLORE_MIN = 0;
 const EXPLORE_MAX = 8;
 const TIMEOUT_MIN = 0;
 const TIMEOUT_MAX = 3_600_000;
+const CONTEXT_CHARS_MIN = 1_000;
+const CONTEXT_CHARS_MAX = 60_000;
+const CONTEXT_ENTRIES_MIN = 1;
+const CONTEXT_ENTRIES_MAX = 120;
+const CONTEXT_TOOL_CHARS_MIN = 200;
+const CONTEXT_TOOL_CHARS_MAX = 4_000;
 
 /** A JSON object parsed from an untrusted source (settings file, fragment). */
 export type JsonObject = Record<string, unknown>;
@@ -161,6 +181,24 @@ export function coerceReviewModeConfig(
       base.exploreBudget,
     ),
     timeoutMs: clampInt(r.timeoutMs, TIMEOUT_MIN, TIMEOUT_MAX, base.timeoutMs),
+    contextChars: clampInt(
+      r.contextChars,
+      CONTEXT_CHARS_MIN,
+      CONTEXT_CHARS_MAX,
+      base.contextChars,
+    ),
+    contextEntries: clampInt(
+      r.contextEntries,
+      CONTEXT_ENTRIES_MIN,
+      CONTEXT_ENTRIES_MAX,
+      base.contextEntries,
+    ),
+    contextToolChars: clampInt(
+      r.contextToolChars,
+      CONTEXT_TOOL_CHARS_MIN,
+      CONTEXT_TOOL_CHARS_MAX,
+      base.contextToolChars,
+    ),
   };
 }
 
@@ -280,12 +318,41 @@ export function readReviewModeConfig(
 }
 
 /**
- * The single gate used by every Review Mode hook.
+ * The automatic-review gate: true only when the persisted
+ * `workflow.reviewMode.enabled` flag is on. This gates AUTOMATIC review
+ * only (background handoff kickoff, reviewer prefetch, planner prompt
+ * note). Manual one-shot commands (`/review`, `/review say|pause|resume|
+ * abort|status`) intentionally bypass this gate — see `canRunManualReview`.
  * Never throws.
  */
 export function isReviewEnabled(cwd: string, agentDir: string): boolean {
   try {
     return readReviewModeConfig(cwd, agentDir).config.enabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What caused a review round: `"auto"` is the background handoff audit
+ * (requires the persisted `enabled` flag); `"manual"` is an explicit
+ * user command (`/review`, `/review-resume` fresh-plan branch) and bypasses
+ * only the `enabled` check — limits, model and prompt still come from saved
+ * config. Never persisted; the manual path never flips `enabled`.
+ */
+export type ReviewTrigger = "auto" | "manual";
+
+/**
+ * The manual-review gate: true whenever review settings are readable,
+ * regardless of the persisted `enabled` flag. A one-shot `/review` uses the
+ * saved rounds/passes/verify/budget/timeout/model as-is and never flips
+ * `enabled`. Returns false only when settings cannot be read at all.
+ * Never throws.
+ */
+export function canRunManualReview(cwd: string, agentDir: string): boolean {
+  try {
+    readReviewModeConfig(cwd, agentDir);
+    return true;
   } catch {
     return false;
   }
@@ -707,9 +774,18 @@ export function shouldRouteInputToReviewer(input: {
   reviewEnabled: boolean;
   reviewActive: boolean;
   hasReviewerSession: boolean;
+  /**
+   * Live ad-hoc session override: true while a manual one-shot review
+   * owns a live reviewer session (`reviewSessionLive()` in index.ts).
+   * Lets `/review say` and plain-chat steering reach the reviewer even
+   * when the persisted `enabled` flag is off. Never persisted.
+   */
+  manualSessionActive?: boolean;
 }): boolean {
+  const allowed =
+    input.reviewEnabled === true || input.manualSessionActive === true;
   return (
-    input.reviewEnabled === true &&
+    allowed &&
     input.reviewActive === true &&
     input.hasReviewerSession === true
   );
@@ -1484,15 +1560,18 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "## Tools",
   "",
-  "- `read`, `grep`, `find`, `ls` — inspect the repository freely. Always verify a",
-  "  claim about the codebase with these before you rely on it.",
+  "- `read`, `grep`, `find`, `ls` — inspect the repository freely. The pass-1",
+  "  prompt carries Plan Mode's file inventory and recon summaries: trust them",
+  "  for what they cover, and re-read the files your findings anchor (plus a",
+  "  spot check or two) before you cite them.",
   "- `review_bash` — a READ-ONLY/VERIFY shell on the same role allowlist Plan Mode",
   "  uses (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch, npm",
   "  test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo",
   "  clippy, ...). Mutating commands, redirects, installs and builds are refused.",
   "  Verify a plan's claims by reading the code and, where useful, by running its",
   "  tests or linters — but never assert that something passes unless you ran it.",
-  "- `review_explore` — delegate focused read-only reconnaissance to subagents.",
+  "- `review_explore` — delegate focused read-only reconnaissance to subagents",
+  "  (rarely needed: the pass-1 prompt already carries Plan Mode's recon).",
   "- `review_submit_plan` — submit the final rewritten plan. This is the ONLY way",
   "  your work reaches the user. A review that never submits is a failed review.",
   "- `review_pass_done` — end the current pass with a verdict and your findings.",

@@ -2,6 +2,48 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Changed — Ad-hoc `/review` without Review Mode on
+
+Bare `/review` (plus `/review say|pause|resume|abort|status`) now works
+whether or not Review Mode is on: it runs a single one-shot round on the
+saved config and never flips the persisted `enabled` flag. Only the
+automatic background audit at handoff (plus the prefetch and the planner
+note) still requires `/review-mode on`.
+
+### Changed — Review Mode goes fast-path + interactive (plan 2026-10-23)
+
+**Speed (fast by default, existing settings still override).** The pass-1
+context is dieted (`contextChars` 60K→15K, `contextEntries` 120→30,
+`contextToolChars` 4K→1K — new settings, old caps are the maxima), and a
+Planner-context manifest (file inventory with size/mtime/hash tokens plus
+recent `explore` recon, newest first) rides along so the reviewer verifies
+instead of re-exploring. `exploreBudget` defaults to `1` (was `3`) and drops
+to `0` whenever the manifest already carries recon. Pass 2 runs only for
+`accepted` findings at severity ≥ 7 (was ≥ 5) and checks a unified diff
+instead of two full plans. The reviewer session stays warm across rounds and
+mode switches (a model change reboots it), the handoff prefetches the session
+while it resolves the plan, and `timeoutMs` defaults to 5 minutes (was
+unlimited; `0` still opts out).
+
+**Interactive (the handoff never waits).** The handoff renders immediately with
+the author's plan (marked "review pending"); the round works detached and the
+landing only announces — it never overwrites edits made meanwhile (a guarded
+`updated`/`unchanged`/`stale` classification, unit-tested). ESC pauses the
+round and keeps the session warm (`/review-pause`, `/review-resume`,
+`/review-abort`; in-memory only). Plain chat stays with the plan agent
+mid-review — `/review say <msg>` steers the reviewer, `/btw` always queues.
+`/role` and `/profile` switches take effect next round (the model is
+snapshotted per round and named in the band/status). `/review` aborts any
+in-flight round before re-running, and nested option modals stack on a depth
+counter instead of clobbering each other.
+
+**Tests.** 329 green, including new contracts for the verify gate (7/accepted),
+the plan diff, the manifest (inventory caps, newest-first recon, junk input),
+the landing guard, ESC-abort-keeps-session-warm, pause→resume session reuse,
+manifest-in-prompt, and model-change reboot.
+
 ## [0.7.0] - 2026-10-23
 
 ### Added — per-profile Default-mode model

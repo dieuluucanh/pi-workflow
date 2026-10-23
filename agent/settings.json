@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.3.0",
+  "lastChangelogVersion": "1.4.0",
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
@@ -43,7 +43,7 @@
   "doubleEscapeAction": "none",
   "workflow": {
     "reviewMode": {
-      "enabled": false,
+      "enabled": true,
       "rounds": 1,
       "passes": 2,
       "verify": true,
