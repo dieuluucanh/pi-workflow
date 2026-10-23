@@ -40,6 +40,7 @@ import {
   applySubmittedPlan,
   canRunManualReview,
   coerceReviewModeConfig,
+  createReviewHandoffGate,
   createReviewRoundGate,
   createReviewState,
   createReviewSession,
@@ -51,9 +52,11 @@ import {
   readReviewModeConfig,
   resolveReviewPrompt,
   reviewElapsedMs,
+  reviewFooterSegment,
   reviewIsActive,
   reviewPhaseLabel,
   sanitizeFindings,
+  shouldPauseReviewOnEscape,
   shouldRouteInputToReviewer,
   reviewStateSummary,
   writeReviewModeConfig,
@@ -1584,6 +1587,97 @@ test("round gate: notifies, resolves immediately, times out, aborts, resets", as
   assert.equal(g5.lastPassDone(), undefined);
   g5.notifyPassDone({ pass: 2, verdict: "approve", findings: [], at: 2 });
   assert.equal((await g5.waitForPassDone(10))?.pass, 2);
+});
+
+// ══ Gated handoff (plan 2026-10-23 follow-up) ═════════════════════════
+
+test("handoff gate: resolve-before-wait, single settle, reset, abort", async () => {
+  const gate = createReviewHandoffGate();
+  assert.equal(gate.settled(), false);
+  assert.equal(gate.peek(), undefined);
+
+  // Resolve before wait → the waiter gets the result immediately.
+  gate.resolve({ outcome: "reviewed", planText: "new-plan" });
+  assert.equal(gate.settled(), true);
+  assert.deepEqual(await gate.wait(), {
+    outcome: "reviewed",
+    planText: "new-plan",
+  });
+  assert.equal(gate.peek()?.outcome, "reviewed");
+
+  // Exactly-once: a second resolve is ignored, so an abort cannot clobber
+  // a resume that already landed (and vice versa).
+  gate.resolve({ outcome: "unreviewed", planText: "other" });
+  assert.equal(gate.peek()?.planText, "new-plan");
+
+  // Reset clears the slot for the next gated phase.
+  gate.reset();
+  assert.equal(gate.settled(), false);
+  assert.equal(gate.peek(), undefined);
+
+  // Wait then resolve.
+  const g2 = createReviewHandoffGate();
+  const waiting = g2.wait();
+  setTimeout(
+    () => g2.resolve({ outcome: "unreviewed", planText: undefined }),
+    5,
+  );
+  assert.deepEqual(await waiting, {
+    outcome: "unreviewed",
+    planText: undefined,
+  });
+  assert.equal(g2.settled(), true);
+
+  // A caller abort releases the wait with undefined; the gate itself stays
+  // open so an explicit settle still delivers the handoff exactly once.
+  const g3 = createReviewHandoffGate();
+  const ac = new AbortController();
+  const abortedWait = g3.wait(ac.signal);
+  setTimeout(() => ac.abort(), 5);
+  assert.equal(await abortedWait, undefined);
+  assert.equal(g3.settled(), false);
+  g3.resolve({ outcome: "reviewed", planText: "late-plan" });
+  assert.equal((await g3.wait())?.planText, "late-plan");
+});
+
+test("shouldPauseReviewOnEscape pauses exactly once per round", () => {
+  assert.equal(
+    shouldPauseReviewOnEscape({ roundActive: true, paused: false }),
+    true,
+  );
+  assert.equal(
+    shouldPauseReviewOnEscape({ roundActive: true, paused: true }),
+    false,
+    "an ESC while already paused falls through (editor/selector keep it)",
+  );
+  assert.equal(
+    shouldPauseReviewOnEscape({ roundActive: false, paused: false }),
+    false,
+    "an ESC with no round running falls through",
+  );
+  assert.equal(
+    shouldPauseReviewOnEscape({ roundActive: false, paused: true }),
+    false,
+  );
+});
+
+test("reviewFooterSegment composes the footer review state", () => {
+  assert.equal(reviewFooterSegment(undefined, false), "");
+  assert.equal(
+    reviewFooterSegment(undefined, true),
+    "🔍 review paused — /review-resume to continue",
+  );
+  const s = createReviewState({
+    planHash: "abc",
+    modelLabel: "p/m",
+    round: 1,
+  });
+  assert.equal(reviewFooterSegment(s, false), reviewStateSummary(s));
+  assert.equal(
+    reviewFooterSegment(s, true),
+    "🔍 review paused — /review-resume to continue",
+    "the paused form wins over the live phase",
+  );
 });
 
 // ══ Step 6: child session isolation ═══════════════════════════════════
@@ -3358,6 +3452,43 @@ test("plan-2026-10-23: landing guard never overwrites user edits", () => {
     "stale",
     "user edits since the review are kept",
   );
+});
+
+test("plan-2026-10-23-follow-up: abort during verification keeps pass 1's plan and the session warm", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    // Hang the verification pass: only an abort ends it.
+    pass2: async () => {
+      await new Promise<void>(() => {});
+    },
+  });
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+  const inFlight = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  // Wait until the verification pass starts, then abort it.
+  const t0 = Date.now();
+  while (capture.followUps.length === 0) {
+    if (Date.now() - t0 > 10_000)
+      throw new Error("verification pass never started");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(rt.isRoundActive(), true);
+  await rt.abortRound();
+  const res = await inFlight;
+  // Pass 2 is best-effort: the abort keeps pass 1's rewrite, not the draft.
+  // (The handoff layer maps this completion to the reviewed plan; a pause
+  // that raced it is dropped as stale there.)
+  assert.equal(res.ok, true);
+  assert.equal(res.fallback, false);
+  assert.ok(res.planText.includes("Result<string, ExportError>"));
+  assert.equal(rt.isRoundActive(), false);
+  assert.equal(rt.isAlive(), true, "abort keeps the session warm");
+  await rt.teardown();
 });
 
 test("plan-2026-10-23: host abort (ESC) ends the round but keeps the session warm", async () => {

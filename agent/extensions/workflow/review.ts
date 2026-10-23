@@ -1149,6 +1149,108 @@ export function createReviewRoundGate(): ReviewRoundGate {
   };
 }
 
+// ── Gated handoff (plan 2026-10-23 follow-up) ───────────────────────────
+//
+// The handoff waits for the review instead of racing it: `runHandoff`
+// awaits this gate, and `/review-resume` / `/review-abort` / teardown
+// settle it. A pause does NOT resolve the gate — the waiter keeps waiting
+// for the resume/abort outcome. Exactly-once: the first `resolve` wins;
+// a reload drops the gate (in-memory only), so a fresh `agent_end` simply
+// reviews again instead of rendering a phantom handoff.
+
+/** Lifecycle of the gated handoff review phase (in-memory, never persisted). */
+export type ReviewHandoffPhase = "idle" | "auditing" | "paused";
+
+/** How the gated review phase ended, for handoff rendering. */
+export type ReviewHandoffOutcome = "reviewed" | "unreviewed";
+
+/** The settled value the handoff renderer consumes. */
+export interface ReviewHandoffResult {
+  outcome: ReviewHandoffOutcome;
+  /** Final plan text; `undefined` means "keep the author's draft". */
+  planText: string | undefined;
+}
+
+export interface ReviewHandoffGate {
+  /** Clear the slot for a new gated phase. */
+  reset(): void;
+  /** Settle the gate; the first call wins, later calls are no-ops. */
+  resolve(result: ReviewHandoffResult): void;
+  /** True once `resolve` has run. */
+  settled(): boolean;
+  /** Latest settled result, if any (read-only peek for the waiter). */
+  peek(): ReviewHandoffResult | undefined;
+  /**
+   * Await settlement. Resolves `undefined` if the caller's signal aborts
+   * first — the handoff then falls back to the author's draft.
+   */
+  wait(signal?: AbortSignal): Promise<ReviewHandoffResult | undefined>;
+}
+
+export function createReviewHandoffGate(): ReviewHandoffGate {
+  let result: ReviewHandoffResult | undefined;
+  let waiters: Array<(value: ReviewHandoffResult | undefined) => void> = [];
+  return {
+    reset() {
+      result = undefined;
+      waiters = [];
+    },
+    resolve(r) {
+      if (result !== undefined) return;
+      result = r;
+      for (const resolve of waiters.splice(0)) {
+        try {
+          resolve(r);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    settled() {
+      return result !== undefined;
+    },
+    peek() {
+      return result;
+    },
+    wait: (signal) =>
+      deferredWait<ReviewHandoffResult>(
+        () => result,
+        (resolve) => waiters.push(resolve),
+        undefined,
+        signal,
+      ),
+  };
+}
+
+/**
+ * Pure ESC-routing decision for the review input listener.
+ *
+ * The caller pre-filters raw input (`isKeyRelease` / `matchesKey(data,
+ * Key.escape)`); this decides from round state only: pause exactly once per
+ * round — a press while no round runs, or while already paused, falls
+ * through so the editor, questionnaire and handoff selector keep ESC.
+ */
+export function shouldPauseReviewOnEscape(input: {
+  roundActive: boolean;
+  paused: boolean;
+}): boolean {
+  return input.roundActive === true && input.paused !== true;
+}
+
+/**
+ * Footer segment for a live review phase, composed into the single
+ * `"workflow"` status by `updateStatus`. Empty when no review is live, so
+ * callers can append unconditionally.
+ */
+export function reviewFooterSegment(
+  state: ReviewState | undefined,
+  paused: boolean,
+): string {
+  if (paused) return "🔍 review paused — /review-resume to continue";
+  if (!state) return "";
+  return reviewStateSummary(state);
+}
+
 // ── Step 16: reviewer transcript stream ──────────────────────────────
 
 /** Default cap on retained pane lines (the panes are a rolling window). */

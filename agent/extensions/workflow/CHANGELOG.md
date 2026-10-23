@@ -9,8 +9,49 @@ All notable changes to this package are documented in this file.
 Bare `/review` (plus `/review say|pause|resume|abort|status`) now works
 whether or not Review Mode is on: it runs a single one-shot round on the
 saved config and never flips the persisted `enabled` flag. Only the
-automatic background audit at handoff (plus the prefetch and the planner
-note) still requires `/review-mode on`.
+automatic audit at handoff (now a foreground gated phase — the handoff waits
+for it — plus the prefetch and the planner note) still requires
+`/review-mode on`.
+
+### Changed — Gated handoff: the plan waits for the review (plan 2026-10-23 follow-up)
+
+This supersedes Phase B step 5 of the fast-interactive plan below ("the
+handoff never waits") — that behavior is reversed.
+
+**The handoff waits.** `agent_end` now runs the automatic review as a
+foreground gated phase before anything renders: no browser prompt, inline
+choice, or headless preview appears until the round lands, fails, or you
+pause/abort it. The reviewed plan becomes the handed-off text (todo steps
+re-synced); any failure hands over the author's draft with a warning
+(`fallbackOnError = "skip"` is unchanged). A second `agent_end` while the
+gate is open is told the review is running instead of queueing behind it.
+
+**ESC works everywhere.** A terminal-input listener registered for the
+round's lifetime maps a bare ESC to `/review-pause` semantics (snapshot once,
+warm session, one notice) and consumes the key only when it paused — the
+editor, questionnaire, and handoff selector keep ESC otherwise. This unifies
+the previously split command/host-signal pause paths with exactly-once
+snapshot and notice (including the pass-2 race, where the rewrite wins and a
+stale pause is dropped).
+
+**Working signal.** The footer `workflow` status composes a review segment
+from the same summary the widget shows (single owner: `updateStatus`),
+refreshed on every reviewer phase transition; the spinner row reads
+`🔍 Reviewing plan…` for the round (`⏸ Review paused — …` while paused) and
+is restored afterwards. No new Pi APIs — only the public working-indicator
+methods, guarded for headless hosts.
+
+**Abort delivers.** `/review-abort` while a handoff waits settles the gate
+with the author's plan, so the normal renderer runs and the plan is always
+delivered. `/review` (fresh round) refuses while a gate is open and points at
+steer/pause/abort instead, so nothing can race the handoff it is about to
+render. Approve/deny can only arrive after the review (the prompt does not
+exist before), with `suspendReview` kept as the warm-abort safety net. The
+gate is in-memory only and exactly-once; pause never resolves it
+(`/review-resume` does), and teardown paths settle it as skipped.
+
+**Tests.** 334 green (330 + gate resolver, ESC predicate, footer segment,
+pass-2-abort-keeps-pass-1's-plan).
 
 ### Changed — Review Mode goes fast-path + interactive (plan 2026-10-23)
 
@@ -27,9 +68,10 @@ mode switches (a model change reboots it), the handoff prefetches the session
 while it resolves the plan, and `timeoutMs` defaults to 5 minutes (was
 unlimited; `0` still opts out).
 
-**Interactive (the handoff never waits).** The handoff renders immediately with
-the author's plan (marked "review pending"); the round works detached and the
-landing only announces — it never overwrites edits made meanwhile (a guarded
+**Interactive (SUPERSEDED by the gated handoff above — kept as history).**
+The handoff used to render immediately with the author's plan (marked
+"review pending") while the round worked detached and the landing only
+announced — it never overwrites edits made meanwhile (a guarded
 `updated`/`unchanged`/`stale` classification, unit-tested). ESC pauses the
 round and keeps the session warm (`/review-pause`, `/review-resume`,
 `/review-abort`; in-memory only). Plain chat stays with the plan agent
@@ -39,7 +81,7 @@ snapshotted per round and named in the band/status). `/review` aborts any
 in-flight round before re-running, and nested option modals stack on a depth
 counter instead of clobbering each other.
 
-**Tests.** 329 green, including new contracts for the verify gate (7/accepted),
+**Tests.** 330 green at that point (334 now — see above), including new contracts for the verify gate (7/accepted),
 the plan diff, the manifest (inventory caps, newest-first recon, junk input),
 the landing guard, ESC-abort-keeps-session-warm, pause→resume session reuse,
 manifest-in-prompt, and model-change reboot.

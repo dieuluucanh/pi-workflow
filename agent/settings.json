@@ -51,7 +51,7 @@
       "exploreBudget": 3,
       "timeoutMs": 0
     },
-    "defaultProfile": "Opencode-Free",
+    "defaultProfile": "Opencode-Contributor",
     "writePolicy": {
       "mode": "allow",
       "allowedPaths": [],

@@ -100,7 +100,7 @@
       "roles": {
         "planner": {
           "provider": "opencode-go",
-          "id": "minimax-m3.1-flash-free",
+          "id": "beam-free",
           "thinking": "xhigh"
         },
         "explorer": {
@@ -110,7 +110,7 @@
         },
         "builder": {
           "provider": "opencode-go",
-          "id": "minimax-m3.1-flash-free",
+          "id": "beam-free",
           "thinking": "high"
         },
         "reviewer": {
@@ -121,7 +121,7 @@
       },
       "defaultModel": {
         "provider": "opencode-go",
-        "id": "minimax-m3.1-flash-free",
+        "id": "beam-free",
         "thinking": "high"
       }
     }

@@ -218,15 +218,16 @@ Input follows the **active mode**, decided automatically — there is nothing to
 
 Delivery to the reviewer is best-effort: if it fails, the message stays in the plan-agent chat rather than being swallowed.
 
-**Status line.** While a review is running, the status widget above the editor shows the live phase (`🔍 review · pass 2/2 · 3 findings · ● verifying`).
+**Status line.** While a review is running, the footer status carries a review segment alongside the mode (`⏸ plan … · 🔍 review · pass 2/2 · 3 findings · ● verifying`), the widget above the editor shows the same live phase, and the spinner row reads `🔍 Reviewing plan…`. Pausing switches both to the paused form (`🔍 review paused — /review-resume to continue`).
 
 ### Controlling a running review
 
-The handoff never waits for the reviewer: it renders immediately with the author's plan (marked "review pending") while the round works in the background, and the plan file is updated when the review lands. A landing only **announces** — it never overwrites edits you made meanwhile; if the plan changed under it you get "landed for an older revision" and keep your text.
+The handoff **waits for the reviewer**: no browser prompt or inline choice renders until the gated round lands, fails, or you pause/abort it. The reviewed plan (the reviewer writes the plan file mid-round) becomes the handed-off text, with the todo steps re-synced to match. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
 
-- **ESC** (or `/review-pause`) pauses the round and keeps the reviewer session warm.
-- `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause).
-- `/review-abort` stops the round — or discards a paused one. The aborted revision is not auto-reviewed again until the plan changes.
+- **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. A terminal listener maps it to `/review-pause` semantics (warm session kept) and consumes the key only when it actually paused, so the editor, questionnaire and handoff selector keep ESC otherwise. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.
+- `/review-pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
+- `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result.
+- `/review-abort` stops the round — or discards a paused one — and, when a handoff is waiting, **hands off the author's plan immediately** so the plan is always delivered. The aborted revision is not auto-reviewed again until the plan changes.
 - `/review say <message>` talks to the in-flight reviewer.
 - `/review-status` shows phase, round, the snapshotted model, findings, and any paused state.
 

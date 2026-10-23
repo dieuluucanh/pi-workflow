@@ -32,6 +32,7 @@ import {
   Markdown,
   Text,
   Key,
+  isKeyRelease,
   matchesKey,
   SelectList,
   ScrollView,
@@ -188,6 +189,7 @@ import {
 } from "./profiles.ts";
 import {
   applySubmittedPlan,
+  createReviewHandoffGate,
   DEFAULT_REVIEW_MODE_CONFIG,
   formatReviewStatusLines,
   formatReviewTimeoutLabel,
@@ -195,11 +197,16 @@ import {
   planHash,
   readReviewModeConfig,
   resolveReviewPrompt,
+  reviewFooterSegment,
   reviewStateSummary,
+  shouldPauseReviewOnEscape,
   shouldRouteInputToReviewer,
   writeReviewModeConfig,
   writeReviewPrompt,
   type ReviewFinding,
+  type ReviewHandoffGate,
+  type ReviewHandoffPhase,
+  type ReviewHandoffResult,
   type ReviewState,
   type ReviewTranscriptOp,
   type ReviewTrigger,
@@ -1019,13 +1026,32 @@ export default function workflowExtension(pi: ExtensionAPI) {
     const writePolicy =
       workflowMode === null ? ` · writes:${writeMode}` : "";
     const staleMarker = todoStale ? " ⚠" : "";
+    // Review segment (plan 2026-10-23 follow-up): one footer owner — the
+    // round already shows `reviewStateSummary` in its widget, so the footer
+    // composes the same string instead of opening a second status key.
+    let reviewSegment = "";
+    try {
+      if (
+        reviewRuntime?.isRoundActive() === true ||
+        pausedReview !== undefined
+      ) {
+        const seg = reviewFooterSegment(
+          reviewState,
+          pausedReview !== undefined,
+        );
+        if (seg) reviewSegment = ` · ${seg}`;
+      }
+    } catch (_e) {
+      void _e;
+      reviewSegment = "";
+    }
     const done = todoItems.filter((t) => isDone(t)).length;
     const total = todoItems.length;
     if (workflowMode === "build") {
       const label =
         total > 0
-          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`
-          : `▶ build${suffix}${policy}${writePolicy}`;
+          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`
+          : `▶ build${suffix}${policy}${writePolicy}${reviewSegment}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", label));
     } else if (workflowMode === "plan") {
       const base = plannotatorActive
@@ -1033,21 +1059,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
         : "⏸ plan";
       const label =
         total > 0
-          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`
-          : `${base}${suffix}${policy}${writePolicy}`;
+          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`
+          : `${base}${suffix}${policy}${writePolicy}${reviewSegment}`;
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
     } else if (total > 0) {
       ctx.ui.setStatus(
         "workflow",
         ctx.ui.theme.fg(
           "muted",
-          `◦ ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}`,
+          `◦ ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`,
         ),
       );
     } else {
       ctx.ui.setStatus(
         "workflow",
-        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}${writePolicy}`),
+        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}${writePolicy}${reviewSegment}`),
       );
     }
     if (todoItems.length > 0) {
@@ -1114,12 +1140,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
    */
   let lastManifestRecon = 0;
   /**
-   * Detached background review landing record (plan 2026-10-23, step 5).
-   * Set at kickoff, cleared when the round lands, is superseded, or is torn
-   * down. The `planHash` gates the landing: a completion for any other
-   * revision is dropped silently so a stale review never overwrites new work.
+   * Gated handoff review phase (plan 2026-10-23 follow-up). In-memory only:
+   * `"auditing"` while the handoff awaits the reviewer, `"paused"` while
+   * it awaits /review-resume or /review-abort, `"idle"` otherwise. Never
+   * persisted — a reload starts fresh instead of a phantom handoff.
    */
-  let pendingReview: { planHash: string; startedAt: number } | undefined;
+  let reviewGatePhase: ReviewHandoffPhase = "idle";
+  /** Single-settle resolver the gated `runHandoff` awaits (see review.ts). */
+  const reviewHandoffGate: ReviewHandoffGate = createReviewHandoffGate();
 
   /**
    * Compact change token for a planner-touched path (step 8): size + short
@@ -1517,7 +1545,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       promptText: () => resolveReviewPrompt(cwd, agentDir).text,
       onState: (s: ReviewState | undefined) => {
         reviewState = s;
-        if (currentSessionCtx) updateReviewStatus(currentSessionCtx);
+        // Phase transitions only (no throttle timer): the widget + footer
+        // review segment follow the round live.
+        if (currentSessionCtx) {
+          updateReviewStatus(currentSessionCtx);
+          updateStatus(currentSessionCtx);
+        }
       },
       onTranscriptOps: (ops) => pushReviewOps(ops),
     });
@@ -1525,11 +1558,94 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   /**
+   * Pause the in-flight round, keeping the reviewer session warm.
+   *
+   * Single implementation behind `/review-pause` and the ESC input
+   * listener: snapshots `pausedReview` exactly once per revision, drops the
+   * handoff gate to `"paused"` (it stays open — the handoff still waits),
+   * aborts the round, and notifies exactly once. Returns false when no round
+   * was running or this revision is already paused.
+   */
+  async function pauseReviewRound(
+    reason: "esc" | "command",
+  ): Promise<boolean> {
+    const rt = reviewRuntime;
+    if (!rt?.isRoundActive() || !activeReview) return false;
+    // Exactly-once per revision: a second ESC while the abort lands, or a
+    // /review-pause racing the listener, must not snapshot or notify twice.
+    const hash = planHash(activeReview.planText);
+    if (pausedReview?.planHash === hash) return false;
+    pausedReview = {
+      planText: activeReview.planText,
+      planHash: hash,
+      round: activeReview.round,
+      previousFindings: reviewPreviousFindings,
+      at: Date.now(),
+    };
+    if (reviewGatePhase === "auditing") reviewGatePhase = "paused";
+    try {
+      await rt.abortRound();
+    } catch (_e) {
+      void _e;
+    }
+    // The resolving round emits the paused band; the footer + working
+    // message switch to the paused form here so the state is visible even
+    // before the abort lands.
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+      updateReviewStatus(currentSessionCtx ?? ({} as ExtensionContext));
+    } catch (_e) {
+      void _e;
+    }
+    setReviewWorkingMessage(pausedWorkingMessage());
+    notifyReview(
+      reason === "esc"
+        ? "Review paused (Escape) — the reviewer session stays warm. /review-resume to continue, /review-abort to stop."
+        : "Review paused — /review-resume to continue, /review-abort to stop.",
+      "info",
+    );
+    return true;
+  }
+
+  /**
+   * Set (or clear) the interactive working message for the review phase.
+   * Headless-safe: `hasUI` gates it and every call is guarded — a missing
+   * working API must never break a round.
+   */
+  function setReviewWorkingMessage(message: string | undefined): void {
+    try {
+      const ctx = currentSessionCtx;
+      if (!ctx || !(ctx as any).hasUI) return;
+      (ctx as any).ui?.setWorkingMessage?.(message);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function pausedWorkingMessage(): string {
+    return "⏸ Review paused — /review-resume to continue";
+  }
+
+  /**
+   * Settle the gated handoff when one is open. No-op when `reviewGatePhase`
+   * is `"idle"` (manual `/review` / `/review-resume` outside a handoff),
+   * and exactly-once when a gate is pending (the first `resolve` wins).
+   */
+  function settleReviewGate(result: ReviewHandoffResult): void {
+    try {
+      if (reviewGatePhase === "idle") return;
+      reviewHandoffGate.resolve(result);
+    } catch (_e) {
+      void _e;
+    }
+  }
+  /**
    * Execute one review round and fold the outcome into extension state.
    *
    * Shared by the handoff path (`runReviewStep`), manual `/review` and
-   * `/review-resume`: bands, transcript flush, status widget and the
-   * ok/fallback mapping live here so every entry point behaves identically.
+   * `/review-resume`: bands, transcript flush, status widget, working signal
+   * and the ok/fallback mapping live here so every entry point behaves
+   * identically. Registers the ESC listener for the round's lifetime.
    *
    * An aborted round is a pause, not a failure: the reviewer session stays
    * warm and the author's plan is returned, so `/review-resume` continues
@@ -1553,6 +1669,49 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // Snapshot the reviewer model for this round (step 4): a `/role` or
     // `/profile` switch mid-round takes effect next round, never mid-pass.
     reviewModelSnapshot = resolveReviewerModel();
+    // Working signal: the footer segment (via updateStatus) + widget already
+    // follow `reviewState`; the spinner row needs an explicit message while
+    // the child session streams off the main turn.
+    setReviewWorkingMessage("🔍 Reviewing plan…");
+    // ESC pauses everywhere a round is active (plan 2026-10-23 follow-up):
+    // the handoff threads no host signal while the main turn is idle, so a
+    // terminal-input listener registered for exactly this round is the pause
+    // path. Registered/unregistered here so every entry point shares it and
+    // pause/abort/failure/throw all unsubscribe. Interactive-only
+    // (`onTerminalInput` is undefined in RPC/print) — those hosts keep
+    // `/review-abort` as their stop path.
+    let detachEscListener: (() => void) | undefined;
+    try {
+      const ui = (ctx as any)?.ui;
+      if (typeof ui?.onTerminalInput === "function") {
+        const handler = (data: string) => {
+          try {
+            if (isKeyRelease(data)) return undefined;
+            if (!matchesKey(data, Key.escape)) return undefined;
+            if (
+              !shouldPauseReviewOnEscape({
+                roundActive: reviewRuntime?.isRoundActive() === true,
+                paused: pausedReview !== undefined,
+              })
+            ) {
+              return undefined;
+            }
+            void pauseReviewRound("esc");
+            return { consume: true };
+          } catch (_e) {
+            void _e;
+            return undefined;
+          }
+        };
+        try {
+          detachEscListener = ui.onTerminalInput(handler);
+        } catch (_e) {
+          void _e;
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
     try {
       const rt = ensureReviewRuntime();
       const res = await rt.runRound({
@@ -1565,10 +1724,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
       flushReviewEntries(true);
       reviewState = res.state;
       updateReviewStatus(ctx);
+      updateStatus(ctx);
       if (res.ok) {
         lastReviewedPlanHash = res.planHash;
         abortedReviewHash = undefined;
         quietAbortHash = undefined;
+        // A pause that raced a pass-2 completion: the rewrite won (pass 2 is
+        // best-effort — an abort keeps pass 1's plan), so there is nothing
+        // to resume. Drop the stale snapshot — and the gated paused phase —
+        // instead of stranding /review-resume and the handoff gate.
+        if (pausedReview?.planHash === hash) {
+          pausedReview = undefined;
+          if ((reviewGatePhase as ReviewHandoffPhase) === "paused") {
+            reviewGatePhase = "auditing";
+          }
+        }
         const keep = res.state.findings.filter(
           (f) => f.disposition !== "rejected",
         );
@@ -1577,9 +1747,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
         return res.planText;
       }
       if (res.reason === "aborted") {
-        // Explicit pause (command) already recorded the payload; an ESC abort
-        // (host signal, no command) pauses implicitly. Either way the warm
+        // A command/ESC pause already recorded the payload; a host-signal
+        // abort (foreground ESC) pauses implicitly. Either way the warm
         // session is kept and the author's plan is returned.
+        // Exactly-once notice: only the path that created the snapshot
+        // notifies (the listener and /review-pause already confirmed).
+        let implicitPaused = false;
         if (
           (!pausedReview || pausedReview.planHash !== hash) &&
           signal?.aborted
@@ -1591,15 +1764,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
             previousFindings,
             at: Date.now(),
           };
+          implicitPaused = true;
         }
         if (pausedReview?.planHash === hash) {
           emitReviewBand({
             mode: "review-done",
             reason: "paused — /review-resume to continue, /review-abort to stop",
           });
-          // The pause command already confirmed; only an implicit ESC pause
-          // needs its own notice.
-          if (signal?.aborted) {
+          if (implicitPaused) {
             notifyReview(
               "Review paused (Escape) — the reviewer session stays warm. /review-resume to continue, /review-abort to stop.",
               "info",
@@ -1639,6 +1811,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } finally {
       activeReview = undefined;
       reviewModelSnapshot = undefined;
+      try {
+        detachEscListener?.();
+      } catch (_e) {
+        void _e;
+      }
+      detachEscListener = undefined;
+      // A pause keeps its own working message (pauseReviewRound sets it
+      // after the abort lands); every other exit restores the default.
+      if (!(pausedReview && pausedReview.planHash === hash)) {
+        setReviewWorkingMessage(undefined);
+      }
     }
   }
 
@@ -1730,131 +1913,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   /**
-   * Start a review round without blocking the handoff (step 5): the handoff
-   * UI renders immediately with the author's plan while the reviewer works
-   * detached; `finishBackgroundReview` patches/announces when it lands.
-   *
-   * No host signal is threaded through: the handoff turn ends (or the gate
-   * consumes ESC) while the round runs, so its lifetime is owned by explicit
-   * `/review-pause` / `/review-abort`, supersede, or teardown instead.
-   * Never throws; a kickoff failure leaves the author's plan in place.
-   */
-  function kickOffBackgroundReview(
-    authorPlan: string,
-    ctx: ExtensionContext,
-  ): void {
-    try {
-      const hash = planHash(authorPlan);
-      // Already reviewed / aborted revisions are never kicked off
-      // (runReviewStep rechecks anyway; this avoids a pointless notice).
-      if (hash === lastReviewedPlanHash) return;
-      if (abortedReviewHash !== undefined && hash === abortedReviewHash) return;
-      const rt = reviewRuntime;
-      if (rt?.isRoundActive()) {
-        const inFlightHash = activeReview
-          ? planHash(activeReview.planText)
-          : undefined;
-        if (
-          inFlightHash !== undefined &&
-          pendingReview?.planHash === inFlightHash
-        ) {
-          if (inFlightHash === hash) {
-            // Same revision still auditing — attach: the landing announces.
-            return;
-          }
-          // Stale revision — supersede it, then re-kick.
-          pendingReview = undefined;
-          try {
-            void rt.abortRound();
-          } catch (_e) {
-            void _e;
-          }
-        } else {
-          // A foreground round (/review, /review-resume) owns the reviewer
-          // — don't steal it; its own bands announce the outcome.
-          notifyReview(
-            "A review round is already running — the handoff shows the pre-review draft.",
-            "info",
-          );
-          return;
-        }
-      }
-      pendingReview = { planHash: hash, startedAt: Date.now() };
-      notifyReview(
-        "Review running in the background — the handoff shows the pre-review draft; the plan file will be updated when it lands.",
-        "info",
-      );
-      void runReviewStep(authorPlan, ctx, undefined)
-        .then((finalText) => {
-          try {
-            finishBackgroundReview(hash, authorPlan, finalText);
-          } catch (_e) {
-            void _e;
-          }
-        })
-        .catch(() => {
-          /* runReviewStep never rejects; belt-and-braces */
-        });
-    } catch (_e) {
-      void _e;
-    }
-  }
-
-  /**
-   * Land a detached background round (step 5 companion to kickoff).
-   * The reviewer's submit path already wrote the plan file; this only
-   * decides what to ANNOUNCE — it never writes, so user edits made meanwhile
-   * are never clobbered. Silent for superseded/torn-down rounds.
-   */
-  function finishBackgroundReview(
-    inputHash: string,
-    authorPlan: string,
-    finalText: string,
-  ): void {
-    const pending = pendingReview;
-    if (!pending || pending.planHash !== inputHash) return;
-    pendingReview = undefined;
-    // Fallback, pause, abort or display-only appendix: the bands emitted
-    // inside the round already said everything.
-    if (finalText === authorPlan) return;
-    let diskHash: string | undefined;
-    try {
-      const p = currentPlanFile;
-      if (p) {
-        const abs = path.isAbsolute(p) ? p : path.join(reviewCwd(), p);
-        if (fs.existsSync(abs)) diskHash = planHash(fs.readFileSync(abs, "utf8"));
-      }
-    } catch (_e) {
-      void _e;
-    }
-    if (diskHash === undefined) return;
-    if (diskHash === planHash(finalText)) {
-      const s = reviewState;
-      const ours = s && s.planHash === inputHash ? s : undefined;
-      const detail = ours
-        ? ` with ${ours.findings.length} finding${ours.findings.length === 1 ? "" : "s"}${ours.verdict ? ` (verdict ${ours.verdict})` : ""}`
-        : "";
-      notifyReview(
-        `Review landed — plan updated${detail}. The handoff above shows the pre-review draft.`,
-        "info",
-      );
-      return;
-    }
-    if (diskHash === inputHash) return; // display-only outcome; bands covered it
-    // The user edited the plan while the review ran — keep their text.
-    notifyReview(
-      "Review landed for an older revision — your edits were kept. /review to re-run.",
-      "info",
-    );
-  }
-
-  /**
    * Suspend review activity but keep the reviewer session warm (step 10).
    * Aborts any in-flight round (silently for its own revision) and drops
    * pending landings and pauses, without paying for a cold reboot next round.
    * Round/bookkeeping state is kept — only the activity stops.
    */
   async function suspendReview(): Promise<void> {
+    // Capture before clearing: an open gate settles with the author's text.
+    const suspendedText = activeReview?.planText;
     try {
       const rt = reviewRuntime;
       if (rt?.isRoundActive() && activeReview) {
@@ -1868,10 +1934,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
-    pendingReview = undefined;
     pausedReview = undefined;
     activeReview = undefined;
     flushReviewEntries(true);
+    // An open handoff gate must never leak: approve/Tab-to-Build settle it
+    // as skipped so the awaiting handoff still renders (or its caller,
+    // already past the gate, is unaffected — resolve is exactly-once).
+    // A mode switch mid-gate already left plan mode, so the woken handoff
+    // re-checks the mode and stays silent.
+    settleReviewGate({
+      outcome: "unreviewed",
+      planText: suspendedText,
+    });
+    setReviewWorkingMessage(undefined);
+    if (currentSessionCtx) updateStatus(currentSessionCtx);
   }
 
   /** Stop the reviewer and clear all Review Mode state. Never throws. */
@@ -1886,11 +1962,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
     lastReviewedPlanHash = undefined;
     reviewRound = 0;
     reviewPreviousFindings = undefined;
-    pendingReview = undefined;
+    // Never leak an open gate: a reload/teardown cannot be resumed, so the
+    // awaiting handoff falls back to the author's draft instead of hanging.
+    settleReviewGate({
+      outcome: "unreviewed",
+      planText: activeReview?.planText,
+    });
+    reviewGatePhase = "idle";
     pausedReview = undefined;
     activeReview = undefined;
     abortedReviewHash = undefined;
     quietAbortHash = undefined;
+    setReviewWorkingMessage(undefined);
     flushReviewEntries(true);
     resetReviewStream();
     try {
@@ -2379,6 +2462,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`Plan file not readable: ${planPath}`, "warning");
         return;
       }
+      // The gated handoff owns the reviewer while it is open: a fresh round
+      // here would race the handoff it is about to render. Steer the running
+      // round with `/review say`, pause with ESC, or stop it with
+      // `/review-abort` instead; resume a paused one with `/review-resume`.
+      if (reviewGatePhase !== "idle") {
+        ctx.ui.notify(
+          reviewGatePhase === "paused"
+            ? "A handoff review is paused — /review-resume to continue it, /review-abort to hand off the plan as-is."
+            : "A handoff review is running — /review say <msg> to steer it, ESC to pause, /review-abort to hand off the plan as-is.",
+          "info",
+        );
+        return;
+      }
       // Abort-first (step 6): never run two rounds on one reviewer session.
       // The superseded round resolves `aborted` and stays silent for its own
       // revision (quietAbortHash) so only the fresh round announces.
@@ -2387,14 +2483,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
           ? planHash(activeReview.planText)
           : undefined;
         pausedReview = undefined;
-        pendingReview = undefined;
         try {
           await reviewRuntime.abortRound();
         } catch (_e) {
           void _e;
         }
-      } else {
-        pendingReview = undefined;
       }
       lastReviewedPlanHash = undefined; // force a fresh review
       abortedReviewHash = undefined;
@@ -2426,8 +2519,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       // Manual control: pause works whether or not Review Mode is on.
       // Gate only on session liveness below — no `enabled` check here.
-      const rt = reviewRuntime;
-      if (!rt?.isRoundActive() || !activeReview) {
+      if (!reviewRuntime?.isRoundActive() || !activeReview) {
         ctx.ui.notify(
           pausedReview
             ? "Review is already paused — /review-resume to continue, /review-abort to stop."
@@ -2436,24 +2528,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
         );
         return;
       }
-      pausedReview = {
-        planText: activeReview.planText,
-        planHash: planHash(activeReview.planText),
-        round: activeReview.round,
-        previousFindings: reviewPreviousFindings,
-        at: Date.now(),
-      };
-      try {
-        await rt.abortRound();
-      } catch (_e) {
-        void _e;
-      }
-      // The in-flight round resolves `aborted`; executeReviewRound emits the
-      // paused band. This confirms the command landed immediately.
-      ctx.ui.notify(
-        "Review paused — /review-resume to continue, /review-abort to stop.",
-        "info",
-      );
+      // Shared with the ESC listener: snapshots once, drops an open handoff
+      // gate to "paused" (it stays open — the handoff still waits), and
+      // notifies. The resolving round emits the paused band.
+      await pauseReviewRound("command");
     },
   });
 
@@ -2502,6 +2580,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
           (ctx as any).signal as AbortSignal | undefined,
           "manual",
         );
+        // A second ESC during the resumed round re-pauses instead of
+        // settling: the gate stays open for the next resume/abort. An open
+        // gate outside a handoff is a no-op (settle checks the phase).
+        if (!pausedReview) {
+          settleReviewGate({ outcome: "reviewed", planText: out });
+        }
         ctx.ui.notify(
           out === current
             ? "Review finished — plan left unchanged."
@@ -2520,6 +2604,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx: ctx as any,
         signal: (ctx as any).signal as AbortSignal | undefined,
       });
+      // Same re-pause guard as the fresh-revision branch above.
+      if (!pausedReview) {
+        settleReviewGate({ outcome: "reviewed", planText: out });
+      }
       ctx.ui.notify(
         out === paused.planText
           ? "Review finished — no usable rewrite (plan left unchanged)."
@@ -2542,6 +2630,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const targetHash =
         pausedReview?.planHash ??
         (activeReview ? planHash(activeReview.planText) : undefined);
+      // Text the gate hands off when one is open (resolved below after the
+      // abort lands; falls back to the author's draft when unknown).
+      const abortedText =
+        pausedReview?.planText ?? activeReview?.planText;
       pausedReview = undefined;
       // An aborted revision is not auto-reviewed again until the plan changes.
       if (targetHash) abortedReviewHash = targetHash;
@@ -2559,6 +2651,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
           "Review stopped — the author's plan stands unreviewed.",
           "info",
         );
+        // A gated handoff was waiting on this round: hand off the author's
+        // plan through the normal renderer so the plan is always delivered.
+        settleReviewGate({ outcome: "unreviewed", planText: abortedText });
         return;
       }
       flushReviewEntries(true);
@@ -2567,6 +2662,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         "Paused review discarded — the author's plan stands.",
         "info",
       );
+      settleReviewGate({ outcome: "unreviewed", planText: abortedText });
     },
   });
 
@@ -8602,6 +8698,23 @@ export default function workflowExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    // Gated review owns this window: a second agent_end while the handoff
+    // awaits the reviewer must not queue behind it — tell the user and stop.
+    // (Checked before the mutex: awaiting the in-flight handoff would block
+    // for the whole review instead of short-circuiting.)
+    if (reviewGatePhase !== "idle") {
+      try {
+        ctx.ui.notify(
+          reviewGatePhase === "paused"
+            ? "Review paused — /review-resume to continue, /review-abort to hand off the plan as-is."
+            : "Review running — ESC pauses it, /review-abort hands off the plan as-is.",
+          "info",
+        );
+      } catch (_e) {
+        void _e;
+      }
+      return;
+    }
     // Mutex: serialize concurrent agent_end handoffs (bus may emit Promise.all)
     if (handoffInFlight) {
       try {
@@ -9027,15 +9140,79 @@ export default function workflowExtension(pi: ExtensionAPI) {
         void _e;
       }
 
-      // ── Review Mode: audit in the background (plan 2026-10-23, step 5).
-      // The handoff renders immediately with the author's plan; the reviewer
-      // works detached and finishBackgroundReview patches/announces on
-      // landing. On any failure the author's plan is kept.
-      // Automatic review only — manual `/review` bypasses via "manual" trigger.
-      let reviewPendingAtHandoff = false;
+      // ── Review Mode: gated foreground audit (plan 2026-10-23 follow-up).
+      // The handoff waits for the reviewer — no browser/inline prompt renders
+      // until the round lands, fails, or the user pauses/aborts. A broken
+      // reviewer never blocks the plan (fallbackOnError = "skip" returns the
+      // author's draft with a warning). Automatic review only — manual
+      // `/review` bypasses via the "manual" trigger.
+      //
+      // Fold a gated result into the handoff: the reviewer writes the plan
+      // file mid-round, so a changed result re-syncs the rendered text and
+      // the numbered todo steps before any prompt renders.
+      const applyGatedResult = (finalText: string, authorPlan: string) => {
+        if (planHash(finalText) === planHash(authorPlan)) return;
+        planTextForRender = finalText;
+        try {
+          const steps = extractPlanStepsFromMarkdown(finalText);
+          if (steps.length > 0) {
+            todoItems =
+              todoItems.length > 0
+                ? mergeTodoItems(todoItems, steps).items
+                : ensureTodoLabels(steps);
+            updateStatus(ctx as any);
+            persistState();
+          }
+        } catch (_e) {
+          void _e;
+        }
+      };
       if (planTextForRender && reviewEnabled()) {
-        kickOffBackgroundReview(planTextForRender, ctx as ExtensionContext);
-        reviewPendingAtHandoff = pendingReview !== undefined;
+        const authorPlan: string = planTextForRender;
+        reviewHandoffGate.reset();
+        reviewGatePhase = "auditing";
+        try {
+          const reviewed = await runReviewStep(
+            authorPlan,
+            ctx as ExtensionContext,
+            (ctx as any).signal as AbortSignal | undefined,
+            "auto",
+          );
+          // Fresh read: the phase may have moved to "paused" (ESC /
+          // /review-pause) while the round was returning. The `as` widens
+          // past the "auditing" narrowing above (a plain annotation does
+          // not — tsc keeps the assignment-site literal for closures).
+          const phaseAfterRound = reviewGatePhase as ReviewHandoffPhase;
+          if (phaseAfterRound === "paused" && !reviewHandoffGate.settled()) {
+            // Paused mid-gate: the round returned the author plan early and
+            // the gate stays open until /review-resume or /review-abort
+            // settles it (teardown skips it so the plan is still delivered).
+            // No host signal here: the wait is settled explicitly by
+            // /review-resume, /review-abort or teardown, and a pre-aborted
+            // ctx.signal would hang the underlying deferred wait forever.
+            const res = await reviewHandoffGate.wait();
+            applyGatedResult(res?.planText ?? authorPlan, authorPlan);
+          } else {
+            if (!reviewHandoffGate.settled()) {
+              reviewHandoffGate.resolve({
+                outcome: reviewed !== authorPlan ? "reviewed" : "unreviewed",
+                planText: reviewed,
+              });
+            }
+            // Peek, don't trust the local: a resume/abort may have settled
+            // the gate with a newer result while the round was returning.
+            const finalText =
+              reviewHandoffGate.peek()?.planText ?? reviewed;
+            applyGatedResult(finalText, authorPlan);
+          }
+        } catch (_e) {
+          void _e;
+        } finally {
+          reviewGatePhase = "idle";
+        }
+        // A mode switch mid-gate (e.g. Tab-to-Build) already left plan mode:
+        // the gate settled as skipped, so there is nothing to hand off.
+        if (workflowMode !== "plan") return;
       }
       // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
       if (!hasUI && planTextForRender && !awaitingDecision) {
@@ -9048,9 +9225,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           (pi as any).sendMessage?.(
             {
               customType: "workflow-handoff-fallback",
-              content: reviewPendingAtHandoff
-                ? `${content}\n\n🔍 Review running in background — this preview is the pre-review draft.`
-                : content,
+              content,
               display: true,
             },
             { triggerTurn: false },
@@ -9095,7 +9270,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   payload: {
                     planContent: planTextForRender!,
                     planFilePath: planPath,
-                    reviewPending: reviewPendingAtHandoff,
+                    // The handoff only renders after the gated review
+                    // resolves, so a pending review is impossible here;
+                    // the field stays for the external browser app.
+                    reviewPending: false,
                     // Provenance so the browser/inline view can show that this
                     // plan was independently reviewed (and by what).
                     reviewSummary: reviewState
@@ -9233,10 +9411,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
                       ` Plan: ${path.basename(planPath!)} ` +
                         (collapsed
                           ? "(collapsed — press c to expand)"
-                          : "(press c to collapse)") +
-                        (reviewPendingAtHandoff
-                          ? " · 🔍 review in progress"
-                          : ""),
+                          : "(press c to collapse)"),
                     ),
                   ),
                   1,
