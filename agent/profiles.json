@@ -22,9 +22,14 @@
         },
         "reviewer": {
           "provider": "synthetic",
-          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
           "thinking": "xhigh"
         }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "deepseek-v4.1-flash",
+        "thinking": "high"
       }
     },
     {
@@ -33,17 +38,17 @@
       "roles": {
         "planner": {
           "provider": "synthetic",
-          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
           "thinking": "xhigh"
         },
         "explorer": {
           "provider": "synthetic",
-          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
           "thinking": "medium"
         },
         "builder": {
           "provider": "synthetic",
-          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
           "thinking": "high"
         },
         "reviewer": {
@@ -51,6 +56,11 @@
           "id": "deepseek-v4.1-flash",
           "thinking": "xhigh"
         }
+      },
+      "defaultModel": {
+        "provider": "synthetic",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "thinking": "high"
       }
     },
     {
@@ -77,6 +87,11 @@
           "id": "deepseek-v4.1-flash",
           "thinking": "xhigh"
         }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "muse-spark-1.3-contributor",
+        "thinking": "high"
       }
     },
     {
@@ -103,6 +118,11 @@
           "id": "beam-free",
           "thinking": "xhigh"
         }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "minimax-m3.1-flash-free",
+        "thinking": "high"
       }
     }
   ]

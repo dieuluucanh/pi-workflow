@@ -55,6 +55,8 @@ export interface Profile {
   description: string;
   /** Partial by design: hand-edited files may override a subset of roles. */
   roles: Partial<Record<ProfileRoleName, RoleModel>>;
+  /** Optional model used in Default mode (chat). Not a role — roles.json is untouched. */
+  defaultModel?: RoleModel;
 }
 
 export interface ProfileConfig {
@@ -240,11 +242,17 @@ export function sanitizeProfile(p: any): Profile | undefined {
     const m = sanitizeProfileModel((rawRoles as any)[roleName]);
     if (m) roles[roleName] = m;
   }
-  if (Object.keys(roles).length === 0) return undefined;
+  // Default-mode model: prefer the dedicated field, fall back to a
+  // `roles.default` alias for hand-edited files.
+  const defaultModel =
+    sanitizeProfileModel(p.defaultModel) ??
+    sanitizeProfileModel((rawRoles as any).default);
+  if (Object.keys(roles).length === 0 && !defaultModel) return undefined;
   return {
     name: nameCheck.value,
     description: typeof p.description === "string" ? p.description.trim() : "",
     roles,
+    ...(defaultModel ? { defaultModel } : {}),
   };
 }
 
@@ -417,6 +425,10 @@ export function formatProfileOneLine(p: Profile): string {
     const m = p.roles[r];
     return m ? `${roleIcon(r)} ${formatModelRef(m)} (${m.thinking})` : `${roleIcon(r)} —`;
   });
+  if (p.defaultModel) {
+    const m = p.defaultModel;
+    parts.push(`◦ ${formatModelRef(m)} (${m.thinking})`);
+  }
   const desc = p.description ? ` — ${p.description}` : "";
   return `⚡ ${p.name}${desc}: ${parts.join(" · ")}`;
 }
@@ -433,6 +445,12 @@ export function describeProfile(p: Profile): string {
       }`,
     );
   }
+  const dm = p.defaultModel;
+  lines.push(
+    `  ◦ default: ${
+      dm ? `${formatModelRef(dm)} (${dm.thinking})` : "(not set — keeps current Default-mode model)"
+    }`,
+  );
   return lines.join("\n");
 }
 
@@ -473,6 +491,12 @@ export function formatProfilesForDisplay(
         }`,
       );
     }
+    const dm = p.defaultModel;
+    lines.push(
+      `     ◦ default: ${
+        dm ? `${formatModelRef(dm)} (${dm.thinking})` : "(current Default-mode model)"
+      }`,
+    );
   }
   lines.push("");
   lines.push(

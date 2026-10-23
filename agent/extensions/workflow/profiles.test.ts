@@ -27,6 +27,7 @@ import {
   profileArgumentCompletions,
   validateProfileName,
   applyProfileOverlay,
+  sanitizeProfile,
   missingProfileRoles,
   extractDefaultProfile,
   readDefaultProfileSetting,
@@ -598,4 +599,46 @@ test("profiles: the none candidate is filtered by the partial token", () => {
 test("profiles: 'off' is now a reserved profile name", () => {
   assert.equal(validateProfileName("off").ok, false);
   assert.equal(validateProfileName("OFF").ok, false, "reserved check is case-insensitive");
+});
+
+test("profiles: defaultModel round-trips through sanitize", () => {
+  const root = tmpRoot();
+  const userPath = path.join(root, "agent", "profiles.json");
+  writeProfilesFile(userPath, [
+    {
+      name: "cheap",
+      description: "budget mix",
+      roles: {
+        planner: { provider: "prov-a", id: "model-a", thinking: "high" },
+      },
+      defaultModel: { provider: "prov-b", id: "model-b", thinking: "low" },
+    },
+  ]);
+  const cfg = loadProfiles(root, { userPath });
+  const p = getProfile(cfg, "cheap");
+  assert.ok(p);
+  assert.deepEqual(p!.defaultModel, { provider: "prov-b", id: "model-b", thinking: "low" });
+});
+
+test("profiles: roles.default alias promotes to defaultModel", () => {
+  const raw = {
+    name: "alias",
+    roles: {
+      planner: { provider: "prov-a", id: "model-a", thinking: "high" },
+      default: { provider: "prov-c", id: "model-c", thinking: "medium" },
+    },
+  };
+  const p = sanitizeProfile(raw);
+  assert.ok(p);
+  assert.deepEqual(p!.defaultModel, { provider: "prov-c", id: "model-c", thinking: "medium" });
+  assert.equal((p!.roles as any).default, undefined);
+});
+
+test("profiles: missing defaultModel keeps undefined", () => {
+  const p = sanitizeProfile({
+    name: "nodef",
+    roles: { planner: { provider: "p", id: "m", thinking: "high" } },
+  });
+  assert.ok(p);
+  assert.equal(p!.defaultModel, undefined);
 });

@@ -183,6 +183,7 @@ import {
   PROFILE_ROLES,
   type ProfileConfig,
   type Profile,
+  type ProfileRoleName,
 } from "./profiles.ts";
 import {
   applySubmittedPlan,
@@ -722,6 +723,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
           `  ${roleIcon(roleName)} ${roleName} → ${formatModelRef(m)} (${m.thinking})`,
         );
     }
+    if (profile.defaultModel) {
+      const m = profile.defaultModel;
+      lines.push(
+        `  ◦ default → ${formatModelRef(m)} (${m.thinking})`,
+      );
+    }
     const missing = missingProfileRoles(profile);
     if (missing.length) {
       lines.push(
@@ -771,6 +778,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     profileExplicit = opts?.explicit ?? true;
     invalidateEffectiveRoles();
+    const prof = activeProfileName
+      ? getProfile(profilesConfig, activeProfileName)
+      : null;
+    // Default-mode model follows the profile when it carries one.
+    if (prof?.defaultModel) {
+      defaultModel = { ...prof.defaultModel };
+    }
     try {
       persistState();
     } catch (_e) {
@@ -780,6 +794,27 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (workflowMode) {
       try {
         await applyModeModel(ctx as any, { quiet: opts?.quiet });
+      } catch (_e) {
+        void _e;
+      }
+    } else if (prof?.defaultModel) {
+      // In Default mode, apply the profile's default model immediately.
+      try {
+        const m = prof.defaultModel;
+        const reg = (ctx as any)?.modelRegistry;
+        const found = reg?.find?.(m.provider, m.id);
+        if (found) {
+          await (pi as any).setModel?.(found);
+          if (m.thinking && isValidThinkingLevel(m.thinking)) {
+            (pi as any).setThinkingLevel?.(m.thinking);
+          }
+          if (!opts?.quiet) {
+            ctx.ui.notify(
+              `Default mode: model → ${m.provider}/${m.id}${m.thinking ? ` (${m.thinking})` : ""}`,
+              "info",
+            );
+          }
+        }
       } catch (_e) {
         void _e;
       }
@@ -3455,6 +3490,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const m = getEffectiveRole(roleName)?.model;
       if (m) seed.roles[roleName] = { ...m };
     }
+    if (defaultModel)
+      seed.defaultModel = {
+        provider: defaultModel.provider,
+        id: defaultModel.id,
+        thinking: (defaultModel.thinking as ThinkingLevel) ?? "medium",
+      };
     return seed;
   }
 
@@ -3635,10 +3676,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ]
           .filter(Boolean)
           .join(", ");
-        const modelSummary = PROFILE_ROLES.map((r) => {
-          const m = p.roles[r];
-          return m ? `${roleIcon(r)} ${formatModelRef(m)}` : null;
-        })
+        const modelSummary = [
+          ...PROFILE_ROLES.map((r) => {
+            const m = p.roles[r];
+            return m ? `${roleIcon(r)} ${formatModelRef(m)}` : null;
+          }),
+          p.defaultModel
+            ? `◦ ${formatModelRef(p.defaultModel)}`
+            : null,
+        ]
           .filter(Boolean)
           .join(" · ");
         entries.push({
@@ -4031,8 +4077,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
         description: base?.description ?? `Role ${roleName}`,
       });
     }
+    roleMeta.set("default", {
+      name: "default",
+      description: "Model used in Default mode (chat)",
+    });
     // Keep the narrow tuple type so profile.roles[roleName] typechecks.
-    const tabIds = [...PROFILE_ROLES];
+    const tabIds = [...PROFILE_ROLES, "default"];
     // Stage from the profile (edit) or the current effective roles (create).
     const staged = new Map<string, StagedProfileModel>();
     for (const roleName of PROFILE_ROLES) {
@@ -4044,6 +4094,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
         thinking: src?.thinking ?? "medium",
       });
     }
+    const defaultSrc = existing?.defaultModel ?? defaultModel;
+    staged.set("default", {
+      provider: defaultSrc?.provider ?? "",
+      id: defaultSrc?.id ?? "",
+      thinking: (defaultSrc?.thinking as ThinkingLevel) ?? "medium",
+    });
 
     overlayActive = true;
     let saved: {
@@ -4213,7 +4269,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
           for (let i = 0; i < tabIds.length; i++) {
             const roleName = tabIds[i];
             const st = staged.get(roleName)!;
-            const base = existing?.roles[roleName];
+            const base =
+              roleName === "default"
+                ? existing?.defaultModel
+                : existing?.roles[roleName as ProfileRoleName];
             const dirty =
               !base ||
               `${st.provider}/${st.id}` !== `${base.provider}/${base.id}` ||
@@ -4389,6 +4448,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
           id: st.id,
           thinking: st.thinking,
         };
+    }
+    const defaultSt = saved.staged.get("default");
+    if (defaultSt && defaultSt.provider && defaultSt.id) {
+      profile.defaultModel = {
+        provider: defaultSt.provider,
+        id: defaultSt.id,
+        thinking: defaultSt.thinking,
+      };
+    } else {
+      delete profile.defaultModel;
     }
     try {
       saveProfiles(profilesConfig, "user");
@@ -6409,6 +6478,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                       void _e;
                     }
                     activeProfileName = null;
+                  } else if (activeProfileName) {
+                    const rp = getProfile(profilesConfig, activeProfileName);
+                    if (rp?.defaultModel) {
+                      defaultModel = { ...rp.defaultModel };
+                    }
                   }
                 } else {
                   activeProfileName = null;
@@ -6511,6 +6585,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
             if (activeProfileName !== p.name) {
               activeProfileName = p.name;
               invalidateEffectiveRoles();
+            }
+            if (p.defaultModel) {
+              defaultModel = { ...p.defaultModel };
             }
           } else {
             try {
