@@ -415,6 +415,39 @@ The default profile lives under `workflow.defaultProfile` (global/project preced
 
 `/profile default <name|none> [global|project]` writes this key read-modify-write, preserving every other settings key. Sessions that never picked explicitly (fresh or resumed) re-read it at every start, so changing the default applies to them; an explicit `/profile use` in a session pins that session until changed.
 
+### Default model persistence
+
+The model you select is remembered as the default for the **next** session. This covers every way of selecting one:
+
+- the model selector in terminal Pi (plain Enter, not only `Ctrl+S`),
+- model cycling (`Ctrl+P`, `Ctrl+Alt+Up/Down`),
+- the model picker in Pi Desktop,
+- an explicit `/profile use` (its `defaultModel` tab),
+- an explicit `/role set`, `/role use`, or a `/role` picker save.
+
+Entering Plan/Build mode does **not** change the default: the planner/builder model belongs to that mode, so the next session still starts on your Default-mode model. Resumed sessions keep their recorded model, and Workflow's own `explore`/review subagents keep their role model.
+
+The value is stored in `settings.json` (global `~/.pi/agent/settings.json`, or the project file `<cwd>/.pi/settings.json` when that file already defines it):
+
+```json
+{
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4.1-flash",
+  "defaultThinkingLevel": "high",
+  "workflow": {
+    "modelDefault": {
+      "provider": "opencode-go",
+      "id": "deepseek-v4.1-flash",
+      "thinking": "high"
+    }
+  }
+}
+```
+
+`workflow.modelDefault` is the authoritative record (our key — it survives Pi upgrades). The three top-level keys are Pi's own native defaults, mirrored in the same write so terminal Pi, Pi Desktop and Pi's settings UI agree. The extension also applies `workflow.modelDefault` on `session_start` for a brand-new session, because Pi's own startup resolution prefers the **first `enabledModels` entry** over a saved default — without that step a default outside your model scope would be ignored.
+
+Every other settings key (including `workflow.commitPolicy`, `workflow.writePolicy`, `workflow.defaultProfile`, `enabledModels`) is preserved by the read-modify-write. Clear the default by deleting `workflow.modelDefault` and the three top-level keys, or simply select a different model. `/role list` and the `/profile` picker show which model the next session will start on and which file defines it.
+
 Review Mode settings live under `workflow.reviewMode`:
 
 | Key | Default | Meaning |

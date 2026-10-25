@@ -191,6 +191,18 @@ import {
   type ProfileRoleName,
 } from "./profiles.ts";
 import {
+  coerceModelDefault,
+  describeModelDefaultApply,
+  formatPersistedModel,
+  modelDefaultWriteScope,
+  readModelDefault,
+  shouldApplyModelDefaultAtSessionStart,
+  shouldPersistModelSelect,
+  shouldPersistThinkingSelect,
+  writeModelDefault,
+  type PersistedModelDefault,
+} from "./model-default.ts";
+import {
   applySubmittedPlan,
   createReviewHandoffGate,
   DEFAULT_REVIEW_MODE_CONFIG,
@@ -699,10 +711,38 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * active, an explicit section naming the profile and its model overrides.
    * Without a profile this is exactly the plain roles display.
    */
+  /**
+   * One line naming the model the NEXT session will start on, read from the
+   * settings file that currently defines it. Used by `/role list` and the
+   * `/profile` picker so "what will the next session use?" is answerable
+   * without opening settings.json.
+   */
+  function persistedDefaultLabel(): string {
+    try {
+      const { cwd, agentDir } = modelDefaultContext(currentSessionCtx);
+      const res = readModelDefault(cwd, agentDir);
+      if (res.value) {
+        const m = res.value;
+        const where =
+          res.sources.effective === "project"
+            ? `${CONFIG_DIR_NAME}/settings.json (project)`
+            : `~/${CONFIG_DIR_NAME}/agent/settings.json`;
+        return `◦ ${formatPersistedModel(m)}${
+          m.thinking ? ` (${m.thinking})` : ""
+        } — ${where}`;
+      }
+      return "none — Pi picks the first scoped/available model";
+    } catch (_e) {
+      void _e;
+      return "unknown (settings unreadable)";
+    }
+  }
+
   function formatRolesDisplayWithProfile(): string {
     const base = formatRolesForDisplay(roleConfig);
     const profile = resolveActiveProfile();
-    if (!profile) return base;
+    const savedLine = `Saved default (next session): ${persistedDefaultLabel()}`;
+    if (!profile) return [base, "", savedLine].join("\n");
     const lines: string[] = [
       base,
       "",
@@ -717,6 +757,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           `  ${roleIcon(roleName)} ${roleName} → ${formatModelRef(m)} (${m.thinking})  (profile override)`,
         );
     }
+    lines.push("", savedLine);
     lines.push(
       `  /profile edit ${profile.name} to change the profile • /profile use none to deactivate`,
     );
@@ -809,23 +850,33 @@ export default function workflowExtension(pi: ExtensionAPI) {
       } catch (_e) {
         void _e;
       }
+      // The profile's Default-mode model becomes the saved default even while
+      // a role mode is active — it is what the next session starts on.
+      if (
+        prof?.defaultModel &&
+        registryModel(ctx, prof.defaultModel.provider, prof.defaultModel.id)
+      ) {
+        persistModelDefault(ctx as any, prof.defaultModel, "profile");
+      }
     } else if (prof?.defaultModel) {
       // In Default mode, apply the profile's default model immediately.
       try {
         const m = prof.defaultModel;
-        const reg = (ctx as any)?.modelRegistry;
-        const found = reg?.find?.(m.provider, m.id);
+        const found = registryModel(ctx, m.provider, m.id);
         if (found) {
-          await (pi as any).setModel?.(found);
-          if (m.thinking && isValidThinkingLevel(m.thinking)) {
-            (pi as any).setThinkingLevel?.(m.thinking);
-          }
+          await withPersistSuppressed(async () => {
+            await (pi as any).setModel?.(found);
+            if (m.thinking && isValidThinkingLevel(m.thinking)) {
+              (pi as any).setThinkingLevel?.(m.thinking);
+            }
+          });
           if (!opts?.quiet) {
             ctx.ui.notify(
               `Default mode: model → ${m.provider}/${m.id}${m.thinking ? ` (${m.thinking})` : ""}`,
               "info",
             );
           }
+          persistModelDefault(ctx as any, m, "profile");
         }
       } catch (_e) {
         void _e;
@@ -2848,13 +2899,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
       current.provider === m.provider &&
       current.id === m.id
     ) {
-      try {
-        if (m.thinking && isValidThinkingLevel(m.thinking)) {
-          (pi as any).setThinkingLevel?.(m.thinking);
+      await withPersistSuppressed(async () => {
+        try {
+          if (m.thinking && isValidThinkingLevel(m.thinking)) {
+            (pi as any).setThinkingLevel?.(m.thinking);
+          }
+        } catch (_e) {
+          void _e;
         }
-      } catch (_e) {
-        void _e;
-      }
+      });
       return true;
     }
     let found: any;
@@ -2872,7 +2925,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       return false;
     }
     try {
-      const result = await (pi as any).setModel?.(found);
+      const result = await withPersistSuppressed(async () =>
+        (pi as any).setModel?.(found),
+      );
       if (result === false) throw new Error("setModel returned false");
     } catch (e: any) {
       ctx.ui.notify(
@@ -2881,13 +2936,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
       );
       return false;
     }
-    try {
-      if (m.thinking && isValidThinkingLevel(m.thinking)) {
-        (pi as any).setThinkingLevel?.(m.thinking);
+    await withPersistSuppressed(async () => {
+      try {
+        if (m.thinking && isValidThinkingLevel(m.thinking)) {
+          (pi as any).setThinkingLevel?.(m.thinking);
+        }
+      } catch (_e) {
+        void _e;
       }
-    } catch (_e) {
-      void _e;
-    }
+    });
     lastModeSwitch = {
       from: fromLabel,
       to: `${m.provider}/${m.id}`,
@@ -2980,6 +3037,182 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     } catch (_e) {
       void _e;
+    }
+  }
+
+  // ── Persisted default model ────────────────────────────────────
+  /**
+   * True while the extension itself is switching models (entering Plan/Build,
+   * restoring Default mode, the session-start apply). Wrapped around every
+   * internal `pi.setModel` so the `model_select` handler cannot mistake an
+   * internal switch for a user gesture — otherwise the planner/builder model
+   * would become the next session's default.
+   */
+  let persistSuppressed = false;
+
+  /** Run `fn` with persistence suppressed; the flag is restored in `finally`. */
+  async function withPersistSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = persistSuppressed;
+    persistSuppressed = true;
+    try {
+      return await fn();
+    } finally {
+      persistSuppressed = previous;
+    }
+  }
+
+  /** Resolve the cwd + agent dir used for the persisted default's settings file. */
+  function modelDefaultContext(ctx?: ExtensionContext | null): {
+    cwd: string;
+    agentDir: string;
+  } {
+    let cwd = "";
+    try {
+      cwd = (ctx as any)?.cwd ?? currentSessionCtx?.cwd ?? "";
+    } catch (_e) {
+      void _e;
+    }
+    let agentDir = "";
+    try {
+      agentDir = getAgentDir();
+    } catch (_e) {
+      void _e;
+    }
+    return {
+      cwd: cwd || process.cwd(),
+      agentDir: agentDir || path.join(os.homedir(), CONFIG_DIR_NAME, "agent"),
+    };
+  }
+
+  /**
+   * The single writer for the persisted default model.
+   *
+   * Writes the extension-owned `workflow.modelDefault` key plus Pi's native
+   * `defaultProvider`/`defaultModel`/`defaultThinkingLevel` mirror, updates the
+   * in-memory `defaultModel` so Default-mode restore and the next session agree,
+   * and mirrors the value into the `workflow` session entry.
+   *
+   * A failed write is reported with its path and never throws; memory still
+   * follows the model the session is actually on, because refusing to remember
+   * it would be worse than a stale file. A no-op write (same value already on
+   * disk) is silent.
+   *
+   * `source` is documentation + diagnostics only: call sites decide whether a
+   * change should persist (`user-select` / `cycle` / `profile` /
+   * `role-default` / `thinking`). Internal switches call this only after an
+   * explicit user decision.
+   */
+  function persistModelDefault(
+    ctx: ExtensionContext | null,
+    model:
+      | { provider?: string; id?: string; thinking?: string }
+      | null
+      | undefined,
+    source: "user-select" | "cycle" | "profile" | "role-default" | "thinking",
+  ): boolean {
+    const coerced = coerceModelDefault(
+      model && model.provider && model.id
+        ? {
+            provider: model.provider,
+            id: model.id,
+            thinking: model.thinking,
+          }
+        : undefined,
+    );
+    if (!coerced) return false;
+    defaultModel = {
+      provider: coerced.provider,
+      id: coerced.id,
+      thinking: coerced.thinking,
+    };
+    const { cwd, agentDir } = modelDefaultContext(ctx);
+    try {
+      const scope = modelDefaultWriteScope(cwd, agentDir);
+      const res = writeModelDefault(scope, cwd, agentDir, coerced);
+      if (!res.ok) {
+        try {
+          ctx?.ui.notify(
+            `Default model not saved (${res.path}): ${res.error ?? "unknown error"}. The session keeps ${formatPersistedModel(coerced)}.`,
+            "warning",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return false;
+      }
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+      if (res.changed) {
+        const label = `${formatPersistedModel(coerced)}${
+          coerced.thinking ? ` (${coerced.thinking})` : ""
+        }`;
+        try {
+          ctx?.ui.notify(
+            `Default model saved → ${label}. The next session starts here (${source}).`,
+            "info",
+          );
+        } catch (_e) {
+          void _e;
+        }
+      }
+      return true;
+    } catch (e: any) {
+      try {
+        ctx?.ui.notify(
+          `Default model not saved: ${String(e?.message || e)}`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Look a model up in the session's registry. Returns undefined when the
+   * registry is unavailable or does not know the pair — never throws.
+   */
+  function registryModel(
+    ctx: ExtensionContext | null,
+    provider: string,
+    id: string,
+  ): any {
+    try {
+      const reg = (ctx as any)?.modelRegistry;
+      return reg?.find?.(provider, id);
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
+  /**
+   * Read the persisted default from disk, optionally adopting it into the
+   * in-memory `defaultModel` (the value Default-mode restore and the session
+   * entry use). Never throws; an absent/corrupt file is "no persisted default".
+   */
+  function loadPersistedDefaultModel(
+    ctx?: ExtensionContext | null,
+    adopt = true,
+  ): PersistedModelDefault | undefined {
+    try {
+      const { cwd, agentDir } = modelDefaultContext(ctx);
+      const res = readModelDefault(cwd, agentDir);
+      if (res.value && adopt) {
+        defaultModel = {
+          provider: res.value.provider,
+          id: res.value.id,
+          thinking: res.value.thinking,
+        };
+      }
+      return res.value;
+    } catch (_e) {
+      void _e;
+      return undefined;
     }
   }
 
@@ -4157,7 +4390,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const sub = (parts[0] || "").toLowerCase();
       const rest = parts.slice(1);
 
-      const saveAndSync = (msg: string) => {
+      const saveAndSync = (msg: string): boolean => {
         try {
           saveRoleConfig(roleConfig, "user");
         } catch (e: any) {
@@ -4165,11 +4398,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
             `Role updated but file save failed: ${String(e?.message || e)}`,
             "warning",
           );
-          return;
+          return false;
         }
         persistState();
         updateStatus(ctx as any);
         ctx.ui.notify(msg, "info");
+        return true;
       };
 
       // Bare /role → interactive config screen (one block per role:
@@ -4256,9 +4490,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
           void _e;
         }
         role.model = { provider, id, thinking };
-        saveAndSync(
+        const saved = saveAndSync(
           `Role ${roleIcon(role.name)} ${role.name} → ${provider}/${id} (${thinking})`,
         );
+        // An explicit /role set is an explicit choice of model: it becomes the
+        // saved default for the next session too (mode entry never does).
+        if (saved) persistModelDefault(ctx as any, role.model, "role-default");
         return;
       }
 
@@ -4339,11 +4576,21 @@ export default function workflowExtension(pi: ExtensionAPI) {
           return;
         }
         roleConfig.activeRole = name === "auto" ? null : name.toLowerCase();
-        saveAndSync(
+        const saved = saveAndSync(
           roleConfig.activeRole
             ? `Active role → ${roleConfig.activeRole}`
             : "Active role → auto (plan→planner, build→builder)",
         );
+        // An explicit /role use names the model to run: it becomes the saved
+        // default as well, so the next session starts on it.
+        if (saved) {
+          const active = roleConfig.activeRole
+            ? getRole(roleConfig, roleConfig.activeRole)
+            : undefined;
+          if (active?.model) {
+            persistModelDefault(ctx as any, active.model, "role-default");
+          }
+        }
         if (workflowMode) {
           try {
             await applyModeModel(ctx as any);
@@ -4633,6 +4880,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   "muted",
                   `— active: ${activeProfileName ?? "none (default roles)"}`,
                 )}`,
+              );
+              lines.push(
+                ` ${theme.fg("muted", `next session: ${persistedDefaultLabel()}`)}`,
               );
               lines.push("");
               for (const l of list.render(Math.max(1, W - 2)))
@@ -6183,6 +6433,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
       })
       .join(" · ");
     ctx.ui.notify(`Roles saved: ${summary}`, "info");
+    // An explicit picker save is an explicit choice: the role that defines the
+    // Default-mode default (the forced active role, else the planner) becomes
+    // the saved default for the next session. Entering Plan/Build does not.
+    try {
+      const defaultRoleName = roleConfig.activeRole ?? "planner";
+      const st = saved.get(defaultRoleName);
+      if (st) persistModelDefault(ctx as any, st, "role-default");
+    } catch (_e) {
+      void _e;
+    }
     if (workflowMode) {
       try {
         await applyModeModel(ctx);
@@ -7334,6 +7594,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
     // restore state from custom entries (supports both legacy enabled/executing and new mode field)
+    // Set when this session entry carried its own Default-mode model.
+    let restoredEntryDefault = false;
     try {
       const entries = ctx.sessionManager.getBranch();
       for (const e of entries as any[]) {
@@ -7424,6 +7686,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 thinking:
                   typeof dm.thinking === "string" ? dm.thinking : undefined,
               };
+              restoredEntryDefault = true;
             }
             awaitingDecision = !!d.awaitingDecision;
             lastHandoffAt =
@@ -7481,6 +7744,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
+    // Persisted default model: read it for the apply rule below, and adopt it
+    // as the in-memory Default-mode model unless this session restored its own
+    // (an explicit session entry wins). The profile seeding below may override
+    // it — a live profile is the more specific choice.
+    let persistedDefault: PersistedModelDefault | undefined;
+    try {
+      persistedDefault = loadPersistedDefaultModel(
+        ctx as any,
+        !restoredEntryDefault,
+      );
+    } catch (_e) {
+      void _e;
+    }
     // Default-profile seeding: sessions without an explicit choice follow
     // workflow.defaultProfile, re-read at every start/resume so a changed
     // default applies. Sessions that picked explicitly (or explicitly chose
@@ -7516,6 +7792,115 @@ export default function workflowExtension(pi: ExtensionAPI) {
       } catch (_e) {
         void _e;
       }
+    }
+    // Adopt the saved default on a brand-new session. This is what makes a
+    // model OUTSIDE `enabledModels` stick: Pi's own findInitialModel prefers
+    // the first scoped model over settings.defaultModel, so writing
+    // settings.json alone would not be enough. Resumed/reloaded sessions keep
+    // their recorded model (Pi's precedence) and workflow subagents keep their
+    // role model — both are refused by the pure decision helper.
+    try {
+      const profileDefault = resolveActiveProfile()?.defaultModel;
+      const effectiveDefault: PersistedModelDefault | undefined = profileDefault
+        ? {
+            provider: profileDefault.provider,
+            id: profileDefault.id,
+            thinking: profileDefault.thinking,
+          }
+        : persistedDefault;
+      let live: any = null;
+      try {
+        live = (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+      } catch (_e) {
+        void _e;
+      }
+      let settings: any = null;
+      try {
+        settings = (pi as any)?.getSettings?.();
+      } catch (_e) {
+        void _e;
+      }
+      const scopedFirst = (() => {
+        try {
+          const s = (ctx as any)?.scopedModels?.[0]?.model;
+          return s?.provider && s?.id
+            ? { provider: s.provider, id: s.id }
+            : undefined;
+        } catch (_e) {
+          void _e;
+          return undefined;
+        }
+      })();
+      const decision = shouldApplyModelDefaultAtSessionStart({
+        reason: event.reason,
+        subagentRoleEnv: process.env[WORKFLOW_ROLE_ENV],
+        live:
+          live?.provider && live?.id
+            ? { provider: live.provider, id: live.id }
+            : undefined,
+        scopedFirst,
+        settingsDefault:
+          settings?.defaultProvider && settings?.defaultModel
+            ? { provider: settings.defaultProvider, id: settings.defaultModel }
+            : undefined,
+        persisted: effectiveDefault,
+      });
+      if (decision.apply && effectiveDefault) {
+        const found = registryModel(
+          ctx as any,
+          effectiveDefault.provider,
+          effectiveDefault.id,
+        );
+        if (!found) {
+          try {
+            (ctx as any).ui?.notify?.(
+              `Saved default model ${formatPersistedModel(effectiveDefault)} is not available — starting on the provider's pick.`,
+              "warning",
+            );
+          } catch (_e) {
+            void _e;
+          }
+        } else {
+          try {
+            await withPersistSuppressed(async () => {
+              const ok = await (pi as any)?.setModel?.(found);
+              if (ok === false) throw new Error("setModel returned false");
+              if (
+                effectiveDefault.thinking &&
+                isValidThinkingLevel(effectiveDefault.thinking)
+              ) {
+                (pi as any).setThinkingLevel?.(effectiveDefault.thinking);
+              }
+            });
+          } catch (e: any) {
+            // Auth missing or the provider rejected the switch: keep Pi's pick.
+            try {
+              (ctx as any).ui?.notify?.(
+                `Saved default model ${formatPersistedModel(effectiveDefault)} could not be applied (${String(e?.message || e)}) — starting on Pi's pick.`,
+                "warning",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          }
+        }
+      } else if (
+        decision.reason === "live-is-explicit" &&
+        event.reason === "startup"
+      ) {
+        // Diagnosable, not user-noisy: an explicit --model/project default won.
+        try {
+          pi.appendEntry("workflow-model-default-skip", {
+            reason: describeModelDefaultApply(decision),
+            at: Date.now(),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      }
+    } catch (_e) {
+      // Keep whatever model Pi resolved — never block session start.
+      void _e;
     }
     // auto-enable plan mode if flag set at startup (support both --plan and --workflow-plan)
     const flagPlan =
@@ -9970,9 +10355,58 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Keep status fresh
-  pi.on("model_select", async (_e, ctx) => updateStatus(ctx as any));
-  pi.on("thinking_level_select", async (_e, ctx) => updateStatus(ctx as any));
+  // Keep status fresh, and remember user model/thinking selections as the
+  // default for the next session (Pi's own Ctrl+S gesture is only one of the
+  // ways to pick a model; plain Enter, Ctrl+P cycling and Pi Desktop's picker
+  // all land here). Internal switches are suppressed by `persistSuppressed`.
+  pi.on("model_select", async (event, ctx) => {
+    updateStatus(ctx as any);
+    // `restore` is Pi re-applying a recorded model (session resume / reload):
+    // never a user gesture. Extension-initiated switches are suppressed.
+    if (!shouldPersistModelSelect({ source: event.source, suppressed: persistSuppressed }))
+      return;
+    const model: any = event.model;
+    if (!model?.provider || !model?.id) return;
+    let thinking: string | undefined;
+    try {
+      thinking = (pi as any)?.getThinkingLevel?.();
+    } catch (_e) {
+      void _e;
+    }
+    persistModelDefault(
+      ctx as any,
+      { provider: model.provider, id: model.id, thinking },
+      event.source === "cycle" ? "cycle" : "user-select",
+    );
+  });
+  pi.on("thinking_level_select", async (event, ctx) => {
+    updateStatus(ctx as any);
+    // Only the Default-mode model's thinking is a default. A role model's
+    // level belongs to that role (roles.json / profiles.json), so persisting
+    // it here would corrupt the next session's default.
+    let current: any = null;
+    try {
+      current = (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
+    } catch (_e) {
+      void _e;
+    }
+    if (
+      !shouldPersistThinkingSelect({
+        suppressed: persistSuppressed,
+        current:
+          current?.provider && current?.id
+            ? { provider: current.provider, id: current.id }
+            : undefined,
+        defaultModel,
+      })
+    )
+      return;
+    persistModelDefault(
+      ctx as any,
+      { provider: current.provider, id: current.id, thinking: event.level },
+      "thinking",
+    );
+  });
 
   // Sync with pi-code's plan-mode bus if present (so /plan from pi-code toggles our state too)
   try {

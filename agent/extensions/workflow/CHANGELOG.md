@@ -4,6 +4,37 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — The selected model becomes the default for the next session (2026-10-25)
+
+Picking a model used to last only for the current session unless you remembered
+`Ctrl+S`; `/profile use` and `/role set` never touched the saved default at all.
+The latest selection now wins for every entry point: the model selector (plain
+Enter), `Ctrl+P` / `Ctrl+Alt` cycling, Pi Desktop's picker, an explicit
+`/profile use` (its `defaultModel`), and an explicit `/role set` / `/role use` /
+`/role` picker save.
+
+Entering Plan/Build mode deliberately does **not** persist: the planner/builder
+model belongs to that mode, so the next session still starts on the Default-mode
+model. Resumed sessions keep their recorded model, and Workflow's
+`explore`/review subagents keep their role model (an internal-switch suppression
+flag plus an `PI_WORKFLOW_ROLE` guard).
+
+Storage is two-part, written by one read-modify-write that preserves every other
+settings key: `workflow.modelDefault` (the extension's own, upgrade-safe record)
+plus Pi's native `defaultProvider` / `defaultModel` / `defaultThinkingLevel`
+mirror. On `session_start` a brand-new session adopts `workflow.modelDefault`,
+because Pi's own resolution prefers the first `enabledModels` entry over a saved
+default — without that step a default outside the model scope would be ignored.
+The apply is skipped for resumed/reloaded sessions, for subagents, and when the
+live model is an explicit choice (it differs from Pi's scoped-first pick, Pi's
+saved default and ours). Idempotent writes make a repeated selection a no-op.
+`/role list` and the `/profile` picker now show which model the next session
+will start on and which settings file defines it.
+
+Tests: 379 green (340 + 38 `model-default.test.ts` cases covering coercion,
+project-over-global precedence, key preservation, byte-identical idempotency,
+the session-start apply matrix and the event-gating regression locks).
+
 ### Changed — Model pickers: full names, state in the header (2026-10-25)
 
 The `/profile` and `/role` model lists no longer use pi-tui's description column.
