@@ -4,6 +4,29 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — `/profile` and `/role` pickers: real type-to-filter and close-after-action (2026-10-25)
+
+**Typing now filters.** `SelectList` silently dropped printable keys, so every
+"type to filter" hint in `/profile` and `/role` was false advertising. A shared
+`picker.ts` (`FilterableList`) pairs pi-tui's `Input` with `fuzzyFilter`, the same
+shape pi's `/model` selector uses: match by `provider/id`, profile name/marker,
+description, and the model's display name (carried as hidden `searchText`, so
+long refs still render untruncated). It covers the `/profile` list, the default
+picker, both model tabs and the thinking lists. `Ctrl+O` keeps the query while
+re-scoping; `Esc`/`Ctrl+C` clears a non-empty filter first, and Enter over a
+no-match list is inert instead of silently closing.
+
+**Completed actions close `/profile`.** `openProfileEditor`/`pickDefaultProfile`
+now return `completed | cancelled | failed`, and the picker maps that through
+`profileActionClosesPicker`: activate, deactivate, a saved edit/new profile, a
+picked default, rename and delete close the overlay; Esc-cancel, a save failure
+and the action menu's Back keep the profile list open (with its filter
+remembered). No more second Esc.
+
+Tests: `picker.test.ts` (16 cases) covers fuzzy matching, hidden display-name
+text, selection, Backspace, Esc/Ctrl+C, no-match and `setItems` scope changes;
+`profiles.test.ts` covers the close/keep rule and the new hidden search text.
+
 ### Fixed — Review resume no longer stalls on a stale host abort (2026-10-25)
 
 `/review-resume` reused the **parked parent turn's** `ctx.signal`. A second/leaked

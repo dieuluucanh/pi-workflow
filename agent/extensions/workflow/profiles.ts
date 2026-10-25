@@ -423,6 +423,12 @@ export function applyProfileOverlay(
 export interface ModelPickerItem {
   value: string;
   label: string;
+  /**
+   * Hidden search text (the model's display name). Never rendered: `SelectList`
+   * only reads value/label/description, so this cannot reserve a column or
+   * truncate the ref.
+   */
+  searchText?: string;
 }
 
 /**
@@ -433,13 +439,19 @@ export interface ModelPickerItem {
  * description (and truncates the label to 30), which is what used to cut long
  * refs such as `synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017` even on a wide
  * pane. Selection and scope state belong in the picker header, not in a column.
+ * The optional display name travels as `searchText`, so typing what `/model`
+ * shows (e.g. "DeepSeek V4.1 Flash") still matches without touching the row's
+ * visible shape.
  */
 export function modelPickerItems(
-  entries: readonly { provider: string; id: string }[],
+  entries: readonly { provider: string; id: string; name?: string }[],
 ): ModelPickerItem[] {
   return entries.map((entry) => {
     const ref = `${entry.provider}/${entry.id}`;
-    return { value: ref, label: ref };
+    const name = entry.name?.trim();
+    return name
+      ? { value: ref, label: ref, searchText: name }
+      : { value: ref, label: ref };
   });
 }
 
@@ -476,6 +488,24 @@ export function describeProfile(p: Profile): string {
     }`,
   );
   return lines.join("\n");
+}
+
+// ── Picker flow ──────────────────────────────────────────────────────
+
+/** Result of a `/profile` sub-flow (editor, default picker, action). */
+export type ProfileFlowOutcome = "completed" | "cancelled" | "failed";
+
+/**
+ * Whether a finished `/profile` sub-flow closes the picker overlay.
+ *
+ * Only a completed action closes it. Cancelled or failed sub-flows stay on the
+ * profile list so the user can retry or choose another action, and the action
+ * menu's "back" entry is navigation, never a close.
+ */
+export function profileActionClosesPicker(
+  outcome: ProfileFlowOutcome | "back",
+): boolean {
+  return outcome === "completed";
 }
 
 export function formatProfilesForDisplay(

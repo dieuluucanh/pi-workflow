@@ -35,8 +35,8 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/rewind` | Pick checkpoint to restore |
 | `/todos` | Show todo list |
 | `/btw` | Queue note for next turn |
-| `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
-| `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default…. CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]` |
+| `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included; type to filter models by `provider/id` or display name). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
+| `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default… (fuzzy type-to-filter; completed actions close the picker). CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]` |
 | `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout |
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
@@ -53,7 +53,7 @@ Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` short
 A profile is a **named combination of role model settings** — one `{provider, id, thinking}` each for planner, explorer, builder and reviewer. Profiles layer on top of Model Roles: role identity (tools, system prompts, custom roles) stays global in `roles.json`; a profile only overrides models while it is active.
 
 ```text
-/profile                    # picker: activate / edit / rename / delete / New profile… / Default…
+/profile                    # picker: activate / edit / rename / delete / New profile… / Default… (type to filter)
 /profile create budget      # name it, then pick model + thinking per role (same flow as /role)
 /profile use budget         # activate for THIS session (none = back to the roles.json flow)
 /profile edit budget        # re-open the tabbed model editor
@@ -70,6 +70,8 @@ A profile is a **named combination of role model settings** — one `{provider, 
 - **Effect**: `/plan` switches to the profile's planner, `/build` to the profile's builder, `explore` subagents run on the profile's explorer, and Review Mode's reviewer session uses the profile's reviewer (planner fallback preserved). Activating while in plan/build re-applies the mode model immediately; in Default mode nothing switches until the next plan/build/explore/review use — the manual chat model is never touched by activation.
 - **`/role` keeps editing the base roles.** With a profile active, the `/role` picker shows a notice and `/role list` prints the profile's overrides; `/profile edit <name>` is the way to change what actually runs.
 - **Fallback**: no profiles (or none active) → the roles.json flow, identical to before profiles existed. A profile referencing a model missing from the registry is warned about at save time and refused at switch time ("staying on current model"), same as `/role`.
+
+**Picker keys**: `/profile` and `/role` are fuzzy-filterable — start typing to narrow models by `provider/id` or display name (e.g. `flash`, `open/beam`, `muse spark`) and profiles by name, marker, description or one of their models. `↑`/`↓` navigate, `Enter` selects/commits (inert when nothing matches), `Tab`/`←`/`→` switch role tabs, and `Ctrl+O` toggles scoped ↔ all while keeping the filter. `Esc` (or `Ctrl+C`) clears a non-empty filter first; a second press backs out or cancels. A completed `/profile` action closes the overlay; Esc-cancel, a failed save and the action menu's Back keep the profile list open, with its filter remembered.
 
 **Why**: mix models from different providers in one workflow (frontier planner + cheap explorer), keep one profile per provider to control budget per provider, run concurrent sessions on different providers to work around per-provider concurrency limits, and exploit cheaper starter plans across several providers.
 

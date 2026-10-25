@@ -187,10 +187,13 @@ import {
   defaultProfileWriteScope,
   PROFILE_ROLES,
   modelPickerItems,
+  profileActionClosesPicker,
+  type ProfileFlowOutcome,
   type ProfileConfig,
   type Profile,
   type ProfileRoleName,
 } from "./profiles.ts";
+import { FilterableList, type FilterableItem } from "./picker.ts";
 import {
   coerceModelDefault,
   describeModelDefaultApply,
@@ -5145,16 +5148,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   /**
    * Profile management picker: activate / none / new / per-profile actions
-   * (edit, rename, delete) and the default-profile entry. Loops so actions
-   * return to the list; every action handles its own persistence.
+   * (edit, rename, delete) and the default-profile entry.
+   *
+   * The loop exists for navigation and retries: a completed action closes the
+   * overlay, while Back, a cancelled sub-flow and a failed save keep the list
+   * open. Every action handles its own persistence.
    */
   async function openProfilePicker(ctx: ExtensionContext): Promise<void> {
     ensureProfilesConfig((ctx as any)?.cwd);
     ensureRoleConfig((ctx as any)?.cwd);
+    // Remembered across "Back"/cancelled actions so the list re-opens as the
+    // user left it (Esc clears it first).
+    let pickerQuery = "";
     while (true) {
       const profiles = profilesConfig.profiles;
       const def = currentDefaultProfileName((ctx as any)?.cwd);
-      const entries: SelectItem[] = [];
+      const entries: FilterableItem[] = [];
       entries.push({
         value: "none",
         label: activeProfileName
@@ -5187,6 +5196,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
           value: p.name,
           label: `⚡ ${p.name}${markers ? `  (${markers})` : ""}`,
           description: p.description || modelSummary || undefined,
+          // Hidden from the row, but findable: a profile can be located by a
+          // model it uses even when it has a custom description.
+          searchText: modelSummary || undefined,
         });
       }
       entries.push({
@@ -5202,7 +5214,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
       const selected = await ctx.ui.custom<string | null>(
         (tui, theme, _kb, done) => {
-          const list = new SelectList(entries, 10, listThemeOf(theme));
+          const list = new FilterableList({
+            items: entries,
+            maxVisible: 10,
+            theme: listThemeOf(theme),
+            initialQuery: pickerQuery,
+            noMatchText: "No matching profiles",
+          });
           let cached: string[] | undefined;
           return {
             render: (width: number) => {
@@ -5220,11 +5238,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 ` ${theme.fg("muted", `next session: ${persistedDefaultLabel()}`)}`,
               );
               lines.push("");
-              for (const l of list.render(Math.max(1, W - 2)))
+              for (const l of list.renderQuery(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+              for (const l of list.renderList(Math.max(1, W - 2)))
                 lines.push(` ${l}`);
               lines.push("");
               lines.push(
-                ` ${theme.fg("dim", "Enter: select/action • type to filter • Esc close")}`,
+                ` ${theme.fg(
+                  "dim",
+                  "Enter: select/action • type to filter • ↑↓ navigate • Esc clear/close",
+                )}`,
               );
               lines.push(theme.fg("accent", "─".repeat(W)));
               cached = lines;
@@ -5234,15 +5257,25 @@ export default function workflowExtension(pi: ExtensionAPI) {
               cached = undefined;
             },
             handleInput: (data: string) => {
+              if (matchesKey(data, Key.enter)) {
+                const item = list.getSelectedItem();
+                // Enter on a filter with no matches must stay inert: closing
+                // the overlay here would look like a silent cancel.
+                if (!item) return;
+                pickerQuery = list.getQuery();
+                done(item.value);
+                return;
+              }
+              if (list.handleInput(data)) {
+                pickerQuery = list.getQuery();
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
               if (matchesKey(data, Key.escape)) {
                 done(null);
                 return;
               }
-              if (matchesKey(data, Key.enter)) {
-                done(list.getSelectedItem()?.value ?? null);
-                return;
-              }
-              list.handleInput(data);
               cached = undefined;
               tui.requestRender();
             },
@@ -5256,11 +5289,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
           existing: profilesConfig.profiles.map((p) => p.name),
         });
         if (!name) continue;
-        await openProfileEditor(ctx, { createName: name });
+        const outcome = await openProfileEditor(ctx, {
+          createName: name,
+        });
+        if (profileActionClosesPicker(outcome)) return;
         continue;
       }
       if (selected === "__default") {
-        await pickDefaultProfile(ctx);
+        const outcome = await pickDefaultProfile(ctx);
+        if (profileActionClosesPicker(outcome)) return;
         continue;
       }
       if (selected === "none") {
@@ -5269,7 +5306,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No profile active — default roles flow.", "info");
         }
-        continue;
+        return;
       }
       // A concrete profile → action menu
       const profile = getProfile(profilesConfig, selected);
@@ -5357,14 +5394,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
       if (!action || action === "back") continue;
       if (action === "activate") {
         await setActiveProfile(ctx as any, profile.name, { explicit: true });
-        continue;
+        return;
       }
       if (action === "deactivate") {
         await setActiveProfile(ctx as any, null, { explicit: true });
-        continue;
+        return;
       }
       if (action === "edit") {
-        await openProfileEditor(ctx, { name: profile.name });
+        const outcome = await openProfileEditor(ctx, { name: profile.name });
+        if (profileActionClosesPicker(outcome)) return;
         continue;
       }
       if (action === "rename") {
@@ -5375,7 +5413,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
             .filter((p) => p !== profile)
             .map((p) => p.name),
         });
-        if (newName && newName !== profile.name) {
+        if (!newName) continue;
+        if (newName !== profile.name) {
           const oldName = profile.name;
           const wasActive =
             activeProfileName?.toLowerCase() === profile.name.toLowerCase();
@@ -5395,7 +5434,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           }
           updateStatus(ctx as any);
         }
-        continue;
+        return;
       }
       if (action === "delete") {
         const confirmed = await confirmProfileDelete(ctx, profile);
@@ -5435,16 +5474,22 @@ export default function workflowExtension(pi: ExtensionAPI) {
           }
         }
         updateStatus(ctx as any);
-        continue;
+        return;
       }
     }
   }
 
-  /** Picker for the default profile (workflow.defaultProfile) + its scope. */
-  async function pickDefaultProfile(ctx: ExtensionContext): Promise<void> {
+  /**
+   * Picker for the default profile (`workflow.defaultProfile`).
+   * "completed" only after a successful write; Esc/cancel and write failures
+   * leave the caller's `/profile` menu open.
+   */
+  async function pickDefaultProfile(
+    ctx: ExtensionContext,
+  ): Promise<ProfileFlowOutcome> {
     const cwd = (ctx as any)?.cwd as string | undefined;
     const current = currentDefaultProfileName(cwd);
-    const entries: SelectItem[] = [
+    const entries: FilterableItem[] = [
       {
         value: "__none",
         label: "— none —",
@@ -5458,7 +5503,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     ];
     const name = await ctx.ui.custom<string | null>(
       (tui, theme, _kb, done) => {
-        const list = new SelectList(entries, 8, listThemeOf(theme));
+        const list = new FilterableList({
+          items: entries,
+          maxVisible: 8,
+          theme: listThemeOf(theme),
+          noMatchText: "No matching profiles",
+        });
         let cached: string[] | undefined;
         return {
           render: (width: number) => {
@@ -5473,10 +5523,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
               )}`,
             );
             lines.push("");
-            for (const l of list.render(Math.max(1, W - 2)))
+            for (const l of list.renderQuery(Math.max(1, W - 2)))
+              lines.push(` ${l}`);
+            for (const l of list.renderList(Math.max(1, W - 2)))
               lines.push(` ${l}`);
             lines.push("");
-            lines.push(` ${theme.fg("dim", "Enter select • Esc cancel")}`);
+            lines.push(
+              ` ${theme.fg(
+                "dim",
+                "Enter select • type to filter • ↑↓ navigate • Esc clear/cancel",
+              )}`,
+            );
             lines.push(theme.fg("accent", "─".repeat(W)));
             cached = lines;
             return lines;
@@ -5485,22 +5542,28 @@ export default function workflowExtension(pi: ExtensionAPI) {
             cached = undefined;
           },
           handleInput: (data: string) => {
+            if (matchesKey(data, Key.enter)) {
+              const item = list.getSelectedItem();
+              if (!item) return;
+              done(item.value);
+              return;
+            }
+            if (list.handleInput(data)) {
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
             if (matchesKey(data, Key.escape)) {
               done(null);
               return;
             }
-            if (matchesKey(data, Key.enter)) {
-              done(list.getSelectedItem()?.value ?? null);
-              return;
-            }
-            list.handleInput(data);
             cached = undefined;
             tui.requestRender();
           },
         };
       },
     );
-    if (name === null) return;
+    if (name === null) return "cancelled";
     // Write where the effective value lives, so an existing project value is
     // not shadowed by a fresh global write.
     const scope = defaultProfileWriteScope(
@@ -5519,7 +5582,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         `Could not write default profile: ${res.error ?? "unknown error"}`,
         "error",
       );
-      return;
+      return "failed";
     }
     ctx.ui.notify(
       value
@@ -5528,6 +5591,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       "info",
     );
     updateStatus(ctx as any);
+    return "completed";
   }
 
   interface StagedProfileModel {
@@ -5542,11 +5606,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * activate and Save only. Selections stage locally; saving writes
    * profiles.json (user scope). `createName` creates a new profile seeded
    * from the current effective roles; `name` edits an existing one.
+   *
+   * Returns "completed" after a successful save, "cancelled" on Esc/invalid
+   * entry, and "failed" when the file write throws (callers keep the picker
+   * open in the latter two cases).
    */
   async function openProfileEditor(
     ctx: ExtensionContext,
     opts: { createName?: string; name?: string },
-  ): Promise<void> {
+  ): Promise<ProfileFlowOutcome> {
     ensureProfilesConfig((ctx as any)?.cwd);
     ensureRoleConfig((ctx as any)?.cwd);
     const catalog = collectRoleCatalog(ctx);
@@ -5555,14 +5623,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
         "No models available from connected providers — connect a provider first.",
         "warning",
       );
-      return;
+      return "cancelled";
     }
     const existing = opts.name
       ? getProfile(profilesConfig, opts.name)
       : undefined;
     if (opts.name && !existing) {
       ctx.ui.notify(`Profile "${opts.name}" no longer exists.`, "warning");
-      return;
+      return "cancelled";
     }
     const isNew = !existing;
     const profileName = existing
@@ -5570,7 +5638,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       : (opts.createName ?? "").trim();
     if (!profileName) {
       ctx.ui.notify("Profile name required.", "warning");
-      return;
+      return "cancelled";
     }
     const roleMeta = new Map<string, { name: string; description: string }>();
     for (const roleName of PROFILE_ROLES) {
@@ -5623,32 +5691,46 @@ export default function workflowExtension(pi: ExtensionAPI) {
         // Model rows are pure `provider/id` labels. pi-tui reserves a fixed
         // 32-cell first column whenever a row has a description, which used to
         // truncate long refs; selection and scope state live in the header.
-        const buildModelItems = (): SelectItem[] =>
+        const buildModelItems = (): FilterableItem[] =>
           modelPickerItems(showAll ? catalog.all : catalog.scoped);
-        const modelLists = new Map<string, SelectList>();
-        const thinkingList = new SelectList(
-          VALID_THINKING_LEVELS.map((t) => ({ value: t, label: t })),
-          Math.min(VALID_THINKING_LEVELS.length, 8),
-          themeList,
-        );
-        const getModelList = (roleName: string): SelectList => {
+        const modelLists = new Map<string, FilterableList>();
+        const thinkingList = new FilterableList({
+          items: VALID_THINKING_LEVELS.map((t) => ({ value: t, label: t })),
+          maxVisible: Math.min(VALID_THINKING_LEVELS.length, 8),
+          theme: themeList,
+          noMatchText: "No matching thinking levels",
+        });
+        const getModelList = (roleName: string): FilterableList => {
           let list = modelLists.get(roleName);
           if (!list) {
-            list = new SelectList(buildModelItems(), 10, themeList);
             const st = staged.get(roleName)!;
             const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
               (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
             );
-            if (idx > 0) list.setSelectedIndex(idx);
+            list = new FilterableList({
+              items: buildModelItems(),
+              maxVisible: 10,
+              theme: themeList,
+              initialIndex: idx > 0 ? idx : 0,
+              noMatchText: "No matching models",
+            });
             modelLists.set(roleName, list);
           }
           return list;
         };
-        const rebuildModelLists = () => modelLists.clear();
+        // Ctrl+O re-scopes the rows: keep each tab's query and re-filter instead
+        // of rebuilding the lists from scratch.
+        const rebuildModelLists = () => {
+          const items = buildModelItems();
+          for (const list of modelLists.values()) list.setItems(items);
+        };
         const syncThinkingCursor = (roleName: string) => {
           const st = staged.get(roleName)!;
+          // Clear first: the shared list may still be filtered from a previous
+          // visit, and the index refers to the full VALID_THINKING_LEVELS order.
+          thinkingList.clearFilter();
           const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
-          if (idx >= 0) thinkingList.setSelectedIndex(idx);
+          thinkingList.setSelectedIndex(idx >= 0 ? idx : 0);
         };
         const commitModelSelection = (roleName: string) => {
           const sel = getModelList(roleName).getSelectedItem();
@@ -5674,16 +5756,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
         };
 
         const handleInput = (data: string) => {
-          if (matchesKey(data, Key.escape)) {
-            if (phase === "thinking" && !isSubmitTab()) {
-              phase = "model";
-              cached = undefined;
-              tui.requestRender();
-              return;
-            }
-            done(null);
-            return;
-          }
           if (
             matchesKey(data, Key.tab) ||
             matchesKey(data, Key.right) ||
@@ -5718,10 +5790,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
           if (isSubmitTab()) {
             if (matchesKey(data, Key.enter)) {
               done({ activate: isSaveActivate(), staged: new Map(staged) });
+              return;
             }
+            if (matchesKey(data, Key.escape)) done(null);
             return;
           }
           const roleName = tabIds[currentTab];
+          // Esc first clears a non-empty filter; the next Esc steps back
+          // (thinking → model) or cancels the editor.
+          if (matchesKey(data, Key.escape)) {
+            const activeList =
+              phase === "model" ? getModelList(roleName) : thinkingList;
+            if (activeList.handleInput(data)) {
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+            if (phase === "thinking") {
+              phase = "model";
+              cached = undefined;
+              tui.requestRender();
+              return;
+            }
+            done(null);
+            return;
+          }
           if (matchesKey(data, Key.enter)) {
             if (phase === "model") {
               if (!commitModelSelection(roleName)) return;
@@ -5735,8 +5828,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
             advanceFromThinking();
             return;
           }
-          if (phase === "model") getModelList(roleName).handleInput(data);
-          else thinkingList.handleInput(data);
+          const activeList =
+            phase === "model" ? getModelList(roleName) : thinkingList;
+          activeList.handleInput(data);
           cached = undefined;
           tui.requestRender();
         };
@@ -5880,27 +5974,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   )}`,
                 ),
               );
-              for (const l of getModelList(roleName).render(Math.max(1, W - 2)))
+              const modelList = getModelList(roleName);
+              for (const l of modelList.renderQuery(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+              for (const l of modelList.renderList(Math.max(1, W - 2)))
                 lines.push(` ${l}`);
             } else {
               lines.push(
                 ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
               );
-              for (const l of thinkingList.render(Math.max(1, W - 2)))
+              for (const l of thinkingList.renderQuery(Math.max(1, W - 2)))
+                lines.push(` ${l}`);
+              for (const l of thinkingList.renderList(Math.max(1, W - 2)))
                 lines.push(` ${l}`);
             }
           }
           lines.push("");
           const scopeHint =
             catalog.scoped.length > 0 ? " • Ctrl+O scoped/all" : "";
-          lines.push(
-            ...wrap(
-              ` ${theme.fg(
-                "dim",
-                `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel${scopeHint}`,
-              )}`,
-            ),
-          );
+          const footer = isSubmitTab()
+            ? "Tab/←→ switch • Enter save • Esc cancel"
+            : phase === "thinking"
+              ? `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc clear/back${scopeHint}`
+              : `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc clear/cancel${scopeHint}`;
+          lines.push(...wrap(` ${theme.fg("dim", footer)}`));
           lines.push(theme.fg("accent", "─".repeat(W)));
           cached = lines;
           return lines;
@@ -5922,7 +6019,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         isNew ? "Profile creation cancelled." : "Profile editor cancelled.",
         "info",
       );
-      return;
+      return "cancelled";
     }
     // Validate against registry (warn-only, matching /role set).
     try {
@@ -5977,7 +6074,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         `Profile updated but file save failed: ${String(e?.message || e)}`,
         "warning",
       );
-      return;
+      return "failed";
     }
     invalidateEffectiveRoles();
     updateStatus(ctx as any);
@@ -6006,6 +6103,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         "info",
       );
     }
+    return "completed";
   }
 
   // ── Model profiles command ───────────────────────────────────────
@@ -6358,6 +6456,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
   interface RoleCatalogEntry {
     provider: string;
     id: string;
+    /** Model display name; hidden picker search text, never rendered. */
+    name?: string;
     inScope: boolean;
   }
 
@@ -6372,7 +6472,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       for (const s of raw) {
         const m = s?.model ?? s;
         if (m && typeof m.provider === "string" && typeof m.id === "string")
-          scoped.push({ provider: m.provider, id: m.id, inScope: true });
+          scoped.push({
+            provider: m.provider,
+            id: m.id,
+            name: typeof m.name === "string" ? m.name : undefined,
+            inScope: true,
+          });
       }
     } catch (_e) {
       void _e;
@@ -6395,7 +6500,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const key = `${m.provider}/${m.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      rest.push({ provider: m.provider, id: m.id, inScope: false });
+      rest.push({
+        provider: m.provider,
+        id: m.id,
+        name: typeof m.name === "string" ? m.name : undefined,
+        inScope: false,
+      });
     }
     const CAP = 200;
     const all = [...scoped, ...rest];
@@ -6445,8 +6555,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
           let phase: "model" | "thinking" = "model";
           let showAll = catalog.scoped.length === 0;
           let cached: string[] | undefined;
-          // One SelectList per role tab for models + one shared for thinking,
-          // so filter text + cursor survive tab switches.
+          // One filterable list per role tab for models + one shared for
+          // thinking, so filter text + cursor survive tab switches.
           const listTheme = {
             selectedPrefix: (t: string) => theme.fg("accent", t),
             selectedText: (t: string) => theme.fg("accent", t),
@@ -6456,38 +6566,49 @@ export default function workflowExtension(pi: ExtensionAPI) {
           };
           // Pure `provider/id` rows: no description column, so long refs are
           // not truncated. The header carries staged/saved and the scope.
-          const buildModelItems = (): SelectItem[] =>
+          const buildModelItems = (): FilterableItem[] =>
             modelPickerItems(showAll ? catalog.all : catalog.scoped);
-          const modelLists = new Map<string, SelectList>();
-          const thinkingList = new SelectList(
-            VALID_THINKING_LEVELS.map((t) => ({
+          const modelLists = new Map<string, FilterableList>();
+          const thinkingList = new FilterableList({
+            items: VALID_THINKING_LEVELS.map((t) => ({
               value: t,
               label: t,
             })),
-            Math.min(VALID_THINKING_LEVELS.length, 8),
-            listTheme,
-          );
-          const getModelList = (role: Role): SelectList => {
+            maxVisible: Math.min(VALID_THINKING_LEVELS.length, 8),
+            theme: listTheme,
+            noMatchText: "No matching thinking levels",
+          });
+          const getModelList = (role: Role): FilterableList => {
             let list = modelLists.get(role.name);
             if (!list) {
-              list = new SelectList(buildModelItems(), 10, listTheme);
               const st = staged.get(role.name)!;
               const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
                 (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
               );
-              if (idx > 0) list.setSelectedIndex(idx);
+              list = new FilterableList({
+                items: buildModelItems(),
+                maxVisible: 10,
+                theme: listTheme,
+                initialIndex: idx > 0 ? idx : 0,
+                noMatchText: "No matching models",
+              });
               modelLists.set(role.name, list);
             }
             return list;
           };
+          // Ctrl+O re-scopes the rows: keep each tab's query and re-filter
+          // instead of rebuilding the lists from scratch.
           const rebuildModelLists = () => {
-            modelLists.clear();
+            const items = buildModelItems();
+            for (const list of modelLists.values()) list.setItems(items);
           };
           const syncThinkingCursor = (role: Role) => {
             const st = staged.get(role.name)!;
+            // Clear first: the shared list may still be filtered from a previous
+            // visit, and the index refers to the full VALID_THINKING_LEVELS order.
+            thinkingList.clearFilter();
             const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
             thinkingList.setSelectedIndex(idx >= 0 ? idx : 0);
-            thinkingList.setFilter("");
           };
           const isSubmitTab = () => currentTab === tabs.length;
 
@@ -6517,16 +6638,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
           };
 
           const handleInput = (data: string) => {
-            if (matchesKey(data, Key.escape)) {
-              if (phase === "thinking" && !isSubmitTab()) {
-                phase = "model";
-                cached = undefined;
-                tui.requestRender();
-                return;
-              }
-              done(null);
-              return;
-            }
             if (
               matchesKey(data, Key.tab) ||
               matchesKey(data, Key.right) ||
@@ -6558,10 +6669,33 @@ export default function workflowExtension(pi: ExtensionAPI) {
               void _e;
             }
             if (isSubmitTab()) {
-              if (matchesKey(data, Key.enter)) done(new Map(staged));
+              if (matchesKey(data, Key.enter)) {
+                done(new Map(staged));
+                return;
+              }
+              if (matchesKey(data, Key.escape)) done(null);
               return;
             }
             const role = tabs[currentTab];
+            // Esc first clears a non-empty filter; the next Esc steps back
+            // (thinking → model) or cancels the picker.
+            if (matchesKey(data, Key.escape)) {
+              const activeList =
+                phase === "model" ? getModelList(role) : thinkingList;
+              if (activeList.handleInput(data)) {
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
+              if (phase === "thinking") {
+                phase = "model";
+                cached = undefined;
+                tui.requestRender();
+                return;
+              }
+              done(null);
+              return;
+            }
             if (matchesKey(data, Key.enter)) {
               if (phase === "model") {
                 if (!commitModelSelection(role)) return;
@@ -6575,8 +6709,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
               advanceFromThinking();
               return;
             }
-            if (phase === "model") getModelList(role).handleInput(data);
-            else thinkingList.handleInput(data);
+            const activeList =
+              phase === "model" ? getModelList(role) : thinkingList;
+            activeList.handleInput(data);
             cached = undefined;
             tui.requestRender();
           };
@@ -6709,27 +6844,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
                     )}`,
                   ),
                 );
-                for (const l of getModelList(role).render(Math.max(1, W - 2)))
+                const modelList = getModelList(role);
+                for (const l of modelList.renderQuery(Math.max(1, W - 2)))
+                  lines.push(` ${l}`);
+                for (const l of modelList.renderList(Math.max(1, W - 2)))
                   lines.push(` ${l}`);
               } else {
                 lines.push(
                   ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
                 );
-                for (const l of thinkingList.render(Math.max(1, W - 2)))
+                for (const l of thinkingList.renderQuery(Math.max(1, W - 2)))
+                  lines.push(` ${l}`);
+                for (const l of thinkingList.renderList(Math.max(1, W - 2)))
                   lines.push(` ${l}`);
               }
             }
             lines.push("");
             const scopeHint =
               catalog.scoped.length > 0 ? " • Ctrl+O scoped/all" : "";
-            lines.push(
-              ...wrap(
-                ` ${theme.fg(
-                  "dim",
-                  `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel${scopeHint}`,
-                )}`,
-              ),
-            );
+            const footer = isSubmitTab()
+              ? "Tab/←→ switch • Enter save • Esc cancel"
+              : phase === "thinking"
+                ? `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc clear/back${scopeHint}`
+                : `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc clear/cancel${scopeHint}`;
+            lines.push(...wrap(` ${theme.fg("dim", footer)}`));
             lines.push(theme.fg("accent", "─".repeat(W)));
             cached = lines;
             return lines;

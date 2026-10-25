@@ -34,6 +34,7 @@ import {
   writeDefaultProfileSetting,
   defaultProfileWriteScope,
   modelPickerItems,
+  profileActionClosesPicker,
   type Profile,
 } from "./profiles.ts";
 import { joinArgumentValue } from "./utils.ts";
@@ -680,19 +681,38 @@ test("profiles: missing defaultModel keeps undefined", () => {
   assert.equal(p!.defaultModel, undefined);
 });
 
-test("profiles: model picker rows are full refs and never a description", () => {
+test("profiles: model picker rows are full refs with hidden display-name text", () => {
   const longRef = "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017";
   const items = modelPickerItems([
-    { provider: "synthetic", id: "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017" },
+    {
+      provider: "synthetic",
+      id: "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      name: "DeepSeek V4.1 Flash",
+    },
     { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+    { provider: "empty", id: "name", name: "   " },
   ]);
 
   assert.deepEqual(items, [
-    { value: longRef, label: longRef },
-    { value: "opencode-go/deepseek-v4.1-flash", label: "opencode-go/deepseek-v4.1-flash" },
+    { value: longRef, label: longRef, searchText: "DeepSeek V4.1 Flash" },
+    {
+      value: "opencode-go/deepseek-v4.1-flash",
+      label: "opencode-go/deepseek-v4.1-flash",
+    },
+    { value: "empty/name", label: "empty/name" },
   ]);
   // pi-tui caps the label column when a description exists; the whole point of
   // these rows is that the model ref is never truncated for a marker column.
   for (const item of items) assert.equal("description" in item, false);
+  // A missing/blank display name must not add an empty hidden key.
+  assert.equal("searchText" in items[1], false);
+  assert.equal("searchText" in items[2], false);
   assert.deepEqual(modelPickerItems([]), []);
+});
+
+test("profiles: only a completed action closes the profile picker", () => {
+  assert.equal(profileActionClosesPicker("completed"), true);
+  assert.equal(profileActionClosesPicker("cancelled"), false);
+  assert.equal(profileActionClosesPicker("failed"), false);
+  assert.equal(profileActionClosesPicker("back"), false);
 });

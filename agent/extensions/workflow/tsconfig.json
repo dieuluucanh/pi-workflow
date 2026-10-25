@@ -26,6 +26,8 @@
     "./roles.test.ts",
     "./profiles.ts",
     "./profiles.test.ts",
+    "./picker.ts",
+    "./picker.test.ts",
     "./commit-policy.ts",
     "./commit-policy.test.ts",
     "./edit-policy.ts",
