@@ -419,6 +419,30 @@ export function applyProfileOverlay(
 
 // ── Display ──────────────────────────────────────────────────────────
 
+/** One selectable model row for pi-tui's `SelectList`. */
+export interface ModelPickerItem {
+  value: string;
+  label: string;
+}
+
+/**
+ * The rows of a model picker: the **full** `provider/id` in the label, never a
+ * `description`.
+ *
+ * pi-tui reserves a fixed 32-cell primary column whenever a row has a
+ * description (and truncates the label to 30), which is what used to cut long
+ * refs such as `synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017` even on a wide
+ * pane. Selection and scope state belong in the picker header, not in a column.
+ */
+export function modelPickerItems(
+  entries: readonly { provider: string; id: string }[],
+): ModelPickerItem[] {
+  return entries.map((entry) => {
+    const ref = `${entry.provider}/${entry.id}`;
+    return { value: ref, label: ref };
+  });
+}
+
 /** One-line summary: `⚡ cheap — 🧠 a/b (high) · 🔍 …` (for picker rows). */
 export function formatProfileOneLine(p: Profile): string {
   const parts = PROFILE_ROLES.map((r) => {

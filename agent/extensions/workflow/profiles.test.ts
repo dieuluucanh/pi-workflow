@@ -32,6 +32,7 @@ import {
   extractDefaultProfile,
   readDefaultProfileSetting,
   writeDefaultProfileSetting,
+  modelPickerItems,
   type Profile,
 } from "./profiles.ts";
 import { joinArgumentValue } from "./utils.ts";
@@ -641,4 +642,21 @@ test("profiles: missing defaultModel keeps undefined", () => {
   });
   assert.ok(p);
   assert.equal(p!.defaultModel, undefined);
+});
+
+test("profiles: model picker rows are full refs and never a description", () => {
+  const longRef = "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017";
+  const items = modelPickerItems([
+    { provider: "synthetic", id: "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017" },
+    { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+  ]);
+
+  assert.deepEqual(items, [
+    { value: longRef, label: longRef },
+    { value: "opencode-go/deepseek-v4.1-flash", label: "opencode-go/deepseek-v4.1-flash" },
+  ]);
+  // pi-tui caps the label column when a description exists; the whole point of
+  // these rows is that the model ref is never truncated for a marker column.
+  for (const item of items) assert.equal("description" in item, false);
+  assert.deepEqual(modelPickerItems([]), []);
 });

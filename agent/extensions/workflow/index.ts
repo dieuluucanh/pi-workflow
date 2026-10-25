@@ -185,6 +185,7 @@ import {
   writeDefaultProfileSetting,
   defaultProfileSettingPaths,
   PROFILE_ROLES,
+  modelPickerItems,
   type ProfileConfig,
   type Profile,
   type ProfileRoleName,
@@ -5030,21 +5031,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         const themeList = listThemeOf(theme);
         const isSubmitTab = () => currentTab >= tabIds.length;
         const isSaveActivate = () => currentTab === tabIds.length;
-        const buildModelItems = (roleName: string): SelectItem[] => {
-          const st = staged.get(roleName)!;
-          const cur = `${st.provider}/${st.id}`;
-          const src = showAll ? catalog.all : catalog.scoped;
-          return src.map((e) => {
-            const ref = `${e.provider}/${e.id}`;
-            const description: string | undefined =
-              ref === cur
-                ? "● selected"
-                : showAll && !e.inScope
-                  ? "all"
-                  : undefined;
-            return { value: ref, label: ref, description };
-          });
-        };
+        // Model rows are pure `provider/id` labels. pi-tui reserves a fixed
+        // 32-cell first column whenever a row has a description, which used to
+        // truncate long refs; selection and scope state live in the header.
+        const buildModelItems = (): SelectItem[] =>
+          modelPickerItems(showAll ? catalog.all : catalog.scoped);
         const modelLists = new Map<string, SelectList>();
         const thinkingList = new SelectList(
           VALID_THINKING_LEVELS.map((t) => ({ value: t, label: t })),
@@ -5054,7 +5045,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         const getModelList = (roleName: string): SelectList => {
           let list = modelLists.get(roleName);
           if (!list) {
-            list = new SelectList(buildModelItems(roleName), 10, themeList);
+            list = new SelectList(buildModelItems(), 10, themeList);
             const st = staged.get(roleName)!;
             const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
               (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
@@ -5121,9 +5112,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
             tui.requestRender();
             return;
           }
-          // Ctrl+O toggles scoped ↔ all models
+          // Ctrl+O toggles scoped ↔ all models. With no scope configured the
+          // "scoped" side is empty, so the key is inert instead of clearing the list.
           try {
             if (matchesKey(data, Key.ctrl("o"))) {
+              if (catalog.scoped.length === 0) return;
               showAll = !showAll;
               rebuildModelLists();
               cached = undefined;
@@ -5267,15 +5260,29 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 )}`,
               ),
             );
+            const stagedRef = st.provider ? `${st.provider}/${st.id}` : "";
+            if (
+              !showAll &&
+              stagedRef.length > 0 &&
+              !catalog.scoped.some((e) => `${e.provider}/${e.id}` === stagedRef)
+            ) {
+              lines.push(
+                ...wrap(
+                  ` ${theme.fg("dim", "staged model is outside the scope — Ctrl+O for all")}`,
+                ),
+              );
+            }
             lines.push("");
             if (phase === "model") {
               const scopeLabel = showAll
                 ? `all ${String(catalog.all.length)}${catalog.truncated ? "+" : ""}`
                 : `scoped ${String(catalog.scoped.length)}`;
               const toggleHint =
-                catalog.scoped.length > 0 && !showAll
-                  ? " — Ctrl+O for all"
-                  : "";
+                catalog.scoped.length === 0
+                  ? ""
+                  : showAll
+                    ? " — Ctrl+O for scoped"
+                    : " — Ctrl+O for all";
               lines.push(
                 ...wrap(
                   ` ${theme.fg(
@@ -5295,11 +5302,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
             }
           }
           lines.push("");
+          const scopeHint =
+            catalog.scoped.length > 0 ? " • Ctrl+O scoped/all" : "";
           lines.push(
             ...wrap(
               ` ${theme.fg(
                 "dim",
-                "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+                `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel${scopeHint}`,
               )}`,
             ),
           );
@@ -5840,27 +5849,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
             scrollInfo: (t: string) => theme.fg("dim", t),
             noMatch: (t: string) => theme.fg("warning", t),
           };
-          const currentRef = (role: Role) =>
-            `${role.model.provider}/${role.model.id}`;
-          const buildModelItems = (role: Role): SelectItem[] => {
-            const st = staged.get(role.name)!;
-            const cur = `${st.provider}/${st.id}`;
-            const src = showAll ? catalog.all : catalog.scoped;
-            return src.map((e) => {
-              const ref = `${e.provider}/${e.id}`;
-              let description: string | undefined;
-              if (ref === cur) {
-                description = "● selected";
-              } else if (ref === currentRef(role)) {
-                description = "current";
-              } else if (showAll && !e.inScope) {
-                description = "all";
-              } else {
-                description = undefined;
-              }
-              return { value: ref, label: ref, description };
-            });
-          };
+          // Pure `provider/id` rows: no description column, so long refs are
+          // not truncated. The header carries staged/saved and the scope.
+          const buildModelItems = (): SelectItem[] =>
+            modelPickerItems(showAll ? catalog.all : catalog.scoped);
           const modelLists = new Map<string, SelectList>();
           const thinkingList = new SelectList(
             VALID_THINKING_LEVELS.map((t) => ({
@@ -5873,7 +5865,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           const getModelList = (role: Role): SelectList => {
             let list = modelLists.get(role.name);
             if (!list) {
-              list = new SelectList(buildModelItems(role), 10, listTheme);
+              list = new SelectList(buildModelItems(), 10, listTheme);
               const st = staged.get(role.name)!;
               const idx = (showAll ? catalog.all : catalog.scoped).findIndex(
                 (e) => `${e.provider}/${e.id}` === `${st.provider}/${st.id}`,
@@ -5947,9 +5939,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
               tui.requestRender();
               return;
             }
-            // Ctrl+O toggles scoped ↔ all models
+            // Inert without a scope: the "scoped" side would be empty.
             try {
               if (matchesKey(data, Key.ctrl("o"))) {
+                if (catalog.scoped.length === 0) return;
                 showAll = !showAll;
                 rebuildModelLists();
                 cached = undefined;
@@ -6072,16 +6065,37 @@ export default function workflowExtension(pi: ExtensionAPI) {
                   )}`,
                 ),
               );
+              lines.push(
+                ...wrap(
+                  ` ${theme.fg(
+                    "muted",
+                    `saved: ${role.model.provider}/${role.model.id} (${role.model.thinking})`,
+                  )}`,
+                ),
+              );
+              const stagedRef = `${st.provider}/${st.id}`;
+              if (
+                !showAll &&
+                stagedRef.length > 1 &&
+                !catalog.scoped.some((e) => `${e.provider}/${e.id}` === stagedRef)
+              ) {
+                lines.push(
+                  ...wrap(
+                    ` ${theme.fg("dim", "staged model is outside the scope — Ctrl+O for all")}`,
+                  ),
+                );
+              }
               lines.push("");
               if (phase === "model") {
-                const src = showAll ? catalog.all : catalog.scoped;
                 const scopeLabel = showAll
                   ? `all ${String(catalog.all.length)}${catalog.truncated ? "+" : ""}`
                   : `scoped ${String(catalog.scoped.length)}`;
                 const toggleHint =
-                  catalog.scoped.length > 0 && !showAll
-                    ? " — Ctrl+O for all"
-                    : "";
+                  catalog.scoped.length === 0
+                    ? ""
+                    : showAll
+                      ? " — Ctrl+O for scoped"
+                      : " — Ctrl+O for all";
                 lines.push(
                   ...wrap(
                     ` ${theme.fg(
@@ -6092,7 +6106,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
                 );
                 for (const l of getModelList(role).render(Math.max(1, W - 2)))
                   lines.push(` ${l}`);
-                void src;
               } else {
                 lines.push(
                   ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
@@ -6102,11 +6115,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
               }
             }
             lines.push("");
+            const scopeHint =
+              catalog.scoped.length > 0 ? " • Ctrl+O scoped/all" : "";
             lines.push(
               ...wrap(
                 ` ${theme.fg(
                   "dim",
-                  "Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel • Ctrl+O scoped/all",
+                  `Tab/←→ roles • ↑↓ navigate • type to filter • Enter select • Esc back/cancel${scopeHint}`,
                 )}`,
               ),
             );

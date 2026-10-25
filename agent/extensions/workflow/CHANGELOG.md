@@ -4,6 +4,17 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Model pickers: full names, state in the header (2026-10-25)
+
+The `/profile` and `/role` model lists no longer use pi-tui's description column.
+That column reserves a fixed 32-cell first column (truncating long refs such as
+`synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017`), and the pickers filled it
+with `● selected` / `current` / `all`. Rows are now plain `provider/id`; the
+header shows `staged:` (and `saved:` in `/role`) plus the scope (`scoped N` /
+`all N`), and Ctrl+O is inert when no scope is configured instead of swapping
+the list for an empty one. The desktop host now honours `enabledModels`, so a
+scoped session opens on the scoped models rather than the whole catalogue.
+
 ### Fixed — Resumed review state and stale plan handoff (plan 2026-10-25 follow-up)
 
 **Resumed reviews report running.** `/review-resume` now moves a gated paused
