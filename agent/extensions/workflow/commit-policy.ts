@@ -403,6 +403,8 @@ export function isAuthorizationActive(
 export interface CommitConfirmationQuestion {
   question?: string;
   header?: string;
+  /** The proposed message lives here (the questionnaire renders it scrollably). */
+  context?: string;
   options?: { label?: string; description?: string }[];
 }
 
@@ -628,4 +630,45 @@ export function commitPolicyArgumentCompletions(
     return null;
   }
   return items;
+}
+
+/**
+ * The `/commit` agent instruction.
+ *
+ * The proposed message is deliberately put in the questionnaire's scrollable
+ * `context` field, with a short pinned question. Putting the whole message in
+ * `question` is what used to push the choice rows off-screen on long commits.
+ */
+export function buildCommitPrompt(
+  statSummary: string,
+  stageAll: boolean,
+): string {
+  return [
+    `The user ran /commit${stageAll ? " -a" : ""} and wants to commit the currently staged changes.`,
+    "",
+    "STAGED FILES:",
+    statSummary,
+    "",
+    "INSTRUCTIONS:",
+    "1. Run `git diff --staged` via the bash tool to see the full diff of the staged changes.",
+    "2. Analyze the diff and compose a concise, free-form commit message summarizing the changes.",
+    "3. Present the proposal using the questionnaire tool with exactly ONE question:",
+    '   header: "Commit"',
+    '   question: "Commit these staged changes?"',
+    '   context: "<the exact proposed commit message>"',
+    '   options: [\n     { label: "✅ Commit", description: "Commit with this message" },\n     { label: "✏️ Edit", description: "Modify the message before committing" },\n     { label: "❌ Cancel", description: "Abort without committing" }\n   ]',
+    "   Put the whole proposed message in `context`, exactly as it should be committed (no code fences, no commentary). It renders in a scrollable panel, so the choices stay visible. Never put the diff in `context`. Keep `question` short.",
+    '   (The questionnaire tool auto-appends a "Type something." freeform option — if the user types a custom message, use that text as the commit message instead.)',
+    "4. After the user responds:",
+    '   - "✅ Commit" → run `git commit -m "<message>"` via the bash tool.',
+    '   - "✏️ Edit" or custom written text → run `git commit -m "<written message>"` via the bash tool.',
+    '   - "❌ Cancel" → do NOT commit; report that the commit was cancelled by the user.',
+    "5. Report the outcome (commit success output, or the error if it failed).",
+    "",
+    "IMPORTANT CONSTRAINTS:",
+    "- Only commit the staged changes. Do NOT run `git add` or `git commit -a`.",
+    "- Leave all unstaged changes untouched.",
+    "- If the commit fails (e.g., pre-commit hook, empty message), report the error and do NOT retry.",
+    "- Escape special characters in the commit message appropriately for the shell, or use `git commit -F <file>` for complex messages.",
+  ].join("\n");
 }

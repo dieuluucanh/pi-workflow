@@ -39,7 +39,6 @@ import {
   Editor,
   type EditorTheme,
   type SelectItem,
-  visibleWidth,
   wrapTextWithAnsi,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
@@ -97,6 +96,7 @@ import {
   COMMIT_AUTH_TTL_MS,
   COMMIT_FLOW_TTL_MS,
   armCommitAuthorization,
+  buildCommitPrompt,
   commitConfigPaths,
   commitPolicyArgumentCompletions,
   decideCommitGate,
@@ -194,6 +194,12 @@ import {
   type ProfileRoleName,
 } from "./profiles.ts";
 import { FilterableList, type FilterableItem } from "./picker.ts";
+import { QUESTIONNAIRE_OVERLAY_MAX_HEIGHT } from "./questionnaire-layout.ts";
+import {
+  createQuestionnaireView,
+  type QuestionnaireQuestion,
+  type QuestionnaireResult,
+} from "./questionnaire-view.ts";
 import {
   coerceModelDefault,
   describeModelDefaultApply,
@@ -4134,36 +4140,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
   }
 
-  function buildCommitPrompt(statSummary: string, stageAll: boolean): string {
-    return [
-      `The user ran /commit${stageAll ? " -a" : ""} and wants to commit the currently staged changes.`,
-      "",
-      "STAGED FILES:",
-      statSummary,
-      "",
-      "INSTRUCTIONS:",
-      "1. Run `git diff --staged` via the bash tool to see the full diff of the staged changes.",
-      "2. Analyze the diff and compose a concise, free-form commit message summarizing the changes.",
-      "3. Present the proposed message to the user using the questionnaire tool with exactly these options:",
-      '   - { label: "✅ Commit", description: "Commit with this message" }',
-      '   - { label: "✏️ Edit", description: "Modify the message before committing" }',
-      '   - { label: "❌ Cancel", description: "Abort without committing" }',
-      '   Use question: "Proposed commit message:\\n\\n  <your message>\\n\\nCommit these staged changes?" and header: "Commit".',
-      '   (The questionnaire tool auto-appends a "Type something." freeform option — if the user types a custom message, use that text as the commit message instead.)',
-      "4. After the user responds:",
-      '   - "✅ Commit" → run `git commit -m "<message>"` via the bash tool.',
-      '   - "✏️ Edit" or custom written text → run `git commit -m "<written message>"` via the bash tool.',
-      '   - "❌ Cancel" → do NOT commit; report that the commit was cancelled by the user.',
-      "5. Report the outcome (commit success output, or the error if it failed).",
-      "",
-      "IMPORTANT CONSTRAINTS:",
-      "- Only commit the staged changes. Do NOT run `git add` or `git commit -a`.",
-      "- Leave all unstaged changes untouched.",
-      "- If the commit fails (e.g., pre-commit hook, empty message), report the error and do NOT retry.",
-      "- Escape special characters in the commit message appropriately for the shell, or use `git commit -F <file>` for complex messages.",
-    ].join("\n");
-  }
-
   async function handleCommitCommand(args: string, ctx: any) {
     const cwd = (ctx as any)?.cwd ?? process.cwd();
     const stageAll = /(^|\s)-a(\s|$)/.test(args.trim());
@@ -7168,6 +7144,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     header: Type.Optional(
       Type.String({ description: "Short label for tab, e.g. Scope" }),
     ),
+    context: Type.Optional(
+      Type.String({
+        description:
+          "Long supporting text (e.g. a proposed commit message), rendered in a scrollable panel. Keep question short.",
+      }),
+    ),
     options: Type.Array(QuestionOptionSchema, {
       description: "Options (first = recommended)",
     }),
@@ -7177,11 +7159,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     name: "questionnaire",
     label: "Questionnaire",
     description:
-      'Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Loops until clear. Use in plan mode. Tool appends "Type something." automatically - do not include freeform in options.',
+      'Ask user 1-4 multiple-choice questions at once. Each has header, question, options (first = recommendation). Put long supporting text in context; keep question short. Loops until clear. Use in plan mode. Tool appends "Type something." automatically - do not include freeform in options.',
     parameters: Type.Object({
       questions: Type.Optional(Type.Array(QuestionSchema)),
       question: Type.Optional(Type.String()),
       header: Type.Optional(Type.String()),
+      context: Type.Optional(Type.String()),
       options: Type.Optional(Type.Array(QuestionOptionSchema)),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -7192,17 +7175,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
         };
 
       // Normalize to questions[] array for unified UI (supports both single-question and multi-question calls)
-      let questions: {
-        question: string;
-        header?: string;
-        options: { label: string; description?: string }[];
-      }[] = [];
+      let questions: QuestionnaireQuestion[] = [];
       if (
         params.questions &&
         Array.isArray(params.questions) &&
         params.questions.length > 0
       ) {
-        questions = params.questions as any;
+        questions = params.questions as QuestionnaireQuestion[];
       } else if (
         params.question &&
         params.options &&
@@ -7212,6 +7191,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           {
             question: params.question as string,
             header: params.header as string | undefined,
+            context: params.context as string | undefined,
             options: params.options as any,
           },
         ];
@@ -7245,465 +7225,26 @@ export default function workflowExtension(pi: ExtensionAPI) {
           details: {},
         };
 
-      // Build items for UI - reuse questionnaire pattern: tabs
-      type DisplayOpt = {
-        label: string;
-        description?: string;
-        isOther?: boolean;
-      };
-      const isMulti = questions.length > 1;
-
       overlayDepth += 1;
-      let result: {
-        answers: {
-          question: string;
-          header?: string;
-          answer: string;
-          wasCustom: boolean;
-          index?: number;
-        }[];
-        cancelled: boolean;
-      } | null;
+      let result: QuestionnaireResult | null;
       try {
-        result = await ctx.ui.custom<{
-          answers: {
-            question: string;
-            header?: string;
-            answer: string;
-            wasCustom: boolean;
-            index?: number;
-          }[];
-          cancelled: boolean;
-        } | null>((tui, theme, _kb, done) => {
-          let currentTab = 0;
-          let optionIndex = 0;
-          let inputMode = false;
-          let inputQuestionIdx: number | null = null;
-          let cached: string[] | undefined;
-          const answers = new Map<
-            number,
-            { answer: string; wasCustom: boolean; index?: number }
-          >();
-
-          const editorTheme: EditorTheme = {
-            borderColor: (s) => theme.fg("accent", s),
-            selectList: {
-              selectedPrefix: (t) => theme.fg("accent", t),
-              selectedText: (t) => theme.fg("accent", t),
-              description: (t) => theme.fg("muted", t),
-              scrollInfo: (t) => theme.fg("dim", t),
-              noMatch: (t) => theme.fg("warning", t),
+        result = await ctx.ui.custom<QuestionnaireResult | null>(
+          (tui, theme, _kb, done) =>
+            createQuestionnaireView(tui, theme, {
+              questions,
+              done,
+              signal,
+            }),
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "bottom-center",
+              width: "100%",
+              maxHeight: QUESTIONNAIRE_OVERLAY_MAX_HEIGHT,
+              margin: 0,
             },
-          };
-          const editor = new Editor(tui, editorTheme);
-          // ── Shared freeform helpers (single source of truth) ──
-          const FREEFORM_ALIASES = new Set([
-            "type something",
-            "type something else",
-            "other",
-            "other (please specify)",
-            "other please specify",
-          ]);
-          const normalizeFreeform = (s: string) =>
-            s.toLowerCase().trim().replace(/\.$/, "").replace(/\s+/g, " ");
-          function buildDisplayOptions(
-            raw: { label: string; description?: string }[],
-          ): DisplayOpt[] {
-            const filtered: DisplayOpt[] = (raw as DisplayOpt[]).filter(
-              (o) => !FREEFORM_ALIASES.has(normalizeFreeform(o.label)),
-            );
-            filtered.push({ label: "Type something.", isOther: true });
-            return filtered;
-          }
-          function isCustomSelected(
-            prev: { wasCustom: boolean; index?: number } | undefined,
-            opt: DisplayOpt | undefined,
-            idx: number,
-          ): boolean {
-            if (!prev) return false;
-            if (prev.wasCustom && opt?.isOther) return true;
-            return prev.index === idx + 1;
-          }
-          editor.onSubmit = (value) => {
-            if (inputQuestionIdx === null) return;
-            const trimmed = value.trim() || "(no response)";
-            const freeformIndex = buildDisplayOptions(
-              questions[inputQuestionIdx]?.options.map((o) => ({
-                label: o.label,
-                description: o.description,
-              })) ?? [],
-            ).length; // 1-based last row
-            answers.set(inputQuestionIdx, {
-              answer: trimmed,
-              wasCustom: true,
-              index: freeformIndex,
-            });
-            inputMode = false;
-            inputQuestionIdx = null;
-            editor.setText("");
-            advanceAfter();
-          };
-
-          function currentQ() {
-            return questions[currentTab];
-          }
-          function currentOpts(): DisplayOpt[] {
-            const q = currentQ();
-            if (!q) return [];
-            return buildDisplayOptions(
-              q.options.map((o) => ({
-                label: o.label,
-                description: o.description,
-              })),
-            );
-          }
-          function optsForTab(tab: number): DisplayOpt[] {
-            const q = questions[tab];
-            if (!q) return [];
-            return buildDisplayOptions(
-              q.options.map((o) => ({
-                label: o.label,
-                description: o.description,
-              })),
-            );
-          }
-          function restoreOptionIndex(tab: number) {
-            if (tab >= questions.length) {
-              optionIndex = 0;
-              return;
-            }
-            const prev = answers.get(tab);
-            // wasCustom is authoritative for freeform (resilient to option count changes)
-            if (prev?.wasCustom) {
-              optionIndex = Math.max(0, optsForTab(tab).length - 1);
-              return;
-            }
-            if (prev?.index) {
-              const len = optsForTab(tab).length;
-              optionIndex = Math.max(0, Math.min(prev.index - 1, len - 1));
-            } else {
-              optionIndex = 0;
-            }
-          }
-          function allAnswered() {
-            return questions.every((_, i) => answers.has(i));
-          }
-          function advanceAfter() {
-            if (!isMulti) {
-              submit(false);
-              return;
-            }
-            if (currentTab < questions.length - 1) currentTab++;
-            else currentTab = questions.length; // submit tab
-            restoreOptionIndex(currentTab);
-            cached = undefined;
-            tui.requestRender();
-          }
-          function submit(cancelled: boolean) {
-            if (cancelled) {
-              done({ answers: [], cancelled: true });
-              return;
-            }
-            const arr = questions.map((q, i) => {
-              const a = answers.get(i);
-              return {
-                question: q.question,
-                header: q.header,
-                answer: a ? a.answer : "",
-                wasCustom: a ? a.wasCustom : false,
-                index: a?.index,
-              };
-            });
-            done({ answers: arr, cancelled: false });
-          }
-          function refresh() {
-            cached = undefined;
-            tui.requestRender();
-          }
-
-          const handleInput = (data: string) => {
-            if (signal?.aborted) {
-              done(null);
-              return;
-            }
-            if (inputMode) {
-              if (matchesKey(data, Key.escape)) {
-                inputMode = false;
-                inputQuestionIdx = null;
-                editor.setText("");
-                refresh();
-                return;
-              }
-              editor.handleInput(data);
-              refresh();
-              return;
-            }
-            const q = currentQ();
-            const opts = currentOpts();
-            if (isMulti) {
-              if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
-                currentTab = (currentTab + 1) % (questions.length + 1);
-                restoreOptionIndex(currentTab);
-                refresh();
-                return;
-              }
-              if (
-                matchesKey(data, Key.shift("tab")) ||
-                matchesKey(data, Key.left)
-              ) {
-                currentTab =
-                  (currentTab - 1 + questions.length + 1) %
-                  (questions.length + 1);
-                restoreOptionIndex(currentTab);
-                refresh();
-                return;
-              }
-            }
-            if (currentTab === questions.length) {
-              if (matchesKey(data, Key.enter) && allAnswered()) {
-                submit(false);
-              } else if (matchesKey(data, Key.escape)) {
-                submit(true);
-              }
-              return;
-            }
-            if (matchesKey(data, Key.up)) {
-              optionIndex = Math.max(0, optionIndex - 1);
-              refresh();
-              return;
-            }
-            if (matchesKey(data, Key.down)) {
-              optionIndex = Math.min(opts.length - 1, optionIndex + 1);
-              refresh();
-              return;
-            }
-            if (matchesKey(data, Key.enter) && q) {
-              const opt = opts[optionIndex];
-              if (opt.isOther) {
-                inputMode = true;
-                inputQuestionIdx = currentTab;
-                const prev = answers.get(currentTab);
-                editor.setText(prev?.wasCustom ? prev.answer : "");
-                refresh();
-                return;
-              }
-              answers.set(currentTab, {
-                answer: opt.label,
-                wasCustom: false,
-                index: optionIndex + 1,
-              });
-              advanceAfter();
-              return;
-            }
-            if (matchesKey(data, Key.escape)) {
-              submit(true);
-            }
-          };
-
-          const render = (width: number): string[] => {
-            if (cached) return cached;
-            const lines: string[] = [];
-            const W = Math.max(1, width);
-            const q = currentQ();
-            const opts = currentOpts();
-            const wrap = (s: string) => {
-              const out: string[] = [];
-              for (const line of s.split("\n")) {
-                out.push(...wrapTextWithAnsi(line, W));
-              }
-              return out;
-            };
-            const wrapWithPrefix = (prefix: string, text: string) => {
-              const pw = visibleWidth(prefix);
-              if (pw >= W) return wrap(prefix + text);
-              const wrapped = wrapTextWithAnsi(text, W - pw);
-              const cont = " ".repeat(pw);
-              return wrapped.map(
-                (ln, idx) => `${idx === 0 ? prefix : cont}${ln}`,
-              );
-            };
-            lines.push(theme.fg("accent", "─".repeat(W)));
-            if (isMulti) {
-              const tabs: string[] = [];
-              for (let i = 0; i < questions.length; i++) {
-                const active = i === currentTab;
-                const answered = answers.has(i);
-                const lbl = questions[i].header || `Q${i + 1}`;
-                const box = answered ? "■" : "□";
-                const color = answered ? "success" : "muted";
-                const text = ` ${box} ${lbl} `;
-                // The active tab carries an explicit marker, not only the
-                // selection fill. A fill alone is easy to miss in a host that
-                // paints it in its own palette (the desktop app); the marker is
-                // what says "this one" in every surface. The marker replaces
-                // the two-space indent, so the labels stay aligned.
-                const styled = active
-                  ? theme.bg(
-                      "selectedBg",
-                      `${theme.fg("accent", "→")} ${theme.fg("text", text)}`,
-                    )
-                  : theme.fg(color as any, `  ${text}`);
-                tabs.push(`${styled} `);
-              }
-              const canSubmit = allAnswered();
-              const isSubmit = currentTab === questions.length;
-              const submitText = " ✓ Submit ";
-              const sStyled = isSubmit
-                ? theme.bg(
-                    "selectedBg",
-                    `${theme.fg("accent", "→")} ${theme.fg("text", submitText)}`,
-                  )
-                : theme.fg(canSubmit ? "success" : "dim", `  ${submitText}`);
-              tabs.push(`${sStyled}`);
-              // naive join wrapped
-              lines.push(` ${tabs.join("")}`);
-              lines.push("");
-            }
-            if (inputMode && q) {
-              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
-              lines.push("");
-              for (let i = 0; i < opts.length; i++) {
-                const opt = opts[i];
-                const sel = i === optionIndex;
-                const isOther = !!opt.isOther;
-                const prefix = sel ? theme.fg("accent", "> ") : "  ";
-                const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-                const color = sel || (isOther && inputMode) ? "accent" : "text";
-                lines.push(...wrap(prefix + theme.fg(color as any, label)));
-                if (opt.description)
-                  lines.push(
-                    ...wrap(`     ${theme.fg("muted", opt.description)}`),
-                  );
-              }
-              lines.push("");
-              lines.push(...wrap(` ${theme.fg("muted", "Your answer:")}`));
-              for (const l of editor.render(Math.max(1, W - 2)))
-                lines.push(` ${l}`);
-              lines.push("");
-              lines.push(
-                ...wrap(
-                  ` ${theme.fg("dim", "Enter to submit • Esc to go back")}`,
-                ),
-              );
-            } else if (currentTab === questions.length) {
-              lines.push(
-                ...wrap(
-                  ` ${theme.fg("accent", theme.bold("Ready to submit"))}`,
-                ),
-              );
-              lines.push("");
-              for (let i = 0; i < questions.length; i++) {
-                const a = answers.get(i);
-                if (a) {
-                  const prefix = a.wasCustom ? "(wrote) " : "";
-                  lines.push(
-                    ...wrap(
-                      `  ${theme.fg(
-                        "muted",
-                        `${questions[i].header || `Q${i + 1}`}: `,
-                      )}${theme.fg("text", prefix + a.answer)}`,
-                    ),
-                  );
-                }
-              }
-              lines.push("");
-              if (allAnswered())
-                lines.push(
-                  ...wrap(` ${theme.fg("success", "Press Enter to submit")}`),
-                );
-              else {
-                const missing = questions
-                  .filter((_, i) => !answers.has(i))
-                  .map((q, idx) => q.header || `Q${idx + 1}`)
-                  .join(", ");
-                lines.push(
-                  ...wrap(` ${theme.fg("warning", `Unanswered: ${missing}`)}`),
-                );
-              }
-            } else if (q) {
-              lines.push(...wrap(` ${theme.fg("text", q.question)}`));
-              lines.push("");
-              const prevAns = answers.get(currentTab);
-              for (let i = 0; i < opts.length; i++) {
-                const opt = opts[i];
-                const sel = i === optionIndex;
-                const isPrevSelected = isCustomSelected(prevAns, opt, i);
-                const isOther = !!opt.isOther;
-                let prefix: string;
-                let color: string;
-                if (sel) {
-                  prefix = theme.fg("accent", "> ");
-                  color = "accent";
-                } else if (isPrevSelected) {
-                  prefix = theme.fg("success", "✓ ");
-                  color = "success";
-                } else if (isOther && inputMode) {
-                  prefix = "  ";
-                  color = "accent";
-                } else {
-                  prefix = "  ";
-                  color = "text";
-                }
-                const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
-                lines.push(
-                  ...wrapWithPrefix(prefix, theme.fg(color as any, label)),
-                );
-                if (opt.description)
-                  lines.push(
-                    ...wrapWithPrefix(
-                      "     ",
-                      theme.fg("muted", opt.description),
-                    ),
-                  );
-                // Show previously typed custom answer inline below the Type something. row
-                if (isOther && prevAns?.wasCustom) {
-                  const answerLabel = theme.fg("muted", "↳ Your answer: ");
-                  const answerVal = theme.fg("text", `"${prevAns.answer}"`);
-                  // Handle multiline answers: split and wrap each segment
-                  const answerLines = prevAns.answer.split("\n");
-                  if (answerLines.length === 1) {
-                    lines.push(
-                      ...wrapWithPrefix("    ", `${answerLabel}${answerVal}`),
-                    );
-                  } else {
-                    lines.push(
-                      ...wrapWithPrefix(
-                        "    ",
-                        `${answerLabel}${theme.fg("text", `"${answerLines[0]}`)}`,
-                      ),
-                    );
-                    for (let ai = 1; ai < answerLines.length; ai++) {
-                      const closing = ai === answerLines.length - 1 ? `"` : "";
-                      const seg = theme.fg(
-                        "text",
-                        `${answerLines[ai]}${closing}`,
-                      );
-                      lines.push(...wrapWithPrefix("    ", seg));
-                    }
-                  }
-                }
-              }
-            }
-            lines.push("");
-            if (!inputMode) {
-              const help = isMulti
-                ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
-                : "↑↓ navigate • Enter select • Esc cancel";
-              lines.push(...wrap(` ${theme.fg("dim", help)}`));
-            }
-            lines.push(theme.fg("accent", "─".repeat(W)));
-            cached = lines;
-            return lines;
-          };
-
-          return {
-            render,
-            invalidate: () => {
-              cached = undefined;
-            },
-            handleInput,
-          };
-        });
+          },
+        );
       } finally {
         overlayDepth = Math.max(0, overlayDepth - 1);
       }

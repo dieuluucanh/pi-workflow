@@ -21,6 +21,7 @@ import {
   DEFAULT_COMMIT_POLICY_CONFIG,
   WORKFLOW_SETTINGS_KEY,
   armCommitAuthorization,
+  buildCommitPrompt,
   coerceCommitPolicyConfig,
   commitConfigPaths,
   commitPolicyArgumentCompletions,
@@ -634,4 +635,43 @@ test("commitPolicyArgumentCompletions: applyCompletion algebra keeps the mode", 
   const item = commitPolicyArgumentCompletions(prefix)![0];
   const newLine = line.slice(0, line.length - prefix.length) + item.value;
   assert.equal(newLine, "/commit-policy never project");
+});
+
+test("buildCommitPrompt: proposes via short question + scrollable context", () => {
+  const prompt = buildCommitPrompt("src/app.ts | 12 ++++++------", true);
+
+  assert.match(prompt, /\/commit -a/);
+  assert.match(prompt, /git diff --staged/);
+  assert.match(prompt, /question: "Commit these staged changes\?"/);
+  assert.match(prompt, /context: "<the exact proposed commit message>"/);
+  assert.match(prompt, /✅ Commit/);
+  assert.match(prompt, /✏️ Edit/);
+  assert.match(prompt, /❌ Cancel/);
+  assert.match(prompt, /scrollable panel/);
+  assert.match(prompt, /Never put the diff in `context`/);
+  assert.match(prompt, /Only commit the staged changes/);
+  assert.match(prompt, /Do NOT run `git add` or `git commit -a`/);
+
+  // The old instruction put the whole message in `question`; that is exactly
+  // the layout that pushed the choices off-screen.
+  assert.doesNotMatch(prompt, /Proposed commit message:/);
+  assert.doesNotMatch(prompt, /Use question:/);
+});
+
+test("isCommitConfirmation: the new short question + context still matches", () => {
+  assert.equal(
+    isCommitConfirmation([
+      {
+        header: "Commit",
+        question: "Commit these staged changes?",
+        context: "feat: add the scrollable questionnaire",
+        options: [
+          { label: "✅ Commit" },
+          { label: "✏️ Edit" },
+          { label: "❌ Cancel" },
+        ],
+      },
+    ]),
+    true,
+  );
 });

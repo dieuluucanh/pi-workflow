@@ -4,6 +4,37 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Long questionnaire content can no longer hide the choices (2026-10-25)
+
+`/commit` asked the agent to put the whole proposed commit message into the
+questionnaire's `question`. A multi-paragraph message made the view taller than
+the fullscreen input dock, and the dock clips the editor container from the
+bottom (it is a flat leaf: the layout engine never descends into the custom
+component), so the ✅ Commit / ✏️ Edit / ❌ Cancel rows and the help line were
+pushed off-screen. Fullscreen also routes wheel / `PgUp` / `PgDn` to the
+transcript unless a real overlay is focused, so an inline questionnaire could
+not scroll even if it had handlers.
+
+The questionnaire is now a **bounded bottom-sheet overlay** (full width,
+bottom-anchored, at most 80% of the terminal). The view renders at most
+`min(32, floor(rows * 0.8) - 1)` lines and slices its own panes: the short
+question stays pinned with the choices and help at the bottom, while the long
+question or the new optional `context` field scrolls with the wheel,
+`PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The option list scrolls only when it must,
+keeping the selected row visible. While typing a free-form answer the options
+are hidden and the editor gets the pane; `Esc` returns to the list.
+
+`/commit` now passes the proposed message in `context` with a short pinned
+question (`Commit these staged changes?`), so even an agent that ignores the
+new field still gets a scrollable question and visible choices. The result
+shape and commit-authorization arming are unchanged (`{answers, cancelled}`;
+arms only on a positive answer).
+
+New pure geometry/scroll helpers in `questionnaire-layout.ts` and the bounded
+view in `questionnaire-view.ts`; `/commit`'s prompt moved to `commit-policy.ts`.
+Tests: 447 green, including 16 layout cases, 14 view regression cases, and two
+prompt/detection cases.
+
 ### Fixed — `/profile` and `/role` pickers: real type-to-filter and close-after-action (2026-10-25)
 
 **Typing now filters.** `SelectList` silently dropped printable keys, so every

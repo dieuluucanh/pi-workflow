@@ -7,7 +7,7 @@
   "description": "Plan↔Build mode with an independent Review Mode reviewer, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
   "license": "MIT",
   "scripts": {
-    "test": "node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts picker.test.ts model-default.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts",
+    "test": "node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check:policy": "node --experimental-transform-types scripts/verify-write-policy.mjs"
   },
@@ -32,6 +32,8 @@
     "roles.ts",
     "profiles.ts",
     "picker.ts",
+    "questionnaire-layout.ts",
+    "questionnaire-view.ts",
     "model-default.ts",
     "permissions.ts",
     "review.ts",

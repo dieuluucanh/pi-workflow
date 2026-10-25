@@ -6,7 +6,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 
 - **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; tab + `CtrlAlt+p` shortcuts, `--workflow-plan` flag
 - **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, rewrites it, streams its work into the main transcript, and hands the result to Plannotator. Off by default; see [Review Mode](#review-mode) below.
-- **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, inline `↳ Your answer:` editor
+- **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, and an inline `↳ Your answer:` editor. Rendered as a bounded bottom-sheet overlay: a short question and the choices stay pinned, while a long question or the optional `context` body (e.g. a proposed commit message) scrolls with the wheel, `PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The freeform editor takes the pane while typing.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
 - **Todos** — plan-faithful todo list (global step refs + statuses + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/update/done/pending/add/toggle/sync/clear`) with industry-style wholesale `update` (send the COMPLETE list; omitted items are removed) plus idempotent `done`/`pending`, lenient `[DONE:<ref>]` markers, throttled Claude-Code-style reminders, a tool-result footer, and a stale ⚠ notice — but **no forced turns and no heuristic auto-completion** (reference: Claude Code / OpenCode / Codex practice).
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
@@ -329,6 +329,8 @@ The status line always shows the active policy (`▶ build 2/5 · commits:never`
 
 The confirmation step is required: with no positive answer no authorization exists and the policy keeps blocking. `-a` staging happens extension-side before the flow, outside the tool gate.
 
+The proposed message is passed in the questionnaire's scrollable `context`, not in `question`. The bottom-sheet keeps the short decision line and the ✅ Commit / ✏️ Edit / ❌ Cancel rows pinned while the message scrolls (wheel, `PgUp`/`PgDn`, `Ctrl+U`/`Ctrl+D`), so a long, multi-paragraph commit message can never hide the choices.
+
 ```text
 /commit-policy                # status: mode, which scope supplied it, both settings paths
 /commit-policy never          # set globally (~/.pi/agent/settings.json)
@@ -529,7 +531,7 @@ Write Permission settings live under `workflow.writePolicy` (same global/project
 
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion and write — no runtime imports, unit-testable), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -573,7 +575,7 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):
