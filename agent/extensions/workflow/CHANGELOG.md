@@ -4,6 +4,48 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Resumed review state and stale plan handoff (plan 2026-10-25 follow-up)
+
+**Resumed reviews report running.** `/review-resume` now moves a gated paused
+phase back to `"auditing"`, and `settleReviewGate` resets the phase to `"idle"`.
+The mode-lock predicate treats a real pause snapshot as paused, a live round as
+running even when the parked handoff still says paused, and only falls back to
+the gate phase when neither is present. Pressing `Tab` during a resumed round no
+longer says "Review is paused", and a second ESC can pause the resumed round
+again.
+
+**A stale plan can no longer hand off.** A Plan handoff now opens only when the
+current user run started in Plan mode and wrote/edited a `.pi/plans/` file in
+that run. Session-lifetime `lastPlanWritePath`/`currentPlanFile` state and
+session-branch scans are no longer handoff sources, so Build → Plan followed by a
+new prompt does not reopen the previous Build plan in Plannotator. A fresh
+prompt or mode switch resets per-run provenance and supersedes any pending
+browser/inline decision; stale Plannotator approvals are correlated by
+`awaitingDecision`, review id and plan path/hash. The current run's write path is
+authoritative for the handoff content, `planFilePath` and `currentPlanFile`.
+
+Tests: 340 green (337 + resumed-phase/lock precedence and handoff provenance
+coverage).
+
+### Changed — Review mode locks mode switching (plan 2026-10-25)
+
+A live review now owns the turn: `Tab`, `Ctrl+Alt+P`, `/plan`, `/build`,
+`/default`, the programmatic Build entry, Plannotator approve/deny and the
+external pi-code plan-mode event are refused until the round lands, fails, or is
+aborted. Previously Tab-to-Build mid-review silently swapped the tool set and
+`suspendReview()` dropped the round/pause and the pending handoff. The lock is a
+derived projection over in-memory review state (never persisted), so success,
+failure, pause/resume, `/review-abort` and `/review-mode off` release it
+automatically; a reload cannot restore a phantom lock. The notice names `ESC`,
+`/review-pause`, `/review-resume`, `/review-abort` and `/review-mode off`, and the
+footer carries `🔒 modes locked` (also shown by `/review-status`). The
+post-review handoff prompt is intentionally unlocked because the independent
+reviewer has finished. This supersedes the 2026-10-23 acceptance of "Tab-to-Build
+mid-gate" as an exit path.
+
+Tests: 337 green (334 + the mode-lock truth table, notice and footer/status
+coverage).
+
 ### Changed — Ad-hoc `/review` without Review Mode on
 
 Bare `/review` (plus `/review say|pause|resume|abort|status`) now works

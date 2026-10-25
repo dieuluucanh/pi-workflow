@@ -34,7 +34,7 @@
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "minimax-m3.1-flash-free",
+  "defaultModel": "deepseek-v4.1-flash",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -51,7 +51,7 @@
       "exploreBudget": 3,
       "timeoutMs": 0
     },
-    "defaultProfile": "Opencode-Contributor",
+    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
     "writePolicy": {
       "mode": "allow",
       "allowedPaths": [],

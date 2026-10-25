@@ -46,6 +46,8 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
 
+Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a review round or a paused review owns the turn; see [Controlling a running review](#controlling-a-running-review).
+
 ## Model Profiles
 
 A profile is a **named combination of role model settings** — one `{provider, id, thinking}` each for planner, explorer, builder and reviewer. Profiles layer on top of Model Roles: role identity (tools, system prompts, custom roles) stays global in `roles.json`; a profile only overrides models while it is active.
@@ -197,7 +199,7 @@ reviewer `opencode-go/muse-spark-1.3-contributor` · verdict **revise**
 
 Because the two agents run sequentially — Plan Mode finishes before the reviewer starts — their transcripts can never interleave, and there is no overlay or second pane to navigate. Everything shows up in Pi's normal transcript.
 
-Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress): switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line. Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
+Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress): switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line. The one exception is a live review: mode switching is refused with a notice (see [Controlling a running review](#controlling-a-running-review)). Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
 
 | Entry | Color | Meaning |
 | --- | --- | --- |
@@ -218,18 +220,21 @@ Input follows the **active mode**, decided automatically — there is nothing to
 
 Delivery to the reviewer is best-effort: if it fails, the message stays in the plan-agent chat rather than being swallowed.
 
-**Status line.** While a review is running, the footer status carries a review segment alongside the mode (`⏸ plan … · 🔍 review · pass 2/2 · 3 findings · ● verifying`), the widget above the editor shows the same live phase, and the spinner row reads `🔍 Reviewing plan…`. Pausing switches both to the paused form (`🔍 review paused — /review-resume to continue`).
+**Status line.** While a review is running, the footer status carries a review segment alongside the mode (`⏸ plan … · 🔍 review · pass 2/2 · 3 findings · ● verifying`), the widget above the editor shows the same live phase, and the spinner row reads `🔍 Reviewing plan…`. Pausing switches both to the paused form (`🔍 review paused — /review-resume to continue`); resuming returns them to the running form. While the review owns the turn, the footer also appends `🔒 modes locked`.
 
 ### Controlling a running review
 
 The handoff **waits for the reviewer**: no browser prompt or inline choice renders until the gated round lands, fails, or you pause/abort it. The reviewed plan (the reviewer writes the plan file mid-round) becomes the handed-off text, with the todo steps re-synced to match. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
 
+A handoff opens **only when the current Plan run writes or edits a `.pi/plans/` file**. Switching Build → Plan keeps the previous plan and todos as reference, but they cannot be handed off again until the new run writes a plan. A fresh prompt also supersedes any pending browser/inline handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
+
+- **Mode switching is locked** from the moment a review round starts (including the cold boot) until it lands, fails, or is aborted, and for the whole paused state. `Tab`, `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. `/review-abort` and `/review-mode off` end the lock; the post-review handoff prompt is intentionally unlocked because the independent reviewer has finished.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. A terminal listener maps it to `/review-pause` semantics (warm session kept) and consumes the key only when it actually paused, so the editor, questionnaire and handoff selector keep ESC otherwise. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.
 - `/review-pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
-- `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result.
-- `/review-abort` stops the round — or discards a paused one — and, when a handoff is waiting, **hands off the author's plan immediately** so the plan is always delivered. The aborted revision is not auto-reviewed again until the plan changes.
+- `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result. A resumed round is **running** again — the notice/footer return to the running form, and a second ESC can pause it.
+- `/review-abort` stops the round — or discards a paused one — and, when a handoff is waiting, **hands off the author's plan immediately** so the plan is always delivered. The aborted revision is not auto-reviewed again until the plan changes. It also releases the mode-switch lock immediately.
 - `/review say <message>` talks to the in-flight reviewer.
-- `/review-status` shows phase, round, the snapshotted model, findings, and any paused state.
+- `/review-status` shows phase, round, the snapshotted model, findings, any paused state, and the mode-switch lock with its allowed exits.
 
 Pausing is in-memory only: a reload starts fresh.
 

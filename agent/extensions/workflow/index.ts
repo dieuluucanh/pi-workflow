@@ -56,6 +56,8 @@ import {
   normalizeStepText,
   todoKey,
   isPlanWritePath,
+  findPlanWritePathInMessages,
+  shouldHandoffPlan,
   getUtcDatePrefix,
   normalizePlanPath,
   isUserInteractionEntry,
@@ -198,6 +200,11 @@ import {
   readReviewModeConfig,
   resolveReviewPrompt,
   reviewFooterSegment,
+  reviewGatePhaseOnResume,
+  reviewModeLockFooter,
+  reviewModeLockKind,
+  reviewModeLockNotice,
+  reviewModeLockStatusLine,
   reviewStateSummary,
   shouldPauseReviewOnEscape,
   shouldRouteInputToReviewer,
@@ -207,6 +214,7 @@ import {
   type ReviewHandoffGate,
   type ReviewHandoffPhase,
   type ReviewHandoffResult,
+  type ReviewModeLockKind,
   type ReviewState,
   type ReviewTranscriptOp,
   type ReviewTrigger,
@@ -239,16 +247,6 @@ function getTextContent(msg: AssistantMessage): string {
     .map((b) => b.text)
     .join("\n");
 }
-function slugify(s: string): string {
-  return (
-    s
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40) || "plan"
-  );
-}
-
 // ── Subagent runner (trimmed from examples/extensions/subagent) ─────
 
 interface AgentConfig {
@@ -1041,6 +1039,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         );
         if (seg) reviewSegment = ` · ${seg}`;
       }
+      // Lock marker is independent of `reviewState`: it must show during the
+      // cold boot (before the first phase event) and while the gated handoff
+      // audit has returned but not yet rendered.
+      const lockFooter = reviewModeLockFooter(reviewModeLockKindNow());
+      if (lockFooter) reviewSegment += ` · ${lockFooter}`;
     } catch (_e) {
       void _e;
       reviewSegment = "";
@@ -1148,6 +1151,46 @@ export default function workflowExtension(pi: ExtensionAPI) {
   let reviewGatePhase: ReviewHandoffPhase = "idle";
   /** Single-settle resolver the gated `runHandoff` awaits (see review.ts). */
   const reviewHandoffGate: ReviewHandoffGate = createReviewHandoffGate();
+
+  /**
+   * Live review lock. Derived from the same state the review controls use;
+   * never persisted, so land/fail/abort/teardown release it automatically.
+   * `activeReview` closes the cold-boot window before `isRoundActive()` flips.
+   */
+  function reviewModeLockKindNow(): ReviewModeLockKind | undefined {
+    const roundInFlight = activeReview !== undefined;
+    const paused = pausedReview !== undefined;
+    const gatePhase = reviewGatePhase;
+    let roundActive = false;
+    try {
+      roundActive = reviewRuntime?.isRoundActive() === true;
+    } catch (_e) {
+      // A disposed runtime must not unlock a pause/gate; the closure flags
+      // above still decide (only the runtime probe is best-effort).
+      void _e;
+    }
+    return reviewModeLockKind({
+      roundInFlight,
+      roundActive,
+      paused,
+      gatePhase,
+    });
+  }
+
+  /** Refuse a mode transition while a review round or pause owns the turn. */
+  function blockModeSwitchDuringReview(
+    ctx?: ExtensionContext,
+  ): boolean {
+    const kind = reviewModeLockKindNow();
+    if (!kind) return false;
+    try {
+      const ui = ((ctx ?? currentSessionCtx) as any)?.ui;
+      ui?.notify?.(reviewModeLockNotice(kind), "info");
+    } catch (_e) {
+      void _e;
+    }
+    return true;
+  }
 
   /**
    * Compact change token for a planner-touched path (step 8): size + short
@@ -1635,6 +1678,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
     try {
       if (reviewGatePhase === "idle") return;
       reviewHandoffGate.resolve(result);
+      // Settlement owns the phase: abort/teardown/suspend must not leave a
+      // stale "paused"/"auditing" phase for the lock, footer or /review-status.
+      // The parked handoff only awaits the gate; it does not re-read the phase
+      // after this point.
+      reviewGatePhase = "idle";
     } catch (_e) {
       void _e;
     }
@@ -1917,6 +1965,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * Aborts any in-flight round (silently for its own revision) and drops
    * pending landings and pauses, without paying for a cold reboot next round.
    * Round/bookkeeping state is kept — only the activity stops.
+   *
+   * Clearing `activeReview`/`pausedReview` also releases the derived mode-switch
+   * lock (plan 2026-10-25); there is no lock field to clear here.
    */
   async function suspendReview(): Promise<void> {
     // Capture before clearing: an open gate settles with the author's text.
@@ -1937,11 +1988,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
     pausedReview = undefined;
     activeReview = undefined;
     flushReviewEntries(true);
-    // An open handoff gate must never leak: approve/Tab-to-Build settle it
-    // as skipped so the awaiting handoff still renders (or its caller,
-    // already past the gate, is unaffected — resolve is exactly-once).
-    // A mode switch mid-gate already left plan mode, so the woken handoff
-    // re-checks the mode and stays silent.
+    // An open handoff gate must never leak: an approve/explicit post-review
+    // exit settles it as skipped so the awaiting handoff still renders (or its
+    // caller, already past the gate, is unaffected — resolve is exactly-once).
+    // Mid-review Tab-to-Build is now refused by the mode lock, so this path is
+    // no longer reachable from a mode switch.
     settleReviewGate({
       outcome: "unreviewed",
       planText: suspendedText,
@@ -1950,7 +2001,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
     if (currentSessionCtx) updateStatus(currentSessionCtx);
   }
 
-  /** Stop the reviewer and clear all Review Mode state. Never throws. */
+  /**
+   * Stop the reviewer and clear all Review Mode state. Never throws.
+   *
+   * `/review-mode off` and `session_shutdown` intentionally call this even while
+   * a review owns the turn: they are explicit exits, not mode transitions, so
+   * they are not guarded. Clearing the review state releases the derived
+   * mode-switch lock (plan 2026-10-25).
+   */
   async function teardownReview(): Promise<void> {
     try {
       await reviewRuntime?.teardown();
@@ -1973,6 +2031,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
     activeReview = undefined;
     abortedReviewHash = undefined;
     quietAbortHash = undefined;
+    // A teardown ends any pending handoff decision/correlation and the
+    // per-run provenance; a reload cannot inherit either.
+    const clearedDecision = clearPendingHandoffDecision();
+    resetPlanRunProvenance();
+    if (clearedDecision) {
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
     setReviewWorkingMessage(undefined);
     flushReviewEntries(true);
     resetReviewStream();
@@ -2115,7 +2184,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Disabling: stop everything and restore the pre-Review behaviour.
+      // Disabling is an explicit review exit (not a mode transition): do not
+      // guard it. Teardown settles an open gate and releases the derived lock.
       await teardownReview();
       ctx.ui.notify(
         `Review Mode disabled (${scope}) — automatic review off; plan/build flow is back to single-agent.\nTip: /review still runs a one-shot review any time.\nSettings: ${res.path}`,
@@ -2341,13 +2411,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
     description: "Show Review Mode state, findings and any error",
     handler: async (_args, ctx) => {
       const s = reviewState;
+      const lockKind = reviewModeLockKindNow();
       if (!s) {
         if (pausedReview) {
           ctx.ui.notify(
             [
               `Review paused at round ${pausedReview.round} (plan hash ${pausedReview.planHash})`,
               "  /review-resume to continue, /review-abort to stop.",
-            ].join("\n"),
+              reviewModeLockStatusLine(lockKind),
+            ]
+              .filter(Boolean)
+              .join("\n"),
             "info",
           );
           return;
@@ -2360,9 +2434,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
             ? ` Saved config: rounds ${manualCfg.rounds}, passes ${manualCfg.passes}.`
             : "";
         ctx.ui.notify(
-          reviewEnabled()
-            ? "Review Mode is enabled but no review has run yet."
-            : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} /review runs a one-shot review.`,
+          [
+            reviewEnabled()
+              ? "Review Mode is enabled but no review has run yet."
+              : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} /review runs a one-shot review.`,
+            reviewModeLockStatusLine(lockKind),
+          ]
+            .filter(Boolean)
+            .join("\n"),
           "info",
         );
         return;
@@ -2384,6 +2463,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         reviewRuntime?.isRoundActive()
           ? "  live    : round in flight — /role and /profile switches apply next round; /review say <msg> to steer"
           : "",
+        reviewModeLockStatusLine(lockKind),
         ...s.findings.map(
           (f) =>
             `  - [${f.disposition}] sev ${f.severity}/conf ${f.confidence} ${f.summary}`,
@@ -2550,6 +2630,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
         ctx.ui.notify("A review round is already running.", "warning");
         return;
       }
+      // A resumed gated review is auditing again. Without this, the parked
+      // handoff keeps `reviewGatePhase === "paused"` for the whole round and
+      // the lock/footer report the wrong state (plan 2026-10-25 follow-up).
+      // A manual pause (idle gate) is unchanged; the runtime/activeReview
+      // flags carry that lock.
+      reviewGatePhase = reviewGatePhaseOnResume(reviewGatePhase);
       // If the plan file moved on while paused, review the new revision
       // fresh instead of resuming stale text.
       let current: string | undefined;
@@ -2621,6 +2707,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     description:
       "Stop the Review round (or discard a paused one) — the author's plan stands",
     handler: async (_args, ctx) => {
+      // Explicit review exit: intentionally unguarded by the mode-switch lock.
+      // Aborting clears `pausedReview`/the round, which releases the lock and
+      // settles an open handoff gate with the author's plan.
       const rt = reviewRuntime;
       const active = rt?.isRoundActive() === true;
       if (!active && !pausedReview) {
@@ -2929,10 +3018,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
       );
       return;
     }
+    // A live review owns the turn: no mode transition until it lands, fails,
+    // pauses or is aborted. The post-review approve path enters Build through
+    // `enterBuildModeFromPlan`, which is no longer locked once the gate settles.
+    if (blockModeSwitchDuringReview(ctx)) return;
     // Leaving Default mode: remember its model so it can be restored on return.
     if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "plan";
     syncLegacyFlags();
+    // Entering Plan starts a new handoff cycle. Old plan/todos stay as
+    // reference, but only the next fresh prompt can make a run eligible.
+    resetPlanRunProvenance();
+    clearPendingHandoffDecision();
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
     pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
@@ -2971,10 +3068,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
       );
       return;
     }
+    // Refuse before assigning the mode / swapping tools / suspending review.
+    if (blockModeSwitchDuringReview(ctx)) return;
     // Leaving Default mode (e.g. /build from default): remember its model.
     if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "build";
     syncLegacyFlags();
+    // Leaving Plan invalidates this cycle's handoff/provenance.
+    resetPlanRunProvenance();
+    clearPendingHandoffDecision();
     pi.setActiveTools(
       toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
     );
@@ -3013,6 +3115,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
       );
       return;
     }
+    // Refuse before clearing the mode, restoring tools or touching the model.
+    if (blockModeSwitchDuringReview(ctx)) return;
     workflowMode = null;
     syncLegacyFlags();
     // Restore original tools
@@ -3023,8 +3127,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // Keep the todo list + plan reference so progress survives mode cycling.
     // (/todos clear or approving a new plan resets it.)
     todoPlanPath = todoPlanPath ?? currentPlanFile;
-    awaitingDecision = false;
-    lastHandoffAt = undefined;
+    // Leaving the workflow mode ends any pending handoff cycle; the plan and
+    // todos stay as reference, but no per-run eligibility survives.
+    clearPendingHandoffDecision();
+    resetPlanRunProvenance();
     // Restore the model that was active in Default mode (don't leak the
     // Build/Plan role model into Default).
     try {
@@ -3044,7 +3150,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   async function cycleWorkflowMode(ctx: ExtensionContext) {
     // Keyboard cycling is silent: no chat line, no band. The footer status is
-    // the confirmation (see plan 2026-09-19).
+    // the confirmation (see plan 2026-09-19). A live review is the one
+    // exception: Tab / Ctrl+Alt+P are refused with one notice instead of
+    // silently changing mode and suspending the reviewer.
+    if (blockModeSwitchDuringReview(ctx)) return;
     const opts: ModeSwitchOptions = { quiet: true };
     if (workflowMode === null) await setPlanMode(ctx, opts);
     else if (workflowMode === "plan") await setBuildMode(ctx, opts);
@@ -3124,8 +3233,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     planPath: string,
   ) {
+    // Defense in depth: the inline/browser approve paths only run after the
+    // gated review resolves, but a stale approve must never switch tools while
+    // a round or pause still owns the turn.
+    if (blockModeSwitchDuringReview(ctx)) return;
     workflowMode = "build";
     syncLegacyFlags();
+    // The plan is being handed to Build; this Plan cycle cannot hand off again.
+    resetPlanRunProvenance();
+    clearPendingHandoffDecision();
     // Approve path: Plan mode is off in favour of Build, but the reviewer
     // session stays warm — a landing review must not rewrite the plan the
     // user just approved (step 10).
@@ -3166,6 +3282,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     const ctx = getActiveCtx();
     if (!ctx) return;
     if (workflowMode !== "plan") return;
+    // A stale browser approve while a review runs must not clear the pending
+    // decision or send the execute messages: the plan is still being audited.
+    if (blockModeSwitchDuringReview(ctx as any)) return;
+    // No prompt means no decision to consume. A fresh prompt/mode switch
+    // clears this, so an old browser tab cannot approve the previous plan.
+    if (!awaitingDecision) return;
     // Resolve plan path (plannotator gives cwd + relative path)
     let resolvedPlan = planFilePath;
     try {
@@ -3180,6 +3302,35 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
+    // Correlate the event with the plan the current handoff prompt showed.
+    // A stale browser tab must not approve an older plan after a new task.
+    try {
+      if (
+        !pendingHandoffPlanPath ||
+        path.resolve(resolvedPlan) !== path.resolve(pendingHandoffPlanPath)
+      ) {
+        ctx.ui.notify(
+          "Ignoring a stale browser approval from a previous plan.",
+          "info",
+        );
+        return;
+      }
+    } catch (_e) {
+      void _e;
+      if (!pendingHandoffPlanPath || resolvedPlan !== pendingHandoffPlanPath)
+        return;
+    }
+    if (
+      planContent &&
+      pendingHandoffPlanHash &&
+      planHash(planContent) !== pendingHandoffPlanHash
+    ) {
+      ctx.ui.notify(
+        "Ignoring a stale browser approval — the plan content changed.",
+        "info",
+      );
+      return;
+    }
     // Ensure file exists (fallback write if agent only gave content)
     try {
       if (!fs.existsSync(resolvedPlan) && planContent) {
@@ -3189,9 +3340,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
-    awaitingDecision = false;
-    lastHandoffAt = undefined;
-    lastReviewId = null;
+    clearPendingHandoffDecision();
     void enterBuildModeFromPlan(ctx as any, resolvedPlan)
       .then(() => updateStatus(ctx as any))
       .catch(() => {
@@ -3239,9 +3388,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
   function handlePlannotatorDeny(feedback: string) {
     const ctx = getActiveCtx();
     if (!ctx) return;
-    awaitingDecision = false;
-    lastHandoffAt = undefined;
-    lastReviewId = null;
+    // Not a mode transition, but while a review owns the turn every browser
+    // decision is stale: injecting feedback here would mutate the plan under
+    // the reviewer. A legitimate deny only arrives after the gate resolves.
+    if (blockModeSwitchDuringReview(ctx as any)) return;
+    if (!awaitingDecision) return;
+    clearPendingHandoffDecision();
     // Feedback cycle: the next plan revision gets a fresh review round, and the
     // outstanding findings are carried forward so the reviewer can confirm they
     // were actually addressed rather than re-raising them.
@@ -3302,7 +3454,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
       bus.on(PLANNOTATOR_REVIEW_RESULT, (event: any) => {
         try {
           if (!event || typeof event.reviewId !== "string") return;
-          if (lastReviewId && event.reviewId !== lastReviewId) return;
+          // Strict correlation: a review result without the current handoff's
+          // review id is stale (e.g. an old browser tab after a new prompt).
+          if (!lastReviewId || event.reviewId !== lastReviewId) return;
           if (event.approved) {
             // For review-result we need to resolve planPath from currentPlanFile or lastReviewId
             const planPath = currentPlanFile || lastReviewId || "";
@@ -6050,6 +6204,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         Type.String({ description: "Working directory override" }),
       ),
     }),
+    // eslint-disable-next-line complexity, max-params -- Pi's fixed tool execute signature; pre-existing explore fan-out
+    // pi-lens-ignore: long-parameter-list -- Pi's fixed tool execute signature
     async execute(_id, params, signal, onUpdate, ctx) {
       const cwd = (params.cwd as string | undefined) ?? ctx.cwd;
       const agents = discoverAgents(cwd);
@@ -6133,7 +6289,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
       // concurrency 4
       const MAX_CONC = 4;
-      const results: any[] = new Array(jobs.length);
+      const results: any[] = Array.from({ length: jobs.length });
       let next = 0;
       const workers = Array.from(
         { length: Math.min(MAX_CONC, jobs.length) },
@@ -7371,6 +7527,13 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
       persistState();
     }
+    // A restored/forked session never inherits handoff eligibility or a
+    // pending browser correlation. The persisted awaitingDecision recovery
+    // above is kept for a recent modal; the first fresh prompt supersedes it.
+    resetPlanRunProvenance();
+    pendingHandoffPlanPath = null;
+    pendingHandoffPlanHash = null;
+    lastReviewId = null;
     currentSessionCtx = ctx as any;
     // Register plannotator bridge (idempotent) and detect presence
     ensurePlannotatorListeners();
@@ -7422,11 +7585,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     }
     activeSubagents.clear();
-    // Ensure awaitingDecision does not persist stale across restart
-    if (awaitingDecision) {
-      awaitingDecision = false;
-      lastHandoffAt = undefined;
-      lastReviewId = null;
+    // Ensure a handoff decision/provenance does not persist stale across restart
+    const clearedAtShutdown = clearPendingHandoffDecision();
+    resetPlanRunProvenance();
+    if (clearedAtShutdown) {
       try {
         persistState();
       } catch (_e) {
@@ -8433,17 +8595,20 @@ export default function workflowExtension(pi: ExtensionAPI) {
     turnsSinceLastReminder = 0;
     mutatedSinceLastTodoWrite = false;
     footerInjectedThisTurn = false;
-    // Stale handoff reset: fresh user prompt means previous gate was dismissed/crashed
+    // A fresh user prompt starts a new handoff/provenance run. It also
+    // supersedes any pending browser/inline decision immediately: the user
+    // moved on, so a stale tab must not approve the previous plan. Follow-up
+    // runs keep the current run's provenance.
     try {
       const fw =
         (event as any).followUp === true ||
         (event as any).deliverAs === "followUp";
-      if (awaitingDecision && !fw) {
-        // If user sent a new prompt while gate stale, free it so next agent_end can show again
+      if (!fw) {
         const age = lastHandoffAt ? Date.now() - lastHandoffAt : Infinity;
-        if (age > 5_000) {
-          awaitingDecision = false;
-          lastHandoffAt = undefined;
+        const cleared = clearPendingHandoffDecision();
+        resetPlanRunProvenance();
+        handoffEligibleThisRun = workflowMode === "plan";
+        if (cleared) {
           persistState();
           try {
             pi.appendEntry("workflow-handoff-reset-before-start", {
@@ -8622,6 +8787,43 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   // Plan file detection + full render + decision gate
   let lastPlanWritePath: string | null = null;
+  /** This user run started in Plan mode; a Build-originated run never hands off. */
+  let handoffEligibleThisRun = false;
+  /** This run wrote/edited a plan file under .pi/plans/. */
+  let planWrittenThisRun = false;
+  /** Absolute path of this run's last plan write. */
+  let planWritePathThisRun: string | null = null;
+  /** Plan path/hash the currently rendered handoff prompt belongs to. */
+  let pendingHandoffPlanPath: string | null = null;
+  let pendingHandoffPlanHash: string | null = null;
+
+  /** Clear per-run handoff provenance (fresh prompt / mode switch / session boundary). */
+  function resetPlanRunProvenance(): void {
+    handoffEligibleThisRun = false;
+    planWrittenThisRun = false;
+    planWritePathThisRun = null;
+    lastPlanWritePath = null;
+  }
+
+  /**
+   * Drop a pending browser/inline handoff decision. A fresh prompt or a mode
+   * switch supersedes it; stale browser events must not approve the old plan.
+   * Returns true when persisted state changed so the caller can persist once.
+   */
+  function clearPendingHandoffDecision(): boolean {
+    const changed =
+      awaitingDecision === true ||
+      lastHandoffAt !== undefined ||
+      lastReviewId !== null ||
+      pendingHandoffPlanPath !== null ||
+      pendingHandoffPlanHash !== null;
+    awaitingDecision = false;
+    lastHandoffAt = undefined;
+    lastReviewId = null;
+    pendingHandoffPlanPath = null;
+    pendingHandoffPlanHash = null;
+    return changed;
+  }
 
   // Passive todo footer: first successful mutating tool result of the turn.
   // (Separate handler so it can patch content without short-circuiting the
@@ -8681,9 +8883,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
             ? String(p)
             : path.join(cwd2, String(p));
           lastPlanWritePath = abs;
+          // Per-run provenance: only a write in THIS run may authorize a
+          // handoff. `lastPlanWritePath` alone is session-lifetime stale.
+          planWritePathThisRun = abs;
+          planWrittenThisRun = true;
         } catch (_e) {
           void _e;
           lastPlanWritePath = String(p);
+          planWritePathThisRun = String(p);
+          planWrittenThisRun = true;
         }
         try {
           pi.appendEntry("workflow-handoff-resolve", {
@@ -8735,6 +8943,35 @@ export default function workflowExtension(pi: ExtensionAPI) {
       }
     }
     const runHandoff = async () => {
+      // Per-run handoff gate (plan 2026-10-25 follow-up): a Plan-mode run
+      // that wrote no plan this run must not reconcile, review, or hand off
+      // an older plan. This runs before the reviewer prefetch so a new task
+      // cannot even boot a reviewer on stale state. Build mode keeps its own
+      // completion branch below.
+      if (workflowMode === "plan" && !planWrittenThisRun) {
+        const cwd = (ctx as any)?.cwd ?? process.cwd();
+        const found =
+          planWritePathThisRun ??
+          findPlanWritePathInMessages((event as any).messages ?? [], cwd);
+        if (found) {
+          planWritePathThisRun = path.isAbsolute(found)
+            ? found
+            : path.join(cwd, found);
+          lastPlanWritePath = planWritePathThisRun;
+          planWrittenThisRun = true;
+        }
+      }
+      if (workflowMode === "plan") {
+        const eligible = shouldHandoffPlan({
+          mode: workflowMode,
+          runStartedInPlan: handoffEligibleThisRun,
+          planWrittenThisRun,
+        });
+        if (!eligible) {
+          if (!planWrittenThisRun) clearPendingHandoffDecision();
+          return;
+        }
+      }
       // Step 10 — prefetch: boot the reviewer session while the branch scan
       // and todo reconciliation below run, so the SDK import and provider
       // seeding overlap handoff work instead of blocking the review kickoff.
@@ -8847,29 +9084,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const lastAssistant = [...(event.messages as any[])]
         .reverse()
         .find((m) => m.role === "assistant" && Array.isArray(m.content));
-      let planCandidate: string | undefined =
-        lastPlanWritePath ?? currentPlanFile;
-      if (!planCandidate) {
-        try {
-          const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
-          for (let i = branch.length - 1; i >= 0; i--) {
-            const e: any = branch[i];
-            const cand =
-              e?.data?.planFile ||
-              e?.data?.planPath ||
-              e?.input?.path ||
-              e?.input?.file_path ||
-              "";
-            const s = String(cand).toLowerCase();
-            if (s.includes("plans/") || s.includes(".pi/plans")) {
-              planCandidate = cand;
-              break;
-            }
-          }
-        } catch (_e) {
-          void _e;
-        }
-      }
+      // The current run's write is the only authoritative plan source. Old
+      // `currentPlanFile`/`lastPlanWritePath` values and session-branch scans
+      // are session-lifetime state and must never reach a new task's handoff.
+      const planCandidate: string | undefined =
+        planWritePathThisRun ?? undefined;
+      if (!planCandidate) return; // the per-run gate above should have caught this
       let planExtracted: TodoItem[] = [];
       let planAbs: string | undefined;
       let planTextForReconcile = "";
@@ -8882,7 +9102,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
           planAbs = abs;
           planTextForReconcile = planText;
           planExtracted = extractPlanStepsFromMarkdown(planText);
-          if (!lastPlanWritePath) lastPlanWritePath = abs;
         } catch (_e) {
           void _e;
         }
@@ -8891,18 +9110,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
         planAbs && planTextForReconcile
           ? planReconcileKey(planAbs, planTextForReconcile)
           : undefined;
+      const samePlan = (() => {
+        try {
+          return (
+            !!todoPlanPath &&
+            !!planCandidate &&
+            path.resolve(todoPlanPath) === path.resolve(planCandidate)
+          );
+        } catch {
+          return todoPlanPath === planCandidate;
+        }
+      })();
       if (planExtracted.length > 0) {
-        const samePlan = (() => {
-          try {
-            return (
-              !!todoPlanPath &&
-              !!planCandidate &&
-              path.resolve(todoPlanPath) === path.resolve(planCandidate)
-            );
-          } catch {
-            return todoPlanPath === planCandidate;
-          }
-        })();
         if (samePlan) {
           // Skip when the earlier all-modes reconciliation already merged this
           // exact plan content; a `- [x]` tick changes the key and re-merges.
@@ -8914,6 +9133,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
           todoItems = ensureTodoLabels(planExtracted);
           if (planCandidate) todoPlanPath = planCandidate;
         }
+      } else if (!samePlan) {
+        // A new plan file with no parsable steps must not inherit the previous
+        // task's todos; the synthesis block below fills a single title step.
+        todoItems = [];
+        if (planCandidate) todoPlanPath = planCandidate;
       } else if (todoItems.length === 0 && lastAssistant) {
         try {
           const chat = extractTodoItems(
@@ -8924,82 +9148,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
           void _e;
         }
       }
-      // Broaden planPath recovery: scan branch for any plan file if lastPlanWritePath is still null
-      if (todoItems.length === 0 && !lastPlanWritePath) {
-        try {
-          const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
-          for (let i = branch.length - 1; i >= 0; i--) {
-            const e: any = branch[i];
-            const cand =
-              e?.data?.planFile ||
-              e?.data?.planPath ||
-              e?.data?.path ||
-              e?.message?.toolName === "write" ||
-              e?.message?.toolName === "edit"
-                ? e?.input?.path || e?.input?.file_path || ""
-                : "";
-            const s = String(cand).toLowerCase();
-            if (s.includes("plans/") || s.includes(".pi/plans")) {
-              // try to resolve that entry as plan source
-              try {
-                const text = fs.readFileSync(
-                  path.isAbsolute(cand)
-                    ? cand
-                    : path.join((ctx as any).cwd, cand),
-                  "utf8",
-                );
-                const fromFile = extractPlanStepsFromMarkdown(text);
-                if (fromFile.length > 0) {
-                  todoItems = fromFile;
-                  lastPlanWritePath = cand;
-                  break;
-                }
-              } catch (_e) {
-                void _e;
-              }
-            }
-            // Also check custom entries that store planFile
-            if (e?.customType === "workflow" && e?.data?.planFile) {
-              try {
-                const text = fs.readFileSync(e.data.planFile, "utf8");
-                const fromFile = extractPlanStepsFromMarkdown(text);
-                if (fromFile.length > 0) {
-                  todoItems = fromFile;
-                  lastPlanWritePath = e.data.planFile;
-                  break;
-                }
-              } catch (_e) {
-                void _e;
-              }
-            }
-          }
-        } catch (_e) {
-          void _e;
-        }
-      }
-      // If still zero but a plan file exists, synthesize a single todo from its title so the handoff still appears
+      // No session-branch recovery: only this run's plan write is eligible.
+      // If still zero but the run's plan file exists, synthesize a single todo
+      // from its title so the handoff still appears.
       let _synthesizedFromTitle = false;
       void _synthesizedFromTitle;
       if (todoItems.length === 0) {
         // Try to synthesize from plan file title or last assistant text
         let synthText: string | undefined;
         // Prefer reading the resolved plan file if we can find one
-        const candPlan =
-          (currentPlanFile && fs.existsSync(currentPlanFile)
-            ? currentPlanFile
-            : null) ||
-          (lastPlanWritePath &&
-            (() => {
-              try {
-                const p = path.isAbsolute(lastPlanWritePath)
-                  ? lastPlanWritePath
-                  : path.join((ctx as any).cwd, lastPlanWritePath);
-                return fs.existsSync(p) ? p : null;
-              } catch {
-                return null;
-              }
-            })()) ||
-          null;
+        const candPlan = planAbs;
         if (candPlan) {
           try {
             const md = fs.readFileSync(candPlan, "utf8");
@@ -9041,20 +9199,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Try to find plan file path
-      let planPath = currentPlanFile;
-      if (!planPath && lastPlanWritePath) planPath = lastPlanWritePath;
-      if (planPath && !path.isAbsolute(planPath))
+      // The run write is the handoff path; never prefer an older currentPlanFile.
+      let planPath = planWritePathThisRun;
+      if (!planPath) return;
+      if (!path.isAbsolute(planPath))
         planPath = path.join((ctx as any).cwd, planPath);
-      if (!planPath) {
-        // synthesize path for display if file not yet written but plan text exists
-        const slug = slugify(
-          (event.messages.find((m: any) => m.role === "user") as any)
-            ?.content?.[0]?.text || "plan",
-        );
-        const fname = `${getUtcDatePrefix()}-${slug}.md`;
-        planPath = path.join((ctx as any).cwd, CONFIG_DIR_NAME, "plans", fname);
-      }
       currentPlanFile = planPath;
       persistState();
 
@@ -9071,64 +9220,30 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         return null;
       };
-      // Priority: lastPlanWritePath (most recent write) -> current planPath -> branch scan -> assistant draft
-      const fromLastWrite = tryRead(lastPlanWritePath);
-      if (fromLastWrite) {
-        planTextForRender = fromLastWrite;
-        planSource = "lastPlanWritePath";
-      } else {
-        const fromPlanPath = tryRead(planPath);
-        if (fromPlanPath) {
-          planTextForRender = fromPlanPath;
-          planSource = "planPath";
-        } else {
-          // Branch scan for any .pi/plans write that we missed (e.g. file_path alias, timing)
+      // Current-run write only: a stale file can never be rendered for a new
+      // task. The assistant draft is acceptable only because the run wrote a
+      // plan (the per-run gate above), so it is current-run text.
+      const fromRunWrite = tryRead(planWritePathThisRun);
+      if (fromRunWrite) {
+        planTextForRender = fromRunWrite;
+        planSource = "run-write";
+      } else if (lastAssistant) {
+        planTextForRender = getTextContent(
+          lastAssistant as AssistantMessage,
+        );
+        if (planTextForRender) {
+          planSource = "assistant-draft";
           try {
-            const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
-            for (let i = branch.length - 1; i >= 0; i--) {
-              const e: any = branch[i];
-              const cand: string =
-                e?.input?.path ||
-                e?.input?.file_path ||
-                e?.data?.planFile ||
-                "";
-              const s = String(cand).toLowerCase();
-              if (s.includes("plans/") || s.includes(".pi/plans")) {
-                const txt = tryRead(cand);
-                if (txt) {
-                  const steps = extractPlanStepsFromMarkdown(txt);
-                  if (steps.length > 0 || txt.length > 200) {
-                    planTextForRender = txt;
-                    planSource = "branch-scan";
-                    if (!lastPlanWritePath)
-                      lastPlanWritePath = path.isAbsolute(cand)
-                        ? cand
-                        : path.join((ctx as any).cwd, cand);
-                    break;
-                  }
-                }
-              }
-            }
+            ctx.ui.notify(
+              "Using in-memory draft — plan file not yet persisted",
+              "info",
+            );
           } catch (_e) {
             void _e;
           }
-          if (!planTextForRender && lastAssistant) {
-            planTextForRender = getTextContent(
-              lastAssistant as AssistantMessage,
-            );
-            if (planTextForRender) planSource = "assistant-draft";
-            try {
-              if (planTextForRender)
-                ctx.ui.notify(
-                  "Using in-memory draft — plan file not yet persisted",
-                  "info",
-                );
-            } catch (_e) {
-              void _e;
-            }
-          }
         }
       }
+      if (!planTextForRender) return;
       try {
         pi.appendEntry("workflow-handoff-resolve", {
           at: Date.now(),
@@ -9251,6 +9366,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         if (plannotatorActive) {
           awaitingDecision = true;
           lastHandoffAt = Date.now();
+          pendingHandoffPlanPath = planPath;
+          pendingHandoffPlanHash = planHash(planTextForRender);
           persistState();
           try {
             const bus: any = (pi as any).events;
@@ -9352,14 +9469,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
             }
           }
           // Browser branch failed — clear gate so inline can show
-          awaitingDecision = false;
-          lastHandoffAt = undefined;
-          lastReviewId = null;
+          clearPendingHandoffDecision();
           persistState();
           // fall through to inline handoff below
         }
         awaitingDecision = true;
         lastHandoffAt = Date.now();
+        pendingHandoffPlanPath = planPath;
+        pendingHandoffPlanHash = planHash(planTextForRender);
         persistState();
         const handoffStart = Date.now();
         try {
@@ -9706,8 +9823,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
             ctx.ui.notify("Dismissed. Type your follow-up.", "info");
           }
         } finally {
-          awaitingDecision = false;
-          lastHandoffAt = undefined;
+          clearPendingHandoffDecision();
           persistState();
           try {
             (ctx as any).ui?.requestRender?.();
@@ -9736,8 +9852,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         } catch (_e) {
           void _e;
         }
-        awaitingDecision = false;
-        lastHandoffAt = undefined;
+        clearPendingHandoffDecision();
         persistState();
       } else if (awaitingDecision) {
         // Stale guard — if plannotator review is still pending, don't reset
@@ -9796,9 +9911,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
           }
         }
         if (age > 60_000) {
-          awaitingDecision = false;
-          lastHandoffAt = undefined;
-          lastReviewId = null;
+          clearPendingHandoffDecision();
           persistState();
           try {
             ctx.ui.notify("Recovered stale handoff gate — retrying", "info");
@@ -9851,6 +9964,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
     const bus: any = (pi as any).events;
     if (bus && typeof bus.on === "function") {
       bus.on("pi-code:plan-mode", (state: any) => {
+        // An external plan-mode change is still a mode transition: while a
+        // review owns the turn it must not swap the tool set or suspend the
+        // reviewer. Ignore it (best-effort; the external UI can retry later).
+        if (reviewModeLockKindNow()) {
+          notifyReview(
+            "Mode switching is locked until the review resolves — ignoring the external plan-mode change.",
+            "info",
+          );
+          return;
+        }
         // Mirror pi-code plan-mode into workflow's plan mode to avoid double toggles
         const isPlan = workflowMode === "plan";
         if (

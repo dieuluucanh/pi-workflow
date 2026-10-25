@@ -53,7 +53,12 @@ import {
   resolveReviewPrompt,
   reviewElapsedMs,
   reviewFooterSegment,
+  reviewGatePhaseOnResume,
   reviewIsActive,
+  reviewModeLockFooter,
+  reviewModeLockKind,
+  reviewModeLockNotice,
+  reviewModeLockStatusLine,
   reviewPhaseLabel,
   sanitizeFindings,
   shouldPauseReviewOnEscape,
@@ -1678,6 +1683,73 @@ test("reviewFooterSegment composes the footer review state", () => {
     "🔍 review paused — /review-resume to continue",
     "the paused form wins over the live phase",
   );
+});
+
+// ══ Mode-switch lock (plan 2026-10-25) ═══════════════════════════════
+
+test("reviewModeLockKind locks running and paused reviews only", () => {
+  assert.equal(reviewModeLockKind({}), undefined);
+  assert.equal(
+    reviewModeLockKind({ gatePhase: "idle" }),
+    undefined,
+    "a resolved/post-review handoff is intentionally unlocked",
+  );
+  assert.equal(reviewModeLockKind({ roundInFlight: true }), "running");
+  assert.equal(reviewModeLockKind({ roundActive: true }), "running");
+  assert.equal(
+    reviewModeLockKind({ gatePhase: "auditing" }),
+    "running",
+    "the gated handoff audit still owns the turn",
+  );
+  assert.equal(reviewModeLockKind({ paused: true }), "paused");
+  assert.equal(reviewModeLockKind({ gatePhase: "paused" }), "paused");
+  assert.equal(
+    reviewModeLockKind({ roundActive: true, paused: true }),
+    "paused",
+    "a pause wins while the abort is still landing",
+  );
+  assert.equal(
+    reviewModeLockKind({ roundActive: true, gatePhase: "paused" }),
+    "running",
+    "a resumed round must not be masked by a stale paused gate phase",
+  );
+});
+
+test("reviewGatePhaseOnResume makes a gated pause auditing again", () => {
+  assert.equal(reviewGatePhaseOnResume("paused"), "auditing");
+  assert.equal(reviewGatePhaseOnResume("auditing"), "auditing");
+  assert.equal(reviewGatePhaseOnResume("idle"), "idle");
+});
+
+test("reviewModeLockNotice names only the allowed review exits", () => {
+  const running = reviewModeLockNotice("running");
+  for (const s of [
+    "ESC",
+    "/review-pause",
+    "/review-resume",
+    "/review-abort",
+    "/review-mode off",
+  ]) {
+    assert.ok(running.includes(s), `running notice names ${s}`);
+  }
+  const paused = reviewModeLockNotice("paused");
+  for (const s of ["/review-resume", "/review-abort", "/review-mode off"]) {
+    assert.ok(paused.includes(s), `paused notice names ${s}`);
+  }
+  assert.ok(!paused.includes("ESC"), "ESC is a pause, not a resume");
+});
+
+test("reviewModeLockFooter/StatusLine surface the lock", () => {
+  assert.equal(reviewModeLockFooter(undefined), "");
+  assert.equal(reviewModeLockFooter("running"), "🔒 modes locked");
+  assert.equal(reviewModeLockFooter("paused"), "🔒 modes locked");
+  assert.ok(
+    reviewModeLockStatusLine("paused").includes(
+      "mode switching stays locked",
+    ),
+  );
+  assert.ok(reviewModeLockStatusLine("running").includes("mode switching is locked"));
+  assert.equal(reviewModeLockStatusLine(undefined), "");
 });
 
 // ══ Step 6: child session isolation ═══════════════════════════════════

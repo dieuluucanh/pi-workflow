@@ -1251,6 +1251,85 @@ export function reviewFooterSegment(
   return reviewStateSummary(state);
 }
 
+// ── Mode-switch lock (plan 2026-10-25) ───────────────────────────────
+//
+// While a review owns the turn, mode transitions are refused: switching to
+// Build mid-review would swap the tool set and suspend the reviewer, and
+// switching to Default would leave the reviewer running outside Plan Mode.
+// The lock is a PROJECTION over existing state (never persisted), so every
+// existing exit — land, fail, pause/resume, abort, suspend, teardown —
+// releases it automatically. The post-review handoff prompt is deliberately
+// NOT part of the lock: the independent reviewer has already finished.
+
+/** Which mode-switch lock is active, if any. Derived, never persisted. */
+export type ReviewModeLockKind = "running" | "paused";
+
+export interface ReviewModeLockInput {
+  /** `activeReview !== undefined` — set before the child session boots. */
+  roundInFlight?: boolean;
+  /** `reviewRuntime.isRoundActive()` at call time. */
+  roundActive?: boolean;
+  /** `pausedReview !== undefined`. */
+  paused?: boolean;
+  /** The gated handoff phase; `"auditing"` counts as running. */
+  gatePhase?: ReviewHandoffPhase;
+}
+
+/**
+ * Decide whether a mode transition must be refused.
+ *
+ * A real pause snapshot wins over a round that is still aborting: ESC has
+ * already been pressed, so the notice should tell the user how to resume.
+ * A live round wins over a stale gate phase: `/review-resume` clears the
+ * snapshot and starts the round before the parked handoff resets its phase,
+ * so `gatePhase === "paused"` must not mask the running reviewer. A bare
+ * paused gate (no round, no snapshot) is the fallback for the small window
+ * between an abort and the handoff continuation.
+ */
+export function reviewModeLockKind(
+  input: ReviewModeLockInput,
+): ReviewModeLockKind | undefined {
+  if (input.paused === true) return "paused";
+  if (input.roundInFlight === true || input.roundActive === true) {
+    return "running";
+  }
+  if (input.gatePhase === "paused") return "paused";
+  if (input.gatePhase === "auditing") return "running";
+  return undefined;
+}
+
+/**
+ * Phase to use when `/review-resume` starts a paused gated round.
+ * A gated pause becomes an active audit again; a manual review (idle gate)
+ * is unchanged. This keeps a second ESC able to demote auditing → paused.
+ */
+export function reviewGatePhaseOnResume(
+  phase: ReviewHandoffPhase,
+): ReviewHandoffPhase {
+  return phase === "paused" ? "auditing" : phase;
+}
+
+/** One short notice for a blocked mode transition. */
+export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
+  return kind === "paused"
+    ? "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop, /review-mode off to end review."
+    : "Review is running — mode switching is locked. ESC or /review-pause to pause, /review-resume to continue, /review-abort to stop, /review-mode off to end review.";
+}
+
+/** Footer marker appended to the single `"workflow"` status while locked. */
+export function reviewModeLockFooter(
+  kind: ReviewModeLockKind | undefined,
+): string {
+  return kind ? "🔒 modes locked" : "";
+}
+
+/** `/review-status` row describing the lock and its allowed exits. */
+export function reviewModeLockStatusLine(
+  kind: ReviewModeLockKind | undefined,
+): string {
+  return kind ? `  lock    : ${kind} — ${reviewModeLockNotice(kind)}` : "";
+}
+
 // ── Step 16: reviewer transcript stream ──────────────────────────────
 
 /** Default cap on retained pane lines (the panes are a rolling window). */

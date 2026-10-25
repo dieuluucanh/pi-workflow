@@ -30,6 +30,8 @@ import {
   buildTodoFooter,
   formatAmbiguity,
   shouldRemind,
+  shouldHandoffPlan,
+  findPlanWritePathInMessages,
   TURNS_SINCE_WRITE,
   type TodoItem,
   type TodoUpdateEntry,
@@ -866,4 +868,122 @@ test("refs are always 1..N and unique after merge/update", () => {
   items = mergeTodoItems(items, plan).items;
   assertCompact(items);
   assert.equal(items.length, 4); // A, B, C + preserved ad-hoc agent item
+});
+
+// ══ Handoff provenance (plan 2026-10-25 follow-up) ═══════════════════
+
+test("shouldHandoffPlan requires Plan + started in Plan + a plan write", () => {
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "plan",
+      runStartedInPlan: true,
+      planWrittenThisRun: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "build",
+      runStartedInPlan: true,
+      planWrittenThisRun: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: null,
+      runStartedInPlan: true,
+      planWrittenThisRun: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "plan",
+      runStartedInPlan: false,
+      planWrittenThisRun: true,
+    }),
+    false,
+    "a Build-originated run that flipped to Plan never hands off",
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "plan",
+      runStartedInPlan: true,
+      planWrittenThisRun: false,
+    }),
+    false,
+    "an old plan file alone never hands off",
+  );
+});
+
+test("findPlanWritePathInMessages reads only the supplied (current) run", () => {
+  const cwd = "C:/repo";
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "write a plan" }] },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "write",
+          arguments: { path: ".pi/plans/old.md" },
+        },
+        {
+          type: "toolCall",
+          name: "read",
+          arguments: { path: ".pi/plans/ignored.md" },
+        },
+        {
+          type: "toolCall",
+          name: "edit",
+          arguments: { file_path: "C:\\repo\\.pi\\plans\\new.md" },
+        },
+        {
+          type: "toolCall",
+          name: "write",
+          arguments: { path: "src/app.ts" },
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "write",
+          arguments: { path: ".pi/plans/latest.md" },
+        },
+      ],
+    },
+  ];
+  assert.equal(
+    findPlanWritePathInMessages(messages, cwd),
+    ".pi/plans/latest.md",
+    "newest write wins",
+  );
+  assert.equal(
+    findPlanWritePathInMessages(
+      [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              name: "write",
+              arguments: { path: "src/app.ts" },
+            },
+          ],
+        },
+      ],
+      cwd,
+    ),
+    undefined,
+    "non-plan writes are ignored",
+  );
+  assert.equal(findPlanWritePathInMessages([], cwd), undefined);
+  assert.equal(
+    findPlanWritePathInMessages([{ role: "user", content: "junk" }], cwd),
+    undefined,
+  );
 });

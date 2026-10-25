@@ -931,6 +931,53 @@ export function isPlanWritePath(p: string, cwd: string): boolean {
   return norm.includes(".pi/plans/") || norm.startsWith(cwdNorm + "/.pi/plans");
 }
 
+/** Inputs for deciding whether this run may hand a plan off. */
+export interface PlanHandoffEligibility {
+  mode: "plan" | "build" | null;
+  /** The run started in Plan mode (not a Build turn that flipped to Plan). */
+  runStartedInPlan: boolean;
+  /** This run wrote/edited a file under `.pi/plans/`. */
+  planWrittenThisRun: boolean;
+}
+
+/**
+ * A handoff requires all three: the workflow is in Plan mode NOW, the run
+ * started in Plan mode, and the run actually wrote a plan. Session-lifetime
+ * plan files and old todos never authorize a handoff.
+ */
+export function shouldHandoffPlan(input: PlanHandoffEligibility): boolean {
+  return (
+    input.mode === "plan" &&
+    input.runStartedInPlan === true &&
+    input.planWrittenThisRun === true
+  );
+}
+
+/**
+ * Last `write`/`edit` tool call in THIS RUN whose path is under `.pi/plans/`.
+ * `messages` must be the `agent_end` run messages (the run's `newMessages`),
+ * never the session history — scanning history would resurrect old plans.
+ * Returns the path as supplied by the tool call; the caller resolves it.
+ */
+export function findPlanWritePathInMessages(
+  messages: readonly unknown[],
+  cwd: string,
+): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as any;
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (let j = m.content.length - 1; j >= 0; j--) {
+      const b = m.content[j];
+      if (b?.type !== "toolCall") continue;
+      if (b.name !== "write" && b.name !== "edit") continue;
+      const p = b.arguments?.path ?? b.arguments?.file_path;
+      if (typeof p === "string" && p && isPlanWritePath(p, cwd)) return p;
+    }
+  }
+  return undefined;
+}
+
 // ── Plan date helpers (UTC) ──────────────────────────────────────
 
 /** Return YYYY-MM-DD in UTC for the given date (default: now). Uses toISOString slice, deterministic across locales. */

@@ -21,8 +21,8 @@
           "thinking": "high"
         },
         "reviewer": {
-          "provider": "synthetic",
-          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
           "thinking": "xhigh"
         }
       },
@@ -52,8 +52,8 @@
           "thinking": "high"
         },
         "reviewer": {
-          "provider": "opencode-go",
-          "id": "deepseek-v4.1-flash",
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
           "thinking": "xhigh"
         }
       },
