@@ -4,7 +4,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 
 ## Features
 
-- **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; tab + `CtrlAlt+p` shortcuts, `--workflow-plan` flag
+- **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; **Tab** completes the highlighted suggestion while a list is open and otherwise cycles Plan → Build → Default (`Ctrl+Alt+P` always cycles), `--workflow-plan` flag
 - **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, rewrites it, streams its work into the main transcript, and hands the result to Plannotator. Off by default; see [Review Mode](#review-mode) below.
 - **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, and an inline `↳ Your answer:` editor. Rendered as a bounded bottom-sheet overlay: a short question and the choices stay pinned, while a long question or the optional `context` body (e.g. a proposed commit message) scrolls with the wheel, `PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The freeform editor takes the pane while typing.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
@@ -46,7 +46,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
 
-Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a review round or a paused review owns the turn; see [Controlling a running review](#controlling-a-running-review).
+Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a review round or a paused review owns the turn (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review).
 
 ## Model Profiles
 
@@ -201,7 +201,9 @@ reviewer `opencode-go/muse-spark-1.3-contributor` · verdict **revise**
 
 Because the two agents run sequentially — Plan Mode finishes before the reviewer starts — their transcripts can never interleave, and there is no overlay or second pane to navigate. Everything shows up in Pi's normal transcript.
 
-Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress): switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line. The one exception is a live review: mode switching is refused with a notice (see [Controlling a running review](#controlling-a-running-review)). Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
+Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress): switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line.
+
+**Tab precedence.** While the input's suggestion list is open (commands, `@files`, `#documents`), **Tab** applies the highlighted item and leaves the mode alone. With no list open, the workflow's `tab` shortcut cycles Plan → Build → Default. `Ctrl+Alt+P` always cycles. This matches Pi Desktop; it requires `tui.input.tab` to stay bound (the default is `tab`), because a disabled binding leaves nothing for the editor to accept. The one exception is a live review: mode switching is refused with a notice (see [Controlling a running review](#controlling-a-running-review)). Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
 
 | Entry | Color | Meaning |
 | --- | --- | --- |
@@ -230,7 +232,7 @@ The handoff **waits for the reviewer**: no browser prompt or inline choice rende
 
 A handoff opens **only when the current Plan run writes or edits a `.pi/plans/` file**. Switching Build → Plan keeps the previous plan and todos as reference, but they cannot be handed off again until the new run writes a plan. A fresh prompt also supersedes any pending browser/inline handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
 
-- **Mode switching is locked** from the moment a review round starts (including the cold boot) until it lands, fails, or is aborted, and for the whole paused state. `Tab`, `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. `/review-abort` and `/review-mode off` end the lock; the post-review handoff prompt is intentionally unlocked because the independent reviewer has finished.
+- **Mode switching is locked** from the moment a review round starts (including the cold boot) until it lands, fails, or is aborted, and for the whole paused state. `Tab` (when no suggestion list is open), `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. `/review-abort` and `/review-mode off` end the lock; the post-review handoff prompt is intentionally unlocked because the independent reviewer has finished.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. One long-lived terminal listener maps it to `/review-pause` semantics (warm session kept) and stays registered through the paused window: a second ESC while a gated review is paused is swallowed with a hint instead of aborting the parked plan turn (that abort used to poison the turn's signal and stall every `/review-resume`). With no review owning the turn it passes ESC through, so the editor, questionnaire and handoff selector keep it. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.
 - `/review-pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
 - `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result. A resumed round is **running** again — the notice/footer return to the running form, and a second ESC can pause it. It runs on a fresh controller and deliberately does **not** inherit the parked turn's signal, so an interrupted parent turn cannot instantly re-abort every resume; ESC, `/review-pause` and `/review-abort` are its stop paths. Its notice names the real outcome (rewritten, unchanged, paused, aborted, skipped or fallback).

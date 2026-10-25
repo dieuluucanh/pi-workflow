@@ -4,6 +4,33 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Tab applies the highlighted suggestion instead of cycling modes (2026-10-25)
+
+The workflow registered a raw `tab` shortcut, and Pi's `CustomEditor` dispatches
+extension shortcuts **before** the editor. Tab was therefore swallowed even
+while a `/profile`-style suggestion list was visible, and
+`agent/keybindings.json` additionally disabled `tui.input.tab` entirely.
+
+The extension now installs a thin `CustomEditor` subclass through
+`ctx.ui.setEditorComponent()`. While `isShowingAutocomplete()` is true, Tab is
+given back to the editor so it applies the highlighted `/command`, `@file` or
+`#document`; with no list open the existing shortcut still cycles
+Plan → Build → Default, and `Ctrl+Alt+P` is unchanged. `tui.input.tab` is
+restored to `tab`, and a one-time warning points users who still disable it at
+the fix. The rule is menu-visibility-only, matching Pi Desktop; a `/command`
+whose list has not rendered yet still cycles.
+
+The wrapper preserves the default editor's top-border working spinner, seeds
+prompt history after the editor swap (including `/reload` and `/resume`), and
+expands large-paste markers before they can be submitted as literal
+`[paste #N …]` text. If another extension already installed a custom editor, the
+wrapper leaves it alone.
+
+Tests: 463 green (447 + 8 policy cases + 8 editor/history cases).
+`tab-policy.test.ts` covers the decision table (including the disabled binding
+and strict-parity race); `tab-editor.test.ts` covers the shortcut bypass,
+history helpers and embedded-status flag.
+
 ### Fixed — Long questionnaire content can no longer hide the choices (2026-10-25)
 
 `/commit` asked the agent to put the whole proposed commit message into the

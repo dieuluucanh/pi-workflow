@@ -20,7 +20,7 @@ Each extension is its own npm package (install just what you want):
 | `agent/extensions/server-logs/` | `@dieulc/server-logs` | Docker + systemd log inspection tools (remote SSH or local) |
 | `agent/extensions/browser-inspector/` | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP: console, network, screenshots (fresh browser or real session) |
 | `agent/settings.json` | — | Shared config: `packages`, theme, enabled models |
-| `agent/keybindings.json` | — | Disables `tui.input.tab` (autocomplete conflict) |
+| `agent/keybindings.json` | — | Keeps `tui.input.tab` bound to Tab; workflow completes while a suggestion list is open and cycles modes otherwise |
 | `agent/plannotator.json` | — | `planning` phase tool gate + status label |
 | `agent/agents/planner.md`, `scout.md` | — | Agent presets |
 | `scripts/` | — | `verify-packages.mjs` (pre-publish gate) + `release.mjs` (release tooling) |

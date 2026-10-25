@@ -20,6 +20,7 @@ import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
   CONFIG_DIR_NAME,
@@ -262,6 +263,7 @@ import {
   type ReviewLineBuffer,
   type ReviewModeBandData,
 } from "./review-ui.ts";
+import { seedPromptHistory, WorkflowTabEditor } from "./tab-editor.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -3591,7 +3593,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   ) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
-        "Already in Plan mode — read-only. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
+        "Already in Plan mode — read-only. Press Tab (when no suggestion list is open) to cycle: Plan → Build → Default. Or /build to switch to Build.",
         "info",
       );
       return;
@@ -3613,7 +3615,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab to cycle: Plan → Build → Default. Or /build to switch to Build.",
+        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab (when no suggestion list is open) to cycle: Plan → Build → Default. Or /build to switch to Build.",
         "info",
       );
     }
@@ -3641,7 +3643,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   ) {
     if (workflowMode === "build") {
       ctx.ui.notify(
-        "Already in Build mode — full access. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
+        "Already in Build mode — full access. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
         "info",
       );
       return;
@@ -3666,7 +3668,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     }
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Build mode — full access restored. Press Tab to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
+        "Build mode — full access restored. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
         "info",
       );
     }
@@ -3688,7 +3690,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
   ) {
     if (workflowMode === null) {
       ctx.ui.notify(
-        "Already in Default mode — no workflow. Press Tab or /plan to switch to Plan.",
+        "Already in Default mode — no workflow. Press Tab (when no suggestion list is open) or /plan to switch to Plan.",
         "info",
       );
       return;
@@ -3720,7 +3722,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     persistState();
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Default mode — workflow off, full access. Press Tab to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
+        "Default mode — workflow off, full access. Press Tab (when no suggestion list is open) to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
         "info",
       );
     }
@@ -4248,12 +4250,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
     void _e;
   }
 
-  // Tab to toggle plan/build (context-aware: not when overlay active) — single registration to avoid duplicate-conflict warning
+  // Tab cycles workflow modes (context-aware: not when an overlay is active).
+  // WorkflowTabEditor gives Tab back to autocomplete while a suggestion list is
+  // visible; this registration remains the no-list path. Single registration to
+  // avoid a duplicate-conflict warning.
   try {
     pi.registerShortcut(
       "tab" as any,
       {
-        description: "Toggle plan/build mode (Tab)",
+        description:
+          "Cycle workflow mode (Tab; completes when a suggestion list is open)",
         handler: async (ctx: any) => {
           if (overlayDepth > 0) return;
           cycleWorkflowMode(ctx as any);
@@ -7607,6 +7613,80 @@ export default function workflowExtension(pi: ExtensionAPI) {
     return { action: "continue" } as any;
   });
 
+  // ── Tab precedence (autocomplete vs. workflow mode cycle) ────────
+  // Pi's CustomEditor dispatches extension shortcuts before the editor, so the
+  // raw `tab` registration would otherwise swallow the key even while the
+  // suggestion list is visible. Install a thin CustomEditor subclass through the
+  // public API: it gives Tab back to autocomplete while a list is open and lets
+  // the existing shortcut cycle modes otherwise. See tab-editor.ts.
+  let warnedDisabledTab = false;
+
+  function ensureWorkflowTabEditor(ctx: ExtensionContext): void {
+    const ui = (ctx as any)?.ui;
+    if (typeof ui?.setEditorComponent !== "function") return;
+    try {
+      // Respect another extension's custom editor instead of clobbering it.
+      if (
+        typeof ui.getEditorComponent === "function" &&
+        ui.getEditorComponent()
+      ) {
+        return;
+      }
+
+      let editor: WorkflowTabEditor | undefined;
+      let keybindings: KeybindingsManager | undefined;
+      // Core copies getText() (which can still contain `[paste #N …]` markers)
+      // into an editor with an empty paste map. Capture the expanded draft first
+      // so a large paste survives the swap and submits as real content.
+      const expandedDraft =
+        typeof ui.getEditorText === "function"
+          ? ui.getEditorText()
+          : undefined;
+
+      ui.setEditorComponent((tui: any, theme: any, kb: any) => {
+        keybindings = kb;
+        editor = new WorkflowTabEditor(tui, theme, kb);
+        return editor;
+      });
+
+      if (editor && expandedDraft && /\[paste #\d+/.test(editor.getText())) {
+        editor.setText(expandedDraft);
+      }
+
+      if (
+        !warnedDisabledTab &&
+        keybindings?.getKeys("tui.input.tab")?.length === 0
+      ) {
+        warnedDisabledTab = true;
+        ui.notify?.(
+          "Workflow: Tab completion is disabled by keybindings.json (`tui.input.tab`: []). Tab can only cycle modes.",
+          "warning",
+        );
+      }
+
+      if (editor) {
+        // setCustomEditorComponent copies the text, not the prompt history. On a
+        // reload/switch the session is rendered before session_start, so seed the
+        // new editor from the context entries — unless the host already populated
+        // it (startup renders after bind), which the override flag detects.
+        const installed = editor;
+        const timer = setTimeout(() => {
+          if (installed.hasHostHistory()) return;
+          try {
+            const entries =
+              (ctx as any)?.sessionManager?.buildContextEntries?.() ?? [];
+            seedPromptHistory(installed, entries);
+          } catch (_e) {
+            void _e;
+          }
+        }, 0);
+        (timer as any).unref?.();
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
@@ -7971,6 +8051,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     pendingHandoffPlanHash = null;
     lastReviewId = null;
     currentSessionCtx = ctx as any;
+    // Give Tab back to autocomplete while a suggestion list is visible; the raw
+    // `tab` shortcut keeps cycling modes otherwise.
+    ensureWorkflowTabEditor(ctx as any);
     // Register plannotator bridge (idempotent) and detect presence
     ensurePlannotatorListeners();
     // Also detect via presence of plannotator package in settings
