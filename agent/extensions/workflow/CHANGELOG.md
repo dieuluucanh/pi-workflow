@@ -4,6 +4,43 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — The active profile no longer overrides your latest model choice (2026-10-25)
+
+A profile's Default-mode model was treated as live state and re-applied on every
+session start, so picking a model while a default profile was active only lasted
+for that session: the next one started on the profile's model again. `Profile.defaultModel`
+is now a **seed consumed on activation**; `workflow.modelDefault` is the single
+authority. Precedence is resolved once, in `resolveDefaultModeModel`:
+
+| Situation | Default-mode model |
+| --- | --- |
+| Resumed session with its own recorded model | that session's model |
+| Otherwise | `workflow.modelDefault` |
+| No record yet (older install) | the profile's `defaultModel` (legacy seed) |
+
+Picking a model never edits `profiles.json`; activating a profile later restores
+that profile's own model, because the latest choice wins. A **project-level**
+default (`<cwd>/.pi/settings.json` `defaultProvider`/`defaultModel`) is detected
+and left in place instead of being overridden — Pi merges that file over the
+global one, so the extension now agrees with Pi. Editing the already active
+profile's `default` tab also takes effect immediately, without "save & activate".
+
+### Added — Activating a profile makes it the default profile (2026-10-25)
+
+`workflow.defaultProfile` used to be written only by `/profile default`. Every
+explicit activation now writes it as well (`/profile use`, the picker's activate
+entry, "save & activate"), so the newest profile selection is the one a new
+session auto-activates; `/profile use none` clears it. The write targets the
+project settings file when that file already defines the key, else global. The
+key stays coherent for the rest of a profile's life: renaming the default
+profile rewrites it, and deleting it clears it instead of leaving a dangling
+name that made every new session warn. `/role list` and the `/profile` picker
+now show the whole "what starts next" answer — model, defining file, and the
+profile that will be activated.
+
+Tests: 391 green (379 + 11 resolution/project-default cases and 1 write-scope
+case).
+
 ### Added — The selected model becomes the default for the next session (2026-10-25)
 
 Picking a model used to last only for the current session unless you remembered

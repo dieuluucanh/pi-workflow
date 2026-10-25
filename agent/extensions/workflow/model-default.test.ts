@@ -23,7 +23,9 @@ import {
   formatPersistedModel,
   modelDefaultSettingPaths,
   modelDefaultWriteScope,
+  projectDefaultModel,
   readModelDefault,
+  resolveDefaultModeModel,
   sameModelRef,
   shouldApplyModelDefaultAtSessionStart,
   shouldPersistModelSelect,
@@ -499,6 +501,7 @@ test("describe: every reason has a phrase", () => {
     "reason-not-new",
     "subagent",
     "no-persisted",
+    "project-default",
     "live-is-persisted",
     "live-is-explicit",
   ] as const) {
@@ -506,6 +509,170 @@ test("describe: every reason has a phrase", () => {
     assert.equal(typeof text, "string");
     assert.ok(text.length > 0, reason);
   }
+});
+
+// ── Default-mode resolution (Gap 1) ─────────────────────────────────
+// The profile's `defaultModel` used to be re-applied over a newer explicit
+// choice on every session start. These pin the corrected precedence.
+
+const entryModel = { provider: "p", id: "entry", thinking: "low" as const };
+const persistedModel = {
+  provider: "p",
+  id: "persisted",
+  thinking: "high" as const,
+};
+const seedModel = { provider: "p", id: "profile", thinking: "medium" as const };
+
+test("resolve: session entry wins for the in-memory default", () => {
+  const r = resolveDefaultModeModel({
+    entryModel,
+    persistedModel,
+    profileModel: seedModel,
+  });
+  assert.deepEqual(r.inMemory, entryModel);
+  assert.equal(r.source, "entry");
+  // A resumed session never re-applies, so the target ignores the entry.
+  assert.deepEqual(r.applyTarget, persistedModel);
+});
+
+test("resolve: the persisted record beats the profile seed (the bug)", () => {
+  const r = resolveDefaultModeModel({
+    persistedModel,
+    profileModel: seedModel,
+  });
+  assert.deepEqual(r.inMemory, persistedModel);
+  assert.deepEqual(r.applyTarget, persistedModel);
+  assert.equal(r.source, "persisted");
+});
+
+test("resolve: the profile seed is a legacy fallback only", () => {
+  const r = resolveDefaultModeModel({ profileModel: seedModel });
+  assert.deepEqual(r.inMemory, seedModel);
+  assert.deepEqual(r.applyTarget, seedModel);
+  assert.equal(r.source, "profile");
+});
+
+test("resolve: nothing configured yields no target", () => {
+  const r = resolveDefaultModeModel({});
+  assert.equal(r.inMemory, undefined);
+  assert.equal(r.applyTarget, undefined);
+  assert.equal(r.source, "none");
+});
+
+test("resolve: thinking travels with the chosen record", () => {
+  const r = resolveDefaultModeModel({ persistedModel });
+  assert.equal(r.inMemory?.thinking, "high");
+  assert.equal(r.applyTarget?.thinking, "high");
+});
+
+// ── Project-level default ───────────────────────────────────────────
+
+test("project default: absent project file reads as absent", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    assert.equal(projectDefaultModel(cwd, agentDir), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("project default: reads the project settings file only", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      JSON.stringify({
+        defaultProvider: "proj",
+        defaultModel: "proj-model",
+        defaultThinkingLevel: "xhigh",
+      }),
+      "utf8",
+    );
+    assert.deepEqual(projectDefaultModel(cwd, agentDir), {
+      provider: "proj",
+      id: "proj-model",
+      thinking: "xhigh",
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("project default: a global file alone is not project-scoped", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "g", defaultModel: "global-model" }),
+      "utf8",
+    );
+    assert.equal(projectDefaultModel(cwd, agentDir), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("project default: half a pair, corrupt JSON and bad thinking", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  const project = path.join(cwd, ".pi", "settings.json");
+  try {
+    fs.mkdirSync(path.dirname(project), { recursive: true });
+
+    fs.writeFileSync(project, JSON.stringify({ defaultModel: "only-id" }), "utf8");
+    assert.equal(projectDefaultModel(cwd, agentDir), undefined);
+
+    fs.writeFileSync(project, JSON.stringify({ defaultProvider: "only-provider" }), "utf8");
+    assert.equal(projectDefaultModel(cwd, agentDir), undefined);
+
+    fs.writeFileSync(project, "{not json", "utf8");
+    assert.equal(projectDefaultModel(cwd, agentDir), undefined);
+
+    fs.writeFileSync(
+      project,
+      JSON.stringify({
+        defaultProvider: "p",
+        defaultModel: "m",
+        defaultThinkingLevel: "ultra",
+      }),
+      "utf8",
+    );
+    assert.deepEqual(projectDefaultModel(cwd, agentDir), {
+      provider: "p",
+      id: "m",
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("apply: a project-level default wins inside its project", () => {
+  const projectDefault = { provider: "proj", id: "proj-model" };
+  // Even the coincidence case (live == the first scoped model) must not let the
+  // record override an explicit project configuration.
+  assert.deepEqual(
+    decide({ projectDefault, live: { provider: "p", id: "first" } }),
+    { apply: false, reason: "project-default" },
+  );
+  // And a live model that differs from everything is still the project default.
+  assert.equal(
+    decide({ projectDefault, live: { provider: "other", id: "x" } }).reason,
+    "project-default",
+  );
+});
+
+test("apply: project-default still defers to the earlier guards", () => {
+  const projectDefault = { provider: "proj", id: "proj-model" };
+  assert.equal(decide({ projectDefault, reason: "resume" }).reason, "reason-not-new");
+  assert.equal(
+    decide({ projectDefault, subagentRoleEnv: "explorer" }).reason,
+    "subagent",
+  );
+  assert.equal(
+    decide({ projectDefault, persisted: undefined }).reason,
+    "no-persisted",
+  );
 });
 
 // ── Event gating (the wired behaviour) ───────────────────────────────

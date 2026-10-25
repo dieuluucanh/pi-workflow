@@ -198,6 +198,35 @@ export function readModelDefault(
 }
 
 /**
+ * Read Pi's OWN project-level default (`<cwd>/.pi/settings.json` top-level
+ * `defaultProvider`/`defaultModel`), i.e. a default configured for this
+ * project rather than by this extension.
+ *
+ * Pi deep-merges the project settings file over the global one, so a project
+ * value wins when Pi resolves a startup model. The extension must agree with
+ * that instead of overwriting it — see
+ * `shouldApplyModelDefaultAtSessionStart`'s `project-default` branch.
+ *
+ * Only the project file is consulted: the global file is already covered by
+ * `pi.getSettings()`, and mixing the two here would make a global default look
+ * project-scoped. Missing/corrupt/half-specified settings read as absent and
+ * never throw.
+ */
+export function projectDefaultModel(
+  cwd: string,
+  agentDir: string,
+): PersistedModelDefault | undefined {
+  const paths = modelDefaultSettingPaths(cwd, agentDir);
+  const root = readSettingsSafe(paths.project);
+  if (!root) return undefined;
+  return coerceModelDefault({
+    provider: root.defaultProvider,
+    id: root.defaultModel,
+    thinking: root.defaultThinkingLevel,
+  });
+}
+
+/**
  * Which scope a write should target: the project file when it already defines
  * `workflow.modelDefault` (so an existing project override stays effective),
  * otherwise global. Mirrors the "write where the effective value lives" rule
@@ -314,8 +343,58 @@ export type ModelDefaultApplyReason =
   | "reason-not-new"
   | "subagent"
   | "no-persisted"
+  | "project-default"
   | "live-is-persisted"
   | "live-is-explicit";
+
+/**
+ * Who supplied the Default-mode model this session remembers.
+ *
+ * `entry` is a resumed session's own recorded model (Pi's precedence, and the
+ * user's chosen behaviour); `persisted` is `workflow.modelDefault`; `profile`
+ * is the legacy fallback (a profile's `defaultModel` when no record exists).
+ */
+export type DefaultModeModelSource = "entry" | "persisted" | "profile" | "none";
+
+export interface DefaultModeModelResolution {
+  /** What `defaultModel` should hold in memory (source for mode restore). */
+  inMemory: PersistedModelDefault | undefined;
+  /**
+   * What a brand-new session should adopt. The session entry is deliberately
+   * excluded: a resumed session never re-applies, and a brand-new one has no
+   * entry — so including it could only ever produce a stale target.
+   */
+  applyTarget: PersistedModelDefault | undefined;
+  /** Which input supplied `inMemory` (diagnostics / display). */
+  source: DefaultModeModelSource;
+}
+
+/**
+ * Resolve the Default-mode model for a session start.
+ *
+ * Precedence (confirmed with the user):
+ *   in-memory  = session entry -> workflow.modelDefault -> profile seed
+ *   apply      = workflow.modelDefault -> profile seed
+ *
+ * The profile's `defaultModel` is a SEED consumed when the profile is
+ * activated, never live state re-applied over a newer explicit choice. Without
+ * this rule an active profile silently reset the user's last model pick on
+ * every new session.
+ */
+export function resolveDefaultModeModel(input: {
+  entryModel?: PersistedModelDefault;
+  persistedModel?: PersistedModelDefault;
+  profileModel?: PersistedModelDefault;
+}): DefaultModeModelResolution {
+  const inMemory =
+    input.entryModel ?? input.persistedModel ?? input.profileModel;
+  const applyTarget = input.persistedModel ?? input.profileModel;
+  let source: DefaultModeModelSource = "none";
+  if (input.entryModel) source = "entry";
+  else if (input.persistedModel) source = "persisted";
+  else if (input.profileModel) source = "profile";
+  return { inMemory, applyTarget, source };
+}
 
 export interface ModelDefaultApplyInput {
   /** `session_start` event reason: startup | new | resume | reload. */
@@ -328,6 +407,11 @@ export interface ModelDefaultApplyInput {
   scopedFirst: { provider: string; id: string } | undefined;
   /** Pi's own saved default (`defaultProvider`/`defaultModel`). */
   settingsDefault: { provider: string; id: string } | undefined;
+  /**
+   * Pi's PROJECT-level default (`<cwd>/.pi/settings.json`). An explicit
+   * project configuration wins inside its project (user decision).
+   */
+  projectDefault?: PersistedModelDefault | undefined;
   /** Our persisted record. */
   persisted: PersistedModelDefault | undefined;
 }
@@ -352,6 +436,9 @@ export interface ModelDefaultApplyDecision {
  *   persisted record. Anything explicit (`--model`, another extension, a
  *   project default) therefore wins.
  * - When the live model already IS the persisted default, nothing to do.
+ * - An explicit PROJECT-level default (`<cwd>/.pi/settings.json`) is never
+ *   replaced: Pi merges that file over the global one, so the extension agrees
+ *   with Pi rather than fighting it (user decision).
  */
 export function shouldApplyModelDefaultAtSessionStart(
   input: ModelDefaultApplyInput,
@@ -364,6 +451,12 @@ export function shouldApplyModelDefaultAtSessionStart(
   }
   const persisted = input.persisted;
   if (!persisted) return { apply: false, reason: "no-persisted" };
+  // A project-level default outranks the extension's record inside its project.
+  // Checked before the live-model comparisons so a live model that happens to
+  // equal `scopedFirst` cannot be mistaken for Pi's own pick.
+  if (input.projectDefault) {
+    return { apply: false, reason: "project-default" };
+  }
   const live = input.live;
   if (!live) return { apply: true, reason: "apply" };
   if (sameModelRef(live, persisted)) {
@@ -432,6 +525,8 @@ export function describeModelDefaultApply(
       return "workflow subagent — keeping its role model";
     case "no-persisted":
       return "no saved default";
+    case "project-default":
+      return "a project-level default is configured — keeping it";
     case "live-is-persisted":
       return "already on the saved default";
     case "live-is-explicit":

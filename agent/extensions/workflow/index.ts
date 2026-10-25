@@ -184,6 +184,7 @@ import {
   readDefaultProfileSetting,
   writeDefaultProfileSetting,
   defaultProfileSettingPaths,
+  defaultProfileWriteScope,
   PROFILE_ROLES,
   modelPickerItems,
   type ProfileConfig,
@@ -195,7 +196,9 @@ import {
   describeModelDefaultApply,
   formatPersistedModel,
   modelDefaultWriteScope,
+  projectDefaultModel,
   readModelDefault,
+  resolveDefaultModeModel,
   shouldApplyModelDefaultAtSessionStart,
   shouldPersistModelSelect,
   shouldPersistThinkingSelect,
@@ -717,9 +720,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * `/profile` picker so "what will the next session use?" is answerable
    * without opening settings.json.
    */
+  /**
+   * One line naming what the NEXT session starts on: the default model (from
+   * the settings file that defines it) plus the profile that is auto-activated.
+   * Both parts matter — the model record and `workflow.defaultProfile` are
+   * independent — and this feeds `/role list` and the `/profile` picker.
+   */
   function persistedDefaultLabel(): string {
+    let profileSuffix = "";
+    let modelPart: string;
     try {
       const { cwd, agentDir } = modelDefaultContext(currentSessionCtx);
+      const profile = readDefaultProfileSetting(cwd, agentDir).value;
+      if (profile) profileSuffix = ` · profile ⚡ ${profile}`;
       const res = readModelDefault(cwd, agentDir);
       if (res.value) {
         const m = res.value;
@@ -727,15 +740,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
           res.sources.effective === "project"
             ? `${CONFIG_DIR_NAME}/settings.json (project)`
             : `~/${CONFIG_DIR_NAME}/agent/settings.json`;
-        return `◦ ${formatPersistedModel(m)}${
+        modelPart = `◦ ${formatPersistedModel(m)}${
           m.thinking ? ` (${m.thinking})` : ""
         } — ${where}`;
+      } else {
+        modelPart = "none — Pi picks the first scoped/available model";
       }
-      return "none — Pi picks the first scoped/available model";
     } catch (_e) {
       void _e;
-      return "unknown (settings unreadable)";
+      modelPart = "unknown (settings unreadable)";
     }
+    return `${modelPart}${profileSuffix}`;
   }
 
   function formatRolesDisplayWithProfile(): string {
@@ -805,11 +820,132 @@ export default function workflowExtension(pi: ExtensionAPI) {
    * session is in plan/build mode the role model is re-applied immediately so
    * the profile's planner/builder take effect right away; explorer/reviewer
    * resolution picks the profile up on next subagent/review round.
+   *
+   * An explicit activation also becomes the profile a NEW session starts on
+   * (`workflow.defaultProfile`) — the latest profile selection wins. Seeding
+   * at session start reads that key, so it must never write it back:
+   * `persistChoice: false` exists to keep that boundary explicit.
    */
+  /**
+   * Write `workflow.defaultProfile` for the profile that just became active.
+   *
+   * Silent when the effective value is unchanged, and never throws: a failed
+   * settings write must not cancel the activation the user asked for. Scope
+   * follows `defaultProfileWriteScope` so an existing project value is not
+   * shadowed by a global write.
+   */
+  function persistDefaultProfileChoice(
+    ctx: ExtensionContext,
+    opts?: { quiet?: boolean },
+  ): void {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const agentDir = getAgentDir();
+    try {
+      const before = (currentDefaultProfileName(cwd) ?? "").toLowerCase();
+      const after = (activeProfileName ?? "").toLowerCase();
+      if (before === after) return;
+      const scope = defaultProfileWriteScope(cwd, agentDir);
+      const res = writeDefaultProfileSetting(
+        scope,
+        cwd,
+        agentDir,
+        activeProfileName,
+      );
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Profile activated, but the default profile was not saved (${res.path}): ${res.error ?? "unknown error"}.`,
+          "warning",
+        );
+        return;
+      }
+      if (opts?.quiet) return;
+      ctx.ui.notify(
+        activeProfileName
+          ? `Default profile → ⚡ ${activeProfileName} (${scope} settings). New sessions start on it.`
+          : `Default profile cleared (${scope} settings).`,
+        "info",
+      );
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Profile activated, but the default profile was not saved: ${String(e?.message || e)}`,
+        "warning",
+      );
+    }
+  }
+
+  /**
+   * Rewrite `workflow.defaultProfile` after a rename so new sessions keep
+   * starting on the renamed profile instead of warning that a missing profile
+   * was skipped.
+   *
+   * The effective value is re-read from disk (the rename did not touch the
+   * settings file), so the caller only has to know the old name. Never throws.
+   */
+  function retargetDefaultProfile(
+    ctx: ExtensionContext,
+    oldName: string,
+    newName: string,
+  ): void {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const agentDir = getAgentDir();
+    try {
+      const def = readDefaultProfileSetting(cwd, agentDir).value;
+      if (!def || def.toLowerCase() !== oldName.toLowerCase()) return;
+      const scope = defaultProfileWriteScope(cwd, agentDir);
+      const res = writeDefaultProfileSetting(scope, cwd, agentDir, newName);
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Profile renamed, but the default profile still points at "${oldName}" (${res.path}): ${res.error ?? "unknown error"}.`,
+          "warning",
+        );
+      }
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Profile renamed, but the default profile was not updated: ${String(e?.message || e)}`,
+        "warning",
+      );
+    }
+  }
+
+  /**
+   * Clear `workflow.defaultProfile` when the profile it names was deleted, so
+   * a new session does not warn that a missing default profile was skipped.
+   * Never throws.
+   */
+  function clearDefaultProfileIfDeleted(
+    ctx: ExtensionContext,
+    deletedName: string,
+  ): void {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const agentDir = getAgentDir();
+    try {
+      const def = readDefaultProfileSetting(cwd, agentDir).value;
+      if (!def || def.toLowerCase() !== deletedName.toLowerCase()) return;
+      const scope = defaultProfileWriteScope(cwd, agentDir);
+      const res = writeDefaultProfileSetting(scope, cwd, agentDir, null);
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Profile deleted, but the default profile still points at "${deletedName}" (${res.path}): ${res.error ?? "unknown error"}.`,
+          "warning",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `Default profile cleared — it named the deleted profile "${deletedName}".`,
+        "info",
+      );
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Profile deleted, but the default profile was not cleared: ${String(e?.message || e)}`,
+        "warning",
+      );
+    }
+  }
+
   async function setActiveProfile(
     ctx: ExtensionContext,
     name: string | null,
-    opts?: { explicit?: boolean; quiet?: boolean },
+    opts?: { explicit?: boolean; quiet?: boolean; persistChoice?: boolean },
   ): Promise<void> {
     ensureProfilesConfig((ctx as any)?.cwd);
     const trimmed = name ? String(name).trim() : null;
@@ -844,6 +980,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
     updateStatus(ctx as any);
+    // Make this the profile new sessions start on (Gap 2). Written after the
+    // in-memory switch so a failed settings write cannot cancel activation.
+    if (opts?.persistChoice !== false)
+      persistDefaultProfileChoice(ctx, opts);
     if (workflowMode) {
       try {
         await applyModeModel(ctx as any, { quiet: opts?.quiet });
@@ -3191,25 +3331,16 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }
 
   /**
-   * Read the persisted default from disk, optionally adopting it into the
-   * in-memory `defaultModel` (the value Default-mode restore and the session
-   * entry use). Never throws; an absent/corrupt file is "no persisted default".
+   * Read the persisted default from disk. Pure: it never mutates the in-memory
+   * `defaultModel`, because precedence is resolved in one place at session
+   * start (`resolveDefaultModeModel`). Never throws.
    */
-  function loadPersistedDefaultModel(
+  function readPersistedDefaultModel(
     ctx?: ExtensionContext | null,
-    adopt = true,
   ): PersistedModelDefault | undefined {
     try {
       const { cwd, agentDir } = modelDefaultContext(ctx);
-      const res = readModelDefault(cwd, agentDir);
-      if (res.value && adopt) {
-        defaultModel = {
-          provider: res.value.provider,
-          id: res.value.id,
-          thinking: res.value.thinking,
-        };
-      }
-      return res.value;
+      return readModelDefault(cwd, agentDir).value;
     } catch (_e) {
       void _e;
       return undefined;
@@ -5041,6 +5172,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
             .map((p) => p.name),
         });
         if (newName && newName !== profile.name) {
+          const oldName = profile.name;
           const wasActive =
             activeProfileName?.toLowerCase() === profile.name.toLowerCase();
           profile.name = newName;
@@ -5048,6 +5180,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
           invalidateEffectiveRoles();
           try {
             saveProfiles(profilesConfig, "user");
+            // Keep workflow.defaultProfile pointing at the profile it names.
+            retargetDefaultProfile(ctx, oldName, profile.name);
             ctx.ui.notify(`Profile renamed → ⚡ ${profile.name}.`, "info");
           } catch (e: any) {
             ctx.ui.notify(
@@ -5073,6 +5207,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         try {
           saveProfiles(profilesConfig, "user");
+          // A dangling default profile would warn on every new session.
+          clearDefaultProfileIfDeleted(ctx, profile.name);
           ctx.ui.notify(
             `Profile ⚡ ${profile.name} deleted.${
               wasActive
@@ -5161,13 +5297,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       },
     );
     if (name === null) return;
-    // Keep the scope where the setting currently lives (else global).
-    const resolved = readDefaultProfileSetting(
+    // Write where the effective value lives, so an existing project value is
+    // not shadowed by a fresh global write.
+    const scope = defaultProfileWriteScope(
       cwd ?? process.cwd(),
       getAgentDir(),
     );
-    const scope: "global" | "project" =
-      resolved.sources.effective === "project" ? "project" : "global";
     const value = name === "__none" ? null : name;
     const res = writeDefaultProfileSetting(
       scope,
@@ -5643,8 +5778,25 @@ export default function workflowExtension(pi: ExtensionAPI) {
     invalidateEffectiveRoles();
     updateStatus(ctx as any);
     if (saved.activate) {
+      // Activation already persists both the model default and the default
+      // profile, so nothing else is needed here.
       await setActiveProfile(ctx as any, profile.name, { explicit: true });
     } else {
+      // Editing the ALREADY ACTIVE profile's Default-mode model must take
+      // effect without a second activation: the profile seed was just
+      // authored by the user, so it is the newest choice. (Clearing the tab
+      // leaves the saved model alone — there is no "no default" state.)
+      if (
+        activeProfileName?.toLowerCase() === profile.name.toLowerCase() &&
+        profile.defaultModel &&
+        registryModel(
+          ctx as any,
+          profile.defaultModel.provider,
+          profile.defaultModel.id,
+        )
+      ) {
+        persistModelDefault(ctx as any, profile.defaultModel, "profile");
+      }
       ctx.ui.notify(
         `Profile ⚡ ${profile.name} saved. Activate with /profile use ${profile.name}.`,
         "info",
@@ -5824,26 +5976,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
         }
         const wasActive =
           activeProfileName?.toLowerCase() === p.name.toLowerCase();
+        const previousName = p.name;
         p.name = check.value;
         if (wasActive) activeProfileName = p.name;
         invalidateEffectiveRoles();
-        persistAndNotify(
+        const savedOk = persistAndNotify(
           `Profile renamed → ⚡ ${p.name}${
             wasActive ? " (still active in this session)" : ""
           }`,
         );
-        const def = readDefaultProfileSetting(
-          cwd ?? process.cwd(),
-          getAgentDir(),
-        );
-        if (def.value && def.value.toLowerCase() === oldName.toLowerCase()) {
-          ctx.ui.notify(
-            `workflow.defaultProfile still points at "${def.value}" — update with /profile default ${p.name}${
-              def.sources.effective === "project" ? " project" : ""
-            }`,
-            "warning",
-          );
-        }
+        // Keep workflow.defaultProfile pointing at the profile it names.
+        if (savedOk) retargetDefaultProfile(ctx as any, previousName, p.name);
         return;
       }
 
@@ -5879,6 +6022,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
             wasActive ? " It was active — default roles flow restored." : ""
           }`,
         );
+        // A dangling default profile would warn on every new session.
+        if (savedOk) clearDefaultProfileIfDeleted(ctx as any, p.name);
         if (savedOk && wasActive && workflowMode) {
           try {
             await applyModeModel(ctx as any);
@@ -5895,11 +6040,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
         const target = rest.find(
           (t) => t.toLowerCase() !== "global" && t.toLowerCase() !== "project",
         );
-        const scope: "global" | "project" = rest
-          .map((t) => t.toLowerCase())
-          .includes("project")
-          ? "project"
-          : "global";
+        const scopeTokens = rest.map((t) => t.toLowerCase());
+        // An explicit token wins; otherwise write where the effective value
+        // lives, so a project-scoped default is not shadowed by a global write.
+        let scope: "global" | "project";
+        if (scopeTokens.includes("project")) scope = "project";
+        else if (scopeTokens.includes("global")) scope = "global";
+        else
+          scope = defaultProfileWriteScope(
+            cwd ?? process.cwd(),
+            getAgentDir(),
+          );
         const paths = defaultProfileSettingPaths(
           cwd ?? process.cwd(),
           getAgentDir(),
@@ -7594,8 +7745,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
       void _e;
     }
     // restore state from custom entries (supports both legacy enabled/executing and new mode field)
-    // Set when this session entry carried its own Default-mode model.
-    let restoredEntryDefault = false;
+    // Collected during the restore and resolved ONCE below
+    // (`resolveDefaultModeModel`): the session's own entry wins, then the
+    // persisted record, then a profile seed. The profile is never re-applied
+    // over a newer explicit choice.
+    let entryDefaultModel: PersistedModelDefault | undefined;
+    let profileModel: PersistedModelDefault | undefined;
     try {
       const entries = ctx.sessionManager.getBranch();
       for (const e of entries as any[]) {
@@ -7654,10 +7809,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
                     }
                     activeProfileName = null;
                   } else if (activeProfileName) {
+                    // Older sessions carry no `defaultModel` in their entry: the
+                    // restored profile's seed is the only hint (legacy fallback).
                     const rp = getProfile(profilesConfig, activeProfileName);
-                    if (rp?.defaultModel) {
-                      defaultModel = { ...rp.defaultModel };
-                    }
+                    const seed = coerceModelDefault(rp?.defaultModel);
+                    if (seed) profileModel = seed;
                   }
                 } else {
                   activeProfileName = null;
@@ -7673,21 +7829,8 @@ export default function workflowExtension(pi: ExtensionAPI) {
               lastModeSwitch = (d as any).lastModeSwitch as any;
             }
             // restore the remembered Default-mode model
-            const dm = (d as any).defaultModel;
-            if (
-              dm &&
-              typeof dm === "object" &&
-              typeof dm.provider === "string" &&
-              typeof dm.id === "string"
-            ) {
-              defaultModel = {
-                provider: dm.provider,
-                id: dm.id,
-                thinking:
-                  typeof dm.thinking === "string" ? dm.thinking : undefined,
-              };
-              restoredEntryDefault = true;
-            }
+            const dm = coerceModelDefault((d as any).defaultModel);
+            if (dm) entryDefaultModel = dm;
             awaitingDecision = !!d.awaitingDecision;
             lastHandoffAt =
               typeof d.awaitingDecisionAt === "number"
@@ -7744,16 +7887,12 @@ export default function workflowExtension(pi: ExtensionAPI) {
     } catch (_e) {
       void _e;
     }
-    // Persisted default model: read it for the apply rule below, and adopt it
-    // as the in-memory Default-mode model unless this session restored its own
-    // (an explicit session entry wins). The profile seeding below may override
-    // it — a live profile is the more specific choice.
+    // Persisted default model: a side-effect-free read. Precedence is resolved
+    // once, after the profile seeding below, so the profile cannot silently
+    // overwrite a newer explicit choice.
     let persistedDefault: PersistedModelDefault | undefined;
     try {
-      persistedDefault = loadPersistedDefaultModel(
-        ctx as any,
-        !restoredEntryDefault,
-      );
+      persistedDefault = readPersistedDefaultModel(ctx as any);
     } catch (_e) {
       void _e;
     }
@@ -7775,9 +7914,11 @@ export default function workflowExtension(pi: ExtensionAPI) {
               activeProfileName = p.name;
               invalidateEffectiveRoles();
             }
-            if (p.defaultModel) {
-              defaultModel = { ...p.defaultModel };
-            }
+            // Seeding activates the profile for ROLES only. Its defaultModel is
+            // a seed consumed on explicit activation, never state re-applied
+            // here — that is what used to reset the user's model choice.
+            const seed = coerceModelDefault(p.defaultModel);
+            if (seed) profileModel = seed;
           } else {
             try {
               (ctx as any).ui?.notify?.(
@@ -7793,6 +7934,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
         void _e;
       }
     }
+    // One resolved Default-mode model for this session. See
+    // resolveDefaultModeModel: session entry > persisted record > profile seed.
+    const defaultResolution = resolveDefaultModeModel({
+      entryModel: entryDefaultModel,
+      persistedModel: persistedDefault,
+      profileModel,
+    });
+    defaultModel = defaultResolution.inMemory;
     // Adopt the saved default on a brand-new session. This is what makes a
     // model OUTSIDE `enabledModels` stick: Pi's own findInitialModel prefers
     // the first scoped model over settings.defaultModel, so writing
@@ -7800,14 +7949,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
     // their recorded model (Pi's precedence) and workflow subagents keep their
     // role model — both are refused by the pure decision helper.
     try {
-      const profileDefault = resolveActiveProfile()?.defaultModel;
-      const effectiveDefault: PersistedModelDefault | undefined = profileDefault
-        ? {
-            provider: profileDefault.provider,
-            id: profileDefault.id,
-            thinking: profileDefault.thinking,
-          }
-        : persistedDefault;
+      const effectiveDefault = defaultResolution.applyTarget;
       let live: any = null;
       try {
         live = (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
@@ -7843,6 +7985,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
           settings?.defaultProvider && settings?.defaultModel
             ? { provider: settings.defaultProvider, id: settings.defaultModel }
             : undefined,
+        // An explicit project-level default wins inside its project; Pi merges
+        // `<cwd>/.pi/settings.json` over the global file, and we agree with it.
+        projectDefault: (() => {
+          try {
+            const { cwd, agentDir } = modelDefaultContext(ctx as any);
+            return projectDefaultModel(cwd, agentDir);
+          } catch (_e) {
+            void _e;
+            return undefined;
+          }
+        })(),
         persisted: effectiveDefault,
       });
       if (decision.apply && effectiveDefault) {

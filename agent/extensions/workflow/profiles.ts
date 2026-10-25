@@ -558,6 +558,25 @@ export function defaultProfileSettingPaths(
 }
 
 /**
+ * Which scope a `workflow.defaultProfile` write should target: the project file
+ * when it already defines the key (so an existing project value stays
+ * effective), otherwise global.
+ *
+ * Mirrors `modelDefaultWriteScope` in model-default.ts. Without this, an
+ * activation would write global while a project value kept shadowing it, and
+ * the write would silently do nothing.
+ */
+export function defaultProfileWriteScope(
+  cwd: string,
+  agentDir: string,
+): "global" | "project" {
+  const paths = defaultProfileSettingPaths(cwd, agentDir);
+  return extractDefaultProfile(readSettingsSafe(paths.project)) !== undefined
+    ? "project"
+    : "global";
+}
+
+/**
  * Extract `workflow.defaultProfile` (a profile name string) from a raw
  * settings object. Anything else (absent, non-string, blank) → undefined.
  */

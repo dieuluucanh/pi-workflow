@@ -413,7 +413,7 @@ The default profile lives under `workflow.defaultProfile` (global/project preced
 }
 ```
 
-`/profile default <name|none> [global|project]` writes this key read-modify-write, preserving every other settings key. Sessions that never picked explicitly (fresh or resumed) re-read it at every start, so changing the default applies to them; an explicit `/profile use` in a session pins that session until changed.
+`/profile default <name|none> [global|project]` writes this key read-modify-write, preserving every other settings key. **Activating a profile writes it too**: `/profile use`, the picker's activate entry, "save & activate" in the editor, and `/profile use none` (which clears it) all keep the key pointing at the profile chosen last, so the newest profile selection is the one a new session starts on. Renaming the default profile rewrites the key; deleting it clears the key instead of leaving a dangling name that every new session would warn about. Writes go to the project settings file when it already defines the key, else the global one. Sessions that never picked explicitly (fresh or resumed) re-read it at every start, so changing the default applies to them; an explicit `/profile use` in a session pins that session until changed.
 
 ### Default model persistence
 
@@ -426,6 +426,18 @@ The model you select is remembered as the default for the **next** session. This
 - an explicit `/role set`, `/role use`, or a `/role` picker save.
 
 Entering Plan/Build mode does **not** change the default: the planner/builder model belongs to that mode, so the next session still starts on your Default-mode model. Resumed sessions keep their recorded model, and Workflow's own `explore`/review subagents keep their role model.
+
+**Which value wins.** `workflow.modelDefault` is the single authority for the Default-mode model:
+
+| Situation | Default-mode model |
+| --- | --- |
+| Resumed session with its own recorded model | that session's model (Pi's precedence) |
+| Otherwise | `workflow.modelDefault` |
+| No record yet (older install) | the active profile's `defaultModel` — a one-time legacy seed |
+
+A profile's `defaultModel` is a **seed consumed when the profile is activated**, not live state re-applied at every start. Activating a profile writes both `workflow.defaultProfile` and `workflow.modelDefault`; picking a model afterwards does **not** edit `profiles.json`. That is what makes the *latest* choice win: pick a model, or activate a profile, and whichever happened last is what the next session uses. Editing the **already active** profile's `default` tab also takes effect immediately, without needing "save & activate".
+
+A **project-level** default (a `defaultProvider`/`defaultModel` in `<cwd>/.pi/settings.json`) wins inside its project: Pi merges that file over the global one, and the extension leaves it alone instead of overriding it.
 
 The value is stored in `settings.json` (global `~/.pi/agent/settings.json`, or the project file `<cwd>/.pi/settings.json` when that file already defines it):
 
@@ -446,7 +458,7 @@ The value is stored in `settings.json` (global `~/.pi/agent/settings.json`, or t
 
 `workflow.modelDefault` is the authoritative record (our key — it survives Pi upgrades). The three top-level keys are Pi's own native defaults, mirrored in the same write so terminal Pi, Pi Desktop and Pi's settings UI agree. The extension also applies `workflow.modelDefault` on `session_start` for a brand-new session, because Pi's own startup resolution prefers the **first `enabledModels` entry** over a saved default — without that step a default outside your model scope would be ignored.
 
-Every other settings key (including `workflow.commitPolicy`, `workflow.writePolicy`, `workflow.defaultProfile`, `enabledModels`) is preserved by the read-modify-write. Clear the default by deleting `workflow.modelDefault` and the three top-level keys, or simply select a different model. `/role list` and the `/profile` picker show which model the next session will start on and which file defines it.
+Every other settings key (including `workflow.commitPolicy`, `workflow.writePolicy`, `workflow.defaultProfile`, `enabledModels`) is preserved by the read-modify-write. Clear the default by deleting `workflow.modelDefault` and the three top-level keys, or simply select a different model. `/role list` and the `/profile` picker show the full answer to "what starts next": the model, the file that defines it, and the profile that will be auto-activated.
 
 Review Mode settings live under `workflow.reviewMode`:
 

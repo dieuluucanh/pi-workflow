@@ -32,6 +32,7 @@ import {
   extractDefaultProfile,
   readDefaultProfileSetting,
   writeDefaultProfileSetting,
+  defaultProfileWriteScope,
   modelPickerItems,
   type Profile,
 } from "./profiles.ts";
@@ -346,6 +347,41 @@ test("profiles: extractDefaultProfile coercion", () => {
     extractDefaultProfile({ workflow: { defaultProfile: " Cheap " } }),
     "Cheap",
   );
+});
+
+test("profiles: default profile write scope follows the effective value", () => {
+  const root = tmpRoot();
+  const agentDir = path.join(root, "agent");
+  const cwd = path.join(root, "proj");
+  const projectFile = path.join(cwd, ".pi", "settings.json");
+
+  try {
+    // No files at all → global (the default location).
+    assert.equal(defaultProfileWriteScope(cwd, agentDir), "global");
+
+    // A global value alone does not make the project the target.
+    writeDefaultProfileSetting("global", cwd, agentDir, "cheap");
+    assert.equal(defaultProfileWriteScope(cwd, agentDir), "global");
+
+    // Once the project file defines the key, writes must follow it — otherwise
+    // a fresh global write would be shadowed by the project value forever.
+    writeDefaultProfileSetting("project", cwd, agentDir, "premium");
+    assert.equal(defaultProfileWriteScope(cwd, agentDir), "project");
+
+    // Other workflow keys in the project file do not count.
+    fs.writeFileSync(
+      projectFile,
+      JSON.stringify({ workflow: { commitPolicy: { mode: "never" } } }),
+      "utf8",
+    );
+    assert.equal(defaultProfileWriteScope(cwd, agentDir), "global");
+
+    // A corrupt project file is treated as absent, never as a crash.
+    fs.writeFileSync(projectFile, "{not json", "utf8");
+    assert.equal(defaultProfileWriteScope(cwd, agentDir), "global");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("profiles: default profile setting — project wins, writes preserve other keys, clear works", () => {

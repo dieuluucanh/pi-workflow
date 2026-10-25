@@ -34,7 +34,7 @@
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4.1-flash",
+  "defaultModel": "muse-spark-1.3-contributor",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -60,6 +60,11 @@
         "sed -n '395,500p' docs/multi_gpu.md"
       ],
       "mutatingTools": []
+    },
+    "modelDefault": {
+      "provider": "opencode-go",
+      "id": "muse-spark-1.3-contributor",
+      "thinking": "high"
     }
   }
 }
