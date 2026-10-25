@@ -32,6 +32,7 @@ import {
   planHash,
   readProviderErrorEvent,
   reviewNeedsVerification,
+  reviewRunLabel,
   truncateErrorText,
   type CreateReviewSessionOptions,
   type CreateReviewSessionResult,
@@ -147,6 +148,12 @@ export interface RunRoundInput {
    * Linked to the round's own controller; detached when the round ends.
    */
   signal?: AbortSignal;
+  /**
+   * `/review-resume` is continuing a paused round on the warm session. Only the
+   * transcript label needs this: warmth alone cannot express intent, because a
+   * next round reuses the same session too.
+   */
+  resumed?: boolean;
 }
 
 export interface ReviewRuntime {
@@ -316,7 +323,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let state: ReviewState | undefined;
   let transcript: Transcript | undefined;
   let gate: ReviewRoundGate = createReviewRoundGate();
-  let starting: Promise<boolean> | undefined;
+  let starting: Promise<EnsureSessionResult> | undefined;
   let abortController: AbortController | undefined;
   /** `provider/id/thinking` the live session was created with (step 10). */
   let sessionModelKey: string | undefined;
@@ -366,6 +373,26 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   const ensureTranscript = (): Transcript => {
     if (!transcript) transcript = new Transcript();
     return transcript;
+  };
+
+  /**
+   * Emit a runtime-authored status line to the local transcript buffer and the
+   * parent stream. Used for run-start narration, which the child's
+   * `agent_start` cannot describe truthfully (see `reviewRunLabel`).
+   * Display-only: a broken sink must never break a review.
+   */
+  const pushStatus = (text: string): void => {
+    const op: ReviewTranscriptOp = { op: "new", kind: "status", text };
+    try {
+      ensureTranscript().apply(op);
+    } catch {
+      /* ignore */
+    }
+    try {
+      deps.onTranscriptOps?.([op]);
+    } catch {
+      /* ignore */
+    }
   };
 
   /**
@@ -541,7 +568,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     if (stop === "timeout") {
       const capMs = Math.max(1000, config().timeoutMs);
       deps.log(
-        `Review Mode pass ${pass} hit its ${Math.round(
+        `pass ${pass} hit its ${Math.round(
           capMs / 1000,
         )}s limit — continuing with ${
           submitted ? "the submitted plan" : "the author's plan"
@@ -583,7 +610,18 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     }
   }
 
-  async function ensureStarted(): Promise<boolean> {
+  /** Outcome of `ensureSession`: `created` is true only for a fresh boot. */
+  interface EnsureSessionResult {
+    ok: boolean;
+    created: boolean;
+  }
+
+  /**
+   * Idempotent session boot. `created` tells the caller whether THIS call paid
+   * for a new child session, which is what makes the transcript's run label
+   * truthful (fresh boot vs warm resume/next round).
+   */
+  async function ensureSession(): Promise<EnsureSessionResult> {
     const modelRef = deps.reviewerModel();
     const modelKey = modelRef
       ? `${modelRef.provider}/${modelRef.id}/${modelRef.thinking}`
@@ -593,23 +631,23 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       // reviewer switch since then reboots it so the new model audits.
       if (modelKey && sessionModelKey && modelKey !== sessionModelKey) {
         deps.log(
-          "Review Mode: reviewer model changed — restarting the reviewer session.",
+          "reviewer model changed — restarting the reviewer session.",
           "info",
         );
         await disposeSession();
       } else {
-        return true;
+        return { ok: true, created: false };
       }
     }
     if (starting) return starting;
-    starting = (async () => {
+    starting = (async (): Promise<EnsureSessionResult> => {
       const cfg = config();
       if (!modelRef) {
         deps.log(
-          "Review Mode: no reviewer model configured — run /role set reviewer <provider/model>",
+          "no reviewer model configured — run /role set reviewer <provider/model>",
           "warning",
         );
-        return false;
+        return { ok: false, created: false };
       }
       try {
         // The SDK must be loaded BEFORE building the tools: review_bash is
@@ -715,17 +753,17 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
         if (!created.ok || !created.session) {
           deps.log(
-            `Review Mode unavailable: ${created.error ?? "unknown error"} — the plan will be handed over unreviewed.`,
+            `reviewer unavailable: ${created.error ?? "unknown error"} — the plan will be handed over unreviewed.`,
             cfg.fallbackOnError === "block" ? "error" : "warning",
           );
-          return false;
+          return { ok: false, created: false };
         }
 
         // One line per session, so "the reviewer has no tools" is visible
         // immediately instead of only after a failed pass (see /review-status).
         if (created.activeTools) {
           deps.log(
-            `Review Mode: reviewer tools active — ${created.activeTools.join(", ")}`,
+            `reviewer tools active — ${created.activeTools.join(", ")}`,
             "info",
           );
         }
@@ -733,6 +771,15 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         session = created.session;
         // Step 10: remember which model this session audits with.
         sessionModelKey = modelKey;
+        // Config, not round state: report the missing cap once per live
+        // session, so a resume cannot replay it as if the reviewer had just
+        // started. Also avoids the old `Review Mode: Review Mode:` doubling.
+        if (cfg.timeoutMs <= 0) {
+          deps.log(
+            "no time limit configured — each pass ends when the reviewer submits or its run settles.",
+            "info",
+          );
+        }
         ensureTranscript();
         const child = created.session;
         session.subscribe((event) => {
@@ -785,18 +832,23 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
             }, 0);
           }
         });
-        return true;
+        return { ok: true, created: true };
       } catch (e: unknown) {
         deps.log(
-          `Review Mode failed to start: ${e instanceof Error ? e.message : String(e)}`,
+          `failed to start: ${e instanceof Error ? e.message : String(e)}`,
           "warning",
         );
-        return false;
+        return { ok: false, created: false };
       } finally {
         starting = undefined;
       }
     })();
     return starting;
+  }
+
+  /** Public shape: idempotent, creates the reviewer session if it is not alive. */
+  async function ensureStarted(): Promise<boolean> {
+    return (await ensureSession()).ok;
   }
 
   async function runRound(input: RunRoundInput): Promise<ReviewRoundResult> {
@@ -888,10 +940,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         };
       }
 
-      const ready = await ensureStarted();
-      if (!ready || !session) {
+      const start = await ensureSession();
+      if (!start.ok || !session) {
         return fail("reviewer session unavailable");
       }
+      const created = start.created;
       const child = session;
 
       if (!state || state.planHash !== hash || state.phase === "done") {
@@ -936,12 +989,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       // settle race below still ends a silent pass quickly either way.
       const limitMs = cfg.timeoutMs > 0 ? cfg.timeoutMs : undefined;
       const deadline = limitMs !== undefined ? started + limitMs : undefined;
-      if (limitMs === undefined) {
-        deps.log(
-          "Review Mode: no time limit configured — each pass ends when the reviewer submits or its run settles.",
-          "info",
-        );
-      }
 
       // ── Pass 1 ──────────────────────────────────────────────────────
       await settleInFlight(deadline, rc);
@@ -963,9 +1010,14 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         verify: cfg.verify && cfg.passes > 1,
       });
 
-      const p1 = await runPass(1, deadline, rc, () =>
-        child.prompt(pass1Prompt),
-      );
+      const p1 = await runPass(1, deadline, rc, () => {
+        // Pushed inside `send`: an already-aborted pass never sends, so it must
+        // not claim a start either.
+        pushStatus(
+          reviewRunLabel({ created, resumed: input.resumed === true, pass: 1 }),
+        );
+        return child.prompt(pass1Prompt);
+      });
 
       if (p1.stop === "error") {
         await abortChild();
@@ -1020,7 +1072,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         // The protocol completed, the run did not: stop paying for it, but keep
         // the submission — never discard real work over a slow model.
         deps.log(
-          "Review Mode pass 1 exceeded its time limit after submitting — using the submitted plan.",
+          "pass 1 exceeded its time limit after submitting — using the submitted plan.",
           "warning",
         );
         await abortChild();
@@ -1045,9 +1097,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           rewrittenPlan: p1.submitted.planBody,
           findings: state?.findings ?? [],
         });
-        const p2 = await runPass(2, deadline, rc, () =>
-          child.followUp(pass2Prompt),
-        );
+        const p2 = await runPass(2, deadline, rc, () => {
+          pushStatus(reviewRunLabel({ created, pass: 2 }));
+          return child.followUp(pass2Prompt);
+        });
         // Name the provider when the verification pass died on one; pass 2
         // stays best-effort either way — pass 1's plan is never lost to it.
         const p2Provider = lastProviderError
@@ -1057,8 +1110,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           // Verification is an enhancement: never lose pass 1's plan over it.
           deps.log(
             p2Provider
-              ? `Review Mode verification pass failed (${p2Provider}; send error: ${errorText(p2.error)}) — keeping pass 1's plan.`
-              : `Review Mode verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
+              ? `verification pass failed (${p2Provider}; send error: ${errorText(p2.error)}) — keeping pass 1's plan.`
+              : `verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
             "warning",
           );
         } else if (p2.submitted) {
@@ -1067,7 +1120,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           // The run settled without a submission AND a provider error was
           // seen this pass: say why, then keep going with pass 1's rewrite.
           deps.log(
-            `Review Mode verification pass ended without a submission (${p2Provider}) — keeping pass 1's plan.`,
+            `verification pass ended without a submission (${p2Provider}) — keeping pass 1's plan.`,
             "warning",
           );
         }

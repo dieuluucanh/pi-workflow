@@ -50,6 +50,13 @@ export interface ReviewModeBandData {
   round?: number;
   verdict?: string;
   reason?: string;
+  /**
+   * A round that continues a paused one (`/review-resume`). The band renders
+   * `resumed` instead of `sequential audit` so the two flows never look alike.
+   */
+  resumed?: boolean;
+  /** The round stopped for a pause; renders `REVIEW PAUSED`, not `REVIEW DONE`. */
+  paused?: boolean;
 }
 
 /** Payload of a `workflow-review-transcript` chunk entry. */
@@ -103,6 +110,10 @@ export function reviewBandKey(data: ReviewModeBandData | undefined): string {
     data?.modelLabel ?? "",
     data?.verdict ?? "",
     data?.reason ?? "",
+    // A resumed (or paused) band is never the same event as the fresh band it
+    // continues, even when mode/round/model/verdict/reason happen to match.
+    data?.resumed === true ? "resumed" : "",
+    data?.paused === true ? "paused" : "",
   ].join("|");
 }
 
@@ -295,19 +306,28 @@ export function formatReviewModeBand(
   }
   if (mode === "review") {
     const bits: string[] = [];
-    if (typeof data?.round === "number" && data.round > 1) {
+    const resumed = data?.resumed === true;
+    if (resumed) {
+      bits.push("resumed");
+      // Always name the round on a resume: "resumed · round 1" reads as a
+      // continuation, while a bare "resumed" hides which round continues.
+      if (typeof data?.round === "number") bits.push(`round ${data.round}`);
+    } else if (typeof data?.round === "number" && data.round > 1) {
       bits.push(`round ${data.round}`);
     }
     if (typeof data?.modelLabel === "string" && data.modelLabel) {
       bits.push(data.modelLabel);
     }
-    bits.push("sequential audit");
+    // "sequential audit" describes a fresh flow; a resumed round continues the
+    // flow it was paused in.
+    if (!resumed) bits.push("sequential audit");
     const title = theme.fg("accent", theme.bold("▌ REVIEW MODE"));
     return [title + theme.fg("muted", `  ${bits.join(" · ")}`)];
   }
   if (mode === "review-done") {
+    const paused = data?.paused === true;
     const clean = data?.verdict === "approve" && !data?.reason;
-    const color: ThemeColor = clean ? "success" : "warning";
+    const color: ThemeColor = paused || !clean ? "warning" : "success";
     let detail = "";
     if (data?.reason) {
       detail = `  ${data.reason}`;
@@ -315,7 +335,10 @@ export function formatReviewModeBand(
       detail = `  verdict: ${data.verdict}`;
     }
     return [
-      theme.fg(color, theme.bold("▌ REVIEW DONE")) + theme.fg("muted", detail),
+      theme.fg(
+        color,
+        theme.bold(paused ? "▌ REVIEW PAUSED" : "▌ REVIEW DONE"),
+      ) + theme.fg("muted", detail),
     ];
   }
   return [theme.fg("muted", "▌ review")];

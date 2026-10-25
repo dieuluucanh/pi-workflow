@@ -4,6 +4,44 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Resuming a review no longer reads as a fresh start (2026-10-25)
+
+`/review-resume` was correct internally — the warm reviewer session, its round
+and its findings were reused — but the main transcript narrated it as a cold
+boot:
+
+```text
+▌ REVIEW MODE  opencode-go/deepseek-v4.1-flash · sequential audit
+ Review Mode: Review Mode: no time limit configured — …
+reviewer started
+```
+
+Three independent causes are fixed. The child's `agent_start` is a per-run event
+(it fires for every prompt on the same session), so it can no longer produce a
+run-start line; the runtime emits the truthful one instead: `reviewer started`
+for a fresh session, `reviewer resumed` for a warm `/review-resume`,
+`reviewer continuing` for a later round, `reviewer restarting — new reviewer
+session` when a reviewer-model switch forced a reboot, and `reviewer verifying —
+pass 2` for the verification pass. The mode band gains a `resumed` marker
+(`▌ REVIEW MODE  resumed · round N · model`, never `sequential audit`), and a
+paused round renders `▌ REVIEW PAUSED` instead of the contradictory
+`▌ REVIEW DONE  paused`. `notifyReview` now prefixes `Review Mode:` exactly once
+(the doubled `Review Mode: Review Mode: …` notices are gone), the `no time limit
+configured` notice is emitted once per reviewer session rather than on every
+round, and pending transcript lines are flushed before a band so a resume band
+cannot appear above the previous round's last line.
+
+A fourth bug in the same path is fixed: `review_submit_plan` writes the rewrite
+to the plan file *during* the round, so pausing after a submission (typically
+during pass 2) made `/review-resume` compare the file against the round's input
+hash. It then took the fresh branch, printed `Plan changed since the pause`,
+reset the round and re-reviewed the reviewer's own rewrite. The pause snapshot
+now records the plan-file hash (refreshed when the round settles) and compares
+against that, so only an author edit made after the pause starts a fresh round.
+
+Tests: `reviewRunLabel` / `reviewNoticeText` / `reviewResumePlanChoice` tables;
+runtime run-label and notice-once cases on the fake SDK; band renderer/key cases
+
 ### Fixed — Tab applies the highlighted suggestion instead of cycling modes (2026-10-25)
 
 The workflow registered a raw `tab` shortcut, and Pi's `CustomEditor` dispatches

@@ -172,6 +172,25 @@ test("formatReviewModeBand: plan=warning, review=accent, done follows the verdic
     theme,
   )[0];
   assert.ok(timedOut.includes("[warning]") && timedOut.includes("timeout"));
+  // A resumed round is never rendered like a fresh flow.
+  const resumed = formatReviewModeBand(
+    { mode: "review", round: 1, modelLabel: "p/m", resumed: true },
+    theme,
+  )[0];
+  assert.ok(resumed.includes("resumed"));
+  assert.ok(resumed.includes("round 1"));
+  assert.ok(
+    !resumed.includes("sequential audit"),
+    "a resume is a continuation, not a fresh audit",
+  );
+  // A pause is not a done band.
+  const paused = formatReviewModeBand(
+    { mode: "review-done", paused: true, reason: "paused — /review-resume" },
+    theme,
+  )[0];
+  assert.ok(paused.includes("REVIEW PAUSED"));
+  assert.ok(!paused.includes("REVIEW DONE"));
+  assert.ok(paused.includes("[warning]"));
   assert.ok(formatReviewModeBand(undefined, theme)[0].includes("[muted]"));
 });
 
@@ -226,7 +245,16 @@ test("reviewBandKey: ignores `at`, follows mode/round/verdict/reason", () => {
     reviewBandKey({ mode: "review-done", reason: "timeout" }),
     reviewBandKey({ mode: "review-done", reason: "failed: x" }),
   );
-  assert.equal(reviewBandKey(undefined), "unknown||||");
+  assert.notEqual(
+    reviewBandKey({ mode: "review", round: 1 }),
+    reviewBandKey({ mode: "review", round: 1, resumed: true }),
+    "a resumed band must not collapse into the fresh band it continues",
+  );
+  assert.notEqual(
+    reviewBandKey({ mode: "review-done", reason: "paused" }),
+    reviewBandKey({ mode: "review-done", reason: "paused", paused: true }),
+  );
+  assert.equal(reviewBandKey(undefined), "unknown||||||");
 });
 
 test("createReviewBandGate: suppresses only consecutive identical bands", () => {

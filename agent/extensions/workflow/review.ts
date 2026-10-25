@@ -914,6 +914,77 @@ export function reviewResumeNotice(result: ReviewExecutionResult): string {
   }
 }
 
+/**
+ * The transcript line for the run that is about to start.
+ *
+ * `agent_start` fires for every prompt on the same child session, so it cannot
+ * distinguish a cold reviewer boot from a warm resume or a next round. The
+ * runtime knows both facts (`created`, `resumed`) at the moment it sends the
+ * prompt, and this helper turns them into one truthful line.
+ *
+ * `created` wins over `resumed`: a resume whose session had to be rebuilt (the
+ * reviewer model changed) really did start a new session, and saying so is more
+ * useful than claiming a warm resume that did not happen.
+ */
+export function reviewRunLabel(input: {
+  /** The runtime had to create a reviewer session for this round. */
+  created: boolean;
+  /** `/review-resume` is continuing a paused round on the warm session. */
+  resumed?: boolean;
+  /** 1 for the audit pass, 2 for the self-verification pass. */
+  pass?: 1 | 2;
+}): string {
+  if (input.pass === 2) return "reviewer verifying — pass 2";
+  if (input.created === true) {
+    return input.resumed === true
+      ? "reviewer restarted — new reviewer session"
+      : "reviewer started";
+  }
+  return input.resumed === true ? "reviewer resumed" : "reviewer continuing";
+}
+
+/**
+ * Prefix a Review Mode notice exactly once.
+ *
+ * Callers already speak in sentences ("no reviewer model configured …"), while
+ * a few sources carried their own `Review Mode: `/`Review Mode ` prefix. Blindly
+ * interpolating produced `Review Mode: Review Mode: …`. Idempotent by design:
+ * anything already starting with `Review Mode` is returned unchanged.
+ */
+export function reviewNoticeText(message: string): string {
+  const text = String(message ?? "").trim();
+  if (text.length === 0) return "Review Mode: ";
+  return /^Review Mode\b/.test(text) ? text : `Review Mode: ${text}`;
+}
+
+/** Whether `/review-resume` may reuse the paused round or must start fresh. */
+export type ReviewResumePlanChoice = "fresh" | "warm";
+
+/**
+ * Decide whether a paused review can still be resumed as-is.
+ *
+ * The plan *file* is not a reliable witness on its own: the reviewer writes its
+ * rewrite to that same file during the round (`review_submit_plan`), so after a
+ * pause during pass 2 the file no longer matches the text the round started
+ * with. Comparing against the hash captured at pause time means only a change
+ * made **after** the pause — an author edit — starts a fresh round.
+ *
+ * A missing file (or a snapshot from before this field existed) keeps today's
+ * behaviour: resume the paused text.
+ */
+export function reviewResumePlanChoice(input: {
+  /** Hash of the text the paused round was auditing. */
+  pausedPlanHash: string;
+  /** Plan-file hash captured when the pause was recorded. */
+  pausedFileHash?: string;
+  /** Plan-file hash read by `/review-resume`; undefined when the file is gone. */
+  currentFileHash?: string;
+}): ReviewResumePlanChoice {
+  if (input.currentFileHash === undefined) return "warm";
+  const baseline = input.pausedFileHash ?? input.pausedPlanHash;
+  return input.currentFileHash === baseline ? "warm" : "fresh";
+}
+
 const DISPOSITIONS: readonly ReviewDisposition[] = [
   "accepted",
   "rejected",
@@ -1091,7 +1162,7 @@ export function applySubmittedPlan(
 
   try {
     options.notify?.(
-      `Review Mode submitted the plan (${options.verdict}, ${options.findings.length} finding${
+      `submitted the plan (${options.verdict}, ${options.findings.length} finding${
         options.findings.length === 1 ? "" : "s"
       })`,
       "info",
@@ -1704,6 +1775,11 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
  * `auto_retry_end` or an `agent_end` that stopped on `stopReason === "error"`
  * appends an `error` line — a dead provider is then visible in the pane during
  * the review instead of resurfacing later as a mysterious "no plan" failure.
+ *
+ * Run-start lines are NOT produced here. `agent_start` fires for every prompt on
+ * the same child session, so it cannot tell a cold boot from a warm resume or a
+ * next round; the runtime emits the truthful line with `reviewRunLabel` at the
+ * moment it sends the prompt.
  */
 export function translateReviewEvent(
   event: unknown,
@@ -1738,9 +1814,6 @@ export function translateReviewEvent(
     ];
   }
 
-  if (type === "agent_start") {
-    return [{ op: "new", kind: "status", text: "reviewer started" }];
-  }
   return providerErrorOps(e, type);
 }
 
@@ -1748,9 +1821,10 @@ export function translateReviewEvent(
  * Provider-error events → transcript lines, split out of
  * `translateReviewEvent` to keep the dispatcher flat:
  *
- * - `agent_end`        → status line, plus an `error` line when the run
+ * - `agent_end`        → neutral run-end line, plus an `error` line when the run
  *   stopped on `stopReason === "error"` (auto-retry disabled, or the first
- *   failure was not retryable).
+ *   failure was not retryable). "Run ended" is truthful for a finished,
+ *   aborted or paused run alike.
  * - `auto_retry_start` → notice carrying the provider's message (truncated).
  * - `auto_retry_end`   → `error` line when the retry budget is exhausted
  *   (`success: false`); a recovered retry (`success: true`) stays silent.
@@ -1763,7 +1837,7 @@ function providerErrorOps(
 ): ReviewTranscriptOp[] {
   if (type === "agent_end") {
     const ops: ReviewTranscriptOp[] = [
-      { op: "new", kind: "status", text: "reviewer finished this run" },
+      { op: "new", kind: "status", text: "reviewer run ended" },
     ];
     const failed = lastAssistantErrorStop(e.messages);
     if (failed) {

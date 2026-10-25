@@ -62,11 +62,14 @@ import {
   reviewModeLockKind,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
+  reviewNoticeText,
   reviewPhaseLabel,
   reviewResumeGateOutcome,
   reviewResumeNotice,
+  reviewResumePlanChoice,
   reviewResumeSettles,
   reviewStatusVisible,
+  reviewRunLabel,
   sanitizeFindings,
   shouldPauseReviewOnEscape,
   shouldRouteInputToReviewer,
@@ -980,7 +983,7 @@ test("translateReviewEvent: never throws on malformed events", () => {
       ],
     }),
     [
-      { op: "new", kind: "status", text: "reviewer finished this run" },
+      { op: "new", kind: "status", text: "reviewer run ended" },
       {
         op: "new",
         kind: "error",
@@ -993,8 +996,12 @@ test("translateReviewEvent: never throws on malformed events", () => {
       type: "agent_end",
       messages: [{ role: "assistant", content: [], stopReason: "stop" }],
     }),
-    [{ op: "new", kind: "status", text: "reviewer finished this run" }],
+    [{ op: "new", kind: "status", text: "reviewer run ended" }],
   );
+  // Run-start lines are the runtime's job (`reviewRunLabel`): `agent_start`
+  // fires for every prompt on the same child session, so it cannot tell a cold
+  // boot from a warm resume or a next round.
+  assert.deepEqual(translateReviewEvent({ type: "agent_start" }), []);
 });
 
  test("readProviderErrorEvent: decodes retry/exhaust/stop, junk-safe", () => {
@@ -1738,6 +1745,97 @@ test("review resume helpers: settle, gate outcome and truthful notices", () => {
     ),
   );
   assert.ok(reviewResumeNotice(r("skipped", { reason: "already reviewed" })).includes("already reviewed"));
+});
+
+test("reviewRunLabel: names a boot, a resume, a continuation and pass 2", () => {
+  assert.equal(reviewRunLabel({ created: true }), "reviewer started");
+  assert.equal(
+    reviewRunLabel({ created: true, resumed: true }),
+    "reviewer restarted — new reviewer session",
+    "a resume that had to reboot names the new session instead of claiming warmth",
+  );
+  assert.equal(reviewRunLabel({ created: false }), "reviewer continuing");
+  assert.equal(
+    reviewRunLabel({ created: false, resumed: true }),
+    "reviewer resumed",
+  );
+  // Pass 2 is always the verification pass, whatever the session history.
+  assert.equal(
+    reviewRunLabel({ created: true, resumed: true, pass: 2 }),
+    "reviewer verifying — pass 2",
+  );
+  assert.equal(
+    reviewRunLabel({ created: false, pass: 2 }),
+    "reviewer verifying — pass 2",
+  );
+  // The user-visible regression: a warm resume is never narrated as a start.
+  assert.ok(
+    !reviewRunLabel({ created: false, resumed: true }).includes("started"),
+  );
+});
+
+test("reviewNoticeText: prefixes exactly once", () => {
+  assert.equal(
+    reviewNoticeText("no reviewer model configured"),
+    "Review Mode: no reviewer model configured",
+  );
+  assert.equal(
+    reviewNoticeText("Review Mode: no time limit configured"),
+    "Review Mode: no time limit configured",
+  );
+  assert.equal(
+    reviewNoticeText("Review Mode unavailable: no provider"),
+    "Review Mode unavailable: no provider",
+  );
+  assert.equal(
+    reviewNoticeText("Review Mode pass 1 exceeded its limit"),
+    "Review Mode pass 1 exceeded its limit",
+  );
+  assert.equal(reviewNoticeText("  spaced  "), "Review Mode: spaced");
+  assert.equal(reviewNoticeText(""), "Review Mode: ");
+  assert.ok(
+    !reviewNoticeText("Review Mode: x").includes("Review Mode: Review Mode:"),
+    "no notice may be double-prefixed",
+  );
+});
+
+test("reviewResumePlanChoice: the reviewer's own rewrite still resumes", () => {
+  // The regression: pass 1 wrote the rewrite to the file before a pass-2 pause.
+  assert.equal(
+    reviewResumePlanChoice({
+      pausedPlanHash: "orig",
+      pausedFileHash: "rewrite",
+      currentFileHash: "rewrite",
+    }),
+    "warm",
+    "a reviewer-authored change is not an author edit",
+  );
+  assert.equal(
+    reviewResumePlanChoice({
+      pausedPlanHash: "orig",
+      pausedFileHash: "rewrite",
+      currentFileHash: "author-edit",
+    }),
+    "fresh",
+  );
+  assert.equal(
+    reviewResumePlanChoice({
+      pausedPlanHash: "orig",
+      pausedFileHash: "rewrite",
+      currentFileHash: undefined,
+    }),
+    "warm",
+    "a missing file cannot be an author edit",
+  );
+  // Defensive fallback: no snapshot → compare with the round's text, as before.
+  assert.equal(
+    reviewResumePlanChoice({ pausedPlanHash: "orig", currentFileHash: "orig" }),
+    "warm",
+  );
+  assert.equal(
+    reviewResumePlanChoice({ pausedPlanHash: "orig", currentFileHash: "other" }),
+    "fresh",
+  );
 });
 
 test("reviewHandoffParks requires phase + snapshot + unsettled gate", () => {
@@ -3809,6 +3907,141 @@ test("plan-2026-10-23: abort then resume reuses the warm session", async () => {
   assert.equal(resumed.ok, true, "resume completes on the warm session");
   assert.ok(resumed.planText.includes("Result<string, ExportError>"));
   assert.equal(creations.n, 1, "resume reuses the session");
+  await rt.teardown();
+});
+
+test("runtime: run labels name a fresh boot, a warm round and the verify pass", async () => {
+  const { sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const seen: Array<{ kind?: string; text?: string }> = [];
+  const { deps } = runtimeDeps(sdk, {
+    onTranscriptOps: (ops) => seen.push(...(ops as typeof seen)),
+  });
+  const rt = createReviewRuntime(deps as never);
+  const statuses = (): string[] =>
+    seen
+      .filter((op) => op.kind === "status")
+      .map((op) => String(op.text ?? ""));
+
+  const first = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(first.ok, true);
+  assert.ok(
+    statuses().includes("reviewer started"),
+    "a cold boot says started",
+  );
+  assert.ok(
+    statuses().includes("reviewer verifying — pass 2"),
+    "pass 2 names itself instead of re-announcing a boot",
+  );
+
+  seen.length = 0;
+  const second = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 2,
+  });
+  assert.equal(second.ok, true);
+  assert.ok(
+    statuses().includes("reviewer continuing"),
+    "a next round on the warm session is a continuation",
+  );
+  assert.ok(
+    !statuses().includes("reviewer started"),
+    "a warm round must not claim a fresh boot",
+  );
+  await rt.teardown();
+});
+
+test("runtime: a resumed round reuses the warm session and says resumed", async () => {
+  let allowSubmit = false;
+  const { sdk } = fakeSdk({
+    pass1: async (c) => {
+      if (!allowSubmit) {
+        await new Promise<void>(() => {}); // hangs until aborted
+        return;
+      }
+      await submitThenFinish(REWRITTEN_PLAN)(c);
+    },
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const creations = { n: 0 };
+  const origCreate = (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession;
+  (
+    sdk as { createAgentSession: (o: unknown) => Promise<unknown> }
+  ).createAgentSession = async (o) => {
+    creations.n += 1;
+    return origCreate(o);
+  };
+  const seen: Array<{ kind?: string; text?: string }> = [];
+  const { deps } = runtimeDeps(sdk, {
+    onTranscriptOps: (ops) => seen.push(...(ops as typeof seen)),
+  });
+  const rt = createReviewRuntime(deps as never);
+  const ac = new AbortController();
+  const paused = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: ac.signal,
+  });
+  ac.abort();
+  assert.equal((await paused).reason, "aborted");
+  assert.equal(creations.n, 1, "the paused round booted the session");
+
+  seen.length = 0;
+  allowSubmit = true;
+  const resumed = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    resumed: true,
+  });
+  assert.equal(resumed.ok, true);
+  assert.equal(creations.n, 1, "resume reuses the warm session");
+  const statuses = seen
+    .filter((op) => op.kind === "status")
+    .map((op) => String(op.text ?? ""));
+  assert.ok(statuses.includes("reviewer resumed"), "resume is named");
+  assert.ok(
+    !statuses.includes("reviewer started"),
+    "a warm resume never reads as a fresh start",
+  );
+  await rt.teardown();
+});
+
+test("runtime: the no-limit notice is logged once per reviewer session", async () => {
+  const { sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const { deps, logs } = runtimeDeps(sdk, { config: { timeoutMs: 0 } });
+  const rt = createReviewRuntime(deps as never);
+  const count = (): number =>
+    logs.filter((l) => l.includes("no time limit configured")).length;
+
+  const first = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(count(), 1, "a fresh session reports the missing cap once");
+
+  const second = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 2,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(count(), 1, "a warm round does not replay it");
   await rt.teardown();
 });
 

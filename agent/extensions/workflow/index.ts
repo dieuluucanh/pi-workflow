@@ -232,8 +232,10 @@ import {
   reviewModeLockKind,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
+  reviewNoticeText,
   reviewResumeGateOutcome,
   reviewResumeNotice,
+  reviewResumePlanChoice,
   reviewEscapeAction,
   reviewHandoffParks,
   reviewResumeSettles,
@@ -1337,6 +1339,15 @@ export default function workflowExtension(pi: ExtensionAPI) {
     | {
         planText: string;
         planHash: string;
+        /**
+         * Hash of the plan *file* when the pause was recorded (refreshed when
+         * the round settles). The reviewer writes its rewrite to that file
+         * mid-round, so comparing the file against `planHash` alone would read
+         * the reviewer's own submission as an author edit on resume.
+         * `undefined` when the file was missing/unreadable — fall back to
+         * `planHash` (pre-snapshot behaviour).
+         */
+        fileHashAtPause?: string;
         round: number;
         previousFindings: ReviewFinding[] | undefined;
         at: number;
@@ -1497,6 +1508,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
 
   /** Append a colored Plan/Review/Review-done band to the main transcript. */
   function emitReviewBand(data: ReviewModeBandData): void {
+    // Bands append immediately while reviewer lines are buffered (400 ms), so
+    // flush first: a band must never be inserted above lines that were already
+    // produced (the resume band used to precede the previous run's last line).
+    try {
+      flushReviewEntries(true);
+    } catch (_e) {
+      void _e;
+    }
     if (!reviewBandGate.accept(data)) return; // identical to the newest band
     try {
       pi.appendEntry(REVIEW_MODE_ENTRY_TYPE, { ...data, at: Date.now() });
@@ -1596,6 +1615,26 @@ export default function workflowExtension(pi: ExtensionAPI) {
     return currentSessionCtx?.cwd ?? process.cwd();
   }
 
+  /**
+   * Current plan-file text (absolute or cwd-relative), or `undefined` when there
+   * is no plan path, the file is gone, or it is unreadable. Never throws.
+   *
+   * Shared by the pause snapshot and `/review-resume` so both compare the same
+   * thing: one read of the file, not two subtly different ones.
+   */
+  function readCurrentPlanText(cwd: string): string | undefined {
+    try {
+      const p = currentPlanFile;
+      if (!p) return undefined;
+      const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+      if (!fs.existsSync(abs)) return undefined;
+      return fs.readFileSync(abs, "utf8");
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
   function reviewConfigNow() {
     try {
       return readReviewModeConfig(reviewCwd(), reviewAgentDir());
@@ -1646,7 +1685,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
     level: "info" | "warning" | "error" = "info",
   ): void {
     try {
-      currentSessionCtx?.ui.notify(`Review Mode: ${message}`, level);
+      // One prefix owner: callers speak in sentences, and the few sources that
+      // still carry their own `Review Mode:` prefix are not doubled.
+      currentSessionCtx?.ui.notify(reviewNoticeText(message), level);
     } catch (_e) {
       void _e;
     }
@@ -1852,9 +1893,14 @@ export default function workflowExtension(pi: ExtensionAPI) {
   }): boolean {
     const hash = planHash(input.planText);
     if (pausedReview?.planHash === hash) return false;
+    // Snapshot the file as well as the text: the reviewer may already have
+    // written its rewrite, and that must not look like an author edit later.
+    const currentFile = readCurrentPlanText(reviewCwd());
     pausedReview = {
       planText: input.planText,
       planHash: hash,
+      fileHashAtPause:
+        currentFile !== undefined ? planHash(currentFile) : undefined,
       round: input.round,
       previousFindings: input.previousFindings,
       at: Date.now(),
@@ -2045,8 +2091,10 @@ export default function workflowExtension(pi: ExtensionAPI) {
     previousFindings: ReviewFinding[] | undefined;
     ctx: ExtensionContext;
     signal?: AbortSignal;
+    /** `/review-resume` is continuing a paused round (band + run label). */
+    resumed?: boolean;
   }): Promise<ReviewExecutionResult> {
-    const { planText, round, previousFindings, ctx, signal } = opts;
+    const { planText, round, previousFindings, ctx, signal, resumed } = opts;
     const hash = planHash(planText);
     // The round owns this controller. Pause/abort abort it directly, which also
     // covers the cold-start window before `runRound` creates its own runtime
@@ -2057,6 +2105,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
       mode: "review",
       round,
       modelLabel: reviewModelLabel(),
+      ...(resumed === true ? { resumed: true } : {}),
     });
     activeReview = { planText, round, controller };
     // Snapshot the reviewer model for this round (step 4): a `/role` or
@@ -2094,8 +2143,19 @@ export default function workflowExtension(pi: ExtensionAPI) {
         round,
         previousFindings,
         signal: controller.signal,
+        ...(resumed === true ? { resumed: true } : {}),
       });
       flushReviewEntries(true);
+      // The pause snapshot was taken while the round was still aborting. A
+      // `review_submit_plan` that landed in that window changed the file after
+      // the snapshot, so refresh it: otherwise `/review-resume` would read the
+      // reviewer's own late write as an author edit and start a fresh round.
+      if (pausedReview?.planHash === hash) {
+        const currentFile = readCurrentPlanText(reviewCwd());
+        if (currentFile !== undefined) {
+          pausedReview.fileHashAtPause = planHash(currentFile);
+        }
+      }
       reviewState = res.state;
       updateStatus(ctx);
       // The snapshot is the ONLY pause signal. A pre-aborted host signal or a
@@ -2140,6 +2200,7 @@ export default function workflowExtension(pi: ExtensionAPI) {
         // widget, spinner, phase demote) was applied by markReviewPaused.
         emitReviewBand({
           mode: "review-done",
+          paused: true,
           reason: "paused — /review-resume to continue, /review-abort to stop",
         });
         return {
@@ -3037,21 +3098,17 @@ export default function workflowExtension(pi: ExtensionAPI) {
       reviewGatePhase = reviewGatePhaseOnResume(reviewGatePhase);
       // A stale quiet-abort marker must not silence this explicit resume.
       quietAbortHash = undefined;
-      // If the plan file moved on while paused, review the new revision
-      // fresh instead of resuming stale text.
-      let current: string | undefined;
-      try {
-        const p = currentPlanFile;
-        if (p) {
-          const abs = path.isAbsolute(p)
-            ? p
-            : path.join((ctx as any).cwd ?? process.cwd(), p);
-          if (fs.existsSync(abs)) current = fs.readFileSync(abs, "utf8");
-        }
-      } catch (_e) {
-        void _e;
-      }
-      if (current !== undefined && planHash(current) !== paused.planHash) {
+      // If the plan file moved on while paused, review the new revision fresh
+      // instead of resuming stale text. The reviewer writes its own rewrite to
+      // that file mid-round, so compare against the pause-time snapshot — not
+      // the text the round started with (see `markReviewPaused`).
+      const current = readCurrentPlanText((ctx as any).cwd ?? process.cwd());
+      const resumeChoice = reviewResumePlanChoice({
+        pausedPlanHash: paused.planHash,
+        pausedFileHash: paused.fileHashAtPause,
+        currentFileHash: current !== undefined ? planHash(current) : undefined,
+      });
+      if (current !== undefined && resumeChoice === "fresh") {
         pausedReview = undefined;
         abortedReviewHash = undefined;
         notifyReview(
@@ -3091,6 +3148,9 @@ export default function workflowExtension(pi: ExtensionAPI) {
         previousFindings: paused.previousFindings,
         ctx: ctx as any,
         signal: undefined,
+        // The transcript must say "resumed", not "started": the round is a
+        // continuation, even though it re-runs pass 1 on the paused text.
+        resumed: true,
       });
       if (reviewResumeSettles(result)) {
         settleReviewGate({
