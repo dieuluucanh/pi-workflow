@@ -39,6 +39,7 @@ import {
   DEFAULT_REVIEW_PROMPT,
   applySubmittedPlan,
   canRunManualReview,
+  classifyReviewExecution,
   coerceReviewModeConfig,
   createReviewHandoffGate,
   createReviewRoundGate,
@@ -52,14 +53,20 @@ import {
   readReviewModeConfig,
   resolveReviewPrompt,
   reviewElapsedMs,
+  reviewEscapeAction,
   reviewFooterSegment,
   reviewGatePhaseOnResume,
+  reviewHandoffParks,
   reviewIsActive,
   reviewModeLockFooter,
   reviewModeLockKind,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
   reviewPhaseLabel,
+  reviewResumeGateOutcome,
+  reviewResumeNotice,
+  reviewResumeSettles,
+  reviewStatusVisible,
   sanitizeFindings,
   shouldPauseReviewOnEscape,
   shouldRouteInputToReviewer,
@@ -73,6 +80,7 @@ import {
   parseReviewTimeoutArg,
   timeoutSourceOf,
   truncateErrorText,
+  type ReviewExecutionResult,
   type ReviewStatusInput,
   REVIEW_BUILTIN_TOOLS,
   reviewToolAllowlist,
@@ -1643,6 +1651,159 @@ test("handoff gate: resolve-before-wait, single settle, reset, abort", async () 
   assert.equal(g3.settled(), false);
   g3.resolve({ outcome: "reviewed", planText: "late-plan" });
   assert.equal((await g3.wait())?.planText, "late-plan");
+});
+
+test("handoff gate: an already-aborted signal resolves immediately", async () => {
+  const gate = createReviewHandoffGate();
+  const ac = new AbortController();
+  ac.abort();
+  // Regression: the old deferredWait registered a listener that could never
+  // fire, so the parked agent_end handler waited forever.
+  assert.equal(await gate.wait(ac.signal), undefined);
+  assert.equal(gate.settled(), false);
+  // The gate stays open, so an explicit settle still delivers exactly once.
+  gate.resolve({ outcome: "reviewed", planText: "late-plan" });
+  assert.equal((await gate.wait())?.planText, "late-plan");
+});
+
+test("classifyReviewExecution: a pre-aborted signal is an abort, never a pause", () => {
+  const base = {
+    ok: false,
+    aborted: false,
+    abortedBeforeStart: false,
+    paused: false,
+    planChanged: false,
+  };
+  // The exact 2026-10-25 regression: no explicit pause snapshot exists, so a
+  // pre-aborted host signal must not be classified as a pause.
+  assert.equal(
+    classifyReviewExecution({ ...base, abortedBeforeStart: true }),
+    "aborted",
+  );
+  assert.equal(
+    classifyReviewExecution({ ...base, aborted: true }),
+    "aborted",
+  );
+  assert.equal(
+    classifyReviewExecution({ ...base, aborted: true, paused: true }),
+    "paused",
+    "an explicit pause snapshot wins",
+  );
+  assert.equal(
+    classifyReviewExecution({ ...base, ok: true, planChanged: true }),
+    "rewritten",
+  );
+  assert.equal(
+    classifyReviewExecution({ ...base, ok: true, planChanged: false }),
+    "unchanged",
+  );
+  assert.equal(classifyReviewExecution(base), "fallback");
+});
+
+test("review resume helpers: settle, gate outcome and truthful notices", () => {
+  const r = (
+    outcome: ReviewExecutionResult["outcome"],
+    over: Partial<ReviewExecutionResult> = {},
+  ): ReviewExecutionResult => ({
+    planText: "plan",
+    outcome,
+    paused: outcome === "paused",
+    ...over,
+  });
+
+  assert.equal(reviewResumeSettles(r("paused")), false);
+  for (const outcome of [
+    "rewritten",
+    "unchanged",
+    "aborted",
+    "skipped",
+    "fallback",
+  ] as const) {
+    assert.equal(reviewResumeSettles(r(outcome)), true, outcome);
+  }
+
+  assert.equal(reviewResumeGateOutcome(r("rewritten")), "reviewed");
+  assert.equal(reviewResumeGateOutcome(r("unchanged")), "unreviewed");
+  assert.equal(reviewResumeGateOutcome(r("fallback")), "unreviewed");
+  assert.equal(reviewResumeGateOutcome(r("paused")), undefined);
+
+  const pausedNotice = reviewResumeNotice(r("paused"));
+  assert.ok(pausedNotice.includes("paused"));
+  assert.ok(!pausedNotice.includes("no usable rewrite"));
+  assert.ok(reviewResumeNotice(r("unchanged")).includes("kept the plan"));
+  assert.ok(reviewResumeNotice(r("rewritten")).includes("rewritten"));
+  assert.ok(
+    reviewResumeNotice(r("fallback", { reason: "provider down" })).includes(
+      "provider down",
+    ),
+  );
+  assert.ok(reviewResumeNotice(r("skipped", { reason: "already reviewed" })).includes("already reviewed"));
+});
+
+test("reviewHandoffParks requires phase + snapshot + unsettled gate", () => {
+  assert.equal(
+    reviewHandoffParks({ phase: "paused", paused: true, settled: false }),
+    true,
+  );
+  assert.equal(
+    reviewHandoffParks({ phase: "paused", paused: false, settled: false }),
+    false,
+    "a paused phase without a snapshot could never be resumed",
+  );
+  assert.equal(
+    reviewHandoffParks({ phase: "paused", paused: true, settled: true }),
+    false,
+  );
+  assert.equal(
+    reviewHandoffParks({ phase: "auditing", paused: true, settled: false }),
+    false,
+  );
+  assert.equal(
+    reviewHandoffParks({ phase: "idle", paused: true, settled: false }),
+    false,
+  );
+});
+
+test("reviewEscapeAction: pause a live round, swallow a paused gate, pass otherwise", () => {
+  assert.equal(
+    reviewEscapeAction({ roundActive: true, paused: false, gatedPause: false }),
+    "pause",
+  );
+  assert.equal(
+    reviewEscapeAction({ roundActive: true, paused: false, gatedPause: true }),
+    "pause",
+  );
+  assert.equal(
+    reviewEscapeAction({ roundActive: false, paused: true, gatedPause: true }),
+    "swallow",
+    "ESC must not abort the parked parent turn",
+  );
+  assert.equal(
+    reviewEscapeAction({ roundActive: false, paused: true, gatedPause: false }),
+    "pass",
+  );
+  assert.equal(
+    reviewEscapeAction({ roundActive: false, paused: false, gatedPause: false }),
+    "pass",
+  );
+});
+
+test("reviewStatusVisible: only a live round or a pause shows the review line", () => {
+  assert.equal(reviewStatusVisible({}), false);
+  assert.equal(reviewStatusVisible({ roundInFlight: true }), true);
+  assert.equal(reviewStatusVisible({ roundActive: true }), true);
+  assert.equal(reviewStatusVisible({ paused: true }), true);
+
+  // Regression: a retained terminal state must render the PAUSED text while
+  // paused, never "… aborted", and the widget is hidden when not visible.
+  const aborted = createReviewState({ planHash: "h", modelLabel: "m" });
+  aborted.phase = "aborted";
+  assert.ok(reviewFooterSegment(aborted, false).includes("aborted"));
+  assert.equal(
+    reviewFooterSegment(aborted, true),
+    "🔍 review paused — /review-resume to continue",
+  );
+  assert.ok(!reviewFooterSegment(aborted, true).includes("aborted"));
 });
 
 test("shouldPauseReviewOnEscape pauses exactly once per round", () => {
@@ -3584,6 +3745,11 @@ test("plan-2026-10-23: host abort (ESC) ends the round but keeps the session war
   const res = await inFlight;
   assert.equal(res.ok, false);
   assert.equal(res.reason, "aborted");
+  assert.notEqual(
+    res.abortedBeforeStart,
+    true,
+    "a mid-round abort is not a pre-start abort",
+  );
   assert.equal(res.planText, ORIGINAL_PLAN, "author's plan kept");
   assert.equal(res.fallback, true);
   assert.ok(capture.aborts >= 1, "the child run was aborted");
@@ -3628,6 +3794,11 @@ test("plan-2026-10-23: abort then resume reuses the warm session", async () => {
   ac.abort();
   const paused = await inFlight;
   assert.equal(paused.reason, "aborted");
+  assert.notEqual(
+    paused.abortedBeforeStart,
+    true,
+    "the aborted live round did start",
+  );
   assert.equal(creations.n, 1, "no reboot on abort");
   allowSubmit = true; // /review-resume on the warm session
   const resumed = await rt.runRound({
@@ -3638,6 +3809,45 @@ test("plan-2026-10-23: abort then resume reuses the warm session", async () => {
   assert.equal(resumed.ok, true, "resume completes on the warm session");
   assert.ok(resumed.planText.includes("Result<string, ExportError>"));
   assert.equal(creations.n, 1, "resume reuses the session");
+  await rt.teardown();
+});
+
+test("plan-2026-10-25: a pre-aborted host signal aborts before start, never a pause", async () => {
+  const { capture, sdk } = fakeSdk({});
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+  assert.equal(await rt.ensureStarted(), true);
+  const promptsBefore = capture.prompts.length;
+  const ac = new AbortController();
+  ac.abort();
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: ac.signal,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "aborted-before-start");
+  assert.equal(res.abortedBeforeStart, true);
+  assert.equal(res.fallback, true);
+  assert.equal(res.planText, ORIGINAL_PLAN);
+  assert.equal(res.state.phase, "aborted");
+  assert.equal(capture.prompts.length, promptsBefore, "no prompt was sent");
+  assert.equal(rt.isRoundActive(), false);
+  assert.equal(rt.isAlive(), true, "the warm session is kept");
+
+  // A cold runtime must not boot a session for a pre-aborted signal either.
+  const coldBuilt = runtimeDeps(sdk);
+  const cold = createReviewRuntime(coldBuilt.deps as never);
+  const coldRes = await cold.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: ac.signal,
+  });
+  assert.equal(coldRes.abortedBeforeStart, true);
+  assert.equal(cold.isAlive(), false, "no session was booted");
+
   await rt.teardown();
 });
 

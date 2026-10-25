@@ -847,6 +847,47 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         return fail("no plan path — the reviewer has nowhere to submit");
       }
 
+      // A signal that is already aborted means the host turn this round would
+      // belong to is gone (e.g. the planner turn was interrupted). Do not boot
+      // a session, send a prompt or spend a pass on it: report a fast abort.
+      // The caller decides what that means — the automatic handoff skips the
+      // review and hands off unreviewed, while an explicit `/review-resume`
+      // passes no host signal at all (its stop paths are ESC / `/review-abort`).
+      // Crucially, a pre-aborted signal must never become a pause: doing so
+      // re-created `pausedReview` on every resume and parked the handoff
+      // forever (2026-10-25 stall).
+      if (input.signal?.aborted === true) {
+        if (!state || state.planHash !== hash) {
+          state = createReviewState({
+            planHash: hash,
+            planPath: input.planPath,
+            modelLabel: session?.modelLabel ?? "reviewer",
+            round: input.round,
+            now: started,
+          });
+        }
+        state.round = input.round;
+        state.planPath = input.planPath;
+        state.phase = "aborted";
+        state.error =
+          "aborted before start — the host turn was already aborted";
+        state.finishedAt = Date.now();
+        try {
+          deps.onState?.(state);
+        } catch {
+          /* status updates are best-effort */
+        }
+        return {
+          ok: false,
+          fallback: true,
+          planText: originalPlan,
+          planHash: hash,
+          state,
+          reason: "aborted-before-start",
+          abortedBeforeStart: true,
+        };
+      }
+
       const ready = await ensureStarted();
       if (!ready || !session) {
         return fail("reviewer session unavailable");

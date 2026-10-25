@@ -4,6 +4,42 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Review resume no longer stalls on a stale host abort (2026-10-25)
+
+`/review-resume` reused the **parked parent turn's** `ctx.signal`. A second/leaked
+ESC while a gated review was paused aborted that parked turn, leaving the signal
+permanently aborted. Every resume then started a round, was aborted before the
+first prompt (15-18 ms), and the implicit-pause branch re-created `pausedReview`,
+so the handoff gate never settled and the plan was never handed off. Pauses are
+now **explicit-only** (ESC, `/review-pause`, or the per-round controller): a
+pre-aborted or stale host signal is an abort, never a pause. `/review-resume` runs
+on a fresh extension-owned `AbortController` and never inherits that signal; a
+pre-aborted automatic handoff skips the review and hands off the author's plan.
+While a gated review is paused, ESC is swallowed with a hint instead of aborting
+the parked turn, and Ctrl+C releases the gate and hands off the author's plan.
+`deferredWait` now resolves an already-aborted wait immediately, and the gate
+parks only when a paused phase, a snapshot and an unsettled gate all agree.
+
+Pause now also updates every surface: the gate phase, the footer, the status
+widget and the spinner all show the paused form (previously the implicit pause
+left the spinner on "Reviewing plan…" and the phase on `auditing`).
+
+**The review status line is live-only.** It was driven by the retained
+`reviewState`, so `🔍 review · pass 1/2 · 0 findings · aborted` stayed above the
+editor in Plan/Build long after the round ended; while paused it showed the
+terminal "aborted" text instead of the paused form. The footer and widget now
+share `reviewStatusVisible`, clear on every terminal path (success, failure,
+abort, mode switch, `/review-mode on`, teardown), and show the paused form while
+paused. `reviewState` is still retained for `/review-status` and the REVIEW
+SUMMARY band.
+
+Resume notices are outcome-driven (`rewritten` / `unchanged` / `paused` /
+`aborted` / `skipped` / `fallback`) instead of comparing strings, so a pause or
+failure is no longer reported as "no usable rewrite".
+
+Tests: 398 green (391 + pre-aborted-signal, deferred-wait, outcome, gate-park,
+ESC-routing and live-status coverage).
+
 ### Fixed — The active profile no longer overrides your latest model choice (2026-10-25)
 
 A profile's Default-mode model was treated as live state and re-applied on every

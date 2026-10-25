@@ -13,28 +13,19 @@
     "models.ts"
   ],
   "enabledModels": [
-    "opencode-go/muse-spark-1.2-contributor",
-    "opencode-go/mimo-v2.5",
-    "opencode-go/longcat-2.0",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/big-pickle",
-    "opencode-go/mimo-v2.5-pro",
     "opencode-go/muse-spark-1.3-contributor",
-    "opencode-go/glm-5.3-flash",
     "opencode-go/deepseek-v4.1-flash",
     "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash",
     "synthetic/hf:zai-org/GLM-5.3-Flash",
-    "synthetic/hf:Qwen/Qwen3.8-27B",
-    "opencode-go/minimax-m3.1-flash-free",
     "opencode-go/beam-free",
     "opencode-go/mimo-v2.6-flash",
-    "opencode-go/longcat-2.5-preview-free",
-    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "opencode-go/minimax-m3.1-flash-free",
+    "opencode-go/longcat-2.5-preview-free"
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "muse-spark-1.3-contributor",
+  "defaultModel": "deepseek-v4.1-flash",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -51,7 +42,6 @@
       "exploreBudget": 3,
       "timeoutMs": 0
     },
-    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
     "writePolicy": {
       "mode": "allow",
       "allowedPaths": [],
@@ -63,8 +53,9 @@
     },
     "modelDefault": {
       "provider": "opencode-go",
-      "id": "muse-spark-1.3-contributor",
+      "id": "deepseek-v4.1-flash",
       "thinking": "high"
-    }
+    },
+    "defaultProfile": "Opencode-Deepseek-V4.1-Flash"
   }
 }

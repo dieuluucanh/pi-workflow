@@ -823,6 +823,95 @@ export interface ReviewRoundResult {
   planHash: string;
   state: ReviewState;
   reason?: string;
+  /**
+   * The round never started because the host signal was already aborted.
+   * A pre-aborted signal is an abort, never a pause (see
+   * `classifyReviewExecution`).
+   */
+  abortedBeforeStart?: boolean;
+}
+
+/**
+ * How one executed review round ended. Used for user notices and for deciding
+ * whether a paused gated handoff settles. `"paused"` is the only outcome that
+ * keeps the handoff open; everything else is terminal.
+ */
+export type ReviewExecutionOutcome =
+  | "rewritten"
+  | "unchanged"
+  | "paused"
+  | "aborted"
+  | "skipped"
+  | "fallback";
+
+/** Result of one `/review`, `/review-resume` or gated handoff execution. */
+export interface ReviewExecutionResult {
+  /** Plan to hand off: the reviewer's rewrite or the author's text. */
+  planText: string;
+  outcome: ReviewExecutionOutcome;
+  /** Human-facing reason for paused / aborted / skipped / fallback. */
+  reason?: string;
+  /** True when `pausedReview` holds this revision and the gate stays open. */
+  paused: boolean;
+}
+
+/**
+ * Classify one round outcome from the pieces the orchestrator already knows.
+ *
+ * Invariant: a pre-aborted/stale host signal (`abortedBeforeStart`) is an
+ * abort, never a pause. Only an explicit pause snapshot may keep the gate
+ * open, so `paused` is decided by the caller from `pausedReview.planHash`.
+ */
+export function classifyReviewExecution(input: {
+  ok: boolean;
+  aborted: boolean;
+  abortedBeforeStart?: boolean;
+  paused: boolean;
+  planChanged: boolean;
+}): ReviewExecutionOutcome {
+  if (input.paused === true) return "paused";
+  if (input.ok === true) return input.planChanged ? "rewritten" : "unchanged";
+  if (input.aborted === true || input.abortedBeforeStart === true) {
+    return "aborted";
+  }
+  return "fallback";
+}
+
+/** True when a resume outcome ends the round (everything except a re-pause). */
+export function reviewResumeSettles(result: ReviewExecutionResult): boolean {
+  return result.outcome !== "paused";
+}
+
+/**
+ * Gate outcome for a settled resume. Only a real rewrite counts as reviewed;
+ * an unchanged plan, a skip, an abort or a fallback hands off the author's
+ * plan. `undefined` means "keep the gate parked" (the round paused again).
+ */
+export function reviewResumeGateOutcome(
+  result: ReviewExecutionResult,
+): "reviewed" | "unreviewed" | undefined {
+  if (result.outcome === "paused") return undefined;
+  return result.outcome === "rewritten" ? "reviewed" : "unreviewed";
+}
+
+/** One accurate user-facing notice for a resume result. */
+export function reviewResumeNotice(result: ReviewExecutionResult): string {
+  const reason = result.reason ? ` (${result.reason})` : "";
+  switch (result.outcome) {
+    case "paused":
+      return "Review paused again — /review-resume to continue, /review-abort to stop.";
+    case "rewritten":
+      return "Review finished — plan rewritten and saved.";
+    case "unchanged":
+      return "Review finished — the reviewer kept the plan as-is.";
+    case "aborted":
+      return "Review stopped — the author's plan stands.";
+    case "skipped":
+      return `Review skipped${reason} — the plan will be handed over as-is.`;
+    case "fallback":
+    default:
+      return `Review could not complete${reason} — the plan will be handed over unreviewed (run /review to retry).`;
+  }
 }
 
 const DISPOSITIONS: readonly ReviewDisposition[] = [
@@ -1069,6 +1158,10 @@ function deferredWait<T>(
 ): Promise<T | undefined> {
   const existing = current();
   if (existing !== undefined) return Promise.resolve(existing);
+  // A signal that is already aborted must resolve immediately: its `abort`
+  // event has already fired, so a listener registered below would never run
+  // and the caller (the gated handoff) would wait forever.
+  if (signal?.aborted === true) return Promise.resolve(undefined);
   return new Promise<T | undefined>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1237,6 +1330,37 @@ export function shouldPauseReviewOnEscape(input: {
   return input.roundActive === true && input.paused !== true;
 }
 
+/** What the review ESC listener should do with one key press. */
+export type ReviewEscapeAction = "pause" | "swallow" | "pass";
+
+/**
+ * Route an ESC press while a review owns the turn.
+ *
+ * - A live, unpaused round pauses (exactly once per round).
+ * - A paused **gated** handoff swallows ESC with a hint: letting it reach the
+ *   editor aborts the parked parent turn and poisons `ctx.signal` for every
+ *   later `/review-resume` (the 2026-10-25 stall). `/review-abort` is the
+ *   explicit exit.
+ * - Everything else passes ESC through to the editor / questionnaire / handoff
+ *   selector.
+ */
+export function reviewEscapeAction(input: {
+  roundActive: boolean;
+  paused: boolean;
+  gatedPause: boolean;
+}): ReviewEscapeAction {
+  if (
+    shouldPauseReviewOnEscape({
+      roundActive: input.roundActive,
+      paused: input.paused,
+    })
+  ) {
+    return "pause";
+  }
+  if (input.paused === true && input.gatedPause === true) return "swallow";
+  return "pass";
+}
+
 /**
  * Footer segment for a live review phase, composed into the single
  * `"workflow"` status by `updateStatus`. Empty when no review is live, so
@@ -1249,6 +1373,28 @@ export function reviewFooterSegment(
   if (paused) return "🔍 review paused — /review-resume to continue";
   if (!state) return "";
   return reviewStateSummary(state);
+}
+
+/**
+ * Whether the review status surfaces (footer segment and status widget) should
+ * be visible at all.
+ *
+ * A review owns the turn only while a round is in flight (including the
+ * cold-start `activeReview` window before `isRoundActive()` flips) or a pause
+ * exists. `reviewState` alone is deliberately NOT enough: it is retained after
+ * a round for `/review-status` and the REVIEW SUMMARY band, and using it to
+ * drive the widget left a stale "🔍 review … aborted" line in Plan/Build mode.
+ */
+export function reviewStatusVisible(input: {
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+}): boolean {
+  return (
+    input.roundInFlight === true ||
+    input.roundActive === true ||
+    input.paused === true
+  );
 }
 
 // ── Mode-switch lock (plan 2026-10-25) ───────────────────────────────
@@ -1307,6 +1453,26 @@ export function reviewGatePhaseOnResume(
   phase: ReviewHandoffPhase,
 ): ReviewHandoffPhase {
   return phase === "paused" ? "auditing" : phase;
+}
+
+/**
+ * Whether the gated handoff may park on the review gate.
+ *
+ * Invariant: parking requires all three — a paused phase, a pause snapshot for
+ * the current revision, and an unsettled gate. A phase without a snapshot (a
+ * stale/implicit pause) could never be released by `/review-resume`, so the
+ * handoff must settle with the author's plan instead of waiting forever.
+ */
+export function reviewHandoffParks(input: {
+  phase: ReviewHandoffPhase;
+  paused: boolean;
+  settled: boolean;
+}): boolean {
+  return (
+    input.phase === "paused" &&
+    input.paused === true &&
+    input.settled !== true
+  );
 }
 
 /** One short notice for a blocked mode transition. */
