@@ -43,7 +43,7 @@
       "timeoutMs": 0
     },
     "writePolicy": {
-      "mode": "allow",
+      "mode": "ask",
       "allowedPaths": [],
       "allowedCommands": [
         "sed -n '260,340p' docs/multi_gpu.md",

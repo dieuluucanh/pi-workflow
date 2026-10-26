@@ -4,25 +4,6 @@ All notable changes to this package are documented in this file.
 
 ## [0.8.0] - 2026-10-26
 
-### Fixes
-
-- narrate a resumed review as a resume, not a fresh start (d4b9552)
-- give Tab back to autocomplete while a suggestion list is open (76c3425)
-- keep questionnaire choices visible in a scrollable bottom-sheet (2a36a91)
-
-### Other changes
-
-- real type-to-filter pickers and close-after-action for /profile & /role (1881ade)
-- fix review resume stalling on a stale host abort (83e5eb1)
-- make profile model a seed and activation the default-profile trigger (d7e708b)
-- persist the selected model as the default for the next session (a918012)
-- show full model refs in /profile and /role pickers (df851b5)
-- lock mode switching during review, gate handoff on the current run (fdc9f28)
--  workflow: gated review handoff — reviewer runs before handoff renders (ff67019)
-- fast-path interactive review; ad-hoc /review works with mode off (1bf7a15)
-
-## [Unreleased]
-
 ### Fixed — Resuming a review no longer reads as a fresh start (2026-10-25)
 
 `/review-resume` was correct internally — the warm reviewer session, its round
