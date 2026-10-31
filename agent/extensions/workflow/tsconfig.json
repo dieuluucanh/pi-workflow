@@ -47,6 +47,8 @@
     "./review-ui.ts",
     "./review.test.ts",
     "./review-ui.test.ts",
+    "./test-support.ts",
+    "./extension.test.ts",
     "./permissions.test.ts"
   ],
   "exclude": ["node_modules"]

@@ -532,6 +532,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     const remaining = (): number | undefined =>
       deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
     let sendError: unknown;
+    // The losing waiters in the pass race must be cancelled when the winner
+    // settles. Otherwise their timers (up to `timeoutMs`, 5 minutes by
+    // default) stay referenced and keep the process alive after the round.
+    const waitAbort = new AbortController();
 
     const stop = await new Promise<PassStop>((resolve) => {
       let done = false;
@@ -542,6 +546,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         done = true;
         if (timer !== undefined) clearTimeout(timer);
         rc.signal.removeEventListener("abort", onAbort);
+        waitAbort.abort();
         resolve(s);
       };
       if (rc.signal.aborted) {
@@ -551,10 +556,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       const cap = remaining();
       if (cap !== undefined) timer = setTimeout(() => finish("timeout"), cap);
       rc.signal.addEventListener("abort", onAbort, { once: true });
-      void gate.waitForPassDone(remaining(), rc.signal).then((result) => {
+      void gate.waitForPassDone(remaining(), waitAbort.signal).then((result) => {
         if (result) finish("passDone");
       });
-      void waitForSettle(baseline, remaining(), rc.signal).then((did) => {
+      void waitForSettle(baseline, remaining(), waitAbort.signal).then((did) => {
         if (did) finish("settled");
       });
       void send().catch((e: unknown) => {

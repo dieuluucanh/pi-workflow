@@ -934,22 +934,27 @@ export function isPlanWritePath(p: string, cwd: string): boolean {
 /** Inputs for deciding whether this run may hand a plan off. */
 export interface PlanHandoffEligibility {
   mode: "plan" | "build" | null;
-  /** The run started in Plan mode (not a Build turn that flipped to Plan). */
-  runStartedInPlan: boolean;
   /** This run wrote/edited a file under `.pi/plans/`. */
   planWrittenThisRun: boolean;
+  /**
+   * The write happened while Plan mode was active. A run that starts in
+   * Default/Build and switches to Plan mid-run counts; a plan written before
+   * the switch does not. `agent_end`'s current-run message scan sets this too
+   * when the run ends in Plan (the tool_result handler was missed).
+   */
+  planWrittenInPlanMode: boolean;
 }
 
 /**
  * A handoff requires all three: the workflow is in Plan mode NOW, the run
- * started in Plan mode, and the run actually wrote a plan. Session-lifetime
+ * wrote a plan, and that write happened under Plan mode. Session-lifetime
  * plan files and old todos never authorize a handoff.
  */
 export function shouldHandoffPlan(input: PlanHandoffEligibility): boolean {
   return (
     input.mode === "plan" &&
-    input.runStartedInPlan === true &&
-    input.planWrittenThisRun === true
+    input.planWrittenThisRun === true &&
+    input.planWrittenInPlanMode === true
   );
 }
 
@@ -973,6 +978,73 @@ export function findPlanWritePathInMessages(
       if (b.name !== "write" && b.name !== "edit") continue;
       const p = b.arguments?.path ?? b.arguments?.file_path;
       if (typeof p === "string" && p && isPlanWritePath(p, cwd)) return p;
+    }
+  }
+  return undefined;
+}
+
+/** Where a manual `/review` found the plan it is about to audit. */
+export type PlanPathSource =
+  | "explicit"
+  | "run"
+  | "session"
+  | "handoff"
+  | "branch";
+
+export interface PlanPathCandidate {
+  path?: string | null;
+  source: PlanPathSource;
+}
+
+export interface PlanPathSelection {
+  path: string;
+  source: PlanPathSource;
+}
+
+/**
+ * Pick the first readable plan for a manual `/review`.
+ *
+ * Candidates arrive in priority order (`explicit` → `run` → `session` →
+ * `handoff` → `branch`). Missing, empty and unreadable candidates are skipped;
+ * a plan that disappeared since it was written must never win over the next
+ * candidate. Pure: the caller owns path resolution and the filesystem probe.
+ */
+export function choosePlanPath(
+  candidates: readonly PlanPathCandidate[],
+  isReadable: (absolutePath: string) => boolean,
+): PlanPathSelection | undefined {
+  for (const candidate of candidates) {
+    const p = candidate.path;
+    if (typeof p !== "string" || p.length === 0) continue;
+    if (isReadable(p)) return { path: p, source: candidate.source };
+  }
+  return undefined;
+}
+
+/**
+ * Newest plan reference in a session branch, used as the last manual
+ * `/review` fallback after a reload or when the in-memory path was lost.
+ *
+ * Recognises the persisted `workflow` entry (`planFile`), the
+ * `workflow-handoff-resolve` entry (`planPath`), and an assistant `write`/
+ * `edit` tool call under `.pi/plans/`. Scans newest-first and never throws.
+ */
+export function findLatestPlanWriteInBranch(
+  entries: readonly unknown[],
+  cwd: string,
+): string | undefined {
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as any;
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "custom") {
+      const p = e.data?.planPath ?? e.data?.planFile;
+      if (typeof p === "string" && p && isPlanWritePath(p, cwd)) return p;
+      continue;
+    }
+    if (e.type === "message" && e.message) {
+      const found = findPlanWritePathInMessages([e.message], cwd);
+      if (found) return found;
     }
   }
   return undefined;

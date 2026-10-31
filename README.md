@@ -51,6 +51,10 @@ pi -e npm:@dieulc/workflow
 
 Manage them with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workflow`.
 
+> Folder checkpoints (`@dieulc/checkpoints`) moved to the Pi Desktop repository.
+> Install it with `pi install npm:@dieulc/checkpoints`; it is not part of this
+> dotfiles repo.
+
 ### B — The dotfiles (git clone)
 
 This repo **is** `~/.pi`. Clone it directly:

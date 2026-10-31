@@ -5,9 +5,7 @@ agent/sessions/
 agent/memory/
 sessions/
 agent/checkpoints/
-# runtime shadow repos only — do NOT ignore agent/extensions/checkpoints, the
-# published @dieulc/checkpoints package lives there.
-/checkpoints/
+checkpoints/
 # dependencies — ignore at any depth (workflow, npm, future extensions)
 **/node_modules/
 # jiti / build caches

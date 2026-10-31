@@ -41,7 +41,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
-| `/review` | Run a one-shot review round now — works with Review Mode on or off (mode stays OFF) |
+| `/review [path]` | Run a one-shot review round now. Without a path it uses this run's plan write, then the session's latest plan write; works with Review Mode on or off (mode stays OFF). An explicit path must be under `.pi/plans/` |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
@@ -81,14 +81,13 @@ Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-
 
 ## Review Mode
 
-An independent second agent supervises the plan without freezing your session. The handoff renders **immediately** with the author's plan (marked "review pending") while the reviewer works **in the background**; the plan file is updated when the review lands.
+An independent second agent audits the plan before the handoff renders. The handoff waits for the gated round; the reviewed plan (the reviewer writes the plan file mid-round) is what you see, and the todo steps are re-synced to match. The reviewer runs in its own child session, so Plan Mode and Build Mode never see its prompt, findings or transcript.
 
 ```text
-Plan Mode (main session) ──plan file──▶ handoff renders at once (author's plan)
-                                              │  ╰─▶ Review Mode (child session, background)
-                                              │         │ rewrites the plan file
-                                              │         ▼
-                                              │      "review landed" notice
+Plan Mode (main session) ──plan file──▶ Review Mode (child session, gated)
+                                              │ rewrites the plan file
+                                              ▼
+                                   handoff renders the reviewed plan
                                               ▼
         Plannotator webview ◀── plan file + `## Review changes`
                 │ approve ──▶ Build Mode (review activity suspends, session stays warm)
@@ -233,7 +232,9 @@ Delivery to the reviewer is best-effort: if it fails, the message stays in the p
 
 The handoff **waits for the reviewer**: no browser prompt or inline choice renders until the gated round lands, fails, or you pause/abort it. The reviewed plan (the reviewer writes the plan file mid-round) becomes the handed-off text, with the todo steps re-synced to match. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
 
-A handoff opens **only when the current Plan run writes or edits a `.pi/plans/` file**. Switching Build → Plan keeps the previous plan and todos as reference, but they cannot be handed off again until the new run writes a plan. A fresh prompt also supersedes any pending browser/inline handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
+A handoff opens **only when the current run writes or edits a `.pi/plans/` file while Plan mode is active**. A mid-run switch into Plan counts — the write after the switch is eligible. A plan written before the switch does not auto-handoff: the extension shows `Plan file ready: <path>. Run /review to audit it.` and leaves the plan for the manual command. Switching Build → Plan keeps the previous plan and todos as reference; a fresh prompt also supersedes any pending browser/inline handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
+
+`/review` resolves its target independently of the handoff, so a plan is never unreachable because of how Plan mode was entered: explicit path → this run's last plan write → the session's last plan write → the last handed-off plan → the newest plan write in the session branch. Missing, empty or unreadable candidates are skipped; the resolved path is named when it came from a fallback; the reviewer writes back to that same file. With no candidate it lists the newest `.pi/plans/*.md` files and the explicit-path syntax. `/review <path>` is restricted to `.pi/plans/`.
 
 - **Mode switching is locked** from the moment a review round starts (including the cold boot) until it lands, fails, or is aborted, and for the whole paused state. `Tab` (when no suggestion list is open), `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. `/review-abort` and `/review-mode off` end the lock; the post-review handoff prompt is intentionally unlocked because the independent reviewer has finished.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. One long-lived terminal listener maps it to `/review-pause` semantics (warm session kept) and stays registered through the paused window: a second ESC while a gated review is paused is swallowed with a hint instead of aborting the parked plan turn (that abort used to poison the turn's signal and stall every `/review-resume`). With no review owning the turn it passes ESC through, so the editor, questionnaire and handoff selector keep it. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.

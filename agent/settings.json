@@ -7,7 +7,7 @@
     "npm:@plannotator/pi-extension",
     "npm:pi-memory",
     "npm:@dieulc/pi-office-protocol@0.3.0",
-    "npm:@dieulc/pi-office-bridge@^0.5.0"
+    "npm:@dieulc/pi-office-bridge@^0.6.0"
   ],
   "extensions": [
     "models.ts"
@@ -43,7 +43,7 @@
       "timeoutMs": 0
     },
     "writePolicy": {
-      "mode": "ask",
+      "mode": "allow",
       "allowedPaths": [],
       "allowedCommands": [
         "sed -n '260,340p' docs/multi_gpu.md",

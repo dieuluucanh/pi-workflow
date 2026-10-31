@@ -9,6 +9,9 @@ How the four `@dieulc/*` Pi extensions in this repo are verified and published t
 | `@dieulc/server-logs` | `agent/extensions/server-logs` | <https://www.npmjs.com/package/@dieulc/server-logs> |
 | `@dieulc/browser-inspector` | `agent/extensions/browser-inspector` | <https://www.npmjs.com/package/@dieulc/browser-inspector> |
 
+> `@dieulc/checkpoints` moved to the Pi Desktop repository (`packages/checkpoints`);
+> it is not released from this repo.
+
 Each package is published **independently**: its own version, its own tag (`@dieulc/workflow@0.2.0`), its own `CHANGELOG.md`. The repo root (`@dieulc/pi-workflow`) is `"private": true` and is **never published** — it is the dotfiles repo plus the release tooling.
 
 > **Local releases, by design.** Publishing happens on this machine with `npm publish` under the logged-in `dieulc` account. That keeps the flow to one command, but it means npm **provenance attestations are not generated** (those require a CI/OIDC publisher). Everything else — semver bumps, per-package changelogs, version↔tag symmetry, idempotent publishing — already matches the shape a CI publisher needs, so trusted publishing can be added later without changing this workflow.

@@ -2,6 +2,42 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.8.1] - 2026-10-31
+
+### Fixed — `/review` finds the plan you just wrote (2026-10-31)
+
+Starting in Default mode and switching to Plan mid-session left the written plan
+visible in the transcript but unreachable by Review: `/review` only read
+`currentPlanFile`, which was assigned at approval/handoff/restore — never on a
+plan write — and the automatic handoff required the run to have **started** in
+Plan mode. `setPlanMode` also cleared the session's last plan path, so a plan
+written before the switch had no remaining reference.
+
+- **Manual `/review` is now self-sufficient.** It resolves a readable plan in a
+  stable priority order: explicit `path` → this run's last write → the session's
+  last write → the last handed-off plan → the newest write in the session branch.
+  Missing/unreadable candidates are skipped; the resolved path is named when it
+  came from a fallback; the reviewer's `review_submit_plan` writes to that same
+  file. `/review <path>` is accepted (restricted to `.pi/plans/`), and a bare
+  `/review` with no candidate lists the newest `.pi/plans/*.md` files.
+- **Automatic handoff eligibility is mode-at-write.** A mid-run switch into Plan
+  now reviews the plan written after the switch. The per-run write check still
+  prevents stale plans from being resurrected; a plan written before the switch
+  gets `Plan file ready: <path>. Run /review to audit it.` instead of silently
+  falling back.
+- **Plan targets survive mode switches and prompts.** `currentPlanFile` is set on
+  every `.pi/plans/` write and persisted once at `agent_end`; the session-scoped
+  last plan path is no longer cleared by `resetPlanRunProvenance`. Restore no
+  longer lets an entry without `planFile` erase an earlier one, and `/tree`
+  re-derives the plan (or clears it) for the branch that was rewound to.
+- **Pass-race timers are cancelled when a pass ends.** The losing waiters in a
+  review pass no longer leave the configured timeout armed after the round (or
+  the process) finished.
+
+Tests: 480 (new `extension.test.ts` covers Default→Plan→`/review`, mid-run
+switch→handoff, pre-switch write→notice, explicit path, no plan, Review Mode off,
+restore and `/tree`).
+
 ## [0.8.0] - 2026-10-26
 
 ### Fixed — Resuming a review no longer reads as a fresh start (2026-10-25)

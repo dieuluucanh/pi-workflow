@@ -32,6 +32,8 @@ import {
   shouldRemind,
   shouldHandoffPlan,
   findPlanWritePathInMessages,
+  findLatestPlanWriteInBranch,
+  choosePlanPath,
   TURNS_SINCE_WRITE,
   type TodoItem,
   type TodoUpdateEntry,
@@ -872,48 +874,33 @@ test("refs are always 1..N and unique after merge/update", () => {
 
 // ══ Handoff provenance (plan 2026-10-25 follow-up) ═══════════════════
 
-test("shouldHandoffPlan requires Plan + started in Plan + a plan write", () => {
+test("shouldHandoffPlan requires Plan + a write made under Plan mode", () => {
+  const base = {
+    mode: "plan" as const,
+    planWrittenThisRun: true,
+    planWrittenInPlanMode: true,
+  };
+  assert.equal(shouldHandoffPlan(base), true);
+  assert.equal(shouldHandoffPlan({ ...base, mode: "build" }), false);
+  assert.equal(shouldHandoffPlan({ ...base, mode: null }), false);
   assert.equal(
-    shouldHandoffPlan({
-      mode: "plan",
-      runStartedInPlan: true,
-      planWrittenThisRun: true,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldHandoffPlan({
-      mode: "build",
-      runStartedInPlan: true,
-      planWrittenThisRun: true,
-    }),
+    shouldHandoffPlan({ ...base, planWrittenInPlanMode: false }),
     false,
+    "a plan written before switching into Plan does not auto-handoff",
   );
   assert.equal(
-    shouldHandoffPlan({
-      mode: null,
-      runStartedInPlan: true,
-      planWrittenThisRun: true,
-    }),
-    false,
-  );
-  assert.equal(
-    shouldHandoffPlan({
-      mode: "plan",
-      runStartedInPlan: false,
-      planWrittenThisRun: true,
-    }),
-    false,
-    "a Build-originated run that flipped to Plan never hands off",
-  );
-  assert.equal(
-    shouldHandoffPlan({
-      mode: "plan",
-      runStartedInPlan: true,
-      planWrittenThisRun: false,
-    }),
+    shouldHandoffPlan({ ...base, planWrittenThisRun: false }),
     false,
     "an old plan file alone never hands off",
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "plan",
+      planWrittenThisRun: true,
+      planWrittenInPlanMode: true,
+    }),
+    true,
+    "REGRESSION 2026-10-31: a mid-run switch into Plan still hands off",
   );
 });
 
@@ -985,5 +972,122 @@ test("findPlanWritePathInMessages reads only the supplied (current) run", () => 
   assert.equal(
     findPlanWritePathInMessages([{ role: "user", content: "junk" }], cwd),
     undefined,
+  );
+});
+
+// ══ Manual /review plan resolution (plan 2026-10-31) ═════════════════
+
+test("choosePlanPath prefers explicit, then run/session/handoff, skipping unreadable", () => {
+  const readable = new Set(["/proj/.pi/plans/run.md", "/proj/.pi/plans/session.md"]);
+  assert.deepEqual(
+    choosePlanPath(
+      [
+        { path: "/proj/.pi/plans/explicit.md", source: "explicit" },
+        { path: "/proj/.pi/plans/run.md", source: "run" },
+        { path: "/proj/.pi/plans/session.md", source: "session" },
+      ],
+      (p) => readable.has(p),
+    ),
+    { path: "/proj/.pi/plans/run.md", source: "run" },
+  );
+  assert.deepEqual(
+    choosePlanPath(
+      [
+        { path: "/proj/.pi/plans/missing.md", source: "run" },
+        { path: "/proj/.pi/plans/session.md", source: "session" },
+      ],
+      (p) => readable.has(p),
+    ),
+    { path: "/proj/.pi/plans/session.md", source: "session" },
+    "a deleted run write falls through to the session target",
+  );
+  assert.equal(
+    choosePlanPath(
+      [
+        { path: null, source: "run" },
+        { path: "", source: "session" },
+        { path: "/proj/.pi/plans/nope.md", source: "handoff" },
+      ],
+      () => false,
+    ),
+    undefined,
+  );
+});
+
+test("findLatestPlanWriteInBranch reads the newest branch reference", () => {
+  const cwd = "C:/repo";
+  const entries = [
+    {
+      type: "custom",
+      customType: "workflow",
+      data: { planFile: ".pi/plans/2026-10-20-old.md" },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: { path: ".pi/plans/2026-10-31-tool.md" },
+          },
+        ],
+      },
+    },
+    {
+      type: "custom",
+      customType: "workflow-handoff-resolve",
+      data: { planPath: "C:\\repo\\.pi\\plans\\2026-10-31-latest.md" },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "write",
+        details: { path: ".pi/plans/ignored.md" },
+      },
+    },
+  ];
+  assert.equal(
+    findLatestPlanWriteInBranch(entries, cwd),
+    "C:\\repo\\.pi\\plans\\2026-10-31-latest.md",
+    "newest custom reference wins",
+  );
+  assert.equal(
+    findLatestPlanWriteInBranch(
+      [
+        {
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                name: "edit",
+                arguments: { file_path: ".pi/plans/2026-10-31-edit.md" },
+              },
+            ],
+          },
+        },
+      ],
+      cwd,
+    ),
+    ".pi/plans/2026-10-31-edit.md",
+  );
+  assert.equal(findLatestPlanWriteInBranch([], cwd), undefined);
+  assert.equal(
+    findLatestPlanWriteInBranch(
+      [
+        {
+          type: "custom",
+          customType: "workflow",
+          data: { planFile: "src/app.ts" },
+        },
+      ],
+      cwd,
+    ),
+    undefined,
+    "non-plan references are ignored",
   );
 });

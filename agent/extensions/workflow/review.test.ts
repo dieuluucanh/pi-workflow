@@ -109,54 +109,19 @@ import {
   findParentProviderSurface,
   seedChildRuntimeProviders,
 } from "./review-providers.ts";
+import {
+  FAKE_BUILTIN_TOOLS,
+  HIGH_FINDING,
+  ORIGINAL_PLAN,
+  REWRITTEN_PLAN,
+  fakeSdk,
+  submitThenFinish,
+  submitThenFinishPass2,
+  tmpProject,
+  type FakeCapture,
+} from "./test-support.ts";
 
 // ── Fixtures ─────────────────────────────────────────────────────────
-
-const ORIGINAL_PLAN = [
-  "# Plan: Add CSV export",
-  "",
-  "## Context",
-  "The reports page needs CSV export following the existing export conventions.",
-  "",
-  "## Plan Steps",
-  "",
-  "1. Add a CSV serializer in src/export/csv.ts",
-  "2. Wire a download button into the reports toolbar",
-  "3. Add tests under tests/export/",
-  "",
-  "## Verification",
-  "- Run the export test suite",
-].join("\n");
-
-/** A realistic rewrite: adds framework detail and a step, keeps the shape. */
-const REWRITTEN_PLAN = ORIGINAL_PLAN.replace(
-  "1. Add a CSV serializer in src/export/csv.ts",
-  "1. Add a CSV serializer in src/export/csv.ts returning Result<string, ExportError>, matching src/export/json.ts\n2. Register the format in src/export/index.ts so feature flags apply",
-).replace(
-  "3. Add tests under tests/export/",
-  "4. Add tests under tests/export/ following the table-driven pattern",
-);
-
-function tmpProject(): { root: string; cwd: string; agentDir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rv-test-"));
-  const cwd = path.join(root, "proj");
-  const agentDir = path.join(root, "agent");
-  fs.mkdirSync(cwd, { recursive: true });
-  fs.mkdirSync(agentDir, { recursive: true });
-  return { root, cwd, agentDir };
-}
-
-const HIGH_FINDING = {
-  id: "F1",
-  severity: 9,
-  confidence: 85,
-  category: "framework-alignment",
-  file: "src/export/csv.ts",
-  lineRange: "1",
-  summary: "Plan ignored the Result<T,E> convention",
-  rationale: "Every sibling exporter returns Result.",
-  disposition: "accepted" as const,
-};
 
 // ══ Step 2: configuration ═════════════════════════════════════════════
 
@@ -2347,168 +2312,6 @@ test("createReviewTools: reports missing SDK pieces instead of throwing", () => 
 
 // ══ Steps 18-25: orchestrator (fake SDK, no provider needed) ══════════
 
-interface FakeCapture {
-  prompts: string[];
-  followUps: string[];
-  tools: Record<string, { execute: (...args: unknown[]) => Promise<unknown> }>;
-  /** The `tools` allowlist the runtime passed to createAgentSession. */
-  toolAllowlist: string[];
-  /** Tool names the child session reports as enabled. */
-  activeTools: string[];
-  /** How many times the child's `abort()` was called. */
-  aborts: number;
-  unsubscribeCount: number;
-  /** Emit an arbitrary child-session event (provider-error scripts use this). */
-  emit: (event: unknown) => void;
-}
-
-/** Built-in tool names the SDK registers before the allowlist is applied. */
-const FAKE_BUILTIN_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
-
-/**
- * A fake SDK whose "model" invokes the real review tools.
- *
- * This exercises the genuine orchestration path — tool wiring, the round gate,
- * the pass 1 → pass 2 advance, the fallback on timeout, and teardown — without
- * a provider, a network call, or a real child session.
- *
- * It also reproduces the SDK behaviour that caused the "reviewer can never
- * submit" bug (see `reviewToolAllowlist`): `tools` is a GLOBAL allowlist applied
- * to built-in AND custom tools, and `getActiveToolNames()` reports the result.
- * Finishing a run emits `agent_settled`, exactly like a real session does after
- * its post-run continuations, so the runtime's settle detection is exercised.
- */
-function fakeSdk(script: {
-  pass1?: (c: FakeCapture) => Promise<void>;
-  pass2?: (c: FakeCapture) => Promise<void>;
-  shouldThrowOnCreate?: boolean;
-  /** Child runtime double handed out by ModelRuntime.create (default {}). */
-  runtime?: unknown;
-  /** Make the child's first prompt reject with this value (preflight-style). */
-  failPrompt1?: unknown;
-}): { capture: FakeCapture; sdk: unknown } {
-  const capture: FakeCapture = {
-    prompts: [],
-    followUps: [],
-    tools: {},
-    toolAllowlist: [],
-    activeTools: [],
-    aborts: 0,
-    unsubscribeCount: 0,
-    emit: () => {},
-  };
-  const sdk = {
-    ModelRuntime: { create: async () => script.runtime ?? {} },
-    DefaultResourceLoader: class {
-      async reload() {}
-    },
-    SessionManager: { inMemory: () => ({}) },
-    createBashToolDefinition: () => ({
-      parameters: {},
-      execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
-    }),
-    createAgentSession: async (opts: {
-      tools?: string[];
-      customTools?: Array<{ name: string }>;
-    }) => {
-      if (script.shouldThrowOnCreate) throw new Error("session create failed");
-      capture.toolAllowlist = [...(opts.tools ?? [])];
-      for (const t of opts.customTools ?? []) {
-        capture.tools[t.name] = t as never;
-      }
-      // Pi's real rule: only names in `tools` survive, built-in or custom.
-      const allow = opts.tools ? new Set(opts.tools) : undefined;
-      const registered = new Set<string>([
-        ...FAKE_BUILTIN_TOOLS,
-        ...Object.keys(capture.tools),
-      ]);
-      capture.activeTools = [...registered].filter(
-        (n) => !allow || allow.has(n),
-      );
-
-      const listeners: Array<(event: unknown) => void> = [];
-      const emit = (event: unknown): void => {
-        for (const l of [...listeners]) l(event);
-      };
-      capture.emit = emit;
-      return {
-        session: {
-          subscribe: (listener: (event: unknown) => void) => {
-            capture.unsubscribeCount += 1;
-            listeners.push(listener);
-            return () => {
-              const i = listeners.indexOf(listener);
-              if (i >= 0) listeners.splice(i, 1);
-            };
-          },
-          prompt: async (text: string) => {
-            capture.prompts.push(text);
-            if (script.failPrompt1 !== undefined) throw script.failPrompt1;
-            emit({
-              type: "tool_execution_start",
-              toolCallId: "t1",
-              toolName: "read",
-              args: { path: "plan.md" },
-            });
-            emit({
-              type: "tool_execution_end",
-              toolCallId: "t1",
-              toolName: "read",
-              isError: false,
-            });
-            emit({
-              type: "message_update",
-              assistantMessageEvent: {
-                type: "text_delta",
-                delta: "reviewing…\n",
-              },
-            });
-            try {
-              await script.pass1?.(capture);
-            } finally {
-              emit({ type: "agent_settled" });
-            }
-          },
-          followUp: async (text: string) => {
-            capture.followUps.push(text);
-            emit({
-              type: "tool_execution_start",
-              toolCallId: "t2",
-              toolName: "grep",
-              args: { pattern: "TODO" },
-            });
-            emit({
-              type: "tool_execution_end",
-              toolCallId: "t2",
-              toolName: "grep",
-              isError: false,
-            });
-            emit({
-              type: "message_update",
-              assistantMessageEvent: {
-                type: "text_delta",
-                delta: "verifying…\n",
-              },
-            });
-            try {
-              await script.pass2?.(capture);
-            } finally {
-              emit({ type: "agent_settled" });
-            }
-          },
-          abort: async () => {
-            capture.aborts += 1;
-          },
-          isStreaming: false,
-          getActiveToolNames: () => capture.activeTools.slice(),
-          bindExtensions: async () => {},
-        },
-      };
-    },
-  };
-  return { capture, sdk };
-}
-
 function runtimeDeps(
   sdk: unknown,
   over: {
@@ -2576,54 +2379,6 @@ function runtimeDeps(
   }
   return { deps, writes, logs };
 }
-
-const submitThenFinish =
-  (plan: string) =>
-  async (c: FakeCapture): Promise<void> => {
-    await c.tools.review_submit_plan.execute(
-      "1",
-      {
-        planMarkdown: plan,
-        findings: [HIGH_FINDING],
-        verdict: "revise",
-        summary: "aligned",
-      },
-      undefined,
-      undefined,
-      {},
-    );
-    await c.tools.review_pass_done.execute(
-      "2",
-      { pass: 1, verdict: "revise", findings: [HIGH_FINDING] },
-      undefined,
-      undefined,
-      {},
-    );
-  };
-
-const submitThenFinishPass2 =
-  (plan: string) =>
-  async (c: FakeCapture): Promise<void> => {
-    await c.tools.review_submit_plan.execute(
-      "3",
-      {
-        planMarkdown: plan,
-        findings: [],
-        verdict: "approve",
-        summary: "verified",
-      },
-      undefined,
-      undefined,
-      {},
-    );
-    await c.tools.review_pass_done.execute(
-      "4",
-      { pass: 2, verdict: "approve", findings: [] },
-      undefined,
-      undefined,
-      {},
-    );
-  };
 
 test("runtime: full round wires all tools, verifies, and returns the rewrite", async () => {
   const { capture, sdk } = fakeSdk({
