@@ -24,8 +24,8 @@
     "opencode-go/longcat-2.5-preview-free"
   ],
   "defaultThinkingLevel": "high",
-  "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4.1-flash",
+  "defaultProvider": "synthetic",
+  "defaultModel": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -52,10 +52,13 @@
       "mutatingTools": []
     },
     "modelDefault": {
-      "provider": "opencode-go",
-      "id": "deepseek-v4.1-flash",
+      "provider": "synthetic",
+      "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
       "thinking": "high"
     },
-    "defaultProfile": "Opencode-Deepseek-V4.1-Flash"
+    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
+    "commitPolicy": {
+      "mode": "never"
+    }
   }
 }
