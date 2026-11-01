@@ -32,6 +32,7 @@ import {
 interface BootOptions {
   enabled?: boolean;
   verify?: boolean;
+  modelRegistry?: { find?: (provider: string, id: string) => unknown };
   script?: {
     pass1?: (c: FakeCapture) => Promise<void>;
     pass2?: (c: FakeCapture) => Promise<void>;
@@ -71,6 +72,7 @@ async function boot(over: BootOptions = {}) {
     cwd,
     hasUI: false,
     branch: over.branch ?? [],
+    ...(over.modelRegistry ? { modelRegistry: over.modelRegistry } : {}),
   });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
@@ -92,9 +94,13 @@ async function boot(over: BootOptions = {}) {
 
 function placePlan(
   cwd: string,
-  name = "2026-10-31-review-target.md",
+  name = "review-target.md",
 ): { rel: string; abs: string } {
-  const rel = path.join(".pi", "plans", name);
+  // The plan target must be dated TODAY (UTC): `normalizePlanPath` rewrites a
+  // stale date prefix, so a hard-coded fixture date would have the reviewer
+  // write a different file than the one the test reads back.
+  const today = new Date().toISOString().slice(0, 10);
+  const rel = path.join(".pi", "plans", `${today}-${name}`);
   const abs = path.join(cwd, rel);
   fs.writeFileSync(abs, ORIGINAL_PLAN, "utf8");
   return { rel, abs };
@@ -144,6 +150,33 @@ function assertRewritten(abs: string): void {
     "the reviewer rewrote the plan the user actually wrote",
   );
 }
+
+test("switching to Plan clamps an unsupported role level silently", async () => {
+  const model = {
+    provider: "opencode-go",
+    id: "muse-spark-1.2-contributor",
+    reasoning: true,
+    thinkingLevelMap: {
+      off: "none",
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: null,
+      xhigh: null,
+      max: null,
+    },
+  };
+  const b = await boot({ modelRegistry: { find: () => model } });
+  try {
+    await switchToPlan(b.pi, b.ctx);
+    assert.ok(notified(b.notifies, "Plan mode enabled"));
+    // The planner role's stored `high` is unsupported by this fixture; the
+    // activation still clamps, but it must not add a thinking-clamp warning.
+    assert.ok(!notified(b.notifies, "does not support"));
+  } finally {
+    await b.cleanup();
+  }
+});
 
 test("A: /review audits a plan written in Default, after switching to Plan", async () => {
   const b = await boot();
@@ -230,7 +263,7 @@ test("C: a plan written before the switch is not auto-reviewed, but /review work
 test("D: bare /review with no plan lists recent plans and the path syntax", async () => {
   const b = await boot();
   try {
-    const plan = placePlan(b.cwd, "2026-10-31-recent.md");
+    const plan = placePlan(b.cwd, "recent.md");
     await runReview(b.pi, b.ctx);
     assert.ok(
       notified(b.notifies, "No plan file found"),

@@ -167,12 +167,21 @@ import {
   roleIcon,
   BUILT_IN_ROLES,
   REVIEW_ROLE_NAME,
-  VALID_THINKING_LEVELS,
   type RoleConfig,
   type Role,
   type RoleModel,
   type ThinkingLevel,
 } from "./roles.ts";
+import {
+  clampThinkingForModel,
+  thinkingLevelsForModel,
+  thinkingLevelsForPair,
+} from "./thinking-levels.ts";
+import {
+  buildWorkflowStatusSegments,
+  setWorkflowStatus,
+  WORKFLOW_STATUS_KEYS,
+} from "./workflow-status.ts";
 import {
   defaultProfileConfig,
   loadProfilesDetailed,
@@ -1044,9 +1053,7 @@ export default function workflowExtension(
         if (found) {
           await withPersistSuppressed(async () => {
             await (pi as any).setModel?.(found);
-            if (m.thinking && isValidThinkingLevel(m.thinking)) {
-              (pi as any).setThinkingLevel?.(m.thinking);
-            }
+            applyThinkingForModel(ctx, found, m.thinking, "Default mode");
           });
           if (!opts?.quiet) {
             ctx.ui.notify(
@@ -1223,8 +1230,6 @@ export default function workflowExtension(
     // Profile prefix (⚡ name) when one is active, then the role label.
     const profileLabel = activeProfileLabel();
     const roleLabel = activeRoleLabel();
-    const statusParts = [profileLabel, roleLabel].filter(Boolean);
-    const suffix = statusParts.length ? ` | ${statusParts.join(" | ")}` : "";
     // Commit-policy surfacing (workflow.commitPolicy): always visible so the
     // user can see at a glance what the agent may do to git history. Read
     // live so /commit-policy changes show up without a reload.
@@ -1237,7 +1242,6 @@ export default function workflowExtension(
     } catch {
       commitMode = "never";
     }
-    const policy = ` · commits:${commitMode}`;
     // Write-policy surfacing (workflow.writePolicy): the active file-write
     // permission, visible at a glance like the commit policy. Read live so a
     // /write-policy change shows up without a reload. It only applies in
@@ -1251,67 +1255,38 @@ export default function workflowExtension(
     } catch {
       writeMode = "allow";
     }
-    const writePolicy =
-      workflowMode === null ? ` · writes:${writeMode}` : "";
-    const staleMarker = todoStale ? " ⚠" : "";
-    // Review segment (plan 2026-10-23 follow-up): one footer owner — the
-    // round already shows `reviewStateSummary` in its widget, so the footer
-    // composes the same string instead of opening a second status key.
-    let reviewSegment = "";
-    try {
-      if (
-        reviewStatusVisible({
-          roundInFlight: activeReview !== undefined,
-          roundActive: reviewRuntime?.isRoundActive() === true,
-          paused: pausedReview !== undefined,
-        })
-      ) {
-        const seg = reviewFooterSegment(
-          reviewState,
-          pausedReview !== undefined,
-        );
-        if (seg) reviewSegment = ` · ${seg}`;
-      }
-      // Lock marker is independent of `reviewState`: it must show during the
-      // cold boot (before the first phase event) and while the gated handoff
-      // audit has returned but not yet rendered.
-      const lockFooter = reviewModeLockFooter(reviewModeLockKindNow());
-      if (lockFooter) reviewSegment += ` · ${lockFooter}`;
-    } catch (_e) {
-      void _e;
-      reviewSegment = "";
-    }
-    const done = todoItems.filter((t) => isDone(t)).length;
-    const total = todoItems.length;
-    if (workflowMode === "build") {
-      const label =
-        total > 0
-          ? `▶ build ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`
-          : `▶ build${suffix}${policy}${writePolicy}${reviewSegment}`;
-      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", label));
-    } else if (workflowMode === "plan") {
-      const base = plannotatorActive
-        ? "⏸ plan — reviewing in browser"
-        : "⏸ plan";
-      const label =
-        total > 0
-          ? `${base} ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`
-          : `${base}${suffix}${policy}${writePolicy}${reviewSegment}`;
-      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("warning", label));
-    } else if (total > 0) {
-      ctx.ui.setStatus(
-        "workflow",
-        ctx.ui.theme.fg(
-          "muted",
-          `◦ ${done}/${total}${staleMarker}${suffix}${policy}${writePolicy}${reviewSegment}`,
-        ),
-      );
-    } else {
-      ctx.ui.setStatus(
-        "workflow",
-        ctx.ui.theme.fg("muted", `◦ commits:${commitMode}${writePolicy}${reviewSegment}`),
-      );
-    }
+    const segments = buildWorkflowStatusSegments({
+      mode: workflowMode,
+      plannotatorActive,
+      done: todoItems.filter((t) => isDone(t)).length,
+      total: todoItems.length,
+      stale: todoStale,
+      profileLabel,
+      roleLabel,
+      commitMode,
+      writeMode: workflowMode === null ? writeMode : null,
+    });
+    const modeTone =
+      workflowMode === "build"
+        ? "accent"
+        : workflowMode === "plan"
+          ? "warning"
+          : "muted";
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.mode,
+      ctx.ui.theme.fg(modeTone, segments.mode),
+    );
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.profile,
+      segments.profile ? ctx.ui.theme.fg("muted", segments.profile) : "",
+    );
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.policy,
+      ctx.ui.theme.fg("dim", segments.policy),
+    );
     if (todoItems.length > 0) {
       ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
         return {
@@ -1619,8 +1594,6 @@ export default function workflowExtension(
     reviewTruncationNoted = false;
   }
 
-  const REVIEW_STATUS_WIDGET = "workflow-review-status";
-
   function reviewAgentDir(): string {
     try {
       return getAgentDir();
@@ -1844,26 +1817,23 @@ export default function workflowExtension(
         roundActive,
         paused,
       });
-      // The widget is a LIVE review indicator, not a result holder: the last
+      // The review status is a LIVE indicator, not a result holder: the last
       // round's state stays for `/review-status` and the REVIEW SUMMARY band,
-      // but the editor line must disappear as soon as the round ends. While
+      // but the footer segment must disappear as soon as the round ends. While
       // paused it shows the paused form (never the terminal "aborted" summary).
-      const text = visible ? reviewFooterSegment(reviewState, paused) : "";
-      if (!visible || !text) {
-        ctx.ui.setWidget(REVIEW_STATUS_WIDGET, undefined);
-        return;
+      const reviewText = visible ? reviewFooterSegment(reviewState, paused) : "";
+      let lockText = "";
+      try {
+        lockText = reviewModeLockFooter(reviewModeLockKindNow());
+      } catch (_e) {
+        void _e;
       }
-      ctx.ui.setWidget(REVIEW_STATUS_WIDGET, (_tui: any, theme: any) => ({
-        render: (w: number) => [
-          truncateToWidth(
-            theme.fg("muted", text),
-            Math.max(10, Number(w) || 40),
-            "…",
-          ),
-        ],
-        invalidate: () => {},
-        dispose: () => {},
-      }));
+      const text = [reviewText, lockText].filter(Boolean).join(" · ");
+      setWorkflowStatus(
+        ctx.ui,
+        WORKFLOW_STATUS_KEYS.review,
+        text ? ctx.ui.theme.fg("muted", text) : "",
+      );
     } catch (_e) {
       void _e;
     }
@@ -2630,7 +2600,7 @@ export default function workflowExtension(
     resetReviewStream();
     detachReviewEscListenerNow();
     try {
-      currentSessionCtx?.ui.setWidget(REVIEW_STATUS_WIDGET, undefined);
+      currentSessionCtx?.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     } catch (_e) {
       void _e;
     }
@@ -3497,9 +3467,12 @@ export default function workflowExtension(
     ) {
       await withPersistSuppressed(async () => {
         try {
-          if (m.thinking && isValidThinkingLevel(m.thinking)) {
-            (pi as any).setThinkingLevel?.(m.thinking);
-          }
+          applyThinkingForModel(
+            ctx,
+            current,
+            m.thinking,
+            `Workflow ${workflowMode ?? "mode"}`,
+          );
         } catch (_e) {
           void _e;
         }
@@ -3534,9 +3507,7 @@ export default function workflowExtension(
     }
     await withPersistSuppressed(async () => {
       try {
-        if (m.thinking && isValidThinkingLevel(m.thinking)) {
-          (pi as any).setThinkingLevel?.(m.thinking);
-        }
+        applyThinkingForModel(ctx, found, m.thinking, `Workflow ${workflowMode ?? "mode"}`);
       } catch (_e) {
         void _e;
       }
@@ -3598,12 +3569,12 @@ export default function workflowExtension(
       current.id === defaultModel.id
     ) {
       try {
-        if (
-          defaultModel.thinking &&
-          isValidThinkingLevel(defaultModel.thinking)
-        ) {
-          (pi as any).setThinkingLevel?.(defaultModel.thinking);
-        }
+        applyThinkingForModel(
+          ctx,
+          current,
+          defaultModel.thinking as ThinkingLevel | undefined,
+          "Default mode",
+        );
       } catch (_e) {
         void _e;
       }
@@ -3619,12 +3590,12 @@ export default function workflowExtension(
     if (!found) return; // registry no longer has it — keep current model
     try {
       await (pi as any).setModel?.(found);
-      if (
-        defaultModel.thinking &&
-        isValidThinkingLevel(defaultModel.thinking)
-      ) {
-        (pi as any).setThinkingLevel?.(defaultModel.thinking);
-      }
+      applyThinkingForModel(
+        ctx,
+        found,
+        defaultModel.thinking as ThinkingLevel | undefined,
+        "Default mode",
+      );
       if (!opts?.quiet) {
         ctx.ui.notify(
           `Default mode: model → ${defaultModel.provider}/${defaultModel.id}${defaultModel.thinking ? ` (${defaultModel.thinking})` : ""}`,
@@ -3783,6 +3754,31 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
       return undefined;
+    }
+  }
+
+  /**
+   * Apply a role/default thinking level, clamped to the model Pi will actually
+   * use. The role config is shared with terminal Pi and may predate the model's
+   * current `thinkingLevelMap`; clamping here keeps the live session valid.
+   *
+   * The clamp is **silent**: the host already shows the live thinking level, and
+   * notifying on every mode switch buried the transcript and toasts in the same
+   * advisory (2026-10-31 plan). Explicit `/role set` validation still warns
+   * because that is a direct user edit.
+   */
+  function applyThinkingForModel(
+    _ctx: ExtensionContext | null,
+    model: any,
+    level: ThinkingLevel | undefined,
+    _label: string,
+  ): void {
+    if (!level || !isValidThinkingLevel(level)) return;
+    const clamped = clampThinkingForModel(model, level);
+    try {
+      (pi as any).setThinkingLevel?.(clamped);
+    } catch (_e) {
+      void _e;
     }
   }
 
@@ -5037,21 +5033,28 @@ export default function workflowExtension(
           }
           thinking = thinkingRaw.toLowerCase() as any;
         }
-        // validate against registry (warn-only — model may be added later)
+        // Validate against the registry. A missing model is warn-only (it may be
+        // added later), but a known model clamps the stored level to its map.
+        let found: any;
         try {
-          const reg = (ctx as any)?.modelRegistry;
-          if (
-            reg &&
-            typeof reg.find === "function" &&
-            !reg.find(provider, id)
-          ) {
+          found = (ctx as any)?.modelRegistry?.find?.(provider, id);
+        } catch (_e) {
+          void _e;
+        }
+        if (!found) {
+          ctx.ui.notify(
+            `Warning: ${provider}/${id} not in model registry — saved anyway.`,
+            "warning",
+          );
+        } else {
+          const pair = thinkingLevelsForPair(found, thinking);
+          if (pair.level !== thinking) {
             ctx.ui.notify(
-              `Warning: ${provider}/${id} not in model registry — saved anyway.`,
+              `Thinking ${thinking} is not supported by ${provider}/${id}; using ${pair.level}.`,
               "warning",
             );
           }
-        } catch (_e) {
-          void _e;
+          thinking = pair.level;
         }
         role.model = { provider, id, thinking };
         const saved = saveAndSync(
@@ -5920,12 +5923,7 @@ export default function workflowExtension(
         const buildModelItems = (): FilterableItem[] =>
           modelPickerItems(showAll ? catalog.all : catalog.scoped);
         const modelLists = new Map<string, FilterableList>();
-        const thinkingList = new FilterableList({
-          items: VALID_THINKING_LEVELS.map((t) => ({ value: t, label: t })),
-          maxVisible: Math.min(VALID_THINKING_LEVELS.length, 8),
-          theme: themeList,
-          noMatchText: "No matching thinking levels",
-        });
+        const thinkingLists = new Map<string, FilterableList>();
         const getModelList = (roleName: string): FilterableList => {
           let list = modelLists.get(roleName);
           if (!list) {
@@ -5944,6 +5942,26 @@ export default function workflowExtension(
           }
           return list;
         };
+        /** One list per model: the supported set differs per role/default tab. */
+        const getThinkingList = (roleName: string): FilterableList => {
+          let list = thinkingLists.get(roleName);
+          if (!list) {
+            const st = staged.get(roleName)!;
+            const levels = thinkingLevelsForModel(
+              registryModel(ctx, st.provider, st.id),
+            );
+            const idx = levels.indexOf(st.thinking);
+            list = new FilterableList({
+              items: levels.map((t) => ({ value: t, label: t })),
+              maxVisible: Math.min(levels.length, 8),
+              theme: themeList,
+              initialIndex: Math.max(0, idx),
+              noMatchText: "No matching thinking levels",
+            });
+            thinkingLists.set(roleName, list);
+          }
+          return list;
+        };
         // Ctrl+O re-scopes the rows: keep each tab's query and re-filter instead
         // of rebuilding the lists from scratch.
         const rebuildModelLists = () => {
@@ -5952,11 +5970,14 @@ export default function workflowExtension(
         };
         const syncThinkingCursor = (roleName: string) => {
           const st = staged.get(roleName)!;
-          // Clear first: the shared list may still be filtered from a previous
-          // visit, and the index refers to the full VALID_THINKING_LEVELS order.
-          thinkingList.clearFilter();
-          const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
-          thinkingList.setSelectedIndex(idx >= 0 ? idx : 0);
+          const list = getThinkingList(roleName);
+          // Clear first: the list may still be filtered from a previous visit.
+          list.clearFilter();
+          const levels = thinkingLevelsForModel(
+            registryModel(ctx, st.provider, st.id),
+          );
+          const idx = levels.indexOf(st.thinking);
+          list.setSelectedIndex(idx >= 0 ? idx : 0);
         };
         const commitModelSelection = (roleName: string) => {
           const sel = getModelList(roleName).getSelectedItem();
@@ -5964,11 +5985,23 @@ export default function workflowExtension(
           const { provider, id } = parseModelRef(sel.value);
           if (!provider || !id) return false;
           const st = staged.get(roleName)!;
-          staged.set(roleName, { ...st, provider, id });
+          // A new model can drop the staged level (DeepSeek has no `medium`).
+          const pair = thinkingLevelsForPair(
+            registryModel(ctx, provider, id),
+            st.thinking,
+          );
+          staged.set(roleName, {
+            ...st,
+            provider,
+            id,
+            thinking: pair.level,
+          });
+          // The old list belongs to the old model; rebuild on the next visit.
+          thinkingLists.delete(roleName);
           return true;
         };
         const commitThinkingSelection = (roleName: string) => {
-          const sel = thinkingList.getSelectedItem();
+          const sel = getThinkingList(roleName).getSelectedItem();
           if (!sel || !isValidThinkingLevel(sel.value)) return false;
           const st = staged.get(roleName)!;
           staged.set(roleName, { ...st, thinking: sel.value });
@@ -6026,7 +6059,7 @@ export default function workflowExtension(
           // (thinking → model) or cancels the editor.
           if (matchesKey(data, Key.escape)) {
             const activeList =
-              phase === "model" ? getModelList(roleName) : thinkingList;
+              phase === "model" ? getModelList(roleName) : getThinkingList(roleName);
             if (activeList.handleInput(data)) {
               cached = undefined;
               tui.requestRender();
@@ -6055,7 +6088,7 @@ export default function workflowExtension(
             return;
           }
           const activeList =
-            phase === "model" ? getModelList(roleName) : thinkingList;
+            phase === "model" ? getModelList(roleName) : getThinkingList(roleName);
           activeList.handleInput(data);
           cached = undefined;
           tui.requestRender();
@@ -6212,9 +6245,10 @@ export default function workflowExtension(
               lines.push(
                 ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
               );
-              for (const l of thinkingList.renderQuery(Math.max(1, W - 2)))
+              const list = getThinkingList(roleName);
+              for (const l of list.renderQuery(Math.max(1, W - 2)))
                 lines.push(` ${l}`);
-              for (const l of thinkingList.renderList(Math.max(1, W - 2)))
+              for (const l of list.renderList(Math.max(1, W - 2)))
                 lines.push(` ${l}`);
             }
           }
@@ -6250,21 +6284,30 @@ export default function workflowExtension(
       );
       return "cancelled";
     }
-    // Validate against registry (warn-only, matching /role set).
+    // Validate against registry (warn-only, matching /role set). A known model
+    // also clamps its staged thinking level so this save cannot write a pair
+    // the model does not support.
     try {
       const reg = (ctx as any)?.modelRegistry;
       if (reg && typeof reg.find === "function") {
         for (const [roleName, st] of saved.staged) {
-          if (
-            st.provider &&
-            st.id &&
-            typeof reg.find === "function" &&
-            !reg.find(st.provider, st.id)
-          )
+          if (!st.provider || !st.id) continue;
+          const model = reg.find(st.provider, st.id);
+          if (!model) {
             ctx.ui.notify(
               `Warning: ${st.provider}/${st.id} (${roleName}) not in model registry — saved anyway.`,
               "warning",
             );
+            continue;
+          }
+          const pair = thinkingLevelsForPair(model, st.thinking);
+          if (pair.level !== st.thinking) {
+            ctx.ui.notify(
+              `Thinking ${st.thinking} → ${pair.level} for ${roleName} (${st.provider}/${st.id} does not support ${st.thinking}).`,
+              "warning",
+            );
+            st.thinking = pair.level;
+          }
         }
       }
     } catch (_e) {
@@ -6798,15 +6841,7 @@ export default function workflowExtension(
           const buildModelItems = (): FilterableItem[] =>
             modelPickerItems(showAll ? catalog.all : catalog.scoped);
           const modelLists = new Map<string, FilterableList>();
-          const thinkingList = new FilterableList({
-            items: VALID_THINKING_LEVELS.map((t) => ({
-              value: t,
-              label: t,
-            })),
-            maxVisible: Math.min(VALID_THINKING_LEVELS.length, 8),
-            theme: listTheme,
-            noMatchText: "No matching thinking levels",
-          });
+          const thinkingLists = new Map<string, FilterableList>();
           const getModelList = (role: Role): FilterableList => {
             let list = modelLists.get(role.name);
             if (!list) {
@@ -6825,6 +6860,26 @@ export default function workflowExtension(
             }
             return list;
           };
+          /** One list per role: the supported set follows that role's model. */
+          const getThinkingList = (role: Role): FilterableList => {
+            let list = thinkingLists.get(role.name);
+            if (!list) {
+              const st = staged.get(role.name)!;
+              const levels = thinkingLevelsForModel(
+                registryModel(ctx, st.provider, st.id),
+              );
+              const idx = levels.indexOf(st.thinking);
+              list = new FilterableList({
+                items: levels.map((t) => ({ value: t, label: t })),
+                maxVisible: Math.min(levels.length, 8),
+                theme: listTheme,
+                initialIndex: Math.max(0, idx),
+                noMatchText: "No matching thinking levels",
+              });
+              thinkingLists.set(role.name, list);
+            }
+            return list;
+          };
           // Ctrl+O re-scopes the rows: keep each tab's query and re-filter
           // instead of rebuilding the lists from scratch.
           const rebuildModelLists = () => {
@@ -6833,11 +6888,14 @@ export default function workflowExtension(
           };
           const syncThinkingCursor = (role: Role) => {
             const st = staged.get(role.name)!;
-            // Clear first: the shared list may still be filtered from a previous
-            // visit, and the index refers to the full VALID_THINKING_LEVELS order.
-            thinkingList.clearFilter();
-            const idx = VALID_THINKING_LEVELS.indexOf(st.thinking);
-            thinkingList.setSelectedIndex(idx >= 0 ? idx : 0);
+            const list = getThinkingList(role);
+            // Clear first: the list may still be filtered from a previous visit.
+            list.clearFilter();
+            const levels = thinkingLevelsForModel(
+              registryModel(ctx, st.provider, st.id),
+            );
+            const idx = levels.indexOf(st.thinking);
+            list.setSelectedIndex(idx >= 0 ? idx : 0);
           };
           const isSubmitTab = () => currentTab === tabs.length;
 
@@ -6847,13 +6905,22 @@ export default function workflowExtension(
             const { provider, id } = parseModelRef(sel.value);
             if (!provider || !id) return false;
             const st = staged.get(role.name)!;
-            staged.set(role.name, { ...st, provider, id });
-            // If the chosen model is unknown to the registry, keep it —
-            // save path warns, matching /role set behavior.
+            const pair = thinkingLevelsForPair(
+              registryModel(ctx, provider, id),
+              st.thinking,
+            );
+            staged.set(role.name, {
+              ...st,
+              provider,
+              id,
+              thinking: pair.level,
+            });
+            // The old list belongs to the old model; rebuild on the next visit.
+            thinkingLists.delete(role.name);
             return true;
           };
           const commitThinkingSelection = (role: Role) => {
-            const sel = thinkingList.getSelectedItem();
+            const sel = getThinkingList(role).getSelectedItem();
             if (!sel || !isValidThinkingLevel(sel.value)) return false;
             const st = staged.get(role.name)!;
             staged.set(role.name, { ...st, thinking: sel.value });
@@ -6910,7 +6977,7 @@ export default function workflowExtension(
             // (thinking → model) or cancels the picker.
             if (matchesKey(data, Key.escape)) {
               const activeList =
-                phase === "model" ? getModelList(role) : thinkingList;
+                phase === "model" ? getModelList(role) : getThinkingList(role);
               if (activeList.handleInput(data)) {
                 cached = undefined;
                 tui.requestRender();
@@ -6939,7 +7006,7 @@ export default function workflowExtension(
               return;
             }
             const activeList =
-              phase === "model" ? getModelList(role) : thinkingList;
+              phase === "model" ? getModelList(role) : getThinkingList(role);
             activeList.handleInput(data);
             cached = undefined;
             tui.requestRender();
@@ -7082,9 +7149,10 @@ export default function workflowExtension(
                 lines.push(
                   ...wrap(` ${theme.fg("accent", "Thinking level:")}`),
                 );
-                for (const l of thinkingList.renderQuery(Math.max(1, W - 2)))
+                const list = getThinkingList(role);
+                for (const l of list.renderQuery(Math.max(1, W - 2)))
                   lines.push(` ${l}`);
-                for (const l of thinkingList.renderList(Math.max(1, W - 2)))
+                for (const l of list.renderList(Math.max(1, W - 2)))
                   lines.push(` ${l}`);
               }
             }
@@ -7118,16 +7186,28 @@ export default function workflowExtension(
       ctx.ui.notify("Role picker cancelled.", "info");
       return;
     }
-    // Validate against registry (warn-only, matching /role set) then save.
+    // Validate against registry (warn-only, matching /role set) and clamp each
+    // staged thinking level to the model it will run on.
     try {
       const reg = (ctx as any)?.modelRegistry;
       if (reg && typeof reg.find === "function") {
         for (const [name, st] of saved) {
-          if (!reg.find(st.provider, st.id))
+          const model = reg.find(st.provider, st.id);
+          if (!model) {
             ctx.ui.notify(
               `Warning: ${st.provider}/${st.id} (${name}) not in model registry — saved anyway.`,
               "warning",
             );
+            continue;
+          }
+          const pair = thinkingLevelsForPair(model, st.thinking);
+          if (pair.level !== st.thinking) {
+            ctx.ui.notify(
+              `Thinking ${st.thinking} → ${pair.level} for ${name} (${st.provider}/${st.id} does not support ${st.thinking}).`,
+              "warning",
+            );
+            st.thinking = pair.level;
+          }
         }
       }
     } catch (_e) {
@@ -8235,12 +8315,12 @@ export default function workflowExtension(
             await withPersistSuppressed(async () => {
               const ok = await (pi as any)?.setModel?.(found);
               if (ok === false) throw new Error("setModel returned false");
-              if (
-                effectiveDefault.thinking &&
-                isValidThinkingLevel(effectiveDefault.thinking)
-              ) {
-                (pi as any).setThinkingLevel?.(effectiveDefault.thinking);
-              }
+              applyThinkingForModel(
+                ctx as any,
+                found,
+                effectiveDefault.thinking,
+                "Session start",
+              );
             });
           } catch (e: any) {
             // Auth missing or the provider rejected the switch: keep Pi's pick.
@@ -8371,7 +8451,10 @@ export default function workflowExtension(
         void _e;
       }
     }
-    ctx.ui.setStatus("workflow", undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.mode, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.profile, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.policy, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
     // Drop any /commit authorization or flow: a reload/quit must never leave
     // an exemption armed for whatever runs next.

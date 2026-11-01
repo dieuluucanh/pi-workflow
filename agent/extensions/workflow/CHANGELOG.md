@@ -2,6 +2,37 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.9.0] - 2026-10-31
+
+### Changed — model-aligned thinking levels, short footer statuses
+
+- **`/profile` and `/role` thinking lists follow the selected model.** Pi's
+  `getSupportedThinkingLevels`/`clampThinkingLevel` are now consulted for each
+  role's staged model. A model whose `thinkingLevelMap` disables `minimal` or
+  `medium` no longer offers them, and an unsupported level already stored in a
+  profile is clamped on save and on activation with a visible warning. Unknown
+  registry entries still fall back to the full list so offline editing works.
+- **Every activation path uses the same clamp.** Default-mode profile switches,
+  Plan/Build role switches, restore-default and session start now go through
+  `applyThinkingForModel`, so the live level always matches the model Pi runs.
+- **Footer statuses are split for column layouts.** `workflow` now carries only
+  the mode/progress; profile/role and commit/write policy live in
+  `workflow-profile` and `workflow-policy`, and the review indicator is the
+  `workflow-review` status instead of a separate widget. Desktop hosts can
+  render each as its own short footer column; terminal Pi reads the same
+  statuses.
+
+Tests: `thinking-levels.test.ts` (new) plus the profile/role/extension suites.
+
+### Fixed — silent activation clamp
+
+- **No repeated thinking-clamp notification on every mode switch.**
+  `applyThinkingForModel` still clamps a stale profile/role level to the model's
+  supported set, but it no longer calls `ctx.ui.notify` for it. The live level is
+  already visible in the host's composer/footer, and the same advisory was
+  re-emitted by every Plan/Build/Default switch. The explicit `/role set`
+  validation warning is unchanged.
+
 ## [0.8.1] - 2026-10-31
 
 ### Fixed — `/review` finds the plan you just wrote (2026-10-31)
