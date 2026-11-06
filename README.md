@@ -101,7 +101,7 @@ Releases are cut locally with one script. Versions are **independent per package
 ```bash
 npm login                      # once per machine (npm user: dieulc)
 npm run release:status         # read-only: manifest versions vs the npm registry
-npm run verify                 # gate: all four packages
+npm run verify                 # gate: all four packages (includes the packed import closure)
 npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
 npm run release                # interactive: pick packages + bump type
 
@@ -109,7 +109,7 @@ npm run release                # interactive: pick packages + bump type
 npm run release -- --packages workflow,autocompact --bump minor --yes
 ```
 
-What a release does: preflight (clean tree, `main`, npm auth) → verify → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
+What a release does: preflight (clean tree, `main`, npm auth) → verify (including the packed import closure and a load test of the packed file set) → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
 
 - `--bump none` publishes the current version as-is (first publish, or resuming).
 - `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.

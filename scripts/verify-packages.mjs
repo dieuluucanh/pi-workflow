@@ -7,17 +7,22 @@
  *   b) import audit (peer vs dependencies, no relative imports escaping the package)
  *   c) `npm run typecheck` and `npm test` when those scripts exist
  *   d) `npm pack --dry-run --json` tarball contents (no tests, no node_modules, no lockfile)
- *   e) load smoke test of every `pi.extensions` entry (Node type-stripped import)
+ *      and the packed import closure: every relative import of every packed file must
+ *      resolve to another packed file
+ *   e) load smoke test of every `pi.extensions` entry from a materialized copy of
+ *      the packed file set (Node type-stripped import)
  *
  * Usage:
  *   npm run verify                            # all packages
  *   npm run verify -- --packages workflow,autocompact
+ *   npm run verify -- --pack-only             # packing checks only (prepublishOnly)
  *   node scripts/verify-packages.mjs --help
  */
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { builtinModules } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -38,6 +43,7 @@ const BUILTINS = new Set([
 const PEER_PACKAGES = new Set(["typebox"]);
 
 const FROM_RE = /\bfrom\s+["']([^"']+)["']/g;
+const BARE_IMPORT_RE = /\bimport\s+["']([^"']+)["']/g;
 const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 const RELATIVE_IMPORT_RE = /^\.{1,2}(?:[/\\]|$)/;
 const TEST_FILE_RE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
@@ -73,15 +79,50 @@ function walkSourceFiles(dir, out = []) {
   return out;
 }
 
-function collectSpecifiers(file) {
-  const source = fs.readFileSync(file, "utf8");
+function collectSpecifiers(source) {
   const specs = new Set();
-  for (const re of [FROM_RE, DYNAMIC_IMPORT_RE]) {
+  for (const re of [FROM_RE, BARE_IMPORT_RE, DYNAMIC_IMPORT_RE]) {
     re.lastIndex = 0;
-    let match;
-    while ((match = re.exec(source)) !== null) specs.add(match[1]);
+    let match = re.exec(source);
+    while (match !== null) {
+      specs.add(match[1]);
+      match = re.exec(source);
+    }
   }
   return [...specs];
+}
+
+/**
+ * Resolve one relative specifier against the packed file set. The set is the
+ * exact `npm pack` list, so a target that is absent exists in the checkout but
+ * not in the tarball.
+ */
+export function resolvePackedTarget(fromFile, spec, packed) {
+  const base = path.posix.normalize(
+    path.posix.join(
+      path.posix.dirname(String(fromFile).replace(/\\/g, "/")),
+      String(spec).replace(/\\/g, "/"),
+    ),
+  );
+  const candidates = [base];
+  if (!/\.(?:ts|mts|cts|js|mjs|cjs|json)$/.test(base)) candidates.push(`${base}.ts`);
+  if (/\.js$/.test(base)) candidates.push(base.replace(/\.js$/, ".ts"));
+  candidates.push(`${base}/index.ts`);
+  return candidates.find((candidate) => packed.has(candidate)) ?? null;
+}
+
+/** Pure: every relative import/export of every packed `.ts` file must resolve inside the tarball. */
+export function findMissingPackedImports(packedFiles, readFile) {
+  const packed = new Set(packedFiles.map((file) => String(file).replace(/\\/g, "/")));
+  const missing = [];
+  for (const file of packed) {
+    if (!/\.(?:ts|mts|cts)$/.test(file)) continue;
+    for (const spec of collectSpecifiers(readFile(file))) {
+      if (!RELATIVE_IMPORT_RE.test(spec)) continue;
+      if (!resolvePackedTarget(file, spec, packed)) missing.push({ from: file, spec });
+    }
+  }
+  return missing;
 }
 
 function readJson(file) {
@@ -181,7 +222,7 @@ function checkImports(dir, pkg, errors) {
 
   for (const file of walkSourceFiles(dir)) {
     if (TEST_FILE_RE.test(file)) continue;
-    for (const spec of collectSpecifiers(file)) {
+    for (const spec of collectSpecifiers(fs.readFileSync(file, "utf8"))) {
       const rel = path.relative(dir, file);
       if (spec.startsWith("node:") || BUILTINS.has(spec)) continue;
       if (RELATIVE_IMPORT_RE.test(spec)) {
@@ -221,12 +262,12 @@ function checkPack(dir, pkg, errors) {
     errors.push(
       `\`npm pack --dry-run --json\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
     );
-    return 0;
+    return { count: 0, files: [] };
   }
   const parsed = parsePackJson(res.stdout);
   if (!parsed?.[0]?.files) {
     errors.push("could not parse `npm pack --dry-run --json` output");
-    return 0;
+    return { count: 0, files: [] };
   }
   const files = parsed[0].files.map((f) => String(f.path).replace(/\\/g, "/"));
   const has = (re) => files.some((f) => re.test(f));
@@ -248,32 +289,74 @@ function checkPack(dir, pkg, errors) {
       errors.push(`tarball is missing the pi.extensions entry: ${normalized}`);
   }
 
-  return files.length;
+  // The tarball is the release artifact. A module that is imported by a packed
+  // file but omitted from `files[]` loads here and nowhere else.
+  const missing = findMissingPackedImports(files, (rel) =>
+    fs.readFileSync(path.join(dir, rel), "utf8"),
+  );
+  for (const { from, spec } of missing) {
+    errors.push(`tarball is missing ${spec} (imported by ${from})`);
+  }
+
+  return { count: files.length, files };
 }
 
-function checkLoad(dir, entries, errors) {
-  for (const entry of entries) {
-    const url = pathToFileURL(path.join(dir, entry)).href;
-    const res = run(
-      process.execPath,
-      [
-        // Node's default strip-only .ts loader rejects non-erasable syntax
-        // (e.g. parameter properties); pi loads extensions via jiti, which
-        // transforms them, so use the matching transform mode here.
-        "--experimental-transform-types",
-        "--no-warnings",
-        "--input-type=module",
-        "-e",
-        `await import(${JSON.stringify(url)})`,
-      ],
-      dir,
-      { timeout: 60_000 },
-    );
-    if (res.status !== 0) {
-      errors.push(
-        `load smoke test failed for ${entry}:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+function checkLoadPacked(dir, entries, packedFiles, errors) {
+  // Materialize exactly the packed file set. Keep it outside node_modules:
+  // Node refuses type stripping for files under a node_modules path. A
+  // node_modules symlink inside the temp dir lets peer packages resolve from
+  // the package's own install without copying them.
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verify-pack-"));
+  const tempModules = path.join(tempRoot, "node_modules");
+  try {
+    for (const rel of packedFiles) {
+      const target = path.join(tempRoot, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(path.join(dir, rel), target);
+    }
+    // Node needs the package.json to treat .ts as ESM ("type": "module").
+    fs.copyFileSync(path.join(dir, "package.json"), path.join(tempRoot, "package.json"));
+
+    const packageModules = path.join(dir, "node_modules");
+    if (fs.existsSync(packageModules)) {
+      fs.symlinkSync(
+        packageModules,
+        tempModules,
+        process.platform === "win32" ? "junction" : "dir",
       );
     }
+
+    for (const entry of entries) {
+      const url = pathToFileURL(path.join(tempRoot, entry)).href;
+      const res = run(
+        process.execPath,
+        [
+          // Node's default strip-only .ts loader rejects non-erasable syntax
+          // (e.g. parameter properties); pi loads extensions via jiti, which
+          // transforms them, so use the matching transform mode here.
+          "--experimental-transform-types",
+          "--no-warnings",
+          "--input-type=module",
+          "-e",
+          `await import(${JSON.stringify(url)})`,
+        ],
+        dir,
+        { timeout: 60_000 },
+      );
+      if (res.status !== 0) {
+        errors.push(
+          `packed load smoke test failed for ${entry}:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+        );
+      }
+    }
+  } finally {
+    // Remove the link before the tree so a Windows junction is never followed.
+    try {
+      fs.unlinkSync(tempModules);
+    } catch {
+      // No link was created (e.g. a package without node_modules).
+    }
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 }
 
@@ -282,14 +365,18 @@ function checkLoad(dir, entries, errors) {
 function main() {
   const argv = process.argv.slice(2);
   let filter = null;
+  let packOnly = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--packages")
       filter = String(argv[++i] ?? "")
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+    else if (argv[i] === "--pack-only") packOnly = true;
     else if (argv[i] === "--help" || argv[i] === "-h") {
-      console.log("Usage: node scripts/verify-packages.mjs [--packages a,b,c]");
+      console.log(
+        "Usage: node scripts/verify-packages.mjs [--packages a,b,c] [--pack-only]",
+      );
       return 0;
     } else {
       console.error(`unknown argument: ${argv[i]}`);
@@ -325,15 +412,15 @@ function main() {
     const errors = [];
 
     const entries = checkManifest(dir, pkg, errors);
-    checkImports(dir, pkg, errors);
-    checkScripts(dir, pkg, errors);
+    if (!packOnly) checkImports(dir, pkg, errors);
+    if (!packOnly) checkScripts(dir, pkg, errors);
     const packed = checkPack(dir, pkg, errors);
-    checkLoad(dir, entries, errors);
+    checkLoadPacked(dir, entries, packed.files, errors);
 
-    results.push({ name, version: pkg.version, packed, errors });
+    results.push({ name, version: pkg.version, packed: packed.count, errors });
     const status = errors.length ? "FAIL" : "ok";
     console.log(
-      `── ${name} @ ${pkg.version} — ${status} (${packed} files packed)`,
+      `── ${name} @ ${pkg.version} — ${status} (${packed.count} files packed)`,
     );
     for (const err of errors) console.log(`     ✗ ${err}`);
   }
@@ -350,4 +437,12 @@ function main() {
   return 0;
 }
 
-process.exitCode = main();
+const invokedDirectly =
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) process.exitCode = main();
+
+// Exported for scripts/verify-packages.test.mjs: the closure check is pure, so
+// it is tested without npm, a tarball or a package install.
+export { collectSpecifiers };

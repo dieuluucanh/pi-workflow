@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
@@ -24,8 +24,8 @@
     "opencode-go/longcat-2.5-preview-free"
   ],
   "defaultThinkingLevel": "high",
-  "defaultProvider": "synthetic",
-  "defaultModel": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4.1-flash",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -52,13 +52,18 @@
       "mutatingTools": []
     },
     "modelDefault": {
-      "provider": "synthetic",
-      "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "provider": "opencode-go",
+      "id": "deepseek-v4.1-flash",
       "thinking": "high"
     },
     "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
     "commitPolicy": {
       "mode": "never"
     }
+  },
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.4.8",
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.46.0",
+    "{\"source\":\"npm:pi-memory\",\"scope\":\"user\"}": "0.4.2"
   }
 }

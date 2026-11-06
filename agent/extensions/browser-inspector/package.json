@@ -8,7 +8,8 @@
   "keywords": ["pi-package", "browser", "devtools", "cdp", "inspector"],
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node ../../../scripts/verify-packages.mjs --pack-only --packages browser-inspector"
   },
   "repository": {
     "type": "git",

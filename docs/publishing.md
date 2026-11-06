@@ -60,13 +60,29 @@ npm run release -- --packages workflow,autocompact,server-logs,browser-inspector
 
 1. **Preflight** — Node major check; current branch must equal `--branch` (default `main`); working tree must be clean; `git fetch` and refuse to continue if the branch is behind `origin`; `npm whoami` must be `dieulc` (override with `--npm-user`; skipped in `--dry-run`).
 2. **Resolve** — compute each selected package's next version from the bump kind, and query the registry (one `npm view <name>@<version> version` per package). A version that is already on npm is **skipped, never fatal**: the rest of the batch is still verified, published, tagged and pushed. See [Skipping already-published packages](#skipping-already-published-packages).
-3. **Verify** — run `scripts/verify-packages.mjs` for the packages that are actually going to be published: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, and a load smoke test of every `pi.extensions` entry.
+3. **Verify** — run `scripts/verify-packages.mjs` for the packages that are actually going to be published: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, the packed import closure (every relative import of every packed file must resolve inside the tarball), and a load smoke test of every `pi.extensions` entry from a materialized copy of the packed file set.
 4. **Changelog** — for each package being published, collect commits since that package's previous tag (`git log --no-merges … -- <package dir>`), group them by conventional type, and prepend a `## [version] - YYYY-MM-DD` section to that package's `CHANGELOG.md`.
 5. **Bump** — write the new version into the package's `package.json`.
 6. **Commit** — one commit for the released packages: `chore(release): @dieulc/workflow@0.2.0, @dieulc/autocompact@0.1.1`.
 7. **Publish** — `npm publish` in each package directory, in turn. Output is inherited so npm's 2FA/OTP prompt works. `publishConfig.access: "public"` in each manifest supplies public access for the scoped names.
 8. **Tag** — annotated tag per package: `git tag -a @dieulc/workflow@0.2.0`.
 9. **Push** — `git push origin <branch>` then `git push origin <tag> …`.
+
+### The pack gate
+
+`npm run verify` checks the **packed artifact**, not the source tree. For each package it:
+
+- runs `npm pack --dry-run --json` to get the exact file list npm would publish;
+- resolves every relative import, re-export and dynamic import in every packed `.ts` file
+  against that list — a module that is imported but omitted from `files[]` fails with
+  `tarball is missing ./X.ts (imported by Y.ts)`;
+- materializes exactly that file set in a temp directory and imports every `pi.extensions`
+  entry, so a missing module fails before publish.
+
+`prepublishOnly` runs the same check with `--pack-only` on every `npm publish`, including
+manual publishes that bypass `scripts/release.mjs`. `npm run verify -- --pack-only` is the
+fast local form; `npm run verify` additionally runs the peer/dependency audit, `typecheck`
+and the package tests.
 
 ### Skipping already-published packages
 
@@ -189,7 +205,7 @@ git tag -a "@dieulc/workflow@0.2.0" -m "@dieulc/workflow@0.2.0"
 git push origin main && git push origin "@dieulc/workflow@0.2.0"
 ```
 
-Always run `npm run verify -- --packages <pkg>` first — it catches the mistakes that manual publishing would otherwise push to the registry.
+Always run `npm run verify -- --packages <pkg>` first — it catches the mistakes that manual publishing would otherwise push to the registry. `prepublishOnly` also re-runs the pack gate on `npm publish`, so a manual publish cannot ship a tarball whose imported modules are missing.
 
 ## Verifying an install
 
@@ -307,6 +323,7 @@ which is exactly what step 2 cautions against doing for its own sake.
 | Plan line `blocked (registry query failed)` + exit 1 | The registry could not be queried (offline, mirror, rate limit, auth). Nothing was published for that package — deliberately: an unreadable state is never treated as “not published”. Re-run when it is reachable. |
 | `--continue reached npm, not this script` (exit 2) | The flags were typed without `--`, so npm consumed them. Run `npm run release -- --continue`. |
 | `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
+| `tarball is missing ./<module>.ts (imported by <file>.ts)` | A file imported by the package is not in `files[]`. Add it to the package manifest (or the directory that contains it) and re-run the gate. This is the failure mode that shipped `@dieulc/workflow@0.9.0` without `thinking-levels.ts` and `workflow-status.ts`. |
 | `npm publish` returns 403 | Two different causes — read the message. *`403 Forbidden - PUT … you do not have permission`*: first publish of a scoped package must be public (handled by `publishConfig.access`) — check you are a member of the `@dieulc` scope. *`Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages`*: see the row below. |
 | 403 `Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages` | The configured npm credential cannot write, and npm does **not** prompt for an OTP when a token is configured — so this fails even in an interactive terminal (observed with a read-only/without-bypass granular token in `~/.npmrc`). Fix: create a **Granular Access Token** with *Bypass 2FA* enabled (npmjs.com → Access Tokens → Generate New Token; give it read+write on `@dieulc` or all packages) and put it in `~/.npmrc`. Alternative: `npm logout` / remove the token, `npm login`, then publish interactively with `npm publish --otp=<code>` (npm also reads the code from `NPM_CONFIG_OTP`). After fixing the credential, resume with `npm run release -- --continue`. |
 | 403 `… may not perform this action` when unpublishing or deprecating | Destructive registry actions require an interactive 2FA session; a bypass-2FA granular token is refused. Use the npm website or `npm login` interactively. |

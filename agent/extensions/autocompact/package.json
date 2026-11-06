@@ -8,7 +8,8 @@
   "license": "MIT",
   "scripts": {
     "test": "node --test summarizer.test.ts trigger.test.ts smoke-integration.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node ../../../scripts/verify-packages.mjs --pack-only --packages autocompact"
   },
   "repository": {
     "type": "git",
