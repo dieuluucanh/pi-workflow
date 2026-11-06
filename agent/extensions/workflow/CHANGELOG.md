@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.9.1] - 2026-11-06
+
+### Fixes
+
+- verify the packed import closure before publishing (50efcdc)
+
 ## [0.9.0] - 2026-10-31
 
 ### Changed — model-aligned thinking levels, short footer statuses
