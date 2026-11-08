@@ -48,6 +48,7 @@ import {
   extractReviewModeRaw,
   isReviewEnabled,
   mergeReviewModeConfig,
+  nextReviewRound,
   planHash as planHashReexported,
   readProviderErrorEvent,
   readReviewModeConfig,
@@ -63,11 +64,13 @@ import {
   reviewModeLockNotice,
   reviewModeLockStatusLine,
   reviewNoticeText,
+  reviewPauseIsCurrent,
   reviewPhaseLabel,
   reviewResumeGateOutcome,
   reviewResumeNotice,
   reviewResumePlanChoice,
   reviewResumeSettles,
+  reviewStatusText,
   reviewStatusVisible,
   reviewRunLabel,
   sanitizeFindings,
@@ -1856,6 +1859,25 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
   assert.equal(reviewStatusVisible({ roundInFlight: true }), true);
   assert.equal(reviewStatusVisible({ roundActive: true }), true);
   assert.equal(reviewStatusVisible({ paused: true }), true);
+  assert.equal(
+    reviewStatusVisible({ roundActive: true, phase: "reviewing" }),
+    true,
+  );
+  assert.equal(
+    reviewStatusVisible({ roundInFlight: true, phase: "reviewing" }),
+    true,
+  );
+  // Cold boot: roundActive flips before the first live phase event, so a
+  // retained terminal state from the previous round must not be painted.
+  assert.equal(
+    reviewStatusVisible({ roundActive: true, phase: "aborted" }),
+    false,
+  );
+  assert.equal(reviewStatusVisible({ roundActive: true, phase: "done" }), false);
+  assert.equal(
+    reviewStatusVisible({ roundInFlight: true, phase: "failed" }),
+    false,
+  );
 
   // Regression: a retained terminal state must render the PAUSED text while
   // paused, never "… aborted", and the widget is hidden when not visible.
@@ -1867,6 +1889,64 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
     "🔍 review paused — /review-resume to continue",
   );
   assert.ok(!reviewFooterSegment(aborted, true).includes("aborted"));
+
+  // reviewStatusText is the single composer used by the footer/widget.
+  assert.equal(
+    reviewStatusText({
+      state: aborted,
+      roundActive: true,
+      roundInFlight: false,
+      paused: false,
+    }),
+    "",
+    "a terminal state is not live during a new round's cold boot",
+  );
+  assert.equal(
+    reviewStatusText({
+      state: aborted,
+      roundActive: false,
+      roundInFlight: false,
+      paused: true,
+    }),
+    "🔍 review paused — /review-resume to continue",
+  );
+});
+
+test("nextReviewRound restarts a new cycle even after the cap", () => {
+  assert.deepEqual(nextReviewRound({ round: 1, maxRounds: 1 }), {
+    round: 2,
+    allowed: false,
+  });
+  assert.deepEqual(
+    nextReviewRound({ round: 1, maxRounds: 1, newCycle: true }),
+    { round: 1, allowed: true },
+    "a new plan cycle must not inherit the previous cycle's consumed round",
+  );
+  assert.deepEqual(nextReviewRound({ round: 0, maxRounds: 1 }), {
+    round: 1,
+    allowed: true,
+  });
+  assert.deepEqual(nextReviewRound({ round: -3, maxRounds: 1 }), {
+    round: 1,
+    allowed: true,
+  });
+  assert.deepEqual(nextReviewRound({ round: 1, maxRounds: 0 }), {
+    round: 2,
+    allowed: false,
+  });
+  assert.deepEqual(nextReviewRound({ round: 1, maxRounds: Number.NaN }), {
+    round: 2,
+    allowed: false,
+  });
+});
+
+test("reviewPauseIsCurrent ignores a pause from a superseded cycle", () => {
+  assert.equal(reviewPauseIsCurrent({ pauseCycle: 3, currentCycle: 3 }), true);
+  assert.equal(reviewPauseIsCurrent({ pauseCycle: 2, currentCycle: 3 }), false);
+  assert.equal(
+    reviewPauseIsCurrent({ pauseCycle: undefined, currentCycle: 3 }),
+    false,
+  );
 });
 
 test("shouldPauseReviewOnEscape pauses exactly once per round", () => {

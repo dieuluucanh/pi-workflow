@@ -4,6 +4,34 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased] - 2026-11-08
 
+### Fixed — Review Mode resets per plan cycle and the review line is live-only
+
+**A second plan in the same session no longer skips review.** `reviewRound` was
+a session-wide counter, while `rounds` is documented as per user-feedback cycle.
+With the default `rounds: 1`, the first successful review consumed the only
+round and the next plan file was handed over with `round limit (1) reached` — no
+reviewer run. Recent sessions (for example the second plan in the 2026-11-06
+pi-desktop session) show the exact sequence. The counter is now scoped by a
+review-cycle token: a fresh prompt, an explicit inline `Refine`, browser `Deny`,
+a changed plan-file path and Build entry each start a new cycle. Findings carry
+across a same-plan refinement and are cleared for a new plan file.
+
+**The review line cannot outlive its review.** `pausedReview` had no lifecycle
+tie to the plan cycle: `before_agent_start` cleared handoff provenance but not a
+pause or a parked gate, so an abandoned pause kept `🔍 review paused` and
+`🔒 modes locked` alive indefinitely, and a stale non-idle gate made the next
+`agent_end` return early — skipping the next plan's review and handoff. A fresh
+prompt now abandons the pause once (stopping the round and settling the open
+gate with the author's plan), and pause/gate state is tagged with the cycle that
+owns it. A retained terminal `reviewState` is no longer painted during a new
+round's cold boot: the footer/widget use `reviewStatusText`, which requires a
+live phase (or a current-cycle pause). Old handoff continuations are generation-
+guarded, so they cannot render or clear a newer cycle's state.
+
+Tests: 533 green (525 + status-text cold-boot/terminal cases, `nextReviewRound`,
+`reviewPauseIsCurrent`, `samePlanPath`, and extension-level two-cycle / inline
+Refine / browser-deny / abandoned-pause regressions). `npm run typecheck` clean.
+
 ### Fixed — command policy: quoted text is a value, not a command
 
 **The problem.** Plan Mode refused the canonical exploration queries, and the

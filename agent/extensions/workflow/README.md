@@ -227,13 +227,17 @@ Input follows the **active mode**, decided automatically — there is nothing to
 
 Delivery to the reviewer is best-effort: if it fails, the message stays in the plan-agent chat rather than being swallowed.
 
-**Status line.** While a review is running, the footer status carries a review segment alongside the mode (`⏸ plan … · 🔍 review · pass 2/2 · 3 findings · ● verifying`), the widget above the editor shows the same live phase, and the spinner row reads `🔍 Reviewing plan…`. Pausing switches both to the paused form (`🔍 review paused — /review-resume to continue`); resuming returns them to the running form. The line is **live-only**: it disappears as soon as the round lands, fails or is aborted, and on a mode switch — Plan/Build never keeps a stale `🔍 review … aborted` line. `/review-status` still reports the last round's result. While the review owns the turn, the footer also appends `🔒 modes locked`.
+**Status line.** While a review is running, the footer status carries a review segment alongside the mode (`⏸ plan … · 🔍 review · pass 2/2 · 3 findings · ● verifying`), the widget above the editor shows the same live phase, and the spinner row reads `🔍 Reviewing plan…`. Pausing switches both to the paused form (`🔍 review paused — /review-resume to continue`); resuming returns them to the running form. The line is **live-only**: it disappears as soon as the round lands, fails or is aborted, and on a mode switch — Plan/Build never keeps a stale `🔍 review … aborted` line. A retained terminal state is also hidden during a new round's cold boot, and a pause from an earlier plan cycle is ignored. Starting a new prompt (or an explicit refine/deny) abandons a paused review and clears both the review line and `🔒 modes locked`. `/review-status` still reports the last round's result.
 
 ### Controlling a running review
 
 The handoff **waits for the reviewer**: no browser prompt or inline choice renders until the gated round lands, fails, or you pause/abort it. The reviewed plan (the reviewer writes the plan file mid-round) becomes the handed-off text, with the todo steps re-synced to match. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
 
 A handoff opens **only when the current run writes or edits a `.pi/plans/` file while Plan mode is active**. A mid-run switch into Plan counts — the write after the switch is eligible. A plan written before the switch does not auto-handoff: the extension shows `Plan file ready: <path>. Run /review to audit it.` and leaves the plan for the manual command. Switching Build → Plan keeps the previous plan and todos as reference; a fresh prompt also supersedes any pending browser/inline handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
+
+**Review cycles.** The round budget (`rounds`) is per plan/feedback cycle, not per session. A fresh prompt, an explicit inline `Refine` or browser `Deny`, a different plan-file path, and entering Build all start a new cycle, so a second plan in the same session still gets reviewed with the default `rounds: 1`. Findings carry across a refinement of the same plan file and are cleared for a new plan file. A fresh prompt **abandons** a paused review: the old round is stopped, its open handoff gate settles with the author's plan, and the footer/lock clear. The old handoff cannot render or apply a plan after the new cycle starts.
+
+A paused review is in-memory and belongs to the cycle that recorded it: it cannot keep `🔒 modes locked` alive or short-circuit the next plan's review after a new prompt.
 
 `/review` resolves its target independently of the handoff, so a plan is never unreachable because of how Plan mode was entered: explicit path → this run's last plan write → the session's last plan write → the last handed-off plan → the newest plan write in the session branch. Missing, empty or unreadable candidates are skipped; the resolved path is named when it came from a fallback; the reviewer writes back to that same file. With no candidate it lists the newest `.pi/plans/*.md` files and the explicit-path syntax. `/review <path>` is restricted to `.pi/plans/`.
 
@@ -246,7 +250,7 @@ A handoff opens **only when the current run writes or edits a `.pi/plans/` file 
 - `/review say <message>` talks to the in-flight reviewer.
 - `/review-status` shows phase, round, the snapshotted model, findings, any paused state, and the mode-switch lock with its allowed exits.
 
-Pausing is in-memory only: a reload starts fresh.
+Pausing is in-memory only: a reload starts fresh. A pause also belongs to the current review cycle; a new prompt abandons it (and clears the footer/lock) rather than leaving a resumable round from the previous task.
 
 ### Isolation
 
@@ -476,8 +480,8 @@ Review Mode settings live under `workflow.reviewMode`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | Master toggle. When false, every Review Mode code path is a no-op |
-| `rounds` | `1` | Max Plan↔Review rounds per user-feedback cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
+| `enabled` | `false` | Automatic-review toggle. When false, the handoff review/prefetch/planner note are off; the manual `/review*` commands still work |
+| `rounds` | `1` | Max Plan↔Review rounds per plan/feedback cycle. A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
 | `passes` | `2` | `1` = review+rewrite only; `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |

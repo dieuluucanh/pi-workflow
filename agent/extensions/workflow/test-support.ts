@@ -312,13 +312,18 @@ export interface FakePi {
   setModel(model: unknown): void;
   sendMessage(content: unknown, options?: unknown): void;
   sendUserMessage(content: unknown, options?: unknown): void;
-  events: { on(): void; emit(): void; listenerCount(): number };
+  events: {
+    on(event: string, handler: (payload: unknown) => unknown): void;
+    emit(event: string, payload?: unknown): void;
+    listenerCount(event?: string): number;
+  };
   /** Fire every handler registered for an event, in registration order. */
   emit(event: string, payload?: unknown, ctx?: unknown): Promise<unknown[]>;
 }
 
 export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
   const handlers = new Map<string, EventHandler[]>();
+  const busHandlers = new Map<string, Array<(payload: unknown) => unknown>>();
   const commands: FakePi["commands"] = {};
   const entries: FakePi["entries"] = [];
   const sent: FakePi["sent"] = [];
@@ -367,7 +372,27 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
     sendUserMessage(content, options) {
       sent.push({ content, options });
     },
-    events: { on() {}, emit() {}, listenerCount() { return 0; } },
+    events: {
+      on(event, handler) {
+        const list = busHandlers.get(event) ?? [];
+        list.push(handler);
+        busHandlers.set(event, list);
+      },
+      emit(event, payload) {
+        for (const handler of busHandlers.get(event) ?? []) {
+          try {
+            void handler(payload);
+          } catch {
+            /* listener failures must not break the fake host */
+          }
+        }
+      },
+      listenerCount(event) {
+        return event === undefined
+          ? [...busHandlers.values()].reduce((n, list) => n + list.length, 0)
+          : (busHandlers.get(event)?.length ?? 0);
+      },
+    },
     async emit(event, payload = {}, ctx) {
       const list = handlers.get(event) ?? [];
       const results: unknown[] = [];
@@ -387,6 +412,10 @@ export interface FakeCtxOptions {
   hasUI?: boolean;
   branch?: unknown[];
   selectAnswer?: string | undefined;
+  /** Value returned by `ui.custom` (the inline handoff choice). */
+  customAnswer?: string | null;
+  /** Value returned by `ui.editor` (e.g. the inline Refine text). */
+  editorAnswer?: string | null;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   signal?: AbortSignal;
 }
@@ -411,6 +440,12 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     ui: {
       async select(_title: string, _options: unknown[]) {
         return over.selectAnswer;
+      },
+      async custom() {
+        return over.customAnswer ?? null;
+      },
+      async editor() {
+        return over.editorAnswer;
       },
       async input() {
         return undefined;

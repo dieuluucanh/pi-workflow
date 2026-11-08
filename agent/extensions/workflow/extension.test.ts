@@ -32,6 +32,10 @@ import {
 interface BootOptions {
   enabled?: boolean;
   verify?: boolean;
+  hasUI?: boolean;
+  plannotator?: boolean;
+  customAnswer?: string | null;
+  editorAnswer?: string | null;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   script?: {
     pass1?: (c: FakeCapture) => Promise<void>;
@@ -67,12 +71,34 @@ async function boot(over: BootOptions = {}) {
     over.script ?? { pass1: submitThenFinish(REWRITTEN_PLAN) },
   );
   const pi = makeFakePi();
+  if (over.plannotator === true) {
+    // Registering a request listener is what makes the extension detect a live
+    // Plannotator host. The fake answers plan-review with a review id so the
+    // browser deny/approve path can be driven without a real browser.
+    pi.events.on("plannotator:request", (raw: unknown) => {
+      const request = raw as any;
+      if (request?.action === "plan-review") {
+        request.respond?.({
+          status: "handled",
+          result: { reviewId: "review-1" },
+        });
+      } else {
+        request.respond?.({ status: "handled", result: { status: "pending" } });
+      }
+    });
+  }
   await workflowExtension(pi as never, { loadSdk: async () => sdk as never });
-  const { ctx, notifies } = makeFakeCtx({
+  const { ctx, notifies, statuses, widgets } = makeFakeCtx({
     cwd,
-    hasUI: false,
+    hasUI: over.hasUI === true,
     branch: over.branch ?? [],
     ...(over.modelRegistry ? { modelRegistry: over.modelRegistry } : {}),
+    ...(over.customAnswer !== undefined
+      ? { customAnswer: over.customAnswer }
+      : {}),
+    ...(over.editorAnswer !== undefined
+      ? { editorAnswer: over.editorAnswer }
+      : {}),
   });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
@@ -89,7 +115,18 @@ async function boot(over: BootOptions = {}) {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { root, cwd, agentDir, pi, ctx, notifies, capture, cleanup };
+  return {
+    root,
+    cwd,
+    agentDir,
+    pi,
+    ctx,
+    notifies,
+    statuses,
+    widgets,
+    capture,
+    cleanup,
+  };
 }
 
 function placePlan(
@@ -381,6 +418,290 @@ test("H: restore keeps a planFile from an earlier entry and /review uses it", as
     }
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
+
+test("J: a second Plan cycle gets a fresh review budget (rounds:1)", async () => {
+  const b = await boot();
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const first = placePlan(b.cwd, "first.md");
+    await writeResult(b.pi, b.ctx, first.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(first.rel) }, b.ctx);
+    assert.equal(b.capture.prompts.length, 1, "first plan reviewed");
+    assertRewritten(first.abs);
+    assert.ok(
+      !b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-mode" &&
+          String(e.data?.reason ?? "").includes("round limit"),
+      ),
+      "the first plan never hits the cap",
+    );
+
+    // A fresh prompt is a new feedback cycle. The second plan must be reviewed
+    // with the default rounds: 1, not handed over as a round-limit skip.
+    await freshPrompt(b.pi, b.ctx);
+    const second = placePlan(b.cwd, "second.md");
+    await writeResult(b.pi, b.ctx, second.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(second.rel) }, b.ctx);
+
+    assert.equal(
+      b.capture.prompts.length,
+      2,
+      "the second plan ran its own review round",
+    );
+    assertRewritten(second.abs);
+    assert.ok(
+      !b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-mode" &&
+          String(e.data?.reason ?? "").includes("round limit"),
+      ),
+      "a new cycle never inherits the previous cycle's consumed round",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-cycle" && e.data?.reason === "prompt",
+      ),
+      "the new cycle is recorded for diagnosis",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("K: a same-plan feedback prompt keeps findings but restarts the round", async () => {
+  const b = await boot();
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "refine.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.capture.prompts.length, 1, "first revision reviewed");
+
+    // Same plan file, fresh feedback prompt: a new round must run (not the
+    // round cap) and the previous finding must reach the reviewer.
+    fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
+    await freshPrompt(b.pi, b.ctx);
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(
+      b.capture.prompts.length,
+      2,
+      "the same-plan feedback revision got a fresh round",
+    );
+    assert.ok(
+      b.capture.prompts[1].includes("Findings from the previous round"),
+      "the reviewer is asked to verify the prior finding",
+    );
+    assert.ok(
+      b.capture.prompts[1].includes("Result<T,E> convention"),
+      "the actual prior finding is carried into the prompt",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("M: inline Refine starts a new cycle and carries findings", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswer: "refine",
+    editorAnswer: "Please add an export test.",
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "inline-refine.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.capture.prompts.length, 1, "first revision reviewed");
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-handoff-result" && e.data?.choice === "refine",
+      ),
+      "the inline Refine choice was taken",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-cycle" && e.data?.reason === "refine",
+      ),
+      "Refine started a new review cycle",
+    );
+    assert.ok(
+      b.pi.sent.some((s: any) =>
+        String(s.content).includes("Please add an export test."),
+      ),
+      "the refinement feedback was sent as the follow-up",
+    );
+
+    // Simulate the follow-up run writing the revised same plan and ending.
+    // Dismiss the second handoff so this test only exercises the refine cycle.
+    (b.ctx as any).ui.custom = async () => null;
+    fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(
+      b.capture.prompts.length,
+      2,
+      "the refined plan got a fresh review round",
+    );
+    assert.ok(
+      b.capture.prompts[1].includes("Findings from the previous round"),
+      "Refine preserved the prior findings for verification",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("N: browser Deny restarts the cycle and sends the feedback", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "browser-deny.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.capture.prompts.length, 1, "first revision reviewed");
+    assert.ok(
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Plan opened in browser"),
+      ) ||
+        b.pi.entries.some(
+          (e: any) => e.type === "workflow-handoff-plannotator",
+        ),
+      "the browser handoff opened after the review",
+    );
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: false,
+      feedback: "Please add an export test.",
+    });
+    for (let i = 0; i < 100; i += 1) {
+      const cycleStarted = b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-cycle" && e.data?.reason === "deny",
+      );
+      const feedbackSent = b.pi.sent.some((s: any) =>
+        String(s.content).includes("Please add an export test."),
+      );
+      if (cycleStarted && feedbackSent) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-cycle" && e.data?.reason === "deny",
+      ),
+      "browser Deny started a new review cycle",
+    );
+    assert.ok(
+      b.pi.sent.some((s: any) =>
+        String(s.content).includes("Please add an export test."),
+      ),
+      "the deny feedback was sent as the follow-up",
+    );
+
+    // Simulate the follow-up run writing the revised same plan and ending.
+    // The browser branch answers with a new review id; this handoff is enough
+    // to prove the deny cycle reset reached the next automatic review.
+    fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(
+      b.capture.prompts.length,
+      2,
+      "the denied plan got a fresh review round",
+    );
+    assert.ok(
+      b.capture.prompts[1].includes("Findings from the previous round"),
+      "browser Deny preserved the prior findings for verification",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("L: a new prompt abandons a paused gated review and clears its status/lock", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const b = await boot({
+    script: {
+      pass1: async (c) => {
+        await gate;
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "paused.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const handoff = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+    for (let i = 0; i < 100 && b.capture.prompts.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(b.capture.prompts.length, 1, "the gated round started");
+
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Plan ready"),
+      ),
+      "a paused gated review withholds the handoff",
+    );
+    assert.ok(notified(b.notifies, "Review paused"));
+
+    const before = b.statuses.length;
+    await freshPrompt(b.pi, b.ctx);
+    // The new prompt settles the parked gate; the old handoff must return
+    // without rendering after the cycle token changed.
+    await handoff;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(
+      notified(b.notifies, "Paused review abandoned"),
+      "the user is told the pause was abandoned",
+    );
+    const after = b.statuses
+      .slice(before)
+      .filter((value): value is string => typeof value === "string");
+    assert.ok(
+      !after.some((value) => value.includes("review paused")),
+      "the stale paused line is cleared",
+    );
+    assert.ok(
+      !after.some((value) => value.includes("modes locked")),
+      "the stale mode lock is cleared",
+    );
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Plan ready"),
+      ),
+      "the abandoned handoff never renders after the new prompt",
+    );
+  } finally {
+    release();
+    await b.cleanup();
   }
 });
 

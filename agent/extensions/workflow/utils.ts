@@ -931,6 +931,48 @@ export function isPlanWritePath(p: string, cwd: string): boolean {
   return norm.includes(".pi/plans/") || norm.startsWith(cwdNorm + "/.pi/plans");
 }
 
+/**
+ * Whether two plan paths identify the same file.
+ *
+ * Plan targets arrive in several shapes: absolute Windows paths from a
+ * `tool_result`, relative paths from `/review <path>`, forward slashes from a
+ * handoff, and case differences from the host. A review-cycle boundary must
+ * not fire for a spelling difference, and must fire for a real move. Kept in
+ * this dependency-free module so the comparison is unit-testable; callers pass
+ * the session cwd for relative paths.
+ */
+export function samePlanPath(
+  a: string | null | undefined,
+  b: string | null | undefined,
+  cwd: string = process.cwd(),
+): boolean {
+  const normalize = (raw: string | null | undefined): string => {
+    let value = String(raw ?? "").trim();
+    if (!value) return "";
+    value = value.replace(/\\/g, "/");
+    const absolute =
+      value.startsWith("/") || /^[A-Za-z]:\//.test(value);
+    if (!absolute) {
+      value = `${String(cwd ?? "").replace(/\\/g, "/").replace(/\/+$/, "")}/${value}`;
+    }
+    const parts: string[] = [];
+    for (const part of value.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (parts.length > 0) parts.pop();
+        continue;
+      }
+      parts.push(part);
+    }
+    let out = parts.join("/");
+    if (value.startsWith("/")) out = `/${out}`;
+    // Windows drive letters are case-insensitive; keep POSIX case-sensitive.
+    out = out.replace(/^([A-Za-z]):/, (_m, drive: string) => `${drive.toUpperCase()}:`);
+    return process.platform === "win32" ? out.toLowerCase() : out;
+  };
+  return normalize(a) === normalize(b);
+}
+
 /** Inputs for deciding whether this run may hand a plan off. */
 export interface PlanHandoffEligibility {
   mode: "plan" | "build" | null;

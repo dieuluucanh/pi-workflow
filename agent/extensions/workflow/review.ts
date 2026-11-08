@@ -1460,12 +1460,89 @@ export function reviewStatusVisible(input: {
   roundInFlight?: boolean;
   roundActive?: boolean;
   paused?: boolean;
+  /**
+   * The retained round state's phase, when one exists. A retained *terminal*
+   * phase must not make the line visible during a new round's cold boot
+   * (`roundActive` flips before the first live phase event).
+   */
+  phase?: ReviewPhase;
+}): boolean {
+  if (input.paused === true) return true;
+  if (input.roundInFlight !== true && input.roundActive !== true) return false;
+  // `undefined` means the round has not emitted a state yet; there is nothing
+  // stale to paint and the lock/working message still describe the round.
+  return input.phase === undefined || reviewIsActive(input.phase);
+}
+
+/**
+ * The text for the live review status surface, or `""` when nothing is live.
+ *
+ * Single source for the footer segment and the review widget: a retained
+ * `reviewState` is used for `/review-status` and the summary band, but it is
+ * never painted as a live line once its round is over. While paused it shows
+ * the paused form (never the retained terminal summary).
+ */
+export function reviewStatusText(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+}): string {
+  const visible = reviewStatusVisible({
+    roundInFlight: input.roundInFlight,
+    roundActive: input.roundActive,
+    paused: input.paused,
+    phase: input.state?.phase,
+  });
+  return visible ? reviewFooterSegment(input.state, input.paused === true) : "";
+}
+
+/**
+ * Whether a pause snapshot belongs to the current review cycle.
+ *
+ * Pauses are in-memory and cycle-tagged. A snapshot from an older cycle must
+ * never keep the review line/lock alive or be resumed after new work started.
+ */
+export function reviewPauseIsCurrent(input: {
+  pauseCycle: number | undefined;
+  currentCycle: number;
 }): boolean {
   return (
-    input.roundInFlight === true ||
-    input.roundActive === true ||
-    input.paused === true
+    typeof input.pauseCycle === "number" &&
+    input.pauseCycle === input.currentCycle
   );
+}
+
+/** Result of consuming one review round from the cycle budget. */
+export interface ReviewRoundBudget {
+  /** The round number this attempt would use (1-based). */
+  round: number;
+  /** False when the cycle's `rounds` cap has already been consumed. */
+  allowed: boolean;
+}
+
+/**
+ * Consume one round from a cycle's budget.
+ *
+ * A new cycle starts at round 1 regardless of the previous cycle's count; this
+ * is the fix for the session-wide counter that made a second plan skip review
+ * with `round limit (1) reached`. Within a cycle the existing cap applies.
+ */
+export function nextReviewRound(input: {
+  round: number;
+  maxRounds: number;
+  newCycle?: boolean;
+}): ReviewRoundBudget {
+  const maxRaw = Number.isFinite(input.maxRounds)
+    ? Math.trunc(input.maxRounds)
+    : 1;
+  const max = Math.max(1, maxRaw);
+  const roundRaw = Number.isFinite(input.round)
+    ? Math.trunc(input.round)
+    : 0;
+  const current = Math.max(0, roundRaw);
+  const round = (input.newCycle === true ? 0 : current) + 1;
+  return { round, allowed: round <= max };
 }
 
 // ── Mode-switch lock (plan 2026-10-25) ───────────────────────────────

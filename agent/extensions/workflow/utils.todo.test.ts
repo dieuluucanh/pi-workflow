@@ -31,6 +31,7 @@ import {
   formatAmbiguity,
   shouldRemind,
   shouldHandoffPlan,
+  samePlanPath,
   findPlanWritePathInMessages,
   findLatestPlanWriteInBranch,
   choosePlanPath,
@@ -1090,4 +1091,36 @@ test("findLatestPlanWriteInBranch reads the newest branch reference", () => {
     undefined,
     "non-plan references are ignored",
   );
+});
+
+test("samePlanPath normalizes relative/absolute and Windows spellings", () => {
+  const cwd = "C:\\repo";
+  assert.equal(
+    samePlanPath(
+      "C:\\repo\\.pi\\plans\\2026-11-08-a.md",
+      ".pi/plans/2026-11-08-a.md",
+      cwd,
+    ),
+    true,
+    "absolute backslashes and a relative forward-slash path are the same file",
+  );
+  assert.equal(
+    samePlanPath(
+      "C:\\Repo\\.pi\\plans\\2026-11-08-a.md",
+      "c:/repo/.pi/plans/2026-11-08-a.md",
+      cwd,
+    ),
+    process.platform === "win32",
+    "case-only differences are ignored on Windows, preserved on POSIX",
+  );
+  assert.equal(
+    samePlanPath(
+      ".pi/plans/2026-11-08-a.md",
+      ".pi/plans/2026-11-08-b.md",
+      cwd,
+    ),
+    false,
+    "a different plan file is a new target",
+  );
+  assert.equal(samePlanPath("", null, cwd), true);
 });

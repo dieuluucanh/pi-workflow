@@ -56,6 +56,7 @@ import {
   normalizeStepText,
   todoKey,
   isPlanWritePath,
+  samePlanPath,
   findPlanWritePathInMessages,
   findLatestPlanWriteInBranch,
   choosePlanPath,
@@ -240,13 +241,14 @@ import {
   planHash,
   readReviewModeConfig,
   resolveReviewPrompt,
-  reviewFooterSegment,
+  nextReviewRound,
   reviewGatePhaseOnResume,
   reviewModeLockFooter,
   reviewModeLockKind,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
   reviewNoticeText,
+  reviewPauseIsCurrent,
   reviewResumeGateOutcome,
   reviewResumeNotice,
   reviewResumePlanChoice,
@@ -254,7 +256,7 @@ import {
   reviewHandoffParks,
   reviewResumeSettles,
   reviewStateSummary,
-  reviewStatusVisible,
+  reviewStatusText,
   shouldRouteInputToReviewer,
   writeReviewModeConfig,
   writeReviewPrompt,
@@ -1324,6 +1326,16 @@ export default function workflowExtension(
   let lastReviewedPlanHash: string | undefined;
   /** 1-based round within the current user-feedback cycle. */
   let reviewRound = 0;
+  /**
+   * Monotonic cycle token. A fresh prompt, an explicit refine/deny, or Build
+   * entry starts a new cycle; async handoffs capture it so a superseded cycle
+   * can never render, apply todos, or clear a newer gate.
+   */
+  let reviewCycleId = 0;
+  /** Plan target the current review cycle belongs to (absolute, or null). */
+  let reviewCyclePlanPath: string | null = null;
+  /** Cycle that owns the parked gate; `0` when no gate is owned. */
+  let reviewGateCycleId = 0;
   /** Findings carried into the next round so the reviewer can verify fixes. */
   let reviewPreviousFindings: ReviewFinding[] | undefined;
   /**
@@ -1345,9 +1357,22 @@ export default function workflowExtension(
         fileHashAtPause?: string;
         round: number;
         previousFindings: ReviewFinding[] | undefined;
+        /** Cycle that recorded the pause; stale cycles are ignored. */
+        cycleId: number;
         at: number;
       }
     | undefined;
+
+  /** The pause only counts while it belongs to the current review cycle. */
+  function currentPausedReview(): typeof pausedReview {
+    if (!pausedReview) return undefined;
+    return reviewPauseIsCurrent({
+      pauseCycle: pausedReview.cycleId,
+      currentCycle: reviewCycleId,
+    })
+      ? pausedReview
+      : undefined;
+  }
   /** In-flight round input (set while `runRound` awaits) — the pause source. */
   let activeReview:
     | { planText: string; round: number; controller: AbortController }
@@ -1386,8 +1411,10 @@ export default function workflowExtension(
    */
   function reviewModeLockKindNow(): ReviewModeLockKind | undefined {
     const roundInFlight = activeReview !== undefined;
-    const paused = pausedReview !== undefined;
-    const gatePhase = reviewGatePhase;
+    const paused = currentPausedReview() !== undefined;
+    // A gate from a superseded cycle must not keep the modes locked.
+    const gatePhase =
+      reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
     let roundActive = false;
     try {
       roundActive = reviewRuntime?.isRoundActive() === true;
@@ -1807,23 +1834,24 @@ export default function workflowExtension(
    */
   function updateReviewStatus(ctx: ExtensionContext): void {
     try {
-      const paused = pausedReview !== undefined;
+      const paused = currentPausedReview() !== undefined;
       let roundActive = false;
       try {
         roundActive = reviewRuntime?.isRoundActive() === true;
       } catch (_e) {
         void _e;
       }
-      const visible = reviewStatusVisible({
+      // The review status is a LIVE indicator, not a result holder: the last
+      // round's state stays for `/review-status` and the REVIEW SUMMARY band,
+      // but the footer segment must disappear as soon as the round ends. A
+      // retained terminal phase is not painted during a new round's cold boot,
+      // and a pause from an old cycle is ignored by `currentPausedReview`.
+      const reviewText = reviewStatusText({
+        state: reviewState,
         roundInFlight: activeReview !== undefined,
         roundActive,
         paused,
       });
-      // The review status is a LIVE indicator, not a result holder: the last
-      // round's state stays for `/review-status` and the REVIEW SUMMARY band,
-      // but the footer segment must disappear as soon as the round ends. While
-      // paused it shows the paused form (never the terminal "aborted" summary).
-      const reviewText = visible ? reviewFooterSegment(reviewState, paused) : "";
       let lockText = "";
       try {
         lockText = reviewModeLockFooter(reviewModeLockKindNow());
@@ -1998,7 +2026,7 @@ export default function workflowExtension(
     previousFindings: ReviewFinding[] | undefined;
   }): boolean {
     const hash = planHash(input.planText);
-    if (pausedReview?.planHash === hash) return false;
+    if (currentPausedReview()?.planHash === hash) return false;
     // Snapshot the file as well as the text: the reviewer may already have
     // written its rewrite, and that must not look like an author edit later.
     const currentFile = readCurrentPlanText(reviewCwd());
@@ -2009,6 +2037,7 @@ export default function workflowExtension(
         currentFile !== undefined ? planHash(currentFile) : undefined,
       round: input.round,
       previousFindings: input.previousFindings,
+      cycleId: reviewCycleId,
       at: Date.now(),
     };
     // A gated audit becomes a paused gate (the handoff keeps waiting). A
@@ -2061,7 +2090,7 @@ export default function workflowExtension(
             roundActive:
               activeReview !== undefined ||
               reviewRuntime?.isRoundActive() === true,
-            paused: pausedReview !== undefined,
+            paused: currentPausedReview() !== undefined,
             gatedPause: reviewGatePhase === "paused",
           });
           if (action === "pause") {
@@ -2175,6 +2204,7 @@ export default function workflowExtension(
       // The parked handoff only awaits the gate; it does not re-read the phase
       // after this point.
       reviewGatePhase = "idle";
+      reviewGateCycleId = 0;
     } catch (_e) {
       void _e;
     }
@@ -2256,17 +2286,18 @@ export default function workflowExtension(
       // `review_submit_plan` that landed in that window changed the file after
       // the snapshot, so refresh it: otherwise `/review-resume` would read the
       // reviewer's own late write as an author edit and start a fresh round.
-      if (pausedReview?.planHash === hash) {
+      const pausedNow = currentPausedReview();
+      if (pausedNow?.planHash === hash) {
         const currentFile = readCurrentPlanText(reviewCwd());
         if (currentFile !== undefined) {
-          pausedReview.fileHashAtPause = planHash(currentFile);
+          pausedNow.fileHashAtPause = planHash(currentFile);
         }
       }
       reviewState = res.state;
       updateStatus(ctx);
       // The snapshot is the ONLY pause signal. A pre-aborted host signal or a
       // host abort without this snapshot is an abort, never a pause.
-      const pausedHere = pausedReview?.planHash === hash;
+      const pausedHere = pausedNow?.planHash === hash;
       if (res.ok) {
         lastReviewedPlanHash = res.planHash;
         abortedReviewHash = undefined;
@@ -2365,7 +2396,7 @@ export default function workflowExtension(
       detachHostSignal = undefined;
       // A pause keeps its own working message (pauseReviewRound sets it
       // after the abort lands); every other exit restores the default.
-      if (!(pausedReview && pausedReview.planHash === hash)) {
+      if (!(currentPausedReview()?.planHash === hash)) {
         setReviewWorkingMessage(undefined);
       }
       // Ownership ended: refresh both surfaces now that `activeReview` is
@@ -2424,6 +2455,21 @@ export default function workflowExtension(
       };
     }
 
+    // A fresh automatic round supersedes any paused one. Even when this
+    // decision is skipped below, no stale pause/line may survive it.
+    if (trigger === "auto" && pausedReview !== undefined) {
+      pausedReview = undefined;
+      try {
+        if (currentSessionCtx) updateStatus(currentSessionCtx);
+      } catch (_e) {
+        void _e;
+      }
+    }
+
+    // A different plan file is a new target even inside one user run: reset the
+    // budget/hashes/findings before the dedupe gates below.
+    const cycleChanged = notePlanTargetForReviewCycle(currentPlanFile);
+
     // Already reviewed this exact revision — do not re-review on re-emit.
     if (hash === lastReviewedPlanHash) {
       return {
@@ -2443,8 +2489,13 @@ export default function workflowExtension(
       };
     }
 
-    reviewRound += 1;
-    if (reviewRound > cfg.rounds) {
+    const budget = nextReviewRound({
+      round: reviewRound,
+      maxRounds: cfg.rounds,
+      newCycle: cycleChanged,
+    });
+    reviewRound = budget.round;
+    if (!budget.allowed) {
       // Round cap reached: hand over with the outstanding findings visible.
       const unresolved = (reviewState?.findings ?? []).filter(
         (f) => f.disposition !== "rejected",
@@ -2483,6 +2534,11 @@ export default function workflowExtension(
 
     // A fresh round supersedes any paused one (resume uses its own path).
     pausedReview = undefined;
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
 
     try {
       return await executeReviewRound({
@@ -2549,6 +2605,127 @@ export default function workflowExtension(
     });
     setReviewWorkingMessage(undefined);
     if (currentSessionCtx) updateStatus(currentSessionCtx);
+  }
+
+  type ReviewCycleReason =
+    | "prompt"
+    | "refine"
+    | "deny"
+    | "build"
+    | "session";
+
+  /**
+   * Start a new review cycle: one plan-authoring/feedback sequence.
+   *
+   * Every fresh prompt, explicit refine/deny, and Build entry owns a cycle.
+   * The cycle token invalidates an old `runHandoff` continuation, the budget
+   * restarts, and an abandoned pause/gate is cancelled (D2) so it cannot keep
+   * the footer line, lock the modes, or short-circuit the next `agent_end`.
+   * Findings survive a same-plan refinement and are cleared for a new file.
+   * Never throws: a broken review surface must not block the prompt.
+   */
+  async function beginReviewCycle(opts: {
+    reason: ReviewCycleReason;
+    keepFindings?: boolean;
+    planPath?: string | null;
+  }): Promise<void> {
+    const hadActive = activeReview !== undefined;
+    const hadPause = currentPausedReview() !== undefined;
+    const hadGate = reviewGatePhase !== "idle";
+    // Synchronously first: any old handoff continuation is stale from here on.
+    reviewCycleId += 1;
+    if (hadActive || pausedReview !== undefined || hadGate) {
+      try {
+        await suspendReview();
+      } catch (_e) {
+        void _e;
+      }
+    }
+    reviewRound = 0;
+    lastReviewedPlanHash = undefined;
+    abortedReviewHash = undefined;
+    if (!hadActive) quietAbortHash = undefined;
+
+    const rawNext = opts.planPath ?? currentPlanFile ?? null;
+    let next: string | null = null;
+    if (rawNext) {
+      try {
+        next = path.isAbsolute(rawNext)
+          ? rawNext
+          : path.join(reviewCwd(), rawNext);
+      } catch (_e) {
+        void _e;
+        next = rawNext;
+      }
+    }
+    const pathChanged =
+      reviewCyclePlanPath !== null &&
+      next !== null &&
+      !samePlanPath(next, reviewCyclePlanPath, reviewCwd());
+    if (pathChanged || opts.keepFindings === false) {
+      reviewPreviousFindings = undefined;
+    }
+    reviewCyclePlanPath = next;
+    reviewGateCycleId = 0;
+
+    if (hadPause || hadGate) {
+      notifyReview(
+        "Paused review abandoned — new work started; the paused round will not resume.",
+        "info",
+      );
+    }
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      if (reviewEnabled() || hadActive || hadPause || hadGate || reviewState) {
+        pi.appendEntry("workflow-review-cycle", {
+          reason: opts.reason,
+          cycleId: reviewCycleId,
+          planPath: reviewCyclePlanPath,
+          at: Date.now(),
+        });
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * A different plan file is a new review target even inside one user run.
+   * Resets the cycle budget and prior findings, but not the cycle token: the
+   * handoff that owns this run must stay current.
+   */
+  function notePlanTargetForReviewCycle(
+    rawPath: string | null | undefined,
+  ): boolean {
+    if (!rawPath) return false;
+    const cwd = reviewCwd();
+    let next: string;
+    try {
+      next = path.isAbsolute(rawPath) ? rawPath : path.join(cwd, rawPath);
+    } catch (_e) {
+      void _e;
+      next = rawPath;
+    }
+    if (reviewCyclePlanPath === null) {
+      reviewCyclePlanPath = next;
+      return false;
+    }
+    if (samePlanPath(next, reviewCyclePlanPath, cwd)) return false;
+    reviewCyclePlanPath = next;
+    reviewRound = 0;
+    lastReviewedPlanHash = undefined;
+    abortedReviewHash = undefined;
+    reviewPreviousFindings = undefined;
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+    return true;
   }
 
   /**
@@ -2996,10 +3173,11 @@ export default function workflowExtension(
       const s = reviewState;
       const lockKind = reviewModeLockKindNow();
       if (!s) {
-        if (pausedReview) {
+        const paused = currentPausedReview();
+        if (paused) {
           ctx.ui.notify(
             [
-              `Review paused at round ${pausedReview.round} (plan hash ${pausedReview.planHash})`,
+              `Review paused at round ${paused.round} (plan hash ${paused.planHash})`,
               "  /review-resume to continue, /review-abort to stop.",
               reviewModeLockStatusLine(lockKind),
             ]
@@ -3037,8 +3215,8 @@ export default function workflowExtension(
         `  explore : ${s.exploreUsed} subagent(s)   tokens≈${s.tokenEstimate ?? "n/a"}`,
         s.verdict ? `  verdict : ${s.verdict}` : "",
         s.error ? `  error   : ${s.error}` : "",
-        pausedReview
-          ? `  paused  : round ${pausedReview.round} — /review-resume to continue, /review-abort to stop`
+        currentPausedReview()
+          ? `  paused  : round ${currentPausedReview()!.round} — /review-resume to continue, /review-abort to stop`
           : "",
         abortedReviewHash
           ? `  note    : revision ${abortedReviewHash} was aborted — it will not be auto-reviewed until the plan changes`
@@ -3203,6 +3381,7 @@ export default function workflowExtension(
       }
       currentPlanFile = target.abs;
       lastPlanWritePath = target.abs;
+      notePlanTargetForReviewCycle(target.abs);
       persistState();
       lastReviewedPlanHash = undefined; // force a fresh review
       abortedReviewHash = undefined;
@@ -3231,7 +3410,7 @@ export default function workflowExtension(
       // Gate only on round ownership below — no `enabled` check here.
       if (!activeReview) {
         ctx.ui.notify(
-          pausedReview
+          currentPausedReview()
             ? "Review is already paused — /review-resume to continue, /review-abort to stop."
             : "No review round running.",
           "info",
@@ -3251,7 +3430,7 @@ export default function workflowExtension(
     handler: async (_args, ctx) => {
       // Manual control: resume works whether or not Review Mode is on.
       // Gate only on paused-session state below — no `enabled` check here.
-      const paused = pausedReview;
+      const paused = currentPausedReview();
       if (!paused) {
         ctx.ui.notify("No paused review — nothing to resume.", "info");
         return;
@@ -3345,17 +3524,18 @@ export default function workflowExtension(
       const rt = reviewRuntime;
       const active =
         activeReview !== undefined || rt?.isRoundActive() === true;
-      if (!active && !pausedReview) {
+      const paused = currentPausedReview();
+      if (!active && !paused) {
         ctx.ui.notify("No review running or paused.", "info");
         return;
       }
       const targetHash =
-        pausedReview?.planHash ??
+        paused?.planHash ??
         (activeReview ? planHash(activeReview.planText) : undefined);
       // Text the gate hands off when one is open (resolved below after the
       // abort lands; falls back to the author's draft when unknown).
       const abortedText =
-        pausedReview?.planText ?? activeReview?.planText;
+        paused?.planText ?? activeReview?.planText;
       pausedReview = undefined;
       // An aborted revision is not auto-reviewed again until the plan changes.
       if (targetHash) abortedReviewHash = targetHash;
@@ -3942,8 +4122,14 @@ export default function workflowExtension(
     updateStatus(ctx);
     persistState();
     // Tab-to-Build leaves Plan behind; suspend review activity but keep the
-    // reviewer session warm for the next round (step 10).
+    // reviewer session warm for the next round (step 10). End the review cycle
+    // so its budget/findings cannot leak into the next Plan round.
     await suspendReview();
+    try {
+      await beginReviewCycle({ reason: "build", keepFindings: false });
+    } catch (_e) {
+      void _e;
+    }
   }
 
   async function setDefaultMode(
@@ -4089,6 +4275,15 @@ export default function workflowExtension(
     // user just approved (step 10).
     await suspendReview();
     currentPlanFile = planPath;
+    try {
+      await beginReviewCycle({
+        reason: "build",
+        keepFindings: false,
+        planPath,
+      });
+    } catch (_e) {
+      void _e;
+    }
     pi.setActiveTools(
       toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
     );
@@ -4227,7 +4422,7 @@ export default function workflowExtension(
     }
   }
 
-  function handlePlannotatorDeny(feedback: string) {
+  async function handlePlannotatorDeny(feedback: string) {
     const ctx = getActiveCtx();
     if (!ctx) return;
     // Not a mode transition, but while a review owns the turn every browser
@@ -4239,8 +4434,7 @@ export default function workflowExtension(
     // Feedback cycle: the next plan revision gets a fresh review round, and the
     // outstanding findings are carried forward so the reviewer can confirm they
     // were actually addressed rather than re-raising them.
-    reviewRound = 0;
-    lastReviewedPlanHash = undefined;
+    await beginReviewCycle({ reason: "deny", keepFindings: true });
     persistState();
     try {
       const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
@@ -4317,7 +4511,9 @@ export default function workflowExtension(
               (getActiveCtx() as any)?.cwd,
             );
           } else {
-            handlePlannotatorDeny(event.feedback || "Plan needs revision.");
+            void handlePlannotatorDeny(
+              event.feedback || "Plan needs revision.",
+            );
           }
         } catch (_e) {
           void _e;
@@ -9507,6 +9703,18 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    // Every fresh prompt is a new review cycle: reset the round budget, cancel
+    // an abandoned pause/gate, and tag the cycle so an old handoff cannot
+    // render after this prompt.
+    try {
+      await beginReviewCycle({
+        reason: "prompt",
+        keepFindings: true,
+        planPath: currentPlanFile,
+      });
+    } catch (_e) {
+      void _e;
+    }
     // Capture header for next checkpoint commit message (first line of prompt)
     try {
       const raw = String((event as any).prompt ?? (event as any).text ?? "");
@@ -9791,6 +9999,7 @@ export default function workflowExtension(
           // The reviewer's `review_submit_plan` writes this path; a manual
           // `/review` must also audit the file the user just wrote.
           currentPlanFile = abs;
+          notePlanTargetForReviewCycle(abs);
           // A run that starts in Default/Build and switches into Plan mid-run
           // still qualifies: what matters is the mode at write time.
           if (workflowMode === "plan") planWrittenInPlanModeThisRun = true;
@@ -9801,6 +10010,7 @@ export default function workflowExtension(
           planWritePathThisRun = raw;
           planWrittenThisRun = true;
           currentPlanFile = raw;
+          notePlanTargetForReviewCycle(raw);
           if (workflowMode === "plan") planWrittenInPlanModeThisRun = true;
         }
         try {
@@ -9821,17 +10031,29 @@ export default function workflowExtension(
     // (Checked before the mutex: awaiting the in-flight handoff would block
     // for the whole review instead of short-circuiting.)
     if (reviewGatePhase !== "idle") {
-      try {
-        ctx.ui.notify(
-          reviewGatePhase === "paused"
-            ? "Review paused — /review-resume to continue, /review-abort to hand off the plan as-is."
-            : "Review running — ESC pauses it, /review-abort hands off the plan as-is.",
-          "info",
-        );
-      } catch (_e) {
-        void _e;
+      // A gate from a superseded cycle must not swallow this run's handoff.
+      // Settle it with the old pause text (the old runHandoff already holds the
+      // author's plan) and continue as if it were idle.
+      if (reviewGateCycleId !== reviewCycleId) {
+        settleReviewGate({
+          outcome: "unreviewed",
+          planText: currentPausedReview()?.planText,
+        });
+        reviewGatePhase = "idle";
+        reviewGateCycleId = 0;
+      } else {
+        try {
+          ctx.ui.notify(
+            reviewGatePhase === "paused"
+              ? "Review paused — /review-resume to continue, /review-abort to hand off the plan as-is."
+              : "Review running — ESC pauses it, /review-abort hands off the plan as-is.",
+            "info",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return;
       }
-      return;
     }
     // Mutex: serialize concurrent agent_end handoffs (bus may emit Promise.all)
     if (handoffInFlight) {
@@ -9853,6 +10075,10 @@ export default function workflowExtension(
       }
     }
     const runHandoff = async () => {
+      // Capture the cycle that owns this handoff. A fresh prompt/refine/deny
+      // increments `reviewCycleId`; every later continuation must stop instead
+      // of rendering or applying a superseded plan.
+      const handoffCycle = reviewCycleId;
       // Per-run handoff gate (plan 2026-10-25 follow-up): a Plan-mode run
       // that wrote no plan this run must not reconcile, review, or hand off
       // an older plan. This runs before the reviewer prefetch so a new task
@@ -9884,6 +10110,7 @@ export default function workflowExtension(
           : path.join(cwd, planWritePathThisRun);
         currentPlanFile = abs;
         lastPlanWritePath = abs;
+        notePlanTargetForReviewCycle(abs);
         // Persist once per run even when the tool_result handler already set
         // the in-memory target: resume must find the plan without a mode
         // switch or a todo update happening to persist it first.
@@ -10239,6 +10466,7 @@ export default function workflowExtension(
         const authorPlan: string = planTextForRender;
         reviewHandoffGate.reset();
         reviewGatePhase = "auditing";
+        reviewGateCycleId = handoffCycle;
         try {
           const reviewed = await runReviewStep(
             authorPlan,
@@ -10246,6 +10474,7 @@ export default function workflowExtension(
             (ctx as any).signal as AbortSignal | undefined,
             "auto",
           );
+          if (handoffCycle !== reviewCycleId) return;
           const reviewedText = reviewed.planText;
           // Fresh read: the phase may have moved to "paused" (ESC /
           // /review-pause) while the round was returning. The `as` widens
@@ -10255,7 +10484,7 @@ export default function workflowExtension(
           if (
             reviewHandoffParks({
               phase: phaseAfterRound,
-              paused: pausedReview !== undefined,
+              paused: currentPausedReview() !== undefined,
               settled: reviewHandoffGate.settled(),
             })
           ) {
@@ -10268,6 +10497,7 @@ export default function workflowExtension(
             const res = await reviewHandoffGate.wait(
               (ctx as any).signal as AbortSignal | undefined,
             );
+            if (handoffCycle !== reviewCycleId) return;
             if (res === undefined) {
               // Host abort while parked: stop the reviewer, drop the pause,
               // do not auto-review this revision again, and hand the author's
@@ -10312,11 +10542,15 @@ export default function workflowExtension(
         } catch (_e) {
           void _e;
         } finally {
-          reviewGatePhase = "idle";
+          if (reviewGateCycleId === handoffCycle) {
+            reviewGatePhase = "idle";
+            reviewGateCycleId = 0;
+          }
         }
         // A mode switch mid-gate (e.g. Tab-to-Build) already left plan mode:
         // the gate settled as skipped, so there is nothing to hand off.
         if (workflowMode !== "plan") return;
+        if (handoffCycle !== reviewCycleId) return;
       }
       // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
       if (!hasUI && planTextForRender && !awaitingDecision) {
@@ -10772,6 +11006,14 @@ export default function workflowExtension(
                   "",
                 );
                 if (refinement?.trim()) {
+                  try {
+                    await beginReviewCycle({
+                      reason: "refine",
+                      keepFindings: true,
+                    });
+                  } catch (_e) {
+                    void _e;
+                  }
                   const todoListText = formatTodoNumberedList(todoItems, {
                     glyph: true,
                   });
