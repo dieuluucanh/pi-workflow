@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased] - 2026-11-08
+## [0.9.2] - 2026-11-08
 
 ### Fixed — Review Mode resets per plan cycle and the review line is live-only
 

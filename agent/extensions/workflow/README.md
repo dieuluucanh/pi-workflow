@@ -586,7 +586,7 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts roles.test.ts profiles.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts commit-policy.test.ts edit-policy.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):
