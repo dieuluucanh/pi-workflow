@@ -183,8 +183,8 @@ const CATALOG: readonly CatalogEntry[] = [
 		pricing: { prompt: "$0.00000045", completion: "$0.0000022", input_cache_reads: "$0.00000009" },
 	},
 	{
-		id: "hf:deepseek-ai/DeepSeek-V4.1-Flash",
-		name: "deepseek-ai/DeepSeek-V4.1-Flash",
+		id: "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+		name: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
 		vision: true,
 		contextWindow: 524288,
 		maxTokens: 65536,

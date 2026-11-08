@@ -15,13 +15,11 @@
   "enabledModels": [
     "opencode-go/muse-spark-1.3-contributor",
     "opencode-go/deepseek-v4.1-flash",
-    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash",
+    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
     "synthetic/hf:zai-org/GLM-5.3-Flash",
     "opencode-go/beam-free",
     "opencode-go/mimo-v2.6-flash",
-    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
-    "opencode-go/minimax-m3.1-flash-free",
-    "opencode-go/longcat-2.5-preview-free"
+    "command-code/deepseek/deepseek-v4.1-flash"
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",

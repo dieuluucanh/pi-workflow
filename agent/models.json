@@ -1,4 +1,5 @@
 {
+  "$schema": "https://pi.dev/schemas/models.schema.json",
   "providers": {
     "synthetic": {
       "baseUrl": "https://api.synthetic.new/openai/v1",
@@ -42,6 +43,46 @@
         }
       ],
       "name": "synthetic"
+    },
+    "command-code": {
+      "baseUrl": "https://api.commandcode.ai/provider/v1",
+      "name": "Command-Code",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash (CommandCode)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "off",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 65536,
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "thinkingFormat": "openai",
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
     }
   }
 }

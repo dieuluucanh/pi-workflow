@@ -88,8 +88,10 @@ import {
 } from "./utils.ts";
 import {
   WORKFLOW_ROLE_ENV,
+  describeCommandPolicy,
   explainCommandRefusal,
   gitCommitPolicyHit,
+  permissionsArgumentCompletions,
   policyForRole,
   resolveSessionRole,
   subagentEnv,
@@ -2928,6 +2930,26 @@ export default function workflowExtension(
     // typed argument text ("ask project", never bare "project").
     getArgumentCompletions: (prefix: string) =>
       writePolicyArgumentCompletions(prefix),
+  });
+
+  // ── /permissions: explain a command's verdict (diagnostics) ────────
+  //
+  // Answers "why was that blocked?" (or "would it be?") without touching a
+  // gate: it reads the same analyzeCommand/explainCommandRefusal the gates
+  // use, so the explanation cannot describe a policy the gate no longer
+  // enforces. Read-only, so it is safe in every mode.
+  pi.registerCommand("permissions", {
+    description:
+      "Explain why a shell command would be allowed or refused: /permissions explain <command>",
+    handler: async (args, ctx) => {
+      const raw = String(args ?? "").trim();
+      const first = raw.split(/\s+/)[0]?.toLowerCase() ?? "";
+      // `/permissions explain <cmd>` and `/permissions <cmd>` both work.
+      const command = first === "explain" ? raw.slice("explain".length).trim() : raw;
+      ctx.ui.notify(describeCommandPolicy(command).join("\n"), "info");
+    },
+    getArgumentCompletions: (prefix: string) =>
+      permissionsArgumentCompletions(prefix),
   });
 
   pi.registerCommand("review-prompt", {

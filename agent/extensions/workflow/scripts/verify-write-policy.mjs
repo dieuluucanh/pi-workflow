@@ -197,6 +197,22 @@ try {
   r = await call(makeCtx("Deny"), "bash", { command: "ls -la" });
   check("3c read-only bash does not prompt", dialogs, 0);
   check("3d read-only bash is allowed", r === undefined, true);
+  // A quoted pattern is data, not a command: the write gate must not prompt
+  // for the canonical exploration queries (shell-text.ts owns the quoting).
+  for (const cmd of [
+    `rg -n "rm -rf" src`,
+    `grep -rn 'a > b' docs`,
+    `git log --grep="rm -rf"`,
+  ]) {
+    dialogs = 0;
+    r = await call(makeCtx("Deny"), "bash", { command: cmd });
+    check(`3d1 no prompt for a quoted pattern: ${cmd}`, dialogs, 0);
+    check(`3d2 allowed: ${cmd}`, r === undefined, true);
+  }
+  // ...while a real redirect still prompts.
+  dialogs = 0;
+  await call(makeCtx("Deny"), "bash", { command: `rg -n 'a' f > out` });
+  check("3d3 a real redirect still prompts", dialogs, 1);
   // A mutating command can be granted permanently too.
   dialogs = 0;
   r = await call(makeCtx(ALWAYS_COMMAND), "bash", { command: "rm -rf otherdir" });

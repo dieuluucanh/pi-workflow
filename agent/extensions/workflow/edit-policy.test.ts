@@ -556,6 +556,52 @@ test("commandMayWrite: a write reports the offending segment", () => {
   assert.ok(r.reason && r.reason.length > 0);
 });
 
+// ── quote-aware classification (shell-text.ts) ─────────────────────
+
+test("commandMayWrite: a quoted pattern is data, not a write", () => {
+  for (const cmd of [
+    `rg -n "rm -rf" src`,
+    `rg -n 'sudo' .`,
+    `grep -rn "touch" src`,
+    `git log --grep="rm -rf"`,
+    // A quoted operator is literal text, not a redirect or a substitution.
+    `grep -rn 'a > b' docs`,
+    `grep -rn 'a & b' docs`,
+    `rg -n '<<' docs`,
+    `rg -n '$(x)' docs`,
+    "rg -n '`id`' docs",
+    "rg -n '${x}' docs",
+  ]) {
+    assert.equal(commandMayWrite(cmd).mutating, false, cmd);
+  }
+});
+
+test("commandMayWrite: an unquoted operator or expansion is still a write", () => {
+  for (const cmd of [
+    `rg -n 'a' f > out`,
+    `rg -n 'a' f >> out`,
+    `rg -n "a $(id)" docs`,
+    "rg -n \"a `id`\" docs",
+    "rg -n a & docs",
+  ]) {
+    assert.equal(commandMayWrite(cmd).mutating, true, cmd);
+  }
+  // Expansion inside double quotes executes; inside single quotes it does not.
+  assert.equal(commandMayWrite(`rg '$(id)' f`).mutating, false);
+  assert.equal(commandMayWrite(`rg "$(id)" f`).mutating, true);
+});
+
+test("commandMayWrite: the grant key is the raw segment, unchanged", () => {
+  const cfg = coerceWritePolicyConfig({ mode: "ask" });
+  const sed = classifyWriteCall("bash", { command: "sed -n '1,5p' f" }, cfg);
+  assert.equal(sed.mutating, true);
+  assert.equal(sed.key, "sed -n '1,5p' f");
+  // A read-only command has no key at all, so no grant is ever offered.
+  const rg = classifyWriteCall("bash", { command: `rg -n "rm -rf" src` }, cfg);
+  assert.equal(rg.mutating, false);
+  assert.equal(rg.key, undefined);
+});
+
 // ── tool classification ─────────────────────────────────────────────
 
 test("writeTargetPaths: reads path, file_path and paths", () => {

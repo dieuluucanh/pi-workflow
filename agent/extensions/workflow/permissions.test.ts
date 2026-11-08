@@ -12,6 +12,7 @@ import {
   ROLE_POLICIES,
   WORKFLOW_ROLE_ENV,
   commandClassOf,
+  describeCommandPolicy,
   describeRolePolicy,
   explainCommandRefusal,
   forbiddenSyntaxReason,
@@ -19,11 +20,13 @@ import {
   hasForbiddenSyntax,
   isCommandAllowedForRole,
   isWorkflowRole,
+  permissionsArgumentCompletions,
   policyForRole,
   resolveSessionRole,
   splitCommandSegments,
   subagentEnv,
 } from "./permissions.ts";
+import { commandMayWrite } from "./edit-policy.ts";
 
 const allowed = (role: "planner" | "reviewer" | "explorer", cmd: string) =>
   isCommandAllowedForRole(role, cmd);
@@ -496,4 +499,196 @@ test("commit-policy hit: non-git commands and junk", () => {
   assert.equal(gitCommitPolicyHit("npm publish"), null);
   assert.equal(gitCommitPolicyHit("commit -m x"), null);
   assert.equal(gitCommitPolicyHit("github-cli push"), null);
+});
+
+// ── Quote-aware command policy (shell-text.ts) ──────────────────────
+
+test("policy: a quoted pattern is data, not a command", () => {
+  for (const cmd of [
+    `rg -n "rm -rf" src`,
+    `rg -n 'sudo' .`,
+    `rg -n "touch" src`,
+    `rg -n "mkdir" scripts`,
+    `git log --grep="rm -rf"`,
+    `git log --grep="git commit"`,
+    `rg -n "code" src`,
+    `rg -n "switch" src`,
+    `grep -rn "child_process" src`,
+    // A quoted operator is literal text, not a redirect/operator/heredoc.
+    `grep -rn 'a > b' docs`,
+    `grep -rn 'a & b' docs`,
+    `rg -n '<<' docs`,
+    `rg -n '$(x)' docs`,
+    "rg -n '${x}' docs",
+    "rg -n '`id`' docs",
+  ]) {
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      assert.equal(allowed(role, cmd), true, `${role} should allow: ${cmd}`);
+      assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+    }
+  }
+});
+
+test("policy: expansions execute only outside single quotes", () => {
+  // Double quotes and no quotes expand; single quotes do not.
+  for (const cmd of [
+    `rg -n "a $(id)" docs`,
+    `rg -n a $(id) docs`,
+    "rg -n \"a `id`\" docs",
+    `rg -n 'a' f > out`,
+    `rg -n "a" f >> out`,
+  ]) {
+    assert.equal(allowed("planner", cmd), false, `should deny: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, true, `is a write: ${cmd}`);
+  }
+  // ...but a quoted one is a literal search.
+  for (const cmd of ["rg -n 'a $(id)' docs", "rg -n '${x}' docs"]) {
+    assert.equal(allowed("explorer", cmd), true, `should allow: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+  }
+});
+
+test("policy: executors stay refused — the denylist's premise", () => {
+  // Every binary that runs its arguments as a command must be class `full`,
+  // otherwise the position-aware keyword layer would be the only defence.
+  for (const cmd of [
+    "bash -c 'rm -rf /'",
+    "sh script.sh",
+    "perl -e 1",
+    `python3 -c 'print(1)'`,
+    "node -e 1",
+    "eval 'rm x'",
+    "xargs rm",
+    "env rm -rf /",
+    "nice -n 5 rm x",
+    "timeout 5 rm x",
+    "find . -exec rm {} ;",
+    `awk '{print}' f`,
+    "sed -n 1p f",
+  ]) {
+    assert.equal(commandClassOf(cmd), "full", `must be full: ${cmd}`);
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      assert.equal(allowed(role, cmd), false, `${role} should deny: ${cmd}`);
+    }
+  }
+});
+
+test("policy: the harmless-redirect exemptions are unchanged", () => {
+  for (const cmd of [
+    "2>/dev/null ls",
+    "ls 2>&1",
+    "ls >/dev/null",
+    "npm test 2>/dev/null",
+    "npm test 2> /dev/null | tail -5",
+    "rg TODO src 2>/dev/null | head -5",
+  ]) {
+    assert.equal(allowed("planner", cmd), true, `should allow: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+  }
+  // A real file is still a write, whatever prefix it shares with /dev/null.
+  for (const cmd of ["ls > /dev/null.txt", "ls 2>/dev/nullx", "ls > out"]) {
+    assert.equal(allowed("planner", cmd), false, `should deny: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, true, `is a write: ${cmd}`);
+  }
+});
+
+test("policy: the two gates agree — plan-allowed implies not-a-write", () => {
+  // The invariant the refactor exists to guarantee. If a future classifier
+  // change lets the role gate allow something the write gate calls a write,
+  // this fails instead of silently prompting the user for a read-only command.
+  const corpus = [
+    "ls -la",
+    "git status",
+    "git log --oneline -5",
+    "rg TODO src",
+    `grep -E 'a|b' src/app.ts`,
+    `rg -n "rm -rf" src`,
+    `grep -rn 'a > b' docs`,
+    `grep -rn 'a & b' docs`,
+    `jq . package.json`,
+    "sort -u file.txt",
+    "find . -name '*.ts'",
+    "npm test",
+    "npm run lint",
+    "tsc --noEmit",
+    "eslint src",
+    "head -n 160 f | tail -n +100",
+    "2>/dev/null ls",
+    "ls 2>&1",
+    "git status && npm test",
+    "npm test 2>&1 | tail -50",
+    // Denied by both, in different ways — the implication holds vacuously.
+    "rm -rf x",
+    `sed -n '1,20p' f`,
+    "npm install left-pad",
+    "eslint --fix src",
+    "git commit -m x",
+  ];
+  for (const cmd of corpus) {
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      if (explainCommandRefusal(role, cmd) !== null) continue;
+      assert.equal(
+        commandMayWrite(cmd).mutating,
+        false,
+        `${role} allows it, so it must not be a write: ${cmd}`,
+      );
+    }
+  }
+});
+
+// ── diagnostics ─────────────────────────────────────────────────────
+
+test("describeCommandPolicy: an empty argument prints usage", () => {
+  const lines = describeCommandPolicy("");
+  assert.match(lines[0], /Usage: \/permissions explain/);
+  assert.equal(describeCommandPolicy(undefined)[0], lines[0]);
+  assert.equal(describeCommandPolicy("   ")[0], lines[0]);
+});
+
+test("describeCommandPolicy: a quoted pattern reads as read-only", () => {
+  const text = describeCommandPolicy(`rg -n "rm -rf" src`).join("\n");
+  assert.match(text, /Segments \(1\)/);
+  assert.match(text, /class=read-only|read-only · no write/);
+  assert.match(text, /planner\s+✔ allowed/);
+  assert.match(text, /Default write policy: read-only/);
+});
+
+test("describeCommandPolicy: a refused command names the rule", () => {
+  const sed = describeCommandPolicy(`sed -n '1,5p' f`).join("\n");
+  assert.match(sed, /full · write/);
+  assert.match(sed, /planner\s+✖ segment-class/);
+  assert.match(sed, /Default write policy: write/);
+
+  const redirect = describeCommandPolicy(`rg -n 'a' f > out`).join("\n");
+  assert.match(redirect, /forbidden shell syntax: a file redirect/);
+  assert.match(redirect, /✖ forbidden-syntax/);
+
+  const keyword = describeCommandPolicy("rm -rf x").join("\n");
+  assert.match(keyword, /destructive denylist: `rm`/);
+  assert.match(keyword, /✖ destructive-pattern/);
+
+  const commit = describeCommandPolicy("git commit -m x").join("\n");
+  assert.match(commit, /git commit \(commit policy\)/);
+  // The commit policy owns it, so the write gate does not call it a write.
+  assert.match(commit, /Default write policy: read-only/);
+});
+
+test("describeCommandPolicy: developer line names the flag", () => {
+  const flag = describeCommandPolicy("eslint --fix src").join("\n");
+  assert.match(flag, /flag --fix/);
+  assert.match(flag, /✖ blocked-flag/);
+});
+
+test("permissionsArgumentCompletions: offers only the explain subcommand", () => {
+  assert.deepEqual(permissionsArgumentCompletions("ex")?.map((c) => c.label), [
+    "explain",
+  ]);
+  assert.equal(permissionsArgumentCompletions("ex")?.[0].value, "explain ");
+  // Exact match closes the list so the first Enter submits.
+  assert.equal(permissionsArgumentCompletions("explain"), null);
+  // The command text itself is free-form.
+  assert.equal(permissionsArgumentCompletions("explain rg"), null);
+  assert.equal(permissionsArgumentCompletions("nope"), null);
+  // An empty prefix offers the subcommand, like /write-policy does.
+  assert.equal(permissionsArgumentCompletions("")?.[0].label, "explain");
 });

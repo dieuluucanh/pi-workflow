@@ -44,7 +44,7 @@
         "explorer": {
           "provider": "synthetic",
           "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
-          "thinking": "medium"
+          "thinking": "high"
         },
         "builder": {
           "provider": "synthetic",
@@ -122,6 +122,37 @@
       "defaultModel": {
         "provider": "opencode-go",
         "id": "beam-free",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "CommandCode-Deepseek-V4.1-Flash",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
+        },
+        "explorer": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "low"
+        },
+        "builder": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
+        }
+      },
+      "defaultModel": {
+        "provider": "command-code",
+        "id": "deepseek/deepseek-v4.1-flash",
         "thinking": "high"
       }
     }

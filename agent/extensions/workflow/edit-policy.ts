@@ -39,14 +39,7 @@ import {
   WORKFLOW_SETTINGS_KEY,
   type JsonObject,
 } from "./commit-policy.ts";
-import {
-  commandClassOf,
-  forbiddenSyntaxReason,
-  gitCommitPolicyHit,
-  splitCommandSegments,
-  stripHarmlessRedirects,
-  DENIED_FLAG_RE,
-} from "./permissions.ts";
+import { analyzeCommand } from "./permissions.ts";
 
 /** Nested key under WORKFLOW_SETTINGS_KEY. */
 export const WRITE_POLICY_KEY = "writePolicy";
@@ -408,67 +401,21 @@ export interface WriteIntent {
 /**
  * Classify a shell command as mutating or not.
  *
- * Per segment, in this order:
- *   1. forbidden shell syntax (file redirect, heredoc, command/process
- *      substitution, background `&`) → mutating. Checked FIRST so a
- *      redirect riding along with a git command (`git commit -m x > log`)
- *      is still caught as a write.
- *   2. `git add` / `git commit` / `git push` → NOT mutating: they touch the
- *      index and the object store, not the user's working-tree files, and
- *      the independent commit policy already governs them.
- *   3. an unrestricted command class (`commandClassOf` → "full") → mutating.
- *      This is the fail-closed default: anything not provably read-only
- *      (sed/awk programs, interpreters, unknown binaries) may write.
- *   4. a write flag (`--fix`, `--write`, `--in-place`, `--update-snapshots`,
- *      `--output`, …) → mutating. Catches verify-class commands that still
- *      rewrite files (`eslint --fix`).
- *   5. otherwise → not mutating (read-only and verify-class segments pass:
- *      `ls`, `cat`, `rg`, `git status`, `npm test`, `tsc --noEmit`).
+ * The decision — and the five-step order it follows — lives in
+ * `analyzeCommand` (`permissions.ts`), the single pipeline the role gate and
+ * the write gate share. This is only the `WriteIntent` adapter, so the two
+ * gates cannot disagree about quoting, redirects or command position.
  */
 export function commandMayWrite(command: unknown): WriteIntent {
   if (typeof command !== "string" || !command.trim()) {
     return { mutating: false };
   }
-  for (const segment of splitCommandSegments(command)) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-
-    // 1. Forbidden syntax — a file redirect is a write whatever else runs.
-    const syntax = forbiddenSyntaxReason(trimmed);
-    if (syntax) {
-      return { mutating: true, reason: syntax, segment: trimmed };
-    }
-
-    // Classify the command with harmless redirections (`2>&1`, `>/dev/null`)
-    // removed, so `2>/dev/null ls` is judged as `ls` (read-only) rather than
-    // as an unknown binary. A segment that is nothing but a redirection
-    // writes no file.
-    const scrubbed = stripHarmlessRedirects(trimmed).trim();
-    if (!scrubbed) continue;
-
-    // 2. Git history operations — governed by the commit policy, not here.
-    if (gitCommitPolicyHit(scrubbed)) continue;
-
-    // 3. Not provably read-only → may write.
-    if (commandClassOf(scrubbed) === "full") {
-      return {
-        mutating: true,
-        reason: "runs a command that may modify files",
-        segment: trimmed,
-      };
-    }
-
-    // 4. A write flag on an otherwise-safe command.
-    const flag = scrubbed.match(DENIED_FLAG_RE);
-    if (flag) {
-      return {
-        mutating: true,
-        reason: `uses the write flag ${flag[2] ?? flag[0].trim()}`,
-        segment: trimmed,
-      };
-    }
-  }
-  return { mutating: false };
+  const analysis = analyzeCommand(command);
+  if (!analysis.mutating) return { mutating: false };
+  const intent: WriteIntent = { mutating: true };
+  if (analysis.writeReason) intent.reason = analysis.writeReason;
+  if (analysis.writeSegment) intent.segment = analysis.writeSegment;
+  return intent;
 }
 
 /** Normalize a shell segment into the key used for allowlist matching. */

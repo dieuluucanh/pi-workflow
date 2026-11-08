@@ -2,6 +2,85 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased] - 2026-11-08
+
+### Fixed — command policy: quoted text is a value, not a command
+
+**The problem.** Plan Mode refused the canonical exploration queries, and the
+write policy independently called a quoted `>` a file write. Both faults came
+from the same place: the policy layer had four text scanners with three
+different ideas about quoting.
+
+| Command | Before | After |
+| --- | --- | --- |
+| `rg -n "rm -rf" src` | refused (`rm` matched the raw text) | allowed, read-only |
+| `rg -n "sudo" .` / `git log --grep="rm -rf"` | refused | allowed, read-only |
+| `grep -rn 'a > b' docs` | refused as a redirect; a *write* in `ask` (prompt) | allowed, read-only |
+| `grep -rn 'a $(b) c' docs` | refused as substitution; a *write* in `ask` | allowed, read-only |
+| `2>/dev/null ls` | refused in Plan Mode | allowed, read-only |
+| `rg -n 'a' f > out` | refused | **still refused** (real redirect) |
+| `rg -n "a $(id)" f` | refused | **still refused** (double quotes expand) |
+| `bash -c 'rm -rf /'`, `env rm -rf /`, `xargs rm`, `find . -exec rm {} ;` | refused | **still refused** |
+| `sed -n '1,20p' f` / `awk …` | refused | **still refused** (Builder-only, unchanged) |
+
+**One scanner, one analysis.** New `shell-text.ts` is the single source of
+quoting truth, and it exposes three views plus the segmentation:
+
+- `structural` — what the shell treats as an **operator** (`| & ; < > ( )` and
+a bare `&`). Quoted and backslash-escaped characters are masked, because they
+are literal text.
+- `expandable` — what the shell **expands**. Single quotes and escapes are
+masked; double quotes are kept, because `$(…)`, `${…}` and backticks do
+expand there.
+- `words` — the **argv** the process receives, after quote removal, with
+operators and redirects excluded (so a leading `2>/dev/null` no longer hides
+the command name).
+- `splitSegments` reproduces the previous splitter bit-for-bit, including its
+legacy escape-inside-single-quotes quirk, because `gitCommitPolicyHit`
+consumes its exact boundaries.
+
+`analyzeCommand()` (`permissions.ts`) is now the single pipeline: the role gate
+(`explainCommandRefusal`) and the write gate (`commandMayWrite`, now a 10-line
+adapter) read the same result, so they can no longer disagree about the same
+text. Classification still runs on `stripHarmlessRedirects(segment)`, which
+keeps the `/dev/null` and `2>&1` exemptions load-bearing.
+
+**The destructive-keyword denylist is now position-aware** (it stays, as
+defence in depth). A keyword counts in **command position** (`rm -rf x`,
+`npm install`, `git commit`) or **anywhere in a segment already classified
+`full`** (`env rm -rf /`, `bash -c "rm -rf /"`, `xargs rm`) — the latter only
+makes the refusal name the cause. A quoted pattern in a read-only command is
+data, which is what makes `rg -n "rm -rf"` usable. Every binary that executes
+its arguments is class `full` and `full` is refused for every restricted role;
+a new executor-invariant test pins that premise, and a cross-gate test pins
+`plan-allowed ⇒ not-a-write` over a corpus.
+
+**New `/permissions [explain] <command>`.** Prints each segment's class, the
+planner/reviewer/explorer verdict and whether the write policy would treat the
+command as a write — from the same analysis, without running anything. This is
+the answer to "why was that blocked?" before the agent hits the wall.
+
+**Deliberately unchanged.** `sed`/`awk` stay Builder-only: their programs are
+code, and `--sandbox` is not a fix — verified with GNU sed 4.9, `sed --sandbox
+-i 's/a/b/' f` (also `-ni`, `--in-place`, `-i.bak`) still rewrites the file,
+and BSD/macOS sed has no `--sandbox`. Use the `read` tool (`offset`/`limit`),
+`head -n N | tail -n +M`, or `rg`; the refusal hints now name them.
+
+**Intentional behaviour changes** (each pinned by a test): `echo rm -rf /` and
+`echo "rm -rf /"` are allowed (they print text; a pipe into an interpreter or a
+real redirect is still refused), and a quoted flag is now caught rather than
+missed — `find . "-delete"` and `eslint "--fix"` are writes, because quote
+removal makes those real flags.
+
+**Tests.** The suite grows from 491 to 525: new `shell-text.test.ts` pins the
+three views (masking, expansion, argv, Windows paths, a quote-nesting fuzz
+loop); `permissions.test.ts` adds the quoted-pattern matrix, the executor
+invariant and the cross-gate invariant (`plan-allowed ⇒ not-a-write`);
+`edit-policy.test.ts` pins that a quoted pattern is not a write and that the
+grant key is unchanged. `npm run check:policy` drives the real `tool_call`
+handler through 83 checks, including “a quoted-pattern `grep` produces zero
+dialogs in `ask` mode”.
+
 ## [0.9.1] - 2026-11-06
 
 ### Fixes

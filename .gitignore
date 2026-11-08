@@ -23,3 +23,6 @@ agent/models-store.json
 agent/trust.json
 agent/npm/package-lock.json
 agent/memory/MEMORY.md
+# local config backups (may contain credentials)
+agent/models.json.bak-*
+agent/models.*.bak
