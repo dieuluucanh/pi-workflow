@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.10.0] - 2026-11-10
+
+### Features
+
+- durable review handoffs, chunked rewrites, provider recovery (09de420)
+
 ## [Unreleased]
 
 ### Fixed — review handoffs survive later rounds and reloads
