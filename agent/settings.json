@@ -54,9 +54,9 @@
       "id": "deepseek-v4.1-flash",
       "thinking": "high"
     },
-    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
+    "defaultProfile": "Opencode-Free",
     "commitPolicy": {
-      "mode": "never"
+      "mode": "allow"
     }
   },
   "extensionChangelogVersions": {

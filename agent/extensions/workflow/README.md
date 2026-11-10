@@ -36,7 +36,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/todos` | Show todo list |
 | `/btw` | Queue note for next turn |
 | `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included; type to filter models by `provider/id` or display name). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
-| `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default… (fuzzy type-to-filter; completed actions close the picker). CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]` |
+| `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default… (fuzzy type-to-filter; completed actions close the picker). CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]`, `retarget-provider <old> <new> [global\|project] [--apply]` |
 | `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout |
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
@@ -145,7 +145,10 @@ Plan Mode and Review Mode share one role-based command policy (`permissions.ts`)
 | `read`, `grep`, `find`, `ls` | Inspect the repository |
 | `review_bash` | Shell access on the same role policy Plan Mode uses: read-only inspection plus **test/lint/typecheck** runners (`npm test`, `npm run lint/typecheck`, `eslint`, `tsc --noEmit`, `node --test`, `pytest`, `cargo clippy`, …). No file redirects (`2>/dev/null` and `2>&1` are allowed), no `sed`/`awk`, no `rm`/`mv`/`cp`/`mkdir`/`touch`, no `sudo`, no package installs, no builds, no `git add/commit/push` |
 | `review_explore` | Read-only reconnaissance subagents on the **explorer** role's model, capped by `exploreBudget` per round |
-| `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<slug>.md` |
+| `review_plan_begin` | Starts a **chunked** rewrite: resets the per-round assembler and states the per-chunk size limit |
+| `review_plan_chunk` | Appends one ordered chunk of the rewrite (`index` 1, 2, 3, …). Out-of-order, repeated or oversized chunks are refused with the index that is expected next |
+| `review_plan_finalize` | Turns the accepted chunks into the plan. Refuses an incomplete assembly; goes through the same `review_submit_plan` funnel, so the plan is written exactly once |
+| `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<slug>.md`. Also the one-shot path for short plans |
 | `review_pass_done` | Ends a pass with a verdict (refused if nothing was submitted) |
 
 The policy classifies commands into three classes and maps them to roles:
@@ -165,11 +168,33 @@ Compound commands are checked segment-by-segment, and each check reads the view 
 
 The built-in `bash`, `edit` and `write` tools are never given to the reviewer at all.
 
+### Chunked rewrite submission
+
+A plan rewrite is the one response in the flow that can be longer than a provider gateway allows a
+stream to live. Nothing is written until a submission succeeds, so a cut mid-response loses the
+whole rewrite and burns the round. Chunking makes the rewrite survive that:
+
+1. `review_plan_begin` (optionally with `totalChunks`) resets the assembler.
+2. `review_plan_chunk` appends `index` 1, 2, 3, … — each at most `chunkChars` characters. A
+   rejected chunk (out of order, repeated, oversized, or cut before it arrived) is answered with
+   the index the assembler expects next, so the retry continues **without restarting**: already
+   accepted chunks are kept. Calling `review_plan_begin` again is the explicit "throw it away" move.
+3. `review_plan_finalize` validates completeness (`totalChunks`, when declared) and calls the same
+   submit funnel the one-shot path uses — `writePlan` stays the single writer and the review gate
+   is notified exactly once.
+
+Pass 1 asks for the chunked protocol when `chunkChars > 0` **and** the plan is longer than
+`chunkChars × 2`; shorter plans keep the one-shot `review_submit_plan`. `chunkedSubmit: "off"` or
+`chunkChars: 0` disables chunking entirely (the runtime then refuses `review_plan_begin`). Pass 2
+reads the assembled rewrite and its diff, so a chunked pass 1 feeds the self-verify pass unchanged.
+On abort, teardown, a new round or a provider switch the assembler is cleared, so a partial rewrite
+can never be stitched onto a different attempt.
+
 The child session is created with an explicit tool allowlist: the read-only built-ins **plus every reviewer tool above**. That union is load-bearing — Pi's `createAgentSession({ tools })` option is a *global* allowlist that filters custom tools too, so a built-ins-only list silently removes `review_submit_plan` and makes every review end in a fallback. The runtime therefore reads `getActiveToolNames()` straight after creation and refuses the session (naming the missing tools) rather than starting a review that cannot succeed; the active tool set is also logged once per session.
 
 ### Two passes
 
-1. **Review + rewrite** — audits the plan against the repository and the guidance, records findings, submits the revised plan.
+1. **Review + rewrite** — audits the plan against the repository and the guidance, records findings, submits the revised plan (one-shot for short plans, `review_plan_begin`/`chunk`/`finalize` when the plan exceeds two chunks).
 2. **Self-verify** — re-reads the original and the rewrite, confirms every accepted finding was actually addressed, and reports anything that was silently dropped. This pass exists because a rewrite can lose a requirement the author cared about.
 
 Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews resubmit pass 1's plan directly. When pass 2 runs it checks a **unified diff** of the rewrite (not two full plans), so the self-check costs roughly a tenth of the tokens.
@@ -241,6 +266,8 @@ A paused review is in-memory and belongs to the cycle that recorded it: it canno
 
 `/review` resolves its target independently of the handoff, so a plan is never unreachable because of how Plan mode was entered: explicit path → this run's last plan write → the session's last plan write → the last handed-off plan → the newest plan write in the session branch. Missing, empty or unreadable candidates are skipped; the resolved path is named when it came from a fallback; the reviewer writes back to that same file. With no candidate it lists the newest `.pi/plans/*.md` files and the explicit-path syntax. `/review <path>` is restricted to `.pi/plans/`.
 
+**Manual handoff and later rounds.** A settled manual `/review` opens Plannotator with the reviewed plan, even with automatic Review Mode off. In Default/Build, Approve enters Build and Deny switches to Plan before sending feedback. The manual cycle keeps re-reviewing and re-handing off after a Deny until Approve, a fresh prompt or Build. Every new round supersedes an older pending browser gate, so round 2 and later always reopen the current plan; a stale Deny arriving during a round is discarded. After `reload`/`resume`/`fork`, the replacement session asks Plannotator `review-status`: a matching pending review keeps its gate, a completed decision is applied, and a missing/changed review is cleared with a reason. Desktop brings a notification review tab to the front and reloads an existing same-URL review tab; tool-result localhost URLs stay in the background.
+
 - **Mode switching is locked** from the moment a review round starts (including the cold boot) until it lands, fails, or is aborted, and for the whole paused state. `Tab` (when no suggestion list is open), `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. `/review-abort` and `/review-mode off` end the lock; the post-review handoff prompt is intentionally unlocked because the independent reviewer has finished.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. One long-lived terminal listener maps it to `/review-pause` semantics (warm session kept) and stays registered through the paused window: a second ESC while a gated review is paused is swallowed with a hint instead of aborting the parked plan turn (that abort used to poison the turn's signal and stall every `/review-resume`). With no review owning the turn it passes ESC through, so the editor, questionnaire and handoff selector keep it. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.
 - `/review-pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
@@ -302,6 +329,28 @@ Every bridged method is feature-detected: on a Pi version without a given access
 ```
 
 A stored credential (`/login <provider>` → `auth.json`) always wins over the `apiKey` template, so `$MY_API_KEY` needs no environment variable while you are logged in. Extensions that register the same provider at runtime keep working: their live model list replaces the static one in the parent, so nothing regresses there.
+
+### Command Code
+
+Command Code's Provider API serves models on three wires: Claude models answer on
+`/messages`, models that advertise `/responses` answer there, and the rest use
+`/chat/completions`. A hand-written `models.json` entry declares one API family for the
+whole provider, so it cannot route each model. Use the maintained
+[`pi-commandcode-provider`](https://www.npmjs.com/package/pi-commandcode-provider)
+package: it registers the `commandcode` provider, routes each model from
+`supported_endpoints`, and normalises Command Code's reasoning deltas.
+
+After installing it, migrate every saved reference without hand-editing JSON:
+
+```text
+/profile retarget-provider command-code commandcode          # dry run
+/profile retarget-provider command-code commandcode --apply  # writes profiles.json + roles.json
+```
+
+The command rewrites only `{ provider, id }` model refs, preserves every other key,
+and creates a `.bak` beside each file it changes. A malformed file blocks both writes.
+Verify the new provider in `/model` before deleting the old static entry. The Pi Desktop
+doctor prints the same recommendation when it sees a single-wire Command Code provider.
 
 ### Configuration
 
@@ -485,6 +534,12 @@ Review Mode settings live under `workflow.reviewMode`:
 | `passes` | `2` | `1` = review+rewrite only; `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |
+| `providerRecovery` | `"fallback"` | After a recoverable provider cut, try the fallback chain instead of failing the round immediately. `"off"` restores the single-model behaviour |
+| `providerRetries` | `1` | SDK retries per reviewer model before the chain advances (0–2) |
+| `fallbackModel` | unset | Optional explicit first fallback `{ provider, id, thinking }`; the automatic chain still follows it |
+| `chunkedSubmit` | `"auto"` | Submit long rewrites through `review_plan_begin`/`review_plan_chunk`/`review_plan_finalize` instead of one oversized response. `"off"` keeps the one-shot `review_submit_plan` |
+| `chunkChars` | `6000` | Max characters per chunk; also sets the auto threshold (`chunkChars × 2` plan characters). `0` disables chunked submission |
+| `recoveryBudgetMs` | `0` | Overall time budget for the provider/fallback attempts. `0` uses the round deadline |
 | `exploreBudget` | `1` | Max `review_explore` subagents per round (cost ceiling). `0` whenever the Planner manifest already carries `explore` recon — the reviewer then verifies instead of re-exploring |
 | `timeoutMs` | `300000` | Wall-clock cap for a whole round, run included (5 minutes). `0` = unlimited (explicit opt-out); a pass then ends on `review_pass_done`, run settle, abort or error. A silent reviewer is still caught immediately by the settle race. `/review-mode status` prints the value and the settings file that set it, and `/review-mode timeout <seconds\|unlimited>` changes it without editing JSON |
 | `contextChars` | `15000` | Max chars of shared Plan Mode context in the pass-1 prompt (diet default; the reviewer re-reads truncated parts with `read`/`grep`) |
@@ -542,7 +597,7 @@ Write Permission settings live under `workflow.writePolicy` (same global/project
 
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `provider-retarget.ts` (guarded, backed-up `provider` ref migration for profiles/roles — pure document rewrite plus a two-phase file apply), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers), `review-handoff.ts` (pure pending-gate correlation, supersede and reload-recovery decisions). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -574,11 +629,18 @@ The warning reads `review skipped (the reviewer's provider failed after 3 retry 
 
 Earlier versions mislabeled this as `the reviewer finished without submitting a plan — it has no write path…`; since 0.3.3 the real provider error is captured from the reviewer session and reported here, in the pane, and via `/review-status` (the old message now appears only when the reviewer genuinely settled without calling `review_submit_plan`).
 
+If the text is specifically `Stream ended without finish_reason`, the gateway closed a long
+SSE response before Pi saw a terminal reason. Pi treats that as a fatal provider error, and
+the retry repeats the same long request. Lowering the thinking level may shorten it, but it
+is not a reliable fix. On Command Code, use the maintained provider and retarget the saved
+references (see [Command Code](#command-code)); then verify the new model in `/model` before
+removing the old static entry.
+
 What to do:
 
-1. **Check the provider** — the truncated message is the provider's own reply (rate limit, quota, overloaded, auth). Retry the review with `/review` once the provider recovers; a review that dies this way can simply be re-run.
+1. **Check the provider** — the truncated message is the provider's own reply (rate limit, quota, overloaded, auth, or a mid-stream cut). Retry the review with `/review` once the provider recovers; a review that dies this way can simply be re-run.
 2. **A long review shares one API key with the parent** — planner + reviewer often hit the same key, so a long review can exhaust rate limits. Stagger heavy Plan Mode work or raise the provider's quota.
-3. **Switch the reviewer model** if the failures recur — `/role set reviewer <provider/model>` (see [Review Mode](#review-mode)); pick a model whose provider is currently healthy.
+3. **Switch the reviewer model** if the failures recur — `/profile use <name>` or `/role set reviewer <provider/model>` (see [Review Mode](#review-mode)); pick a model whose provider is currently healthy.
 
 ## Development
 
@@ -586,7 +648,7 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):

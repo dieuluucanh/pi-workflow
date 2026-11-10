@@ -26,6 +26,7 @@ import * as path from "node:path";
 
 import {
   DEFAULT_REVIEW_MODE_CONFIG,
+  buildReviewerAttempts,
   createReviewRoundGate,
   createReviewSession,
   createReviewState,
@@ -37,6 +38,7 @@ import {
   type CreateReviewSessionOptions,
   type CreateReviewSessionResult,
   type ReviewChildSession,
+  type ReviewFallbackModel,
   type ReviewModeConfig,
   type ReviewPassResult,
   type ReviewPhase,
@@ -50,6 +52,7 @@ import {
   ReviewTranscript as Transcript,
 } from "./review.ts";
 import { appendProviderAuthHint } from "./review-providers.ts";
+import { isRecoverableProviderFailure } from "./review-recovery.ts";
 import { createReviewTools } from "./review-tools.ts";
 import { buildPlanDiff, renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
 
@@ -75,6 +78,8 @@ export interface ReviewRuntimeDeps {
   reviewerModel: () =>
     | { provider: string; id: string; thinking: string }
     | undefined;
+  /** Automatic fallback models for provider recovery (parent, base reviewer, base planner). */
+  fallbackReviewerModels?: () => readonly ReviewFallbackModel[];
   /** Resolve a model from the parent's registry. */
   findModel: (provider: string, id: string) => unknown;
   /**
@@ -193,7 +198,15 @@ export function buildPass1Prompt(input: {
   round: number;
   totalRounds: number;
   verify: boolean;
+  /**
+   * Max characters per submitted chunk (step 18). `0` disables chunked mode.
+   * When set and the plan is longer than two chunks, pass 1 asks for the
+   * chunked protocol instead of one oversized response.
+   */
+  chunkChars?: number;
 }): string {
+  const chunkChars = input.chunkChars ?? 0;
+  const chunked = chunkChars > 0 && input.planText.length > chunkChars * 2;
   const parts: string[] = [
     `[REVIEW MODE — PASS 1 of ${input.verify ? 2 : 1} — round ${input.round}/${input.totalRounds}]`,
     "",
@@ -258,11 +271,51 @@ export function buildPass1Prompt(input: {
 
   parts.push(
     "",
+    "## Recovery",
+    "",
+    "A provider may close this stream before you finish. If the harness retries",
+    "this review on another model, start again from the plan below; do not assume",
+    "the previous model's transcript is available. Submit the complete rewrite as",
+    "soon as it is ready — do not hold it back to add more polish.",
+  );
+
+  if (chunked) {
+    parts.push(
+      "",
+      "## Chunked submission (required for this plan)",
+      "",
+      `This plan is long enough that a single response may be cut off. Send the`,
+      `rewrite in ordered chunks of at most ${chunkChars} characters:`,
+      "",
+      "1. `review_plan_begin` (optionally with `totalChunks`).",
+      "2. `review_plan_chunk` with `index` 1, 2, 3, … — never skip or repeat. The",
+      "   tool echoes the next expected index; if a chunk is rejected, resend that",
+      "   index and continue (accepted chunks are kept).",
+      "3. `review_plan_finalize` with your findings, verdict and summary. Nothing is",
+      "   written before this call succeeds.",
+      "",
+      "Do not call `review_submit_plan` with a full `planMarkdown` in this round, and",
+      "do not repeat earlier chunks. Split on heading boundaries where possible.",
+    );
+  }
+
+  parts.push(
+    "",
     "## Required output",
     "",
-    "1. `review_submit_plan` with the COMPLETE revised plan (readable markdown,",
-    "   original structure preserved, no `Review changes` section — it is generated).",
-    "2. `review_pass_done` with your verdict and the same findings.",
+    ...(chunked
+      ? [
+          "1. `review_plan_begin`, then `review_plan_chunk` for every part of the",
+          "   COMPLETE revised plan (readable markdown, original structure preserved,",
+          "   no `Review changes` section — it is generated).",
+          "2. `review_plan_finalize` with your findings, verdict and summary.",
+          "3. `review_pass_done` with the same findings.",
+        ]
+      : [
+          "1. `review_submit_plan` with the COMPLETE revised plan (readable markdown,",
+          "   original structure preserved, no `Review changes` section — it is generated).",
+          "2. `review_pass_done` with your verdict and the same findings.",
+        ]),
     "",
     "You may run read-only and test/lint/typecheck commands, but you cannot build or",
     "write any file other than the plan. Say what you could not verify instead of",
@@ -339,6 +392,71 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     | { message: string; retries: number; at: number }
     | undefined;
 
+  /** Ordered plan chunks for the current pass; reset on submit/abort/switch. */
+  let planAssembler:
+    | { chunks: string[]; nextIndex: number; totalChunks?: number }
+    | undefined;
+
+  const resetPlanAssembler = (): void => {
+    planAssembler = undefined;
+  };
+
+  const beginPlan = (totalChunks?: number) => {
+    if (config().chunkedSubmit === "off") {
+      return {
+        ok: false,
+        error: "chunked submission is off; pass the complete plan to review_submit_plan",
+      };
+    }
+    planAssembler = {
+      chunks: [],
+      nextIndex: 1,
+      ...(totalChunks !== undefined ? { totalChunks } : {}),
+    };
+    return { ok: true, maxChunkChars: config().chunkChars };
+  };
+
+  const appendPlanChunk = (index: number, content: string) => {
+    if (!planAssembler) {
+      return { ok: false, error: "call review_plan_begin first" };
+    }
+    if (index !== planAssembler.nextIndex) {
+      return {
+        ok: false,
+        error: `expected chunk ${planAssembler.nextIndex}, got ${index}`,
+      };
+    }
+    const maxChunkChars = config().chunkChars;
+    if (content.length > maxChunkChars) {
+      return {
+        ok: false,
+        error: `chunk ${index} is ${content.length} characters; the limit is ${maxChunkChars}`,
+      };
+    }
+    planAssembler.chunks.push(content);
+    planAssembler.nextIndex += 1;
+    return {
+      ok: true,
+      received: planAssembler.chunks.length,
+      nextIndex: planAssembler.nextIndex,
+      totalChars: planAssembler.chunks.reduce(
+        (sum, chunk) => sum + chunk.length,
+        0,
+      ),
+    };
+  };
+
+  const takeAssembledPlan = (): string | undefined => {
+    if (!planAssembler || planAssembler.chunks.length === 0) return undefined;
+    if (
+      planAssembler.totalChunks !== undefined &&
+      planAssembler.chunks.length < planAssembler.totalChunks
+    ) {
+      return undefined;
+    }
+    return planAssembler.chunks.join("");
+  };
+
   /** Record one provider failure. The message arrives pre-decoded, non-empty. */
   const noteProviderError = (message: string, retries: number): void => {
     lastProviderError = {
@@ -346,6 +464,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       retries: Math.max(0, Math.trunc(retries)),
       at: Date.now(),
     };
+    if (state) state.providerError = message;
   };
 
   /** Drop the captured error when a new pass starts. */
@@ -590,9 +709,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   }
 
   /** Release the child session and its round state (step 10). Never throws. */
-  async function disposeSession(): Promise<void> {
+  async function disposeSession(options: { keepRoundController?: boolean } = {}): Promise<void> {
     try {
-      abortController?.abort();
+      if (options.keepRoundController !== true) abortController?.abort();
       await session?.abort();
     } catch {
       /* ignore */
@@ -607,7 +726,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     transcript = undefined;
     sessionModelKey = undefined;
     gate = createReviewRoundGate();
-    abortController = undefined;
+    resetPlanAssembler();
+    if (options.keepRoundController !== true) abortController = undefined;
     try {
       deps.onState?.(undefined);
     } catch {
@@ -626,8 +746,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
    * for a new child session, which is what makes the transcript's run label
    * truthful (fresh boot vs warm resume/next round).
    */
-  async function ensureSession(): Promise<EnsureSessionResult> {
-    const modelRef = deps.reviewerModel();
+  async function ensureSession(modelRefOverride?: {
+    provider: string;
+    id: string;
+    thinking: string;
+  }): Promise<EnsureSessionResult> {
+    const modelRef = modelRefOverride ?? deps.reviewerModel();
     const modelKey = modelRef
       ? `${modelRef.provider}/${modelRef.id}/${modelRef.thinking}`
       : "";
@@ -639,7 +763,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           "reviewer model changed — restarting the reviewer session.",
           "info",
         );
-        await disposeSession();
+        // A recovery switch is part of the SAME round: keep its controller so
+        // the loop can start the next attempt instead of seeing an abort.
+        await disposeSession({ keepRoundController: true });
       } else {
         return { ok: true, created: false };
       }
@@ -702,6 +828,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
               gate.notifySubmitted(payload);
               return { ok: true, path: written.path };
             },
+            beginPlan,
+            appendPlanChunk,
+            takeAssembledPlan,
+            resetPlan: resetPlanAssembler,
+            maxChunkChars: config().chunkChars,
             log: deps.log,
           },
           passDone: {
@@ -744,6 +875,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           findModel: deps.findModel,
           reviewPrompt: deps.promptText(),
           customTools: built.tools,
+          providerRetries: cfg.providerRetries,
           // Reuse the already-resolved module instead of importing twice.
           loadSdk: async () => sdk,
         };
@@ -865,15 +997,23 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     // visible in `finally` (block scoping), and the external listener must
     // always be detached when the round ends.
     let detachExternal: (() => void) | undefined;
+    const recoveryAttempts: string[] = [];
 
     const fail = (
       reason: string,
       planText = originalPlan,
     ): ReviewRoundResult => {
+      const elapsedSeconds = Math.max(
+        1,
+        Math.round((Date.now() - started) / 1000),
+      );
+      const detail = `${reason} (after ${elapsedSeconds}s)`;
       if (state) {
         state.phase = "failed";
-        state.error = reason;
+        state.error = detail;
         state.finishedAt = Date.now();
+        state.recoveryAttempts = [...recoveryAttempts];
+        if (lastProviderError) state.providerError = lastProviderError.message;
       }
       try {
         deps.onState?.(state);
@@ -893,12 +1033,14 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
                 modelLabel: "unavailable",
               }),
             }),
-        reason,
+        reason: detail,
       };
     };
 
     try {
       roundActive = true;
+      // Chunks from an earlier round must never leak into this one.
+      resetPlanAssembler();
       // A review with nowhere to submit can only fail: do not spend a run on it.
       if (!input.planPath) {
         return fail("no plan path — the reviewer has nowhere to submit");
@@ -945,25 +1087,36 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         };
       }
 
-      const start = await ensureSession();
-      if (!start.ok || !session) {
-        return fail("reviewer session unavailable");
+      const baseModel = deps.reviewerModel();
+      if (!baseModel) {
+        deps.log(
+          "no reviewer model configured — run /role set reviewer <provider/model>",
+          "warning",
+        );
+        return fail(
+          "no reviewer model configured — run /role set reviewer <provider/model>",
+        );
       }
-      const created = start.created;
-      const child = session;
-
-      if (!state || state.planHash !== hash || state.phase === "done") {
-        state = createReviewState({
-          planHash: hash,
-          planPath: input.planPath,
-          modelLabel: child.modelLabel,
-          round: input.round,
-          now: started,
-        });
+      const attempts =
+        cfg.providerRecovery === "fallback"
+          ? buildReviewerAttempts({
+              base: baseModel,
+              explicitFallback: cfg.fallbackModel,
+              fallbacks: deps.fallbackReviewerModels?.() ?? [],
+              max: 4,
+            })
+          : [{ ...baseModel }];
+      if (attempts.length === 0) {
+        return fail(
+          "no reviewer model configured — run /role set reviewer <provider/model>",
+        );
       }
-      state.round = input.round;
-      state.planPath = input.planPath;
-      setPhase("reviewing");
+      const attemptLabel = (model: {
+        provider: string;
+        id: string;
+        thinking: string;
+      }): string => `${model.provider}/${model.id} (${model.thinking})`;
+      let lastFailure = "reviewer session unavailable";
 
       abortController = new AbortController();
       const rc = abortController;
@@ -994,6 +1147,74 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       // settle race below still ends a silent pass quickly either way.
       const limitMs = cfg.timeoutMs > 0 ? cfg.timeoutMs : undefined;
       const deadline = limitMs !== undefined ? started + limitMs : undefined;
+      const recoveryDeadline =
+        cfg.recoveryBudgetMs > 0
+          ? Math.min(
+              deadline ?? Number.POSITIVE_INFINITY,
+              started + cfg.recoveryBudgetMs,
+            )
+          : deadline;
+
+      for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+        const attempt = attempts[attemptIndex]!;
+        if (rc.signal.aborted) {
+          if (!state) {
+            state = createReviewState({
+              planHash: hash,
+              planPath: input.planPath,
+              modelLabel: attemptLabel(attempt),
+              round: input.round,
+              now: started,
+            });
+          }
+          state.phase = "aborted";
+          return {
+            ok: false,
+            fallback: true,
+            planText: state.rewrittenPlan ?? originalPlan,
+            planHash: hash,
+            state,
+            reason: "aborted",
+          };
+        }
+        if (
+          recoveryDeadline !== undefined &&
+          Date.now() >= recoveryDeadline
+        ) {
+          lastFailure = `provider recovery budget expired before ${attemptLabel(attempt)}`;
+          break;
+        }
+        recoveryAttempts.push(attemptLabel(attempt));
+        if (attemptIndex > 0) {
+          deps.log(
+            `reviewer recovering on ${attemptLabel(attempt)} (attempt ${attemptIndex + 1}/${attempts.length}).`,
+            "warning",
+          );
+          pushStatus(
+            `reviewer recovering — ${attemptLabel(attempt)} (attempt ${attemptIndex + 1}/${attempts.length})`,
+          );
+        }
+        const start = await ensureSession(attempt);
+        if (!start.ok || !session) {
+          lastFailure = `reviewer session unavailable for ${attemptLabel(attempt)}`;
+          continue;
+        }
+        const created = start.created;
+        const child = session;
+
+        if (!state || state.planHash !== hash || state.phase === "done") {
+          state = createReviewState({
+            planHash: hash,
+            planPath: input.planPath,
+            modelLabel: child.modelLabel,
+            round: input.round,
+            now: started,
+          });
+        }
+        state.round = input.round;
+        state.planPath = input.planPath;
+        state.recoveryAttempts = [...recoveryAttempts];
+        setPhase("reviewing");
 
       // ── Pass 1 ──────────────────────────────────────────────────────
       await settleInFlight(deadline, rc);
@@ -1013,6 +1234,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         round: input.round,
         totalRounds: cfg.rounds,
         verify: cfg.verify && cfg.passes > 1,
+        // `chunkedSubmit: "off"` is the coarse switch; `chunkChars: 0` is the
+        // numeric one. Both mean "ask for the one-shot submission".
+        chunkChars: cfg.chunkedSubmit === "off" ? 0 : cfg.chunkChars,
       });
 
       const p1 = await runPass(1, deadline, rc, () => {
@@ -1026,16 +1250,34 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
       if (p1.stop === "error") {
         await abortChild();
+        const sendMessage = errorText(p1.error);
+        const providerMessage = lastProviderError?.message ?? sendMessage;
         // Safety net for any provider-source gap the preflight could not see:
         // the bare "No API key found for <provider>." gains the actionable
         // hint ONLY when the failing provider is the reviewer's own.
-        return fail(
-          `could not prompt the reviewer: ${appendProviderAuthHint(
-            errorText(p1.error),
-            deps.reviewerModel()?.provider,
-            path.join(deps.agentDir, "models.json"),
-          )}`,
-        );
+        lastFailure = `could not prompt the reviewer on ${attemptLabel(
+          attempt,
+        )}: ${appendProviderAuthHint(
+          sendMessage,
+          attempt.provider,
+          path.join(deps.agentDir, "models.json"),
+        )}`;
+        const nextExists = attemptIndex + 1 < attempts.length;
+        const budgetExpired =
+          nextExists &&
+          recoveryDeadline !== undefined &&
+          Date.now() >= recoveryDeadline;
+        const canFallback =
+          nextExists && !rc.signal.aborted && !budgetExpired;
+        if (budgetExpired) lastFailure += " — provider recovery budget expired";
+        if (canFallback && isRecoverableProviderFailure(providerMessage)) {
+          deps.log(
+            `reviewer attempt failed on ${attemptLabel(attempt)} — ${truncateErrorText(providerMessage)}; trying the next model.`,
+            "warning",
+          );
+          continue;
+        }
+        return fail(lastFailure);
       }
       if (p1.stop === "aborted" || rc.signal.aborted) {
         await abortChild();
@@ -1051,27 +1293,46 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
       if (!p1.submitted) {
         // The run is over (or out of time) and nothing reached the plan file.
-        // Fail now — waiting longer cannot produce a submission.
         await abortChild();
+        const nextExists = attemptIndex + 1 < attempts.length;
+        const budgetExpired =
+          nextExists &&
+          recoveryDeadline !== undefined &&
+          Date.now() >= recoveryDeadline;
+        const canFallback =
+          nextExists && !rc.signal.aborted && !budgetExpired;
         if (p1.stop === "timeout") {
-          return fail(
-            `the reviewer did not finish within ${Math.round((limitMs ?? 0) / 1000)}s and submitted no plan`,
-            originalPlan,
-          );
+          lastFailure = `the reviewer did not finish within ${Math.round(
+            (limitMs ?? 0) / 1000,
+          )}s and submitted no plan on ${attemptLabel(attempt)}`;
+          if (budgetExpired) lastFailure += " — provider recovery budget expired";
+          if (canFallback) continue;
+          return fail(lastFailure, originalPlan);
         }
         // A provider failure settles the run without a submission — name the
         // real cause (with the provider's own message) instead of blaming the
         // write path. The slot only holds errors captured during THIS pass.
         if (lastProviderError) {
-          return fail(
-            `the reviewer's provider failed after ${lastProviderError.retries} retry attempt(s): ${truncateErrorText(lastProviderError.message)}`,
-            originalPlan,
-          );
+          lastFailure = `the reviewer's provider failed after ${
+            lastProviderError.retries
+          } retry attempt(s) on ${attemptLabel(attempt)}: ${truncateErrorText(
+            lastProviderError.message,
+          )}`;
+          if (budgetExpired) lastFailure += " — provider recovery budget expired";
+          if (
+            canFallback &&
+            isRecoverableProviderFailure(lastProviderError.message)
+          ) {
+            continue;
+          }
+          return fail(lastFailure, originalPlan);
         }
-        return fail(
-          "the reviewer finished without submitting a plan — it has no write path unless review_submit_plan succeeds",
-          originalPlan,
-        );
+        lastFailure = `the reviewer finished without submitting a plan on ${attemptLabel(
+          attempt,
+        )} — it has no write path unless review_submit_plan succeeds`;
+        if (budgetExpired) lastFailure += " — provider recovery budget expired";
+        if (canFallback) continue;
+        return fail(lastFailure, originalPlan);
       }
       if (p1.stop === "timeout") {
         // The protocol completed, the run did not: stop paying for it, but keep
@@ -1136,6 +1397,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         state.phase = "done";
         state.rewrittenPlan = finalPlan;
         state.finishedAt = Date.now();
+        state.recoveryAttempts = [...recoveryAttempts];
       }
       try {
         deps.onState?.(state);
@@ -1150,6 +1412,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         planHash: planHash(finalPlan),
         state: state as ReviewState,
       };
+      }
+
+      return fail(
+        `${lastFailure} (attempts: ${attempts.map(attemptLabel).join(" → ")})`,
+      );
     } catch (e: unknown) {
       return fail(
         `review round failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -1185,6 +1452,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       } catch {
         /* cancellation is best-effort */
       }
+      // An aborted round cannot be finalised: drop partial chunks so a retry
+      // starts a clean submission instead of silently stitching two rewrites.
+      resetPlanAssembler();
       if (state && state.phase !== "done") state.phase = "aborted";
     },
     async sendUserMessage(text: string, images?: unknown[]): Promise<boolean> {

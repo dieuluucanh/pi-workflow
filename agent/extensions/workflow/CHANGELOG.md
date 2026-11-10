@@ -2,6 +2,67 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — review handoffs survive later rounds and reloads
+
+**Manual `/review` now hands off.** A settled manual round opens Plannotator with
+`source: "manual"`. In Default/Build, Approve enters Build and Deny switches to
+Plan before sending feedback. A manual cycle keeps reviewing/handing off after a
+Deny even when automatic Review Mode is off.
+
+**Round 2+ can no longer be suppressed by a stale gate.** A new round or manual
+`/review` supersedes an older `awaitingDecision`; a browser decision arriving
+while another round runs is discarded and clears the old gate; the full
+correlation (review id, request id, URL, source, plan hash, cycle) is persisted
+and restored instead of being nulled.
+
+**Reload recovery.** On `reload`/`resume`/`fork`, the replacement session asks
+Plannotator `review-status`: pending keeps a matching gate, completed applies the
+recorded approve/deny, and missing/changed clears with a visible reason. Startup,
+new sessions and quit still clear.
+
+**Request lifecycle.** The 5 s response-only wait is replaced by a 15 s wait for
+`respond` or `plannotator:session-opened`; `session-closed` without a decision
+clears the gate. Desktop focuses notification review tabs and reloads an existing
+same-URL tab instead of leaving stale content in front.
+
+### Added — chunked plan rewrites for long plans
+
+Review Mode no longer has to fit an entire plan rewrite into one response. When
+`workflow.reviewMode.chunkChars > 0` (default 6000) and the plan is longer than
+`chunkChars × 2`, pass 1 asks the reviewer to submit through a new three-tool
+protocol:
+
+- `review_plan_begin` — resets the per-round assembler, states the chunk limit.
+- `review_plan_chunk` — appends ordered chunks (`index` 1, 2, 3, …). A rejected
+  chunk (out of order, repeated, oversized, or lost to a stream cut) is answered
+  with the index the assembler expects next, so the retry continues without
+  restarting; accepted chunks are kept.
+- `review_plan_finalize` — validates completeness and writes through the same
+  `review_submit_plan` funnel, so `writePlan` remains the single writer and the
+  plan file is touched exactly once.
+
+Short plans keep the one-shot `review_submit_plan`, which remains the only write
+path (and accepts an assembled plan too). `chunkedSubmit: "off"` or
+`chunkChars: 0` restores single-response submission. The assembler is cleared on
+abort, teardown, a new round and a provider switch, so a partial rewrite can never
+be stitched onto a different attempt. Pass 2 consumes the assembled rewrite and
+its diff unchanged.
+
+### Added — safe provider migration and Command Code guidance
+
+- `/profile retarget-provider <old> <new> [global|project] [--apply]` rewrites every
+  `{ provider, id }` model reference in `profiles.json` and `roles.json`, preserves every
+  other key, and backs up each changed file. It prints a dry run first; `--apply` writes.
+  A malformed file blocks both writes. This is the supported migration from the
+  hand-written `command-code` provider to the maintained `pi-commandcode-provider`
+  (`commandcode`), whose per-model wire routing and reasoning normalisation avoid the
+  single-wire setup that contributes to long Command Code stream cuts.
+- README documents the Command Code wire model, the maintained package, and the retarget
+  workflow. The troubleshooting entry now names `Stream ended without finish_reason` and
+  explains why lowering thinking is not a reliable fix.
+
 ## [0.9.2] - 2026-11-08
 
 ### Fixed — Review Mode resets per plan cycle and the review line is live-only

@@ -64,6 +64,15 @@ export const REVIEW_SUBMITTED_ENTRY_TYPE = "workflow-review-submitted";
 // ── Step 2: Review Mode configuration ────────────────────────────────
 
 export type ReviewFallbackOnError = "skip" | "block";
+export type ReviewProviderRecovery = "fallback" | "off";
+export type ReviewChunkedSubmit = "auto" | "off";
+
+/** A reviewer model reference used by the recovery chain or an explicit fallback. */
+export interface ReviewFallbackModel {
+  provider: string;
+  id: string;
+  thinking: string;
+}
 
 export interface ReviewModeConfig {
   /** Master toggle. When false every Review Mode code path is a no-op. */
@@ -76,6 +85,22 @@ export interface ReviewModeConfig {
   verify: boolean;
   /** What to do if the reviewer model is unavailable or the review fails. */
   fallbackOnError: ReviewFallbackOnError;
+  /**
+   * Provider recovery: after a recoverable stream failure, try the fallback
+   * chain instead of failing the round immediately. `off` restores the old
+   * single-model behaviour.
+   */
+  providerRecovery: ReviewProviderRecovery;
+  /** SDK retries per reviewer model before the chain advances (0-2). */
+  providerRetries: number;
+  /** Explicit first fallback; the runtime still dedupes and clamps it. */
+  fallbackModel?: ReviewFallbackModel;
+  /** Chunked rewrite submission for long plans (default automatic by size). */
+  chunkedSubmit: ReviewChunkedSubmit;
+  /** Max characters per `review_plan_chunk`; also sets the auto threshold. */
+  chunkChars: number;
+  /** Overall recovery budget; 0 uses the round deadline. */
+  recoveryBudgetMs: number;
   /** Max `review_explore` subagents per review round (cost ceiling). */
   exploreBudget: number;
   /**
@@ -103,6 +128,11 @@ export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   passes: 2,
   verify: true,
   fallbackOnError: "skip",
+  providerRecovery: "fallback",
+  providerRetries: 1,
+  chunkedSubmit: "auto",
+  chunkChars: 6_000,
+  recoveryBudgetMs: 0,
   exploreBudget: 1,
   timeoutMs: 300_000,
   contextChars: 15_000,
@@ -124,6 +154,83 @@ const CONTEXT_ENTRIES_MIN = 1;
 const CONTEXT_ENTRIES_MAX = 120;
 const CONTEXT_TOOL_CHARS_MIN = 200;
 const CONTEXT_TOOL_CHARS_MAX = 4_000;
+
+/**
+ * Build the automatic fallback list: the parent session's model first (it just
+ * planned successfully), then the base reviewer and planner roles from
+ * roles.json (ignoring the active profile). The caller supplies the clamp so
+ * this stays independent of Pi's model registry.
+ */
+export function buildReviewerFallbacks(input: {
+  parentModel?: ReviewFallbackModel;
+  baseReviewer?: ReviewFallbackModel;
+  basePlanner?: ReviewFallbackModel;
+  clampThinking?: (model: ReviewFallbackModel) => string;
+}): ReviewFallbackModel[] {
+  const out: ReviewFallbackModel[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: ReviewFallbackModel | undefined): void => {
+    if (!candidate) return;
+    const provider = candidate.provider.trim();
+    const id = candidate.id.trim();
+    if (!provider || !id) return;
+    const key = `${provider}/${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    let thinking = candidate.thinking.trim() || "high";
+    if (input.clampThinking) {
+      try {
+        thinking = input.clampThinking({ ...candidate, provider, id }) || thinking;
+      } catch {
+        /* a registry miss keeps the stored level */
+      }
+    }
+    out.push({ provider, id, thinking });
+  };
+  push(input.parentModel);
+  push(input.baseReviewer);
+  push(input.basePlanner);
+  return out;
+}
+
+/**
+ * The bounded attempt chain for one review round: the selected reviewer model,
+ * an explicit fallback, then the automatic fallback list. Duplicate
+ * provider/id pairs are rejected so a retry never repeats the same model.
+ */
+export function buildReviewerAttempts(input: {
+  base?: ReviewFallbackModel;
+  explicitFallback?: ReviewFallbackModel;
+  fallbacks?: readonly ReviewFallbackModel[];
+  max?: number;
+}): ReviewFallbackModel[] {
+  const out: ReviewFallbackModel[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: ReviewFallbackModel | undefined): void => {
+    if (!candidate) return;
+    const provider = candidate.provider.trim();
+    const id = candidate.id.trim();
+    if (!provider || !id) return;
+    const key = `${provider}/${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      provider,
+      id,
+      thinking: candidate.thinking.trim() || "high",
+    });
+  };
+  push(input.base);
+  push(input.explicitFallback);
+  for (const model of input.fallbacks ?? []) push(model);
+  return out.slice(0, Math.max(1, Math.trunc(input.max ?? 4)));
+}
+const PROVIDER_RETRIES_MIN = 0;
+const PROVIDER_RETRIES_MAX = 2;
+const CHUNK_CHARS_MIN = 1_000;
+const CHUNK_CHARS_MAX = 20_000;
+const RECOVERY_BUDGET_MIN = 0;
+const RECOVERY_BUDGET_MAX = 3_600_000;
 
 /** A JSON object parsed from an untrusted source (settings file, fragment). */
 export type JsonObject = Record<string, unknown>;
@@ -149,6 +256,19 @@ function asBool(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function sanitizeFallbackModel(value: unknown): ReviewFallbackModel | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+  const id = typeof raw.id === "string" ? raw.id.trim() : "";
+  if (!provider || !id) return undefined;
+  const thinking =
+    typeof raw.thinking === "string" && raw.thinking.trim()
+      ? raw.thinking.trim()
+      : "high";
+  return { provider, id, thinking };
+}
+
 /**
  * Coerce an untrusted settings fragment into a complete ReviewModeConfig.
  * Accepts an object, or the boolean shorthand `true`/`false` for
@@ -168,12 +288,42 @@ export function coerceReviewModeConfig(
     r.fallbackOnError === "block" || r.fallbackOnError === "skip"
       ? r.fallbackOnError
       : base.fallbackOnError;
+  const providerRecovery: ReviewProviderRecovery =
+    r.providerRecovery === "off" || r.providerRecovery === "fallback"
+      ? r.providerRecovery
+      : base.providerRecovery;
+  const chunkedSubmit: ReviewChunkedSubmit =
+    r.chunkedSubmit === "off" || r.chunkedSubmit === "auto"
+      ? r.chunkedSubmit
+      : base.chunkedSubmit;
+  const fallbackModel = sanitizeFallbackModel(r.fallbackModel);
   return {
     enabled: asBool(r.enabled, base.enabled),
     rounds: clampInt(r.rounds, ROUNDS_MIN, ROUNDS_MAX, base.rounds),
     passes: clampInt(r.passes, PASSES_MIN, PASSES_MAX, base.passes),
     verify: asBool(r.verify, base.verify),
     fallbackOnError,
+    providerRecovery,
+    providerRetries: clampInt(
+      r.providerRetries,
+      PROVIDER_RETRIES_MIN,
+      PROVIDER_RETRIES_MAX,
+      base.providerRetries,
+    ),
+    ...(fallbackModel ? { fallbackModel } : {}),
+    chunkedSubmit,
+    chunkChars: clampInt(
+      r.chunkChars,
+      CHUNK_CHARS_MIN,
+      CHUNK_CHARS_MAX,
+      base.chunkChars,
+    ),
+    recoveryBudgetMs: clampInt(
+      r.recoveryBudgetMs,
+      RECOVERY_BUDGET_MIN,
+      RECOVERY_BUDGET_MAX,
+      base.recoveryBudgetMs,
+    ),
     exploreBudget: clampInt(
       r.exploreBudget,
       EXPLORE_MIN,
@@ -478,6 +628,22 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
       c.timeoutMs,
       input.timeoutSource,
     )}`,
+    `  recovery       : ${c.providerRecovery}${
+      c.providerRecovery === "fallback"
+        ? ` (${c.providerRetries} SDK retry/model; budget ${
+            c.recoveryBudgetMs === 0
+              ? "round deadline"
+              : `${Math.round(c.recoveryBudgetMs / 1000)}s`
+          }${
+            c.fallbackModel
+              ? `; explicit ${c.fallbackModel.provider}/${c.fallbackModel.id} (${c.fallbackModel.thinking})`
+              : ""
+          })`
+        : ""
+    }`,
+    `  chunked submit : ${c.chunkedSubmit}${
+      c.chunkedSubmit === "auto" ? ` (${c.chunkChars} chars/chunk)` : ""
+    }`,
   ];
   if (
     input.timeoutSource !== "default" &&
@@ -682,6 +848,10 @@ export interface ReviewState {
   rewrittenPlan?: string;
   /** Reviewer passes completed in this round. */
   passes: ReviewPassResult[];
+  /** Recovery attempts made in this round, in order (model labels). */
+  recoveryAttempts?: string[];
+  /** Last provider error text captured during the round. */
+  providerError?: string;
   /** Number of `review_explore` subagents used this round. */
   exploreUsed: number;
   /** Input tokens reported by the child session, when available. */
@@ -1440,9 +1610,11 @@ export function reviewEscapeAction(input: {
 export function reviewFooterSegment(
   state: ReviewState | undefined,
   paused: boolean,
+  /** A round owns the turn before its first state event (cold boot). */
+  starting = false,
 ): string {
   if (paused) return "🔍 review paused — /review-resume to continue";
-  if (!state) return "";
+  if (!state) return starting ? "🔍 review · starting" : "";
   return reviewStateSummary(state);
 }
 
@@ -1494,7 +1666,13 @@ export function reviewStatusText(input: {
     paused: input.paused,
     phase: input.state?.phase,
   });
-  return visible ? reviewFooterSegment(input.state, input.paused === true) : "";
+  return visible
+    ? reviewFooterSegment(
+        input.state,
+        input.paused === true,
+        input.roundInFlight === true,
+      )
+    : "";
 }
 
 /**
@@ -2187,6 +2365,12 @@ export interface CreateReviewSessionOptions {
   /** Reviewer-only tools, built by the caller. */
   customTools: unknown[];
   /**
+   * SDK retries per reviewer model (0-2). Applied through a runtime-only child
+   * SettingsManager override so the recovery chain advances after one doomed
+   * long request instead of spending the parent's 3-retry budget first.
+   */
+  providerRetries?: number;
+  /**
    * Parent-side provider-registration surface (structural, feature-detected),
    * found with `findParentProviderSurface(ctx)` — the session's model registry
    * facade or its underlying model runtime.
@@ -2241,6 +2425,53 @@ function readActiveToolNames(session: unknown): string[] | undefined {
     const names = (get as () => unknown).call(session);
     if (!Array.isArray(names)) return undefined;
     return names.filter((n): n is string => typeof n === "string");
+  } catch {
+    return undefined;
+  }
+}
+
+function clampProviderRetries(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 1;
+  return Math.min(2, Math.max(0, Math.trunc(value)));
+}
+
+/**
+ * Build the child's runtime-only SettingsManager so its SDK retry budget is
+ * bounded. `applyOverrides` is in-memory: the shared settings.json is never
+ * written. Feature-detected for older Pi runtimes; a failure here means the
+ * child keeps the parent's settings and the chain simply waits that budget out.
+ */
+function createChildSettingsManager(
+  sdk: unknown,
+  cwd: string,
+  agentDir: string,
+  providerRetries: number | undefined,
+): unknown | undefined {
+  try {
+    const holder = sdk as {
+      SettingsManager?: { create?: (...args: unknown[]) => unknown };
+    };
+    const SettingsManager = holder?.SettingsManager;
+    const create = SettingsManager?.create;
+    if (typeof create !== "function") return undefined;
+    const manager = create.call(SettingsManager, cwd, agentDir) as {
+      getRetrySettings?: () => Record<string, unknown>;
+      applyOverrides?: (overrides: unknown) => void;
+    };
+    if (!manager || typeof manager !== "object") return undefined;
+    if (typeof manager.applyOverrides !== "function") return manager;
+    const base =
+      typeof manager.getRetrySettings === "function"
+        ? manager.getRetrySettings()
+        : { enabled: true, maxRetries: 3, baseDelayMs: 2_000, maxAgentDelayMs: 60_000 };
+    manager.applyOverrides({
+      retry: {
+        ...base,
+        enabled: true,
+        maxRetries: clampProviderRetries(providerRetries),
+      },
+    });
+    return manager;
   } catch {
     return undefined;
   }
@@ -2421,6 +2652,14 @@ export async function createReviewSession(
     // custom tools too, so a built-ins-only list would silently remove
     // `review_submit_plan` and make every review fail (see REVIEW_BUILTIN_TOOLS).
     const expectedTools = reviewToolAllowlist(options.customTools);
+    // The child gets its own retry budget. The shared settings file is not
+    // touched: applyOverrides is runtime-only.
+    const settingsManager = createChildSettingsManager(
+      sdk,
+      options.cwd,
+      options.agentDir,
+      options.providerRetries,
+    );
 
     process.env[REVIEW_CHILD_MARKER_ENV] = "1";
     let created: { session?: unknown; modelFallbackMessage?: string };
@@ -2435,6 +2674,7 @@ export async function createReviewSession(
         customTools: options.customTools as never,
         resourceLoader: loader,
         sessionManager,
+        ...(settingsManager ? { settingsManager } : {}),
         sessionStartEvent: { type: "session_start", reason: "startup" },
       } as never);
     } finally {

@@ -373,8 +373,27 @@ export interface ReviewSubmitDeps {
     submit: (
         payload: ReviewSubmitPayload,
     ) => Promise<{ ok: boolean; path?: string; error?: string }>;
+    /** Chunked submission is optional so older callers/tests keep working. */
+    beginPlan?: (totalChunks?: number) => {
+        ok: boolean;
+        error?: string;
+        maxChunkChars?: number;
+    };
+    appendPlanChunk?: (index: number, content: string) => {
+        ok: boolean;
+        error?: string;
+        received?: number;
+        nextIndex?: number;
+        totalChars?: number;
+    };
+    takeAssembledPlan?: () => string | undefined;
+    resetPlan?: () => void;
+    /** Max characters accepted per chunk (default 6000). */
+    maxChunkChars?: number;
     log: (message: string, level?: "info" | "warning" | "error") => void;
 }
+
+const DEFAULT_MAX_CHUNK_CHARS = 6_000;
 
 const VERDICT_SCHEMA = Type.Union([
     Type.Literal("approve"),
@@ -414,6 +433,196 @@ const FINDING_SCHEMA = Type.Object({
 });
 
 /**
+ * `review_plan_begin` — start a chunked rewrite submission.
+ *
+ * Long plan rewrites can outlive a gateway's stream duration. This resets the
+ * assembler; the reviewer then sends ordered chunks and finalises through
+ * `review_submit_plan` (with no `planMarkdown`). The single-shot path remains.
+ */
+export function createReviewPlanBeginTool(deps: ReviewSubmitDeps): {
+    name: string;
+    label: string;
+    description: string;
+    parameters: TSchema;
+    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
+} {
+    return {
+        name: "review_plan_begin",
+        label: "Begin Chunked Plan",
+        description:
+            "Start submitting the revised plan in ordered chunks. Use this when the plan is too long for one response, then call review_plan_chunk for each part and review_submit_plan (without planMarkdown) to finalise.",
+        parameters: Type.Object({
+            totalChunks: Type.Optional(
+                Type.Number({
+                    description:
+                        "How many chunks you intend to send. Optional; helps the harness report progress.",
+                }),
+            ),
+        }),
+        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
+            const [, rawParams] = args as unknown as [
+                string,
+                { totalChunks?: unknown },
+            ];
+            if (!deps.beginPlan) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_plan_begin: chunked submission is unavailable in this round; use review_submit_plan with the complete planMarkdown instead.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const totalChunks =
+                typeof rawParams?.totalChunks === "number" &&
+                Number.isInteger(rawParams.totalChunks) &&
+                rawParams.totalChunks > 0
+                    ? rawParams.totalChunks
+                    : undefined;
+            const result = deps.beginPlan(totalChunks);
+            if (!result.ok) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `review_plan_begin: ${result.error ?? "could not start chunked submission"}`,
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const maxChunkChars =
+                result.maxChunkChars ?? deps.maxChunkChars ?? DEFAULT_MAX_CHUNK_CHARS;
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: [
+                            "review_plan_begin: ready.",
+                            `Send the plan in order with review_plan_chunk (max ${maxChunkChars} characters per chunk).`,
+                            "After the last chunk, call review_plan_finalize (or review_submit_plan without planMarkdown).",
+                        ].join("\n"),
+                    },
+                ],
+                details: { totalChunks, maxChunkChars },
+            };
+        },
+    };
+}
+
+/** `review_plan_chunk` — append one ordered part of the rewrite. */
+export function createReviewPlanChunkTool(deps: ReviewSubmitDeps): {
+    name: string;
+    label: string;
+    description: string;
+    parameters: TSchema;
+    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
+} {
+    return {
+        name: "review_plan_chunk",
+        label: "Append Plan Chunk",
+        description:
+            "Append one ordered chunk of the revised plan. Start with review_plan_begin, send index 1, 2, … without skipping or repeating, then finalise with review_submit_plan (no planMarkdown).",
+        parameters: Type.Object({
+            index: Type.Number({
+                description: "1-based chunk index. Must be the next expected index.",
+            }),
+            content: Type.String({
+                description:
+                    "The chunk's markdown. Do not repeat earlier chunks or add a Review changes section.",
+            }),
+        }),
+        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
+            const [, rawParams] = args as unknown as [
+                string,
+                { index?: unknown; content?: unknown },
+            ];
+            const index =
+                typeof rawParams?.index === "number" ? rawParams.index : NaN;
+            if (!Number.isInteger(index) || index < 1) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_plan_chunk: index must be a positive integer.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const content =
+                typeof rawParams?.content === "string" ? rawParams.content : "";
+            if (!content) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_plan_chunk: content is empty.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const maxChunkChars = deps.maxChunkChars ?? DEFAULT_MAX_CHUNK_CHARS;
+            if (content.length > maxChunkChars) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `review_plan_chunk: chunk ${index} is ${content.length} characters; the limit is ${maxChunkChars}. Split it and resend.`,
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            if (!deps.appendPlanChunk) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_plan_chunk: chunked submission is unavailable in this round; use review_submit_plan with the complete planMarkdown instead.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const result = deps.appendPlanChunk(index, content);
+            if (!result.ok) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `review_plan_chunk: ${result.error ?? "chunk rejected"}`,
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const nextIndex = result.nextIndex ?? index + 1;
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: [
+                            `review_plan_chunk: accepted chunk ${index}.`,
+                            `received ${result.received ?? index} chunk(s), ${result.totalChars ?? content.length} characters so far.`,
+                            `Next expected index: ${nextIndex}. When done, call review_submit_plan without planMarkdown.`,
+                        ].join("\n"),
+                    },
+                ],
+                details: {
+                    index,
+                    nextIndex,
+                    totalChars: result.totalChars ?? content.length,
+                },
+            };
+        },
+    };
+}
+
+/**
  * `review_submit_plan` — the ONLY write path for Review Mode.
  *
  * Three things happen here, in order, and nothing is written unless all three
@@ -438,12 +647,14 @@ export function createReviewSubmitPlanTool(deps: ReviewSubmitDeps): {
         name: "review_submit_plan",
         label: "Submit Reviewed Plan",
         description:
-            "Submit the FINAL revised plan. This is the only way your work reaches the user, and the only file you can write. Pass the complete plan markdown (not a diff or a summary) plus your findings and verdict. The plan body must keep a markdown heading and stay close to the original length; the harness rejects stubs. A `## Review changes` section is appended automatically from your findings, so do not write it yourself. You may call this more than once — the last successful submission wins.",
+            "Submit the FINAL revised plan. This is the only way your work reaches the user, and the only file you can write. Pass the complete plan markdown (not a diff or a summary) plus your findings and verdict. After review_plan_begin/review_plan_chunk, omit planMarkdown and the harness uses the assembled chunks. The plan body must keep a markdown heading and stay close to the original length; the harness rejects stubs. A `## Review changes` section is appended automatically from your findings, so do not write it yourself. You may call this more than once — the last successful submission wins.",
         parameters: Type.Object({
-            planMarkdown: Type.String({
-                description:
-                    "The complete revised plan in markdown, preserving the original structure and heading style. Do NOT include a 'Review changes' section.",
-            }),
+            planMarkdown: Type.Optional(
+                Type.String({
+                    description:
+                        "The complete revised plan in markdown, preserving the original structure and heading style. Omit it after review_plan_begin/review_plan_chunk. Do NOT include a 'Review changes' section.",
+                }),
+            ),
             findings: Type.Array(FINDING_SCHEMA, {
                 description:
                     "Every issue you found. Use an empty array if the plan is sound and you are submitting it unchanged.",
@@ -466,10 +677,24 @@ export function createReviewSubmitPlanTool(deps: ReviewSubmitDeps): {
                 },
             ];
 
-            const planBody =
+            const explicitPlan =
                 typeof rawParams?.planMarkdown === "string"
                     ? rawParams.planMarkdown
                     : "";
+            const planBody = explicitPlan.trim()
+                ? explicitPlan
+                : deps.takeAssembledPlan?.() ?? "";
+            if (!planBody.trim()) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_submit_plan: no plan was provided. Pass planMarkdown, or use review_plan_begin + review_plan_chunk first.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
             const verdict: ReviewVerdict =
                 rawParams?.verdict === "approve" ||
                 rawParams?.verdict === "revise" ||
@@ -563,6 +788,11 @@ export function createReviewSubmitPlanTool(deps: ReviewSubmitDeps): {
                 };
             }
 
+            try {
+                deps.resetPlan?.();
+            } catch {
+                /* the written plan is authoritative; reset is best-effort */
+            }
             return {
                 content: [
                     {
@@ -586,6 +816,70 @@ export function createReviewSubmitPlanTool(deps: ReviewSubmitDeps): {
                     findings: findings.length,
                 },
             };
+        },
+    };
+}
+
+// ── Step 17: review_plan_finalize ────────────────────────────────────
+
+/**
+ * `review_plan_finalize` — finalise a chunked rewrite.
+ *
+ * The chunks were accepted by `review_plan_chunk`; this is the step that turns
+ * them into the plan file. It delegates to the SAME `review_submit_plan`
+ * funnel, so `writePlan` stays the only writer and `notifySubmitted` fires once.
+ */
+export function createReviewPlanFinalizeTool(deps: ReviewSubmitDeps): {
+    name: string;
+    label: string;
+    description: string;
+    parameters: TSchema;
+    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
+} {
+    const submit = createReviewSubmitPlanTool(deps);
+    return {
+        name: "review_plan_finalize",
+        label: "Finalize Chunked Plan",
+        description:
+            "Finalise the plan you sent with review_plan_begin + review_plan_chunk. The assembled chunks become the plan body; the findings and verdict are recorded exactly as review_submit_plan would. Refuses an incomplete assembly — send the missing chunks first.",
+        parameters: Type.Object({
+            findings: Type.Array(FINDING_SCHEMA, {
+                description:
+                    "Every issue you found. Use an empty array if the plan is sound and you are submitting it unchanged.",
+            }),
+            verdict: VERDICT_SCHEMA,
+            summary: Type.String({
+                description: "One sentence describing what you changed.",
+            }),
+        }),
+        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
+            const [toolCallId, rawParams, ...rest] = args as [
+                string,
+                Record<string, unknown>,
+                ...unknown[],
+            ];
+            let assembled: string | undefined;
+            try {
+                assembled = deps.takeAssembledPlan?.();
+            } catch {
+                assembled = undefined;
+            }
+            if (!assembled || !assembled.trim()) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_plan_finalize: no complete plan to finalise. Call review_plan_begin, send every chunk with review_plan_chunk (watch the expected next index), then finalise.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            return submit.execute(
+                toolCallId,
+                { ...(rawParams ?? {}) },
+                ...rest,
+            );
         },
     };
 }
@@ -739,6 +1033,9 @@ export function createReviewTools(
     }
 
     tools.push(createReviewExploreTool(deps.explore));
+    tools.push(createReviewPlanBeginTool(deps.submit));
+    tools.push(createReviewPlanChunkTool(deps.submit));
+    tools.push(createReviewPlanFinalizeTool(deps.submit));
     tools.push(createReviewSubmitPlanTool(deps.submit));
     tools.push(createReviewPassDoneTool(deps.passDone));
 

@@ -163,6 +163,8 @@ import {
   roleArgumentCompletions,
   saveRoleConfig,
   getRole,
+  userRolesPath,
+  projectRolesPath,
   formatRolesForDisplay,
   formatModelRef,
   parseModelRef,
@@ -204,11 +206,17 @@ import {
   PROFILE_ROLES,
   modelPickerItems,
   profileActionClosesPicker,
+  userProfilesPath,
+  projectProfilesPath,
   type ProfileFlowOutcome,
   type ProfileConfig,
   type Profile,
   type ProfileRoleName,
 } from "./profiles.ts";
+import {
+  formatRetargetResult,
+  retargetProviderFiles,
+} from "./provider-retarget.ts";
 import { FilterableList, type FilterableItem } from "./picker.ts";
 import { QUESTIONNAIRE_OVERLAY_MAX_HEIGHT } from "./questionnaire-layout.ts";
 import {
@@ -232,6 +240,7 @@ import {
 } from "./model-default.ts";
 import {
   applySubmittedPlan,
+  buildReviewerFallbacks,
   classifyReviewExecution,
   createReviewHandoffGate,
   DEFAULT_REVIEW_MODE_CONFIG,
@@ -253,6 +262,7 @@ import {
   reviewResumeNotice,
   reviewResumePlanChoice,
   reviewEscapeAction,
+  reviewElapsedMs,
   reviewHandoffParks,
   reviewResumeSettles,
   reviewStateSummary,
@@ -261,6 +271,7 @@ import {
   writeReviewModeConfig,
   writeReviewPrompt,
   type ReviewFinding,
+  type ReviewFallbackModel,
   type ReviewExecutionResult,
   type ReviewHandoffGate,
   type ReviewSdkLoader,
@@ -282,12 +293,35 @@ import {
   type ReviewLineBuffer,
   type ReviewModeBandData,
 } from "./review-ui.ts";
+import {
+  pendingHandoffIsStale,
+  reviewHandoffRecovery,
+  shouldHandoffManualResult,
+  type ReviewHandoffSource,
+} from "./review-handoff.ts";
 import { seedPromptHistory, WorkflowTabEditor } from "./tab-editor.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
 const PLANNOTATOR_REVIEW_RESULT = "plannotator:review-result" as const;
 const PLANNOTATOR_PLAN_APPROVED = "plannotator:plan-approved" as const;
+const PLANNOTATOR_SESSION_OPENED = "plannotator:session-opened" as const;
+const PLANNOTATOR_SESSION_CLOSED = "plannotator:session-closed" as const;
+
+/** Structural shape of the optional Plannotator lifecycle events. */
+interface PlannotatorSessionEventLike {
+  id?: string;
+  action?: string;
+  url?: string;
+  reviewId?: string;
+  requestId?: string;
+  outcome?: "approved" | "submitted" | "closed";
+  closedBy?: string;
+}
+
+type PlanReviewRequestOutcome =
+  | { status: "handled"; reviewId?: string; url?: string }
+  | { status: "timeout" | "error" | "unavailable"; reason: string };
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -499,6 +533,10 @@ function getFinalOutput(messages: any[]): string {
  */
 export interface WorkflowExtensionDeps {
   loadSdk?: ReviewSdkLoader;
+  /** Test seam: how long a plan-review request waits for Plannotator. */
+  plannotatorRequestTimeoutMs?: number;
+  /** Test seam: how long a reload recovery status query waits. */
+  plannotatorRecoveryTimeoutMs?: number;
 }
 
 export default function workflowExtension(
@@ -1517,6 +1555,48 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * Automatic provider-recovery chain: the parent model that just planned,
+   * then the base reviewer and planner roles from roles.json (ignoring the
+   * active profile). Deduped and thinking-clamped through the parent registry.
+   */
+  function reviewFallbackModels(): ReviewFallbackModel[] {
+    try {
+      ensureRoleConfig(reviewCwd());
+      ensureProfilesConfig(reviewCwd());
+      const parent = currentSessionCtx?.model;
+      const parentThinking = currentSessionCtx?.thinkingLevel;
+      const baseReviewer = getRole(roleConfig, REVIEW_ROLE_NAME)?.model;
+      const basePlanner = getRole(roleConfig, "planner")?.model;
+      return buildReviewerFallbacks({
+        ...(parent
+          ? {
+              parentModel: {
+                provider: parent.provider,
+                id: parent.id,
+                thinking: parentThinking ?? "high",
+              },
+            }
+          : {}),
+        ...(baseReviewer ? { baseReviewer } : {}),
+        ...(basePlanner ? { basePlanner } : {}),
+        clampThinking: (model) => {
+          const found = (currentSessionCtx as any)?.modelRegistry?.find?.(
+            model.provider,
+            model.id,
+          );
+          return clampThinkingForModel(
+            found,
+            isValidThinkingLevel(model.thinking) ? model.thinking : "high",
+          );
+        },
+      });
+    } catch (_e) {
+      void _e;
+      return [];
+    }
+  }
+
   /** Reviewer model label for the mode band (best-effort). */
   function reviewModelLabel(): string {
     // While a round runs, the band names the snapshotted model — the one
@@ -1927,6 +2007,7 @@ export default function workflowExtension(
         if (reviewModelSnapshot) return reviewModelSnapshot;
         return resolveReviewerModel();
       },
+      fallbackReviewerModels: () => reviewFallbackModels(),
       findModel: (provider: string, id: string) =>
         (currentSessionCtx as any)?.modelRegistry?.find?.(provider, id),
       // Structural probe of the live parent context, evaluated at reviewer
@@ -2180,6 +2261,9 @@ export default function workflowExtension(
     try {
       const ctx = currentSessionCtx;
       if (!ctx || !(ctx as any).hasUI) return;
+      if (message !== undefined) {
+        (ctx as any).ui?.setWorkingVisible?.(true);
+      }
       (ctx as any).ui?.setWorkingMessage?.(message);
     } catch (_e) {
       void _e;
@@ -2251,6 +2335,9 @@ export default function workflowExtension(
     // follow `reviewState`; the spinner row needs an explicit message while
     // the child session streams off the main turn.
     setReviewWorkingMessage("🔍 Reviewing plan…");
+    // Paint the live review line now, not after the child session's first
+    // state event: a manual `/review` must look alive from the first tick.
+    updateStatus(ctx as any);
     // One long-lived listener covers this round AND the paused window (see
     // ensureReviewEscListener for why it is no longer attached per round).
     ensureReviewEscListener(ctx);
@@ -2466,6 +2553,17 @@ export default function workflowExtension(
       }
     }
 
+    // A new round can never inherit an older browser gate: the old tab's
+    // decision would otherwise suppress this round's handoff after it lands.
+    if (awaitingDecision) {
+      supersedePendingHandoff(
+        trigger === "manual"
+          ? "a manual /review started"
+          : "a new review round started",
+        { force: true, nextPlanHash: hash, nextCycleId: reviewCycleId },
+      );
+    }
+
     // A different plan file is a new target even inside one user run: reset the
     // budget/hashes/findings before the dedupe gates below.
     const cycleChanged = notePlanTargetForReviewCycle(currentPlanFile);
@@ -2634,6 +2732,16 @@ export default function workflowExtension(
     const hadGate = reviewGatePhase !== "idle";
     // Synchronously first: any old handoff continuation is stale from here on.
     reviewCycleId += 1;
+    if (
+      opts.reason === "prompt" ||
+      opts.reason === "build" ||
+      opts.reason === "session"
+    ) {
+      supersedePendingHandoff(`a new ${opts.reason} cycle started`, {
+        force: true,
+      });
+      manualReviewCycle = false;
+    }
     if (hadActive || pausedReview !== undefined || hadGate) {
       try {
         await suspendReview();
@@ -2736,7 +2844,9 @@ export default function workflowExtension(
    * they are not guarded. Clearing the review state releases the derived
    * mode-switch lock (plan 2026-10-25).
    */
-  async function teardownReview(): Promise<void> {
+  async function teardownReview(
+    opts: { keepHandoff?: boolean } = {},
+  ): Promise<void> {
     try {
       activeReview?.controller.abort();
     } catch (_e) {
@@ -2749,6 +2859,7 @@ export default function workflowExtension(
     }
     reviewRuntime = undefined;
     reviewState = undefined;
+    if (opts.keepHandoff !== true) manualReviewCycle = false;
     lastReviewedPlanHash = undefined;
     reviewRound = 0;
     reviewPreviousFindings = undefined;
@@ -2763,11 +2874,12 @@ export default function workflowExtension(
     activeReview = undefined;
     abortedReviewHash = undefined;
     quietAbortHash = undefined;
-    // A teardown ends any pending handoff decision/correlation and the
-    // per-run provenance; a reload cannot inherit either.
-    const clearedDecision = clearPendingHandoffDecision();
+    // A reload/resume keeps the browser correlation so the next session_start
+    // can recover it; every other teardown ends the decision and provenance.
+    const clearedDecision =
+      opts.keepHandoff === true ? false : clearPendingHandoffDecision();
     resetPlanRunProvenance();
-    if (clearedDecision) {
+    if (clearedDecision || opts.keepHandoff === true) {
       try {
         persistState();
       } catch (_e) {
@@ -3179,6 +3291,7 @@ export default function workflowExtension(
             [
               `Review paused at round ${paused.round} (plan hash ${paused.planHash})`,
               "  /review-resume to continue, /review-abort to stop.",
+              pendingHandoffStatusLine(),
               reviewModeLockStatusLine(lockKind),
             ]
               .filter(Boolean)
@@ -3199,6 +3312,7 @@ export default function workflowExtension(
             reviewEnabled()
               ? "Review Mode is enabled but no review has run yet."
               : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} /review runs a one-shot review.`,
+            pendingHandoffStatusLine(),
             reviewModeLockStatusLine(lockKind),
           ]
             .filter(Boolean)
@@ -3211,6 +3325,10 @@ export default function workflowExtension(
         reviewStateSummary(s),
         `  phase   : ${s.phase}   round: ${s.round}   pass: ${s.pass}`,
         `  model   : ${s.modelLabel}`,
+        `  attempt : ${s.recoveryAttempts?.length ? s.recoveryAttempts.join(" → ") : "single model"}`,
+        `  elapsed : ${Math.round(reviewElapsedMs(s) / 1000)}s${
+          s.providerError ? `   provider: ${s.providerError.slice(0, 200)}` : ""
+        }`,
         `  plan    : ${s.planPath ?? "(unknown)"}  hash ${s.planHash}`,
         `  explore : ${s.exploreUsed} subagent(s)   tokens≈${s.tokenEstimate ?? "n/a"}`,
         s.verdict ? `  verdict : ${s.verdict}` : "",
@@ -3224,6 +3342,7 @@ export default function workflowExtension(
         reviewRuntime?.isRoundActive()
           ? "  live    : round in flight — /role and /profile switches apply next round; /review say <msg> to steer"
           : "",
+        pendingHandoffStatusLine(),
         reviewModeLockStatusLine(lockKind),
         ...s.findings.map(
           (f) =>
@@ -3398,6 +3517,16 @@ export default function workflowExtension(
       const offSuffix = reviewEnabled()
         ? ""
         : " (Review Mode stays OFF — /review-mode on for automatic review.)";
+      if (
+        await openManualHandoff(
+          result,
+          target.abs,
+          ctx as any,
+          offSuffix,
+        )
+      ) {
+        return;
+      }
       ctx.ui.notify(`${reviewResumeNotice(result)}${offSuffix}`, "info");
     },
   });
@@ -3442,6 +3571,9 @@ export default function workflowExtension(
         ctx.ui.notify("A review round is already running.", "warning");
         return;
       }
+      // A gated resume is settled by its parked runHandoff; a manual pause
+      // (idle gate) opens its own browser handoff after the round lands.
+      const gatedResume = reviewGatePhase !== "idle";
       // A resumed gated review is auditing again. Without this, the parked
       // handoff keeps `reviewGatePhase === "paused"` for the whole round and
       // the lock/footer report the wrong state (plan 2026-10-25 follow-up).
@@ -3485,7 +3617,15 @@ export default function workflowExtension(
             planText: result.planText,
           });
         }
-        ctx.ui.notify(reviewResumeNotice(result), "info");
+        if (!gatedResume && reviewResumeSettles(result)) {
+          await openManualHandoff(
+            result,
+            currentPlanFile ?? "",
+            ctx as any,
+          );
+        } else {
+          ctx.ui.notify(reviewResumeNotice(result), "info");
+        }
         return;
       }
       pausedReview = undefined;
@@ -3510,7 +3650,11 @@ export default function workflowExtension(
           planText: result.planText,
         });
       }
-      ctx.ui.notify(reviewResumeNotice(result), "info");
+      if (!gatedResume && reviewResumeSettles(result)) {
+        await openManualHandoff(result, currentPlanFile ?? "", ctx as any);
+      } else {
+        ctx.ui.notify(reviewResumeNotice(result), "info");
+      }
     },
   });
 
@@ -4014,6 +4158,16 @@ export default function workflowExtension(
       planFile: currentPlanFile,
       awaitingDecision,
       awaitingDecisionAt: awaitingDecision ? lastHandoffAt : undefined,
+      // Full correlation: a restored gate must know which browser review it
+      // belongs to, or it can only suppress the next handoff.
+      lastReviewId: awaitingDecision ? lastReviewId : null,
+      pendingHandoffPlanPath: awaitingDecision ? pendingHandoffPlanPath : null,
+      pendingHandoffPlanHash: awaitingDecision ? pendingHandoffPlanHash : null,
+      pendingHandoffRequestId: awaitingDecision ? pendingHandoffRequestId : null,
+      pendingHandoffSource: awaitingDecision ? pendingHandoffSource : null,
+      pendingHandoffCycleId: awaitingDecision ? pendingHandoffCycleId : 0,
+      pendingHandoffReviewUrl: awaitingDecision ? pendingHandoffReviewUrl : null,
+      manualReviewCycle,
       role: {
         activeRole: roleConfig.activeRole,
         // Session-scoped profile activation (see setActiveProfile): explicit
@@ -4310,6 +4464,365 @@ export default function workflowExtension(
     return currentSessionCtx;
   }
 
+  /**
+   * Adopt the review id/url Plannotator announced. This is the only place the
+   * transcript handoff entry is written, so a `respond` callback and a
+   * `session-opened` event for the same review cannot duplicate it.
+   */
+  function adoptPlannotatorSession(event: PlannotatorSessionEventLike): void {
+    if (!awaitingDecision) return;
+    if (typeof event.reviewId === "string" && event.reviewId) {
+      lastReviewId = event.reviewId;
+    }
+    if (!lastReviewId) return;
+    if (typeof event.url === "string" && event.url) {
+      pendingHandoffReviewUrl = event.url;
+    }
+    if (recordedHandoffReviewId !== lastReviewId) {
+      recordedHandoffReviewId = lastReviewId;
+      try {
+        pi.appendEntry("workflow-handoff-plannotator", {
+          at: Date.now(),
+          planPath: pendingHandoffPlanPath ?? currentPlanFile,
+          reviewId: lastReviewId,
+          ...(pendingHandoffReviewUrl
+            ? { reviewUrl: pendingHandoffReviewUrl }
+            : {}),
+          planTextLen: pendingHandoffPlanTextLen,
+          source: pendingHandoffSource ?? "auto",
+        });
+      } catch (_e) {
+        void _e;
+      }
+      notifyReview(
+        "Plan opened in browser for review. Approve or annotate there.",
+        "info",
+      );
+    }
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /** Settle the one in-flight plan-review request exactly once. */
+  function settlePlanReviewRequest(outcome: PlanReviewRequestOutcome): boolean {
+    const pending = pendingPlanReviewRequest;
+    if (!pending || pending.settled) return false;
+    pending.settled = true;
+    pendingPlanReviewRequest = undefined;
+    pending.finish(outcome);
+    return true;
+  }
+
+  /**
+   * Ask Plannotator to open a plan review and wait for its lifecycle.
+   *
+   * The `respond` callback is the fast path; `plannotator:session-opened` is
+   * the authoritative one (it carries the URL and survives a slow handler).
+   * A timeout clears the gate so the caller can render its own fallback; it
+   * never retries, because a late event would then open a duplicate review.
+   */
+  async function requestPlanReview(input: {
+    planText: string;
+    planPath: string;
+    source: ReviewHandoffSource;
+    ctx: ExtensionContext;
+    cycleId?: number;
+  }): Promise<{ ok: true; reviewId?: string } | { ok: false; reason: string }> {
+    const bus: any = (pi as any).events;
+    if (!plannotatorActive || !bus || typeof bus.emit !== "function") {
+      return { ok: false, reason: "Plannotator is not available in this session" };
+    }
+    if (!input.planText.trim() || !input.planPath) {
+      return { ok: false, reason: "the reviewed plan has no file to hand off" };
+    }
+    // A second request supersedes the first waiter without opening a race.
+    settlePlanReviewRequest({
+      status: "error",
+      reason: "superseded by a newer handoff",
+    });
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    awaitingDecision = true;
+    lastHandoffAt = Date.now();
+    pendingHandoffPlanPath = input.planPath;
+    pendingHandoffPlanHash = planHash(input.planText);
+    pendingHandoffPlanTextLen = input.planText.length;
+    pendingHandoffRequestId = requestId;
+    pendingHandoffSource = input.source;
+    pendingHandoffCycleId = input.cycleId ?? reviewCycleId;
+    pendingHandoffReviewUrl = null;
+    lastReviewId = null;
+    recordedHandoffReviewId = null;
+    persistState();
+    const timeoutMs = Math.max(50, deps.plannotatorRequestTimeoutMs ?? 15_000);
+    const response = await new Promise<PlanReviewRequestOutcome>((resolve) => {
+      let settled = false;
+      const settle = (outcome: PlanReviewRequestOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (pendingPlanReviewRequest?.requestId === requestId) {
+          pendingPlanReviewRequest = undefined;
+        }
+        resolve(outcome);
+      };
+      const timer = setTimeout(() => {
+        settle({
+          status: "timeout",
+          reason: `Plannotator did not answer within ${Math.round(timeoutMs / 1000)}s`,
+        });
+      }, timeoutMs);
+      pendingPlanReviewRequest = {
+        requestId,
+        settled: false,
+        finish: settle,
+      };
+      try {
+        bus.emit(PLANNOTATOR_REQUEST, {
+          requestId,
+          action: "plan-review",
+          payload: {
+            planContent: input.planText,
+            planFilePath: input.planPath,
+            reviewPending: false,
+            reviewSummary: reviewState
+              ? {
+                  modelLabel: reviewState.modelLabel,
+                  round: reviewState.round,
+                  verdict: reviewState.verdict,
+                  findings: reviewState.findings.length,
+                }
+              : undefined,
+          },
+          respond: (res: any) => {
+            if (
+              res &&
+              res.status === "handled" &&
+              typeof res.result?.reviewId === "string"
+            ) {
+              settle({
+                status: "handled",
+                reviewId: res.result.reviewId,
+              });
+            } else {
+              settle({
+                status: "error",
+                reason: `Plannotator answered ${String(res?.status ?? "nothing")}`,
+              });
+            }
+          },
+        });
+      } catch (e: any) {
+        settle({
+          status: "error",
+          reason: `Plannotator request failed: ${String(e?.message ?? e)}`,
+        });
+      }
+    });
+    if (response.status === "handled") {
+      adoptPlannotatorSession({
+        ...(response.reviewId ? { reviewId: response.reviewId } : {}),
+        ...(response.url ? { url: response.url } : {}),
+      });
+      return { ok: true, ...(response.reviewId ? { reviewId: response.reviewId } : {}) };
+    }
+    const changed = clearPendingHandoffDecision();
+    if (changed) persistState();
+    try {
+      pi.appendEntry("workflow-handoff-plannotator-failed", {
+        at: Date.now(),
+        reason: response.reason,
+        source: input.source,
+        planPath: input.planPath,
+      });
+    } catch (_e) {
+      void _e;
+    }
+    notifyReview(`Plannotator handoff unavailable — ${response.reason}.`, "warning");
+    return { ok: false, reason: response.reason };
+  }
+
+  /** Ask Plannotator for the durable status of one review. */
+  async function queryPlannotatorReviewStatus(reviewId: string): Promise<{
+    status: "pending" | "completed" | "missing";
+    approved?: boolean;
+    feedback?: string;
+    savedPath?: string;
+  }> {
+    const bus: any = (pi as any).events;
+    if (!plannotatorActive || !bus || typeof bus.emit !== "function") {
+      return { status: "missing" };
+    }
+    const timeoutMs = Math.max(50, deps.plannotatorRecoveryTimeoutMs ?? 3_000);
+    return await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: any): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(
+          value &&
+            (value.status === "pending" ||
+              value.status === "completed" ||
+              value.status === "missing")
+            ? value
+            : { status: "missing" },
+        );
+      };
+      const timer = setTimeout(() => finish({ status: "missing" }), timeoutMs);
+      try {
+        bus.emit(PLANNOTATOR_REQUEST, {
+          requestId: `${Date.now()}-status`,
+          action: "review-status",
+          payload: { reviewId },
+          respond: (res: any) => {
+            if (res?.status === "handled" && res.result) finish(res.result);
+            else finish({ status: "missing" });
+          },
+        });
+      } catch {
+        finish({ status: "missing" });
+      }
+    });
+  }
+
+  /**
+   * Recover the one pending browser handoff after a session reload/resume.
+   *
+   * `startup`/`new` cannot own the old loopback server, so they clear. For a
+   * reload/resume/fork, Plannotator's durable `review-status` decides: pending
+   * keeps the gate (when the plan hash still matches), completed applies the
+   * recorded decision, and missing/changed clears with a visible reason.
+   */
+  async function recoverPendingHandoff(
+    ctx: ExtensionContext,
+    reason: string,
+  ): Promise<void> {
+    if (recoveryInFlight) return recoveryInFlight;
+    recoveryInFlight = (async () => {
+      const record = (action: string, detail: Record<string, unknown> = {}) => {
+        try {
+          pi.appendEntry("workflow-handoff-recovery", {
+            action,
+            reason,
+            at: Date.now(),
+            ...detail,
+          });
+        } catch (_e) {
+          void _e;
+        }
+      };
+      if (!awaitingDecision) return;
+      if (reason === "startup" || reason === "new" || !lastReviewId) {
+        const changed = clearPendingHandoffDecision();
+        if (changed) persistState();
+        record("clear", { why: "no restorable review" });
+        return;
+      }
+      const currentFile = readCurrentPlanText(reviewCwd());
+      const status = await queryPlannotatorReviewStatus(lastReviewId);
+      const decision = reviewHandoffRecovery({
+        status: status.status,
+        approved: status.approved,
+        feedback: status.feedback,
+        savedPath: status.savedPath,
+        pendingHash: pendingHandoffPlanHash ?? undefined,
+        currentHash:
+          currentFile !== undefined ? planHash(currentFile) : undefined,
+      });
+      if (decision.action === "keep") {
+        if (pendingHandoffSource === "manual") manualReviewCycle = true;
+        record("keep", {
+          reviewId: lastReviewId,
+          ...(pendingHandoffReviewUrl
+            ? { reviewUrl: pendingHandoffReviewUrl }
+            : {}),
+        });
+        notifyReview(
+          `Browser review still open${pendingHandoffReviewUrl ? `: ${pendingHandoffReviewUrl}` : ""} — approve or annotate there.`,
+          "info",
+        );
+        updateStatus(ctx as any);
+        return;
+      }
+      if (decision.action === "apply") {
+        record("apply", {
+          reviewId: lastReviewId,
+          approved: decision.approved,
+        });
+        if (decision.approved) {
+          handlePlannotatorApprove(
+            pendingHandoffPlanPath ?? currentPlanFile ?? "",
+            currentFile ?? "",
+            decision.feedback,
+            ctx.cwd,
+          );
+        } else {
+          await handlePlannotatorDeny(
+            decision.feedback || "Plan needs revision.",
+          );
+        }
+        return;
+      }
+      const changed = clearPendingHandoffDecision();
+      if (changed) persistState();
+      record("clear", { why: decision.reason, reviewId: lastReviewId ?? "" });
+      notifyReview(
+        `Previous browser review could not be recovered — ${decision.reason}.`,
+        "warning",
+      );
+      updateStatus(ctx as any);
+    })();
+    try {
+      await recoveryInFlight;
+    } finally {
+      recoveryInFlight = null;
+    }
+  }
+
+  /**
+   * Open the browser handoff for a settled manual `/review` or resume.
+   * Returns true when the browser owns the decision (or the result is not
+   * handoff-eligible); false when the round paused/aborted and the caller
+   * should show its normal resume notice.
+   */
+  async function openManualHandoff(
+    result: ReviewExecutionResult,
+    planPath: string,
+    ctx: ExtensionContext,
+    suffix = "",
+  ): Promise<boolean> {
+    if (!shouldHandoffManualResult(result)) return false;
+    const previousManualCycle = manualReviewCycle;
+    manualReviewCycle = true;
+    const handoff = await requestPlanReview({
+      planText: result.planText,
+      planPath,
+      source: "manual",
+      ctx,
+    });
+    if (handoff.ok) {
+      ctx.ui.notify(
+        "Plan opened in browser for review. Approve or annotate there." + suffix,
+        "info",
+      );
+      return true;
+    }
+    manualReviewCycle = previousManualCycle;
+    ctx.ui.notify(
+      `Manual review finished, but Plannotator is unavailable (${handoff.reason}). The reviewed plan is at ${planPath}.`,
+      "warning",
+    );
+    return true;
+  }
+
   function handlePlannotatorApprove(
     planFilePath: string,
     planContent: string,
@@ -4318,10 +4831,18 @@ export default function workflowExtension(
   ) {
     const ctx = getActiveCtx();
     if (!ctx) return;
-    if (workflowMode !== "plan") return;
+    // A manual `/review` handoff may be approved from Default/Build; an
+    // automatic handoff only exists in Plan mode.
+    if (workflowMode !== "plan" && pendingHandoffSource !== "manual") return;
     // A stale browser approve while a review runs must not clear the pending
     // decision or send the execute messages: the plan is still being audited.
-    if (blockModeSwitchDuringReview(ctx as any)) return;
+    if (blockModeSwitchDuringReview(ctx as any)) {
+      supersedePendingHandoff(
+        "a browser decision arrived while a new review round was running",
+        { force: true },
+      );
+      return;
+    }
     // No prompt means no decision to consume. A fresh prompt/mode switch
     // clears this, so an old browser tab cannot approve the previous plan.
     if (!awaitingDecision) return;
@@ -4377,6 +4898,7 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    if (pendingHandoffSource === "manual") manualReviewCycle = false;
     clearPendingHandoffDecision();
     void enterBuildModeFromPlan(ctx as any, resolvedPlan)
       .then(() => updateStatus(ctx as any))
@@ -4428,8 +4950,28 @@ export default function workflowExtension(
     // Not a mode transition, but while a review owns the turn every browser
     // decision is stale: injecting feedback here would mutate the plan under
     // the reviewer. A legitimate deny only arrives after the gate resolves.
-    if (blockModeSwitchDuringReview(ctx as any)) return;
+    if (blockModeSwitchDuringReview(ctx as any)) {
+      supersedePendingHandoff(
+        "a browser decision arrived while a new review round was running",
+        { force: true },
+      );
+      return;
+    }
     if (!awaitingDecision) return;
+    const manualSource = pendingHandoffSource === "manual";
+    if (manualSource && workflowMode !== "plan") {
+      // A manual review can be launched from Default/Build. Its feedback is a
+      // plan revision, so switch to Plan before the follow-up turn starts.
+      try {
+        await setPlanMode(ctx as any, { quiet: true });
+      } catch (_e) {
+        void _e;
+      }
+      notifyReview(
+        "Review feedback — switched to Plan mode for the revision.",
+        "info",
+      );
+    }
     clearPendingHandoffDecision();
     // Feedback cycle: the next plan revision gets a fresh review round, and the
     // outstanding findings are carried forward so the reviewer can confirm they
@@ -4515,6 +5057,52 @@ export default function workflowExtension(
               event.feedback || "Plan needs revision.",
             );
           }
+        } catch (_e) {
+          void _e;
+        }
+      });
+      // session-opened is authoritative: it carries the review id and URL even
+      // when the request's respond callback is slow or lost. It can arrive
+      // before or after respond; both paths settle the same waiter once.
+      bus.on(PLANNOTATOR_SESSION_OPENED, (event: any) => {
+        try {
+          if (!event || typeof event !== "object") return;
+          const matchesWaiting =
+            typeof event.requestId === "string" &&
+            event.requestId === pendingPlanReviewRequest?.requestId;
+          const matchesCurrent =
+            typeof event.requestId === "string" &&
+            event.requestId === pendingHandoffRequestId;
+          if (!matchesWaiting && !matchesCurrent) return;
+          adoptPlannotatorSession({
+            reviewId: event.reviewId,
+            url: event.url,
+          });
+          if (matchesWaiting) {
+            settlePlanReviewRequest({
+              status: "handled",
+              reviewId:
+                typeof event.reviewId === "string" ? event.reviewId : undefined,
+              url: typeof event.url === "string" ? event.url : undefined,
+            });
+          }
+        } catch (_e) {
+          void _e;
+        }
+      });
+      // A review closed without a decision must not leave a phantom gate that
+      // suppresses the next round. approved/submitted decisions still flow
+      // through review-result (and, after a reload, review-status).
+      bus.on(PLANNOTATOR_SESSION_CLOSED, (event: any) => {
+        try {
+          if (!event || typeof event !== "object") return;
+          if (event.outcome !== "closed") return;
+          if (!lastReviewId || event.reviewId !== lastReviewId) return;
+          if (!awaitingDecision) return;
+          supersedePendingHandoff(
+            "the browser review closed without a decision",
+            { force: true },
+          );
         } catch (_e) {
           void _e;
         }
@@ -5416,7 +6004,8 @@ export default function workflowExtension(
     "Usage: /profile (picker) | /profile list | /profile show <name> | " +
     "/profile use <name|none> | /profile create <name> | /profile edit <name> | " +
     "/profile rename <old> <new> | /profile delete <name> | " +
-    "/profile default [name|none] [global|project]";
+    "/profile default [name|none] [global|project] | " +
+    "/profile retarget-provider <old> <new> [global|project] [--apply]";
 
   /** Effective workflow.defaultProfile for display (never throws). */
   function currentDefaultProfileName(cwd?: string): string | undefined {
@@ -6824,6 +7413,79 @@ export default function workflowExtension(
             void _e;
           }
         }
+        return;
+      }
+
+      if (sub === "retarget-provider" || sub === "retarget") {
+        const [oldProvider, newProvider, ...flags] = rest;
+        if (!oldProvider || !newProvider) {
+          ctx.ui.notify(
+            "Usage: /profile retarget-provider <old> <new> [global|project] [--apply]\n" +
+              "Rewrite every role/profile model ref from one provider to another. " +
+              "Without --apply it only prints the planned changes.",
+            "info",
+          );
+          return;
+        }
+        if (oldProvider === newProvider) {
+          ctx.ui.notify(
+            `Provider is already "${oldProvider}" — nothing to retarget.`,
+            "info",
+          );
+          return;
+        }
+        const apply = flags.some((flag) => {
+          const value = flag.toLowerCase();
+          return value === "--apply" || value === "apply";
+        });
+        const scope = flags.some((flag) => flag.toLowerCase() === "project")
+          ? "project"
+          : "global";
+        const targetCwd = cwd ?? (ctx as any).cwd ?? process.cwd();
+        const result = retargetProviderFiles({
+          profilesPath:
+            scope === "project"
+              ? projectProfilesPath(targetCwd)
+              : userProfilesPath(),
+          rolesPath:
+            scope === "project"
+              ? projectRolesPath(targetCwd)
+              : userRolesPath(),
+          oldProvider,
+          newProvider,
+          dryRun: !apply,
+        });
+        const summary = formatRetargetResult(result);
+        if (
+          result.profiles.status === "invalid" ||
+          result.roles.status === "invalid"
+        ) {
+          ctx.ui.notify(summary, "error");
+          return;
+        }
+        if (!apply) {
+          ctx.ui.notify(
+            `${summary}\n\nScope: ${scope}. A malformed file blocks both writes.`,
+            "info",
+          );
+          return;
+        }
+        // The files changed underneath the cached configs. Force a reload so
+        // the active profile/role resolves the new provider immediately.
+        roleConfigLoadedFor = undefined;
+        profilesLoadedFor = undefined;
+        invalidateEffectiveRoles();
+        ensureRoleConfig(targetCwd);
+        ensureProfilesConfig(targetCwd);
+        updateStatus(ctx as any);
+        if (workflowMode) {
+          try {
+            await applyModeModel(ctx as any);
+          } catch (_e) {
+            void _e;
+          }
+        }
+        ctx.ui.notify(`${summary}\n\nScope: ${scope}.`, "info");
         return;
       }
 
@@ -8351,31 +9013,39 @@ export default function workflowExtension(
               typeof d.awaitingDecisionAt === "number"
                 ? d.awaitingDecisionAt
                 : undefined;
-            // Stale guard: if awaitingDecision was persisted >60s ago (crash while modal open), reset
-            if (
-              awaitingDecision &&
-              lastHandoffAt &&
-              Date.now() - lastHandoffAt > 60_000
-            ) {
-              awaitingDecision = false;
-              lastHandoffAt = undefined;
-              try {
-                (ctx as any).ui?.notify?.(
-                  "Recovered stale handoff gate — showing again",
-                  "info",
-                );
-              } catch (_e) {
-                void _e;
-              }
-              try {
-                pi.appendEntry("workflow-handoff-stale-reset", {
-                  at: Date.now(),
-                  lastHandoffAt,
-                });
-              } catch (_e) {
-                void _e;
-              }
-            }
+            // Restore the whole correlation, not just the boolean: recovery
+            // and stale-browser correlation both need the review identity.
+            lastReviewId =
+              typeof (d as any).lastReviewId === "string"
+                ? (d as any).lastReviewId
+                : null;
+            pendingHandoffPlanPath =
+              typeof (d as any).pendingHandoffPlanPath === "string"
+                ? (d as any).pendingHandoffPlanPath
+                : null;
+            pendingHandoffPlanHash =
+              typeof (d as any).pendingHandoffPlanHash === "string"
+                ? (d as any).pendingHandoffPlanHash
+                : null;
+            pendingHandoffRequestId =
+              typeof (d as any).pendingHandoffRequestId === "string"
+                ? (d as any).pendingHandoffRequestId
+                : null;
+            pendingHandoffSource =
+              (d as any).pendingHandoffSource === "manual"
+                ? "manual"
+                : (d as any).pendingHandoffSource === "auto"
+                  ? "auto"
+                  : null;
+            pendingHandoffCycleId =
+              typeof (d as any).pendingHandoffCycleId === "number"
+                ? (d as any).pendingHandoffCycleId
+                : 0;
+            pendingHandoffReviewUrl =
+              typeof (d as any).pendingHandoffReviewUrl === "string"
+                ? (d as any).pendingHandoffReviewUrl
+                : null;
+            manualReviewCycle = (d as any).manualReviewCycle === true;
           }
         }
         if (
@@ -8601,9 +9271,10 @@ export default function workflowExtension(
     resetPlanRunProvenance();
     lastPlanWritePath = currentPlanFile ?? null;
     lastPersistedPlanFile = currentPlanFile;
-    pendingHandoffPlanPath = null;
-    pendingHandoffPlanHash = null;
-    lastReviewId = null;
+    // The pending correlation is restored above. Recovery (step 15) decides
+    // whether it survives; do not null it here, or a restored gate can only
+    // suppress the next handoff.
+    if (!awaitingDecision) clearPendingHandoffDecision();
     currentSessionCtx = ctx as any;
     // Give Tab back to autocomplete while a suggestion list is visible; the raw
     // `tab` shortcut keeps cycling modes otherwise.
@@ -8636,10 +9307,14 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    // Recovery is asynchronous (it may query Plannotator); session start must
+    // not wait up to the status timeout. The gate is restored/cleared before
+    // the next user turn.
+    void recoverPendingHandoff(ctx as ExtensionContext, event.reason);
     updateStatus(ctx as any);
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     // A write denial is run-scoped; the session is going away, so drop it.
     writeGateRunDenials.clear();
     writeGateTurnAnswer = null;
@@ -8658,11 +9333,17 @@ export default function workflowExtension(
       }
     }
     activeSubagents.clear();
-    // Ensure a handoff decision/provenance does not persist stale across restart
-    const clearedAtShutdown = clearPendingHandoffDecision();
+    // A reload/resume/fork can recover a browser review in the replacement
+    // session; quitting or starting a new session cannot own the old server.
+    const keepPending =
+      event.reason === "reload" ||
+      event.reason === "resume" ||
+      event.reason === "fork";
+    const clearedAtShutdown =
+      keepPending === true ? false : clearPendingHandoffDecision();
     resetPlanRunProvenance();
     resetSessionPlanProvenance();
-    if (clearedAtShutdown) {
+    if (clearedAtShutdown || keepPending === true) {
       try {
         persistState();
       } catch (_e) {
@@ -8680,7 +9361,7 @@ export default function workflowExtension(
     pendingCommitFlow = null;
     // Release the reviewer session (and its custom tools) on shutdown so a
     // reload or quit never leaves an orphaned in-process session behind.
-    await teardownReview();
+    await teardownReview({ keepHandoff: keepPending });
     currentSessionCtx = null;
   });
 
@@ -9895,6 +10576,25 @@ export default function workflowExtension(
   /** Plan path/hash the currently rendered handoff prompt belongs to. */
   let pendingHandoffPlanPath: string | null = null;
   let pendingHandoffPlanHash: string | null = null;
+  let pendingHandoffRequestId: string | null = null;
+  let pendingHandoffSource: ReviewHandoffSource | null = null;
+  let pendingHandoffCycleId = 0;
+  let pendingHandoffReviewUrl: string | null = null;
+  let pendingHandoffPlanTextLen = 0;
+  /** The one in-flight `plannotator:request` waiter; settles exactly once. */
+  let pendingPlanReviewRequest:
+    | {
+        requestId: string;
+        settled: boolean;
+        finish: (outcome: PlanReviewRequestOutcome) => void;
+      }
+    | undefined;
+  /** The review id already recorded in the transcript (one entry per review). */
+  let recordedHandoffReviewId: string | null = null;
+  /** A manual `/review` owns the following feedback cycle (even when auto is off). */
+  let manualReviewCycle = false;
+  /** One reload recovery at a time (session_start may re-enter). */
+  let recoveryInFlight: Promise<void> | null = null;
   /** Last path announced by the suppressed-handoff notice (per run). */
   let lastPlanReadyNoticeKey: string | null = null;
 
@@ -9919,18 +10619,88 @@ export default function workflowExtension(
    * switch supersedes it; stale browser events must not approve the old plan.
    * Returns true when persisted state changed so the caller can persist once.
    */
+  /** One `/review-status` row for a browser handoff awaiting a decision. */
+  function pendingHandoffStatusLine(): string {
+    if (!awaitingDecision) return "";
+    const age = lastHandoffAt
+      ? Math.max(0, Math.round((Date.now() - lastHandoffAt) / 1000))
+      : 0;
+    return `  handoff : browser pending — ${lastReviewId ?? "review id unknown"}${
+      pendingHandoffReviewUrl ? ` @ ${pendingHandoffReviewUrl}` : ""
+    } (${pendingHandoffSource ?? "auto"}, ${age}s)`;
+  }
+
   function clearPendingHandoffDecision(): boolean {
     const changed =
       awaitingDecision === true ||
       lastHandoffAt !== undefined ||
       lastReviewId !== null ||
       pendingHandoffPlanPath !== null ||
-      pendingHandoffPlanHash !== null;
+      pendingHandoffPlanHash !== null ||
+      pendingHandoffRequestId !== null ||
+      pendingHandoffSource !== null ||
+      pendingHandoffCycleId !== 0 ||
+      pendingHandoffReviewUrl !== null;
     awaitingDecision = false;
     lastHandoffAt = undefined;
     lastReviewId = null;
     pendingHandoffPlanPath = null;
     pendingHandoffPlanHash = null;
+    pendingHandoffRequestId = null;
+    pendingHandoffSource = null;
+    pendingHandoffCycleId = 0;
+    pendingHandoffReviewUrl = null;
+    pendingHandoffPlanTextLen = 0;
+    recordedHandoffReviewId = null;
+    return changed;
+  }
+
+  /**
+   * Drop a gate that cannot belong to the round/plan about to start.
+   *
+   * A new automatic round, a manual `/review`, or a browser decision arriving
+   * while another round runs all supersede the old gate. A duplicate event for
+   * the same plan outside a new round must not clear a legitimate pending
+   * prompt, so the pure `pendingHandoffIsStale` predicate decides.
+   */
+  function supersedePendingHandoff(
+    reason: string,
+    opts: {
+      force?: boolean;
+      nextCycleId?: number;
+      nextPlanHash?: string;
+    } = {},
+  ): boolean {
+    if (
+      !pendingHandoffIsStale({
+        awaiting: awaitingDecision,
+        force: opts.force,
+        pendingCycleId:
+          pendingHandoffCycleId > 0 ? pendingHandoffCycleId : undefined,
+        currentCycleId: opts.nextCycleId ?? reviewCycleId,
+        pendingPlanHash: pendingHandoffPlanHash ?? undefined,
+        nextPlanHash: opts.nextPlanHash,
+      })
+    ) {
+      return false;
+    }
+    const changed = clearPendingHandoffDecision();
+    if (changed) {
+      notifyReview(`Plan handoff superseded — ${reason}.`, "info");
+      try {
+        pi.appendEntry("workflow-handoff-superseded", {
+          reason,
+          at: Date.now(),
+        });
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
     return changed;
   }
 
@@ -10462,7 +11232,8 @@ export default function workflowExtension(
           void _e;
         }
       };
-      if (planTextForRender && reviewEnabled()) {
+      const reviewThisCycle = reviewEnabled() || manualReviewCycle;
+      if (planTextForRender && reviewThisCycle) {
         const authorPlan: string = planTextForRender;
         reviewHandoffGate.reset();
         reviewGatePhase = "auditing";
@@ -10472,7 +11243,7 @@ export default function workflowExtension(
             authorPlan,
             ctx as ExtensionContext,
             (ctx as any).signal as AbortSignal | undefined,
-            "auto",
+            manualReviewCycle ? "manual" : "auto",
           );
           if (handoffCycle !== reviewCycleId) return;
           const reviewedText = reviewed.planText;
@@ -10587,114 +11358,15 @@ export default function workflowExtension(
       if (planTextForRender && hasUI && !awaitingDecision) {
         // ── Plannotator webview branch (browser review) ──────────
         if (plannotatorActive) {
-          awaitingDecision = true;
-          lastHandoffAt = Date.now();
-          pendingHandoffPlanPath = planPath;
-          pendingHandoffPlanHash = planHash(planTextForRender);
-          persistState();
-          try {
-            const bus: any = (pi as any).events;
-            const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            const response: any = await new Promise((resolve) => {
-              let settled = false;
-              const timer = setTimeout(() => {
-                if (!settled) {
-                  settled = true;
-                  resolve({ status: "timeout" });
-                }
-              }, 5000);
-              try {
-                bus.emit(PLANNOTATOR_REQUEST, {
-                  requestId,
-                  action: "plan-review",
-                  payload: {
-                    planContent: planTextForRender!,
-                    planFilePath: planPath,
-                    // The handoff only renders after the gated review
-                    // resolves, so a pending review is impossible here;
-                    // the field stays for the external browser app.
-                    reviewPending: false,
-                    // Provenance so the browser/inline view can show that this
-                    // plan was independently reviewed (and by what).
-                    reviewSummary: reviewState
-                      ? {
-                          modelLabel: reviewState.modelLabel,
-                          round: reviewState.round,
-                          verdict: reviewState.verdict,
-                          findings: reviewState.findings.length,
-                        }
-                      : undefined,
-                  },
-                  respond: (res: any) => {
-                    if (!settled) {
-                      settled = true;
-                      clearTimeout(timer);
-                      resolve(res);
-                    }
-                  },
-                });
-              } catch (e) {
-                if (!settled) {
-                  settled = true;
-                  clearTimeout(timer);
-                  resolve({ status: "error", error: String(e) });
-                }
-              }
-            });
-            if (
-              response &&
-              response.status === "handled" &&
-              response.result &&
-              response.result.reviewId
-            ) {
-              lastReviewId = response.result.reviewId;
-              try {
-                pi.appendEntry("workflow-handoff-plannotator", {
-                  at: Date.now(),
-                  planPath,
-                  reviewId: lastReviewId,
-                  planTextLen: planTextForRender!.length,
-                  source: planSource,
-                });
-              } catch (_e) {
-                void _e;
-              }
-              try {
-                currentSessionCtx = ctx as any;
-                (ctx as any).ui?.notify?.(
-                  "Plan opened in browser for review. Approve or annotate there.",
-                  "info",
-                );
-                updateStatus(ctx as any);
-              } catch (_e) {
-                void _e;
-              }
-              return; // plannotator owns the review — result arrives via plannotator:review-result / plan-approved events
-            }
-            if (response && response.status !== "timeout") {
-              try {
-                (ctx as any).ui?.notify?.(
-                  `Plannotator unavailable (${response.status}), falling back to inline review`,
-                  "warning",
-                );
-              } catch (_e) {
-                void _e;
-              }
-            }
-          } catch (e) {
-            try {
-              (ctx as any).ui?.notify?.(
-                `Plannotator request failed, falling back to inline: ${String(e).slice(0, 80)}`,
-                "warning",
-              );
-            } catch (_e) {
-              void _e;
-            }
-          }
-          // Browser branch failed — clear gate so inline can show
-          clearPendingHandoffDecision();
-          persistState();
-          // fall through to inline handoff below
+          const handoff = await requestPlanReview({
+            planText: planTextForRender,
+            planPath,
+            source: "auto",
+            ctx: ctx as ExtensionContext,
+            cycleId: handoffCycle,
+          });
+          if (handoff.ok) return;
+          // The helper already cleared the gate; fall through to inline.
         }
         awaitingDecision = true;
         lastHandoffAt = Date.now();

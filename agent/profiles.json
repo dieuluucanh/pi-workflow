@@ -100,29 +100,29 @@
       "roles": {
         "planner": {
           "provider": "opencode-go",
-          "id": "beam-free",
-          "thinking": "xhigh"
+          "id": "longcat-2.5-free",
+          "thinking": "high"
         },
         "explorer": {
           "provider": "opencode-go",
-          "id": "beam-free",
-          "thinking": "medium"
+          "id": "iceman-contributor-free",
+          "thinking": "low"
         },
         "builder": {
           "provider": "opencode-go",
-          "id": "beam-free",
-          "thinking": "high"
+          "id": "longcat-2.5-free",
+          "thinking": "medium"
         },
         "reviewer": {
           "provider": "opencode-go",
-          "id": "beam-free",
-          "thinking": "xhigh"
+          "id": "longcat-2.5-free",
+          "thinking": "high"
         }
       },
       "defaultModel": {
         "provider": "opencode-go",
-        "id": "beam-free",
-        "thinking": "high"
+        "id": "longcat-2.5-free",
+        "thinking": "medium"
       }
     },
     {
@@ -132,7 +132,7 @@
         "planner": {
           "provider": "command-code",
           "id": "deepseek/deepseek-v4.1-flash",
-          "thinking": "max"
+          "thinking": "high"
         },
         "explorer": {
           "provider": "command-code",
@@ -147,7 +147,7 @@
         "reviewer": {
           "provider": "command-code",
           "id": "deepseek/deepseek-v4.1-flash",
-          "thinking": "max"
+          "thinking": "high"
         }
       },
       "defaultModel": {

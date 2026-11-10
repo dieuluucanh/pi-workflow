@@ -38,6 +38,8 @@ import {
   DEFAULT_REVIEW_MODE_CONFIG,
   DEFAULT_REVIEW_PROMPT,
   applySubmittedPlan,
+  buildReviewerAttempts,
+  buildReviewerFallbacks,
   canRunManualReview,
   classifyReviewExecution,
   coerceReviewModeConfig,
@@ -97,6 +99,9 @@ import {
   createReviewBashTool,
   createReviewExploreTool,
   createReviewPassDoneTool,
+  createReviewPlanBeginTool,
+  createReviewPlanChunkTool,
+  createReviewPlanFinalizeTool,
   createReviewSubmitPlanTool,
   createReviewTools,
   resolveBashToolDefinitionBuilder,
@@ -106,6 +111,7 @@ import {
   buildPass2Prompt,
   createReviewRuntime,
 } from "./review-runtime.ts";
+import { isRecoverableProviderFailure } from "./review-recovery.ts";
 import {
   appendProviderAuthHint,
   collectMissingChildProviders,
@@ -135,6 +141,11 @@ test("review config: defaults are safe (off, 1 round, verify on)", () => {
   assert.equal(c.passes, 2);
   assert.equal(c.verify, true);
   assert.equal(c.fallbackOnError, "skip");
+  assert.equal(c.providerRecovery, "fallback");
+  assert.equal(c.providerRetries, 1);
+  assert.equal(c.chunkedSubmit, "auto");
+  assert.equal(c.chunkChars, 6_000);
+  assert.equal(c.recoveryBudgetMs, 0);
   assert.equal(c.timeoutMs, 300_000, "5-minute cap by default (step 10)");
   assert.deepEqual(c, { ...DEFAULT_REVIEW_MODE_CONFIG });
 });
@@ -144,14 +155,29 @@ test("review config: clamps out-of-range numbers", () => {
     rounds: 99,
     passes: 9,
     exploreBudget: 500,
+    providerRetries: 9,
+    chunkChars: 1,
+    recoveryBudgetMs: -1,
     timeoutMs: -5,
   });
   assert.equal(c.rounds, 5);
   assert.equal(c.passes, 2);
   assert.equal(c.exploreBudget, 8);
+  assert.equal(c.providerRetries, 2);
+  assert.equal(c.chunkChars, 1_000);
+  assert.equal(c.recoveryBudgetMs, 0);
   assert.equal(c.timeoutMs, 0, "below the minimum clamps to unlimited");
-  const low = coerceReviewModeConfig({ rounds: -3, timeoutMs: 1e12 });
+  const low = coerceReviewModeConfig({
+    rounds: -3,
+    providerRetries: -2,
+    chunkChars: 1e9,
+    recoveryBudgetMs: 1e9,
+    timeoutMs: 1e12,
+  });
   assert.equal(low.rounds, 1);
+  assert.equal(low.providerRetries, 0);
+  assert.equal(low.chunkChars, 20_000);
+  assert.equal(low.recoveryBudgetMs, 3_600_000);
   assert.equal(low.timeoutMs, 3_600_000);
 });
 
@@ -183,6 +209,8 @@ test("review config: removed pane/parallel keys are ignored", () => {
   assert.equal(c.rounds, DEFAULT_REVIEW_MODE_CONFIG.rounds);
   assert.equal(c.fallbackOnError, "skip");
   assert.deepEqual(Object.keys(c).sort(), [
+    "chunkChars",
+    "chunkedSubmit",
     "contextChars",
     "contextEntries",
     "contextToolChars",
@@ -190,10 +218,130 @@ test("review config: removed pane/parallel keys are ignored", () => {
     "exploreBudget",
     "fallbackOnError",
     "passes",
+    "providerRecovery",
+    "providerRetries",
+    "recoveryBudgetMs",
     "rounds",
     "timeoutMs",
     "verify",
   ]);
+});
+
+test("review config: sanitizes the explicit fallback model", () => {
+  const c = coerceReviewModeConfig({
+    fallbackModel: {
+      provider: " synthetic ",
+      id: " hf:deepseek-ai/DeepSeek-V4.1-Flash ",
+      thinking: " xhigh ",
+    },
+  });
+  assert.deepEqual(c.fallbackModel, {
+    provider: "synthetic",
+    id: "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+    thinking: "xhigh",
+  });
+  assert.equal(
+    coerceReviewModeConfig({ fallbackModel: { provider: "", id: "x" } }).fallbackModel,
+    undefined,
+  );
+  assert.equal(
+    coerceReviewModeConfig({ fallbackModel: { provider: "p", id: "m" } }).fallbackModel
+      ?.thinking,
+    "high",
+  );
+});
+
+test("review config: recovery toggles accept only their documented values", () => {
+  const c = coerceReviewModeConfig({
+    providerRecovery: "off",
+    chunkedSubmit: "off",
+  });
+  assert.equal(c.providerRecovery, "off");
+  assert.equal(c.chunkedSubmit, "off");
+  const junk = coerceReviewModeConfig({
+    providerRecovery: "sometimes",
+    chunkedSubmit: "always",
+  });
+  assert.equal(junk.providerRecovery, "fallback");
+  assert.equal(junk.chunkedSubmit, "auto");
+});
+
+test("buildReviewerFallbacks: parent first, then base roles, clamped and deduped", () => {
+  const clamped: string[] = [];
+  const out = buildReviewerFallbacks({
+    parentModel: { provider: "command-code", id: "deepseek", thinking: "max" },
+    baseReviewer: { provider: "synthetic", id: "hf:x", thinking: "xhigh" },
+    basePlanner: { provider: "synthetic", id: "hf:x", thinking: "high" },
+    clampThinking: (model) => {
+      clamped.push(`${model.provider}/${model.id}`);
+      return model.thinking === "max" ? "high" : model.thinking;
+    },
+  });
+  assert.deepEqual(out, [
+    { provider: "command-code", id: "deepseek", thinking: "high" },
+    { provider: "synthetic", id: "hf:x", thinking: "xhigh" },
+  ]);
+  assert.deepEqual(clamped, ["command-code/deepseek", "synthetic/hf:x"]);
+  assert.deepEqual(
+    buildReviewerFallbacks({
+      parentModel: { provider: " ", id: "x", thinking: "high" },
+    }),
+    [],
+  );
+});
+
+test("buildReviewerAttempts: base, explicit fallback, automatic fallbacks; dedupe and cap", () => {
+  const out = buildReviewerAttempts({
+    base: { provider: " command-code ", id: " deepseek ", thinking: " max " },
+    explicitFallback: { provider: "opencode-go", id: "m", thinking: "high" },
+    fallbacks: [
+      { provider: "command-code", id: "deepseek", thinking: "high" },
+      { provider: "synthetic", id: "hf:x", thinking: "xhigh" },
+    ],
+    max: 3,
+  });
+  assert.deepEqual(out, [
+    { provider: "command-code", id: "deepseek", thinking: "max" },
+    { provider: "opencode-go", id: "m", thinking: "high" },
+    { provider: "synthetic", id: "hf:x", thinking: "xhigh" },
+  ]);
+  assert.deepEqual(
+    buildReviewerAttempts({
+      fallbacks: [
+        { provider: "a", id: "1", thinking: "high" },
+        { provider: "a", id: "1", thinking: "max" },
+        { provider: "b", id: "2", thinking: "" },
+      ],
+      max: 2,
+    }),
+    [
+      { provider: "a", id: "1", thinking: "high" },
+      { provider: "b", id: "2", thinking: "high" },
+    ],
+  );
+});
+
+test("review recovery: uses the SDK's transient table and rejects deterministic failures", () => {
+  for (const message of [
+    "Stream ended without finish_reason",
+    "429 Too Many Requests",
+    "Request timed out",
+    "socket hang up",
+    "502 Bad Gateway",
+  ]) {
+    assert.equal(isRecoverableProviderFailure(message), true, message);
+  }
+  for (const message of [
+    "",
+    "Request was aborted",
+    "No API key found for command-code.",
+    "model not found in registry",
+    "invalid_request_error",
+    "context window exceeded",
+    "prompt too long",
+  ]) {
+    assert.equal(isRecoverableProviderFailure(message), false, message);
+  }
 });
 
 test("review config: extractReviewModeRaw handles junk", () => {
@@ -328,6 +476,10 @@ test("formatReviewStatusLines: no flow row, timeout provenance, usage", () => {
   assert.ok(!/flow|parallel/i.test(text), "no flow/parallel wording may survive");
   assert.ok(text.includes("reviewer model : opencode-go/glm-5.3-flash (xhigh)"));
   assert.ok(text.includes("timeout: unlimited (default)"));
+  assert.ok(
+    text.includes("recovery       : fallback (1 SDK retry/model; budget round deadline)"),
+  );
+  assert.ok(text.includes("chunked submit : auto (6000 chars/chunk)"));
   assert.ok(text.includes("runtime        : not started"));
   assert.ok(text.includes("/review-mode timeout <seconds|unlimited>"));
   assert.ok(!text.includes("cap set in"));
@@ -355,6 +507,25 @@ test("formatReviewStatusLines: no flow row, timeout provenance, usage", () => {
   ).join("\n");
   assert.ok(unconfigured.startsWith("Review Mode: disabled"));
   assert.ok(unconfigured.includes("unconfigured — /role set reviewer"));
+
+  const explicit = formatReviewStatusLines(
+    statusInput({
+      config: {
+        ...DEFAULT_REVIEW_MODE_CONFIG,
+        providerRecovery: "fallback",
+        providerRetries: 0,
+        recoveryBudgetMs: 90_000,
+        chunkedSubmit: "off",
+        fallbackModel: { provider: "synthetic", id: "hf:model", thinking: "xhigh" },
+      },
+    }),
+  ).join("\n");
+  assert.ok(
+    explicit.includes(
+      "recovery       : fallback (0 SDK retry/model; budget 90s; explicit synthetic/hf:model (xhigh))",
+    ),
+  );
+  assert.ok(explicit.includes("chunked submit : off"));
 });
 
 // ══ Step 3: reviewer prompt ═══════════════════════════════════════════
@@ -1362,6 +1533,358 @@ test("review_submit_plan: surfaces write failures to the model", async () => {
   assert.ok(r.content[0].text.includes("disk gone"));
 });
 
+test("review_plan_begin/chunk: assemble ordered chunks and reject bad input", async () => {
+  const begun: Array<number | undefined> = [];
+  const chunks: Array<{ index: number; content: string }> = [];
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async () => ({ ok: true, path: "/x" }),
+    beginPlan: (total?: number) => {
+      begun.push(total);
+      return { ok: true, maxChunkChars: 10 };
+    },
+    appendPlanChunk: (index: number, content: string) => {
+      chunks.push({ index, content });
+      return {
+        ok: true,
+        received: chunks.length,
+        nextIndex: index + 1,
+        totalChars: chunks.reduce((sum, chunk) => sum + chunk.content.length, 0),
+      };
+    },
+    takeAssembledPlan: () => chunks.map((chunk) => chunk.content).join(""),
+    resetPlan: () => {},
+    maxChunkChars: 10,
+    log: () => {},
+  };
+
+  const begin = createReviewPlanBeginTool(deps);
+  const beginResult = await begin.execute("id", { totalChunks: 2 }, undefined, undefined, {});
+  assert.equal(beginResult.isError, undefined);
+  assert.match(beginResult.content[0].text, /max 10 characters/);
+  assert.deepEqual(begun, [2]);
+
+  const chunk = createReviewPlanChunkTool(deps);
+  const accepted = await chunk.execute(
+    "id",
+    { index: 1, content: "0123456789" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(accepted.isError, undefined);
+  assert.match(accepted.content[0].text, /Next expected index: 2/);
+
+  for (const params of [
+    { index: 0, content: "x" },
+    { index: 2, content: "x".repeat(11) },
+    { index: 2, content: "" },
+  ]) {
+    const rejected = await chunk.execute("id", params, undefined, undefined, {});
+    assert.equal(rejected.isError, true, JSON.stringify(params));
+  }
+  assert.equal(chunks.length, 1);
+});
+
+test("review_submit_plan: finalises assembled chunks without planMarkdown", async () => {
+  const writes: Array<Record<string, unknown>> = [];
+  const chunks: string[] = [];
+  let resets = 0;
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async (payload: unknown) => {
+      writes.push(payload as Record<string, unknown>);
+      return { ok: true, path: "/abs/plans/x.md" };
+    },
+    beginPlan: () => ({ ok: true, maxChunkChars: REWRITTEN_PLAN.length }),
+    appendPlanChunk: (index: number, content: string) => {
+      chunks.push(content);
+      return { ok: true, received: chunks.length, nextIndex: index + 1 };
+    },
+    takeAssembledPlan: () => chunks.join(""),
+    resetPlan: () => {
+      resets += 1;
+    },
+    maxChunkChars: REWRITTEN_PLAN.length,
+    log: () => {},
+  };
+  const chunk = createReviewPlanChunkTool(deps);
+  await chunk.execute(
+    "id",
+    { index: 1, content: REWRITTEN_PLAN },
+    undefined,
+    undefined,
+    {},
+  );
+  const submit = createReviewSubmitPlanTool(deps);
+  const result = await submit.execute(
+    "id",
+    { findings: [HIGH_FINDING], verdict: "revise", summary: "chunked" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(writes.length, 1);
+  assert.ok(String(writes[0].planBody).includes("Result<string, ExportError>"));
+  assert.equal(resets, 1, "the assembler is cleared after a successful submit");
+});
+
+test("review_submit_plan: no plan and no chunks is rejected", async () => {
+  const tool = createReviewSubmitPlanTool({
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async () => ({ ok: true }),
+    takeAssembledPlan: () => undefined,
+    log: () => {},
+  });
+  const result = await tool.execute(
+    "id",
+    { findings: [], verdict: "approve", summary: "s" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /no plan was provided/);
+});
+
+test("review_plan_finalize: refuses an incomplete assembly, then writes once", async () => {
+  const writes: Array<Record<string, unknown>> = [];
+  const chunks: string[] = [];
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async (payload: unknown) => {
+      writes.push(payload as Record<string, unknown>);
+      return { ok: true, path: "/abs/plans/x.md" };
+    },
+    beginPlan: (totalChunks?: number) => ({ ok: true, totalChunks }),
+    appendPlanChunk: (index: number, content: string) => {
+      chunks.push(content);
+      return { ok: true, received: chunks.length, nextIndex: index + 1 };
+    },
+    // Simulates the harness: the assembly is only complete once the model has
+    // declared (and sent) both chunks.
+    takeAssembledPlan: () => {
+      const head = REWRITTEN_PLAN.slice(0, 60);
+      const tail = REWRITTEN_PLAN.slice(60);
+      return chunks.length >= 2 ? `${head}${tail}` : undefined;
+    },
+    resetPlan: () => {
+      chunks.length = 0;
+    },
+    log: () => {},
+  };
+  const begin = createReviewPlanBeginTool(deps);
+  await begin.execute("id", { totalChunks: 2 }, undefined, undefined, {});
+  const chunk = createReviewPlanChunkTool(deps);
+  await chunk.execute(
+    "id",
+    { index: 1, content: REWRITTEN_PLAN.slice(0, 60) },
+    undefined,
+    undefined,
+    {},
+  );
+
+  const finalize = createReviewPlanFinalizeTool(deps);
+  const early = await finalize.execute(
+    "id",
+    { findings: [], verdict: "approve", summary: "s" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(early.isError, true, "chunk 2 is missing");
+  assert.equal(writes.length, 0, "nothing is written before finalize succeeds");
+
+  const retry = await chunk.execute(
+    "id",
+    { index: 2, content: REWRITTEN_PLAN.slice(60) },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(retry.isError, undefined);
+
+  const done = await finalize.execute(
+    "id",
+    { findings: [HIGH_FINDING], verdict: "revise", summary: "chunked" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(done.isError, undefined);
+  assert.equal(writes.length, 1, "finalize is the single write");
+  assert.equal(
+    String(writes[0].planBody),
+    REWRITTEN_PLAN,
+    "the assembled text is the plan body",
+  );
+  assert.equal(chunks.length, 0, "the assembler is cleared after the write");
+});
+
+test("review_plan_finalize: rejects out-of-order, duplicate and oversized chunks", async () => {
+  const seen: number[] = [];
+  let next = 1;
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async () => ({ ok: true }),
+    beginPlan: () => {
+      next = 1;
+      seen.length = 0;
+      return { ok: true };
+    },
+    appendPlanChunk: (index: number, content: string) => {
+      if (index !== next) {
+        return { ok: false, error: `expected chunk ${next}, got ${index}` };
+      }
+      if (content.length > 10) {
+        return { ok: false, error: `chunk ${index} is too large` };
+      }
+      seen.push(index);
+      next += 1;
+      return { ok: true, received: seen.length, nextIndex: next };
+    },
+    takeAssembledPlan: () => (seen.length === 2 ? "abcdefghijkl" : undefined),
+    maxChunkChars: 10,
+    log: () => {},
+  };
+  const begin = createReviewPlanBeginTool(deps);
+  await begin.execute("id", {}, undefined, undefined, {});
+  const chunk = createReviewPlanChunkTool(deps);
+
+  const skipped = await chunk.execute(
+    "id",
+    { index: 3, content: "x" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(skipped.isError, true);
+  assert.match(skipped.content[0].text, /expected chunk 1/);
+
+  assert.equal(
+    (await chunk.execute("id", { index: 1, content: "12345" }, undefined, undefined, {})).isError,
+    undefined,
+  );
+  const duplicate = await chunk.execute(
+    "id",
+    { index: 1, content: "again" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(duplicate.isError, true);
+  assert.match(duplicate.content[0].text, /expected chunk 2/);
+
+  const oversized = await chunk.execute(
+    "id",
+    { index: 2, content: "y".repeat(11) },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(oversized.isError, true);
+  assert.match(oversized.content[0].text, /limit is 10/);
+  assert.deepEqual(seen, [1], "only the accepted chunk was appended");
+});
+
+test("review_plan_begin: resets an in-progress assembly intentionally", async () => {
+  let chunks: string[] = [];
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async () => ({ ok: true }),
+    beginPlan: () => {
+      chunks = [];
+      return { ok: true };
+    },
+    appendPlanChunk: (index: number, content: string) => {
+      chunks.push(content);
+      return { ok: true, received: chunks.length, nextIndex: index + 1 };
+    },
+    takeAssembledPlan: () => (chunks.length === 0 ? undefined : chunks.join("")),
+    log: () => {},
+  };
+  const chunk = createReviewPlanChunkTool(deps);
+  await chunk.execute("id", { index: 1, content: "first-attempt" }, undefined, undefined, {});
+  assert.equal(deps.takeAssembledPlan(), "first-attempt");
+
+  const begin = createReviewPlanBeginTool(deps);
+  await begin.execute("id", {}, undefined, undefined, {});
+  assert.equal(deps.takeAssembledPlan(), undefined, "begin dropped the partial plan");
+});
+
+test("review_plan_chunk: a cut mid-chunk keeps accepted chunks and names the next index", async () => {
+  let next = 1;
+  const accepted: string[] = [];
+  const deps = {
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "m",
+    submit: async () => ({ ok: true }),
+    beginPlan: () => {
+      next = 1;
+      accepted.length = 0;
+      return { ok: true, maxChunkChars: 8 };
+    },
+    appendPlanChunk: (index: number, content: string) => {
+      if (index !== next) {
+        return { ok: false, error: `expected chunk ${next}, got ${index}` };
+      }
+      if (content.length > 8) {
+        return {
+          ok: false,
+          error: `chunk ${index} is ${content.length} characters; the limit is 8`,
+        };
+      }
+      accepted.push(content);
+      next += 1;
+      return { ok: true, received: accepted.length, nextIndex: next };
+    },
+    maxChunkChars: 8,
+    log: () => {},
+  };
+  const begin = createReviewPlanBeginTool(deps);
+  await begin.execute("id", { totalChunks: 3 }, undefined, undefined, {});
+  const chunk = createReviewPlanChunkTool(deps);
+  await chunk.execute("id", { index: 1, content: "abcdefgh" }, undefined, undefined, {});
+  await chunk.execute("id", { index: 2, content: "ijklmnop" }, undefined, undefined, {});
+
+  // The provider cuts while chunk 3 streams: a truncated chunk never lands, so
+  // the retry must resend exactly index 3.
+  const cut = await chunk.execute(
+    "id",
+    { index: 3, content: "qrstuvwxyz" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(cut.isError, true);
+  assert.match(cut.content[0].text, /limit is 8/, "the cut chunk is refused");
+
+  const retry = await chunk.execute(
+    "id",
+    { index: 3, content: "qrstuvwx" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(retry.isError, undefined, "the retry continues, no restart");
+  assert.match(retry.content[0].text, /Next expected index: 4/);
+  assert.deepEqual(accepted, ["abcdefgh", "ijklmnop", "qrstuvwx"]);
+});
+
 // ══ Step 15: review_pass_done ═════════════════════════════════════════
 
 test("review_pass_done: refuses to end a pass with no submission", async () => {
@@ -1910,6 +2433,11 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
     }),
     "🔍 review paused — /review-resume to continue",
   );
+  assert.equal(
+    reviewStatusText({ state: undefined, roundInFlight: true }),
+    "🔍 review · starting",
+    "the cold-boot window is visible as starting",
+  );
 });
 
 test("nextReviewRound restarts a new cycle even after the cap", () => {
@@ -1972,6 +2500,11 @@ test("shouldPauseReviewOnEscape pauses exactly once per round", () => {
 
 test("reviewFooterSegment composes the footer review state", () => {
   assert.equal(reviewFooterSegment(undefined, false), "");
+  assert.equal(
+    reviewFooterSegment(undefined, false, true),
+    "🔍 review · starting",
+    "a round in flight has a live line before its first state",
+  );
   assert.equal(
     reviewFooterSegment(undefined, true),
     "🔍 review paused — /review-resume to continue",
@@ -2148,6 +2681,73 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
   );
 });
 
+test("createReviewSession: bounds the child SDK retry budget in memory only", async () => {
+  const captured: {
+    createArgs?: { cwd: string; agentDir: string };
+    overrides?: Record<string, unknown>;
+    sessionOpts?: Record<string, unknown>;
+  } = {};
+  const fakeSession = {
+    subscribe: () => () => {},
+    prompt: async () => {},
+    followUp: async () => {},
+    abort: async () => {},
+    isStreaming: false,
+    bindExtensions: async () => {},
+  };
+  const manager = {
+    getRetrySettings: () => ({
+      enabled: true,
+      maxRetries: 3,
+      baseDelayMs: 2_000,
+      maxAgentDelayMs: 60_000,
+    }),
+    applyOverrides: (overrides: Record<string, unknown>) => {
+      captured.overrides = overrides;
+    },
+  };
+  const sdk = {
+    ModelRuntime: { create: async () => ({}) },
+    DefaultResourceLoader: class {
+      async reload() {}
+    },
+    SessionManager: { inMemory: () => ({}) },
+    SettingsManager: {
+      create: (cwd: string, agentDir: string) => {
+        captured.createArgs = { cwd, agentDir };
+        return manager;
+      },
+    },
+    createAgentSession: async (opts: Record<string, unknown>) => {
+      captured.sessionOpts = opts;
+      return { session: fakeSession };
+    },
+  };
+
+  const res = await createReviewSession({
+    cwd: "/proj",
+    agentDir: "/agent",
+    modelRef: { provider: "p", id: "m", thinking: "high" },
+    findModel: () => ({}),
+    reviewPrompt: "guidance",
+    customTools: [],
+    providerRetries: 0,
+    loadSdk: async () => sdk as never,
+  });
+
+  assert.equal(res.ok, true);
+  assert.deepEqual(captured.createArgs, { cwd: "/proj", agentDir: "/agent" });
+  assert.deepEqual(captured.overrides, {
+    retry: {
+      enabled: true,
+      maxRetries: 0,
+      baseDelayMs: 2_000,
+      maxAgentDelayMs: 60_000,
+    },
+  });
+  assert.equal(captured.sessionOpts?.settingsManager, manager);
+});
+
 test("reviewToolAllowlist: built-ins plus every custom tool, junk-tolerant", () => {
   assert.deepEqual(reviewToolAllowlist([]), [...REVIEW_BUILTIN_TOOLS]);
   assert.deepEqual(reviewToolAllowlist(undefined), [...REVIEW_BUILTIN_TOOLS]);
@@ -2218,6 +2818,9 @@ function allowlistSdk(activeOverride?: string[]): {
 const REVIEW_TOOL_NAMES = [
   "review_bash",
   "review_explore",
+  "review_plan_begin",
+  "review_plan_chunk",
+  "review_plan_finalize",
   "review_submit_plan",
   "review_pass_done",
 ];
@@ -2364,6 +2967,9 @@ test("createReviewTools: reports missing SDK pieces instead of throwing", () => 
   const names = withoutSdk.tools.map((t) => (t as { name: string }).name);
   assert.deepEqual(names, [
     "review_explore",
+    "review_plan_begin",
+    "review_plan_chunk",
+    "review_plan_finalize",
     "review_submit_plan",
     "review_pass_done",
   ]);
@@ -2382,7 +2988,7 @@ test("createReviewTools: reports missing SDK pieces instead of throwing", () => 
     } as never,
     deps,
   );
-  assert.equal(withSdk.tools.length, 4, "all four tools with a full SDK");
+  assert.equal(withSdk.tools.length, 7, "all seven tools with a full SDK");
   assert.equal(withSdk.unavailable.length, 0);
   assert.equal(
     resolveBashToolDefinitionBuilder({ createBashToolDefinition: 42 } as never),
@@ -2397,6 +3003,7 @@ function runtimeDeps(
   over: {
     config?: Record<string, unknown>;
     reviewerModel?: unknown;
+    fallbacks?: Array<{ provider: string; id: string; thinking: string }>;
     parentProviders?: unknown;
     onState?: (s: unknown) => void;
     onTranscriptOps?: (ops: unknown[]) => void;
@@ -2424,6 +3031,7 @@ function runtimeDeps(
         : ((over.reviewerModel as
             | { provider: string; id: string; thinking: string }
             | undefined) ?? { provider: "p", id: "m", thinking: "xhigh" }),
+    fallbackReviewerModels: () => over.fallbacks ?? [],
     findModel: () => ({}),
     planPath: () => ".pi/plans/2026-09-18-csv.md",
     readPlan: () => ORIGINAL_PLAN,
@@ -2477,8 +3085,16 @@ test("runtime: full round wires all tools, verifies, and returns the rewrite", a
   assert.equal(await rt.ensureStarted(), true, "ensureStarted is idempotent");
   assert.deepEqual(
     Object.keys(capture.tools).sort(),
-    ["review_bash", "review_explore", "review_pass_done", "review_submit_plan"],
-    "all four reviewer tools wired (review_bash needs the SDK)",
+    [
+      "review_bash",
+      "review_explore",
+      "review_pass_done",
+      "review_plan_begin",
+      "review_plan_chunk",
+      "review_plan_finalize",
+      "review_submit_plan",
+    ],
+    "all seven reviewer tools wired (review_bash needs the SDK)",
   );
 
   const res = await rt.runRound({
@@ -2510,6 +3126,178 @@ test("runtime: full round wires all tools, verifies, and returns the rewrite", a
   await rt.teardown();
   assert.equal(rt.isAlive(), false);
   assert.equal(rt.getState(), undefined);
+});
+
+test("runtime: a recoverable provider cut falls back to the next model", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: async (c) => {
+      if (c.prompts.length === 1) {
+        c.emit({
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [],
+              api: "openai-completions",
+              provider: "command-code",
+              model: "deepseek",
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+              stopReason: "error",
+              errorMessage: "Stream ended without finish_reason",
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        return;
+      }
+      await submitThenFinish(REWRITTEN_PLAN)(c);
+    },
+  });
+  const { deps, logs } = runtimeDeps(sdk, {
+    config: {
+      passes: 1,
+      verify: false,
+      providerRecovery: "fallback",
+      providerRetries: 1,
+    },
+    fallbacks: [{ provider: "fallback", id: "model", thinking: "high" }],
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(res.ok, true, res.reason);
+  assert.equal(capture.prompts.length, 2, "one prompt per model");
+  assert.ok(
+    capture.prompts[1].includes("Plan under review"),
+    "the fallback gets the same review prompt",
+  );
+  assert.ok(
+    logs.some((line) => line.includes("reviewer recovering on fallback/model")),
+    "the switch is visible",
+  );
+  assert.deepEqual(res.state.recoveryAttempts, [
+    "p/m (xhigh)",
+    "fallback/model (high)",
+  ]);
+  assert.ok(res.reason === undefined, "a recovered round has no failure reason");
+  await rt.teardown();
+});
+
+test("runtime: the recovery budget stops the next attempt", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: async (c) => {
+      if (c.prompts.length === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        c.emit({
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [],
+              api: "openai-completions",
+              provider: "command-code",
+              model: "deepseek",
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+              stopReason: "error",
+              errorMessage: "Stream ended without finish_reason",
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        return;
+      }
+      await submitThenFinish(REWRITTEN_PLAN)(c);
+    },
+  });
+  const { deps } = runtimeDeps(sdk, {
+    config: {
+      passes: 1,
+      verify: false,
+      providerRecovery: "fallback",
+      providerRetries: 1,
+      timeoutMs: 60_000,
+      recoveryBudgetMs: 10,
+    },
+    fallbacks: [{ provider: "fallback", id: "model", thinking: "high" }],
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(capture.prompts.length, 1, "no attempt after the budget");
+  assert.match(res.reason ?? "", /provider recovery budget expired/);
+  assert.deepEqual(res.state.recoveryAttempts, ["p/m (xhigh)"]);
+  assert.equal(res.planText, ORIGINAL_PLAN);
+  await rt.teardown();
+});
+
+test("runtime: a non-recoverable provider failure does not switch models", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: async (c) => {
+      c.emit({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: [],
+            api: "openai-completions",
+            provider: "command-code",
+            model: "deepseek",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: "No API key found for command-code.",
+            timestamp: Date.now(),
+          },
+        ],
+      });
+    },
+  });
+  const { deps } = runtimeDeps(sdk, {
+    config: {
+      passes: 1,
+      verify: false,
+      providerRecovery: "fallback",
+      providerRetries: 1,
+    },
+    fallbacks: [{ provider: "fallback", id: "model", thinking: "high" }],
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(capture.prompts.length, 1, "no second model is tried");
+  assert.match(res.reason ?? "", /No API key/);
+  await rt.teardown();
 });
 
 test("runtime: isRoundActive tracks the round, not the session", async () => {
@@ -2710,6 +3498,9 @@ test("runtime: a provider failure that ends pass 1 is named in the failure reaso
     "a dead provider is not mislabeled as a missing write path",
   );
   assert.equal(res.state.error, res.reason, "/review-status sees the cause");
+  assert.match(res.reason ?? "", /after \d+s/, "the failure names elapsed time");
+  assert.deepEqual(res.state.recoveryAttempts, ["p/m (xhigh)"]);
+  assert.match(res.state.providerError ?? "", /429 Too Many Requests/);
   assert.ok(dying.capture.aborts >= 1, "the dead run is cancelled");
 });
 
@@ -2744,7 +3535,7 @@ test("runtime: an error-stop agent_end with no retries also names the provider",
   assert.equal(res.fallback, true);
   assert.match(
     res.reason ?? "",
-    /provider failed after 0 retry attempt\(s\): 503 upstream connect error/,
+    /provider failed after 0 retry attempt\(s\) on p\/m \(xhigh\): 503 upstream connect error/,
   );
 });
 
@@ -2868,6 +3659,112 @@ test("runtime: a submission made before a stalled run is still used", async () =
     "the slow pass is reported",
   );
   assert.ok(stalled.capture.aborts >= 1, "the run is cancelled after handing off");
+});
+
+test("runtime: chunked submission writes the plan once, on finalize", async () => {
+  const head = REWRITTEN_PLAN.slice(0, 120);
+  const tail = REWRITTEN_PLAN.slice(120);
+  const sdk = fakeSdk({
+    pass1: async (c) => {
+      await c.tools.review_plan_begin.execute(
+        "b",
+        { totalChunks: 2 },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_plan_chunk.execute(
+        "c1",
+        { index: 1, content: head },
+        undefined,
+        undefined,
+        {},
+      );
+      const tooEarly = (await c.tools.review_plan_finalize.execute(
+        "f0",
+        { findings: [], verdict: "approve", summary: "early" },
+        undefined,
+        undefined,
+        {},
+      )) as { isError?: boolean; content: Array<{ text: string }> };
+      assert.equal(tooEarly.isError, true, "chunk 2 is still missing");
+      await c.tools.review_plan_chunk.execute(
+        "c2",
+        { index: 2, content: tail },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_plan_finalize.execute(
+        "f1",
+        { findings: [HIGH_FINDING], verdict: "revise", summary: "chunked" },
+        undefined,
+        undefined,
+        {},
+      );
+    },
+  });
+  const { deps } = runtimeDeps(sdk.sdk, { config: { verify: false } });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/x.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, true, res.reason);
+  assert.ok(
+    res.planText.startsWith(REWRITTEN_PLAN),
+    "the assembled chunks are the plan body",
+  );
+  assert.ok(
+    res.planText.includes("Review changes"),
+    "the changelog is appended exactly as the one-shot path would",
+  );
+  assert.equal(sdk.capture.tools.review_plan_finalize !== undefined, true);
+});
+
+test("runtime: abort clears partial chunks so a retry starts clean", async () => {
+  let rtRef: ReturnType<typeof createReviewRuntime> | undefined;
+  const sdk = fakeSdk({
+    pass1: async (c) => {
+      await c.tools.review_plan_begin.execute(
+        "b",
+        { totalChunks: 2 },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_plan_chunk.execute(
+        "c1",
+        { index: 1, content: "partial rewrite" },
+        undefined,
+        undefined,
+        {},
+      );
+      await rtRef?.abortRound();
+    },
+  });
+  const { deps } = runtimeDeps(sdk.sdk, { config: { verify: false } });
+  const rt = createReviewRuntime(deps as never);
+  rtRef = rt;
+
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/x.md",
+    round: 1,
+  });
+  assert.equal(res.ok, false);
+
+  const late = (await sdk.capture.tools.review_plan_finalize.execute(
+    "f",
+    { findings: [], verdict: "approve", summary: "late" },
+    undefined,
+    undefined,
+    {},
+  )) as { isError?: boolean; content: Array<{ text: string }> };
+  assert.equal(late.isError, true, "the aborted assembly is gone");
+  assert.match(late.content[0].text, /no complete plan/);
 });
 
 test("runtime: a round with no plan path never starts the reviewer", async () => {
@@ -2999,7 +3896,7 @@ test("runtime: a mid-review provider-auth failure gains the actionable hint", as
   assert.equal(res.ok, false);
   assert.match(
     res.reason ?? "",
-    /could not prompt the reviewer: No API key found for synthetic\./,
+    /could not prompt the reviewer on synthetic\/hf:zai-org\/GLM-5.3-Flash \(xhigh\): No API key found for synthetic\./,
     "the original error text is kept",
   );
   assert.match(res.reason ?? "", /models\.json/, "the escape hatch is named");
@@ -3071,6 +3968,10 @@ test("buildPass1Prompt / buildPass2Prompt contain the contract, not the reviewer
     p1.includes("review_submit_plan") && p1.includes("review_pass_done"),
   );
   assert.ok(p1.includes("PASS 1 of 2"));
+  assert.ok(
+    p1.includes("If the harness retries") && p1.includes("## Recovery"),
+    "pass 1 tells the reviewer how a recovery retry works",
+  );
 
   const p2 = buildPass2Prompt({
     planPath: ".pi/plans/x.md",
@@ -3092,6 +3993,122 @@ test("buildPass1Prompt / buildPass2Prompt contain the contract, not the reviewer
   assert.ok(!p2.includes(ORIGINAL_PLAN), "no verbatim original plan");
   assert.ok(!p2.includes(REWRITTEN_PLAN), "no verbatim rewritten plan");
   assert.ok(p2.includes("List anything lost"), "pass 2 asks what was lost");
+});
+
+test("buildPass1Prompt: chunked mode is chosen by plan size, and 0 disables it", () => {
+  const base = {
+    planPath: ".pi/plans/x.md",
+    reviewPrompt: "G",
+    contextBlock: "",
+    round: 1,
+    totalRounds: 1,
+    verify: false,
+  };
+
+  // Long plan, chunking on: the chunked protocol replaces the one-shot ask.
+  const chunked = buildPass1Prompt({
+    ...base,
+    planText: "x".repeat(400),
+    chunkChars: 100,
+  });
+  assert.ok(chunked.includes("## Chunked submission"), "chunked section present");
+  for (const name of [
+    "review_plan_begin",
+    "review_plan_chunk",
+    "review_plan_finalize",
+  ]) {
+    assert.ok(chunked.includes(name), `${name} is named`);
+  }
+  assert.ok(
+    chunked.includes("at most 100 characters"),
+    "the chunk budget is stated",
+  );
+  assert.ok(
+    !chunked.includes(
+      "1. `review_submit_plan` with the COMPLETE revised plan",
+    ),
+    "the one-shot instruction is replaced, not duplicated",
+  );
+
+  // Short plan: one-shot stays, even with chunking enabled.
+  const short = buildPass1Prompt({
+    ...base,
+    planText: "x".repeat(150),
+    chunkChars: 100,
+  });
+  assert.ok(!short.includes("## Chunked submission"));
+  assert.ok(short.includes("review_submit_plan"));
+
+  // chunkChars: 0 is the explicit off switch for a long plan.
+  const off = buildPass1Prompt({
+    ...base,
+    planText: "x".repeat(400),
+    chunkChars: 0,
+  });
+  assert.ok(!off.includes("## Chunked submission"));
+  assert.ok(off.includes("1. `review_submit_plan` with the COMPLETE revised plan"));
+});
+
+test("runtime: a chunked pass 1 feeds pass 2 the assembled rewrite", async () => {
+  const pieces: string[] = [];
+  for (let i = 0; i < REWRITTEN_PLAN.length; i += 100) {
+    pieces.push(REWRITTEN_PLAN.slice(i, i + 100));
+  }
+  assert.ok(pieces.length > 2, "the fixture really needs several chunks");
+  const sdk = fakeSdk({
+    pass1: async (c) => {
+      assert.ok(
+        c.prompts[0].includes("## Chunked submission"),
+        "the plan is long enough for chunked mode",
+      );
+      await c.tools.review_plan_begin.execute(
+        "b",
+        { totalChunks: pieces.length },
+        undefined,
+        undefined,
+        {},
+      );
+      for (const [i, content] of pieces.entries()) {
+        const r = (await c.tools.review_plan_chunk.execute(
+          `c${i}`,
+          { index: i + 1, content },
+          undefined,
+          undefined,
+          {},
+        )) as { isError?: boolean; content: Array<{ text: string }> };
+        assert.equal(r.isError, undefined, `chunk ${i + 1} accepted`);
+      }
+      await c.tools.review_plan_finalize.execute(
+        "f1",
+        { findings: [HIGH_FINDING], verdict: "revise", summary: "chunked" },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_pass_done.execute(
+        "p1",
+        { pass: 1, verdict: "revise", findings: [HIGH_FINDING] },
+        undefined,
+        undefined,
+        {},
+      );
+    },
+    pass2: submitThenFinishPass2(REWRITTEN_PLAN),
+  });
+  const { deps } = runtimeDeps(sdk.sdk, { config: { chunkChars: 100 } });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/x.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, true, res.reason);
+  assert.equal(sdk.capture.followUps.length, 1, "pass 2 ran");
+  assert.ok(
+    sdk.capture.followUps[0].includes("returning Result<string, ExportError>"),
+    "pass 2 diffs the ASSEMBLED rewrite",
+  );
 });
 
 // ══ Step 37 (automated): Review Mode disabled ⇒ no-op ═════════════════
