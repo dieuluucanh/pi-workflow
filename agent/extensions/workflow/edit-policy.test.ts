@@ -1074,7 +1074,7 @@ test("writeGateTitle: one write keeps today's wording, several are listed", () =
   ];
   assert.equal(
     writeGateTitle(one),
-    "Write policy 'ask': allow this write (edits src/a.ts)?",
+    "Write policy 'ask': allow this write?\nTarget: src/a.ts\nReason: edits src/a.ts",
   );
   const many: WriteGateItem[] = [
     ...one,
@@ -1082,6 +1082,6 @@ test("writeGateTitle: one write keeps today's wording, several are listed", () =
   ];
   const title = writeGateTitle(many);
   assert.match(title, /allow these 2 writes\?/);
-  assert.ok(title.includes("edits src/a.ts"));
-  assert.ok(title.includes("edits src/b.ts"));
+  assert.ok(title.includes("src/a.ts"));
+  assert.ok(title.includes("src/b.ts"));
 });

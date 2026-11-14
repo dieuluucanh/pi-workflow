@@ -122,9 +122,11 @@ import {
   type StepCommitCandidate,
 } from "./commit-policy.ts";
 import {
+  baseFolderRoots,
   decideFolderGate,
   detectRepoRoot,
   isBroadGrantRoot,
+  outsideProjectRootForTarget,
   evaluateFolderTargets,
   matchSensitivePath,
   readFolderPolicyConfig,
@@ -9993,6 +9995,23 @@ export default function workflowExtension(
     }
   }
 
+  function resolveCommitRoot(
+    candidate: string,
+    cwd: string,
+  ): { root: string; uncertain: boolean } {
+    const res = runGitZ(candidate, ["rev-parse", "--show-toplevel"]);
+    if (res.ok && res.paths[0]) {
+      return {
+        root: normalizeWritePath(res.paths[0], candidate),
+        uncertain: false,
+      };
+    }
+    const detected = detectRepoRoot(candidate) ?? detectRepoRoot(cwd);
+    return detected
+      ? { root: detected, uncertain: false }
+      : { root: candidate, uncertain: true };
+  }
+
   function commitSensitiveHit(
     scope: NonNullable<ReturnType<typeof analyzeShellPaths>["git"]>,
     folderConfig: FolderPolicyConfig,
@@ -10064,7 +10083,13 @@ export default function workflowExtension(
       trusted,
     }).config;
     const git = analyzeShellPaths(cmd, cwd).git;
-    const repoRoot = git?.repoRoot ?? normalizeWritePath(cwd, cwd);
+    const gitDir = /\bGIT_DIR=([^\s;&|]+)/.exec(cmd)?.[1];
+    const candidateRoot = gitDir
+      ? normalizeWritePath(gitDir.replace(/^['"]|['"]$/g, ""), cwd)
+      : (git?.repoRoot ?? normalizeWritePath(cwd, cwd));
+    const resolvedRoot = resolveCommitRoot(candidateRoot, cwd);
+    const repoRoot = resolvedRoot.root;
+    const gitScope = git ? { ...git, repoRoot } : undefined;
     const folderEvaluation = evaluateFolderTargets(
       [{ path: repoRoot, kind: "dir" }],
       {
@@ -10074,13 +10099,18 @@ export default function workflowExtension(
         action: "commit",
       },
     );
-    const folderDecision = decideFolderGate({
+    if (resolvedRoot.uncertain)
+      folderEvaluation.uncertain.push(repoRoot);
+    let folderDecision = decideFolderGate({
       sensitive: false,
       outside: folderEvaluation.outside.length > 0,
       outsideAction: folderConfig.outside,
+      uncertain: folderEvaluation.uncertain.length > 0,
     });
-    const sensitiveHit = git
-      ? commitSensitiveHit(git, folderConfig)
+    if (folderEvaluation.uncertain.length > 0 && folderDecision === "allow")
+      folderDecision = "ask";
+    const sensitiveHit = gitScope
+      ? commitSensitiveHit(gitScope, folderConfig)
       : undefined;
     if (sensitiveHit && "failed" in sensitiveHit) {
       return {
@@ -10162,12 +10192,17 @@ export default function workflowExtension(
       };
     }
     const folderOutside = folderEvaluation.outside.length > 0;
+    const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
+    const commitGrant = folderOutside
+      ? (outsideProjectRootForTarget({ path: repoRoot, kind: "dir" }, baseRoot) ??
+        repoRoot)
+      : repoRoot;
     let sel: unknown;
     try {
       sel = await ui.select(
-        folderOutside
-          ? `Folder policy 'ask': allow \`git ${hit}\` in ${repoRoot}?`
-          : `Commit policy 'ask': allow \`git ${hit}\`?`,
+        `${folderOutside ? "Folder" : "Commit"} policy 'ask': allow \`git ${hit}\`?` +
+          `\nRepository: ${repoRoot}` +
+          (folderOutside ? `\nOutside: ${baseRoot}` : ""),
         folderOutside
           ? ["Allow once", "Always allow this repository folder", "Deny"]
           : ["Allow once", "Deny"],
@@ -10189,7 +10224,7 @@ export default function workflowExtension(
         folderConfig.grantScope,
         cwd,
         getAgentDir(),
-        { allowedPaths: [repoRoot] },
+        { allowedPaths: [commitGrant] },
       );
       if (!written.ok) {
         return {
@@ -10274,9 +10309,14 @@ export default function workflowExtension(
     item: WriteGateItem,
     targets: readonly FolderTarget[],
     cwd: string,
+    baseRoot: string,
   ): WriteGateItem {
     const paths = targets
-      .map((target) => normalizeWritePath(target.path, cwd))
+      .map(
+        (target) =>
+          outsideProjectRootForTarget(target, baseRoot) ??
+          normalizeWritePath(target.path, cwd),
+      )
       .filter(Boolean);
     if (paths.length === 0) return item;
     const unique = [...new Set(paths)].sort();
@@ -10295,6 +10335,7 @@ export default function workflowExtension(
     config: WritePolicyConfig,
     folderConfig: FolderPolicyConfig,
     cwd: string,
+    baseRoot: string,
   ): WriteGateItem[] {
     const items: WriteGateItem[] = [];
     const seen = new Set<string>();
@@ -10319,7 +10360,9 @@ export default function workflowExtension(
       if (!needsFolder && isWriteCallAllowed(classification, config, cwd))
         return;
       const base = writeGateItemFromClassification(name, classification, cwd);
-      const item = needsFolder ? withFolderGrant(base, targets, cwd) : base;
+      const item = needsFolder
+        ? withFolderGrant(base, targets, cwd, baseRoot)
+        : base;
       if (!item.key || seen.has(item.key)) return;
       seen.add(item.key);
       items.push(item);
@@ -10474,6 +10517,9 @@ export default function workflowExtension(
         sensitive: false,
         outside: folderEvaluation.outside.length > 0,
         outsideAction: folderConfig.outside,
+        uncertain:
+          folderEvaluation.uncertain.length > 0 ||
+          (classification.mutating && folderTargets.length === 0),
       });
       const allowed = isWriteCallAllowed(classification, config, cwd);
       const decision = decideWriteGate({
@@ -10554,12 +10600,14 @@ export default function workflowExtension(
         writeGateBatchCalls = [];
         writeGateBatchCallIds = new Set();
       }
+      const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
       const items = collectWriteGateItems(
         event,
         classification,
         config,
         folderConfig,
         cwd,
+        baseRoot,
       );
       const currentBase = writeGateItemFromClassification(
         String(event.toolName ?? ""),
@@ -10568,7 +10616,7 @@ export default function workflowExtension(
       );
       const currentItem =
         folderEvaluation.outside.length > 0
-          ? withFolderGrant(currentBase, folderTargets, cwd)
+          ? withFolderGrant(currentBase, folderTargets, cwd, baseRoot)
           : currentBase;
 
       // (a) The user denied this target earlier in THIS RUN → deny again,
@@ -10764,6 +10812,7 @@ export default function workflowExtension(
     folderConfig: FolderPolicyConfig,
     cwd: string,
     lockedRoots?: readonly string[],
+    baseRoot?: string,
   ): ReadGateItem[] {
     const items: ReadGateItem[] = [];
     const seen = new Set<string>();
@@ -10781,7 +10830,12 @@ export default function workflowExtension(
         action: "read",
       });
       for (const target of evaluation.outside) {
-        const item = readGateItemFromTarget(name, target, "outside the folder");
+        const item = readGateItemFromTarget(
+          name,
+          target,
+          "outside the folder",
+          baseRoot,
+        );
         if (seen.has(item.key)) continue;
         seen.add(item.key);
         items.push(item);
@@ -10896,7 +10950,8 @@ export default function workflowExtension(
         outside: outside.length > 0,
         outsideAction: folderConfig.outside,
         granted: false,
-        uncertain: uncertain.length > 0,
+        uncertain:
+          uncertain.length > 0 || evaluation.uncertain.length > 0,
         shell: config.shell,
       });
 
@@ -10940,6 +10995,7 @@ export default function workflowExtension(
         readGateTurnGrantedRoots.clear();
         readGateTurnUncertainAllowed.clear();
       }
+      const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
       const items = collectReadGateItems(
         event,
         classification,
@@ -10947,6 +11003,7 @@ export default function workflowExtension(
         folderConfig,
         cwd,
         folderResolved.locked?.roots,
+        baseRoot,
       );
       const currentItems = items.filter((item) => {
         if (outside.length > 0)
@@ -10984,7 +11041,7 @@ export default function workflowExtension(
       const options = readGateOptions(readGateItemsKind(items));
       let sel: unknown;
       try {
-        sel = await ui.select(readGateTitle(items), options);
+        sel = await ui.select(readGateTitle(items, baseRoot), options);
       } catch {
         sel = undefined;
       }
@@ -11341,6 +11398,25 @@ export default function workflowExtension(
       if (sensitive) {
         ctx?.ui?.notify?.(
           `Per-step commit skipped: ${sensitive.path} is sensitive. Remove it from the working tree/index or add a manual sensitiveExemptions entry.`,
+          "warning",
+        );
+        return;
+      }
+      const statusFolder = evaluateFolderTargets(
+        status.paths.map((p) => ({
+          path: path.join(repoRoot, p),
+          kind: "file" as const,
+        })),
+        {
+          config: folderConfig,
+          grants: commitConfig.allowedPaths,
+          cwd,
+          action: "commit",
+        },
+      );
+      if (statusFolder.outside.length > 0 || statusFolder.uncertain.length > 0) {
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: staged paths leave the permitted folders or could not be verified. Review the working tree and commit manually.`,
           "warning",
         );
         return;

@@ -118,6 +118,7 @@ test("commit: .env.example is not sensitive", async () => {
     },
   });
   try {
+    git(cwd, ["init"]);
     fs.writeFileSync(path.join(cwd, ".env.example"), "X=1\n");
     assert.equal(
       await commitCall(pi, ctx, "git add .env.example"),

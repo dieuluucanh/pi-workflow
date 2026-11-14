@@ -21,7 +21,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { ArgumentCompletion } from "./utils.ts";
-import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
+import {
+  joinArgumentValue,
+  suppressExactArgumentMatch,
+  translateForeignPath,
+} from "./utils.ts";
 import {
   COMMIT_CONFIG_DIR,
   WORKFLOW_SETTINGS_KEY,
@@ -32,7 +36,10 @@ import type {
   FolderTarget,
   FolderOutsideAction,
 } from "./folder-policy.ts";
-import { grantRootForTarget } from "./folder-policy.ts";
+import {
+  grantRootForTarget,
+  outsideProjectRootForTarget,
+} from "./folder-policy.ts";
 
 /** Nested key under WORKFLOW_SETTINGS_KEY. */
 export const READ_POLICY_KEY = "readPolicy";
@@ -150,9 +157,11 @@ export function readPolicyConfigPaths(
   cwd: string,
   agentDir: string,
 ): ReadPolicyConfigPaths {
+  const nativeCwd = translateForeignPath(cwd).path || cwd;
+  const nativeAgentDir = translateForeignPath(agentDir).path || agentDir;
   return {
-    global: path.join(agentDir, "settings.json"),
-    project: path.join(cwd, COMMIT_CONFIG_DIR, "settings.json"),
+    global: path.join(nativeAgentDir, "settings.json"),
+    project: path.join(nativeCwd, COMMIT_CONFIG_DIR, "settings.json"),
   };
 }
 
@@ -488,8 +497,11 @@ export function readGateItemFromTarget(
   tool: string,
   target: FolderTarget,
   why: string,
+  baseRoot?: string,
 ): ReadGateItem {
-  const grantRoot = grantRootForTarget(target);
+  const grantRoot =
+    (baseRoot && outsideProjectRootForTarget(target, baseRoot)) ||
+    grantRootForTarget(target);
   return {
     tool,
     target,
@@ -519,18 +531,51 @@ export function describeReadGateItems(items: readonly ReadGateItem[]): string {
 }
 
 export function readGateTargetsLabel(items: readonly ReadGateItem[]): string {
-  const labels = items.map((item) => item.grantRoot || item.target.path);
+  const labels = items.map((item) => item.target.path || item.grantRoot);
   const unique = [...new Set(labels)];
   const shown = unique.slice(0, 4).join(", ");
   return unique.length > 4 ? `${shown}, …` : shown;
 }
 
-export function readGateTitle(items: readonly ReadGateItem[]): string {
-  return `Read policy: allow ${describeReadGateItems(items)}?`;
+/** Bounded one-per-line target detail for the permission dialogs. */
+export function readGateDetail(
+  items: readonly ReadGateItem[],
+  max = 5,
+): string {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const item of items) {
+    const key = `${item.target.path}\0${item.grantRoot}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (lines.length >= max) break;
+    const tool = item.tool ? `${item.tool} → ` : "";
+    const target = item.target.path || item.why;
+    const grant =
+      item.grantRoot && item.grantRoot !== item.target.path
+        ? ` (folder: ${item.grantRoot})`
+        : "";
+    lines.push(`  • ${tool}${target}${grant}`);
+  }
+  const total = new Set(items.map((item) => item.target.path)).size;
+  if (total > lines.length) lines.push(`  … and ${total - lines.length} more`);
+  return lines.join("\n");
+}
+
+export function readGateTitle(
+  items: readonly ReadGateItem[],
+  base?: string,
+): string {
+  const detail = readGateDetail(items);
+  return (
+    `Read policy: allow ${describeReadGateItems(items)}?` +
+    (base ? `\nOutside: ${base}` : "") +
+    (detail ? `\n${detail}` : "")
+  );
 }
 
 /** Grant root for a dialog target; exported from folder-policy for callers. */
-export { grantRootForTarget };
+export { grantRootForTarget, outsideProjectRootForTarget };
 
 // ── /read-policy completions ────────────────────────────────────────
 

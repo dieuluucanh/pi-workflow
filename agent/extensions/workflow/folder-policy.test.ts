@@ -31,6 +31,7 @@ import {
   evaluateFolderTargets,
   extractFolderPolicyRaw,
   folderPolicyArgumentCompletions,
+  folderPolicyConfigPaths,
   globToRegExp,
   isBroadGrantRoot,
   isInsideAnyRoot,
@@ -43,7 +44,11 @@ import {
   resolveFolderRoots,
   writeFolderPolicyConfig,
 } from "./folder-policy.ts";
-import { WORKFLOW_SETTINGS_KEY } from "./commit-policy.ts";
+import { WORKFLOW_SETTINGS_KEY, commitConfigPaths } from "./commit-policy.ts";
+import { translateForeignPath } from "./utils.ts";
+import { analyzeShellPaths } from "./shell-paths.ts";
+import { writePolicyConfigPaths } from "./edit-policy.ts";
+import { readPolicyConfigPaths } from "./read-policy.ts";
 
 function tmpCwd(): { cwd: string; agentDir: string; cleanup: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-folder-policy-"));
@@ -143,6 +148,51 @@ test("merge: scalars project-over-global, pattern lists unioned", () => {
 });
 
 // ── read / write / trust / lock ─────────────────────────────────────
+
+test("settings: MSYS cwd resolves to the same native project paths", () => {
+  if (process.platform !== "win32") return;
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    const msys = cwd.replace(/^([A-Za-z]):[\\/]/, "/$1/");
+    const expected = path.join(cwd, ".pi", "settings.json");
+    assert.equal(folderPolicyConfigPaths(msys, agentDir).project, expected);
+    assert.equal(writePolicyConfigPaths(msys, agentDir).project, expected);
+    assert.equal(readPolicyConfigPaths(msys, agentDir).project, expected);
+    assert.equal(commitConfigPaths(msys, agentDir).project, expected);
+  } finally {
+    cleanup();
+  }
+});
+
+test("regression: the reported MSYS command stays inside the repository", () => {
+  const { cwd, cleanup } = tmpCwd();
+  try {
+    fs.mkdirSync(path.join(cwd, ".git"));
+    const target = path.join(
+      cwd,
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "dist",
+    );
+    fs.mkdirSync(target, { recursive: true });
+    const posixCwd = cwd.replace(/\\/g, "/");
+    const shellCwd =
+      process.platform === "win32"
+        ? posixCwd.replace(/^([A-Za-z]):\//, "/$1/")
+        : posixCwd;
+    const command = `cd ${shellCwd}/node_modules/@earendil-works/pi-coding-agent && rg -l "profile" dist | head -20`;
+    const analysis = analyzeShellPaths(command, cwd);
+    const evaluation = evaluateFolderTargets(analysis.reads, {
+      config: { ...DEFAULT_FOLDER_POLICY_CONFIG, mode: "repo" },
+      grants: [],
+      cwd,
+    });
+    assert.deepEqual(evaluation.outside, []);
+  } finally {
+    cleanup();
+  }
+});
 
 test("read: missing files fall back to defaults", () => {
   const { cwd, agentDir, cleanup } = tmpCwd();
@@ -279,6 +329,44 @@ test("path: tilde/@/relative/trailing slash normalisation", () => {
       normalizePolicyPath(os.homedir(), cwd),
     );
     assert.equal(normalizePolicyPath("", cwd), "");
+  } finally {
+    cleanup();
+  }
+});
+
+test("path: foreign shell syntax is translated without case folding", () => {
+  const { cwd, cleanup } = tmpCwd();
+  try {
+    if (process.platform === "win32") {
+      assert.equal(
+        normalizePolicyPath("/c/Users/Lenovo/repo", cwd),
+        "c:/users/lenovo/repo",
+      );
+      assert.equal(
+        normalizePolicyPath("/cygdrive/c/Users/Lenovo/repo", cwd),
+        "c:/users/lenovo/repo",
+      );
+      assert.equal(
+        normalizePolicyPath("/mnt/c/Users/Lenovo/repo", cwd),
+        "c:/users/lenovo/repo",
+      );
+      assert.equal(normalizePolicyPath("/c", cwd), "c:/");
+      assert.equal(
+        translateForeignPath("/c/Users/Lenovo/repo").path,
+        "C:/Users/Lenovo/repo",
+      );
+      assert.equal(translateForeignPath("C:foo").uncertain, true);
+      assert.equal(translateForeignPath("\\\\.\\disk").uncertain, true);
+      assert.equal(
+        translateForeignPath("\\\\server\\share\\dir").path,
+        "\\\\server\\share\\dir",
+      );
+    } else {
+      assert.equal(
+        normalizePolicyPath("/c/Users/Lenovo/repo", cwd),
+        "/c/users/lenovo/repo",
+      );
+    }
   } finally {
     cleanup();
   }

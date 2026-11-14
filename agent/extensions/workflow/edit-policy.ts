@@ -33,7 +33,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ArgumentCompletion } from "./utils.ts";
-import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
+import {
+  joinArgumentValue,
+  suppressExactArgumentMatch,
+  translateForeignPath,
+} from "./utils.ts";
 import {
   COMMIT_CONFIG_DIR,
   WORKFLOW_SETTINGS_KEY,
@@ -198,9 +202,11 @@ export function writePolicyConfigPaths(
   cwd: string,
   agentDir: string,
 ): WritePolicyConfigPaths {
+  const nativeCwd = translateForeignPath(cwd).path || cwd;
+  const nativeAgentDir = translateForeignPath(agentDir).path || agentDir;
   return {
-    global: path.join(agentDir, "settings.json"),
-    project: path.join(cwd, COMMIT_CONFIG_DIR, "settings.json"),
+    global: path.join(nativeAgentDir, "settings.json"),
+    project: path.join(nativeCwd, COMMIT_CONFIG_DIR, "settings.json"),
   };
 }
 
@@ -974,12 +980,21 @@ export function writeGateTargetsLabel(
 export function writeGateTitle(items: readonly WriteGateItem[]): string {
   if (items.length <= 1) {
     const only = items[0];
-    const why = only?.why ? ` (${only.why})` : "";
-    return `Write policy 'ask': allow this write${why}?`;
+    const target = String(only?.target ?? "").trim();
+    const reason = String(only?.why ?? "").trim();
+    return (
+      `Write policy 'ask': allow this write?` +
+      (target ? `\nTarget: ${target}` : "") +
+      (reason && reason !== target ? `\nReason: ${reason}` : "")
+    );
   }
+  const lines = items
+    .slice(0, 5)
+    .map((item) => `  • ${String(item.target ?? "").trim()}`)
+    .filter((line) => line.trim().length > 3);
+  if (items.length > 5) lines.push(`  … and ${items.length - 5} more`);
   return (
-    `Write policy 'ask': allow these ${items.length} writes? ` +
-    `(${describeWriteGateItems(items)})`
+    `Write policy 'ask': allow these ${items.length} writes?\n${lines.join("\n")}`
   );
 }
 

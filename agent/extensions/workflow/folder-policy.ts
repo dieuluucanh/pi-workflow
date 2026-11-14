@@ -39,7 +39,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { ArgumentCompletion } from "./utils.ts";
-import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
+import {
+  joinArgumentValue,
+  suppressExactArgumentMatch,
+  translateForeignPath,
+} from "./utils.ts";
 import {
   COMMIT_CONFIG_DIR,
   WORKFLOW_SETTINGS_KEY,
@@ -296,9 +300,11 @@ export function folderPolicyConfigPaths(
   cwd: string,
   agentDir: string,
 ): FolderPolicyConfigPaths {
+  const nativeCwd = translateForeignPath(cwd).path || cwd;
+  const nativeAgentDir = translateForeignPath(agentDir).path || agentDir;
   return {
-    global: path.join(agentDir, "settings.json"),
-    project: path.join(cwd, COMMIT_CONFIG_DIR, "settings.json"),
+    global: path.join(nativeAgentDir, "settings.json"),
+    project: path.join(nativeCwd, COMMIT_CONFIG_DIR, "settings.json"),
   };
 }
 
@@ -487,7 +493,10 @@ export function writeFolderPolicyConfig(
 // ── Path canonicalisation ────────────────────────────────────────────
 
 function isCaseInsensitivePlatform(): boolean {
-  return process.platform === "win32" || process.platform === "darwin";
+  // Only Windows is case-insensitive by default. macOS APFS can be
+  // case-sensitive; lowercasing there merged distinct paths. realpath handles
+  // the actual filesystem identity.
+  return process.platform === "win32";
 }
 
 /** Strip a Windows extended-length prefix from a realpath result. */
@@ -524,12 +533,14 @@ export function normalizePolicyPath(value: unknown, cwd: string): string {
   if (typeof value !== "string") return "";
   const raw = stripAtPrefix(expandTilde(value.trim()));
   if (!raw) return "";
+  const foreign = translateForeignPath(raw);
+  const translated = foreign.path || raw;
   const base = cwd && cwd.trim() ? cwd : process.cwd();
   let resolved: string;
   try {
-    resolved = path.resolve(base, raw);
+    resolved = path.resolve(base, translated);
   } catch {
-    resolved = raw;
+    resolved = translated;
   }
   let normalized = toPosixPath(stripWindowsPrefix(resolved));
   if (isCaseInsensitivePlatform()) normalized = normalized.toLowerCase();
@@ -701,6 +712,46 @@ export function grantRootForTarget(target: FolderTarget): string {
   }
   if (target.kind === "dir" || target.kind === "repo") return value;
   return toPosixPath(path.dirname(value.replace(/\//g, path.sep)));
+}
+
+/**
+ * The “outside project” folder a grant should cover: the first path segment
+ * below the deepest common ancestor of the base and the target. A file that
+ * sits directly in that common ancestor is granted as the file itself; an
+ * outside target that is an ancestor of the base is granted as itself.
+ *
+ * Returns undefined for a target inside the base (the caller keeps its
+ * capability-specific grant, e.g. an exact write path).
+ */
+export function outsideProjectRootForTarget(
+  target: FolderTarget,
+  baseRoot: string,
+): string | undefined {
+  const base = normalizePolicyPath(baseRoot, baseRoot);
+  const normalized = normalizePolicyPath(target.path, base || process.cwd());
+  if (!base || !normalized) return undefined;
+  if (isInsidePolicyPath(normalized, base)) return undefined;
+  // A repository root above a cwd-mode session is itself the outside folder.
+  if (isInsidePolicyPath(base, normalized)) return normalized;
+
+  const baseParts = base.split("/").filter(Boolean);
+  const targetParts = normalized.split("/").filter(Boolean);
+  let common = 0;
+  while (
+    common < baseParts.length &&
+    common < targetParts.length &&
+    baseParts[common] === targetParts[common]
+  ) {
+    common++;
+  }
+  const commonRoot = baseParts.slice(0, common).join("/");
+  const remaining = targetParts.slice(common);
+  if (remaining.length === 0) return normalized;
+  // Directly in the common ancestor: a file stays the file; a directory is
+  // the directory; a glob/static prefix stays its prefix.
+  if (remaining.length === 1) return normalized;
+  const child = remaining[0];
+  return commonRoot ? `${commonRoot}/${child}` : `/${child}`;
 }
 
 /** A broad grant: filesystem root, home, drive root, or depth ≤ 1. */
@@ -896,6 +947,8 @@ export function evaluateFolderTargets(
       evaluation.uncertain.push("empty path");
       continue;
     }
+    if (translateForeignPath(target.path).uncertain)
+      evaluation.uncertain.push(lexical);
     const canonicalResult = canonicalizePolicyPath(lexical, cwd);
     const canonical = canonicalResult.path || lexical;
     const sensitive = matchSensitivePath(lexical, config, cwd);

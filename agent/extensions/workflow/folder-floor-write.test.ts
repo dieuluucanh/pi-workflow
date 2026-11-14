@@ -188,6 +188,22 @@ test("write: Always allow persists a project-scoped write grant", async () => {
   }
 });
 
+test("write: a path-less mutating tool is uncertain, not silently allowed", async () => {
+  const { pi, ctx, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      writePolicy: { mode: "allow", mutatingTools: ["custom_write"] },
+    },
+  });
+  try {
+    (ctx as any).ui.select = async () => undefined;
+    const result = await toolCall(pi, ctx, "custom_write", { blob: "x" });
+    assert.ok(result && (result as any).block);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("write: Always allow refuses a project grant when the project is untrusted", async () => {
   const { cwd, pi, ctx, cleanup } = await boot(
     {

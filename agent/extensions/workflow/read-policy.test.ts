@@ -27,6 +27,8 @@ import {
   extractReadPolicyRaw,
   grantRootForTarget,
   mergeReadPolicyConfig,
+  readGateItemFromTarget,
+  readGateTitle,
   parseReadGateChoice,
   readGateAlwaysLabel,
   readGateOptions,
@@ -37,7 +39,11 @@ import {
   writeReadPolicyConfig,
 } from "./read-policy.ts";
 import { WORKFLOW_SETTINGS_KEY } from "./commit-policy.ts";
-import { DEFAULT_FOLDER_POLICY_CONFIG, normalizePolicyPath } from "./folder-policy.ts";
+import {
+  DEFAULT_FOLDER_POLICY_CONFIG,
+  normalizePolicyPath,
+  outsideProjectRootForTarget,
+} from "./folder-policy.ts";
 
 function tmpCwd(): { cwd: string; agentDir: string; cleanup: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-read-policy-"));
@@ -332,6 +338,37 @@ test("grant roots: file -> dir, dir -> itself, glob -> prefix", () => {
     grantRootForTarget({ path: glob, kind: "glob" }),
     normalizePolicyPath("/repo/src", process.cwd()),
   );
+});
+
+test("outside grant roots group to the first outside folder", () => {
+  const base = normalizePolicyPath("/repo", "/repo");
+  const target = normalizePolicyPath("/repo/../other/src/a.ts", "/repo");
+  assert.equal(
+    outsideProjectRootForTarget({ path: target, kind: "file" }, base),
+    normalizePolicyPath("/repo/../other", "/repo"),
+  );
+  const direct = normalizePolicyPath("/repo/../notes.md", "/repo");
+  assert.equal(
+    outsideProjectRootForTarget({ path: direct, kind: "file" }, base),
+    direct,
+  );
+  assert.equal(
+    outsideProjectRootForTarget(
+      { path: normalizePolicyPath("/repo/src/a.ts", "/repo"), kind: "file" },
+      base,
+    ),
+    undefined,
+  );
+});
+
+test("dialog title lists the base, target path and grant folder", () => {
+  const base = normalizePolicyPath("/repo", "/repo");
+  const target = normalizePolicyPath("/repo/../other/src/a.ts", "/repo");
+  const item = readGateItemFromTarget("read", { path: target, kind: "file" }, "outside", base);
+  const title = readGateTitle([item], base);
+  assert.match(title, /\/repo/);
+  assert.match(title, /other\/src\/a\.ts/);
+  assert.match(title, /other/);
 });
 
 test("status: includes shared folder scope and read grants", () => {

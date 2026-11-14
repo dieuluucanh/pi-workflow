@@ -436,6 +436,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   const notifies: Array<{ message: string; level?: string }> = [];
   const statuses: unknown[] = [];
   const widgets: unknown[] = [];
+  const selects: Array<{ title: string; options: unknown[] }> = [];
   const ctx = {
     cwd: over.cwd,
     mode: "tui",
@@ -451,7 +452,8 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       buildContextEntries: () => over.branch ?? [],
     },
     ui: {
-      async select(_title: string, _options: unknown[]) {
+      async select(title: string, options: unknown[]) {
+        selects.push({ title, options });
         return over.selectAnswer;
       },
       async custom() {
@@ -479,5 +481,5 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       theme: { fg: (_color: string, text: string) => text },
     },
   };
-  return { ctx, notifies, statuses, widgets };
+  return { ctx, notifies, statuses, widgets, selects };
 }

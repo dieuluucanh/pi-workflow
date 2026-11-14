@@ -24,7 +24,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ArgumentCompletion } from "./utils.ts";
-import { joinArgumentValue, suppressExactArgumentMatch } from "./utils.ts";
+import {
+  joinArgumentValue,
+  suppressExactArgumentMatch,
+  translateForeignPath,
+} from "./utils.ts";
 
 /** Pi's project config directory. Mirrors WORKFLOW_CONFIG_DIR without importing review.ts (which pulls provider modules). */
 export const COMMIT_CONFIG_DIR = ".pi";
@@ -166,9 +170,11 @@ export function commitConfigPaths(
   cwd: string,
   agentDir: string,
 ): CommitConfigPaths {
+  const nativeCwd = translateForeignPath(cwd).path || cwd;
+  const nativeAgentDir = translateForeignPath(agentDir).path || agentDir;
   return {
-    global: path.join(agentDir, "settings.json"),
-    project: path.join(cwd, COMMIT_CONFIG_DIR, "settings.json"),
+    global: path.join(nativeAgentDir, "settings.json"),
+    project: path.join(nativeCwd, COMMIT_CONFIG_DIR, "settings.json"),
   };
 }
 

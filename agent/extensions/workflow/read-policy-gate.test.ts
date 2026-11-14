@@ -34,7 +34,7 @@ async function boot(
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx } = makeFakeCtx({ cwd, hasUI, projectTrusted });
+  const { ctx, selects } = makeFakeCtx({ cwd, hasUI, projectTrusted });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
     try {
@@ -46,7 +46,7 @@ async function boot(
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { cwd, pi, ctx, cleanup };
+  return { cwd, pi, ctx, selects, cleanup };
 }
 
 function call(
@@ -210,6 +210,51 @@ test("tool_result: grep output is redacted", async () => {
     const text = String(result.content?.[0]?.text ?? "");
     assert.doesNotMatch(text, /SECRET/);
     assert.match(text, /src\/app\.ts:2/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("batch: a 3-call batch is listed once, and turn_start resets it", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot();
+  try {
+    const a = path.join(cwd, "..", "outside-a", "a.ts");
+    const b = path.join(cwd, "..", "outside-b", "b.ts");
+    const c = path.join(cwd, "..", "outside-c", "c.ts");
+    await pi.emit(
+      "message_end",
+      {
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "t0", name: "read", arguments: { path: a } },
+            { type: "toolCall", id: "t1", name: "read", arguments: { path: b } },
+            { type: "toolCall", id: "t2", name: "read", arguments: { path: c } },
+          ],
+        },
+      },
+      ctx,
+    );
+    (ctx as any).ui.select = async (title: string, options: unknown[]) => {
+      selects.push({ title, options });
+      return undefined;
+    };
+    await call(pi, ctx, "read", { path: a }, "t0");
+    assert.equal(selects.length, 1);
+    assert.match(selects[0].title, /outside-a/);
+    assert.match(selects[0].title, /outside-b/);
+    assert.match(selects[0].title, /outside-c/);
+
+    await pi.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
+    (ctx as any).ui.select = async (title: string, options: unknown[]) => {
+      selects.push({ title, options });
+      return undefined;
+    };
+    const fresh = path.join(cwd, "..", "fresh", "new.ts");
+    await call(pi, ctx, "read", { path: fresh }, "t0");
+    assert.equal(selects.length, 2);
+    assert.match(selects[1].title, /fresh/);
+    assert.doesNotMatch(selects[1].title, /outside-a|outside-b|outside-c/);
   } finally {
     await cleanup();
   }

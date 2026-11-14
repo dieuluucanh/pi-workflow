@@ -4,7 +4,75 @@
  * imports) so it stays loadable in plain Node tests.
  */
 
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { isCommandAllowedForRole } from "./permissions.ts";
+
+/**
+ * Translate shell foreign path syntax to native syntax without changing case.
+ *
+ * On Windows, Git-Bash/MSYS (`/c/...`), Cygwin (`/cygdrive/c/...`) and WSL
+ * (`/mnt/c/...`) spellings otherwise become `C:\c\...` under `path.resolve`.
+ * On POSIX, a Windows drive path is mapped to `/mnt/<drive>/...` only when the
+ * mount exists; otherwise the caller treats it as uncertain. UNC/WSL UNC
+ * paths intentionally stay network paths.
+ *
+ * This is the case-preserving plumbing used for real filesystem/settings
+ * paths. `normalizePolicyPath` applies this and then lowercases only for the
+ * comparison form.
+ */
+export function translateForeignPath(value: unknown): {
+  path: string;
+  uncertain?: boolean;
+} {
+  if (typeof value !== "string") return { path: "", uncertain: true };
+  let raw = value.trim();
+  if (!raw) return { path: "" };
+
+  if (raw.startsWith("file:")) {
+    try {
+      raw = fileURLToPath(raw);
+    } catch {
+      try {
+        raw = decodeURIComponent(raw.replace(/^file:\/\//i, ""));
+      } catch {
+        return { path: raw, uncertain: true };
+      }
+    }
+  }
+
+  if (process.platform === "win32") {
+    const drivePath = (drive: string, rest: string | undefined): string =>
+      `${drive.toUpperCase()}:/${rest ?? ""}`;
+    const cygdrive = /^\/cygdrive\/([A-Za-z])(?:\/(.*))?$/i.exec(raw);
+    if (cygdrive) return { path: drivePath(cygdrive[1], cygdrive[2]) };
+    const wsl = /^\/mnt\/([A-Za-z])(?:\/(.*))?$/i.exec(raw);
+    if (wsl) return { path: drivePath(wsl[1], wsl[2]) };
+    const msys = /^\/([A-Za-z])(?:\/(.*))?$/.exec(raw);
+    if (msys) return { path: drivePath(msys[1], msys[2]) };
+
+    // A drive-relative path (`C:foo`) or a device path is not a normal
+    // absolute path; do not guess what it means.
+    if (/^[A-Za-z]:[^\\/]/.test(raw) || /^\\\\.\\/.test(raw)) {
+      return { path: raw, uncertain: true };
+    }
+    // Extended-length prefixes are not meaningful to the policy layer.
+    raw = raw
+      .replace(/^\\\\\?\\UNC\\/i, "\\\\")
+      .replace(/^\\\\\?\\/i, "");
+    return { path: raw };
+  }
+
+  // POSIX host: map a Windows drive path only when its WSL mount exists.
+  const win = /^([A-Za-z]):[\\/](.*)$/.exec(raw);
+  if (win) {
+    const mount = `/mnt/${win[1].toLowerCase()}`;
+    if (fs.existsSync(mount)) return { path: `${mount}/${win[2]}` };
+    return { path: raw, uncertain: true };
+  }
+  return { path: raw };
+}
 
 /**
  * Backward-compatible alias for Plan Mode's command policy (read-only plus
