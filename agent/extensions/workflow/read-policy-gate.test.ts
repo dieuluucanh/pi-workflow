@@ -20,6 +20,7 @@ async function boot(
   settings: Record<string, unknown> = {},
   hasUI = true,
   projectTrusted = true,
+  selectAnswer: string | undefined = undefined,
 ) {
   const { root, cwd, agentDir } = tmpProject();
   const previous = process.env.PI_CODING_AGENT_DIR;
@@ -34,7 +35,12 @@ async function boot(
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx, selects } = makeFakeCtx({ cwd, hasUI, projectTrusted });
+  const { ctx, selects } = makeFakeCtx({
+    cwd,
+    hasUI,
+    projectTrusted,
+    selectAnswer,
+  });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
     try {
@@ -257,6 +263,75 @@ test("batch: a 3-call batch is listed once, and turn_start resets it", async () 
     assert.doesNotMatch(selects[1].title, /outside-a|outside-b|outside-c/);
   } finally {
     await cleanup();
+  }
+});
+
+test("read: Build mode leaves inside reads free and asks outside", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    { workflow: { folderPolicy: { mode: "repo", outside: "ask" } } },
+    true,
+    true,
+    "Allow once (this turn)",
+  );
+  try {
+    const build = pi.commands.build;
+    assert.ok(build, "/build command registered");
+    await build.handler("", ctx);
+
+    assert.equal(
+      await call(pi, ctx, "read", { path: "src/app.ts" }, "build-in"),
+      undefined,
+    );
+    assert.equal(selects.length, 0, "an inside read in Build must not prompt");
+
+    const outside = path.join(cwd, "..", "outside-build.ts");
+    assert.equal(
+      await call(pi, ctx, "read", { path: outside }, "build-out"),
+      undefined,
+    );
+    assert.equal(selects.length, 1, "an outside read still asks in Build");
+    assert.match(selects[0]?.title ?? "", /^Read policy/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: strict shell asks for npm test; paths does not", async () => {
+  const paths = await boot(
+    { workflow: { readPolicy: { shell: "paths" } } },
+    true,
+    true,
+    "Allow once (this turn)",
+  );
+  try {
+    assert.equal(
+      await call(paths.pi, paths.ctx, "bash", { command: "npm test" }, "paths-1"),
+      undefined,
+    );
+    assert.equal(
+      paths.selects.length,
+      0,
+      "the default shell mode treats unverifiable commands as a residual",
+    );
+  } finally {
+    await paths.cleanup();
+  }
+
+  const strict = await boot(
+    { workflow: { readPolicy: { shell: "strict" } } },
+    true,
+    true,
+    "Allow once (this turn)",
+  );
+  try {
+    assert.equal(
+      await call(strict.pi, strict.ctx, "bash", { command: "npm test" }, "strict-1"),
+      undefined,
+    );
+    assert.equal(strict.selects.length, 1, "strict is the opt-in ask");
+    assert.match(strict.selects[0]?.title ?? "", /^Read policy/);
+  } finally {
+    await strict.cleanup();
   }
 });
 

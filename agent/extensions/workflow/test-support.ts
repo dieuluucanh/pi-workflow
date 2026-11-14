@@ -446,6 +446,8 @@ export interface FakeCtxOptions {
   hasUI?: boolean;
   branch?: unknown[];
   selectAnswer?: string | undefined;
+  /** Per-dialog answers, consumed in order before falling back to selectAnswer. */
+  selectAnswers?: Array<string | undefined>;
   /** Value returned by `ui.custom` (the inline handoff choice). */
   customAnswer?: string | null;
   /** Value returned by `ui.editor` (e.g. the inline Refine text). */
@@ -486,6 +488,9 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     ui: {
       async select(title: string, options: unknown[]) {
         selects.push({ title, options });
+        if (over.selectAnswers && over.selectAnswers.length > 0) {
+          return over.selectAnswers.shift();
+        }
         return over.selectAnswer;
       },
       async custom() {

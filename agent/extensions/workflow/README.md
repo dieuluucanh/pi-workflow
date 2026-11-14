@@ -360,7 +360,7 @@ Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global
 
 ## Folder and read permission
 
-**One shared floor.** `workflow.folderPolicy` decides which folders read, write and commit may touch. `mode: "repo"` (default) is the nearest `.git` ancestor (fallback: the session cwd); `cwd` is the exact working directory; `parent` is the parent of that base (siblings); `any` disables containment. `outside: "ask"` prompts once per turn (headless fails closed), `outside: "block"` refuses silently. A policy can only be **stricter** than this floor — `writePolicy: "allow"` cannot write outside it. Windows Git-Bash/Cygwin/WSL spellings (`/c/...`, `/cygdrive/c/...`, `/mnt/c/...`) and `file://` paths are translated to native paths before matching; a folder grant covers the first folder outside the base (the outside project), while a file sitting directly in the common parent is granted as that file only. Read, write and commit dialogs list the base/current folder and every requested target path.
+**One shared floor.** `workflow.folderPolicy` decides which folders read, write and commit may touch. `mode: "repo"` (default) is the nearest `.git` ancestor (fallback: the session cwd); `cwd` is the exact working directory; `parent` is the parent of that base (siblings); `any` disables containment. `outside: "ask"` prompts once per turn (headless fails closed); `outside: "block"` refuses silently, and an unresolvable write/commit target is refused without a dialog (the read gate keeps its own `readPolicy.shell` opt-in). A policy can only be **stricter** than this floor — `writePolicy: "allow"` cannot write outside it. Both Default and Build respect the floor. For writes it asks only for a *proven* outside target, a sensitive file, or an explicit path that cannot be resolved; a command whose writes merely cannot be located is not treated as outside (see “Not a sandbox”). Windows Git-Bash/Cygwin/WSL spellings (`/c/...`, `/cygdrive/c/...`, `/mnt/c/...`) and `file://` paths are translated to native paths before matching; a folder grant covers the first folder outside the base (the outside project), while a file sitting directly in the common parent is granted as that file only. Read, write and commit dialogs list the base/current folder and every requested target path; a prompt caused by the floor is titled **Folder policy 'ask'**, not “Write policy”.
 
 **Sensitive files are always blocked.** The default deny list covers `.env*` (templates such as `.env.example` are exempt by default), `.npmrc`/`.netrc`/`.git-credentials`, `auth.json`, `credentials*`, `secrets.*`, SSH/GPG/cloud stores, key/cert stores, `.git/config`, `.tfstate`/`.tfvars` and keychains. A folder grant never re-enables one; add a manual `folderPolicy.sensitiveExemptions` entry only when a template/fixture is genuinely needed. `/folder-policy sensitive` lists the effective rules.
 
@@ -368,9 +368,9 @@ Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global
 
 **Grants.** “Always allow” writes to the capability's `allowedPaths` in project settings by default (`folderPolicy.grantScope: "project"`); the project must be trusted. Existing global write grants remain honoured. “Always allow” cannot grant a filesystem root/home from a dialog — use `/folder-policy any` deliberately.
 
-**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. Use an OS container/VM for a hard boundary. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions; `review_bash` uses the same read guard. Spawned subagents receive locked roots and cannot expand via a sibling project's settings.
+**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. A shell command whose writes cannot be located — `npm run build`, `node script`, `npx`, a `sed`/`awk` program, `powershell`, or a path-less tool in `mutatingTools` — is **not** treated as an outside write: under `writePolicy: "allow"` (and in Build) it runs without a dialog. That is deliberate: the analyzer cannot see inside project code, and asking made ordinary in-repo builds and tests look like a permission violation. Use `writePolicy: "ask"` for a prompt on every mutating call, or an OS container/VM for a hard boundary. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions; `review_bash` uses the same read guard. Spawned subagents receive locked roots and cannot expand via a sibling project's settings.
 
-**Migration.** The default `folderPolicy.mode: "repo"` + `outside: "ask"` also constrains writes/commits. Set `folderPolicy.mode: "any"` to restore the old “write anywhere” behaviour (sensitive files remain blocked), or `cwd`/`parent` to keep a narrower floor.
+**Migration.** The default `folderPolicy.mode: "repo"` + `outside: "ask"` also constrains writes/commits. Set `folderPolicy.mode: "any"` to restore the old “write anywhere” behaviour (sensitive files remain blocked); this now also disables the unresolvable-target asks. Use `cwd`/`parent` to keep a narrower floor.
 
 ## Commit policy
 
@@ -394,6 +394,8 @@ The default exists because prompt-only rules are soft: models habitually commit 
 | `allow` | **Automatic per-step commits.** While a plan todo list is active the extension itself makes exactly **one commit per completed step** (at the `workflow_todo` completion boundary, before the model starts the next step; subject `step N: <step text>`), and the model cannot run `git add`/`commit`/`push` at all. Outside a plan (no todos) the model may commit as before. `/commit` always works |
 
 The status line always shows the active policy (`▶ build 2/5 · commits:never`), so you can see at a glance what the agent may do to history.
+
+**Outside repositories.** The shared folder floor also gates the repository root. Inside the current project, only the commit policy above decides; a command that targets a repository outside the permitted folders (`git -C ../other ...`, or a worktree/GIT_DIR outside) opens a separate **Folder policy 'ask'** dialog, or is refused under `outside: "block"`. The two prompts are deliberately labelled apart, and the model-facing reason names the folder policy when that is what refused it.
 
 ### `/commit` under any policy
 
@@ -419,12 +421,12 @@ Known limits (accepted, same trade-off OpenCode/Claude Code make): a configured 
 
 The extension has three modes — **Plan → Build → Default**. Plan mode is read-only and Build mode is unrestricted *by design* (it is the approved-execution path), but **Default mode was also completely unrestricted**: the tool gate has no role to apply there, so the agent edits your files without asking, and it does so inconsistently — sometimes it asks for clarification, sometimes it goes straight to `edit`.
 
-`workflow.writePolicy` closes that gap. It is a **user-controlled permission**, enforced where the tools execute (not in prose — prompt rules are soft and get ignored), and it applies to **Default mode only**:
+`workflow.writePolicy` closes that gap. It is a **user-controlled permission**, enforced where the tools execute (not in prose — prompt rules are soft and get ignored). The write **mode** applies to **Default mode only**; the shared folder floor is separate and applies in every mode, including Build — but it only asks for a proven outside target, a sensitive file, or an unresolvable explicit path. Build never inherits `ask`/`never`.
 
 | Mode | Meaning |
 | --- | --- |
 | `allow` (default) | The agent writes files freely — today's behaviour, and the shipped default so existing installs are unaffected |
-| `ask` | Writes pop a dialog: **Allow once (this turn)** / **Always allow …** (*this path*, *these paths*, *this command*, *these commands*) / **Deny** / **Deny with instructions…**. One dialog covers a whole turn and lists the writes it covers; a permanent grant is remembered, so the same target stops asking |
+| `ask` | Writes pop a dialog: **Allow once (this turn)** / **Always allow …** (*this path*, *these paths*, *this folder*, *these folders*, *this command*, *these commands*) / **Deny** / **Deny with instructions…**. One dialog covers a whole turn and lists the writes it covers; a permanent grant is remembered, so the same target stops asking. A prompt caused by the folder floor is titled **Folder policy 'ask'** and shows the base folder; a write-mode prompt is **Write policy 'ask'** |
 | `never` | The agent may not modify your files (`.pi/plans/` excepted). You apply the changes, or the user switches to `/build` for the approved-execution path |
 
 The status line always shows the active permission (`◦ commits:never · writes:ask`), so you can see at a glance what the agent may touch.
@@ -433,17 +435,17 @@ The status line always shows the active permission (`◦ commits:never · writes
 
 - The `edit` and `write` tools.
 - `bash` commands that may modify files. A command is treated as a write when it is **not provably read-only**: a file redirect (`>`, `>>`), a heredoc or command substitution, a command outside the read-only/verify allowlist (`rm`, `mv`, `cp`, `sed`, `awk`, `npm install`, `git checkout`, interpreters, unknown binaries …), or a write flag on an otherwise-safe command (`eslint --fix`). Read-only commands (`ls`, `cat`, `rg`, `git status`, `npm test`, `tsc --noEmit`) and harmless redirections (`2>/dev/null`, `2>&1`) stay free. Only an **unquoted** redirect or expansion counts: `rg -n 'a > b' docs` and `rg -n "rm -rf" src` are read-only, so `ask` never prompts for them.
-- **`sed` and `awk` are gated as potential writes whatever their flags** — their programs are code (GNU sed's `e` command runs a shell command and its `w` command writes a file; awk can `system()` or redirect), so a plain `sed -n '…p' file` asks too. To inspect a file without a prompt use `rg` / `head` / `tail` / `cut` / `column` / `jq`, or the `read` tool — or pick **Always allow this command** to grant that one command permanently.
+- **`sed` and `awk` are classified as potential writes whatever their flags** — their programs are code (GNU sed's `e` command runs a shell command and its `w` command writes a file; awk can `system()` or redirect), so a plain `sed -n '…p' file` is a *mutating* call. With `writePolicy: ask` it therefore prompts (use `rg` / `head` / `tail` / `cut` / `column` / `jq` or the `read` tool to avoid that); under `allow` and in Build it runs without a dialog, because the folder floor only asks for a *located* outside target.
 - `powershell` is always treated as a write — it cannot be classified by the POSIX allowlist, so it fails closed.
 
 `git add` / `git commit` / `git push` are **not** treated as file writes: they touch the index and the object store, not your working tree, and the independent [commit policy](#commit-policy) already governs them.
 
 ### Scope and carve-outs
 
-- **Default mode only.** Plan mode keeps its stricter read-only rules (writes only to `.pi/plans/`), and Build mode stays the deliberate "go ahead" escape hatch.
+- **Default mode only for the write mode.** Plan mode keeps its stricter read-only rules (writes only to `.pi/plans/`), and Build stays the execution escape hatch: it never inherits `writePolicy: ask/never`. The shared folder floor still applies in Build and Default (outside targets and sensitive files).
 - **Subagents are unaffected.** A spawned child carries `PI_WORKFLOW_ROLE` and is already read-only through the role gate — and it has no UI to answer a prompt with.
 - **`.pi/plans/` writes stay allowed** in every mode, so a session that leaves Plan mode mid-flow is not stranded.
-- **Third-party write tools need opting in.** `ast_grep_replace` (pi-lens) rewrites files, and the `office_*` tools (pi-office-protocol) write documents; neither is covered by the built-in scope. List them in `mutatingTools` to gate them (see below).
+- **Third-party write tools need opting in.** `ast_grep_replace` (pi-lens) rewrites files, and the `office_*` tools (pi-office-protocol) write documents; neither is covered by the built-in scope. List them in `mutatingTools` to gate them (see below). A path-less mutating tool follows the write mode: no prompt under `allow`/Build, prompted under `ask`.
 
 ```text
 /write-policy                # status: mode, which scope supplied it, the allowlists

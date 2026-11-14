@@ -10,6 +10,21 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — the folder floor no longer prompts for in-repo toolchain commands
+
+Build mode and Default + `writePolicy: allow` no longer open a `Write policy
+'ask'` dialog for commands whose writes the shell analyzer cannot fully locate
+(`sed`/`awk`, `npm run build`, `npx …`, `node script`, `powershell`,
+`git diff | sed`, path-less `mutatingTools`). Only a proven outside target, a
+sensitive file, or an explicit path that cannot be resolved is gated;
+`writePolicy: ask` remains the strict opt-in for every mutating call. A prompt
+caused by the floor is now titled **Folder policy 'ask'** and shows the base
+folder, an outside grant is labelled **Always allow this folder**, and
+`folderPolicy.outside: "block"` refuses an unresolvable target without opening
+a dialog. The commit gate attributes an outside-repository refusal to the
+folder policy, and `runGitZ` honours `PI_GIT_BIN` with a clear error when git
+cannot be found instead of a raw `ENOENT`.
+
 ### Fixed — review handoffs survive later rounds and reloads
 
 **Manual `/review` now hands off.** A settled manual round opens Plannotator with

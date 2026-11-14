@@ -24,7 +24,16 @@ function git(cwd: string, args: string[]): void {
   assert.equal(res.status, 0, `git ${args.join(" ")}: ${res.stderr}`);
 }
 
-async function boot(settings: Record<string, unknown>, projectTrusted = true) {
+interface BootOptions {
+  projectTrusted?: boolean;
+  selectAnswer?: string;
+  selectAnswers?: Array<string | undefined>;
+}
+
+async function boot(
+  settings: Record<string, unknown>,
+  options: BootOptions = {},
+) {
   const { root, cwd, agentDir } = tmpProject();
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -38,11 +47,12 @@ async function boot(settings: Record<string, unknown>, projectTrusted = true) {
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx } = makeFakeCtx({
+  const { ctx, selects } = makeFakeCtx({
     cwd,
     hasUI: true,
-    projectTrusted,
-    selectAnswer: undefined,
+    projectTrusted: options.projectTrusted !== false,
+    selectAnswer: options.selectAnswer,
+    selectAnswers: options.selectAnswers,
   });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
@@ -55,8 +65,10 @@ async function boot(settings: Record<string, unknown>, projectTrusted = true) {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { cwd, agentDir, pi, ctx, cleanup };
+  return { root, cwd, agentDir, pi, ctx, selects, cleanup };
 }
+
+let callSeq = 0;
 
 function commitCall(
   pi: ReturnType<typeof makeFakePi>,
@@ -66,36 +78,136 @@ function commitCall(
   const handlers = pi.handlers.get("tool_call") ?? [];
   assert.ok(handlers.length > 0);
   return handlers[0](
-    { toolName: "bash", toolCallId: "t1", input: { command } },
+    { toolName: "bash", toolCallId: `t${++callSeq}`, input: { command } },
     ctx,
   );
 }
 
-test("commit: git -C outside the folder asks and can be allowed once", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
+test("commit: a repository inside the folder is not gated", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
       commitPolicy: { mode: "allow" },
     },
   });
   try {
-    (ctx as any).ui.select = async () => undefined;
-    const denied = await commitCall(pi, ctx, "git -C ../other add x.txt");
-    assert.ok(denied && (denied as any).block);
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a\n");
+    git(cwd, ["add", "-A"]);
+    git(cwd, ["commit", "-qm", "init"]);
 
-    await pi.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
-    (ctx as any).ui.select = async () => "Allow once";
-    assert.equal(
-      await commitCall(pi, ctx, "git -C ../other add other.txt"),
-      undefined,
-    );
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 0, "inside commits do not ask");
   } finally {
     await cleanup();
   }
 });
 
+test("commit: git -C outside the folder asks and is attributed to the folder policy", async () => {
+  const { pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask" },
+        commitPolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswers: [undefined, "Allow once", "Allow once"] },
+  );
+  try {
+    const denied = await commitCall(pi, ctx, "git -C ../other add x.txt");
+    assert.ok(denied && (denied as any).block);
+    assert.match(String((denied as any).reason), /^Folder policy 'ask'/);
+    assert.equal(selects.length, 1);
+    assert.match(selects[0]?.title ?? "", /^Folder policy 'ask'/);
+    assert.match(selects[0]?.title ?? "", /Outside:/);
+
+    const allowed = await commitCall(pi, ctx, "git -C ../other add other.txt");
+    assert.equal(allowed, undefined);
+    // The commit gate asks for the outside repo, then the read gate asks for
+    // the repository path it reads. Each answer covers one turn.
+    assert.equal(selects.length, 3);
+    assert.match(selects[1]?.title ?? "", /^Folder policy 'ask'/);
+    assert.match(selects[2]?.title ?? "", /^Read policy/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: outside=block refuses an outside repo without a dialog", async () => {
+  const { pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "block" },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const result = await commitCall(pi, ctx, "git -C ../other add x.txt");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /^Folder policy is 'block'/);
+    assert.match(String((result as any).reason), /outside the permitted folders/);
+    assert.equal(selects.length, 0, "block must not open a dialog");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: outside=block refuses an unverifiable root without a dialog", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "block" },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    // A directory inside the base that is not a git repo anywhere above it:
+    // `git rev-parse --show-toplevel` fails, detectRepoRoot falls through, so
+    // the repo root is unverifiable rather than outside.
+    fs.mkdirSync(path.join(cwd, "not-a-repo"));
+    const result = await commitCall(pi, ctx, "git -C not-a-repo add x.txt");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /^Folder policy is 'block'/);
+    assert.match(String((result as any).reason), /could not be verified/);
+    assert.equal(selects.length, 0, "block must not open a dialog");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: a missing git binary fails closed with an explicit reason", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  const previous = process.env.PI_GIT_BIN;
+  try {
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a\n");
+    git(cwd, ["add", "-A"]);
+    git(cwd, ["commit", "-qm", "init"]);
+
+    process.env.PI_GIT_BIN = path.join(cwd, "missing-git-binary");
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /git executable not found/);
+    assert.match(String((result as any).reason), /PI_GIT_BIN/);
+    assert.doesNotMatch(String((result as any).reason), /\bENOENT\b/);
+    assert.equal(selects.length, 0, "a missing git must not open a dialog");
+  } finally {
+    if (previous === undefined) delete process.env.PI_GIT_BIN;
+    else process.env.PI_GIT_BIN = previous;
+    await cleanup();
+  }
+});
+
 test("commit: explicit git add of a sensitive file is blocked", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
+  const { pi, ctx, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
       commitPolicy: { mode: "allow" },
@@ -177,7 +289,10 @@ test("commit: unsafe folder grant is refused when the project is untrusted", asy
         commitPolicy: { mode: "allow" },
       },
     },
-    false,
+    {
+      projectTrusted: false,
+      selectAnswer: "Always allow this repository folder",
+    },
   );
   try {
     fs.mkdirSync(agentDir, { recursive: true });
@@ -186,7 +301,6 @@ test("commit: unsafe folder grant is refused when the project is untrusted", asy
       JSON.stringify({ workflow: { commitPolicy: { mode: "allow" } } }, null, 2),
       "utf8",
     );
-    (ctx as any).ui.select = async () => "Always allow this repository folder";
     const result = await commitCall(pi, ctx, "git -C ../other add x.txt");
     assert.ok(result && (result as any).block);
     assert.match(String((result as any).reason), /trusted|trust/i);

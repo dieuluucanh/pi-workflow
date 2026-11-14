@@ -1001,7 +1001,11 @@ export function decideFolderGate(input: FolderGateInput): FolderGateDecision {
     if (!input.granted) return "ask";
   }
   if (input.network && !input.granted) return "ask";
-  if (input.uncertain) return "ask";
+  if (input.uncertain) {
+    // An unverifiable target follows the user's chosen outside action: a
+    // policy of "block" must not open a dialog, and "ask" must ask.
+    return input.outsideAction === "block" ? "block" : "ask";
+  }
   return "allow";
 }
 
@@ -1031,6 +1035,47 @@ export function describeFolderPolicyMode(mode: FolderPolicyMode): string {
     default:
       return "the current repository root";
   }
+}
+
+/**
+ * Human-readable assessment of one folder evaluation, for `/permissions
+ * explain` and the folder status output. Bounded so a broad command cannot
+ * flood the transcript; `` allowed/outside/sensitive/uncertain counts are
+ * always shown.
+ */
+export function describeFolderEvaluation(
+  evaluation: FolderEvaluation,
+  base: string,
+): string[] {
+  const MAX = 8;
+  const lines = [
+    `Folder base: ${base}`,
+    `  targets: ${evaluation.allowed.length} inside, ${evaluation.outside.length} outside, ${evaluation.sensitive.length} sensitive, ${evaluation.uncertain.length} unverifiable`,
+  ];
+  const add = (label: string, values: readonly string[]) => {
+    for (const value of values.slice(0, MAX)) lines.push(`  ${label}: ${value}`);
+    if (values.length > MAX) {
+      lines.push(`  ${label}: … and ${values.length - MAX} more`);
+    }
+  };
+  add(
+    "inside",
+    evaluation.allowed.map((target) => target.path),
+  );
+  add(
+    "outside",
+    evaluation.outside.map((target) => target.path),
+  );
+  add(
+    "network",
+    evaluation.network.map((target) => target.path),
+  );
+  add(
+    "sensitive",
+    evaluation.sensitive.map((hit) => `${hit.path} (${hit.pattern})`),
+  );
+  add("unverifiable", evaluation.uncertain);
+  return lines;
 }
 
 // ── /folder-policy completions ───────────────────────────────────────

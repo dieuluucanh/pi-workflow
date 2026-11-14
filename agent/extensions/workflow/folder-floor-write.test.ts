@@ -5,7 +5,9 @@
  *
  * Drives the real `tool_call` handler: write mode `allow` must not escape the
  * folder scope; sensitive write targets stay blocked inside the folder; the
- * "Always allow" dialog persists a project-scoped write grant.
+ * "Always allow" dialog persists a project-scoped write grant; and ordinary
+ * in-repo toolchain commands (sed, npm run build, npx, …) must not prompt in
+ * Default-allow or Build.
  */
 
 import { test } from "node:test";
@@ -16,11 +18,21 @@ import * as path from "node:path";
 import workflowExtension from "./index.ts";
 import { makeFakeCtx, makeFakePi, tmpProject } from "./test-support.ts";
 
-async function boot(settings: Record<string, unknown>, projectTrusted = true) {
+interface BootOptions {
+  projectTrusted?: boolean;
+  selectAnswer?: string;
+  selectAnswers?: Array<string | undefined>;
+}
+
+async function boot(
+  settings: Record<string, unknown>,
+  options: BootOptions = {},
+) {
   const { root, cwd, agentDir } = tmpProject();
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
   fs.writeFileSync(
     path.join(cwd, ".pi", "settings.json"),
     `${JSON.stringify(settings, null, 2)}\n`,
@@ -30,11 +42,12 @@ async function boot(settings: Record<string, unknown>, projectTrusted = true) {
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx } = makeFakeCtx({
+  const { ctx, selects, notifies } = makeFakeCtx({
     cwd,
     hasUI: true,
-    projectTrusted,
-    selectAnswer: undefined,
+    projectTrusted: options.projectTrusted !== false,
+    selectAnswer: options.selectAnswer,
+    selectAnswers: options.selectAnswers,
   });
   await pi.emit("session_start", { reason: "startup" }, ctx);
   const cleanup = async () => {
@@ -47,8 +60,10 @@ async function boot(settings: Record<string, unknown>, projectTrusted = true) {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { cwd, agentDir, pi, ctx, cleanup };
+  return { cwd, agentDir, pi, ctx, selects, notifies, cleanup };
 }
+
+let callSeq = 0;
 
 function toolCall(
   pi: ReturnType<typeof makeFakePi>,
@@ -58,30 +73,70 @@ function toolCall(
 ) {
   const handlers = pi.handlers.get("tool_call") ?? [];
   assert.ok(handlers.length > 0, "tool_call handler registered");
-  return handlers[0]({ toolName, toolCallId: "t1", input }, ctx);
+  // A fresh id makes this call its own batch, so the gate never reuses a
+  // previous call's dialog answer.
+  return handlers[0](
+    { toolName, toolCallId: `t${++callSeq}`, input },
+    ctx,
+  );
 }
 
+/** Enter Build mode and give it the todo list the build guard requires. */
+async function enterBuildWithTodo(
+  pi: ReturnType<typeof makeFakePi>,
+  ctx: unknown,
+) {
+  const build = pi.commands.build;
+  assert.ok(build, "/build command registered");
+  await build.handler("", ctx);
+  const todo = (pi.tools as any).workflow_todo;
+  assert.ok(todo, "workflow_todo tool registered");
+  await todo.execute(
+    "todo-setup",
+    { action: "add", text: "probe step" },
+    undefined,
+    undefined,
+    ctx,
+  );
+}
+
+const IN_REPO_COMMANDS: Array<[string, string]> = [
+  ["sed with file", "sed -n '1,5p' package.json"],
+  ["sed without file", "sed -n '900,1100p'"],
+  ["npm run build", "npm run build"],
+  ["npx vitest", "npx vitest run"],
+  ["node script", "node scripts/x.mjs"],
+  ["git diff | sed", "git diff | sed -n '1,20p'"],
+];
+
 test("write: default folder scope asks outside even with writePolicy allow", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
-    workflow: {
-      folderPolicy: { mode: "cwd", outside: "ask" },
-      writePolicy: { mode: "allow" },
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask" },
+        writePolicy: { mode: "allow" },
+      },
     },
-  });
+    { selectAnswers: [undefined, "Allow once (this turn)"] },
+  );
   try {
     const outside = path.join(cwd, "..", "outside.txt");
-    (ctx as any).ui.select = async () => undefined; // cancel -> deny
     const blocked = await toolCall(pi, ctx, "write", { path: outside });
     assert.ok(blocked && (blocked as any).block);
     assert.match(String((blocked as any).reason), /folder|outside|permitted/i);
+    assert.equal(selects.length, 1);
+    assert.match(selects[0]?.title ?? "", /Write policy|Folder policy/);
 
-    await pi.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
-    (ctx as any).ui.select = async () => "Allow once (this turn)";
-    assert.equal(
-      await toolCall(pi, ctx, "write", {
-        path: path.join(cwd, "..", "outside-2.txt"),
-      }),
-      undefined,
+    const allowed = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, "..", "outside-2.txt"),
+    });
+    assert.equal(allowed, undefined);
+    assert.equal(selects.length, 2);
+    assert.ok(
+      selects[1]?.options.some((option) =>
+        String(option).startsWith("Allow once"),
+      ),
+      "the second dialog offers Allow once",
     );
   } finally {
     await cleanup();
@@ -89,7 +144,7 @@ test("write: default folder scope asks outside even with writePolicy allow", asy
 });
 
 test("write: folderPolicy outside=block refuses outside with writePolicy allow", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "block" },
       writePolicy: { mode: "allow" },
@@ -101,47 +156,54 @@ test("write: folderPolicy outside=block refuses outside with writePolicy allow",
     });
     assert.ok(result && (result as any).block);
     assert.match(String((result as any).reason), /Folder policy|permitted/i);
+    assert.equal(selects.length, 0, "block must not open a dialog");
   } finally {
     await cleanup();
   }
 });
 
 test("write: sensitive target is blocked inside the folder even with allow", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
       writePolicy: { mode: "allow" },
     },
   });
   try {
-    const result = await toolCall(pi, ctx, "write", { path: path.join(cwd, ".env") });
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, ".env"),
+    });
     assert.ok(result && (result as any).block);
     assert.match(String((result as any).reason), /sensitive/i);
+    assert.equal(selects.length, 0, "a sensitive block must not ask");
   } finally {
     await cleanup();
   }
 });
 
 test("write: shell destination outside is gated", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
-    workflow: {
-      folderPolicy: { mode: "cwd", outside: "ask" },
-      writePolicy: { mode: "allow" },
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask" },
+        writePolicy: { mode: "allow" },
+      },
     },
-  });
+    { selectAnswer: undefined },
+  );
   try {
-    (ctx as any).ui.select = async () => undefined;
     const result = await toolCall(pi, ctx, "bash", {
       command: `echo x > "${path.join(cwd, "..", "out.txt").replace(/\\/g, "/")}"`,
     });
     assert.ok(result && (result as any).block);
+    assert.equal(selects.length, 1);
   } finally {
     await cleanup();
   }
 });
 
 test("write: shell redirection to .env is blocked as sensitive", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot({
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
       writePolicy: { mode: "allow" },
@@ -153,23 +215,33 @@ test("write: shell redirection to .env is blocked as sensitive", async () => {
     });
     assert.ok(result && (result as any).block);
     assert.match(String((result as any).reason), /sensitive/i);
+    assert.equal(selects.length, 0);
   } finally {
     await cleanup();
   }
 });
 
 test("write: Always allow persists a project-scoped write grant", async () => {
-  const { cwd, agentDir, pi, ctx, cleanup } = await boot({
-    workflow: {
-      folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
-      writePolicy: { mode: "allow" },
+  const { cwd, agentDir, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+        writePolicy: { mode: "allow" },
+      },
     },
-  });
+    { selectAnswer: "Always allow this folder" },
+  );
   try {
     const outside = path.join(cwd, "..", "shared", "out.txt");
-    (ctx as any).ui.select = async () => "Always allow this path";
     const result = await toolCall(pi, ctx, "write", { path: outside });
     assert.equal(result, undefined);
+    assert.equal(selects.length, 1, "the dialog was recorded");
+    assert.ok(
+      selects[0]?.options.some((option) =>
+        String(option).startsWith("Always allow this folder"),
+      ),
+      "an outside folder grant is labelled as a folder",
+    );
     const project = JSON.parse(
       fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
     );
@@ -188,19 +260,41 @@ test("write: Always allow persists a project-scoped write grant", async () => {
   }
 });
 
-test("write: a path-less mutating tool is uncertain, not silently allowed", async () => {
-  const { pi, ctx, cleanup } = await boot({
+test("write: a path-less mutating tool follows the write mode, not folder uncertainty", async () => {
+  const allowed = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
       writePolicy: { mode: "allow", mutatingTools: ["custom_write"] },
     },
   });
   try {
-    (ctx as any).ui.select = async () => undefined;
-    const result = await toolCall(pi, ctx, "custom_write", { blob: "x" });
-    assert.ok(result && (result as any).block);
+    const result = await toolCall(allowed.pi, allowed.ctx, "custom_write", {
+      blob: "x",
+    });
+    assert.equal(result, undefined);
+    assert.equal(allowed.selects.length, 0);
   } finally {
-    await cleanup();
+    await allowed.cleanup();
+  }
+
+  const asked = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask" },
+        writePolicy: { mode: "ask", mutatingTools: ["custom_write"] },
+      },
+    },
+    { selectAnswer: "Allow once (this turn)" },
+  );
+  try {
+    const result = await toolCall(asked.pi, asked.ctx, "custom_write", {
+      blob: "x",
+    });
+    assert.equal(result, undefined);
+    assert.equal(asked.selects.length, 1, "writePolicy ask still covers it");
+    assert.match(asked.selects[0]?.title ?? "", /Write policy/);
+  } finally {
+    await asked.cleanup();
   }
 });
 
@@ -212,15 +306,175 @@ test("write: Always allow refuses a project grant when the project is untrusted"
         writePolicy: { mode: "allow" },
       },
     },
-    false,
+    { projectTrusted: false, selectAnswer: "Always allow this path" },
   );
   try {
-    (ctx as any).ui.select = async () => "Always allow this path";
     const result = await toolCall(pi, ctx, "write", {
       path: path.join(cwd, "..", "outside.txt"),
     });
     assert.ok(result && (result as any).block);
     assert.match(String((result as any).reason), /trusted|trust/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: Build mode allows in-repo toolchain commands without a dialog", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "repo", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    await enterBuildWithTodo(pi, ctx);
+    const inside = path.join(cwd, "src", "new.ts");
+    const cases: Array<[string, string, Record<string, unknown>]> = [
+      ...IN_REPO_COMMANDS.map(
+        ([label, command]) => [label, "bash", { command }] as const,
+      ).map(([label, tool, input]) => [label, tool, input] as [string, string, Record<string, unknown>]),
+      ["edit", "edit", { path: inside }],
+      ["write", "write", { path: inside, content: "x" }],
+    ];
+    for (const [label, tool, input] of cases) {
+      const before = selects.length;
+      const result = await toolCall(pi, ctx, tool, input);
+      assert.equal(result, undefined, `${label} must not be blocked`);
+      assert.equal(selects.length, before, `${label} must not prompt`);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: Default + writePolicy allow allows in-repo toolchain commands", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "repo", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const inside = path.join(cwd, "src", "new-default.ts");
+    const cases: Array<[string, string, Record<string, unknown>]> = [
+      ...IN_REPO_COMMANDS.map(
+        ([label, command]) => [label, "bash", { command }] as const,
+      ).map(([label, tool, input]) => [label, tool, input] as [string, string, Record<string, unknown>]),
+      ["edit", "edit", { path: inside }],
+      ["write", "write", { path: inside, content: "x" }],
+    ];
+    for (const [label, tool, input] of cases) {
+      const before = selects.length;
+      const result = await toolCall(pi, ctx, tool, input);
+      assert.equal(result, undefined, `${label} must not be blocked`);
+      assert.equal(selects.length, before, `${label} must not prompt`);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: folderPolicy any disables the floor's asks", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "any", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    for (const [label, command] of IN_REPO_COMMANDS) {
+      const before = selects.length;
+      const result = await toolCall(pi, ctx, "bash", { command });
+      assert.equal(result, undefined, `${label} must not be blocked under any`);
+      assert.equal(selects.length, before, `${label} must not prompt under any`);
+    }
+    const outside = path.join(cwd, "..", "outside-any.txt");
+    const result = await toolCall(pi, ctx, "write", {
+      path: outside,
+      content: "x",
+    });
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 0, "mode any must not ask for an outside write");
+
+    const sensitive = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, ".env"),
+      content: "x",
+    });
+    assert.ok(sensitive && (sensitive as any).block);
+    assert.match(String((sensitive as any).reason), /sensitive/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: writePolicy ask still prompts for an in-repo sed", async () => {
+  const { pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "repo", outside: "ask" },
+        writePolicy: { mode: "ask" },
+      },
+    },
+    { selectAnswer: "Allow once (this turn)" },
+  );
+  try {
+    const result = await toolCall(pi, ctx, "bash", {
+      command: "sed -n '1,5p' package.json",
+    });
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 1, "ask is the strict opt-in");
+    assert.match(selects[0]?.title ?? "", /Write policy/);
+
+    // A verify-class command is not a write and stays free under ask.
+    const before = selects.length;
+    const test = await toolCall(pi, ctx, "bash", { command: "npm test" });
+    assert.equal(test, undefined);
+    assert.equal(selects.length, before);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: Build asks for an outside write with a Folder policy dialog", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "repo", outside: "ask" },
+        writePolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswer: undefined },
+  );
+  try {
+    await enterBuildWithTodo(pi, ctx);
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, "..", "shared", "outside-build.txt"),
+      content: "x",
+    });
+    assert.ok(result && (result as any).block);
+    assert.equal(selects.length, 1);
+    assert.match(
+      selects[0]?.title ?? "",
+      /^Folder policy 'ask'/,
+      "the dialog is attributed to the folder floor",
+    );
+    assert.match(selects[0]?.title ?? "", /Outside:/);
+    assert.ok(
+      selects[0]?.options.some((option) =>
+        String(option).startsWith("Always allow this folder"),
+      ),
+      "an outside grant is labelled as a folder",
+    );
+
+    // Sensitive stays blocked inside, even in Build.
+    const before = selects.length;
+    const sensitive = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, ".env"),
+      content: "x",
+    });
+    assert.ok(sensitive && (sensitive as any).block);
+    assert.match(String((sensitive as any).reason), /sensitive/i);
+    assert.equal(selects.length, before);
   } finally {
     await cleanup();
   }

@@ -830,6 +830,7 @@ test("sanitizeWriteInstruction: hard-caps the length with an ellipsis", () => {
 test("parseWriteGateChoice: allow-once and always are recognised", () => {
   assert.equal(parseWriteGateChoice("Allow once"), "allow-once");
   assert.equal(parseWriteGateChoice("Always allow this path"), "always");
+  assert.equal(parseWriteGateChoice("Always allow this folder"), "always");
   assert.equal(parseWriteGateChoice("Always allow this command"), "always");
 });
 
@@ -859,6 +860,8 @@ test("coupling guard: every real option parses to the intended choice", () => {
   for (const kind of [
     "path",
     "paths",
+    "folder",
+    "folders",
     "command",
     "commands",
     "mixed",
@@ -906,6 +909,25 @@ test("buildWriteDenyReason: a guided denial quotes the instruction verbatim", ()
   assert.match(reason, /Target: C:\/work\/a\.ts/);
 });
 
+test("buildWriteDenyReason: a folder refusal is attributed to the folder policy", () => {
+  const reason = buildWriteDenyReason({
+    target: "C:/work/../outside.txt",
+    source: "folder",
+    outside: "C:/work",
+  });
+  assert.match(reason, /^Folder policy 'ask'/);
+  assert.match(reason, /outside C:\/work/);
+  assert.doesNotMatch(reason, /^Write policy/);
+});
+
+test("buildWriteDenyReason: a mixed refusal names both policies", () => {
+  const reason = buildWriteDenyReason({
+    target: "C:/work/../outside.txt",
+    source: "mixed",
+  });
+  assert.match(reason, /^Permission policy 'ask'/);
+});
+
 test("buildWriteDenyReason: an empty instruction degrades to a plain denial", () => {
   const guided = buildWriteDenyReason({
     target: "a.ts",
@@ -951,6 +973,8 @@ test("writeGateOptions: the labels state the scope they cover", () => {
   // The "always" label matches the number/kind of the listed writes.
   assert.equal(writeGateAlwaysLabel("path"), "Always allow this path");
   assert.equal(writeGateAlwaysLabel("paths"), "Always allow these paths");
+  assert.equal(writeGateAlwaysLabel("folder"), "Always allow this folder");
+  assert.equal(writeGateAlwaysLabel("folders"), "Always allow these folders");
   assert.equal(writeGateAlwaysLabel("command"), "Always allow this command");
   assert.equal(writeGateAlwaysLabel("commands"), "Always allow these commands");
   assert.equal(writeGateAlwaysLabel("mixed"), "Always allow these");
@@ -1045,6 +1069,23 @@ test("writeGateItemsKind: the kind follows the listed writes", () => {
     "commands",
   );
   assert.equal(writeGateItemsKind([pathItem, commandItem]), "mixed");
+
+  const folderItem: WriteGateItem = {
+    ...pathItem,
+    target: "c:/shared",
+    grantPaths: ["c:/shared"],
+    grantKind: "folder",
+  };
+  assert.equal(writeGateItemsKind([folderItem]), "folder");
+  assert.equal(
+    writeGateItemsKind([folderItem, { ...folderItem, key: "path:c" }]),
+    "folders",
+  );
+  // A file grant keeps the generic path label even beside a folder grant.
+  assert.equal(
+    writeGateItemsKind([folderItem, pathItem]),
+    "paths",
+  );
 });
 
 test("describeWriteGateItems: lists what the answer covers", () => {
@@ -1084,4 +1125,25 @@ test("writeGateTitle: one write keeps today's wording, several are listed", () =
   assert.match(title, /allow these 2 writes\?/);
   assert.ok(title.includes("src/a.ts"));
   assert.ok(title.includes("src/b.ts"));
+});
+
+test("writeGateTitle: folder and mixed sources are attributed", () => {
+  const item: WriteGateItem = {
+    tool: "write",
+    target: "c:/outside.txt",
+    key: "path:c:/outside.txt",
+    grantPaths: ["c:/outside.txt"],
+    grantKind: "folder",
+  };
+  const folder = writeGateTitle([item], "folder", "c:/work");
+  assert.match(folder, /^Folder policy 'ask'/);
+  assert.match(folder, /Outside: c:\/work/);
+  assert.match(folder, /Target: c:\/outside.txt/);
+
+  const mixed = writeGateTitle([item], "mixed", "c:/work");
+  assert.match(mixed, /^Permission required:/);
+  assert.match(mixed, /folder policy are 'ask'/);
+
+  // The default keeps the write-policy wording verbatim.
+  assert.match(writeGateTitle([item]), /^Write policy 'ask'/);
 });

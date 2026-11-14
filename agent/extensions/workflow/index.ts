@@ -123,6 +123,7 @@ import {
 import {
   baseFolderRoots,
   decideFolderGate,
+  describeFolderEvaluation,
   detectRepoRoot,
   isBroadGrantRoot,
   outsideProjectRootForTarget,
@@ -185,6 +186,7 @@ import {
   WRITE_INSTRUCTION_PROMPT_TITLE,
   type WriteGateChoice,
   type WriteGateItem,
+  type WriteGateSource,
   type WriteCallClassification,
   type WritePolicyConfig,
   type WritePolicyMode,
@@ -3281,8 +3283,9 @@ export default function workflowExtension(
   });
 
   // ── /write-policy: view/set the write permission (workflow.writePolicy) ──
-  // Available in every mode: it only writes settings JSON; the gate itself
-  // lives in tool_call and applies in Default mode only.
+  // Available in every mode: it only writes settings JSON. The write *mode*
+  // applies in Default mode only; the shared folder floor applies in every
+  // mode, Build included.
   pi.registerCommand("write-policy", {
     description:
       "View or set the write permission (what the agent may modify in Default mode): /write-policy allow|ask|never [global|project]",
@@ -3311,7 +3314,8 @@ export default function workflowExtension(
         const lines = [
           `Write policy: ${resolved.config.mode} (${where})`,
           `  ${describeWritePolicyMode(resolved.config.mode)}`,
-          "  Applies to Default mode only — Plan mode is read-only already, /build is the execution escape hatch.",
+          "  The write mode applies to Default mode only; the shared folder floor applies in every mode.",
+          "  Plan mode is read-only already; /build is the execution escape hatch.",
         ];
         if (resolved.config.allowedPaths.length > 0) {
           lines.push(
@@ -3404,6 +3408,7 @@ export default function workflowExtension(
           `Folder policy: ${resolved.config.mode} (${resolved.sources.mode === "default" ? "default" : resolved.sources.mode + " settings"})`,
           `  outside: ${resolved.config.outside}; grantScope: ${resolved.config.grantScope}; templates: ${resolved.config.sensitiveTemplates}`,
           `  base: ${detectRepoRoot(cwd) ?? cwd}`,
+          "  unverifiable writes: not prompted (use /write-policy ask for strictness)",
           `  sensitive: ${DEFAULT_SENSITIVE_PATTERNS.length} default, ${resolved.config.sensitivePatterns.length} extra, ${resolved.config.sensitiveExemptions.length} exemption(s)`,
           `Global: ${paths.global}`,
           `Project: ${paths.project}${resolved.sources.projectIgnored ? " (ignored: project not trusted)" : ""}`,
@@ -3519,7 +3524,55 @@ export default function workflowExtension(
       const first = raw.split(/\s+/)[0]?.toLowerCase() ?? "";
       // `/permissions explain <cmd>` and `/permissions <cmd>` both work.
       const command = first === "explain" ? raw.slice("explain".length).trim() : raw;
-      ctx.ui.notify(describeCommandPolicy(command).join("\n"), "info");
+      const lines = describeCommandPolicy(command);
+      if (command.trim()) {
+        const cwd = (ctx as any)?.cwd ?? process.cwd();
+        const trusted = (ctx as any).isProjectTrusted?.() === true;
+        const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
+          trusted,
+        }).config;
+        const writeConfig = readWritePolicyConfig(cwd, getAgentDir(), {
+          trusted,
+        }).config;
+        const readConfig = readReadPolicyConfig(cwd, getAgentDir(), {
+          trusted,
+        }).config;
+        const analysis = analyzeShellPaths(command, cwd);
+        const classification = classifyWriteCall(
+          "bash",
+          { command },
+          writeConfig,
+        );
+        const writeTargets = writeFolderTargetsFor(
+          "bash",
+          { command },
+          classification,
+          cwd,
+        );
+        const evaluation = evaluateFolderTargets(
+          [...analysis.reads, ...writeTargets],
+          {
+            config: folderConfig,
+            grants: [...writeConfig.allowedPaths, ...readConfig.allowedPaths],
+            cwd,
+            action: "write",
+          },
+        );
+        lines.push(
+          "",
+          ...describeFolderEvaluation(
+            evaluation,
+            detectRepoRoot(cwd) ?? cwd,
+          ),
+        );
+        if (analysis.uncertain.length > 0) {
+          lines.push(`  shell analysis: ${analysis.uncertain.join("; ")}`);
+        }
+        lines.push(
+          "  unverifiable writes are not prompted under writePolicy allow/Build; use /write-policy ask for strictness",
+        );
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
     },
     getArgumentCompletions: (prefix: string) =>
       permissionsArgumentCompletions(prefix),
@@ -10148,15 +10201,29 @@ export default function workflowExtension(
     repoRoot: string,
     args: string[],
   ): { ok: boolean; paths: string[]; error?: string } {
+    // The Pi host's PATH is not the shell's PATH (Windows especially). Honour
+    // an explicit override so a desktop install without git on PATH can still
+    // run the commit gate's synchronous checks.
+    const gitBinary = process.env.PI_GIT_BIN?.trim() || "git";
     try {
-      const res = spawnSync("git", ["-C", repoRoot, ...args], {
+      const res = spawnSync(gitBinary, ["-C", repoRoot, ...args], {
         encoding: "utf8",
         timeout: 5000,
         windowsHide: true,
         maxBuffer: 8 * 1024 * 1024,
       });
-      if (res.error)
-        return { ok: false, paths: [], error: res.error.message };
+      if (res.error) {
+        const code = (res.error as NodeJS.ErrnoException).code;
+        const missing =
+          code === "ENOENT" || /\bENOENT\b/.test(res.error.message);
+        return {
+          ok: false,
+          paths: [],
+          error: missing
+            ? `git executable not found (${gitBinary}); set PI_GIT_BIN to the git binary`
+            : res.error.message,
+        };
+      }
       if (res.status !== 0)
         return {
           ok: false,
@@ -10285,14 +10352,16 @@ export default function workflowExtension(
     );
     if (resolvedRoot.uncertain)
       folderEvaluation.uncertain.push(repoRoot);
-    let folderDecision = decideFolderGate({
+    const folderOutside = folderEvaluation.outside.length > 0;
+    const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
+    const folderDecision = decideFolderGate({
       sensitive: false,
       outside: folderEvaluation.outside.length > 0,
       outsideAction: folderConfig.outside,
       uncertain: folderEvaluation.uncertain.length > 0,
     });
-    if (folderEvaluation.uncertain.length > 0 && folderDecision === "allow")
-      folderDecision = "ask";
+    // decideFolderGate already turns uncertainty into ask (outside: ask) or
+    // block (outside: block); there is no "allow" case left to escalate.
     const sensitiveHit = gitScope
       ? commitSensitiveHit(gitScope, folderConfig)
       : undefined;
@@ -10347,7 +10416,10 @@ export default function workflowExtension(
         return {
           block: true,
           reason:
-            `Folder policy is 'block' (workflow.folderPolicy): \`git ${hit}\` targets ${repoRoot}, which is outside the permitted folders. ` +
+            `Folder policy is 'block' (workflow.folderPolicy): \`git ${hit}\` targets ${repoRoot}, ` +
+            (folderOutside
+              ? `which is outside the permitted folders (${baseRoot}). `
+              : "which could not be verified against the permitted folders. ") +
             "Do not retry. Ask the user to grant that repository folder or change /folder-policy.",
         };
       }
@@ -10371,12 +10443,10 @@ export default function workflowExtension(
       return {
         block: true,
         reason:
-          `Commit policy is 'ask' (workflow.commitPolicy): \`git ${hit}\` needs user approval, ` +
+          `${folderOutside ? "Folder policy is 'ask' (workflow.folderPolicy)" : "Commit policy is 'ask' (workflow.commitPolicy)"}: \`git ${hit}\` needs user approval, ` +
           "but no interactive UI is available. Leave the change uncommitted and let the user decide.",
       };
     }
-    const folderOutside = folderEvaluation.outside.length > 0;
-    const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
     const commitGrant = folderOutside
       ? (outsideProjectRootForTarget({ path: repoRoot, kind: "dir" }, baseRoot) ??
         repoRoot)
@@ -10419,6 +10489,14 @@ export default function workflowExtension(
       return undefined;
     }
     if (answer.startsWith("Allow")) return undefined;
+    if (folderOutside) {
+      return {
+        block: true,
+        reason:
+          `Folder policy 'ask': the user declined \`git ${hit}\` for ${repoRoot}, which is outside ${baseRoot}. ` +
+          "Do not retry — leave the changes uncommitted for the user.",
+      };
+    }
     return {
       block: true,
       reason:
@@ -10495,19 +10573,29 @@ export default function workflowExtension(
     cwd: string,
     baseRoot: string,
   ): WriteGateItem {
-    const paths = targets
-      .map(
-        (target) =>
-          outsideProjectRootForTarget(target, baseRoot) ??
-          normalizeWritePath(target.path, cwd),
-      )
-      .filter(Boolean);
-    if (paths.length === 0) return item;
-    const unique = [...new Set(paths)].sort();
+    const grantEntries = targets
+      .map((target) => {
+        const exact = normalizeWritePath(target.path, cwd);
+        const outsideRoot = outsideProjectRootForTarget(target, baseRoot);
+        const path = outsideRoot ?? exact;
+        // A dir/repo target (or a glob's static prefix) is granted as a
+        // folder; so is a containing folder computed for an outside file. A
+        // file directly in the common parent is granted as that file alone.
+        const folder =
+          target.kind !== "file" ||
+          (outsideRoot !== undefined && outsideRoot !== exact);
+        return { path, folder };
+      })
+      .filter((entry) => entry.path.length > 0);
+    if (grantEntries.length === 0) return item;
+    const unique = [...new Set(grantEntries.map((entry) => entry.path))].sort();
     return {
       ...item,
       target: unique.join(", "),
       grantPaths: [...new Set([...(item.grantPaths ?? []), ...unique])],
+      grantKind: grantEntries.every((entry) => entry.folder)
+        ? "folder"
+        : "file",
       grantCommand: undefined,
       key: `path:${unique.join("|")}`,
     };
@@ -10610,13 +10698,16 @@ export default function workflowExtension(
   }
 
   /**
-   * Write permission gate (workflow.writePolicy) — Default mode only.
+   * Write permission gate (workflow.writePolicy + the shared folder floor).
    *
    * The Workflow extension's three modes are Plan → Build → Default. Plan
-   * mode is read-only and Build mode is unrestricted by design, but DEFAULT
-   * mode was ALSO unrestricted: `resolveSessionRole()` returns undefined
-   * there, so the tool_call gate has no branch to take and the agent edits
-   * files without asking. This gate is the missing permission knob.
+   * mode is read-only and Build mode is unrestricted *inside the permitted
+   * folders*, but DEFAULT mode was ALSO unrestricted: `resolveSessionRole()`
+   * returns undefined there, so the tool_call gate has no branch to take and
+   * the agent edits files without asking. This gate is the missing permission
+   * knob. The write MODE is Default-only; the folder floor applies in every
+   * mode (Build included) and asks only for proven outside targets, sensitive
+   * files, or an explicit target path that cannot be resolved.
    *
    * It is deliberately INDEPENDENT of the role gate and of the commit
    * policy: those govern *what* a role may do, this governs *whether the
@@ -10701,9 +10792,16 @@ export default function workflowExtension(
         sensitive: false,
         outside: folderEvaluation.outside.length > 0,
         outsideAction: folderConfig.outside,
-        uncertain:
-          folderEvaluation.uncertain.length > 0 ||
-          (classification.mutating && folderTargets.length === 0),
+        // Only a concrete target path that cannot be canonicalised is folder
+        // uncertainty. "Mutating but no discovered write target" is NOT: the
+        // shell analyzer cannot see inside `npm run build`, `node script`,
+        // `npx`, `sed`/`awk` programs or `powershell`, and treating that as
+        // "possibly outside" made Build and writePolicy:allow prompt for
+        // ordinary in-repo toolchain commands. The capability policy owns
+        // that case — writePolicy:ask still asks for every mutating call —
+        // and undiscoverable shell writes are the documented residual
+        // (README "Not a sandbox").
+        uncertain: folderEvaluation.uncertain.length > 0,
       });
       const allowed = isWriteCallAllowed(classification, config, cwd);
       const decision = decideWriteGate({
@@ -10713,6 +10811,24 @@ export default function workflowExtension(
         folder: folderDecision,
       });
       if (decision === "allow") return undefined;
+
+      // Which policy actually produced this ask. A folder-sourced prompt must
+      // not be labelled "Write policy" — that misattribution is what made the
+      // in-repo toolchain regression look like a write-policy bug.
+      const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
+      const folderAsk = folderDecision === "ask";
+      const gateSource: WriteGateSource = folderAsk
+        ? effectiveWriteMode === "ask"
+          ? "mixed"
+          : "folder"
+        : "write";
+      const gatePolicyLabel =
+        gateSource === "folder"
+          ? "Folder policy"
+          : gateSource === "mixed"
+            ? "Permission policy"
+            : "Write policy";
+      const gateOutside = gateSource === "folder" ? baseRoot : undefined;
 
       const target =
         folderTargets.length > 0
@@ -10760,14 +10876,17 @@ export default function workflowExtension(
       const ui = ctx?.ui;
       if (!ui || !ctx.hasUI) {
         const policyName =
-          effectiveWriteMode === "allow"
+          gateSource === "folder"
             ? "Folder policy is 'ask' (workflow.folderPolicy)"
-            : "Write policy is 'ask' (workflow.writePolicy)";
+            : gateSource === "mixed"
+              ? "Folder and write policies are 'ask' (workflow.folderPolicy + workflow.writePolicy)"
+              : "Write policy is 'ask' (workflow.writePolicy)";
         return {
           block: true,
           reason:
             `${policyName}: writing needs user approval${why}, but no interactive UI is available. ` +
             "Do not retry. Report what you would change and let the user apply it, or tell them to switch to Build mode (/build). " +
+            (gateSource === "folder" ? `Outside: ${baseRoot}. ` : "") +
             `Target: ${target}`,
         };
       }
@@ -10784,7 +10903,6 @@ export default function workflowExtension(
         writeGateBatchCalls = [];
         writeGateBatchCallIds = new Set();
       }
-      const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
       const items = collectWriteGateItems(
         event,
         classification,
@@ -10815,6 +10933,8 @@ export default function workflowExtension(
             target,
             why: classification.reason,
             instruction: remembered.instruction,
+            source: gateSource,
+            outside: gateOutside,
           }),
         };
       }
@@ -10832,6 +10952,8 @@ export default function workflowExtension(
             target,
             why: classification.reason,
             instruction: answer.instruction,
+            source: gateSource,
+            outside: gateOutside,
           }),
         };
       }
@@ -10840,7 +10962,7 @@ export default function workflowExtension(
       const options = writeGateOptions(writeGateItemsKind(items));
       let sel: unknown;
       try {
-        sel = await ui.select(writeGateTitle(items), options);
+        sel = await ui.select(writeGateTitle(items, gateSource, baseRoot), options);
       } catch (_e) {
         void _e;
         sel = undefined;
@@ -10867,7 +10989,7 @@ export default function workflowExtension(
           return {
             block: true,
             reason:
-              "Write policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
+              `${gatePolicyLabel} 'ask': this project is not trusted, so a project-scoped grant would be ignored. ` +
               "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
           };
         }
@@ -10878,7 +11000,7 @@ export default function workflowExtension(
         if (written.ok) {
           try {
             (ctx as any).ui?.notify?.(
-              `Write policy: always allowed ${writeGateTargetsLabel(items)}`,
+              `${gatePolicyLabel}: always allowed ${writeGateTargetsLabel(items)}`,
               "info",
             );
           } catch (_e) {
@@ -10892,7 +11014,7 @@ export default function workflowExtension(
         return {
           block: true,
           reason:
-            `Write policy 'ask': could not save the permission grant (${written.error ?? "unknown error"}), so the write was not allowed. ` +
+            `${gatePolicyLabel} 'ask': could not save the permission grant (${written.error ?? "unknown error"}), so the write was not allowed. ` +
             `Target: ${target}`,
         };
       }
@@ -10942,6 +11064,8 @@ export default function workflowExtension(
         target: items.length > 1 ? writeGateTargetsLabel(items) : target,
         why: classification.reason,
         instruction,
+        source: gateSource,
+        outside: gateOutside,
       });
 
       if (instruction) {

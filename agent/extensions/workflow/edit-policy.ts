@@ -737,6 +737,10 @@ export function writeGateAlwaysLabel(kind: WriteGateOptionKind): string {
       return "Always allow this path";
     case "paths":
       return "Always allow these paths";
+    case "folder":
+      return "Always allow this folder";
+    case "folders":
+      return "Always allow these folders";
     case "command":
       return "Always allow this command";
     case "commands":
@@ -780,6 +784,10 @@ export interface WriteDenyReasonInput {
   why?: string;
   /** The user's instruction; sanitized here. Empty → a plain denial. */
   instruction?: string;
+  /** Which policy asked; a folder refusal must not blame the write policy. */
+  source?: WriteGateSource;
+  /** Base folder for a folder-sourced denial. */
+  outside?: string;
 }
 
 /**
@@ -795,16 +803,23 @@ export interface WriteDenyReasonInput {
 export function buildWriteDenyReason(input: WriteDenyReasonInput): string {
   const target = String(input.target ?? "").trim() || "the requested write";
   const why = input.why ? ` (${input.why})` : "";
+  const policyName =
+    input.source === "folder"
+      ? "Folder policy 'ask'"
+      : input.source === "mixed"
+        ? "Permission policy 'ask'"
+        : "Write policy 'ask'";
+  const outside = input.outside ? ` outside ${input.outside}` : "";
   const instruction = sanitizeWriteInstruction(input.instruction);
   if (!instruction) {
     return (
-      `Write policy 'ask': the user declined this write${why}. Do not retry it. ` +
+      `${policyName}: the user declined this write${outside}${why}. Do not retry it. ` +
       "Propose the change (a diff or the exact edit) and let the user apply it, or ask whether to continue another way. " +
       `Target: ${target}`
     );
   }
   return (
-    `Write policy 'ask': the user denied this write${why} and gave this instruction:\n\n` +
+    `${policyName}: the user denied this write${outside}${why} and gave this instruction:\n\n` +
     `${instruction}\n\n` +
     "Do not retry this write. Follow the instruction above. If it cannot be followed, say so and stop. " +
     `Target: ${target}`
@@ -861,20 +876,29 @@ export interface WriteGateItem {
   key: string;
   /** Path grants "always allow" would persist for this item. */
   grantPaths?: string[];
+  /** Whether those path grants cover files or an outside folder. */
+  grantKind?: "file" | "folder";
   /** Command (or tool) grant "always allow" would persist for this item. */
   grantCommand?: string;
 }
 
+/** Which policy produced the ask: the write mode, the folder floor, or both. */
+export type WriteGateSource = "write" | "folder" | "mixed";
+
 /**
  * Which "always allow" label fits a set of items.
  *
- * "path"/"paths" — every item writes files; "command"/"commands" — every
- * item runs a command (or a path-less tool, whose grant is stored in the
- * command list); "mixed" — both in one turn.
+ * "path"/"paths" — every item writes files; "folder"/"folders" — every
+ * path grant comes from the shared folder floor and covers a folder;
+ * "command"/"commands" — every item runs a command (or a path-less tool,
+ * whose grant is stored in the command list); "mixed" — more than one kind
+ * in one turn.
  */
 export type WriteGateOptionKind =
   | "path"
   | "paths"
+  | "folder"
+  | "folders"
   | "command"
   | "commands"
   | "mixed";
@@ -925,8 +949,10 @@ export function writeGateItemFromClassification(
     why: classification.reason,
     key: writeGateTargetKey(tool, classification, cwd),
   };
-  if (grantPaths.length > 0) item.grantPaths = grantPaths;
-  else if (classification.key) item.grantCommand = classification.key;
+  if (grantPaths.length > 0) {
+    item.grantPaths = grantPaths;
+    item.grantKind = "file";
+  } else if (classification.key) item.grantCommand = classification.key;
   return item;
 }
 
@@ -937,7 +963,12 @@ export function writeGateItemsKind(
   const paths = items.filter((i) => (i.grantPaths?.length ?? 0) > 0);
   const commands = items.filter((i) => Boolean(i.grantCommand));
   if (paths.length > 0 && commands.length > 0) return "mixed";
-  if (paths.length > 0) return paths.length === 1 ? "path" : "paths";
+  if (paths.length > 0) {
+    if (paths.every((i) => i.grantKind === "folder")) {
+      return paths.length === 1 ? "folder" : "folders";
+    }
+    return paths.length === 1 ? "path" : "paths";
+  }
   if (commands.length > 0) return commands.length === 1 ? "command" : "commands";
   return "path";
 }
@@ -974,16 +1005,31 @@ export function writeGateTargetsLabel(
 /**
  * The dialog title.
  *
- * One write keeps today's wording verbatim; several writes are listed, so
- * the user sees exactly what the answer covers.
+ * The source is the policy that actually produced the ask: a folder-floor
+ * prompt must not claim the write policy asked (that confusion is what made
+ * the in-repo toolchain regression look like a write-policy bug). One write
+ * keeps today's wording verbatim; several writes are listed.
  */
-export function writeGateTitle(items: readonly WriteGateItem[]): string {
+export function writeGateTitle(
+  items: readonly WriteGateItem[],
+  source: WriteGateSource = "write",
+  base?: string,
+): string {
+  const outside =
+    source === "folder" && base ? `\nOutside: ${base}` : "";
+  const header =
+    source === "folder"
+      ? "Folder policy 'ask': allow this write outside the permitted folders?"
+      : source === "mixed"
+        ? "Permission required: allow this write? (write policy and folder policy are 'ask')"
+        : "Write policy 'ask': allow this write?";
   if (items.length <= 1) {
     const only = items[0];
     const target = String(only?.target ?? "").trim();
     const reason = String(only?.why ?? "").trim();
     return (
-      `Write policy 'ask': allow this write?` +
+      header +
+      outside +
       (target ? `\nTarget: ${target}` : "") +
       (reason && reason !== target ? `\nReason: ${reason}` : "")
     );
@@ -993,9 +1039,13 @@ export function writeGateTitle(items: readonly WriteGateItem[]): string {
     .map((item) => `  • ${String(item.target ?? "").trim()}`)
     .filter((line) => line.trim().length > 3);
   if (items.length > 5) lines.push(`  … and ${items.length - 5} more`);
-  return (
-    `Write policy 'ask': allow these ${items.length} writes?\n${lines.join("\n")}`
-  );
+  const many =
+    source === "folder"
+      ? `Folder policy 'ask': allow these ${items.length} writes outside the permitted folders?`
+      : source === "mixed"
+        ? `Permission required: allow these ${items.length} writes? (write policy and folder policy are 'ask')`
+        : `Write policy 'ask': allow these ${items.length} writes?`;
+  return `${many}${outside}\n${lines.join("\n")}`;
 }
 
 // ── Argument completions (/write-policy) ────────────────────────────

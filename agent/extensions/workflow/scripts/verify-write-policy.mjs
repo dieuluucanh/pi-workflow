@@ -42,6 +42,7 @@ const cmds = {};
 let dialogs = 0;
 let inputDialogs = 0;
 let lastOptions = [];
+let lastTitle = "";
 const notifies = [];
 /** Every pi.sendUserMessage() call the extension made. */
 const sent = [];
@@ -82,6 +83,7 @@ const makeCtx = (answer, instruction) => ({
   ui: {
     select: async (title, options) => {
       dialogs++;
+      lastTitle = title;
       void title;
       lastOptions = options ?? [];
       return answer;
@@ -159,6 +161,11 @@ const backup = fs.readFileSync(SETTINGS, "utf8");
 const restore = () => fs.writeFileSync(SETTINGS, backup, "utf8");
 
 try {
+  // The script's fake ctx has no isProjectTrusted(), so a project-scoped
+  // "Always allow" grant would be refused (and would create a project file in
+  // the repo). Pin grants to the global file, which this script restores.
+  await cmds["folder-policy"].handler("grant global", makeCtx("Deny"));
+
   // ── Scenario 1: ask mode prompts on a write, and honours the answer ──
   await cmds["write-policy"].handler("ask", makeCtx(ALLOW_ONCE));
   dialogs = 0;
@@ -243,6 +250,21 @@ try {
     false,
   );
 
+  // Pin the folder/write policy so this machine's global config cannot change
+  // the verdict of the new checks.
+  await cmds["folder-policy"].handler("repo", makeCtx("Deny"));
+  await cmds["write-policy"].handler("allow", makeCtx("Deny"));
+  for (const [label, command] of [
+    ["sed", "sed -n '1,5p' package.json"],
+    ["npm run build", "npm run build"],
+    ["npx vitest", "npx vitest run"],
+  ]) {
+    dialogs = 0;
+    r = await call(makeCtx("Deny"), "bash", { command });
+    check(`4a1 build: ${label} does not prompt`, dialogs, 0);
+    check(`4a2 build: ${label} is allowed`, r === undefined, true);
+  }
+
   await cmds["default"].handler("", makeCtx("Deny"));
   await cmds["plan"].handler("", makeCtx("Deny"));
   dialogs = 0;
@@ -255,6 +277,70 @@ try {
   });
   check("4e plan mode still allows .pi/plans writes", r === undefined, true);
   await cmds["default"].handler("", makeCtx("Deny"));
+
+  // ── Scenario 4f: Default + allow leaves in-repo toolchain commands free ──
+  await cmds["write-policy"].handler("allow", makeCtx("Deny"));
+  await cmds["folder-policy"].handler("repo", makeCtx("Deny"));
+  dialogs = 0;
+  r = await call(makeCtx("Deny"), "bash", {
+    command: "sed -n '1,5p' package.json",
+  });
+  check("4f default+allow: sed does not prompt", dialogs, 0);
+  check("4g default+allow: sed is allowed", r === undefined, true);
+
+  // ── Scenario 4h: writePolicy ask is the strict opt-in ──
+  await cmds["write-policy"].handler("ask", makeCtx(ALLOW_ONCE));
+  dialogs = 0;
+  r = await call(makeCtx(ALLOW_ONCE), "bash", {
+    command: "sed -n '1,5p' package.json",
+  });
+  check("4h ask: sed prompts once", dialogs, 1);
+  check("4i ask: allow once permits it", r === undefined, true);
+
+  // ── Scenario 4j: folderPolicy any removes the floor's asks ──
+  await cmds["folder-policy"].handler("any", makeCtx("Deny"));
+  await cmds["write-policy"].handler("allow", makeCtx("Deny"));
+  dialogs = 0;
+  r = await call(makeCtx("Deny"), "bash", {
+    command: "sed -n '1,5p' package.json",
+  });
+  check("4j any: sed does not prompt", dialogs, 0);
+  check("4k any: sed is allowed", r === undefined, true);
+
+  // ── Scenario 4l: an outside write is attributed to the folder policy ──
+  await cmds["folder-policy"].handler("repo", makeCtx("Deny"));
+  await cmds["write-policy"].handler("allow", makeCtx("Deny"));
+  const outsideWrite = path.join(
+    process.cwd(),
+    "..",
+    "..",
+    "..",
+    "..",
+    "verify-outside",
+    "outside.txt",
+  );
+  dialogs = 0;
+  r = await call(makeCtx("Deny"), "write", {
+    path: outsideWrite,
+    content: "x",
+  });
+  check("4l outside write prompts once", dialogs, 1);
+  check("4m outside write is blocked on deny", r?.block, true);
+  check(
+    "4n the dialog is attributed to the folder policy",
+    /^Folder policy 'ask'/.test(lastTitle),
+    true,
+  );
+  check(
+    "4o the denial reason is attributed to the folder policy",
+    /^Folder policy 'ask'/.test(r?.reason ?? ""),
+    true,
+  );
+  check(
+    "4p the outside grant is labelled as a folder",
+    lastOptions.includes("Always allow this folder"),
+    true,
+  );
 
   // ── Scenario 5: never blocks writes but leaves read-only commands free ──
   await cmds["write-policy"].handler("never", makeCtx("Deny"));

@@ -25,6 +25,7 @@ import {
   coerceFolderPolicyConfig,
   combineGateDecisions,
   decideFolderGate,
+  describeFolderEvaluation,
   describeFolderPolicyMode,
   detectRepoRoot,
   effectiveSensitiveExemptions,
@@ -686,6 +687,26 @@ test("decide: sensitive always blocks; outside ask/block; combine order", () => 
     }),
     "allow",
   );
+  // An unverifiable target follows the chosen outside action: "ask" asks,
+  // "block" refuses without opening a dialog.
+  assert.equal(
+    decideFolderGate({
+      sensitive: false,
+      outside: false,
+      outsideAction: "ask",
+      uncertain: true,
+    }),
+    "ask",
+  );
+  assert.equal(
+    decideFolderGate({
+      sensitive: false,
+      outside: false,
+      outsideAction: "block",
+      uncertain: true,
+    }),
+    "block",
+  );
   assert.equal(combineGateDecisions("allow", "ask"), "ask");
   assert.equal(combineGateDecisions("ask", "block"), "block");
   assert.equal(combineGateDecisions(undefined, "allow"), "allow");
@@ -695,6 +716,27 @@ test("describe: every mode has text", () => {
   for (const mode of ["repo", "cwd", "parent", "any"] as const) {
     assert.ok(describeFolderPolicyMode(mode).length > 0);
   }
+});
+
+test("describeFolderEvaluation: counts and lists every verdict", () => {
+  const lines = describeFolderEvaluation(
+    {
+      sensitive: [{ path: "c:/work/.env", pattern: "**/.env" }],
+      outside: [{ path: "c:/other/x.ts", kind: "file" }],
+      allowed: [{ path: "c:/work/src/a.ts", kind: "file" }],
+      network: [{ path: "//server/share/x.ts", kind: "file" }],
+      broad: [],
+      uncertain: ["c:/work/bad"],
+    },
+    "c:/work",
+  );
+  assert.match(lines[0] ?? "", /c:\/work/);
+  assert.match(lines[1] ?? "", /1 inside, 1 outside, 1 sensitive, 1 unverifiable/);
+  assert.ok(lines.some((line) => line.includes("inside: c:/work/src/a.ts")));
+  assert.ok(lines.some((line) => line.includes("outside: c:/other/x.ts")));
+  assert.ok(lines.some((line) => line.includes("network: //server/share/x.ts")));
+  assert.ok(lines.some((line) => line.includes("sensitive: c:/work/.env (**/.env)")));
+  assert.ok(lines.some((line) => line.includes("unverifiable: c:/work/bad")));
 });
 
 test("broad: roots/home are refused, project folders are not", () => {
