@@ -27,9 +27,11 @@ import * as path from "node:path";
 import {
   DEFAULT_REVIEW_MODE_CONFIG,
   buildReviewerAttempts,
+  classifyAssistantStop,
   createReviewRoundGate,
   createReviewSession,
   createReviewState,
+  isAbortStopText,
   planHash,
   readProviderErrorEvent,
   reviewNeedsVerification,
@@ -392,6 +394,31 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     | { message: string; retries: number; at: number }
     | undefined;
 
+  /**
+   * Agent runs stopped by Review Mode's own abort (pass complete, pause,
+   * teardown). The SDK's setup path can report such a stop as
+   * `stopReason: "error"` with an abort-shaped message, so the subscriber
+   * pairs this expectation with `classifyAssistantStop` before suppressing it.
+   * Bounded by two anchors: reset before every pass and on every settle.
+   */
+  let expectedAbortEnds = 0;
+
+  /** Record that the next child run end was requested by this runtime. */
+  const noteExpectedAbort = (): void => {
+    expectedAbortEnds += 1;
+  };
+
+  /** Consume one pending self-abort expectation; false when none is pending. */
+  const consumeExpectedAbort = (): boolean => {
+    if (expectedAbortEnds <= 0) return false;
+    expectedAbortEnds -= 1;
+    return true;
+  };
+
+  const resetExpectedAborts = (): void => {
+    expectedAbortEnds = 0;
+  };
+
   /** Ordered plan chunks for the current pass; reset on submit/abort/switch. */
   let planAssembler:
     | { chunks: string[]; nextIndex: number; totalChunks?: number }
@@ -470,6 +497,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   /** Drop the captured error when a new pass starts. */
   const clearProviderError = (): void => {
     lastProviderError = undefined;
+    // A pending self-abort expectation belongs to the run that already ended.
+    resetExpectedAborts();
   };
 
   const config = (): ReviewModeConfig => {
@@ -604,6 +633,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   /** Abort the reviewer's in-flight run. Best-effort; never throws. */
   async function abortChild(): Promise<void> {
     try {
+      noteExpectedAbort();
       await session?.abort();
     } catch {
       /* cancellation is best-effort */
@@ -712,6 +742,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   async function disposeSession(options: { keepRoundController?: boolean } = {}): Promise<void> {
     try {
       if (options.keepRoundController !== true) abortController?.abort();
+      noteExpectedAbort();
       await session?.abort();
     } catch {
       /* ignore */
@@ -925,44 +956,63 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           // must never reach the main transcript (that tail used to appear
           // while Build/Plan had already started).
           if (!roundActive) return;
-          let ops: ReviewTranscriptOp[] = [];
-          try {
-            ops = ensureTranscript().ingest(event);
-          } catch {
-            /* a malformed event must not break the review */
-          }
-          if (ops.length > 0) {
-            try {
-              deps.onTranscriptOps?.(ops);
-            } catch {
-              /* streaming to the main transcript is display-only: never fatal */
-            }
-          }
           const type = readEventType(event);
-          // Capture provider failures as they happen, so a pass that ends
-          // without a submission can be diagnosed with the reviewer's real
-          // API error instead of a generic "no plan" message (see runRound).
-          try {
-            const failure = readProviderErrorEvent(event);
-            if (failure.kind === "retry") {
-              noteProviderError(failure.message, failure.retries);
-            } else if (failure.kind === "exhaust") {
-              noteProviderError(
-                failure.message ||
-                  lastProviderError?.message ||
-                  "provider error (no detail)",
-                failure.retries || lastProviderError?.retries || 0,
-              );
-            } else if (failure.kind === "stop") {
-              noteProviderError(
-                failure.message,
-                lastProviderError?.retries ?? 0,
-              );
+          // Classify BEFORE ingest/capture: a stop the runtime requested itself
+          // must never reach the transcript or the provider-error slot. The
+          // SDK can label that stop `error` with an abort-shaped message, so
+          // the expectation and the classification are both required.
+          const stop =
+            type === "agent_end"
+              ? classifyAssistantStop(
+                  (event as { messages?: unknown } | undefined)?.messages,
+                )
+              : undefined;
+          // Consume on EVERY agent_end so a real error after a silent abort
+          // cannot leave a stale expectation behind.
+          const expectedAbort = type === "agent_end" && consumeExpectedAbort();
+          const selfAbort = expectedAbort && stop?.kind === "aborted";
+          if (!selfAbort) {
+            let ops: ReviewTranscriptOp[] = [];
+            try {
+              ops = ensureTranscript().ingest(event);
+            } catch {
+              /* a malformed event must not break the review */
             }
-          } catch {
-            /* error capture is diagnostics only: never break the review */
+            if (ops.length > 0) {
+              try {
+                deps.onTranscriptOps?.(ops);
+              } catch {
+                /* streaming to the main transcript is display-only: never fatal */
+              }
+            }
+            // Capture provider failures as they happen, so a pass that ends
+            // without a submission can be diagnosed with the reviewer's real
+            // API error instead of a generic "no plan" message (see runRound).
+            // `aborted` is deliberately not captured: it is our own cancel.
+            try {
+              const failure = readProviderErrorEvent(event);
+              if (failure.kind === "retry") {
+                noteProviderError(failure.message, failure.retries);
+              } else if (failure.kind === "exhaust") {
+                noteProviderError(
+                  failure.message ||
+                    lastProviderError?.message ||
+                    "provider error (no detail)",
+                  failure.retries || lastProviderError?.retries || 0,
+                );
+              } else if (failure.kind === "stop") {
+                noteProviderError(
+                  failure.message,
+                  lastProviderError?.retries ?? 0,
+                );
+              }
+            } catch {
+              /* error capture is diagnostics only: never break the review */
+            }
           }
           if (type === "agent_settled") {
+            // The abort (if any) has landed; no expectation may outlive it.
+            resetExpectedAborts();
             noteSettled();
           } else if (type === "agent_end") {
             // Fallback for a runtime without `agent_settled`: a retry or a
@@ -1253,6 +1303,21 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         return child.prompt(pass1Prompt);
       });
 
+      // A round aborted by ESC / the host signal must take the abort path even
+      // when the in-flight send rejected first: the rejection is a symptom of
+      // the abort, not a provider/send failure to recover from.
+      if (p1.stop === "aborted" || rc.signal.aborted) {
+        await abortChild();
+        if (state) state.phase = "aborted";
+        return {
+          ok: false,
+          fallback: true,
+          planText: p1.submitted?.planText ?? originalPlan,
+          planHash: hash,
+          state: state as ReviewState,
+          reason: "aborted",
+        };
+      }
       if (p1.stop === "error") {
         await abortChild();
         const sendMessage = errorText(p1.error);
@@ -1283,18 +1348,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           continue;
         }
         return fail(lastFailure);
-      }
-      if (p1.stop === "aborted" || rc.signal.aborted) {
-        await abortChild();
-        if (state) state.phase = "aborted";
-        return {
-          ok: false,
-          fallback: true,
-          planText: p1.submitted?.planText ?? originalPlan,
-          planHash: hash,
-          state: state as ReviewState,
-          reason: "aborted",
-        };
       }
       if (!p1.submitted) {
         // The run is over (or out of time) and nothing reached the plan file.
@@ -1381,16 +1434,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         });
         // Name the provider when the verification pass died on one; pass 2
         // stays best-effort either way — pass 1's plan is never lost to it.
-        const p2Provider = lastProviderError
-          ? `provider error after ${lastProviderError.retries} retry attempt(s): ${truncateErrorText(lastProviderError.message)}`
-          : undefined;
+        // A round abort (or an abort-shaped stop) is not provider health.
+        const p2Send = p2.error === undefined ? "" : errorText(p2.error);
+        const p2Aborted =
+          rc.signal.aborted ||
+          isAbortStopText(p2Send) ||
+          isAbortStopText(lastProviderError?.message);
+        const p2Provider =
+          !p2Aborted && lastProviderError
+            ? `provider error after ${lastProviderError.retries} retry attempt(s): ${truncateErrorText(lastProviderError.message)}`
+            : undefined;
         if (p2.error !== undefined) {
           // Verification is an enhancement: never lose pass 1's plan over it.
+          let failureText: string;
+          if (p2Aborted) {
+            failureText = "verification pass aborted";
+          } else if (p2Provider) {
+            failureText = `verification pass failed (${p2Provider}; send error: ${p2Send})`;
+          } else {
+            failureText = `verification pass failed (${p2Send})`;
+          }
           deps.log(
-            p2Provider
-              ? `verification pass failed (${p2Provider}; send error: ${errorText(p2.error)}) — keeping pass 1's plan.`
-              : `verification pass failed (${errorText(p2.error)}) — keeping pass 1's plan.`,
-            "warning",
+            `${failureText} — keeping pass 1's plan.`,
+            p2Aborted ? "info" : "warning",
           );
         } else if (p2.submitted) {
           finalPlan = p2.submitted.planText;
@@ -1443,13 +1509,15 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       // streaming. `review_pass_done` ends the protocol, not the SDK run; the
       // remaining tail could still call review tools or write the plan while
       // the parent has moved to Build/Plan. The submission is already captured.
+      // Mark the round inactive FIRST: the abort's own `agent_end` is teardown
+      // noise, not a run result, and must never reach the transcript.
+      roundActive = false;
       try {
         if (session?.isStreaming()) await session.abort();
       } catch {
         /* cancellation is best-effort */
       }
       abortController = undefined;
-      roundActive = false;
     }
   }
 
@@ -1469,6 +1537,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     async abortRound() {
       try {
         abortController?.abort();
+        noteExpectedAbort();
         await session?.abort();
       } catch {
         /* cancellation is best-effort */

@@ -41,6 +41,7 @@ import {
   buildReviewerAttempts,
   buildReviewerFallbacks,
   canRunManualReview,
+  classifyAssistantStop,
   classifyReviewExecution,
   coerceReviewModeConfig,
   createReviewHandoffGate,
@@ -49,6 +50,7 @@ import {
   createReviewSession,
   extractReviewModeRaw,
   isReviewEnabled,
+  isAbortStopText,
   mergeReviewModeConfig,
   nextReviewRound,
   planHash as planHashReexported,
@@ -326,6 +328,7 @@ test("review recovery: uses the SDK's transient table and rejects deterministic 
     "Stream ended without finish_reason",
     "429 Too Many Requests",
     "Request timed out",
+    "The operation was aborted due to timeout",
     "socket hang up",
     "502 Bad Gateway",
   ]) {
@@ -334,6 +337,10 @@ test("review recovery: uses the SDK's transient table and rejects deterministic 
   for (const message of [
     "",
     "Request was aborted",
+    "This operation was aborted",
+    "The operation was aborted",
+    "Operation aborted",
+    "Retry cancelled",
     "No API key found for command-code.",
     "model not found in registry",
     "invalid_request_error",
@@ -1067,7 +1074,104 @@ test("translateReviewEvent: never throws on malformed events", () => {
   assert.equal(truncateErrorText("abcdefghij", 5), "abcd…");
 });
 
- test("translateReviewEvent: provider failures surface their real, truncated text", () => {
+ test("isAbortStopText: host/SDK aborts only, never timeouts", () => {
+  for (const text of [
+    "This operation was aborted",
+    "The operation was aborted",
+    "Operation aborted",
+    "Request was aborted",
+    "Request aborted",
+    "AbortError: This operation was aborted",
+    "aborted",
+    "Aborted after 2 retry attempts",
+    "Retry cancelled",
+    "Retry canceled",
+  ]) {
+    assert.equal(isAbortStopText(text), true, text);
+  }
+  for (const text of [
+    "The operation was aborted due to timeout",
+    "Request timed out.",
+    "timeout",
+    "Stream ended without finish_reason",
+    "upstream provider error: request aborted",
+    "503 Bad Gateway",
+    "",
+    undefined,
+    { boom: true },
+  ]) {
+    assert.equal(isAbortStopText(text), false, String(text));
+  }
+});
+
+test("classifyAssistantStop: abort wins over the SDK's error label", () => {
+  assert.deepEqual(classifyAssistantStop(undefined), { kind: "clean" });
+  assert.deepEqual(classifyAssistantStop([]), { kind: "clean" });
+  assert.deepEqual(
+    classifyAssistantStop([{ role: "user", content: "x" }]),
+    { kind: "clean" },
+  );
+  assert.deepEqual(
+    classifyAssistantStop([{ role: "assistant", stopReason: "stop" }]),
+    { kind: "clean" },
+  );
+  // The observed SDK shape: a setup abort recorded as an error stop.
+  assert.deepEqual(
+    classifyAssistantStop([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "This operation was aborted",
+      },
+    ]),
+    { kind: "aborted", message: "This operation was aborted" },
+  );
+  assert.deepEqual(
+    classifyAssistantStop([
+      { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" },
+    ]),
+    { kind: "aborted", message: "Operation aborted" },
+  );
+  assert.deepEqual(
+    classifyAssistantStop([{ role: "assistant", stopReason: "aborted" }]),
+    { kind: "aborted" },
+  );
+  // A timeout is a provider failure even though the SDK words it as an abort.
+  assert.deepEqual(
+    classifyAssistantStop([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "The operation was aborted due to timeout",
+      },
+    ]),
+    { kind: "provider-error", message: "The operation was aborted due to timeout" },
+  );
+  assert.deepEqual(
+    classifyAssistantStop([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "Stream ended without finish_reason",
+      },
+    ]),
+    { kind: "provider-error", message: "Stream ended without finish_reason" },
+  );
+  assert.deepEqual(
+    classifyAssistantStop([{ role: "assistant", stopReason: "error" }]),
+    { kind: "provider-error", message: "unknown provider error" },
+  );
+  // The last assistant message decides; a trailing tool result is skipped.
+  assert.deepEqual(
+    classifyAssistantStop([
+      { role: "assistant", stopReason: "error", errorMessage: "429 quota" },
+      { role: "toolResult", content: [] },
+    ]),
+    { kind: "provider-error", message: "429 quota" },
+  );
+});
+
+test("translateReviewEvent: provider failures surface their real, truncated text", () => {
   assert.deepEqual(
     translateReviewEvent({
       type: "auto_retry_start",
@@ -1137,6 +1241,47 @@ test("translateReviewEvent: never throws on malformed events", () => {
     }),
     [{ op: "new", kind: "status", text: "reviewer run ended" }],
   );
+  // A host abort is not provider health: the SDK can label it `error`, but
+  // the pane must stay neutral either way.
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "This operation was aborted",
+        },
+      ],
+    }),
+    [{ op: "new", kind: "status", text: "reviewer run ended" }],
+  );
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "aborted" }],
+    }),
+    [{ op: "new", kind: "status", text: "reviewer run ended" }],
+  );
+  // Abort-shaped retry events produce no notice/error at all.
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "auto_retry_start",
+      attempt: 1,
+      errorMessage: "Retry cancelled",
+    }),
+    [],
+  );
+  assert.deepEqual(
+    translateReviewEvent({
+      type: "auto_retry_end",
+      success: false,
+      attempt: 1,
+      finalError: "Retry cancelled",
+    }),
+    [],
+  );
   // Run-start lines are the runtime's job (`reviewRunLabel`): `agent_start`
   // fires for every prompt on the same child session, so it cannot tell a cold
   // boot from a warm resume or a next round.
@@ -1182,6 +1327,44 @@ test("translateReviewEvent: never throws on malformed events", () => {
     readProviderErrorEvent({
       type: "agent_end",
       messages: [{ role: "assistant", stopReason: "stop" }],
+    }).kind,
+    "none",
+  );
+  assert.deepEqual(
+    readProviderErrorEvent({
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "This operation was aborted",
+        },
+      ],
+    }),
+    { kind: "aborted", message: "This operation was aborted" },
+  );
+  assert.deepEqual(
+    readProviderErrorEvent({
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "aborted" }],
+    }),
+    { kind: "aborted" },
+  );
+  assert.equal(
+    readProviderErrorEvent({
+      type: "auto_retry_start",
+      attempt: 1,
+      errorMessage: "Request was aborted",
+    }).kind,
+    "none",
+    "a cancelled retry is not provider health",
+  );
+  assert.equal(
+    readProviderErrorEvent({
+      type: "auto_retry_end",
+      success: false,
+      attempt: 1,
+      finalError: "Retry cancelled",
     }).kind,
     "none",
   );
@@ -3474,6 +3657,125 @@ test("runtime: a reviewer that ends its run without submitting fails fast, not a
     "no timeout is burned on a run that already ended",
   );
   assert.ok(silent.capture.aborts >= 1, "the abandoned run is cancelled");
+});
+
+test("runtime: Review Mode's own post-pass abort is never a provider error", async () => {
+  const sdk = fakeSdk({
+    pass1: async (c) => {
+      await c.tools.review_submit_plan.execute(
+        "1",
+        {
+          planMarkdown: REWRITTEN_PLAN,
+          findings: [HIGH_FINDING],
+          verdict: "revise",
+          summary: "aligned",
+        },
+        undefined,
+        undefined,
+        {},
+      );
+      await c.tools.review_pass_done.execute(
+        "2",
+        { pass: 1, verdict: "revise", findings: [HIGH_FINDING] },
+        undefined,
+        undefined,
+        {},
+      );
+      // The real reviewer keeps streaming a closing tail after pass_done.
+      await new Promise<void>(() => {});
+    },
+    streaming: true,
+    abortEnd: {
+      stopReason: "error",
+      errorMessage: "This operation was aborted",
+    },
+  });
+  const ops: Array<{ kind?: string; text?: string }> = [];
+  const states: Array<{ providerError?: string } | undefined> = [];
+  const { deps } = runtimeDeps(sdk.sdk, {
+    config: { verify: false, timeoutMs: 60_000 },
+    onTranscriptOps: (batch) =>
+      ops.push(...(batch as Array<{ kind?: string; text?: string }>)),
+    onState: (s) => states.push(s as { providerError?: string } | undefined),
+  });
+  const rt = createReviewRuntime(deps as never);
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, true, "the submitted plan wins");
+  assert.equal(res.fallback, false);
+  assert.ok(res.planText.includes("Result<string, ExportError>"));
+  assert.ok(sdk.capture.aborts >= 1, "the pass-complete tail was aborted");
+  assert.equal(
+    ops.filter((op) => op.kind === "error").length,
+    0,
+    "a self-abort is never a provider error",
+  );
+  assert.equal(
+    ops.filter((op) => op.text === "reviewer run ended").length,
+    0,
+    "a self-abort is silent",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(
+    ops.filter((op) => op.kind === "error").length,
+    0,
+    "a late teardown abort stays silent",
+  );
+  const finalState = states.filter(Boolean).at(-1) as
+    | { providerError?: string }
+    | undefined;
+  assert.equal(finalState?.providerError, undefined);
+});
+
+test("runtime: abortRound is a pause, not a provider failure", async () => {
+  const sdk = fakeSdk({
+    pass1: () => new Promise<void>(() => {}),
+    streaming: true,
+    abortEnd: {
+      stopReason: "error",
+      errorMessage: "This operation was aborted",
+    },
+  });
+  const ops: Array<{ kind?: string; text?: string }> = [];
+  const states: Array<{ providerError?: string; phase?: string } | undefined> = [];
+  const { deps } = runtimeDeps(sdk.sdk, {
+    config: { timeoutMs: 60_000 },
+    onTranscriptOps: (batch) =>
+      ops.push(...(batch as Array<{ kind?: string; text?: string }>)),
+    onState: (s) =>
+      states.push(s as { providerError?: string; phase?: string } | undefined),
+  });
+  const rt = createReviewRuntime(deps as never);
+  const pending = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: "p.md",
+    round: 1,
+  });
+  // Wait until the reviewer's prompt is in flight before aborting.
+  for (let i = 0; i < 100 && sdk.capture.prompts.length === 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(sdk.capture.prompts.length > 0, "the reviewer run started");
+  await rt.abortRound();
+  const res = await pending;
+
+  assert.equal(res.reason, "aborted");
+  assert.equal(res.ok, false);
+  assert.equal(res.planText, ORIGINAL_PLAN, "the author's plan is preserved");
+  assert.equal(
+    ops.filter((op) => op.kind === "error").length,
+    0,
+    "pausing never reports a provider error",
+  );
+  assert.equal(rt.getState()?.phase, "aborted");
+  const lastState = states.filter(Boolean).at(-1) as
+    | { providerError?: string }
+    | undefined;
+  assert.equal(lastState?.providerError, undefined);
 });
 
 test("runtime: a provider failure that ends pass 1 is named in the failure reason", async () => {

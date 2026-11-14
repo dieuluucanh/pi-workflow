@@ -16,10 +16,9 @@ import {
   isRetryableAssistantError,
   type AssistantMessage,
 } from "@earendil-works/pi-ai";
+import { isAbortStopText } from "./review.ts";
 
 const NON_RECOVERABLE_PATTERNS: readonly RegExp[] = [
-  /^request was aborted$/i,
-  /^aborted$/i,
   /\bno api key\b/i,
   /\bmodel\b.*\bnot\b.*\bfound\b/i,
   /\binvalid[_\s-]?request\b/i,
@@ -56,6 +55,9 @@ function asAssistantError(message: string): AssistantMessage {
 export function isRecoverableProviderFailure(message: string | undefined): boolean {
   const text = String(message ?? "").trim();
   if (!text) return false;
+  // One abort table for the whole extension: a host cancellation, a cancelled
+  // backoff or a provider-side abort is never worth another model.
+  if (isAbortStopText(text)) return false;
   if (NON_RECOVERABLE_PATTERNS.some((pattern) => pattern.test(text))) return false;
   try {
     return isRetryableAssistantError(asAssistantError(text));

@@ -111,6 +111,18 @@ export function fakeSdk(script: {
   runtime?: unknown;
   /** Make the child's first prompt reject with this value (preflight-style). */
   failPrompt1?: unknown;
+  /**
+   * Report `isStreaming: true` while a pass script runs, so the runtime's
+   * post-pass `abortChild()` path is exercised (default false preserves the
+   * old fake-session behaviour).
+   */
+  streaming?: boolean;
+  /**
+   * Emit a terminal `agent_end` from `abort()`, reproducing the shape the SDK's
+   * `lazyStream` setup path produces when a host abort lands before the next
+   * provider request is created.
+   */
+  abortEnd?: { stopReason: "error" | "aborted"; errorMessage: string };
 }): { capture: FakeCapture; sdk: unknown } {
   const capture: FakeCapture = {
     prompts: [],
@@ -156,8 +168,21 @@ export function fakeSdk(script: {
         for (const l of [...listeners]) l(event);
       };
       capture.emit = emit;
+      // A getter, not a method: `wrapAgentSession()` reads
+      // `Boolean(s.isStreaming)` on every call.
+      let streaming = false;
+      const beginPass = (): void => {
+        streaming = script.streaming === true;
+      };
+      const endPass = (): void => {
+        streaming = false;
+        emit({ type: "agent_settled" });
+      };
       return {
         session: {
+          get isStreaming() {
+            return streaming;
+          },
           subscribe: (listener: (event: unknown) => void) => {
             capture.unsubscribeCount += 1;
             listeners.push(listener);
@@ -169,6 +194,7 @@ export function fakeSdk(script: {
           prompt: async (text: string) => {
             capture.prompts.push(text);
             if (script.failPrompt1 !== undefined) throw script.failPrompt1;
+            beginPass();
             emit({
               type: "tool_execution_start",
               toolCallId: "t1",
@@ -191,11 +217,12 @@ export function fakeSdk(script: {
             try {
               await script.pass1?.(capture);
             } finally {
-              emit({ type: "agent_settled" });
+              endPass();
             }
           },
           followUp: async (text: string) => {
             capture.followUps.push(text);
+            beginPass();
             emit({
               type: "tool_execution_start",
               toolCallId: "t2",
@@ -218,13 +245,29 @@ export function fakeSdk(script: {
             try {
               await script.pass2?.(capture);
             } finally {
-              emit({ type: "agent_settled" });
+              endPass();
             }
           },
           abort: async () => {
             capture.aborts += 1;
+            streaming = false;
+            if (!script.abortEnd) return;
+            // The real SDK emits the terminal assistant message while
+            // `abort()` is still settling (before it resolves). Reproduce that
+            // ordering so the runtime's suppression is actually exercised;
+            // `agent_settled` follows asynchronously in the real session.
+            emit({
+              type: "agent_end",
+              messages: [
+                {
+                  role: "assistant",
+                  content: [],
+                  stopReason: script.abortEnd.stopReason,
+                  errorMessage: script.abortEnd.errorMessage,
+                },
+              ],
+            });
           },
-          isStreaming: false,
           getActiveToolNames: () => capture.activeTools.slice(),
           bindExtensions: async () => {},
         },

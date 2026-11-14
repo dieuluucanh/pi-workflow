@@ -10,6 +10,29 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — Review Mode no longer reports its own abort as a provider error
+
+Review Mode aborts the reviewer's closing tail after `review_pass_done` (and on
+pause/teardown). When that abort landed before the next provider request was
+created, the SDK's `lazyStream` setup path recorded the host cancellation as a
+`stopReason: "error"` assistant message (`This operation was aborted`), so a
+successful round printed `reviewer run ended on a provider error: …` and stored
+the abort in `/review-status` as a provider failure.
+
+One abort-aware classifier now decides every stop: `stopReason: "aborted"`,
+Node/provider abort spellings (`This operation was aborted`, `Request was
+aborted`, …) and the SDK's `Retry cancelled` are aborts; timeouts
+(`The operation was aborted due to timeout`) remain transient provider
+failures. Self-aborts are suppressed before transcript ingest and provider-error
+capture, and the round is marked inactive before the teardown abort, so
+neither the pane nor `/review-status` blames the provider. A round aborted
+during the send race now takes the pause/abort path instead of a failure path.
+Real provider failures (429/503, `Stream ended without finish_reason`) are
+unchanged, including their recovery chain.
+
+Tests: 762 green (19 new classifier/translator/runtime cases),
+`npm run typecheck` clean.
+
 ### Fixed — the folder floor no longer prompts for in-repo toolchain commands
 
 Build mode and Default + `writePolicy: allow` no longer open a `Write policy

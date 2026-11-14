@@ -1974,23 +1974,80 @@ export function truncateErrorText(input: unknown, max: number = MAX_ERROR_TEXT):
 }
 
 /**
- * Extract the provider error message when a run stopped on an error: scan an
- * `agent_end` event's messages from the end for the last assistant message
- * with `stopReason === "error"`. Structural on purpose — SDK message shapes
- * are not imported here. Returns undefined for clean runs and junk input.
+ * True when an error text describes an *abort*, not a provider failure.
+ *
+ * Review Mode deliberately aborts the reviewer's tail after `review_pass_done`
+ * (and on pause/teardown). Node rejects an aborted operation with its default
+ * reason (`DOMException: This operation was aborted`); provider SDKs use
+ * `Request was aborted`; the Pi SDK's backoff cancellation reports
+ * `Retry cancelled`. The SDK's `lazyStream` setup path can record any of those
+ * as a `stopReason: "error"` assistant message, so a stop-reason check alone
+ * is not enough to tell an abort from a provider fault.
+ *
+ * Timeouts are deliberately NOT aborts: `AbortSignal.timeout()` rejects with
+ * `The operation was aborted due to timeout`, which is a transient provider
+ * failure and must keep its recovery semantics.
+ *
+ * Matching is anchored at the start of the flattened text so a provider payload
+ * that merely mentions "aborted" is not downgraded. Pure and total.
  */
-export function lastAssistantErrorStop(messages: unknown): string | undefined {
-  if (!Array.isArray(messages)) return undefined;
+export function isAbortStopText(input: unknown): boolean {
+  const text =
+    typeof input === "string" ? input.replace(/\s+/g, " ").trim() : "";
+  if (!text) return false;
+  // Checked first: "The operation was aborted due to timeout" is a timeout.
+  if (/\b(?:timed?\s*out|timeout)\b/i.test(text)) return false;
+  // `AgentSession._finishCancelledRetry()` reports a cancelled backoff this
+  // way; it is our own abort, never provider health.
+  if (/^retry\s+cancell?ed\b/i.test(text)) return true;
+  return (
+    /^(?:this|the|request|operation|signal)\b[^.\n]{0,40}abort(?:ed|ing)?\b/i.test(
+      text,
+    ) ||
+    /^abort(?:ed)?\s*error\b/i.test(text) ||
+    /^aborted\b/i.test(text)
+  );
+}
+
+/** How the reviewer's last assistant message stopped. */
+export type ReviewStopClassification =
+  | { kind: "clean" }
+  | { kind: "aborted"; message?: string }
+  | { kind: "provider-error"; message: string };
+
+/**
+ * Classify the outcome of a child run from an `agent_end` event's messages.
+ *
+ * Structural on purpose — SDK message shapes are not imported here. Scans
+ * backwards to the last assistant message (the only one that decides the run's
+ * outcome); a missing assistant message or junk input is `clean`. An error stop
+ * with an abort-shaped message is `aborted` even when the SDK labelled it
+ * `error` (its setup path does not check the abort signal), so callers never
+ * report a host cancellation as provider health.
+ */
+export function classifyAssistantStop(
+  messages: unknown,
+): ReviewStopClassification {
+  if (!Array.isArray(messages)) return { kind: "clean" };
   for (let i = messages.length - 1; i >= 0; i--) {
     const rec = messages[i] as Record<string, unknown> | null | undefined;
     if (!rec || typeof rec !== "object") continue;
     if (rec.role !== "assistant") continue;
-    // Last assistant message reached: a non-error stop means a clean run.
-    if (rec.stopReason !== "error") return undefined;
-    const err = typeof rec.errorMessage === "string" ? rec.errorMessage : "";
-    return err || "unknown provider error";
+    // Last assistant message reached: this one decides the run outcome.
+    const stopReason = rec.stopReason;
+    if (stopReason === "aborted") {
+      const message =
+        typeof rec.errorMessage === "string" ? rec.errorMessage.trim() : "";
+      return message ? { kind: "aborted", message } : { kind: "aborted" };
+    }
+    if (stopReason !== "error") return { kind: "clean" };
+    const err = typeof rec.errorMessage === "string" ? rec.errorMessage.trim() : "";
+    if (isAbortStopText(err)) {
+      return err ? { kind: "aborted", message: err } : { kind: "aborted" };
+    }
+    return { kind: "provider-error", message: err || "unknown provider error" };
   }
-  return undefined;
+  return { kind: "clean" };
 }
 
 /**
@@ -2002,14 +2059,19 @@ export function lastAssistantErrorStop(messages: unknown): string | undefined {
  * - `exhaust` → the retry budget ran out (`auto_retry_end`, `success: false`);
  *   the run is about to settle on an error. `message` may be empty when the
  *   event carries no `finalError` — callers then keep their earlier message.
- * - `stop`    → the run itself ended with `stopReason === "error"` on its last
- *   assistant message (auto-retry disabled, or a non-retryable failure).
+ * - `stop`    → the run itself ended on a provider error
+ *   (`stopReason === "error"` with a non-abort message; auto-retry disabled,
+ *   or a non-retryable failure).
+ * - `aborted` → the run ended on an abort (`stopReason === "aborted"`, or an
+ *   error stop whose message is abort-shaped — the SDK's setup path mislabels
+ *   a host cancellation as `error`). Never provider health.
  * - `none`    → anything else, including a retry that recovered.
  */
 export type ReviewProviderFailure =
   | { kind: "retry"; message: string; retries: number }
   | { kind: "exhaust"; message: string; retries: number }
   | { kind: "stop"; message: string }
+  | { kind: "aborted"; message?: string }
   | { kind: "none" };
 
 /** Structural decode of one provider-failure event. Never throws. */
@@ -2023,6 +2085,8 @@ export function readProviderErrorEvent(
     const message =
       typeof e.errorMessage === "string" ? e.errorMessage.trim() : "";
     if (!message) return { kind: "none" };
+    // A cancelled retry is our own abort, not provider health.
+    if (isAbortStopText(message)) return { kind: "none" };
     return {
       kind: "retry",
       message,
@@ -2032,6 +2096,7 @@ export function readProviderErrorEvent(
   if (type === "auto_retry_end") {
     if (e.success !== false) return { kind: "none" };
     const message = typeof e.finalError === "string" ? e.finalError.trim() : "";
+    if (isAbortStopText(message)) return { kind: "none" };
     return {
       kind: "exhaust",
       message,
@@ -2039,9 +2104,14 @@ export function readProviderErrorEvent(
     };
   }
   if (type === "agent_end") {
-    const message = lastAssistantErrorStop(e.messages);
-    if (message === undefined) return { kind: "none" };
-    return { kind: "stop", message };
+    const stop = classifyAssistantStop(e.messages);
+    if (stop.kind === "aborted") {
+      return stop.message
+        ? { kind: "aborted", message: stop.message }
+        : { kind: "aborted" };
+    }
+    if (stop.kind !== "provider-error") return { kind: "none" };
+    return { kind: "stop", message: stop.message };
   }
   return { kind: "none" };
 }
@@ -2194,18 +2264,25 @@ function providerErrorOps(
     const ops: ReviewTranscriptOp[] = [
       { op: "new", kind: "status", text: "reviewer run ended" },
     ];
-    const failed = lastAssistantErrorStop(e.messages);
-    if (failed) {
+    // An abort is our own cancellation (pass complete / pause / teardown),
+    // never provider health. The SDK's setup path can label it `error` with an
+    // abort-shaped message, so classification cannot rely on `stopReason`.
+    const stop = classifyAssistantStop(e.messages);
+    if (stop.kind === "provider-error") {
       ops.push({
         op: "new",
         kind: "error",
-        text: `reviewer run ended on a provider error: ${truncateErrorText(failed)}`,
+        text: `reviewer run ended on a provider error: ${truncateErrorText(
+          stop.message,
+        )}`,
       });
     }
     return ops;
   }
   if (type === "auto_retry_start") {
     const msg = typeof e.errorMessage === "string" ? e.errorMessage : "";
+    // A cancelled backoff is an abort, not a provider notice.
+    if (isAbortStopText(msg)) return [];
     return [
       {
         op: "new",
@@ -2222,6 +2299,7 @@ function providerErrorOps(
     // retry recovered; the earlier notice already covers that case.
     if (e.success === false) {
       const detail = truncateErrorText(e.finalError);
+      if (isAbortStopText(detail)) return [];
       return [
         {
           op: "new",
