@@ -45,6 +45,8 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
+| `/folder-policy [repo\|cwd\|parent\|any] [global\|project]` | Shared folder scope for read, write **and** commit (default `repo`: nearest `.git` root, fallback cwd). `outside ask\|block`, `grant project\|global`, `templates allow\|block`, `sensitive` |
+| `/read-policy [status\|allow <path>\|revoke <path>\|shell paths\|strict] [global\|project]` | Read grants, shell analysis mode and the shared folder scope. Sensitive files are always blocked |
 | `/permissions [explain] <command>` | Explain a shell command's verdict without running it: each segment's class, the Plan/Review/Explorer answer and whether the write policy would treat it as a write |
 
 Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a review round or a paused review owns the turn (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review).
@@ -355,6 +357,20 @@ doctor prints the same recommendation when it sees a single-wire Command Code pr
 ### Configuration
 
 Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global) or `<cwd>/.pi/settings.json` (project). Project values win field-by-field over global. Writing them preserves every other key in the file.
+
+## Folder and read permission
+
+**One shared floor.** `workflow.folderPolicy` decides which folders read, write and commit may touch. `mode: "repo"` (default) is the nearest `.git` ancestor (fallback: the session cwd); `cwd` is the exact working directory; `parent` is the parent of that base (siblings); `any` disables containment. `outside: "ask"` prompts once per turn (headless fails closed), `outside: "block"` refuses silently. A policy can only be **stricter** than this floor — `writePolicy: "allow"` cannot write outside it.
+
+**Sensitive files are always blocked.** The default deny list covers `.env*` (templates such as `.env.example` are exempt by default), `.npmrc`/`.netrc`/`.git-credentials`, `auth.json`, `credentials*`, `secrets.*`, SSH/GPG/cloud stores, key/cert stores, `.git/config`, `.tfstate`/`.tfvars` and keychains. A folder grant never re-enables one; add a manual `folderPolicy.sensitiveExemptions` entry only when a template/fixture is genuinely needed. `/folder-policy sensitive` lists the effective rules.
+
+**Read gate.** `read`, `ls`, `grep`, `find`, pi-lens read tools, `explore` cwd/tasks, local `fetch_content`/`browser_*` file URLs and balanced shell reads (`cat`, `rg`, `git show/-C`, redirections, `cp`/`tar` sources) are path-gated. `grep`/`find`/`ls` output, sensitive git diff sections and truncated `bash` full-output paths are redacted. `readPolicy.shell: "strict"` also asks for inline/interpreter commands that cannot be statically verified.
+
+**Grants.** “Always allow” writes to the capability's `allowedPaths` in project settings by default (`folderPolicy.grantScope: "project"`); the project must be trusted. Existing global write grants remain honoured. “Always allow” cannot grant a filesystem root/home from a dialog — use `/folder-policy any` deliberately.
+
+**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. Use an OS container/VM for a hard boundary. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions; `review_bash` uses the same read guard. Spawned subagents receive locked roots and cannot expand via a sibling project's settings.
+
+**Migration.** The default `folderPolicy.mode: "repo"` + `outside: "ask"` also constrains writes/commits. Set `folderPolicy.mode: "any"` to restore the old “write anywhere” behaviour (sensitive files remain blocked), or `cwd`/`parent` to keep a narrower floor.
 
 ## Commit policy
 

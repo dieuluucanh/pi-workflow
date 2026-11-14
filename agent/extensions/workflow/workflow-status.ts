@@ -34,6 +34,8 @@ export interface WorkflowStatusInput {
   commitMode: string;
   /** Only Default mode has a write policy; null/undefined omits it. */
   writeMode?: string | null;
+  /** Shared read/write/commit folder scope; null/undefined omits it. */
+  folderMode?: string | null;
 }
 
 export interface WorkflowStatusSegments {
@@ -54,7 +56,8 @@ export function buildWorkflowStatusSegments(
     .join(" | ");
   const policy =
     `commits:${input.commitMode}` +
-    (input.writeMode ? ` · writes:${input.writeMode}` : "");
+    (input.writeMode ? ` · writes:${input.writeMode}` : "") +
+    (input.folderMode ? ` · folders:${input.folderMode}` : "");
 
   let mode: string;
   const phase = input.reviewPhase ?? "idle";

@@ -40,6 +40,11 @@ import {
   type JsonObject,
 } from "./commit-policy.ts";
 import { analyzeCommand } from "./permissions.ts";
+import {
+  isInsidePolicyPath,
+  normalizePolicyPath,
+  type FolderGateDecision,
+} from "./folder-policy.ts";
 
 /** Nested key under WORKFLOW_SETTINGS_KEY. */
 export const WRITE_POLICY_KEY = "writePolicy";
@@ -250,22 +255,33 @@ export interface ResolvedWritePolicy {
  * Resolve the effective Write Policy config from disk.
  * Never throws — a corrupt or missing file falls back to defaults.
  */
+export interface WritePolicyReadOptions {
+  /** Project settings are ignored unless explicitly trusted. */
+  trusted?: boolean;
+}
+
 export function readWritePolicyConfig(
   cwd: string,
   agentDir: string,
+  options: WritePolicyReadOptions = {},
 ): ResolvedWritePolicy {
   const paths = writePolicyConfigPaths(cwd, agentDir);
   const globalSettings = readJsonSafe(paths.global);
   const projectSettings = readJsonSafe(paths.project);
   const globalRaw = extractWritePolicyRaw(globalSettings);
   const projectRaw = extractWritePolicyRaw(projectSettings);
-  const config = mergeWritePolicyConfig(globalRaw, projectRaw);
+  // Trust is fail-closed for callers that do not say otherwise. The long-lived
+  // gate passes ctx.isProjectTrusted(); tests that exercise project settings
+  // explicitly opt in.
+  const trusted = options.trusted === true;
+  const effectiveProjectRaw = trusted ? projectRaw : undefined;
+  const config = mergeWritePolicyConfig(globalRaw, effectiveProjectRaw);
   return {
     config,
     sources: {
       global: globalRaw !== undefined,
       project: projectRaw !== undefined,
-      mode: writePolicyModeSourceOf(globalRaw, projectRaw),
+      mode: writePolicyModeSourceOf(globalRaw, effectiveProjectRaw),
     },
   };
 }
@@ -342,25 +358,7 @@ export function writeWritePolicyConfig(
  * its own path compare equal; the filesystem root keeps its slash.
  */
 export function normalizeWritePath(p: unknown, cwd: string): string {
-  if (typeof p !== "string") return "";
-  const raw = p.trim();
-  if (!raw) return "";
-  const base = cwd && cwd.trim() ? cwd : process.cwd();
-  let resolved: string;
-  try {
-    resolved = path.resolve(base, raw);
-  } catch {
-    resolved = raw;
-  }
-  let normalized = resolved.replace(/\\/g, "/").toLowerCase();
-  while (
-    normalized.length > 1 &&
-    normalized.endsWith("/") &&
-    !/^[a-z]:\/$/.test(normalized)
-  ) {
-    normalized = normalized.slice(0, -1);
-  }
-  return normalized;
+  return normalizePolicyPath(p, cwd);
 }
 
 /**
@@ -380,8 +378,7 @@ export function isPathAllowed(
   for (const entry of allowedPaths) {
     const normalizedEntry = normalizeWritePath(entry, cwd);
     if (!normalizedEntry) continue;
-    if (normalizedTarget === normalizedEntry) return true;
-    if (normalizedTarget.startsWith(`${normalizedEntry}/`)) return true;
+    if (isInsidePolicyPath(normalizedTarget, normalizedEntry)) return true;
   }
   return false;
 }
@@ -591,6 +588,8 @@ export interface WriteGateInput {
   mutating: boolean;
   /** The call is already covered by a persistent grant. */
   allowed: boolean;
+  /** The shared folder floor's verdict (default allow for legacy callers). */
+  folder?: FolderGateDecision;
 }
 
 /**
@@ -607,8 +606,11 @@ export interface WriteGateInput {
  */
 export function decideWriteGate(input: WriteGateInput): WriteGateDecision {
   if (!input.mutating) return "allow";
-  if (input.mode === "allow") return "allow";
+  const folder = input.folder ?? "allow";
+  if (folder === "block") return "block";
   if (input.mode === "never") return "block";
+  if (input.mode === "allow") return folder === "ask" ? "ask" : "allow";
+  if (folder === "ask") return "ask";
   return input.allowed ? "allow" : "ask";
 }
 

@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type {
@@ -122,12 +122,53 @@ import {
   type StepCommitCandidate,
 } from "./commit-policy.ts";
 import {
+  decideFolderGate,
+  detectRepoRoot,
+  isBroadGrantRoot,
+  evaluateFolderTargets,
+  matchSensitivePath,
+  readFolderPolicyConfig,
+  writeFolderPolicyConfig,
+  folderPolicyArgumentCompletions,
+  folderPolicyConfigPaths,
+  DEFAULT_SENSITIVE_PATTERNS,
+  type FolderPolicyConfig,
+  type FolderTarget,
+} from "./folder-policy.ts";
+import { analyzeShellPaths } from "./shell-paths.ts";
+import {
+  buildReadDenyReason,
+  buildReadGuidanceMessage,
+  decideReadGate,
+  parseReadGateChoice,
+  readGateItemFromTarget,
+  readGateItemsKind,
+  readGateOptions,
+  readGateTargetKey,
+  readGateTargetsLabel,
+  readGateTitle,
+  readReadPolicyConfig,
+  sanitizeReadInstruction,
+  writeReadPolicyConfig,
+  readPolicyArgumentCompletions,
+  readPolicyConfigPaths,
+  revokeReadPolicyPath,
+  describeReadPolicy,
+  READ_INSTRUCTION_PROMPT_PLACEHOLDER,
+  READ_INSTRUCTION_PROMPT_TITLE,
+  type ReadGateItem,
+  type ReadPolicyConfig,
+} from "./read-policy.ts";
+import { classifyReadCall } from "./read-policy-tools.ts";
+import { redactToolResult } from "./read-policy-redact.ts";
+import {
   buildWriteDenyReason,
   buildWriteGuidanceMessage,
   classifyWriteCall,
   decideWriteGate,
   describeWritePolicyMode,
   isWriteCallAllowed,
+  normalizeWritePath,
   parseWriteGateChoice,
   readWritePolicyConfig,
   sanitizeWriteInstruction,
@@ -453,8 +494,17 @@ async function runSingleAgent(
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
         // Carry the role into the child so its workflow extension gates bash
-        // with the same policy the parent applies (see permissions.ts).
-        env: subagentEnv(process.env, agent.role),
+        // with the same policy the parent applies (see permissions.ts), and
+        // lock the folder roots so the child cannot expand via a sibling
+        // project's settings.
+        env: {
+          ...subagentEnv(process.env, agent.role),
+          PI_FOLDER_POLICY_LOCKED: "1",
+          PI_FOLDER_POLICY_ROOTS: JSON.stringify([
+            detectRepoRoot(cwd) ?? cwd,
+          ]),
+          PI_FOLDER_POLICY_SOURCE: "parent",
+        },
       },
     );
     // Track for cleanup on session_shutdown — prevents orphaned subagents
@@ -611,6 +661,17 @@ export default function workflowExtension(
     null;
   let writeGateTurnSteered = false;
   const writeGateRunDenials = new Map<string, { instruction: string }>();
+  // ── Read-policy gate state (turn-scoped grants, run-scoped denials) ──
+  let readGateBatchCalls: { name: string; args: unknown }[] = [];
+  let readGateBatchCallIds = new Set<string>();
+  const readGateTurnGrantedRoots = new Set<string>();
+  const readGateTurnUncertainAllowed = new Set<string>();
+  let readGateTurnAnswer: {
+    choice: "allow-once" | "always" | "deny";
+    instruction: string;
+  } | null = null;
+  let readGateTurnSteered = false;
+  const readGateRunDenials = new Map<string, { instruction: string }>();
   // ── Reminder throttle + staleness tracking (passive enforcement layer) ──
   let turnsSinceLastTodoWrite = 0;
   let turnsSinceLastReminder = 0;
@@ -1284,6 +1345,7 @@ export default function workflowExtension(
       commitMode = readCommitPolicyConfig(
         (ctx as any).cwd ?? process.cwd(),
         getAgentDir(),
+        { trusted: (ctx as any).isProjectTrusted?.() === true },
       ).config.mode;
     } catch {
       commitMode = "never";
@@ -1297,9 +1359,20 @@ export default function workflowExtension(
       writeMode = readWritePolicyConfig(
         (ctx as any).cwd ?? process.cwd(),
         getAgentDir(),
+        { trusted: (ctx as any).isProjectTrusted?.() === true },
       ).config.mode;
     } catch {
       writeMode = "allow";
+    }
+    let folderMode: string | null = null;
+    try {
+      folderMode = readFolderPolicyConfig(
+        (ctx as any).cwd ?? process.cwd(),
+        getAgentDir(),
+        { trusted: (ctx as any).isProjectTrusted?.() === true },
+      ).config.mode;
+    } catch {
+      folderMode = null;
     }
     const segments = buildWorkflowStatusSegments({
       mode: workflowMode,
@@ -1311,6 +1384,7 @@ export default function workflowExtension(
       roleLabel,
       commitMode,
       writeMode: workflowMode === null ? writeMode : null,
+      folderMode,
     });
     const modeTone =
       reviewTurn !== "idle"
@@ -3131,7 +3205,9 @@ export default function workflowExtension(
           : "global";
 
       if (!sub || sub === "status") {
-        const resolved = readCommitPolicyConfig(cwd, agentDir);
+        const resolved = readCommitPolicyConfig(cwd, agentDir, {
+          trusted: (ctx as any).isProjectTrusted?.() === true,
+        });
         const paths = commitConfigPaths(cwd, agentDir);
         const where =
           resolved.sources.mode === "default"
@@ -3209,7 +3285,9 @@ export default function workflowExtension(
           : "global";
 
       if (!sub || sub === "status") {
-        const resolved = readWritePolicyConfig(cwd, agentDir);
+        const resolved = readWritePolicyConfig(cwd, agentDir, {
+          trusted: (ctx as any).isProjectTrusted?.() === true,
+        });
         const paths = writePolicyConfigPaths(cwd, agentDir);
         const where =
           resolved.sources.mode === "default"
@@ -3292,6 +3370,132 @@ export default function workflowExtension(
   // gate: it reads the same analyzeCommand/explainCommandRefusal the gates
   // use, so the explanation cannot describe a policy the gate no longer
   // enforces. Read-only, so it is safe in every mode.
+  pi.registerCommand("folder-policy", {
+    description: "Shared folder scope for read/write/commit: repo|cwd|parent|any, outside ask|block, sensitive list",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const trusted = (ctx as any).isProjectTrusted?.() === true;
+      const tokens = String(args || "").trim().split(/\s+/).filter(Boolean);
+      const sub = (tokens[0] || "status").toLowerCase();
+      const second = (tokens[1] || "").toLowerCase();
+      const scope: "global" | "project" = tokens.includes("project")
+        ? "project"
+        : "global";
+      const resolved = readFolderPolicyConfig(cwd, agentDir, { trusted });
+      if (sub === "status") {
+        const paths = folderPolicyConfigPaths(cwd, agentDir);
+        const lines = [
+          `Folder policy: ${resolved.config.mode} (${resolved.sources.mode === "default" ? "default" : resolved.sources.mode + " settings"})`,
+          `  outside: ${resolved.config.outside}; grantScope: ${resolved.config.grantScope}; templates: ${resolved.config.sensitiveTemplates}`,
+          `  base: ${detectRepoRoot(cwd) ?? cwd}`,
+          `  sensitive: ${DEFAULT_SENSITIVE_PATTERNS.length} default, ${resolved.config.sensitivePatterns.length} extra, ${resolved.config.sensitiveExemptions.length} exemption(s)`,
+          `Global: ${paths.global}`,
+          `Project: ${paths.project}${resolved.sources.projectIgnored ? " (ignored: project not trusted)" : ""}`,
+          "Usage: /folder-policy repo|cwd|parent|any [global|project] · outside ask|block · grant project|global · templates allow|block · sensitive",
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+      if (sub === "sensitive") {
+        ctx.ui.notify(
+          [
+            "Sensitive deny list (always blocked for read/write/commit):",
+            ...DEFAULT_SENSITIVE_PATTERNS.map((p) => `  ${p}`),
+            ...(resolved.config.sensitivePatterns.length
+              ? ["Extra:", ...resolved.config.sensitivePatterns.map((p) => `  ${p}`)]
+              : []),
+            ...(resolved.config.sensitiveExemptions.length
+              ? ["Exemptions (manual):", ...resolved.config.sensitiveExemptions.map((p) => `  ${p}`)]
+              : []),
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      let patch: Record<string, unknown> | undefined;
+      if (["repo", "cwd", "parent", "any"].includes(sub)) patch = { mode: sub };
+      else if (sub === "outside" && ["ask", "block"].includes(second)) patch = { outside: second };
+      else if (sub === "grant" && ["project", "global"].includes(second)) patch = { grantScope: second };
+      else if (sub === "templates" && ["allow", "block"].includes(second)) patch = { sensitiveTemplates: second };
+      if (!patch) {
+        ctx.ui.notify("Usage: /folder-policy repo|cwd|parent|any · outside ask|block · grant project|global · templates allow|block · sensitive", "info");
+        return;
+      }
+      const written = writeFolderPolicyConfig(scope, cwd, agentDir, patch as any);
+      ctx.ui.notify(
+        written.ok
+          ? `Folder policy updated (${scope}): ${written.path}`
+          : `Could not write folder policy: ${written.error ?? "unknown error"}`,
+        written.ok ? "info" : "error",
+      );
+      updateStatus(ctx as any);
+    },
+    getArgumentCompletions: (prefix: string) => folderPolicyArgumentCompletions(prefix),
+  });
+
+  pi.registerCommand("read-policy", {
+    description: "Read permission: grants, shell paths|strict, guarded tools and the shared folder scope",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const trusted = (ctx as any).isProjectTrusted?.() === true;
+      const tokens = String(args || "").trim().split(/\s+/).filter(Boolean);
+      const sub = (tokens[0] || "status").toLowerCase();
+      const readResolved = readReadPolicyConfig(cwd, agentDir, { trusted });
+      const folderResolved = readFolderPolicyConfig(cwd, agentDir, { trusted });
+      const paths = readPolicyConfigPaths(cwd, agentDir);
+      if (sub === "status" || !sub) {
+        ctx.ui.notify(
+          [
+            describeReadPolicy(readResolved.config, folderResolved.config),
+            `  grants: ${readResolved.config.allowedPaths.join(", ") || "none"}`,
+            `  guarded tools: ${readResolved.config.guardedTools.join(", ") || "none"}`,
+            `Global: ${paths.global}`,
+            `Project: ${paths.project}${readResolved.sources.projectIgnored ? " (ignored: project not trusted)" : ""}`,
+            "Usage: /read-policy allow <path> [global|project] · revoke <path> · shell paths|strict · status",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      const scope: "global" | "project" = tokens.includes("project")
+        ? "project"
+        : "global";
+      if (sub === "shell") {
+        const value = (tokens[1] || "").toLowerCase();
+        if (value !== "paths" && value !== "strict") {
+          ctx.ui.notify("Usage: /read-policy shell paths|strict [global|project]", "info");
+          return;
+        }
+        const written = writeReadPolicyConfig(scope, cwd, agentDir, { shell: value });
+        ctx.ui.notify(written.ok ? `Read shell → ${value} (${scope})` : `Could not save: ${written.error}`, written.ok ? "info" : "error");
+        updateStatus(ctx as any);
+        return;
+      }
+      if (sub === "allow" || sub === "revoke") {
+        const target = tokens.slice(1).find((t) => t !== "global" && t !== "project");
+        if (!target) {
+          ctx.ui.notify(`Usage: /read-policy ${sub} <path> [global|project]`, "info");
+          return;
+        }
+        const result =
+          sub === "allow"
+            ? writeReadPolicyConfig(scope, cwd, agentDir, { allowedPaths: [target] })
+            : revokeReadPolicyPath(scope, cwd, agentDir, target);
+        ctx.ui.notify(
+          result.ok
+            ? `Read grant ${sub === "allow" ? "added" : "removed"} (${scope}): ${target}`
+            : `Could not save read grant: ${result.error}`,
+          result.ok ? "info" : "error",
+        );
+        return;
+      }
+      ctx.ui.notify("Usage: /read-policy status|allow <path>|revoke <path>|shell paths|strict", "info");
+    },
+    getArgumentCompletions: (prefix: string) => readPolicyArgumentCompletions(prefix),
+  });
+
   pi.registerCommand("permissions", {
     description:
       "Explain why a shell command would be allowed or refused: /permissions explain <command>",
@@ -5239,7 +5443,7 @@ export default function workflowExtension(
         "Plan review closed — choose next step",
         [execute, refine],
       );
-    } catch (_e) {
+    } catch {
       choice = undefined;
     }
     if (choice === execute) {
@@ -9217,6 +9421,13 @@ export default function workflowExtension(
     writeGateTurnSteered = false;
     writeGateBatchCalls = [];
     writeGateBatchCallIds = new Set();
+    readGateRunDenials.clear();
+    readGateTurnAnswer = null;
+    readGateTurnSteered = false;
+    readGateBatchCalls = [];
+    readGateBatchCallIds = new Set();
+    readGateTurnGrantedRoots.clear();
+    readGateTurnUncertainAllowed.clear();
     // Roles are file-backed; load them up-front so every read path (status,
     // band label, reviewer runtime) sees the real config even in a fresh
     // session that has no persisted workflow entry yet. Profiles likewise.
@@ -9635,6 +9846,13 @@ export default function workflowExtension(
     writeGateTurnSteered = false;
     writeGateBatchCalls = [];
     writeGateBatchCallIds = new Set();
+    readGateRunDenials.clear();
+    readGateTurnAnswer = null;
+    readGateTurnSteered = false;
+    readGateBatchCalls = [];
+    readGateBatchCallIds = new Set();
+    readGateTurnGrantedRoots.clear();
+    readGateTurnUncertainAllowed.clear();
     // Kill any active explore subagents to prevent orphan leaks.
     // Without this, `pi --mode json` children spawned by runSingleAgent
     // (up to 4 concurrent) could survive if VS Code closes the terminal
@@ -9740,6 +9958,95 @@ export default function workflowExtension(
    * The decision itself is the pure `decideCommitGate`; this wrapper supplies
    * the runtime inputs and renders the block reasons / ask overlay.
    */
+  function runGitZ(
+    repoRoot: string,
+    args: string[],
+  ): { ok: boolean; paths: string[]; error?: string } {
+    try {
+      const res = spawnSync("git", ["-C", repoRoot, ...args], {
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      if (res.error)
+        return { ok: false, paths: [], error: res.error.message };
+      if (res.status !== 0)
+        return {
+          ok: false,
+          paths: [],
+          error: String(res.stderr ?? "").trim() || `git exited ${res.status}`,
+        };
+      const paths = String(res.stdout ?? "")
+        .split("\0")
+        .map((entry) => entry.replace(/\r?\n$/, ""))
+        .map((entry) => entry.replace(/^..\s+/, ""))
+        .map((entry) => entry.split(" -> ").pop() ?? entry)
+        .filter(Boolean);
+      return { ok: true, paths };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        paths: [],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  function commitSensitiveHit(
+    scope: NonNullable<ReturnType<typeof analyzeShellPaths>["git"]>,
+    folderConfig: FolderPolicyConfig,
+  ): { path: string; pattern: string } | { failed: string } | undefined {
+    const check = (paths: readonly string[]) => {
+      for (const p of paths) {
+        const hit = matchSensitivePath(p, folderConfig, scope.repoRoot);
+        if (hit.sensitive)
+          return { path: p, pattern: hit.pattern ?? "sensitive" };
+      }
+      return undefined;
+    };
+    const explicit = check(scope.explicitPaths);
+    if (explicit) return explicit;
+
+    if (scope.hit === "add" && scope.allPaths) {
+      const status = runGitZ(scope.repoRoot, [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ]);
+      if (!status.ok)
+        return { failed: status.error ?? "git status failed" };
+      const hit = check(status.paths);
+      if (hit) return hit;
+    }
+    if (scope.hit === "commit") {
+      const staged = runGitZ(scope.repoRoot, [
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+      ]);
+      if (!staged.ok)
+        return { failed: staged.error ?? "git diff --cached failed" };
+      const hit = check(staged.paths);
+      if (hit) return hit;
+      if (scope.allPaths) {
+        const status = runGitZ(scope.repoRoot, [
+          "status",
+          "--porcelain=v1",
+          "-z",
+          "--untracked-files=all",
+        ]);
+        if (!status.ok)
+          return { failed: status.error ?? "git status failed" };
+        const modified = check(status.paths);
+        if (modified) return modified;
+      }
+    }
+    return undefined;
+  }
+
   async function commitPolicyGate(
     event: any,
     ctx: any,
@@ -9748,7 +10055,41 @@ export default function workflowExtension(
     const cmd = String(event?.input?.command ?? "");
     const hit = gitCommitPolicyHit(cmd);
     if (!hit) return undefined;
-    const policy = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+    const trusted = ctx?.isProjectTrusted?.() === true;
+    const policyConfig = readCommitPolicyConfig(cwd, getAgentDir(), {
+      trusted,
+    }).config;
+    const policy = policyConfig.mode;
+    const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
+      trusted,
+    }).config;
+    const git = analyzeShellPaths(cmd, cwd).git;
+    const repoRoot = git?.repoRoot ?? normalizeWritePath(cwd, cwd);
+    const folderEvaluation = evaluateFolderTargets(
+      [{ path: repoRoot, kind: "dir" }],
+      {
+        config: folderConfig,
+        grants: policyConfig.allowedPaths,
+        cwd,
+        action: "commit",
+      },
+    );
+    const folderDecision = decideFolderGate({
+      sensitive: false,
+      outside: folderEvaluation.outside.length > 0,
+      outsideAction: folderConfig.outside,
+    });
+    const sensitiveHit = git
+      ? commitSensitiveHit(git, folderConfig)
+      : undefined;
+    if (sensitiveHit && "failed" in sensitiveHit) {
+      return {
+        block: true,
+        reason:
+          `Commit policy: the sensitive-file check could not run (${sensitiveHit.failed}). ` +
+          "Refusing to commit unverified. Do not retry; ask the user to commit manually or fix git access.",
+      };
+    }
     const now = Date.now();
     const decision = decideCommitGate({
       policy,
@@ -9756,6 +10097,8 @@ export default function workflowExtension(
       hasTodos: todoItems.length > 0,
       auth: commitAuthorization,
       now,
+      folder: folderDecision,
+      sensitive: Boolean(sensitiveHit && !("failed" in sensitiveHit)),
     });
     if (decision === "allow") {
       // Count a granted `git commit` against the authorization, but only when
@@ -9778,6 +10121,22 @@ export default function workflowExtension(
     }
 
     if (decision === "block") {
+      if (sensitiveHit && !("failed" in sensitiveHit)) {
+        return {
+          block: true,
+          reason:
+            `Commit policy: \`${sensitiveHit.path}\` is a sensitive file (${sensitiveHit.pattern}). ` +
+            "Committing it is blocked even when the commit mode is 'allow'. Do not retry; remove it from the index, or ask the user to add a manual sensitiveExemptions entry.",
+        };
+      }
+      if (folderDecision === "block" && policy !== "never") {
+        return {
+          block: true,
+          reason:
+            `Folder policy is 'block' (workflow.folderPolicy): \`git ${hit}\` targets ${repoRoot}, which is outside the permitted folders. ` +
+            "Do not retry. Ask the user to grant that repository folder or change /folder-policy.",
+        };
+      }
       return {
         block: true,
         reason:
@@ -9802,16 +10161,45 @@ export default function workflowExtension(
           "but no interactive UI is available. Leave the change uncommitted and let the user decide.",
       };
     }
+    const folderOutside = folderEvaluation.outside.length > 0;
     let sel: unknown;
     try {
       sel = await ui.select(
-        `Commit policy 'ask': allow \`git ${hit}\`?`,
-        ["Allow once", "Deny"],
+        folderOutside
+          ? `Folder policy 'ask': allow \`git ${hit}\` in ${repoRoot}?`
+          : `Commit policy 'ask': allow \`git ${hit}\`?`,
+        folderOutside
+          ? ["Allow once", "Always allow this repository folder", "Deny"]
+          : ["Allow once", "Deny"],
       );
     } catch {
       sel = undefined;
     }
-    if (String(sel ?? "").startsWith("Allow")) return undefined;
+    const answer = String(sel ?? "");
+    if (answer.startsWith("Always allow")) {
+      if (folderConfig.grantScope === "project" && !trusted) {
+        return {
+          block: true,
+          reason:
+            "Folder policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
+            "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
+        };
+      }
+      const written = writeCommitPolicyConfig(
+        folderConfig.grantScope,
+        cwd,
+        getAgentDir(),
+        { allowedPaths: [repoRoot] },
+      );
+      if (!written.ok) {
+        return {
+          block: true,
+          reason: `Could not save the commit folder grant (${written.error ?? "unknown error"}); the commit was not allowed.`,
+        };
+      }
+      return undefined;
+    }
+    if (answer.startsWith("Allow")) return undefined;
     return {
       block: true,
       reason:
@@ -9828,7 +10216,9 @@ export default function workflowExtension(
   function commitDirectiveLine(ctx: any): string {
     try {
       const cwd = ctx?.cwd ?? process.cwd();
-      const mode = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+      const mode = readCommitPolicyConfig(cwd, getAgentDir(), {
+        trusted: ctx?.isProjectTrusted?.() === true,
+      }).config.mode;
       switch (mode) {
         case "never":
           return (
@@ -9864,16 +10254,72 @@ export default function workflowExtension(
    * part of the list (its arguments may have been rewritten by another
    * extension's tool_call handler after the assistant message was sealed).
    */
+  function writeFolderTargetsFor(
+    toolName: string,
+    input: any,
+    classification: WriteCallClassification,
+    cwd: string,
+  ): FolderTarget[] {
+    if (classification.paths.length > 0) {
+      return classification.paths.map((p) => ({ path: p, kind: "file" as const }));
+    }
+    if (toolName === "bash" || toolName === "powershell") {
+      const command = String(input?.command ?? "");
+      return analyzeShellPaths(command, cwd).writes;
+    }
+    return [];
+  }
+
+  function withFolderGrant(
+    item: WriteGateItem,
+    targets: readonly FolderTarget[],
+    cwd: string,
+  ): WriteGateItem {
+    const paths = targets
+      .map((target) => normalizeWritePath(target.path, cwd))
+      .filter(Boolean);
+    if (paths.length === 0) return item;
+    const unique = [...new Set(paths)].sort();
+    return {
+      ...item,
+      target: unique.join(", "),
+      grantPaths: [...new Set([...(item.grantPaths ?? []), ...unique])],
+      grantCommand: undefined,
+      key: `path:${unique.join("|")}`,
+    };
+  }
+
   function collectWriteGateItems(
     currentEvent: any,
     currentClassification: WriteCallClassification,
     config: WritePolicyConfig,
+    folderConfig: FolderPolicyConfig,
     cwd: string,
   ): WriteGateItem[] {
     const items: WriteGateItem[] = [];
     const seen = new Set<string>();
-    const add = (name: string, classification: WriteCallClassification) => {
-      const item = writeGateItemFromClassification(name, classification, cwd);
+    const add = (
+      name: string,
+      classification: WriteCallClassification,
+      input: any,
+    ) => {
+      const targets = writeFolderTargetsFor(
+        name,
+        input,
+        classification,
+        cwd,
+      );
+      const evaluation = evaluateFolderTargets(targets, {
+        config: folderConfig,
+        grants: config.allowedPaths,
+        cwd,
+        action: "write",
+      });
+      const needsFolder = evaluation.outside.length > 0;
+      if (!needsFolder && isWriteCallAllowed(classification, config, cwd))
+        return;
+      const base = writeGateItemFromClassification(name, classification, cwd);
+      const item = needsFolder ? withFolderGrant(base, targets, cwd) : base;
       if (!item.key || seen.has(item.key)) return;
       seen.add(item.key);
       items.push(item);
@@ -9883,8 +10329,6 @@ export default function workflowExtension(
       if (!name) continue;
       const classification = classifyWriteCall(name, call.args, config);
       if (!classification.mutating) continue;
-      // A granted target is not gated — it never reaches a dialog.
-      if (isWriteCallAllowed(classification, config, cwd)) continue;
       // The plan directory stays writable in every mode.
       if (
         classification.paths.length > 0 &&
@@ -9892,9 +10336,9 @@ export default function workflowExtension(
       ) {
         continue;
       }
-      add(name, classification);
+      add(name, classification, call.args);
     }
-    add(String(currentEvent?.toolName ?? ""), currentClassification);
+    add(String(currentEvent?.toolName ?? ""), currentClassification, currentEvent?.input);
     return items;
   }
 
@@ -9965,24 +10409,24 @@ export default function workflowExtension(
     cwd: string,
   ): Promise<{ block: true; reason: string } | undefined> {
     try {
-      // Scope: the top-level Default-mode session only.
-      //  - Plan mode has its own stricter rules (writes only to .pi/plans/).
-      //  - Build mode is the deliberate "go ahead" execution escape hatch.
-      //  - A spawned child carries PI_WORKFLOW_ROLE and is already read-only
-      //    through the role gate (and has no UI to answer a prompt).
-      if (workflowMode !== null) return undefined;
-      if (
-        resolveSessionRole({
-          envRole: process.env[WORKFLOW_ROLE_ENV],
-          workflowMode,
-        }) !== undefined
-      ) {
-        return undefined;
-      }
+      // Scope: the write MODE is a Default-mode knob; the shared FOLDER floor
+      // applies to every mode. Plan mode already restricts writes to
+      // .pi/plans/ (inside the folder root); Build mode is the deliberate
+      // execution path but must still respect the user's folder floor.
+      const gateRole = resolveSessionRole({
+        envRole: process.env[WORKFLOW_ROLE_ENV],
+        workflowMode,
+      });
+      if (gateRole && gateRole !== "builder") return undefined;
+      const defaultMode = workflowMode === null && gateRole === undefined;
 
-      const resolved = readWritePolicyConfig(cwd, getAgentDir());
+      const trusted = ctx?.isProjectTrusted?.() === true;
+      const resolved = readWritePolicyConfig(cwd, getAgentDir(), { trusted });
       const config = resolved.config;
-      if (config.mode === "allow") return undefined;
+      const effectiveWriteMode = defaultMode ? config.mode : "allow";
+      const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      }).config;
 
       const classification = classifyWriteCall(
         event.toolName,
@@ -10000,23 +10444,66 @@ export default function workflowExtension(
         return undefined;
       }
 
+      const folderTargets = writeFolderTargetsFor(
+        String(event.toolName ?? ""),
+        event.input,
+        classification,
+        cwd,
+      );
+      for (const folderTarget of folderTargets) {
+        const hit = matchSensitivePath(folderTarget.path, folderConfig, cwd);
+        if (hit.sensitive) {
+          return {
+            block: true,
+            reason:
+              `Write policy: \`${folderTarget.path}\` is a sensitive file` +
+              (hit.pattern ? ` (${hit.pattern})` : "") +
+              ". This cannot be overridden by a write grant or folder. " +
+              "Do not retry; ask the user to edit the sensitive list in settings.json if this is intentional.",
+          };
+        }
+      }
+
+      const folderEvaluation = evaluateFolderTargets(folderTargets, {
+        config: folderConfig,
+        grants: config.allowedPaths,
+        cwd,
+        action: "write",
+      });
+      const folderDecision = decideFolderGate({
+        sensitive: false,
+        outside: folderEvaluation.outside.length > 0,
+        outsideAction: folderConfig.outside,
+      });
       const allowed = isWriteCallAllowed(classification, config, cwd);
       const decision = decideWriteGate({
-        mode: config.mode,
+        mode: effectiveWriteMode,
         mutating: true,
         allowed,
+        folder: folderDecision,
       });
       if (decision === "allow") return undefined;
 
       const target =
-        classification.paths.length > 0
-          ? classification.paths.join(", ")
-          : (classification.key ?? String(event.toolName));
+        folderTargets.length > 0
+          ? folderTargets.map((item) => item.path).join(", ")
+          : classification.paths.length > 0
+            ? classification.paths.join(", ")
+            : (classification.key ?? String(event.toolName));
       const why = classification.reason
         ? ` (${classification.reason})`
         : "";
 
       if (decision === "block") {
+        if (folderDecision === "block" && effectiveWriteMode !== "never") {
+          return {
+            block: true,
+            reason:
+              `Folder policy is 'block' (workflow.folderPolicy): the target is outside the permitted folders. ` +
+              "Do not retry. Ask the user to open the project at that folder, grant it, or change /folder-policy. " +
+              `Target: ${target}`,
+          };
+        }
         return {
           block: true,
           reason:
@@ -10042,10 +10529,14 @@ export default function workflowExtension(
       // the answer applies to all of them.
       const ui = ctx?.ui;
       if (!ui || !ctx.hasUI) {
+        const policyName =
+          effectiveWriteMode === "allow"
+            ? "Folder policy is 'ask' (workflow.folderPolicy)"
+            : "Write policy is 'ask' (workflow.writePolicy)";
         return {
           block: true,
           reason:
-            `Write policy is 'ask' (workflow.writePolicy): writing needs user approval${why}, but no interactive UI is available. ` +
+            `${policyName}: writing needs user approval${why}, but no interactive UI is available. ` +
             "Do not retry. Report what you would change and let the user apply it, or tell them to switch to Build mode (/build). " +
             `Target: ${target}`,
         };
@@ -10063,12 +10554,22 @@ export default function workflowExtension(
         writeGateBatchCalls = [];
         writeGateBatchCallIds = new Set();
       }
-      const items = collectWriteGateItems(event, classification, config, cwd);
-      const currentItem = writeGateItemFromClassification(
+      const items = collectWriteGateItems(
+        event,
+        classification,
+        config,
+        folderConfig,
+        cwd,
+      );
+      const currentBase = writeGateItemFromClassification(
         String(event.toolName ?? ""),
         classification,
         cwd,
       );
+      const currentItem =
+        folderEvaluation.outside.length > 0
+          ? withFolderGrant(currentBase, folderTargets, cwd)
+          : currentBase;
 
       // (a) The user denied this target earlier in THIS RUN → deny again,
       // silently. The model gets the same sentence; the user is not asked a
@@ -10129,7 +10630,16 @@ export default function workflowExtension(
           for (const p of item.grantPaths ?? []) allowedPaths.push(p);
           if (item.grantCommand) allowedCommands.push(item.grantCommand);
         }
-        const written = writeWritePolicyConfig("global", cwd, getAgentDir(), {
+        const grantScope = folderConfig.grantScope;
+        if (grantScope === "project" && !trusted) {
+          return {
+            block: true,
+            reason:
+              "Write policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
+              "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
+          };
+        }
+        const written = writeWritePolicyConfig(grantScope, cwd, getAgentDir(), {
           allowedPaths,
           allowedCommands,
         });
@@ -10243,6 +10753,340 @@ export default function workflowExtension(
         reason:
           `Write policy (workflow.writePolicy) could not be evaluated (${e instanceof Error ? e.message : String(e)}), so the write was blocked. ` +
           "Do not retry. Ask the user to switch to Build mode (/build) or to fix the policy with /write-policy.",
+      };
+    }
+  }
+
+  function collectReadGateItems(
+    currentEvent: any,
+    currentClassification: ReturnType<typeof classifyReadCall>,
+    config: ReadPolicyConfig,
+    folderConfig: FolderPolicyConfig,
+    cwd: string,
+    lockedRoots?: readonly string[],
+  ): ReadGateItem[] {
+    const items: ReadGateItem[] = [];
+    const seen = new Set<string>();
+    const add = (
+      name: string,
+      classification: ReturnType<typeof classifyReadCall>,
+    ) => {
+      if (classification.exempt) return;
+      const targets = classification.targets;
+      const evaluation = evaluateFolderTargets(targets, {
+        config: folderConfig,
+        grants: [...config.allowedPaths, ...readGateTurnGrantedRoots],
+        cwd,
+        lockedRoots,
+        action: "read",
+      });
+      for (const target of evaluation.outside) {
+        const item = readGateItemFromTarget(name, target, "outside the folder");
+        if (seen.has(item.key)) continue;
+        seen.add(item.key);
+        items.push(item);
+      }
+      if (evaluation.outside.length === 0) {
+        for (const reason of classification.uncertain) {
+          const key = `cmd:${reason}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push({
+            tool: name,
+            target: { path: reason, kind: "file" },
+            grantRoot: "",
+            why: reason,
+            key,
+          });
+        }
+      }
+    };
+    for (const call of readGateBatchCalls) {
+      const name = String(call.name ?? "");
+      if (!name) continue;
+      add(name, classifyReadCall(name, call.args, cwd, config));
+    }
+    add(
+      String(currentEvent?.toolName ?? ""),
+      currentClassification,
+    );
+    return items;
+  }
+
+  function deliverReadInstruction(instruction: string, target: string): void {
+    if (!instruction || readGateTurnSteered) return;
+    const rt = reviewRuntime;
+    const wouldRouteToReviewer = shouldRouteInputToReviewer({
+      reviewEnabled: reviewEnabled(),
+      reviewActive: rt?.isRoundActive() === true,
+      hasReviewerSession: rt?.isAlive() === true,
+      manualSessionActive: reviewSessionLive(),
+    });
+    if (!wouldRouteToReviewer) {
+      try {
+        (pi as any).sendUserMessage?.(
+          buildReadGuidanceMessage({ target, instruction }),
+          { deliverAs: "steer" },
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
+    readGateTurnSteered = true;
+  }
+
+  /**
+   * Read permission gate. Applies in every workflow mode and to every role,
+   * including Build/explorer/reviewer-adjacent calls. The shared folder floor
+   * decides scope; the sensitive list always wins; the dialog is batched once
+   * per assistant turn.
+   */
+  async function readPolicyGate(
+    event: any,
+    ctx: any,
+    cwd: string,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    try {
+      const trusted = ctx?.isProjectTrusted?.() === true;
+      const readResolved = readReadPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      });
+      const folderResolved = readFolderPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      });
+      const config = readResolved.config;
+      const folderConfig = folderResolved.config;
+      const classification = classifyReadCall(
+        String(event.toolName ?? ""),
+        event.input,
+        cwd,
+        config,
+      );
+      if (classification.exempt) return undefined;
+      if (
+        classification.targets.length === 0 &&
+        classification.uncertain.length === 0
+      )
+        return undefined;
+
+      const grants = [...config.allowedPaths, ...readGateTurnGrantedRoots];
+      const evaluation = evaluateFolderTargets(classification.targets, {
+        config: folderConfig,
+        grants,
+        cwd,
+        lockedRoots: folderResolved.locked?.roots,
+        action: "read",
+      });
+      if (evaluation.sensitive.length > 0) {
+        const hit = evaluation.sensitive[0];
+        return {
+          block: true,
+          reason: buildReadDenyReason({
+            kind: "sensitive",
+            target: hit.path,
+            pattern: hit.pattern,
+          }),
+        };
+      }
+
+      const outside = evaluation.outside;
+      const uncertain = classification.uncertain;
+      let decision = decideReadGate({
+        sensitive: false,
+        outside: outside.length > 0,
+        outsideAction: folderConfig.outside,
+        granted: false,
+        uncertain: uncertain.length > 0,
+        shell: config.shell,
+      });
+
+      if (uncertain.length > 0 && config.shell === "strict") {
+        const allowed = uncertain.every((reason) =>
+          readGateTurnUncertainAllowed.has(reason),
+        );
+        if (allowed) decision = "allow";
+      }
+      if (decision === "allow") return undefined;
+      if (decision === "block") {
+        return {
+          block: true,
+          reason: buildReadDenyReason({
+            kind: "blocked",
+            target:
+              outside.length > 0
+                ? outside.map((target) => target.path).join(", ")
+                : uncertain[0] ?? String(event.toolName),
+            outsideAction: folderConfig.outside,
+          }),
+        };
+      }
+
+      const ui = ctx?.ui;
+      if (!ui || !ctx.hasUI) {
+        return {
+          block: true,
+          reason:
+            "Read policy is 'ask' (workflow.folderPolicy): this read needs approval, but no interactive UI is available. " +
+            "Do not retry; report what you need and let the user approve it.",
+        };
+      }
+
+      const callId = String(event.toolCallId ?? "");
+      if (!readGateBatchCallIds.has(callId)) {
+        readGateTurnAnswer = null;
+        readGateTurnSteered = false;
+        readGateBatchCalls = [];
+        readGateBatchCallIds = new Set();
+        readGateTurnGrantedRoots.clear();
+        readGateTurnUncertainAllowed.clear();
+      }
+      const items = collectReadGateItems(
+        event,
+        classification,
+        config,
+        folderConfig,
+        cwd,
+        folderResolved.locked?.roots,
+      );
+      const currentItems = items.filter((item) => {
+        if (outside.length > 0)
+          return outside.some((target) => item.key === readGateTargetKey(target));
+        return uncertain.some((reason) => item.key === `cmd:${reason}`);
+      });
+      const currentItem = currentItems[0];
+      const remembered = currentItem
+        ? readGateRunDenials.get(currentItem.key)
+        : undefined;
+      if (remembered) {
+        return {
+          block: true,
+          reason: buildReadDenyReason({
+            kind: "outside",
+            target: readGateTargetsLabel(currentItems) || "the requested read",
+            instruction: remembered.instruction,
+          }),
+        };
+      }
+      if (readGateTurnAnswer) {
+        if (readGateTurnAnswer.choice === "deny") {
+          return {
+            block: true,
+            reason: buildReadDenyReason({
+              kind: "outside",
+              target: readGateTargetsLabel(currentItems) || "the requested read",
+              instruction: readGateTurnAnswer.instruction,
+            }),
+          };
+        }
+        return undefined;
+      }
+
+      const options = readGateOptions(readGateItemsKind(items));
+      let sel: unknown;
+      try {
+        sel = await ui.select(readGateTitle(items), options);
+      } catch {
+        sel = undefined;
+      }
+      const choice = parseReadGateChoice(sel);
+      if (choice === "allow-once") {
+        for (const item of items) if (item.grantRoot) readGateTurnGrantedRoots.add(item.grantRoot);
+        for (const reason of uncertain) readGateTurnUncertainAllowed.add(reason);
+        readGateTurnAnswer = { choice: "allow-once", instruction: "" };
+        return undefined;
+      }
+      if (choice === "always") {
+        const roots = [
+          ...new Set(items.map((item) => item.grantRoot).filter(Boolean)),
+        ];
+        if (roots.length === 0) {
+          for (const reason of uncertain)
+            readGateTurnUncertainAllowed.add(reason);
+          readGateTurnAnswer = { choice: "always", instruction: "" };
+          return undefined;
+        }
+        const broad = roots.find((root) => isBroadGrantRoot(root));
+        if (broad) {
+          return {
+            block: true,
+            reason:
+              `Read policy: \`${broad}\` is too broad to persist from a dialog. Choose Allow once, or use /folder-policy any deliberately.`,
+          };
+        }
+        if (folderConfig.grantScope === "project" && !trusted) {
+          return {
+            block: true,
+            reason:
+              "Read policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
+              "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
+          };
+        }
+        const written = writeReadPolicyConfig(
+          folderConfig.grantScope,
+          cwd,
+          getAgentDir(),
+          { allowedPaths: roots },
+        );
+        if (!written.ok) {
+          return {
+            block: true,
+            reason: `Read policy 'ask': could not save the permission grant (${written.error ?? "unknown error"}).`,
+          };
+        }
+        for (const root of roots) readGateTurnGrantedRoots.add(root);
+        for (const reason of uncertain) readGateTurnUncertainAllowed.add(reason);
+        readGateTurnAnswer = { choice: "always", instruction: "" };
+        return undefined;
+      }
+
+      let instruction = "";
+      if (choice === "deny-with-instructions") {
+        const inputFn = (ui as any).input;
+        if (typeof inputFn === "function") {
+          try {
+            instruction = sanitizeReadInstruction(
+              await inputFn.call(
+                ui,
+                READ_INSTRUCTION_PROMPT_TITLE,
+                READ_INSTRUCTION_PROMPT_PLACEHOLDER,
+              ),
+            );
+          } catch {
+            instruction = "";
+          }
+        }
+      }
+      readGateTurnAnswer = { choice: "deny", instruction };
+      for (const item of items) readGateRunDenials.set(item.key, { instruction });
+      if (instruction)
+        deliverReadInstruction(
+          instruction,
+          readGateTargetsLabel(items) || "the requested read",
+        );
+      try {
+        pi.appendEntry("workflow-read-denial", {
+          tool: String(event.toolName ?? ""),
+          target: readGateTargetsLabel(items),
+          instruction,
+          at: Date.now(),
+        });
+      } catch (_e) {
+        void _e;
+      }
+      return {
+        block: true,
+        reason: buildReadDenyReason({
+          kind: "outside",
+          target: readGateTargetsLabel(items) || "the requested read",
+          instruction,
+        }),
+      };
+    } catch (error: unknown) {
+      return {
+        block: true,
+        reason:
+          `Read policy could not be evaluated (${error instanceof Error ? error.message : String(error)}), so the read was blocked. ` +
+          "Do not retry; ask the user to fix /read-policy or /folder-policy.",
       };
     }
   }
@@ -10380,14 +11224,18 @@ export default function workflowExtension(
         reason: `${gateRole} role: ${event.toolName} blocked — this role is read-only.`,
       } as any;
     }
-    // ── Write permission gate (workflow.writePolicy) ── Independent of the
-    // role gate and of the commit policy: it governs whether the USER
-    // permits a write at all. It only applies in Default mode — Plan has its
-    // own stricter rules and Build is the approved-execution escape hatch —
-    // and it runs last so it only sees calls nothing else claimed.
-    if (workflowMode === null) {
+    // ── Write permission gate (workflow.writePolicy + shared folder floor) ──
+    // The write MODE is a Default-mode knob; the folder floor applies in every
+    // mode. It runs after the role/commit rules and before the build-todo
+    // guard so a folder/sensitive refusal wins.
+    {
       const writeBlock = await writePolicyGate(event, ctx, cwd);
       if (writeBlock) return writeBlock as any;
+    }
+    // ── Read permission gate (workflow.readPolicy + shared folder floor) ──
+    {
+      const readBlock = await readPolicyGate(event, ctx, cwd);
+      if (readBlock) return readBlock as any;
     }
     // In build mode, ensure todos exist before first real edit
     if (
@@ -10450,7 +11298,54 @@ export default function workflowExtension(
       seedCommittedStepRefs();
       const completed = uncommittedDoneSteps();
       const dirty = await isDirty(pi as any, cwd);
-      const mode = readCommitPolicyConfig(cwd, getAgentDir()).config.mode;
+      const trusted = ctx?.isProjectTrusted?.() === true;
+      const commitConfig = readCommitPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      }).config;
+      const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      }).config;
+      const repoRoot = detectRepoRoot(cwd) ?? cwd;
+      const folder = evaluateFolderTargets(
+        [{ path: repoRoot, kind: "dir" }],
+        {
+          config: folderConfig,
+          grants: commitConfig.allowedPaths,
+          cwd,
+          action: "commit",
+        },
+      );
+      if (folder.outside.length > 0) {
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: ${repoRoot} is outside the permitted folders (use /folder-policy or grant it first).`,
+          "warning",
+        );
+        return;
+      }
+      const status = runGitZ(repoRoot, [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ]);
+      if (!status.ok) {
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: sensitive-file check could not run (${status.error ?? "git status failed"}).`,
+          "warning",
+        );
+        return;
+      }
+      const sensitive = status.paths
+        .map((p) => matchSensitivePath(p, folderConfig, repoRoot))
+        .find((hit) => hit.sensitive);
+      if (sensitive) {
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: ${sensitive.path} is sensitive. Remove it from the working tree/index or add a manual sensitiveExemptions entry.`,
+          "warning",
+        );
+        return;
+      }
+      const mode = commitConfig.mode;
       const decision = stepCommitDecision({
         mode,
         hasTodos: todoItems.length > 0,
@@ -10507,6 +11402,44 @@ export default function workflowExtension(
     }
   }
 
+  // Output redaction is defence in depth for channels the tool gate cannot
+  // fully see (grep --hidden, git diff/show, truncated bash output).
+  pi.on("tool_result", async (event, ctx) => {
+    try {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
+        trusted: (ctx as any)?.isProjectTrusted?.() === true,
+      }).config;
+      return redactToolResult(event as any, folderConfig, cwd) as any;
+    } catch (error: unknown) {
+      const tool = String((event as any)?.toolName ?? "");
+      if (
+        [
+          "read",
+          "read_symbol",
+          "read_enclosing",
+          "module_report",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "powershell",
+        ].includes(tool)
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `[read policy redaction failed — output withheld: ${error instanceof Error ? error.message : String(error)}]`,
+            },
+          ],
+          structuredContent: undefined,
+        } as any;
+      }
+      return undefined;
+    }
+  });
+
   pi.on("tool_result", async (_event, ctx) => {
     try {
       const leaf =
@@ -10559,6 +11492,10 @@ export default function workflowExtension(
       writeGateBatchCallIds = callIds;
       writeGateTurnAnswer = null;
       writeGateTurnSteered = false;
+      readGateBatchCalls = calls;
+      readGateBatchCallIds = callIds;
+      readGateTurnAnswer = null;
+      readGateTurnSteered = false;
     } catch (_e) {
       void _e;
     }
@@ -10572,6 +11509,12 @@ export default function workflowExtension(
     writeGateTurnSteered = false;
     writeGateBatchCalls = [];
     writeGateBatchCallIds = new Set();
+    readGateTurnAnswer = null;
+    readGateTurnSteered = false;
+    readGateBatchCalls = [];
+    readGateBatchCallIds = new Set();
+    readGateTurnGrantedRoots.clear();
+    readGateTurnUncertainAllowed.clear();
     // Seed the per-step commit ledger once per session: steps already done
     // (restored sessions, re-executed plans) never trigger a spurious commit.
     try {
@@ -10622,6 +11565,13 @@ export default function workflowExtension(
     writeGateTurnSteered = false;
     writeGateBatchCalls = [];
     writeGateBatchCallIds = new Set();
+    readGateRunDenials.clear();
+    readGateTurnAnswer = null;
+    readGateTurnSteered = false;
+    readGateBatchCalls = [];
+    readGateBatchCallIds = new Set();
+    readGateTurnGrantedRoots.clear();
+    readGateTurnUncertainAllowed.clear();
     // keep persisted CustomEntry for reload, clear in-memory tombstone only on explicit prune; for now no clear to survive fork
   });
 

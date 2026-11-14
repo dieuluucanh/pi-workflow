@@ -40,10 +40,13 @@ export type CommitPolicyMode = "never" | "ask" | "allow";
 
 export interface CommitPolicyConfig {
   mode: CommitPolicyMode;
+  /** Repository/worktree roots that may be committed outside the folder base. */
+  allowedPaths: string[];
 }
 
 export const DEFAULT_COMMIT_POLICY_CONFIG: Readonly<CommitPolicyConfig> = {
   mode: "never",
+  allowedPaths: [],
 };
 
 const COMMIT_POLICY_MODES: readonly CommitPolicyMode[] = [
@@ -71,6 +74,24 @@ function coerceMode(value: unknown): CommitPolicyMode | undefined {
     : undefined;
 }
 
+function coerceStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (!trimmed || out.includes(trimmed)) continue;
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function unionStrings(a: readonly string[], b: readonly string[]): string[] {
+  const out = [...a];
+  for (const item of b) if (!out.includes(item)) out.push(item);
+  return out;
+}
+
 /**
  * Coerce an untrusted settings fragment into a complete CommitPolicyConfig.
  * Accepts an object (`{ mode: "never" }`) or a bare mode string shorthand.
@@ -83,13 +104,19 @@ export function coerceCommitPolicyConfig(
 ): CommitPolicyConfig {
   if (typeof raw === "string") {
     const mode = coerceMode(raw);
-    return mode ? { mode } : { ...base };
+    return mode ? { ...base, mode } : { ...base };
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ...base };
   }
   const mode = coerceMode((raw as JsonObject).mode);
-  return { mode: mode ?? base.mode };
+  return {
+    mode: mode ?? base.mode,
+    allowedPaths:
+      coerceStringList((raw as JsonObject).allowedPaths) ?? [
+        ...base.allowedPaths,
+      ],
+  };
 }
 
 /** Extract the `workflow.commitPolicy` fragment from a raw settings object. */
@@ -116,7 +143,14 @@ export function mergeCommitPolicyConfig(
   projectRaw: unknown,
 ): CommitPolicyConfig {
   const fromGlobal = coerceCommitPolicyConfig(globalRaw);
-  return coerceCommitPolicyConfig(projectRaw, fromGlobal);
+  const fromProject = coerceCommitPolicyConfig(projectRaw, fromGlobal);
+  return {
+    mode: fromProject.mode,
+    allowedPaths: unionStrings(
+      fromGlobal.allowedPaths,
+      fromProject.allowedPaths,
+    ),
+  };
 }
 
 export interface CommitConfigPaths {
@@ -192,19 +226,22 @@ export interface ResolvedCommitPolicy {
 export function readCommitPolicyConfig(
   cwd: string,
   agentDir: string,
+  options: { trusted?: boolean } = {},
 ): ResolvedCommitPolicy {
   const paths = commitConfigPaths(cwd, agentDir);
   const globalSettings = readJsonSafe(paths.global);
   const projectSettings = readJsonSafe(paths.project);
   const globalRaw = extractCommitPolicyRaw(globalSettings);
   const projectRaw = extractCommitPolicyRaw(projectSettings);
-  const config = mergeCommitPolicyConfig(globalRaw, projectRaw);
+  const trusted = options.trusted === true;
+  const effectiveProjectRaw = trusted ? projectRaw : undefined;
+  const config = mergeCommitPolicyConfig(globalRaw, effectiveProjectRaw);
   return {
     config,
     sources: {
       global: globalRaw !== undefined,
       project: projectRaw !== undefined,
-      mode: modeSourceOf(globalRaw, projectRaw),
+      mode: modeSourceOf(globalRaw, effectiveProjectRaw),
     },
   };
 }
@@ -476,6 +513,10 @@ export interface CommitGateInput {
   hasTodos: boolean;
   auth?: CommitAuthorizationState | null;
   now: number;
+  /** Shared folder floor verdict (default allow for legacy callers). */
+  folder?: "allow" | "ask" | "block";
+  /** A sensitive path would be added/committed. */
+  sensitive?: boolean;
 }
 
 /**
@@ -486,12 +527,23 @@ export interface CommitGateInput {
  */
 export function decideCommitGate(input: CommitGateInput): CommitGateDecision {
   const { policy, hit, hasTodos } = input;
+  if (input.sensitive) return "block";
+  if (input.folder === "block") return "block";
+  if (
+    hit === "commit" &&
+    isAuthorizationActive(input.auth, input.now) &&
+    input.folder !== "ask"
+  ) {
+    return "allow";
+  }
+  if (policy === "never") return "block";
+  if (input.folder === "ask") return "ask";
   if (policy === "allow" && !hasTodos) return "allow";
   if (policy === "ask" && hit === "add") return "allow";
   if (hit === "commit" && isAuthorizationActive(input.auth, input.now)) {
     return "allow";
   }
-  if (policy === "never" || policy === "allow") return "block";
+  if (policy === "allow") return "block";
   return "ask";
 }
 
@@ -516,7 +568,13 @@ export function writeCommitPolicyConfig(
         ? { ...(wfExisting as JsonObject) }
         : {};
     const current = coerceCommitPolicyConfig(wf[COMMIT_POLICY_KEY]);
-    const next = coerceCommitPolicyConfig({ ...current, ...patch }, current);
+    const next: CommitPolicyConfig = {
+      mode: coerceMode(patch.mode) ?? current.mode,
+      allowedPaths: unionStrings(
+        current.allowedPaths,
+        coerceStringList(patch.allowedPaths) ?? [],
+      ),
+    };
     wf[COMMIT_POLICY_KEY] = next;
     root[WORKFLOW_SETTINGS_KEY] = wf;
     fs.mkdirSync(path.dirname(fp), { recursive: true });

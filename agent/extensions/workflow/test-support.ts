@@ -428,6 +428,8 @@ export interface FakeCtxOptions {
   editorAnswer?: string | null;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   signal?: AbortSignal;
+  /** Project-local settings trust (default true for existing fixtures). */
+  projectTrusted?: boolean;
 }
 
 export function makeFakeCtx(over: FakeCtxOptions) {
@@ -439,6 +441,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     mode: "tui",
     hasUI: over.hasUI === true,
     signal: over.signal,
+    isProjectTrusted: () => over.projectTrusted !== false,
     modelRegistry: over.modelRegistry ?? {
       find: (provider: string, id: string) => ({ provider, id }),
     },

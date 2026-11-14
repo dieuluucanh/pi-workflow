@@ -29,6 +29,16 @@ import {
     type ReviewFinding,
 } from "./utils.ts";
 import { explainCommandRefusal } from "./permissions.ts";
+import { analyzeShellPaths } from "./shell-paths.ts";
+import {
+    DEFAULT_FOLDER_POLICY_CONFIG,
+    detectRepoRoot,
+    evaluateFolderTargets,
+    matchSensitivePath,
+    type FolderPolicyConfig,
+    type FolderTarget,
+} from "./folder-policy.ts";
+import { redactSensitiveText } from "./read-policy-redact.ts";
 import type {
     PiCodingAgentSdk,
     ReviewPassResult,
@@ -145,6 +155,35 @@ export function createReviewBashTool(
                 };
             }
 
+            const guard = reviewerReadGuard(deps.cwd);
+            const readPaths = analyzeShellPaths(command, deps.cwd).reads;
+            const readEval = evaluateFolderTargets(readPaths, {
+                config: guard.config,
+                grants: [],
+                cwd: deps.cwd,
+                lockedRoots: [guard.root],
+                action: "read",
+            });
+            if (readEval.sensitive.length > 0 || readEval.outside.length > 0) {
+                const target =
+                    readEval.sensitive[0]?.path ??
+                    readEval.outside[0]?.path ??
+                    "the requested path";
+                deps.log(
+                    `Review Mode refused a read outside the repository/sensitive guard: ${target}`,
+                    "warning",
+                );
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `review_bash: REFUSED — \`${target}\` is outside the reviewer's permitted repository or is a sensitive file. Work only inside the repository; do not work around this.`,
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+
             try {
                 const result = (await inner.execute(
                     toolCallId,
@@ -153,7 +192,7 @@ export function createReviewBashTool(
                     onUpdate,
                     ctx,
                 )) as ReviewToolTextResult;
-                return result;
+                return redactReviewResult(result, "bash", rawParams, deps.cwd, guard.config);
             } catch (e: unknown) {
                 return {
                     content: [
@@ -1015,6 +1054,128 @@ export function createReviewPassDoneTool(deps: ReviewPassDoneDeps): {
     };
 }
 
+interface ReviewerReadGuard {
+    root: string;
+    config: FolderPolicyConfig;
+}
+
+function reviewerReadGuard(cwd: string): ReviewerReadGuard {
+    return {
+        root: detectRepoRoot(cwd) ?? cwd,
+        config: {
+            ...DEFAULT_FOLDER_POLICY_CONFIG,
+            mode: "cwd",
+            outside: "block",
+        },
+    };
+}
+
+function reviewerRefusal(target: FolderTarget): ReviewToolTextResult {
+    return {
+        content: [
+            {
+                type: "text",
+                text: `review read: REFUSED — \`${target.path}\` is outside the reviewer's repository or is a sensitive file. Work inside the repository; sensitive files stay blocked.`,
+            },
+        ],
+        isError: true,
+    };
+}
+
+function guardReviewerTarget(
+    tool: string,
+    input: Record<string, unknown>,
+    guard: ReviewerReadGuard,
+    cwd: string,
+): ReviewToolTextResult | undefined {
+    const raw = input.path;
+    const value =
+        typeof raw === "string" && raw.trim()
+            ? raw
+            : tool === "read"
+              ? ""
+              : cwd;
+    if (!value) {
+        return {
+            content: [{ type: "text", text: `review ${tool}: missing path` }],
+            isError: true,
+        };
+    }
+    const target: FolderTarget = {
+        path: value,
+        kind: tool === "read" ? "file" : "dir",
+    };
+    const hit = matchSensitivePath(value, guard.config, cwd);
+    const evaluation = evaluateFolderTargets([target], {
+        config: guard.config,
+        grants: [],
+        cwd,
+        lockedRoots: [guard.root],
+        action: "read",
+    });
+    if (hit.sensitive || evaluation.sensitive.length > 0)
+        return reviewerRefusal(target);
+    if (evaluation.outside.length > 0) return reviewerRefusal(target);
+    return undefined;
+}
+
+function redactReviewResult(
+    result: ReviewToolTextResult,
+    tool: string,
+    input: Record<string, unknown>,
+    cwd: string,
+    config: FolderPolicyConfig,
+): ReviewToolTextResult {
+    let redacted = false;
+    const content = (result.content ?? []).map((block) => {
+        if (block?.type !== "text") return block;
+        const next = redactSensitiveText(block.text, tool, input, cwd, config);
+        if (next.redacted) redacted = true;
+        return next.redacted ? { ...block, text: next.text } : block;
+    });
+    if (!redacted) return result;
+    return { ...result, content };
+}
+
+function createGuardedBuiltinTools(
+    sdk: PiCodingAgentSdk | undefined,
+    cwd: string,
+): { tools: unknown[]; unavailable: string[] } {
+    const tools: unknown[] = [];
+    const unavailable: string[] = [];
+    const guard = reviewerReadGuard(cwd);
+    const builders: Array<[string, string, unknown]> = [
+        ["read", "read", (sdk as any)?.createReadToolDefinition],
+        ["grep", "grep", (sdk as any)?.createGrepToolDefinition],
+        ["find", "find", (sdk as any)?.createFindToolDefinition],
+        ["ls", "ls", (sdk as any)?.createLsToolDefinition],
+    ];
+    for (const [name, tool, builder] of builders) {
+        if (typeof builder !== "function") {
+            unavailable.push(`${name} (guarded builder unavailable)`);
+            continue;
+        }
+        const definition = builder(cwd) as {
+            name: string;
+            execute: (...args: unknown[]) => Promise<unknown>;
+        };
+        tools.push({
+            ...definition,
+            name,
+            async execute(...args: unknown[]) {
+                const input = (args[1] ?? {}) as Record<string, unknown>;
+                const refusal = guardReviewerTarget(tool, input, guard, cwd);
+                if (refusal) return refusal;
+                const result = (await definition.execute(
+                    ...args,
+                )) as ReviewToolTextResult;
+                return redactReviewResult(result, tool, input, cwd, guard.config);
+            },
+        });
+    }
+    return { tools, unavailable };
+}
+
 /**
  * Build every tool the reviewer may use.
  */
@@ -1031,6 +1192,13 @@ export function createReviewTools(
     } else {
         unavailable.push("review_bash (createBashToolDefinition unavailable)");
     }
+
+    // The reviewer session has NO ambient extensions, so its built-in
+    // read/grep/find/ls are otherwise a complete bypass of the read gate.
+    // Custom tools with those names override the built-ins.
+    const guarded = createGuardedBuiltinTools(sdk, deps.cwd);
+    tools.push(...guarded.tools);
+    unavailable.push(...guarded.unavailable);
 
     tools.push(createReviewExploreTool(deps.explore));
     tools.push(createReviewPlanBeginTool(deps.submit));

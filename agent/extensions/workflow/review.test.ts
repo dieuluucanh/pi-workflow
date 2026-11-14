@@ -2979,20 +2979,33 @@ test("createReviewTools: reports missing SDK pieces instead of throwing", () => 
   ]);
   assert.equal(
     withoutSdk.unavailable.length,
-    1,
-    "review_bash reported unavailable",
+    5,
+    "review_bash + four guarded built-ins reported unavailable",
   );
 
+  const fakeDefinition = (name: string) => ({
+    name,
+    parameters: {},
+    execute: async () => ({ content: [] }),
+  });
   const withSdk = createReviewTools(
     {
       createBashToolDefinition: () => ({
         parameters: {},
         execute: async () => ({ content: [] }),
       }),
+      createReadToolDefinition: () => fakeDefinition("read"),
+      createGrepToolDefinition: () => fakeDefinition("grep"),
+      createFindToolDefinition: () => fakeDefinition("find"),
+      createLsToolDefinition: () => fakeDefinition("ls"),
     } as never,
     deps,
   );
-  assert.equal(withSdk.tools.length, 7, "all seven tools with a full SDK");
+  assert.equal(
+    withSdk.tools.length,
+    11,
+    "all base + guarded built-in tools with a full SDK",
+  );
   assert.equal(withSdk.unavailable.length, 0);
   assert.equal(
     resolveBashToolDefinitionBuilder({ createBashToolDefinition: 42 } as never),

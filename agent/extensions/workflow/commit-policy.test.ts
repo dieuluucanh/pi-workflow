@@ -44,34 +44,55 @@ import {
 // ── coerceCommitPolicyConfig ─────────────────────────────────────────
 
 test("coerce: defaults when raw is undefined/null", () => {
-  assert.deepEqual(coerceCommitPolicyConfig(undefined), { mode: "never" });
-  assert.deepEqual(coerceCommitPolicyConfig(null), { mode: "never" });
+  assert.deepEqual(coerceCommitPolicyConfig(undefined), {
+    mode: "never",
+    allowedPaths: [],
+  });
+  assert.deepEqual(coerceCommitPolicyConfig(null), {
+    mode: "never",
+    allowedPaths: [],
+  });
 });
 
 test("coerce: valid object fragment", () => {
-  assert.deepEqual(coerceCommitPolicyConfig({ mode: "ask" }), { mode: "ask" });
+  assert.deepEqual(coerceCommitPolicyConfig({ mode: "ask" }), {
+    mode: "ask",
+    allowedPaths: [],
+  });
   assert.deepEqual(coerceCommitPolicyConfig({ mode: "allow" }), {
     mode: "allow",
+    allowedPaths: [],
   });
   assert.deepEqual(coerceCommitPolicyConfig({ mode: "never" }), {
     mode: "never",
+    allowedPaths: [],
   });
 });
 
 test("coerce: bare mode string shorthand", () => {
-  assert.deepEqual(coerceCommitPolicyConfig("allow"), { mode: "allow" });
-  assert.deepEqual(coerceCommitPolicyConfig("never"), { mode: "never" });
+  assert.deepEqual(coerceCommitPolicyConfig("allow"), {
+    mode: "allow",
+    allowedPaths: [],
+  });
+  assert.deepEqual(coerceCommitPolicyConfig("never"), {
+    mode: "never",
+    allowedPaths: [],
+  });
 });
 
 test("coerce: mode string is trimmed and case-insensitive", () => {
-  assert.deepEqual(coerceCommitPolicyConfig("  ASK  "), { mode: "ask" });
+  assert.deepEqual(coerceCommitPolicyConfig("  ASK  "), {
+    mode: "ask",
+    allowedPaths: [],
+  });
   assert.deepEqual(coerceCommitPolicyConfig({ mode: " Allow " }), {
     mode: "allow",
+    allowedPaths: [],
   });
 });
 
 test("coerce: garbage falls back to base", () => {
-  const base = { mode: "ask" as const };
+  const base = { mode: "ask" as const, allowedPaths: [] };
   assert.deepEqual(coerceCommitPolicyConfig(true, base), base);
   assert.deepEqual(coerceCommitPolicyConfig(false, base), base);
   assert.deepEqual(coerceCommitPolicyConfig(42, base), base);
@@ -87,6 +108,7 @@ test("coerce: garbage falls back to base", () => {
 
 test("coerce: unknown fields are dropped", () => {
   assert.deepEqual(coerceCommitPolicyConfig({ mode: "allow", evil: true }), {
+    allowedPaths: [],
     mode: "allow",
   });
 });
@@ -215,7 +237,7 @@ test("read+write: global scope then project override", () => {
       p.path,
       path.join(cwd, ".pi", "settings.json"),
     );
-    res = readCommitPolicyConfig(cwd, agentDir);
+    res = readCommitPolicyConfig(cwd, agentDir, { trusted: true });
     assert.equal(res.config.mode, "never");
     assert.equal(res.sources.mode, "project");
     assert.equal(res.sources.global, true);
@@ -263,6 +285,7 @@ test("write: preserves every other key in the settings file", () => {
     assert.equal(root[WORKFLOW_SETTINGS_KEY].unrelated, "keep-me");
     assert.deepEqual(root[WORKFLOW_SETTINGS_KEY][COMMIT_POLICY_KEY], {
       mode: "allow",
+      allowedPaths: [],
     });
 
     // And a second write merges onto the existing policy value.

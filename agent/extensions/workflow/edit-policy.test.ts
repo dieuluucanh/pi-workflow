@@ -311,7 +311,7 @@ test("read+write: global scope then project override", () => {
     const p = writeWritePolicyConfig("project", cwd, agentDir, { mode: "never" });
     assert.equal(p.ok, true);
     assert.equal(p.path, path.join(cwd, ".pi", "settings.json"));
-    res = readWritePolicyConfig(cwd, agentDir);
+    res = readWritePolicyConfig(cwd, agentDir, { trusted: true });
     assert.equal(res.config.mode, "never");
     assert.equal(res.sources.mode, "project");
   } finally {

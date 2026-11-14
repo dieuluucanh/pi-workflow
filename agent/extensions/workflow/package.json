@@ -7,9 +7,10 @@
   "description": "Plan↔Build mode with an independent Review Mode reviewer, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.",
   "license": "MIT",
   "scripts": {
-    "test": "node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-handoff.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts",
+    "test": "node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-handoff.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts shell-paths.test.ts read-policy.test.ts read-policy-tools.test.ts read-policy-redact.test.ts read-policy-gate.test.ts folder-floor-write.test.ts folder-floor-commit.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check:policy": "node --experimental-transform-types scripts/verify-write-policy.mjs",
+    "check:read-policy": "node --experimental-transform-types scripts/verify-read-policy.mjs",
     "prepublishOnly": "node ../../../scripts/verify-packages.mjs --pack-only --packages workflow"
   },
   "repository": {
@@ -29,6 +30,11 @@
     "utils.ts",
     "checkpoint.ts",
     "commit-policy.ts",
+    "folder-policy.ts",
+    "shell-paths.ts",
+    "read-policy.ts",
+    "read-policy-tools.ts",
+    "read-policy-redact.ts",
     "edit-policy.ts",
     "roles.ts",
     "profiles.ts",
