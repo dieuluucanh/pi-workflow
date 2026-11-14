@@ -41,7 +41,6 @@ import {
   type EditorTheme,
   type SelectItem,
   wrapTextWithAnsi,
-  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -230,6 +229,17 @@ import {
   setWorkflowStatus,
   WORKFLOW_STATUS_KEYS,
 } from "./workflow-status.ts";
+import {
+  buildTodoRows,
+  deriveTodoPanel,
+  isTodoListSettled,
+  readPersistedTodoPanel,
+  renderTodoSummary,
+  todoCompletionSignature,
+  todoListKey,
+  type TodoPanelOverride,
+  type TodoPanelState,
+} from "./todo-panel.ts";
 import {
   defaultProfileConfig,
   loadProfilesDetailed,
@@ -680,6 +690,16 @@ export default function workflowExtension(
   let mutatedSinceLastTodoWrite = false;
   let lastRefMisses: { refs: string[] } | undefined;
   let todoStale = false;
+  // ── Todo panel presentation (pinned widget above the editor) ──
+  // The widget can never scroll with the transcript, so it collapses to one
+  // line when the plan settles and hides at the next user prompt. Overrides
+  // are scoped to `todoPanelOverrideKey` (ref/text/group identity), so status
+  // churn keeps the user's choice while a new/renamed list expires it.
+  let todoPanelOverride: TodoPanelOverride = null;
+  let todoPanelOverrideKey: string | null = null;
+  let todoPanelPromptAfterSettle = false;
+  let lastCompletedSignature: string | null = null;
+  let todoPanelAppliedState: TodoPanelState | "unregistered" = "unregistered";
   let footerInjectedThisTurn = false;
   let lastStaleNoticeAt: number | undefined;
   // Path+content hash of the last plan-file reconciliation (skip no-op merges).
@@ -1256,83 +1276,81 @@ export default function workflowExtension(
     todoStale = false;
   }
 
-  /** Display ref for a todo row (stable canonical GLOBAL step). */
-  function todoLabel(it: TodoItem, index: number): string {
-    return todoRef(it) || String(it.step || index + 1);
+  /**
+   * Reconcile the pinned todo widget with the derived presentation state.
+   * Called from `updateStatus` after the footer writes; only re-registers the
+   * component when the state changes (marking a step done repaints through
+   * the host, so the widget is not disposed/rebuilt on every refresh).
+   */
+  function refreshTodoPanel(ctx: ExtensionContext) {
+    const view = deriveTodoPanel({
+      items: todoItems,
+      override: todoPanelOverride,
+      overrideKey: todoPanelOverrideKey,
+      promptAfterSettle: todoPanelPromptAfterSettle,
+      stale: todoStale,
+    });
+    // A choice made for a different list must not hide a new task.
+    if (todoPanelOverrideKey !== view.listKey) {
+      todoPanelOverride = null;
+      todoPanelOverrideKey = null;
+    }
+    if (!view.settled && todoPanelPromptAfterSettle) {
+      todoPanelPromptAfterSettle = false;
+    }
+    // Reopened list: a later completion may emit its own card again.
+    if (!view.settled && lastCompletedSignature !== null) {
+      lastCompletedSignature = null;
+    }
+    if (view.settled && todoStale) todoStale = false;
+    if (view.state === todoPanelAppliedState) return;
+    todoPanelAppliedState = view.state;
+    try {
+      if (view.state === "hidden") {
+        ctx.ui.setWidget("workflow-todos", undefined);
+        return;
+      }
+      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
+        const render = (w: number) => {
+          // Re-derive so the component always shows live items and the live
+          // mode, even though it was registered for an earlier state.
+          const live = deriveTodoPanel({
+            items: todoItems,
+            override: todoPanelOverride,
+            overrideKey: todoPanelOverrideKey,
+            promptAfterSettle: todoPanelPromptAfterSettle,
+            stale: todoStale,
+          });
+          if (live.state === "hidden") return [];
+          return live.state === "collapsed"
+            ? [renderTodoSummary(theme, w, live)]
+            : buildTodoRows(theme, w, todoItems, workflowMode);
+        };
+        return { render, invalidate: () => {}, dispose: () => {} };
+      });
+    } catch (_e) {
+      void _e;
+    }
   }
 
-  /**
-   * Rows for the todo widget: group headers + labelled items, anchored on the
-   * first incomplete item (including its group header), capped for the terminal.
-   */
-  function buildTodoRows(
-    theme: any,
-    width: number,
-    mode: WorkflowMode | null,
-  ): string[] {
-    if (todoItems.length === 0) return [];
-    const MAX_WIDGET_LINES = 15;
-    const contentWidth = Math.max(1, width - 2);
-    type Row = { group?: string; item?: TodoItem; index: number };
-    const rows: Row[] = [];
-    let lastGroup: string | undefined;
-    todoItems.forEach((item, index) => {
-      if (item.group && item.group !== lastGroup) {
-        rows.push({ group: item.group, index });
-        lastGroup = item.group;
-      }
-      rows.push({ item, index });
-    });
-    const firstUndone = todoItems.findIndex(
-      (t) => !isDone(t) && itemStatus(t) !== "cancelled",
-    );
-    const anchorIndex = firstUndone < 0 ? 0 : firstUndone;
-    let startRow = rows.findIndex((r) => r.item && r.index === anchorIndex);
-    if (startRow < 0) startRow = 0;
-    if (startRow > 0 && rows[startRow - 1]?.group) startRow -= 1;
-    const visible = rows.slice(startRow, startRow + MAX_WIDGET_LINES);
-    const rendered = visible.map((row) => {
-      if (row.group) {
-        return truncateToWidth(
-          theme.fg("muted", `── ${row.group}`),
-          contentWidth,
-          "…",
-        );
-      }
-      const item = row.item as TodoItem;
-      const ref = todoLabel(item, row.index);
-      const status = itemStatus(item);
-      const isCurrent = row.index === anchorIndex && !isDone(item);
-      const prefix =
-        isCurrent || status === "in_progress"
-          ? theme.fg("accent", "▶ ")
-          : status === "completed"
-            ? theme.fg("success", "☑ ")
-            : status === "cancelled"
-              ? theme.fg("dim", "✖ ")
-              : theme.fg("dim", "☐ ");
-      const labelPart =
-        item.label !== undefined && String(item.label) !== ref
-          ? theme.fg("muted", ` (${item.label})`)
-          : "";
-      const body = `${ref}. ${item.text}${labelPart}`;
-      let styled: string;
-      if (isDone(item)) {
-        styled = theme.fg("muted", theme.strikethrough(body));
-      } else if (isCurrent && mode === "build") {
-        styled = theme.fg("accent", body);
-      } else if (mode === "plan" || mode === null) {
-        styled = theme.fg("muted", body);
-      } else {
-        styled = body;
-      }
-      return truncateToWidth(`${prefix}${styled}`, contentWidth, "…");
-    });
-    const remaining = rows.length - (startRow + visible.length);
-    if (remaining > 0) {
-      rendered.push(theme.fg("muted", `… +${remaining} more`));
+  function setTodoPanelOverride(
+    ctx: ExtensionContext,
+    override: TodoPanelOverride,
+    note?: string,
+  ) {
+    if (!todoItems.length && override === "expanded") {
+      ctx.ui.notify("No todos.", "info");
+      return;
     }
-    return rendered;
+    todoPanelOverride = override;
+    todoPanelOverrideKey = override === null ? null : todoListKey(todoItems);
+    updateStatus(ctx);
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    if (note) ctx.ui.notify(note, "info");
   }
 
   function updateStatus(ctx: ExtensionContext) {
@@ -1381,7 +1399,7 @@ export default function workflowExtension(
       reviewPhase: reviewTurn,
       done: todoItems.filter((t) => isDone(t)).length,
       total: todoItems.length,
-      stale: todoStale,
+      stale: todoStale && !isTodoListSettled(todoItems),
       profileLabel,
       roleLabel,
       commitMode,
@@ -1412,15 +1430,10 @@ export default function workflowExtension(
       ctx.ui.theme.fg("dim", segments.policy),
     );
     if (todoItems.length > 0) {
-      ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
-        return {
-          render: (w: number) => buildTodoRows(theme, w, workflowMode),
-          invalidate: () => {},
-          dispose: () => {},
-        };
-      });
+      refreshTodoPanel(ctx);
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
+      todoPanelAppliedState = "hidden";
     }
     // One status owner: every footer refresh (mode switch, model change, round
     // phase, pause) also re-evaluates the review widget. This is what clears a
@@ -4520,6 +4533,12 @@ export default function workflowExtension(
       },
       defaultModel,
       lastModeSwitch,
+      todoPanel: {
+        override: todoPanelOverride,
+        overrideKey: todoPanelOverrideKey,
+        promptAfterSettle: todoPanelPromptAfterSettle,
+        completedSignature: lastCompletedSignature,
+      },
     } as any);
     lastPersistedPlanFile = currentPlanFile;
   }
@@ -5799,6 +5818,34 @@ export default function workflowExtension(
     void _e;
   }
 
+  // Todo panel toggle: expanded ↔ collapsed, and hidden → expanded.
+  // Ctrl+Alt+T is the Linux default for opening a terminal, so this uses O.
+  try {
+    pi.registerShortcut(Key.ctrlAlt("o"), {
+      description: "Toggle the workflow todo panel",
+      handler: async (ctx: any) => {
+        if (overlayDepth > 0) return;
+        if (todoItems.length === 0) {
+          ctx.ui.notify("No todos.", "info");
+          return;
+        }
+        const view = deriveTodoPanel({
+          items: todoItems,
+          override: todoPanelOverride,
+          overrideKey: todoPanelOverrideKey,
+          promptAfterSettle: todoPanelPromptAfterSettle,
+          stale: todoStale,
+        });
+        setTodoPanelOverride(
+          ctx as any,
+          view.state === "expanded" ? "collapsed" : "expanded",
+        );
+      },
+    });
+  } catch (_e) {
+    void _e;
+  }
+
   // Tab cycles workflow modes (context-aware: not when an overlay is active).
   // WorkflowTabEditor gives Tab back to autocomplete while a suggestion list is
   // visible; this registration remains the no-list path. Single registration to
@@ -6062,7 +6109,10 @@ export default function workflowExtension(
           };
           todoItems.push(item);
           try {
-            if (currentSessionCtx) updateStatus(currentSessionCtx);
+            if (currentSessionCtx) {
+              updateStatus(currentSessionCtx);
+              persistState();
+            }
           } catch (_e) {
             void _e;
           }
@@ -6183,6 +6233,10 @@ export default function workflowExtension(
           const c = todoItems.length;
           todoItems = [];
           todoPlanPath = undefined;
+          todoPanelOverride = null;
+          todoPanelOverrideKey = null;
+          todoPanelPromptAfterSettle = false;
+          lastCompletedSignature = null;
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -6214,19 +6268,119 @@ export default function workflowExtension(
   });
 
   pi.registerCommand("todos", {
-    description: "Show workflow todos",
-    handler: async (_args, ctx) => {
-      const list = todoItems.length
-        ? `Steps are numbered GLOBALLY 1..${todoItems.length}:
+    description:
+      "Show or control the todo panel: /todos [show|expand|collapse|hide|auto|clear]",
+    handler: async (args, ctx) => {
+      const tokens = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "").toLowerCase();
+      const usage = [
+        "Usage: /todos [show|expand|collapse|hide|auto|clear]",
+        "  (no arg)  list every step with global refs",
+        "  expand    show the full pinned panel",
+        "  collapse  keep one summary line",
+        "  hide      remove the pinned panel (footer keeps progress)",
+        "  auto      follow the automatic collapse/hide sequence",
+        "  clear     delete the todo list (asks first when UI is available)",
+      ].join("\n");
+
+      if (!sub) {
+        const list = todoItems.length
+          ? `Steps are numbered GLOBALLY 1..${todoItems.length}:
 ` +
-          todoItems
-            .map((t) => {
-              const g = t.group ? `[${t.group}] ` : "";
-              return `${g}${formatTodoLine(t)}`;
-            })
-            .join("\n")
-        : "No todos.";
-      ctx.ui.notify(`Todos (${todoItems.length}):\n${list}`, "info");
+            todoItems
+              .map((t) => {
+                const g = t.group ? `[${t.group}] ` : "";
+                return `${g}${formatTodoLine(t)}`;
+              })
+              .join("\n")
+          : "No todos.";
+        ctx.ui.notify(`Todos (${todoItems.length}):\n${list}`, "info");
+        return;
+      }
+
+      if (sub === "show" || sub === "expand") {
+        setTodoPanelOverride(ctx, "expanded");
+        return;
+      }
+      if (sub === "collapse") {
+        setTodoPanelOverride(ctx, "collapsed");
+        return;
+      }
+      if (sub === "hide") {
+        setTodoPanelOverride(ctx, "hidden");
+        return;
+      }
+      if (sub === "auto") {
+        setTodoPanelOverride(ctx, null);
+        return;
+      }
+      if (sub === "clear") {
+        const count = todoItems.length;
+        if (count === 0) {
+          ctx.ui.notify("No todos.", "info");
+          return;
+        }
+        // Headless confirm() resolves false and would silently turn this into
+        // a no-op; the command is explicit, so only ask when there is UI.
+        const confirmed =
+          (ctx as any).hasUI === true
+            ? await ctx.ui.confirm(
+                "Clear todos?",
+                "This resets the list. In Build mode, edits are blocked until a list exists again.",
+              )
+            : true;
+        if (!confirmed) {
+          ctx.ui.notify("Clear cancelled.", "info");
+          return;
+        }
+        todoItems = [];
+        todoPlanPath = undefined;
+        todoPanelOverride = null;
+        todoPanelOverrideKey = null;
+        todoPanelPromptAfterSettle = false;
+        lastCompletedSignature = null;
+        updateStatus(ctx);
+        try {
+          persistState();
+        } catch (_e) {
+          void _e;
+        }
+        onTodoWrite();
+        ctx.ui.notify(
+          `Cleared ${count} todos. In Build mode, edits are blocked until a list exists again (approve a plan or add a step).`,
+          "info",
+        );
+        return;
+      }
+      if (sub === "help") {
+        ctx.ui.notify(usage, "info");
+        return;
+      }
+      ctx.ui.notify(`Unknown /todos action: ${sub}\n${usage}`, "info");
+    },
+    getArgumentCompletions: (prefix: string) => {
+      const raw = String(prefix ?? "");
+      if (/\s/.test(raw.trim())) return null;
+      const lower = raw.trim().toLowerCase();
+      const verbs = [
+        { name: "show", description: "Show the full pinned panel" },
+        { name: "expand", description: "Show the full pinned panel" },
+        { name: "collapse", description: "Keep one summary line" },
+        { name: "hide", description: "Remove the pinned panel" },
+        { name: "auto", description: "Automatic collapse/hide sequence" },
+        { name: "clear", description: "Delete the todo list" },
+        { name: "help", description: "Show usage" },
+      ];
+      const matching = verbs.filter((v) => v.name.startsWith(lower));
+      if (matching.length === 0) return null;
+      return matching.map((v) => ({
+        value: `${v.name} `,
+        label: v.name,
+        description: v.description,
+      }));
     },
   });
 
@@ -9417,6 +9571,14 @@ export default function workflowExtension(
     // A session boundary owns the session-scoped plan fallback; the restore
     // loop below re-seeds it from the persisted `planFile`.
     resetSessionPlanProvenance();
+    // The branch is the source of truth for the panel's presentation. The
+    // host has cleared every extension widget on a session switch/reload, so
+    // the reconciler must register it again from the restored state.
+    todoPanelOverride = null;
+    todoPanelOverrideKey = null;
+    todoPanelPromptAfterSettle = false;
+    lastCompletedSignature = null;
+    todoPanelAppliedState = "unregistered";
     // A reloaded/forked session must never inherit a stale write denial.
     writeGateRunDenials.clear();
     writeGateTurnAnswer = null;
@@ -9469,6 +9631,15 @@ export default function workflowExtension(
             }
             syncLegacyFlags();
             if (Array.isArray(d.todos)) todoItems = ensureTodoLabels(d.todos);
+            // Entries written before this feature have no `todoPanel`; they
+            // must not erase a value restored from an earlier entry.
+            if (d.todoPanel && typeof d.todoPanel === "object") {
+              const panel = readPersistedTodoPanel(d);
+              todoPanelOverride = panel.override;
+              todoPanelOverrideKey = panel.overrideKey;
+              todoPanelPromptAfterSettle = panel.promptAfterSettle;
+              lastCompletedSignature = panel.completedSignature;
+            }
             todoPlanPath = d.planFile;
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             // An entry without a planFile must not erase a value restored
@@ -9889,6 +10060,8 @@ export default function workflowExtension(
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.policy, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
+    // The host dropped the widget; a later session_start re-registers it.
+    todoPanelAppliedState = "unregistered";
     // Drop any /commit authorization or flow: a reload/quit must never leave
     // an exemption armed for whatever runs next.
     commitAuthorization = null;
@@ -9904,6 +10077,12 @@ export default function workflowExtension(
     todoItems = [];
     todoPlanPath = undefined;
     btwNotes = [];
+    // A rewind is a branch boundary: the panel choice belongs to the branch.
+    todoPanelOverride = null;
+    todoPanelOverrideKey = null;
+    todoPanelPromptAfterSettle = false;
+    lastCompletedSignature = null;
+    todoPanelAppliedState = "unregistered";
     // A rewind is a branch boundary: no per-run write from the old branch
     // may authorize a handoff or a manual review on the new one.
     resetPlanRunProvenance();
@@ -9914,13 +10093,18 @@ export default function workflowExtension(
     try {
       const branch = ctx.sessionManager.getBranch();
       for (const e of branch as any[]) {
-        if (
-          e.type === "custom" &&
-          e.customType === "workflow" &&
-          Array.isArray(e.data?.todos)
-        ) {
-          todoItems = ensureTodoLabels(e.data.todos);
-          if (e.data.planFile) todoPlanPath = e.data.planFile;
+        if (e.type === "custom" && e.customType === "workflow") {
+          if (Array.isArray(e.data?.todos)) {
+            todoItems = ensureTodoLabels(e.data.todos);
+            if (e.data.planFile) todoPlanPath = e.data.planFile;
+          }
+          if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
+            const panel = readPersistedTodoPanel(e.data);
+            todoPanelOverride = panel.override;
+            todoPanelOverrideKey = panel.overrideKey;
+            todoPanelPromptAfterSettle = panel.promptAfterSettle;
+            lastCompletedSignature = panel.completedSignature;
+          }
         }
         if (
           e.type === "message" &&
@@ -11721,6 +11905,22 @@ export default function workflowExtension(
     turnsSinceLastReminder = 0;
     mutatedSinceLastTodoWrite = false;
     footerInjectedThisTurn = false;
+    // A real user prompt means the user has moved on from a finished plan:
+    // hide the one-line todo panel. `custom` runs (triggerTurn) must not do
+    // this — they can be self-initiated while the user is still reading.
+    if (
+      event.messageType === "user" &&
+      isTodoListSettled(todoItems) &&
+      !todoPanelPromptAfterSettle
+    ) {
+      todoPanelPromptAfterSettle = true;
+      updateStatus(ctx);
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
     // A fresh user prompt starts a new handoff/provenance run. It also
     // supersedes any pending browser/inline decision immediately: the user
     // moved on, so a stale tab must not approve the previous plan. Follow-up
@@ -12365,26 +12565,36 @@ export default function workflowExtension(
       }
       // Build completion
       if (workflowMode === "build" && todoItems.length > 0) {
-        const allDone = todoItems.every(
-          (t) => isDone(t) || itemStatus(t) === "cancelled",
-        );
+        const allDone = isTodoListSettled(todoItems);
         if (allDone) {
-          try {
-            (pi as any).sendMessage?.(
-              {
-                customType: "workflow-complete",
-                content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
-                display: true,
-              },
-              { triggerTurn: false },
-            );
-          } catch (_e) {
-            void _e;
+          // One card per list revision: a settled list stays settled across
+          // turns, and re-sending the same card on every agent_end buried the
+          // transcript in duplicates. A new/renamed list or changed statuses
+          // produce a new signature and therefore a new card.
+          const signature = todoCompletionSignature(todoItems);
+          if (signature !== lastCompletedSignature) {
+            lastCompletedSignature = signature;
+            try {
+              (pi as any).sendMessage?.(
+                {
+                  customType: "workflow-complete",
+                  content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
+                  display: true,
+                },
+                { triggerTurn: false },
+              );
+            } catch (_e) {
+              void _e;
+            }
           }
           // keep todos for history but stay in build
           todoStale = false;
           updateStatus(ctx as any);
           persistState();
+        } else if (lastCompletedSignature !== null) {
+          // The list reopened (new step or a reverted status): allow the next
+          // completion to emit its own card. Persisted on the next mutation.
+          lastCompletedSignature = null;
         }
         return;
       }

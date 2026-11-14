@@ -19,12 +19,16 @@ import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
 import { planHash } from "./review.ts";
+import { todoListKey } from "./todo-panel.ts";
+import type { TodoItem } from "./utils.ts";
 import {
   ORIGINAL_PLAN,
   REWRITTEN_PLAN,
   fakeSdk,
   makeFakeCtx,
   makeFakePi,
+  renderTodoWidget,
+  stripAnsi,
   submitThenFinish,
   tmpProject,
   type FakeCapture,
@@ -42,6 +46,8 @@ interface BootOptions {
   editorAnswer?: string | null;
   /** `ctx.ui.select` answer (closed-review inline handoff). */
   selectAnswer?: string;
+  /** `ctx.ui.confirm` answer (default true). */
+  confirmAnswer?: boolean;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   script?: {
     pass1?: (c: FakeCapture) => Promise<void>;
@@ -116,7 +122,7 @@ async function boot(over: BootOptions = {}) {
     });
   }
   await workflowExtension(pi as never, { loadSdk: async () => sdk as never });
-  const { ctx, notifies, statuses, widgets } = makeFakeCtx({
+  const { ctx, notifies, statuses, widgets, widgetCalls, confirms } = makeFakeCtx({
     cwd,
     hasUI: over.hasUI === true,
     branch: over.branch ?? [],
@@ -129,6 +135,9 @@ async function boot(over: BootOptions = {}) {
       : {}),
     ...(over.selectAnswer !== undefined
       ? { selectAnswer: over.selectAnswer }
+      : {}),
+    ...(over.confirmAnswer !== undefined
+      ? { confirmAnswer: over.confirmAnswer }
       : {}),
   });
   await pi.emit("session_start", { reason: over.startReason ?? "startup" }, ctx);
@@ -155,6 +164,8 @@ async function boot(over: BootOptions = {}) {
     notifies,
     statuses,
     widgets,
+    widgetCalls,
+    confirms,
     capture,
     plannotatorRequests,
     reviewStatusRequests,
@@ -177,7 +188,11 @@ function placePlan(
 }
 
 async function freshPrompt(pi: any, ctx: any): Promise<void> {
-  await pi.emit("before_agent_start", { prompt: "write a plan" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { messageType: "user", prompt: "write a plan" },
+    ctx,
+  );
 }
 
 async function writeResult(pi: any, ctx: any, rel: string): Promise<void> {
@@ -1197,7 +1212,7 @@ test("S4: a manual cycle keeps reviewing after Deny with Review Mode off", async
     // must preserve it so this manual cycle re-reviews with auto mode off.
     await b.pi.emit(
       "before_agent_start",
-      { prompt: "please add an export test" },
+      { messageType: "custom", prompt: "please add an export test" },
       b.ctx,
     );
 
@@ -1297,7 +1312,7 @@ test("Q: repeated browser feedback legs re-review and reset the round budget", a
       // the fake host does not, so simulate it explicitly.
       await b.pi.emit(
         "before_agent_start",
-        { prompt: `revision ${leg}` },
+        { messageType: "custom", prompt: `revision ${leg}` },
         b.ctx,
       );
       fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
@@ -1674,6 +1689,346 @@ test("Y: cancelling the closed-review inline handoff does not stick Review", asy
     assert.ok(
       modes.at(-1)?.includes("⏸ plan"),
       `cancelling returns to Plan, got ${modes.at(-1)}`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── Todo panel lifecycle (2026-11-14 plan) ──────────────────────────
+
+function seededTodos(
+  spec: Array<{
+    text: string;
+    status?: "pending" | "in_progress" | "completed" | "cancelled";
+    group?: string;
+  }>,
+): TodoItem[] {
+  return spec.map((s, i) => ({
+    step: i + 1,
+    ref: String(i + 1),
+    label: String(i + 1),
+    text: s.text,
+    group: s.group,
+    status: s.status ?? "pending",
+    completed: s.status === "completed",
+    source: "plan",
+  }));
+}
+
+const SETTLED_TODOS = seededTodos([
+  { text: "One", status: "completed" },
+  { text: "Two", status: "completed" },
+]);
+
+
+function workflowBranch(todos: TodoItem[], todoPanel?: Record<string, unknown>) {
+  return [
+    {
+      type: "custom",
+      customType: "workflow",
+      data: {
+        mode: "build",
+        enabled: false,
+        executing: true,
+        todos,
+        planFile: null,
+        ...(todoPanel ? { todoPanel } : {}),
+      },
+    },
+  ];
+}
+
+function hiddenPanel(todos: TodoItem[]): Record<string, unknown> {
+  return {
+    override: "hidden",
+    overrideKey: todoListKey(todos),
+    promptAfterSettle: false,
+    completedSignature: null,
+  };
+}
+
+function completionCards(pi: { sent: Array<{ content: unknown }> }): unknown[] {
+  return pi.sent
+    .map((s) => s.content as { customType?: string })
+    .filter((c) => c?.customType === "workflow-complete");
+}
+
+test("Z1: a settled build list collapses the pinned panel to one row", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    const rows = renderTodoWidget(b.widgetCalls);
+    assert.equal(rows.length, 1, `rows=${JSON.stringify(rows)}`);
+    assert.match(stripAnsi(rows[0]), /☑ Todos 2\/2 · all done · \/todos expand/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z2: agent_end sends the completion card once per settled list", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    assert.equal(
+      completionCards(b.pi).length,
+      1,
+      "a settled list must not re-emit the Build Complete card",
+    );
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e) => e.type === "workflow") as any;
+    assert.ok(
+      typeof persisted?.data?.todoPanel?.completedSignature === "string",
+      "the signature is persisted",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z3: the next user prompt hides the settled panel; a custom run does not", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    assert.equal(renderTodoWidget(b.widgetCalls).length, 1);
+    await b.pi.emit(
+      "before_agent_start",
+      { messageType: "custom", message: { customType: "x", content: "" } },
+      b.ctx,
+    );
+    assert.equal(
+      renderTodoWidget(b.widgetCalls).length,
+      1,
+      "a custom triggerTurn run must not hide the panel",
+    );
+    await b.pi.emit(
+      "before_agent_start",
+      { messageType: "user", prompt: "next task" },
+      b.ctx,
+    );
+    assert.deepEqual(
+      renderTodoWidget(b.widgetCalls),
+      [],
+      "a real user prompt hides the settled panel",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z4: /todos verbs control the panel, list, and clear", async () => {
+  const b = await boot({
+    branch: workflowBranch(SETTLED_TODOS),
+    hasUI: true,
+    confirmAnswer: true,
+  });
+  try {
+    await b.pi.commands.todos.handler("expand", b.ctx);
+    assert.ok(renderTodoWidget(b.widgetCalls).length > 1, "expand shows rows");
+
+    await b.pi.commands.todos.handler("collapse", b.ctx);
+    assert.equal(renderTodoWidget(b.widgetCalls).length, 1, "collapse is one row");
+
+    await b.pi.commands.todos.handler("hide", b.ctx);
+    assert.deepEqual(renderTodoWidget(b.widgetCalls), [], "hide removes the widget");
+
+    await b.pi.commands.todos.handler("auto", b.ctx);
+    assert.equal(
+      renderTodoWidget(b.widgetCalls).length,
+      1,
+      "auto returns a settled list to one row",
+    );
+
+    await b.pi.commands.todos.handler("", b.ctx);
+    assert.ok(
+      b.notifies.some((n) => n.message.includes("Todos (2):")),
+      "no-arg form still lists every step",
+    );
+
+    const completions = b.pi.commands.todos.getArgumentCompletions?.("ex") as
+      | Array<{ value: string }>
+      | null;
+    assert.deepEqual(
+      completions?.map((c) => c.value),
+      ["expand "],
+      "argument completions expose the verbs",
+    );
+
+    await b.pi.commands.todos.handler("clear", b.ctx);
+    assert.equal(b.confirms.length, 1, "clear asks once");
+    assert.match(b.confirms[0].title, /Clear todos\?/);
+    assert.deepEqual(renderTodoWidget(b.widgetCalls), []);
+    assert.ok(b.notifies.some((n) => n.message.includes("Cleared 2 todos")));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z5: /todos clear is headless-safe (no confirm prompt)", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: false });
+  try {
+    await b.pi.commands.todos.handler("clear", b.ctx);
+    assert.equal(b.confirms.length, 0, "headless must not open a dialog");
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e) => e.type === "workflow") as any;
+    assert.deepEqual(persisted?.data?.todos, []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z6: ctrl+alt+o toggles the panel", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    const shortcut = b.pi.shortcuts["ctrl+alt+o"];
+    assert.ok(shortcut, "the shortcut is registered");
+    assert.equal(renderTodoWidget(b.widgetCalls).length, 1);
+
+    await shortcut.handler(b.ctx);
+    assert.ok(
+      renderTodoWidget(b.widgetCalls).length > 1,
+      "toggle expands a collapsed panel",
+    );
+
+    await shortcut.handler(b.ctx);
+    assert.equal(
+      renderTodoWidget(b.widgetCalls).length,
+      1,
+      "toggle collapses an expanded panel",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z7: a status-only mutation repaints without re-registering the widget", async () => {
+  const list = seededTodos([
+    { text: "One", status: "in_progress" },
+    { text: "Two" },
+  ]);
+  const b = await boot({ branch: workflowBranch(list), hasUI: true });
+  try {
+    const before = b.widgetCalls.filter((c) => c.key === "workflow-todos").length;
+    await b.pi.tools["workflow_todo"].execute(
+      "todo-1",
+      { action: "done", step: 2 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    const after = b.widgetCalls.filter((c) => c.key === "workflow-todos").length;
+    assert.equal(after, before, "same expanded state must not be re-registered");
+    const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
+    assert.deepEqual(
+      rows,
+      ["▶ 1. One", "☑ 2. Two"],
+      "the live rows reflect the status change",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z8: workflow_todo add persists and re-expands a hidden panel", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    await b.pi.commands.todos.handler("hide", b.ctx);
+    assert.deepEqual(renderTodoWidget(b.widgetCalls), []);
+
+    await b.pi.tools["workflow_todo"].execute(
+      "todo-2",
+      { action: "add", text: "Three" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+
+    const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
+    assert.deepEqual(
+      rows,
+      ["▶ 3. Three"],
+      "the new step is a full expanded row, not the collapsed summary",
+    );
+
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e) => e.type === "workflow") as any;
+    assert.equal(
+      persisted?.data?.todos?.length,
+      3,
+      "add writes a persisted workflow entry",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z9: a reload restores a persisted hidden or expanded panel", async () => {
+  const hidden = await boot({
+    branch: workflowBranch(SETTLED_TODOS, hiddenPanel(SETTLED_TODOS)),
+    hasUI: true,
+  });
+  try {
+    assert.deepEqual(
+      renderTodoWidget(hidden.widgetCalls),
+      [],
+      "restored hidden state stays hidden",
+    );
+  } finally {
+    await hidden.cleanup();
+  }
+
+  const expanded = await boot({
+    branch: workflowBranch(SETTLED_TODOS, {
+      override: "expanded",
+      overrideKey: todoListKey(SETTLED_TODOS),
+      promptAfterSettle: false,
+      completedSignature: null,
+    }),
+    hasUI: true,
+  });
+  try {
+    assert.ok(
+      renderTodoWidget(expanded.widgetCalls).length > 1,
+      "restored expanded state stays expanded",
+    );
+  } finally {
+    await expanded.cleanup();
+  }
+});
+
+test("Z10: a rewind restores the panel state of the branch", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    const rewound = makeFakeCtx({
+      cwd: b.cwd,
+      hasUI: true,
+      branch: workflowBranch(SETTLED_TODOS, hiddenPanel(SETTLED_TODOS)),
+    });
+    await b.pi.emit("session_tree", {}, rewound.ctx);
+    assert.deepEqual(
+      renderTodoWidget(rewound.widgetCalls),
+      [],
+      "the rewind target's hidden choice wins",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z11: a settled list drops the stale marker from the footer", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    const buildStatuses = b.statuses.filter(
+      (value): value is string =>
+        typeof value === "string" && value.includes("build"),
+    );
+    assert.ok(buildStatuses.length > 0);
+    assert.ok(
+      !buildStatuses.at(-1)!.includes("⚠"),
+      `settled footer must be stale-free: ${buildStatuses.at(-1)}`,
     );
   } finally {
     await b.cleanup();

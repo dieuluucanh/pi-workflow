@@ -289,9 +289,24 @@ type EventHandler = (event: unknown, ctx: unknown) => unknown | Promise<unknown>
 /** Values `pi.getFlagValue()` can return for a registered flag. */
 export type FlagValue = boolean | string | number | undefined;
 
+/** Minimal shape of a tool definition captured from `registerTool`. */
+export interface FakeTool {
+  name?: string;
+  execute: (...args: unknown[]) => unknown;
+}
+
 export interface FakePi {
   handlers: Map<string, EventHandler[]>;
-  commands: Record<string, { description?: string; handler: Function }>;
+  commands: Record<
+    string,
+    {
+      description?: string;
+      handler: Function;
+      getArgumentCompletions?: (prefix: string) => unknown;
+    }
+  >;
+  shortcuts: Record<string, { description?: string; handler: Function }>;
+  tools: Record<string, FakeTool>;
   entries: Array<{ type: string; data: unknown }>;
   sent: Array<{ content: unknown; options?: unknown }>;
   /** Ordered side effects used to pin transition ordering (tools, sends). */
@@ -330,12 +345,16 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
   const handlers = new Map<string, EventHandler[]>();
   const busHandlers = new Map<string, Array<(payload: unknown) => unknown>>();
   const commands: FakePi["commands"] = {};
+  const shortcuts: FakePi["shortcuts"] = {};
+  const tools: FakePi["tools"] = {};
   const entries: FakePi["entries"] = [];
   const sent: FakePi["sent"] = [];
   const timeline: FakePi["timeline"] = [];
   const pi: FakePi = {
     handlers,
     commands,
+    shortcuts,
+    tools,
     entries,
     sent,
     timeline,
@@ -349,8 +368,13 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
     registerCommand(name, opts) {
       commands[name] = opts;
     },
-    registerTool() {},
-    registerShortcut() {},
+    registerTool(def: unknown) {
+      const tool = def as FakeTool;
+      if (tool?.name) tools[tool.name] = tool;
+    },
+    registerShortcut(key, opts) {
+      shortcuts[String(key)] = opts as { description?: string; handler: Function };
+    },
     registerFlag() {},
     registerEntryRenderer() {},
     registerMessageRenderer() {},
@@ -426,6 +450,8 @@ export interface FakeCtxOptions {
   customAnswer?: string | null;
   /** Value returned by `ui.editor` (e.g. the inline Refine text). */
   editorAnswer?: string | null;
+  /** Value returned by `ui.confirm` (default true). */
+  confirmAnswer?: boolean;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   signal?: AbortSignal;
   /** Project-local settings trust (default true for existing fixtures). */
@@ -436,6 +462,12 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   const notifies: Array<{ message: string; level?: string }> = [];
   const statuses: unknown[] = [];
   const widgets: unknown[] = [];
+  const widgetCalls: Array<{
+    key: string;
+    value: unknown;
+    options?: unknown;
+  }> = [];
+  const confirms: Array<{ title: string; message: string }> = [];
   const selects: Array<{ title: string; options: unknown[] }> = [];
   const ctx = {
     cwd: over.cwd,
@@ -465,21 +497,65 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       async input() {
         return undefined;
       },
+      async confirm(title: string, message: string) {
+        confirms.push({ title, message });
+        return over.confirmAnswer !== false;
+      },
       notify(message: string, level?: string) {
         notifies.push({ message, level });
       },
       setStatus(_key: string, value: unknown) {
         statuses.push(value);
       },
-      setWidget(_key: string, value: unknown) {
+      setWidget(key: string, value: unknown, options?: unknown) {
         widgets.push(value);
+        widgetCalls.push({ key, value, options });
       },
       setEditorComponent() {},
       getEditorText() {
         return "";
       },
-      theme: { fg: (_color: string, text: string) => text },
+      theme: {
+        fg: (_color: string, text: string) => text,
+        strikethrough: (text: string) => text,
+      },
     },
   };
-  return { ctx, notifies, statuses, widgets, selects };
+  return {
+    ctx,
+    notifies,
+    statuses,
+    widgets,
+    widgetCalls,
+    confirms,
+    selects,
+  };
+}
+
+/** Visible text without SGR color/reset sequences. */
+export function stripAnsi(text: string): string {
+  return String(text).replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Render the latest `workflow-todos` widget with a plain theme. Returns `[]`
+ * when the widget is cleared (hidden) or was never mounted.
+ */
+export function renderTodoWidget(
+  widgetCalls: Array<{ key: string; value: unknown; options?: unknown }>,
+  width = 80,
+): string[] {
+  const call = [...widgetCalls]
+    .reverse()
+    .find((entry) => entry.key === "workflow-todos");
+  if (!call || call.value === undefined) return [];
+  if (typeof call.value !== "function") {
+    return Array.isArray(call.value) ? (call.value as string[]) : [];
+  }
+  const component = (call.value as Function)({}, {
+    fg: (_color: string, text: string) => text,
+    strikethrough: (text: string) => text,
+  });
+  const rows = component?.render?.(width);
+  return Array.isArray(rows) ? (rows as string[]) : [];
 }

@@ -1,0 +1,11 @@
+{
+  "workflow": {
+    "readPolicy": {
+      "allowedPaths": [
+        "c:/users/lenovo/projects"
+      ],
+      "shell": "paths",
+      "guardedTools": []
+    }
+  }
+}
