@@ -2,13 +2,93 @@
 
 All notable changes to this package are documented in this file.
 
-## [0.10.0] - 2026-11-10
+## [0.11.0] - 2026-11-14
 
-### Features
+### Added — Review is an exclusive turn with an explicit state machine
 
-- durable review handoffs, chunked rewrites, provider recovery (09de420)
+Review used to be a derived lock over a running child, so the browser/inline
+handoff phase (which has no child session) could accept prompts and mode
+switches, the reviewer's streaming tail could leak into Build/Plan, and closing
+the review tab could strand the plan with no handoff.
 
-## [Unreleased]
+- One explicit `ReviewTurnPhase` now tracks the turn: `idle` → `running` →
+  `paused` → `running` → `handoff` → `transition` → `idle`, with `handoff` and
+  `transition` as first-class locked states. While Review owns the turn, a
+  prompt is accepted only if it is a `/review…` control, `/model`, `/thinking`,
+  `/profile` or `/role`; everything else is refused with a notice. Mode
+  switches are refused from user paths for the whole turn, with the validated
+  decision exit (`fromReview`) allowed only when no round is in flight.
+- **Approve is atomic**: stop the reviewer → enter Build → execute messages,
+  with `transition` holding the gates. A failed Build keeps the handoff visible
+  instead of losing it. Deny keeps the refine cycle alive via
+  `reviewFeedbackTurn`, so a manual review still re-reviews the revision with
+  Review Mode off.
+- A browser close (or an aborted manual round) always presents a handoff:
+  inline Approve/Refine, or a no-UI fallback message. Restart-safe restore keeps
+  a settled handoff across a reload; a running round is not restored.
+- `review-runtime.ts` drops child events once the round ends and aborts a
+  still-streaming reviewer on every terminal path, so no tail can be written
+  after handoff. `workflow-status.ts` shows the review phase instead of a
+  Plannotator sub-state and stays free of `n/m`, so the Desktop badge parser
+  does not read review progress as plan steps.
+- Tests: 10 new extension scenarios (auto/manual approve, repeated feedback,
+  pause/resume/abort, reload, no-plan review, closed-review handoff), ordering
+  assertions through a fake-pi timeline, plus review/workflow-status units.
+
+### Added — one shared folder floor for read, write and commit
+
+`folder-policy.ts` is now the single containment floor all three policies
+consult: `mode: repo|cwd|parent|any`, `outside: ask|block`, and a sensitive-file
+deny list that no grant can soften. `shell-paths.ts` extracts the paths a shell
+command reads, writes and commits, so the floor judges concrete targets rather
+than “mutating”.
+
+The read gate is new: `read-policy.ts` (grants, `shell: paths|strict`, guarded
+tools), `read-policy-tools.ts` (classifier for `read`, `ls`, `grep`, `find`,
+pi-lens, `explore` and file-URL tools) and `read-policy-redact.ts` (redaction of
+grep/find/ls/bash diff and truncation-escape output). `/folder-policy` and
+`/read-policy` expose the configuration; project settings are honoured only
+when the project is trusted.
+
+The existing policies are hardened against the same floor: commit gains
+`allowedPaths` plus sensitive/folder verdicts, write reuses the shared path
+helpers, and Review Mode's own `read`/`grep`/`find`/`ls` and `review_bash` get
+the reviewer guard and redaction. The status line shows `folders:`. Covered by
+new test suites and `npm run check:read-policy`.
+
+### Added — pinned todo panel with auto-collapse and explicit overrides
+
+`todo-panel.ts` adds a pure state matrix (expanded/collapsed/hidden), list
+identity key, settled detection, summary and anchored row rendering, and a
+completion signature — with no extension-host dependency.
+
+The panel collapses to one summary line (`☑ Todos N/N · all done`) the moment
+every step is completed or cancelled, and hides at the next user prompt.
+`Ctrl+Alt+O` toggles it. `/todos` gains
+`show|expand|collapse|hide|auto|clear|help` plus argument completions; `clear`
+confirms first when UI is available. The choice is persisted in the workflow
+custom entry scoped to the list identity and reset at session, reload and
+rewind boundaries. Adding, removing or renaming a step re-expands; status-only
+changes keep the choice. The Build-complete card is emitted once per list
+revision instead of on every `agent_end` turn.
+
+### Fixed — shell-foreign paths and harder folder gates
+
+Git-Bash/MSYS (`/c/...`), Cygwin (`/cygdrive/c/...`), WSL (`/mnt/c/...`) and
+`file://` paths are translated to native syntax before policy matching, and
+settings/project config paths resolve natively so an MSYS cwd names the same
+`settings.json`. Case-insensitive comparison is Windows-only, so a
+case-sensitive macOS volume no longer merges distinct paths.
+
+- Outside targets group to the first outside folder; a file directly in the
+  common parent is granted as that file alone.
+- Read, write and commit dialogs show the base/current folder plus each
+  requested target path (bounded, with “… and N more”).
+- The commit gate honours `GIT_DIR`, resolves the real repo root, and asks when
+  the root cannot be verified; per-step commits skip when staged paths leave the
+  permitted folders or are unverifiable.
+- A mutating tool with no discoverable path is treated as uncertain instead of
+  silently allowed.
 
 ### Fixed — Review Mode no longer reports its own abort as a provider error
 
@@ -47,6 +127,8 @@ folder, an outside grant is labelled **Always allow this folder**, and
 a dialog. The commit gate attributes an outside-repository refusal to the
 folder policy, and `runGitZ` honours `PI_GIT_BIN` with a clear error when git
 cannot be found instead of a raw `ENOENT`.
+
+## [0.10.0] - 2026-11-10
 
 ### Fixed — review handoffs survive later rounds and reloads
 
