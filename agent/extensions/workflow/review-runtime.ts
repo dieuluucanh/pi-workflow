@@ -920,6 +920,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         ensureTranscript();
         const child = created.session;
         session.subscribe((event) => {
+          // D4: a round ends at `review_pass_done`/settle, but the child may
+          // still stream a closing tail. Once the round is inactive its events
+          // must never reach the main transcript (that tail used to appear
+          // while Build/Plan had already started).
+          if (!roundActive) return;
           let ops: ReviewTranscriptOp[] = [];
           try {
             ops = ensureTranscript().ingest(event);
@@ -1352,6 +1357,13 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         cfg.passes > 1 &&
         reviewNeedsVerification(state?.findings ?? []);
 
+      // Pass 1's protocol submission is final; stop a tail that is still
+      // streaming before deciding whether pass 2 runs. This is what keeps the
+      // reviewer quiescent when the handoff opens.
+      if (!wantVerify && session?.isStreaming()) {
+        await abortChild();
+      }
+
       if (wantVerify) {
         setPhase("verifying");
         await settleInFlight(deadline, rc);
@@ -1426,6 +1438,15 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         detachExternal?.();
       } catch {
         /* listener cleanup is best-effort */
+      }
+      // D4: no terminal path may return while the reviewer child is still
+      // streaming. `review_pass_done` ends the protocol, not the SDK run; the
+      // remaining tail could still call review tools or write the plan while
+      // the parent has moved to Build/Plan. The submission is already captured.
+      try {
+        if (session?.isStreaming()) await session.abort();
+      } catch {
+        /* cancellation is best-effort */
       }
       abortController = undefined;
       roundActive = false;

@@ -105,11 +105,12 @@ test("pendingHandoffIsStale: force, cycle and plan hash decide", () => {
   );
 });
 
-test("shouldHandoffManualResult: only a settled manual round hands off", () => {
+test("shouldHandoffManualResult: every settled manual round hands off", () => {
   assert.equal(shouldHandoffManualResult({ outcome: "rewritten" }), true);
   assert.equal(shouldHandoffManualResult({ outcome: "unchanged" }), true);
   assert.equal(shouldHandoffManualResult({ outcome: "fallback" }), true);
   assert.equal(shouldHandoffManualResult({ outcome: "skipped" }), true);
   assert.equal(shouldHandoffManualResult({ outcome: "paused" }), false);
-  assert.equal(shouldHandoffManualResult({ outcome: "aborted" }), false);
+  // Abort skips the reviewer but still presents the author's plan.
+  assert.equal(shouldHandoffManualResult({ outcome: "aborted" }), true);
 });

@@ -1612,8 +1612,11 @@ export function reviewFooterSegment(
   paused: boolean,
   /** A round owns the turn before its first state event (cold boot). */
   starting = false,
+  /** The reviewer finished; the plan is waiting for Approve/Revise. */
+  handoff = false,
 ): string {
   if (paused) return "🔍 review paused — /review-resume to continue";
+  if (handoff) return "🔍 review · awaiting decision";
   if (!state) return starting ? "🔍 review · starting" : "";
   return reviewStateSummary(state);
 }
@@ -1632,6 +1635,8 @@ export function reviewStatusVisible(input: {
   roundInFlight?: boolean;
   roundActive?: boolean;
   paused?: boolean;
+  /** The reviewer finished and the browser/inline handoff owns the turn. */
+  handoff?: boolean;
   /**
    * The retained round state's phase, when one exists. A retained *terminal*
    * phase must not make the line visible during a new round's cold boot
@@ -1640,6 +1645,7 @@ export function reviewStatusVisible(input: {
   phase?: ReviewPhase;
 }): boolean {
   if (input.paused === true) return true;
+  if (input.handoff === true) return true;
   if (input.roundInFlight !== true && input.roundActive !== true) return false;
   // `undefined` means the round has not emitted a state yet; there is nothing
   // stale to paint and the lock/working message still describe the round.
@@ -1659,11 +1665,13 @@ export function reviewStatusText(input: {
   roundInFlight?: boolean;
   roundActive?: boolean;
   paused?: boolean;
+  handoff?: boolean;
 }): string {
   const visible = reviewStatusVisible({
     roundInFlight: input.roundInFlight,
     roundActive: input.roundActive,
     paused: input.paused,
+    handoff: input.handoff,
     phase: input.state?.phase,
   });
   return visible
@@ -1671,6 +1679,7 @@ export function reviewStatusText(input: {
         input.state,
         input.paused === true,
         input.roundInFlight === true,
+        input.handoff === true,
       )
     : "";
 }
@@ -1723,18 +1732,77 @@ export function nextReviewRound(input: {
   return { round, allowed: round <= max };
 }
 
-// ── Mode-switch lock (plan 2026-10-25) ───────────────────────────────
+// ── Review turn + mode-switch lock (plan 2026-11-14) ─────────────────
 //
-// While a review owns the turn, mode transitions are refused: switching to
-// Build mid-review would swap the tool set and suspend the reviewer, and
-// switching to Default would leave the reviewer running outside Plan Mode.
-// The lock is a PROJECTION over existing state (never persisted), so every
-// existing exit — land, fail, pause/resume, abort, suspend, teardown —
-// releases it automatically. The post-review handoff prompt is deliberately
-// NOT part of the lock: the independent reviewer has already finished.
+// Review is an exclusive turn, not a background job: from the moment the
+// planner hands its plan to the reviewer until the browser/inline decision is
+// applied, no prompt and no mode transition is accepted. The turn is an
+// explicit state (unlike the old derived lock) because the handoff phase has
+// no running child session and must still be locked.
+//
+//   idle -> running -> paused -> running -> ... -> handoff -> transition -> idle
+//                 \-> handoff (reviewer failed/skipped) -> transition -> idle
+//
+// `transition` is the short, internal window while a decision stops the
+// reviewer, applies Build/Plan and sends the follow-up. It is locked so a
+// queued prompt cannot race the mode change.
+
+/** The exclusive Review turn. `idle` means no review owns the session. */
+export type ReviewTurnPhase =
+  | "idle"
+  | "running"
+  | "paused"
+  | "handoff"
+  | "transition";
+
+export function reviewTurnOwns(phase: ReviewTurnPhase): boolean {
+  return phase !== "idle";
+}
+
+/** Commands a user may run while Review owns the turn. */
+export function reviewInputAllowed(text: string): boolean {
+  const value = text.trim();
+  if (!value.startsWith("/")) return false;
+  return (
+    /^\/review(?:\s|-|$)/i.test(value) ||
+    /^\/model(?:\s|$)/i.test(value) ||
+    /^\/thinking(?:\s|$)/i.test(value) ||
+    /^\/profile(?:\s|$)/i.test(value) ||
+    /^\/role(?:\s|$)/i.test(value)
+  );
+}
+
+export type ReviewInputDecision =
+  | { action: "allow" }
+  | { action: "block"; notice: string };
+
+/** One decision for `pi.on("input")`; pure so the matrix is testable. */
+export function reviewInputDecision(
+  text: string,
+  phase: ReviewTurnPhase,
+): ReviewInputDecision {
+  if (!reviewTurnOwns(phase)) return { action: "allow" };
+  if (reviewInputAllowed(text)) return { action: "allow" };
+  const state =
+    phase === "paused"
+      ? "paused"
+      : phase === "handoff"
+        ? "awaiting a decision"
+        : phase === "transition"
+          ? "applying the decision"
+          : "running";
+  return {
+    action: "block",
+    notice: `Review is ${state} — prompts are locked. /review-pause, /review-resume, /review-abort, or change model/profile.`,
+  };
+}
 
 /** Which mode-switch lock is active, if any. Derived, never persisted. */
-export type ReviewModeLockKind = "running" | "paused";
+export type ReviewModeLockKind =
+  | "running"
+  | "paused"
+  | "handoff"
+  | "transition";
 
 export interface ReviewModeLockInput {
   /** `activeReview !== undefined` — set before the child session boots. */
@@ -1745,6 +1813,10 @@ export interface ReviewModeLockInput {
   paused?: boolean;
   /** The gated handoff phase; `"auditing"` counts as running. */
   gatePhase?: ReviewHandoffPhase;
+  /** The browser/inline decision owns the session. */
+  handoff?: boolean;
+  /** A decision is being applied (stop reviewer -> mode -> follow-up). */
+  transition?: boolean;
 }
 
 /**
@@ -1767,7 +1839,28 @@ export function reviewModeLockKind(
   }
   if (input.gatePhase === "paused") return "paused";
   if (input.gatePhase === "auditing") return "running";
+  if (input.transition === true) return "transition";
+  if (input.handoff === true) return "handoff";
   return undefined;
+}
+
+/**
+ * The narrower "a reviewer round or pause owns the turn" predicate.
+ * Decision handlers must use this (not the full lock): the handoff they are
+ * about to consume is not a stale decision.
+ */
+export function reviewRoundOwnsTurn(input: {
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  gatePhase?: ReviewHandoffPhase;
+}): boolean {
+  return (
+    input.paused === true ||
+    input.roundInFlight === true ||
+    input.roundActive === true ||
+    input.gatePhase === "auditing"
+  );
 }
 
 /**
@@ -1803,9 +1896,16 @@ export function reviewHandoffParks(input: {
 
 /** One short notice for a blocked mode transition. */
 export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
-  return kind === "paused"
-    ? "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop, /review-mode off to end review."
-    : "Review is running — mode switching is locked. ESC or /review-pause to pause, /review-resume to continue, /review-abort to stop, /review-mode off to end review.";
+  if (kind === "paused") {
+    return "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop.";
+  }
+  if (kind === "handoff") {
+    return "Review decision pending — mode switching is locked. Approve or annotate in the review tab, or /review-abort to skip.";
+  }
+  if (kind === "transition") {
+    return "Review decision is being applied — mode switching is briefly locked.";
+  }
+  return "Review is running — mode switching is locked. ESC or /review-pause to pause, /review-resume to continue, /review-abort to stop.";
 }
 
 /** Footer marker appended to the single `"workflow"` status while locked. */

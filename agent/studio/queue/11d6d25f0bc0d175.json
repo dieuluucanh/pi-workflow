@@ -1,0 +1,661 @@
+{
+  "version": 1,
+  "projectKey": "11d6d25f0bc0d175",
+  "paused": false,
+  "jobs": [
+    {
+      "id": "job-mwbhdf87-1mesqu",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an asean man photo",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794362952535,
+      "startedAt": 1794362953568,
+      "finishedAt": 1794362953603,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwbhe57m-u8nkw",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an asean man photo",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794362986210,
+      "startedAt": 1794362986782,
+      "finishedAt": 1794362986792,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwbhex3r-crm40g",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an asean girl photo",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794363022359,
+      "startedAt": 1794363023029,
+      "finishedAt": 1794363023040,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwbhflg8-6v94h",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "local-http",
+      "model": "local/image",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an asean girl photo",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 3,
+      "maxAttempts": 3,
+      "createdAt": 1794363053912,
+      "startedAt": 1794363059279,
+      "finishedAt": 1794363059285,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "network",
+        "message": "fetch failed",
+        "retryable": true
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwbhhvis-a0ftul",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "test a photo",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794363160276,
+      "startedAt": 1794363160592,
+      "finishedAt": 1794363160602,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwczq3gl-aqj84d",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate a photo of asean woman",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 3,
+      "maxAttempts": 3,
+      "createdAt": 1794454243077,
+      "startedAt": 1794454257467,
+      "finishedAt": 1794454257507,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "network",
+        "message": "fetch failed",
+        "retryable": true
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwczu4qe-cmnqp6",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of an asean woman",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794454431350,
+      "startedAt": 1794454432046,
+      "finishedAt": 1794454432123,
+      "costEstimateUsd": null,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwdmw2rv-7apx14",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of asean woman",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794493153291,
+      "startedAt": 1794493153609,
+      "finishedAt": 1794493153638,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwdmwd85-1v5whc",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of a dog",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794493166837,
+      "startedAt": 1794493167694,
+      "finishedAt": 1794493167714,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwdmwlqc-2hto7y",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of a dog",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794493177860,
+      "startedAt": 1794493190827,
+      "finishedAt": 1794493190849,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwdmzymm-fsngvh",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "Scene 1",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "seed": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "bulk",
+      "batchId": "batch-mwdmzyml-305vg",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794493334542,
+      "startedAt": 1794493337812,
+      "finishedAt": 1794493337828,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "invalid_request",
+        "message": "{\"error\": {\"type\": \"prompt_outputs_failed_validation\", \"message\": \"Prompt outputs failed validation\", \"details\": \"Required input is missing: images\", \"extra_info\": {}}, \"node_errors\": {\"9\": {\"errors\": [{\"type\": \"required_input_missing\", \"message\": \"Required input is missing\", \"details\": \"images\", \"extra_info\": {\"input_name\": \"images\"}}], \"dependent_outputs\": [\"9\"], \"class_type\": \"SaveImage\"}}}",
+        "retryable": false,
+        "status": 400
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": "shot-mwbhee9f",
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwe7ke42-k2ivn",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate a dog image",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794527880050,
+      "startedAt": 1794527880390,
+      "finishedAt": 1794527880728,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "configuration",
+        "message": "ComfyUI has no checkpoints installed, so this template cannot run. It reports 1 diffusion model(s): paste an API workflow (ComfyUI → Workflow → Export (API)) to use them.",
+        "retryable": false
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwea6ta7-9mkhnl",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of a dog",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794532285375,
+      "startedAt": 1794532285733,
+      "finishedAt": 1794532286036,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "configuration",
+        "message": "ComfyUI has no checkpoints installed, so this template cannot run. It reports 1 diffusion model(s): paste an API workflow (ComfyUI → Workflow → Export (API)) to use them.",
+        "retryable": false
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mweadaki-bltj81",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of a dog",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794532587714,
+      "startedAt": 1794532587978,
+      "finishedAt": 1794532587988,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "configuration",
+        "message": "ComfyUI has no checkpoints installed, so this template cannot run. It reports 1 diffusion model(s): paste an API workflow (ComfyUI → Workflow → Export (API)) to use them.",
+        "retryable": false
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    },
+    {
+      "id": "job-mwel6o4d-a2zxpu",
+      "projectKey": "11d6d25f0bc0d175",
+      "kind": "image",
+      "provider": "comfyui",
+      "model": "comfyui/txt2img",
+      "request": {
+        "kind": "image",
+        "prompt": "generate an image of a dog",
+        "negative": "",
+        "aspect": "16:9",
+        "durationSeconds": null,
+        "params": {
+          "n": 1
+        },
+        "referenceAssetIds": []
+      },
+      "state": "failed",
+      "priority": "user",
+      "batchId": null,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": 1794550754461,
+      "startedAt": 1794550755444,
+      "finishedAt": 1794550755936,
+      "costEstimateUsd": 0,
+      "costActualUsd": null,
+      "error": {
+        "code": "configuration",
+        "message": "ComfyUI has no checkpoints installed, so this template cannot run. It reports 1 diffusion model(s): paste an API workflow (ComfyUI → Workflow → Export (API)) to use them.",
+        "retryable": false
+      },
+      "progress": {
+        "percent": null,
+        "stage": "submitting",
+        "message": "Submitting"
+      },
+      "providerJobId": null,
+      "shotId": null,
+      "pollAttempts": 0,
+      "nextPollAt": null,
+      "providerCursor": null
+    }
+  ]
+}

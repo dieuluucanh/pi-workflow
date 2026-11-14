@@ -21,8 +21,11 @@ export const WORKFLOW_STATUS_KEYS = {
 
 export interface WorkflowStatusInput {
   mode: "build" | "plan" | null;
-  /** Plannotator's Plan sub-state, shown inside the mode segment. */
-  plannotatorActive?: boolean;
+  /**
+   * The exclusive Review turn. `running|paused|handoff` replaces the author
+   * mode in the segment; `transition` is internal and renders as running.
+   */
+  reviewPhase?: "idle" | "running" | "paused" | "handoff" | "transition" | null;
   done: number;
   total: number;
   stale?: boolean;
@@ -54,13 +57,21 @@ export function buildWorkflowStatusSegments(
     (input.writeMode ? ` · writes:${input.writeMode}` : "");
 
   let mode: string;
-  if (input.mode === "build") {
+  const phase = input.reviewPhase ?? "idle";
+  if (phase !== "idle") {
+    // The mode segment is deliberately free of `n/m` and pass details: the
+    // Desktop's progress parser must not read review progress as plan steps.
+    const base =
+      phase === "paused"
+        ? "🔍 review — paused"
+        : phase === "handoff"
+          ? "🔍 review — awaiting decision"
+          : "🔍 review";
+    mode = base;
+  } else if (input.mode === "build") {
     mode = total > 0 ? `▶ build ${done}/${total}${stale}` : `▶ build${stale}`;
   } else if (input.mode === "plan") {
-    const base = input.plannotatorActive
-      ? "⏸ plan — reviewing in browser"
-      : "⏸ plan";
-    mode = total > 0 ? `${base} ${done}/${total}${stale}` : `${base}${stale}`;
+    mode = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
   } else if (total > 0) {
     // The default mode must stay parseable by the Desktop badge decoder.
     mode = `◦ ${done}/${total}${stale}`;

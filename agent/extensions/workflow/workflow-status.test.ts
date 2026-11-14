@@ -29,20 +29,43 @@ test("build mode keeps the mode/progress in `workflow` and splits the rest", () 
   );
 });
 
-test("plan keeps Plannotator as a mode sub-state", () => {
+test("plan no longer claims a browser review without a Review turn", () => {
   assert.deepEqual(
     buildWorkflowStatusSegments({
       mode: "plan",
-      plannotatorActive: true,
       done: 1,
       total: 4,
       commitMode: "never",
     }),
     {
-      mode: "⏸ plan — reviewing in browser 1/4",
+      mode: "⏸ plan 1/4",
       profile: "",
       policy: "commits:never",
     },
+  );
+});
+
+test("the Review turn replaces the author mode and carries its phase", () => {
+  const base = { mode: "plan" as const, done: 1, total: 4, commitMode: "never" };
+  assert.equal(
+    buildWorkflowStatusSegments({ ...base, reviewPhase: "running" }).mode,
+    "🔍 review",
+  );
+  assert.equal(
+    buildWorkflowStatusSegments({ ...base, reviewPhase: "paused" }).mode,
+    "🔍 review — paused",
+  );
+  assert.equal(
+    buildWorkflowStatusSegments({ ...base, reviewPhase: "handoff" }).mode,
+    "🔍 review — awaiting decision",
+  );
+  assert.equal(
+    buildWorkflowStatusSegments({ ...base, reviewPhase: "transition" }).mode,
+    "🔍 review",
+  );
+  assert.equal(
+    buildWorkflowStatusSegments({ ...base, reviewPhase: "idle" }).mode,
+    "⏸ plan 1/4",
   );
 });
 

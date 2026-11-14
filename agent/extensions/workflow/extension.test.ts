@@ -40,6 +40,8 @@ interface BootOptions {
   startReason?: "startup" | "reload" | "resume" | "fork" | "new";
   customAnswer?: string | null;
   editorAnswer?: string | null;
+  /** `ctx.ui.select` answer (closed-review inline handoff). */
+  selectAnswer?: string;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
   script?: {
     pass1?: (c: FakeCapture) => Promise<void>;
@@ -124,6 +126,9 @@ async function boot(over: BootOptions = {}) {
       : {}),
     ...(over.editorAnswer !== undefined
       ? { editorAnswer: over.editorAnswer }
+      : {}),
+    ...(over.selectAnswer !== undefined
+      ? { selectAnswer: over.selectAnswer }
       : {}),
   });
   await pi.emit("session_start", { reason: over.startReason ?? "startup" }, ctx);
@@ -715,8 +720,9 @@ test("L: a new prompt abandons a paused gated review and clears its status/lock"
     await handoff;
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.ok(
-      notified(b.notifies, "Paused review abandoned"),
-      "the user is told the pause was abandoned",
+      notified(b.notifies, "prompt was already queued") ||
+        notified(b.notifies, "Paused review abandoned"),
+      "the user is told the bypass prompt stopped the review",
     );
     const after = b.statuses
       .slice(before)
@@ -946,6 +952,14 @@ test("R1: reload keeps a pending browser review", async () => {
         notified(made.notifies, "browser"),
       "the restored gate is visible to the user",
     );
+    assert.ok(
+      made.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("🔍 review — awaiting decision"),
+      ),
+      "a kept gate restores Review as the handoff phase",
+    );
   } finally {
     await b.cleanup();
   }
@@ -1002,7 +1016,7 @@ test("R3: reload applies a completed denial", async () => {
 });
 
 test("R4: a missing review is cleared after reload", async () => {
-  const { b } = await reloadWithPending({
+  const { b, made } = await reloadWithPending({
     "review-1": { status: "missing" },
   });
   try {
@@ -1014,6 +1028,17 @@ test("R4: a missing review is cleared after reload", async () => {
         (e: any) => e.type === "workflow-handoff-recovery",
       ),
       "a missing review is recorded and cleared",
+    );
+    const modes = made.statuses.filter(
+      (value): value is string =>
+        typeof value === "string" &&
+        (value.includes("🔍 review") ||
+          value.includes("⏸ plan") ||
+          value.includes("▶ build")),
+    );
+    assert.ok(
+      modes.at(-1)?.includes("⏸ plan"),
+      `a cleared gate returns to the author mode, got ${modes.at(-1)}`,
     );
   } finally {
     await b.cleanup();
@@ -1167,6 +1192,14 @@ test("S4: a manual cycle keeps reviewing after Deny with Review Mode off", async
         String(s.content).includes("please add an export test"),
       ),
     );
+    // Real Pi fires before_agent_start for the extension's feedback turn. It
+    // used to clear manualReviewCycle with reason "prompt"; the refine flag
+    // must preserve it so this manual cycle re-reviews with auto mode off.
+    await b.pi.emit(
+      "before_agent_start",
+      { prompt: "please add an export test" },
+      b.ctx,
+    );
 
     fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
     await writeResult(b.pi, b.ctx, plan.rel);
@@ -1177,6 +1210,470 @@ test("S4: a manual cycle keeps reviewing after Deny with Review Mode off", async
       b.plannotatorRequests.length,
       2,
       "the revised plan handed off again",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("P: auto Review Approve applies Build before execute and ends Review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "approve-order.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the review opened once");
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+
+    const buildToolAt = b.pi.timeline.reduce(
+      (found, entry, index) =>
+        entry.kind === "tools" && entry.tools.includes("write") ? index : found,
+      -1,
+    );
+    const executeAt = b.pi.timeline.findIndex(
+      (entry) =>
+        entry.kind === "send" &&
+        JSON.stringify(entry.content).includes("Execute the plan"),
+    );
+    assert.ok(buildToolAt >= 0, "Build tools were applied");
+    assert.ok(
+      buildToolAt < executeAt,
+      "Build tools are active before the execute message is sent",
+    );
+
+    const statuses = b.statuses.filter(
+      (value): value is string => typeof value === "string",
+    );
+    const lastMode = [...statuses]
+      .reverse()
+      .find(
+        (value) =>
+          value.includes("▶ build") ||
+          value.includes("⏸ plan") ||
+          value.includes("🔍 review"),
+      );
+    assert.ok(
+      lastMode?.includes("▶ build"),
+      `the last mode status is Build, got ${lastMode}`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Q: repeated browser feedback legs re-review and reset the round budget", async () => {
+  const b = await boot({ hasUI: true, plannotator: true, verify: false });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "feedback-loop.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "round 1 handed off");
+
+    for (let leg = 1; leg <= 2; leg += 1) {
+      b.pi.events.emit("plannotator:review-result", {
+        reviewId: `review-${leg}`,
+        approved: false,
+        feedback: `revision ${leg}`,
+      });
+      await waitFor(() =>
+        b.pi.sent.some((s: any) =>
+          String(s.content).includes(`revision ${leg}`),
+        ),
+      );
+      // Real Pi fires before_agent_start for the extension's feedback turn;
+      // the fake host does not, so simulate it explicitly.
+      await b.pi.emit(
+        "before_agent_start",
+        { prompt: `revision ${leg}` },
+        b.ctx,
+      );
+      fs.writeFileSync(plan.abs, ORIGINAL_PLAN, "utf8");
+      await writeResult(b.pi, b.ctx, plan.rel);
+      await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+      assert.equal(
+        b.plannotatorRequests.length,
+        leg + 1,
+        `feedback leg ${leg} opened a fresh handoff`,
+      );
+      assert.ok(
+        !b.pi.entries.some(
+          (e: any) =>
+            e.type === "workflow-review-mode" &&
+            String(e.data?.reason ?? "").includes("round limit"),
+        ),
+        `feedback leg ${leg} did not hit the round cap`,
+      );
+    }
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-3",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.equal(b.capture.prompts.length, 3, "three review rounds ran");
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "approval entered Build",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("R: pause/resume keeps Review, abort still hands off", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "pause-resume.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const handoff = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+
+    const waitForPrompt = async (n: number): Promise<void> => {
+      for (let i = 0; i < 200 && b.capture.prompts.length < n; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(b.capture.prompts.length >= n, `round ${n} started`);
+    };
+
+    await waitForPrompt(1);
+    for (let i = 0; i < 1; i += 1) {
+      await b.pi.commands["review-pause"].handler("", b.ctx);
+      releases.shift()?.();
+      for (let wait = 0; wait < 200; wait += 1) {
+        const paused = b.statuses.some(
+          (value) =>
+            typeof value === "string" && value.includes("🔍 review — paused"),
+        );
+        if (paused) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(
+        b.statuses.some(
+          (value) =>
+            typeof value === "string" && value.includes("🔍 review — paused"),
+        ),
+        `pause ${i + 1} shows Review paused`,
+      );
+      // The paused status is painted before the aborting round's finally has
+      // cleared `activeReview`; let it settle before resuming.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await b.pi.commands["review-resume"].handler("", b.ctx);
+      await waitForPrompt(i + 2);
+    }
+
+    // Abort the fourth round while paused. The gated handoff is parked, so the
+    // abort must settle it and the parked runHandoff must present the plan.
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    releases.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    for (let i = 0; i < 200 && b.plannotatorRequests.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(
+      b.plannotatorRequests.length >= 1,
+      "abort presented the plan for Approve/Revise",
+    );
+    await handoff;
+    const strings = b.statuses.filter(
+      (value): value is string => typeof value === "string",
+    );
+    assert.ok(
+      strings.some((value) => value.includes("🔍 review — awaiting decision")),
+      "the abort moved Review to the handoff phase",
+    );
+    assert.ok(
+      !strings.at(-1)?.includes("🔍 review — paused"),
+      "the paused status did not stick",
+    );
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+function releaseAll(releases: Array<() => void>): void {
+  while (releases.length > 0) releases.shift()?.();
+}
+
+test("T: manual /review locks prompts/modes and Approve enters Build", async () => {
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true });
+  try {
+    const plan = placePlan(b.cwd, "manual-default.md");
+    await runReview(b.pi, b.ctx, plan.rel);
+    assert.equal(b.plannotatorRequests.length, 1, "manual review handed off");
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "manual /review enters Review",
+    );
+
+    const blocked = await b.pi.emit(
+      "input",
+      { text: "rewrite the plan", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(blocked[0], { action: "handled" });
+    assert.ok(notified(b.notifies, "prompts are locked"));
+
+    const allowed = await b.pi.emit(
+      "input",
+      { text: "/model opencode-go/other", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(allowed[0], { action: "continue" });
+
+    await b.pi.commands.plan.handler("", b.ctx);
+    assert.ok(notified(b.notifies, "mode switching is locked"));
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "Approve entered Build",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("U: manual /review feedback switches to Plan", async () => {
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true });
+  try {
+    const plan = placePlan(b.cwd, "manual-feedback.md");
+    await runReview(b.pi, b.ctx, plan.rel);
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: false,
+      feedback: "please revise",
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) => String(s.content).includes("please revise")),
+    );
+    const strings = b.statuses.filter(
+      (value): value is string => typeof value === "string",
+    );
+    assert.ok(
+      strings.some((value) => value.includes("⏸ plan")),
+      "Deny returned to Plan for the revision",
+    );
+    assert.ok(
+      !strings.at(-1)?.includes("🔍 review"),
+      "Review is no longer the active mode after feedback",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("V: /review with no plan warns and never enters Review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await runReview(b.pi, b.ctx);
+    assert.ok(notified(b.notifies, "No plan file found"));
+    assert.equal(b.plannotatorRequests.length, 0, "no handoff opened");
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "no Review mode status was painted",
+    );
+    const allowed = await b.pi.emit(
+      "input",
+      { text: "ordinary prompt", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(allowed[0], { action: "continue" });
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("R5: reload during a running round returns to Plan, no phantom Review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    const plan = placePlan(b.cwd, "reload-running.md");
+    const branch = [
+      {
+        type: "custom",
+        customType: "workflow",
+        data: {
+          mode: "plan",
+          planFile: plan.abs,
+          todos: [],
+          awaitingDecision: false,
+        },
+      },
+    ];
+    const made = makeFakeCtx({ cwd: b.cwd, hasUI: true, branch });
+    await b.pi.emit("session_start", { reason: "reload" }, made.ctx);
+    assert.ok(
+      !made.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "a running round cannot survive the reload as Review",
+    );
+    assert.ok(
+      made.statuses.some(
+        (value) => typeof value === "string" && value.includes("⏸ plan"),
+      ),
+      "the reloaded session returns to Plan",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("W: Build -> Plan -> a new plan gets a fresh review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const first = placePlan(b.cwd, "loop-first.md");
+    await writeResult(b.pi, b.ctx, first.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(first.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1);
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "Build started",
+    );
+
+    // Build -> Plan -> a new plan. The next review must not be suppressed by
+    // the previous plan's budget or hash.
+    await b.pi.commands.plan.handler("", b.ctx);
+    await freshPrompt(b.pi, b.ctx);
+    const second = placePlan(b.cwd, "loop-second.md");
+    await writeResult(b.pi, b.ctx, second.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(second.rel) }, b.ctx);
+    assert.equal(b.capture.prompts.length, 2, "the new plan was reviewed");
+    assert.equal(b.plannotatorRequests.length, 2, "the new plan handed off");
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-cycle" && e.data?.reason === "prompt",
+      ),
+      "the new Plan cycle is recorded",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("X: closing the browser review presents an inline handoff", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    selectAnswer: "Execute the plan in Build Mode",
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "close-review.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the browser review opened");
+
+    b.pi.events.emit("plannotator:session-closed", {
+      reviewId: "review-1",
+      outcome: "closed",
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "the inline handoff executed and entered Build",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Y: cancelling the closed-review inline handoff does not stick Review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true, selectAnswer: undefined });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "close-cancel.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    b.pi.events.emit("plannotator:session-closed", {
+      reviewId: "review-1",
+      outcome: "closed",
+    });
+    await waitFor(() =>
+      b.notifies.some((n) => n.message.includes("Plan review closed — the plan is at")),
+    );
+    const modes = b.statuses.filter(
+      (value): value is string =>
+        typeof value === "string" &&
+        (value.includes("🔍 review") ||
+          value.includes("⏸ plan") ||
+          value.includes("▶ build")),
+    );
+    assert.ok(
+      modes.at(-1)?.includes("⏸ plan"),
+      `cancelling returns to Plan, got ${modes.at(-1)}`,
     );
   } finally {
     await b.cleanup();

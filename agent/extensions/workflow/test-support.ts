@@ -294,6 +294,11 @@ export interface FakePi {
   commands: Record<string, { description?: string; handler: Function }>;
   entries: Array<{ type: string; data: unknown }>;
   sent: Array<{ content: unknown; options?: unknown }>;
+  /** Ordered side effects used to pin transition ordering (tools, sends). */
+  timeline: Array<
+    | { kind: "tools"; tools: string[] }
+    | { kind: "send"; content: unknown }
+  >;
   activeTools: string[];
   model: unknown;
   on(event: string, handler: EventHandler): void;
@@ -327,11 +332,13 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
   const commands: FakePi["commands"] = {};
   const entries: FakePi["entries"] = [];
   const sent: FakePi["sent"] = [];
+  const timeline: FakePi["timeline"] = [];
   const pi: FakePi = {
     handlers,
     commands,
     entries,
     sent,
+    timeline,
     activeTools: over.activeTools ?? ["read", "write", "edit", "bash"],
     model: undefined,
     on(event, handler) {
@@ -356,6 +363,7 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
     },
     setActiveTools(tools) {
       pi.activeTools = [...tools];
+      timeline.push({ kind: "tools", tools: [...tools] });
     },
     getAllTools() {
       return [];
@@ -368,9 +376,11 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
     },
     sendMessage(content, options) {
       sent.push({ content, options });
+      timeline.push({ kind: "send", content });
     },
     sendUserMessage(content, options) {
       sent.push({ content, options });
+      timeline.push({ kind: "send", content });
     },
     events: {
       on(event, handler) {

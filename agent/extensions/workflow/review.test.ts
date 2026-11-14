@@ -2560,20 +2560,24 @@ test("reviewGatePhaseOnResume makes a gated pause auditing again", () => {
 
 test("reviewModeLockNotice names only the allowed review exits", () => {
   const running = reviewModeLockNotice("running");
-  for (const s of [
-    "ESC",
-    "/review-pause",
-    "/review-resume",
-    "/review-abort",
-    "/review-mode off",
-  ]) {
+  for (const s of ["ESC", "/review-pause", "/review-resume", "/review-abort"]) {
     assert.ok(running.includes(s), `running notice names ${s}`);
   }
+  // `/review-mode off` is refused while Review owns the turn (step 4).
+  assert.ok(!running.includes("/review-mode off"));
   const paused = reviewModeLockNotice("paused");
-  for (const s of ["/review-resume", "/review-abort", "/review-mode off"]) {
+  for (const s of ["/review-resume", "/review-abort"]) {
     assert.ok(paused.includes(s), `paused notice names ${s}`);
   }
   assert.ok(!paused.includes("ESC"), "ESC is a pause, not a resume");
+  assert.ok(
+    reviewModeLockNotice("handoff").includes("decision pending"),
+    "handoff names the browser decision",
+  );
+  assert.ok(
+    reviewModeLockNotice("transition").includes("being applied"),
+    "transition names the brief lock",
+  );
 });
 
 test("reviewModeLockFooter/StatusLine surface the lock", () => {

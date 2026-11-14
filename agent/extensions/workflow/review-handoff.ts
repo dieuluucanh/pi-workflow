@@ -116,10 +116,11 @@ export function pendingHandoffIsStale(input: {
 
 /**
  * A manual `/review` hands off when the round settled one way or another.
- * A pause is resumed later; an abort is an explicit exit.
+ * A pause is resumed later; an abort still presents the author's plan (the
+ * user asked to skip the reviewer, not to lose the handoff).
  */
 export function shouldHandoffManualResult(
   result: Pick<ReviewExecutionResult, "outcome">,
 ): boolean {
-  return result.outcome !== "paused" && result.outcome !== "aborted";
+  return result.outcome !== "paused";
 }

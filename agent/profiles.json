@@ -8,12 +8,12 @@
         "planner": {
           "provider": "opencode-go",
           "id": "deepseek-v4.1-flash",
-          "thinking": "xhigh"
+          "thinking": "max"
         },
         "explorer": {
           "provider": "opencode-go",
           "id": "deepseek-v4.1-flash",
-          "thinking": "medium"
+          "thinking": "low"
         },
         "builder": {
           "provider": "opencode-go",
@@ -23,7 +23,7 @@
         "reviewer": {
           "provider": "opencode-go",
           "id": "deepseek-v4.1-flash",
-          "thinking": "xhigh"
+          "thinking": "max"
         }
       },
       "defaultModel": {
@@ -132,7 +132,7 @@
         "planner": {
           "provider": "command-code",
           "id": "deepseek/deepseek-v4.1-flash",
-          "thinking": "high"
+          "thinking": "max"
         },
         "explorer": {
           "provider": "command-code",
@@ -147,7 +147,7 @@
         "reviewer": {
           "provider": "command-code",
           "id": "deepseek/deepseek-v4.1-flash",
-          "thinking": "high"
+          "thinking": "max"
         }
       },
       "defaultModel": {

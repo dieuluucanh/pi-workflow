@@ -256,6 +256,9 @@ import {
   reviewModeLockKind,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
+  reviewInputDecision,
+  reviewRoundOwnsTurn,
+  reviewTurnOwns,
   reviewNoticeText,
   reviewPauseIsCurrent,
   reviewResumeGateOutcome,
@@ -278,6 +281,7 @@ import {
   type ReviewHandoffPhase,
   type ReviewHandoffResult,
   type ReviewModeLockKind,
+  type ReviewTurnPhase,
   type ReviewState,
   type ReviewTranscriptOp,
   type ReviewTrigger,
@@ -1299,7 +1303,7 @@ export default function workflowExtension(
     }
     const segments = buildWorkflowStatusSegments({
       mode: workflowMode,
-      plannotatorActive,
+      reviewPhase: reviewTurn,
       done: todoItems.filter((t) => isDone(t)).length,
       total: todoItems.length,
       stale: todoStale,
@@ -1309,11 +1313,13 @@ export default function workflowExtension(
       writeMode: workflowMode === null ? writeMode : null,
     });
     const modeTone =
-      workflowMode === "build"
+      reviewTurn !== "idle"
         ? "accent"
-        : workflowMode === "plan"
-          ? "warning"
-          : "muted";
+        : workflowMode === "build"
+          ? "accent"
+          : workflowMode === "plan"
+            ? "warning"
+            : "muted";
     setWorkflowStatus(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.mode,
@@ -1415,6 +1421,15 @@ export default function workflowExtension(
   let activeReview:
     | { planText: string; round: number; controller: AbortController }
     | undefined;
+  /**
+   * The exclusive Review turn (plan 2026-11-14). Unlike the old derived lock,
+   * this also covers the browser/inline handoff, where no child session runs.
+   * In-memory: a reload restores `handoff` from `awaitingDecision`, otherwise
+   * idle (a running round cannot survive the process).
+   */
+  let reviewTurn: ReviewTurnPhase = "idle";
+  /** The next plan turn is the feedback/refine continuation of a Deny. */
+  let reviewFeedbackTurn = false;
   /** Long-lived ESC listener covering a round and the paused window. */
   let detachReviewEscListener: (() => void) | undefined;
   /**
@@ -1466,7 +1481,45 @@ export default function workflowExtension(
       roundActive,
       paused,
       gatePhase,
+      handoff: reviewTurn === "handoff" || awaitingDecision,
+      transition: reviewTurn === "transition",
     });
+  }
+
+  /** True while a reviewer round or a real pause owns the turn (not handoff). */
+  function reviewRoundInFlight(): boolean {
+    let roundActive = false;
+    try {
+      roundActive = reviewRuntime?.isRoundActive() === true;
+    } catch (_e) {
+      void _e;
+    }
+    return reviewRoundOwnsTurn({
+      roundInFlight: activeReview !== undefined,
+      roundActive,
+      paused: currentPausedReview() !== undefined,
+      gatePhase:
+        reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle",
+    });
+  }
+
+  /** One status refresh for every review-turn transition. */
+  function setReviewTurn(phase: ReviewTurnPhase): void {
+    if (reviewTurn === phase) return;
+    reviewTurn = phase;
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function beginReviewTurn(): void {
+    setReviewTurn("running");
+  }
+
+  function endReviewTurn(): void {
+    setReviewTurn("idle");
   }
 
   /** Refuse a mode transition while a review round or pause owns the turn. */
@@ -2124,6 +2177,7 @@ export default function workflowExtension(
     // A gated audit becomes a paused gate (the handoff keeps waiting). A
     // manual review (idle gate) leaves the phase alone.
     if (reviewGatePhase === "auditing") reviewGatePhase = "paused";
+    setReviewTurn("paused");
     refreshReviewPauseUi();
     return true;
   }
@@ -2335,6 +2389,7 @@ export default function workflowExtension(
     // follow `reviewState`; the spinner row needs an explicit message while
     // the child session streams off the main turn.
     setReviewWorkingMessage("🔍 Reviewing plan…");
+    setReviewTurn("running");
     // Paint the live review line now, not after the child session's first
     // state event: a manual `/review` must look alive from the first tick.
     updateStatus(ctx as any);
@@ -2890,6 +2945,7 @@ export default function workflowExtension(
     flushReviewEntries(true);
     resetReviewStream();
     detachReviewEscListenerNow();
+    endReviewTurn();
     try {
       currentSessionCtx?.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     } catch (_e) {
@@ -3015,6 +3071,15 @@ export default function workflowExtension(
 
       const scope = scopeFor("global");
       const enable = sub === "on";
+      // Disabling would tear down the review (and its pending handoff) behind
+      // the lock. Abort is the explicit exit while Review owns the turn.
+      if (!enable && reviewTurnOwns(reviewTurn)) {
+        ctx.ui.notify(
+          "Review is active — /review-abort first (or resume/approve in the review tab).",
+          "info",
+        );
+        return;
+      }
 
       const res = writeReviewModeConfig(scope, cwd, agentDir, {
         enabled: enable,
@@ -3506,6 +3571,9 @@ export default function workflowExtension(
       abortedReviewHash = undefined;
       pausedReview = undefined;
       reviewRound = 0;
+      // Manual /review is a Review turn from the first tick: the mode status,
+      // input gate and mode lock must be active before the child boots.
+      beginReviewTurn();
       const result = await runReviewStep(
         target.text,
         ctx as any,
@@ -3580,6 +3648,7 @@ export default function workflowExtension(
       // A manual pause (idle gate) is unchanged; the runtime/activeReview
       // flags carry that lock.
       reviewGatePhase = reviewGatePhaseOnResume(reviewGatePhase);
+      setReviewTurn("running");
       // A stale quiet-abort marker must not silence this explicit resume.
       quietAbortHash = undefined;
       // If the plan file moved on while paused, review the new revision fresh
@@ -3669,6 +3738,46 @@ export default function workflowExtension(
       const active =
         activeReview !== undefined || rt?.isRoundActive() === true;
       const paused = currentPausedReview();
+      // A browser/inline decision can own the turn with no round and no pause.
+      if (!active && !paused && awaitingDecision) {
+        const planPath = pendingHandoffPlanPath ?? currentPlanFile ?? "";
+        const planText =
+          (planPath &&
+            (() => {
+              try {
+                return fs.existsSync(planPath)
+                  ? fs.readFileSync(planPath, "utf8")
+                  : undefined;
+              } catch {
+                return undefined;
+              }
+            })()) ??
+          "";
+        if (pendingHandoffReviewUrl) {
+          setReviewTurn("handoff");
+          ctx.ui.notify(
+            "Review skipped — approve or annotate in the review tab.",
+            "info",
+          );
+          return;
+        }
+        if (planText && planPath) {
+          const handed = await openManualHandoff(
+            { planText, outcome: "aborted", paused: false },
+            planPath,
+            ctx as any,
+          );
+          if (!handed) setReviewTurn("handoff");
+          return;
+        }
+        clearPendingHandoffDecision();
+        setReviewTurn("idle");
+        ctx.ui.notify(
+          `Review skipped — the plan file is ${planPath || "unavailable"}.`,
+          "info",
+        );
+        return;
+      }
       if (!active && !paused) {
         ctx.ui.notify("No review running or paused.", "info");
         return;
@@ -3680,6 +3789,10 @@ export default function workflowExtension(
       // abort lands; falls back to the author's draft when unknown).
       const abortedText =
         paused?.planText ?? activeReview?.planText;
+      const pausedPlanPath = currentPlanFile ?? "";
+      // A parked automatic handoff owns its own presentation: settle the gate
+      // and let `runHandoff` render, never present twice.
+      const gated = reviewGatePhase !== "idle" && !reviewHandoffGate.settled();
       pausedReview = undefined;
       // An aborted revision is not auto-reviewed again until the plan changes.
       if (targetHash) abortedReviewHash = targetHash;
@@ -3702,9 +3815,15 @@ export default function workflowExtension(
           "Review stopped — the author's plan stands unreviewed.",
           "info",
         );
-        // A gated handoff was waiting on this round: hand off the author's
-        // plan through the normal renderer so the plan is always delivered.
-        settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+        if (gated) {
+          setReviewTurn("handoff");
+          settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+          return;
+        }
+        // A manual /review command is awaiting this round; it will present the
+        // aborted plan through `openManualHandoff` (shouldHandoffManualResult
+        // now includes aborted). Keep Review visible until then.
+        setReviewTurn("handoff");
         return;
       }
       flushReviewEntries(true);
@@ -3713,8 +3832,20 @@ export default function workflowExtension(
         "Paused review discarded — the author's plan stands.",
         "info",
       );
-      settleReviewGate({ outcome: "unreviewed", planText: abortedText });
-      // No round will run its finally, so clear the live review line here.
+      if (gated) {
+        setReviewTurn("handoff");
+        settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+        return;
+      }
+      if (abortedText && pausedPlanPath) {
+        await openManualHandoff(
+          { planText: abortedText, outcome: "aborted", paused: false },
+          pausedPlanPath,
+          ctx as any,
+        );
+        return;
+      }
+      setReviewTurn("idle");
       updateStatus(ctx as any);
     },
   });
@@ -3742,6 +3873,12 @@ export default function workflowExtension(
    */
   interface ModeSwitchOptions {
     quiet?: boolean;
+    /**
+     * Internal review-decision exit: the caller already validated the pending
+     * decision and owns the `transition` state, so the full review lock must
+     * not refuse it. Never set this from a user-facing mode switch.
+     */
+    fromReview?: boolean;
   }
 
   /** Pure helper for tests: resolve which RoleModel plan/build will switch to. */
@@ -4193,9 +4330,10 @@ export default function workflowExtension(
       return;
     }
     // A live review owns the turn: no mode transition until it lands, fails,
-    // pauses or is aborted. The post-review approve path enters Build through
-    // `enterBuildModeFromPlan`, which is no longer locked once the gate settles.
-    if (blockModeSwitchDuringReview(ctx)) return;
+    // pauses or is aborted. A validated browser/inline decision passes
+    // `fromReview` because it is the exit, not a competing mode switch.
+    if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
+    if (opts?.fromReview === true && reviewRoundInFlight()) return;
     // Leaving Default mode: remember its model so it can be restored on return.
     if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "plan";
@@ -4414,11 +4552,19 @@ export default function workflowExtension(
   async function enterBuildModeFromPlan(
     ctx: ExtensionContext,
     planPath: string,
-  ) {
-    // Defense in depth: the inline/browser approve paths only run after the
-    // gated review resolves, but a stale approve must never switch tools while
-    // a round or pause still owns the turn.
-    if (blockModeSwitchDuringReview(ctx)) return;
+    opts?: { fromReview?: boolean },
+  ): Promise<boolean> {
+    // Defense in depth: a stale approve must never switch tools while a real
+    // reviewer round/pause owns the turn. The handoff itself is consumed by
+    // the caller (fromReview), so only `reviewRoundInFlight()` can refuse it.
+    if (opts?.fromReview === true) {
+      if (reviewRoundInFlight()) {
+        ctx.ui.notify(reviewModeLockNotice("running"), "info");
+        return false;
+      }
+    } else if (blockModeSwitchDuringReview(ctx)) {
+      return false;
+    }
     workflowMode = "build";
     syncLegacyFlags();
     // The plan is being handed to Build; this Plan cycle cannot hand off again.
@@ -4457,6 +4603,7 @@ export default function workflowExtension(
         : `Build mode: ${loaded.count} todos synced from plan (progress kept).`,
       "info",
     );
+    return true;
   }
 
   // ── Plannotator bridge helpers ─────────────────────────────────
@@ -4560,6 +4707,9 @@ export default function workflowExtension(
     pendingHandoffReviewUrl = null;
     lastReviewId = null;
     recordedHandoffReviewId = null;
+    // Keep the Review mode visible while the browser/inline decision owns the
+    // turn. The reviewer has finished, but prompts and modes stay locked.
+    setReviewTurn("handoff");
     persistState();
     const timeoutMs = Math.max(50, deps.plannotatorRequestTimeoutMs ?? 15_000);
     const response = await new Promise<PlanReviewRequestOutcome>((resolve) => {
@@ -4723,6 +4873,7 @@ export default function workflowExtension(
       if (reason === "startup" || reason === "new" || !lastReviewId) {
         const changed = clearPendingHandoffDecision();
         if (changed) persistState();
+        endReviewTurn();
         record("clear", { why: "no restorable review" });
         return;
       }
@@ -4739,6 +4890,7 @@ export default function workflowExtension(
       });
       if (decision.action === "keep") {
         if (pendingHandoffSource === "manual") manualReviewCycle = true;
+        setReviewTurn("handoff");
         record("keep", {
           reviewId: lastReviewId,
           ...(pendingHandoffReviewUrl
@@ -4758,7 +4910,7 @@ export default function workflowExtension(
           approved: decision.approved,
         });
         if (decision.approved) {
-          handlePlannotatorApprove(
+          await handlePlannotatorApprove(
             pendingHandoffPlanPath ?? currentPlanFile ?? "",
             currentFile ?? "",
             decision.feedback,
@@ -4773,6 +4925,7 @@ export default function workflowExtension(
       }
       const changed = clearPendingHandoffDecision();
       if (changed) persistState();
+      endReviewTurn();
       record("clear", { why: decision.reason, reviewId: lastReviewId ?? "" });
       notifyReview(
         `Previous browser review could not be recovered — ${decision.reason}.`,
@@ -4823,20 +4976,62 @@ export default function workflowExtension(
     return true;
   }
 
-  function handlePlannotatorApprove(
+  /** One execute handoff: todo list + the Build-starting message. */
+  function sendExecuteMessages(
+    ctx: ExtensionContext,
+    planPath: string,
+    feedback?: string,
+  ): void {
+    try {
+      const remainingList = formatTodoNumberedList(todoItems);
+      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
+      const planTodoListMessage = {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        display: true,
+      };
+      const firstTodo = todoItems[0];
+      const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
+      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      (pi as any).sendMessage?.(
+        {
+          customType: "workflow-plan-execute",
+          content: execMessage,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: "execute",
+        source: "plannotator",
+        planPath,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  async function handlePlannotatorApprove(
     planFilePath: string,
     planContent: string,
     feedback: string | undefined,
     cwd: string | undefined,
-  ) {
+  ): Promise<void> {
     const ctx = getActiveCtx();
     if (!ctx) return;
     // A manual `/review` handoff may be approved from Default/Build; an
     // automatic handoff only exists in Plan mode.
     if (workflowMode !== "plan" && pendingHandoffSource !== "manual") return;
-    // A stale browser approve while a review runs must not clear the pending
-    // decision or send the execute messages: the plan is still being audited.
-    if (blockModeSwitchDuringReview(ctx as any)) {
+    // A stale browser approve while a reviewer round/pause runs must not clear
+    // the pending decision or send execute. The handoff itself is deliberately
+    // NOT part of this predicate: it is the decision being consumed here.
+    if (reviewRoundInFlight()) {
       supersedePendingHandoff(
         "a browser decision arrived while a new review round was running",
         { force: true },
@@ -4898,59 +5093,42 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    // Atomic decision exit: stop the reviewer and apply Build BEFORE any
+    // follow-up message. `transition` keeps input/mode gates closed while the
+    // async mode switch runs, so a queued prompt cannot race it.
+    setReviewTurn("transition");
     if (pendingHandoffSource === "manual") manualReviewCycle = false;
     clearPendingHandoffDecision();
-    void enterBuildModeFromPlan(ctx as any, resolvedPlan)
-      .then(() => updateStatus(ctx as any))
-      .catch(() => {
-        try {
-          updateStatus(ctx as any);
-        } catch (_e) {
-          void _e;
-        }
-      });
+    let enteredBuild = false;
     try {
-      const remainingList = formatTodoNumberedList(todoItems);
-      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
-      const planTodoListMessage = {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-        display: true,
-      };
-      const firstTodo = todoItems[0];
-      const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
-      (pi as any).sendMessage?.(
-        {
-          customType: "workflow-plan-execute",
-          content: execMessage,
-          display: true,
-        },
-        { triggerTurn: true, deliverAs: "followUp" },
+      enteredBuild = await enterBuildModeFromPlan(
+        ctx as any,
+        resolvedPlan,
+        { fromReview: true },
       );
-    } catch (_e) {
-      void _e;
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Could not enter Build mode (${String(e?.message ?? e)}); the plan was not executed.`,
+        "warning",
+      );
     }
-    try {
-      pi.appendEntry("workflow-handoff-result", {
-        at: Date.now(),
-        choice: "execute",
-        source: "plannotator",
-        planPath: resolvedPlan,
-      });
-    } catch (_e) {
-      void _e;
+    if (!enteredBuild) {
+      setReviewTurn("handoff");
+      updateStatus(ctx as any);
+      return;
     }
+    setReviewTurn("idle");
+    updateStatus(ctx as any);
+    sendExecuteMessages(ctx as any, resolvedPlan, feedback);
   }
 
   async function handlePlannotatorDeny(feedback: string) {
     const ctx = getActiveCtx();
     if (!ctx) return;
-    // Not a mode transition, but while a review owns the turn every browser
-    // decision is stale: injecting feedback here would mutate the plan under
-    // the reviewer. A legitimate deny only arrives after the gate resolves.
-    if (blockModeSwitchDuringReview(ctx as any)) {
+    // A stale deny while a new reviewer round/pause runs must not inject
+    // feedback under the reviewer. The pending handoff (if any) is the decision
+    // being consumed, so only the round predicate can refuse it.
+    if (reviewRoundInFlight()) {
       supersedePendingHandoff(
         "a browser decision arrived while a new review round was running",
         { force: true },
@@ -4959,11 +5137,12 @@ export default function workflowExtension(
     }
     if (!awaitingDecision) return;
     const manualSource = pendingHandoffSource === "manual";
+    setReviewTurn("transition");
     if (manualSource && workflowMode !== "plan") {
       // A manual review can be launched from Default/Build. Its feedback is a
       // plan revision, so switch to Plan before the follow-up turn starts.
       try {
-        await setPlanMode(ctx as any, { quiet: true });
+        await setPlanMode(ctx as any, { quiet: true, fromReview: true });
       } catch (_e) {
         void _e;
       }
@@ -4977,6 +5156,11 @@ export default function workflowExtension(
     // outstanding findings are carried forward so the reviewer can confirm they
     // were actually addressed rather than re-raising them.
     await beginReviewCycle({ reason: "deny", keepFindings: true });
+    setReviewTurn("idle");
+    // The feedback turn is not a fresh user prompt: keeping the refine reason
+    // preserves manualReviewCycle, so a manual review with automatic Review
+    // Mode off still re-reviews the revision.
+    reviewFeedbackTurn = true;
     persistState();
     try {
       const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
@@ -5010,6 +5194,91 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * The browser review closed without a decision. The user must still get a
+   * handoff: present a compact inline Approve/Revise choice with the author's
+   * plan. Reopening the browser here could loop on every close, so this path is
+   * deliberately inline-only. Never leaves Review stuck: cancel/idle clears it.
+   */
+  async function presentClosedHandoff(
+    ctx: ExtensionContext,
+    planPath: string,
+    planText: string,
+  ): Promise<void> {
+    clearPendingHandoffDecision();
+    setReviewTurn("handoff");
+    if (!planText || !planPath) {
+      endReviewTurn();
+      ctx.ui.notify(
+        `Plan review closed — the plan file is ${planPath || "unavailable"}.`,
+        "info",
+      );
+      return;
+    }
+    if ((ctx as any).hasUI !== true) {
+      try {
+        (pi as any).sendMessage?.(
+          {
+            customType: "workflow-handoff-fallback",
+            content: `**Plan ready**\n\nPlan review closed without a decision. The plan is at ${planPath}.\n\nType "Execute the plan" to build, or tell me what to refine.`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } catch (_e) {
+        void _e;
+      }
+      endReviewTurn();
+      return;
+    }
+    const execute = "Execute the plan in Build Mode";
+    const refine = "Refine the plan in Plan Mode";
+    let choice: string | undefined;
+    try {
+      choice = await (ctx as any).ui.select(
+        "Plan review closed — choose next step",
+        [execute, refine],
+      );
+    } catch (_e) {
+      choice = undefined;
+    }
+    if (choice === execute) {
+      setReviewTurn("transition");
+      const ok = await enterBuildModeFromPlan(ctx as any, planPath, {
+        fromReview: true,
+      });
+      if (!ok) {
+        setReviewTurn("handoff");
+        return;
+      }
+      setReviewTurn("idle");
+      sendExecuteMessages(ctx, planPath);
+      return;
+    }
+    if (choice === refine) {
+      setReviewTurn("transition");
+      if (workflowMode !== "plan") {
+        try {
+          await setPlanMode(ctx as any, { quiet: true, fromReview: true });
+        } catch (_e) {
+          void _e;
+        }
+      }
+      await beginReviewCycle({ reason: "refine", keepFindings: true });
+      setReviewTurn("idle");
+      ctx.ui.notify(
+        "Plan review closed — staying in Plan mode. Tell me what to change.",
+        "info",
+      );
+      return;
+    }
+    endReviewTurn();
+    ctx.ui.notify(
+      `Plan review closed — the plan is at ${planPath}.`,
+      "info",
+    );
+  }
+
   function ensurePlannotatorListeners() {
     if (plannotatorListenersRegistered) return;
     try {
@@ -5017,16 +5286,17 @@ export default function workflowExtension(
       if (!bus || typeof bus.on !== "function") return;
       // plan-approved (external executionMode) — direct handoff
       bus.on(PLANNOTATOR_PLAN_APPROVED, (event: any) => {
-        try {
-          handlePlannotatorApprove(
-            event.planFilePath,
-            event.planContent,
-            event.feedback,
-            event.cwd,
+        void handlePlannotatorApprove(
+          event?.planFilePath,
+          event?.planContent,
+          event?.feedback,
+          event?.cwd,
+        ).catch((e: unknown) => {
+          notifyReview(
+            `Plan approval failed: ${e instanceof Error ? e.message : String(e)}`,
+            "error",
           );
-        } catch (_e) {
-          void _e;
-        }
+        });
       });
       // review-result (plan-review shared API) — approve/deny from browser
       bus.on(PLANNOTATOR_REVIEW_RESULT, (event: any) => {
@@ -5046,12 +5316,17 @@ export default function workflowExtension(
             } catch (_e) {
               void _e;
             }
-            handlePlannotatorApprove(
+            void handlePlannotatorApprove(
               planPath,
               content,
               event.feedback,
               (getActiveCtx() as any)?.cwd,
-            );
+            ).catch((e: unknown) => {
+              notifyReview(
+                `Plan approval failed: ${e instanceof Error ? e.message : String(e)}`,
+                "error",
+              );
+            });
           } else {
             void handlePlannotatorDeny(
               event.feedback || "Plan needs revision.",
@@ -5099,9 +5374,31 @@ export default function workflowExtension(
           if (event.outcome !== "closed") return;
           if (!lastReviewId || event.reviewId !== lastReviewId) return;
           if (!awaitingDecision) return;
-          supersedePendingHandoff(
-            "the browser review closed without a decision",
-            { force: true },
+          const planPath = pendingHandoffPlanPath ?? currentPlanFile ?? "";
+          let planText = "";
+          try {
+            if (planPath && fs.existsSync(planPath)) {
+              planText = fs.readFileSync(planPath, "utf8");
+            }
+          } catch (_e) {
+            void _e;
+          }
+          const ctx = getActiveCtx();
+          if (!ctx) {
+            supersedePendingHandoff(
+              "the browser review closed without a decision",
+              { force: true },
+            );
+            return;
+          }
+          void presentClosedHandoff(ctx as any, planPath, planText).catch(
+            (e: unknown) => {
+              notifyReview(
+                `Plan handoff after review close failed: ${e instanceof Error ? e.message : String(e)}`,
+                "warning",
+              );
+              endReviewTurn();
+            },
           );
         } catch (_e) {
           void _e;
@@ -8805,6 +9102,20 @@ export default function workflowExtension(
   // command reaches the reviewer now; the write-gate steer guard below stays
   // (a write instruction must never be steered into the reviewer).
   pi.on("input", async (event, _ctx) => {
+    // Review owns the turn: only the explicit controls and model/profile
+    // changes may become a prompt. This is the terminal-Pi half of the lock;
+    // the Desktop store refuses prose before it reaches this hook.
+    if (reviewTurnOwns(reviewTurn)) {
+      const decision = reviewInputDecision(
+        typeof event.text === "string" ? event.text : "",
+        reviewTurn,
+      );
+      if (decision.action === "block") {
+        notifyReview(decision.notice, "info");
+        return { action: "handled" } as any;
+      }
+      return { action: "continue" } as any;
+    }
     if (typeof event.text === "string" && event.text.startsWith("/btw ")) {
       const note = event.text.slice(5).trim();
       if (note) {
@@ -9275,6 +9586,9 @@ export default function workflowExtension(
     // whether it survives; do not null it here, or a restored gate can only
     // suppress the next handoff.
     if (!awaitingDecision) clearPendingHandoffDecision();
+    // A reload cannot preserve a running/paused reviewer child. Only a
+    // persisted pending decision survives, and it owns the turn as `handoff`.
+    reviewTurn = awaitingDecision ? "handoff" : "idle";
     currentSessionCtx = ctx as any;
     // Give Tab back to autocomplete while a suggestion list is visible; the raw
     // `tab` shortcut keeps cycling modes otherwise.
@@ -10356,6 +10670,25 @@ export default function workflowExtension(
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
     ensurePlannotatorListeners();
+    // Safety valve for a prompt that bypassed `input` (host queue, another
+    // extension): never let a Review turn run concurrently with a plan/build
+    // turn. Stop the reviewer first, then let the queued prompt proceed.
+    if (reviewTurnOwns(reviewTurn) && reviewTurn !== "transition") {
+      // Invalidate the parked handoff BEFORE settling its gate: otherwise the
+      // runHandoff continuation can observe the old cycle token and render the
+      // abandoned plan alongside the new prompt.
+      reviewCycleId += 1;
+      try {
+        await suspendReview();
+      } catch (_e) {
+        void _e;
+      }
+      endReviewTurn();
+      notifyReview(
+        "Review stopped — a prompt was already queued; the plan was not reviewed.",
+        "info",
+      );
+    }
     // Fresh user prompt → reset the passive reminder cadence. Continuation runs
     // (triggerTurn/steer/followUp) do not fire this event, so state survives them.
     turnsSinceLastTodoWrite = 0;
@@ -10386,10 +10719,14 @@ export default function workflowExtension(
     }
     // Every fresh prompt is a new review cycle: reset the round budget, cancel
     // an abandoned pause/gate, and tag the cycle so an old handoff cannot
-    // render after this prompt.
+    // render after this prompt. A feedback/refine continuation keeps the
+    // manual cycle alive; a genuine user prompt ends it.
+    const feedbackTurn = reviewFeedbackTurn;
+    reviewFeedbackTurn = false;
     try {
+      if (!feedbackTurn) endReviewTurn();
       await beginReviewCycle({
-        reason: "prompt",
+        reason: feedbackTurn ? "refine" : "prompt",
         keepFindings: true,
         planPath: currentPlanFile,
       });
@@ -11238,6 +11575,9 @@ export default function workflowExtension(
         reviewHandoffGate.reset();
         reviewGatePhase = "auditing";
         reviewGateCycleId = handoffCycle;
+        // Review owns the turn before the reviewer boots. A plan handoff with
+        // Review Mode off never reaches this block (no Review turn).
+        beginReviewTurn();
         try {
           const reviewed = await runReviewStep(
             authorPlan,
