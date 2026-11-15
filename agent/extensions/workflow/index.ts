@@ -240,6 +240,7 @@ import {
 import {
   buildWorkflowStatusSegments,
   setWorkflowStatus,
+  setWorkflowWidget,
   WORKFLOW_STATUS_KEYS,
 } from "./workflow-status.ts";
 import {
@@ -354,9 +355,11 @@ import {
   reviewEscapeAction,
   reviewElapsedMs,
   reviewHandoffParks,
+  reviewLiveLine,
   reviewResumeSettles,
   reviewStateSummary,
   reviewStatusText,
+  REVIEW_PAUSED_LINE,
   shouldRouteInputToReviewer,
   writeReviewModeConfig,
   writeReviewPrompt,
@@ -378,6 +381,7 @@ import { findParentProviderSurface } from "./review-providers.ts";
 import {
   createReviewBandGate,
   createReviewLineBuffer,
+  isTerminalPiHost,
   registerReviewEntryRenderers,
   REVIEW_MODE_ENTRY_TYPE,
   REVIEW_TRANSCRIPT_ENTRY_TYPE,
@@ -640,6 +644,11 @@ export interface WorkflowExtensionDeps {
   plannotatorRequestTimeoutMs?: number;
   /** Test seam: how long a reload recovery status query waits. */
   plannotatorRecoveryTimeoutMs?: number;
+  /**
+   * Test seam: whether this host is terminal Pi (an interactive TUI with no
+   * idle working row). Default: `isTerminalPiHost(process.stdout.isTTY, …)`.
+   */
+  isTerminalHost?: () => boolean;
 }
 
 export default function workflowExtension(
@@ -2173,6 +2182,26 @@ export default function workflowExtension(
   }
 
   /**
+   * Terminal-only composer surface for a live review.
+   *
+   * Pi Desktop renders an idle extension working message as its working row
+   * (`SessionView.tsx` `extensionBusy`), so a manual `/review` already has a
+   * live line there. Pi Terminal only draws the working row during a run, so a
+   * manual round needs this widget instead. The key is reused from pre-0.9.0.
+   */
+  const REVIEW_STATUS_WIDGET = "workflow-review-status";
+  /** Last widget text applied; null = never applied, "" = applied hidden. */
+  let reviewWidgetApplied: string | null = null;
+
+  function reviewWidgetHost(): boolean {
+    if (deps.isTerminalHost) return deps.isTerminalHost();
+    return isTerminalPiHost({
+      isTTY: process.stdout.isTTY === true,
+      desktopHostEntry: process.env.PI_DESKTOP_HOST_ENTRY,
+    });
+  }
+
+  /**
    * Status strip: a compact line above the editor while a review runs.
    * Shown for manual one-shot rounds too, whether or not Review Mode is on.
    */
@@ -2208,6 +2237,28 @@ export default function workflowExtension(
         WORKFLOW_STATUS_KEYS.review,
         text ? ctx.ui.theme.fg("muted", text) : "",
       );
+      // Composer surface (Terminal only): a manual `/review` runs while the
+      // host is idle, and Pi Terminal only draws its working row during a run.
+      // Pi Desktop already renders the idle working message as its working row,
+      // so it must not get a second line. `isIdle()` also keeps the automatic
+      // review (`agent_end` is still inside the run) on its existing spinner.
+      const liveText = reviewLiveLine({
+        state: reviewState,
+        roundInFlight: activeReview !== undefined,
+        roundActive,
+        paused,
+      });
+      const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+      const widgetText = reviewWidgetHost() && idle ? liveText : "";
+      if (widgetText !== reviewWidgetApplied) {
+        reviewWidgetApplied = widgetText;
+        setWorkflowWidget(
+          ctx.ui,
+          REVIEW_STATUS_WIDGET,
+          widgetText ? [widgetText] : [],
+          { placement: "aboveEditor" },
+        );
+      }
     } catch (_e) {
       void _e;
     }
@@ -2555,8 +2606,12 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * The paused line for the host working message. Shared with the Terminal
+   * widget (`REVIEW_PAUSED_LINE`) so the two surfaces cannot drift.
+   */
   function pausedWorkingMessage(): string {
-    return "⏸ Review paused — /review-resume to continue";
+    return REVIEW_PAUSED_LINE;
   }
 
   /**
@@ -2680,9 +2735,10 @@ export default function workflowExtension(
     // Snapshot the reviewer model for this round (step 4): a `/role` or
     // `/profile` switch mid-round takes effect next round, never mid-pass.
     reviewModelSnapshot = resolveReviewerModel();
-    // Working signal: the footer segment (via updateStatus) + widget already
-    // follow `reviewState`; the spinner row needs an explicit message while
-    // the child session streams off the main turn.
+    // Working signal: the footer segment (via updateStatus) follows the round;
+    // the Desktop working row and the Terminal `workflow-review-status` widget
+    // both derive from it (see updateReviewStatus). The spinner row needs an
+    // explicit message while the child session streams off the main turn.
     setReviewWorkingMessage("🔍 Reviewing plan…");
     setReviewTurn("running");
     // Paint the live review line now, not after the child session's first
@@ -2836,9 +2892,9 @@ export default function workflowExtension(
       if (!(currentPausedReview()?.planHash === hash)) {
         setReviewWorkingMessage(undefined);
       }
-      // Ownership ended: refresh both surfaces now that `activeReview` is
-      // cleared. A terminal outcome hides the widget; a pause keeps the
-      // paused form.
+      // Ownership ended: refresh every surface now that `activeReview` is
+      // cleared. A terminal outcome hides the Terminal widget and restores the
+      // Desktop working message; a pause keeps the paused form on both.
       try {
         updateStatus(currentSessionCtx ?? ctx);
       } catch (_e) {
@@ -3247,8 +3303,15 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
-    // Recompute the footer now that the review state is gone, so a teardown
-    // cannot leave a stale review segment behind.
+    // Clear the Terminal composer widget explicitly: `endReviewTurn()` above is
+    // a no-op when the turn was already idle, so its status refresh cannot be
+    // relied on here.
+    try {
+      setWorkflowWidget(currentSessionCtx?.ui, REVIEW_STATUS_WIDGET, []);
+    } catch (_e) {
+      void _e;
+    }
+    reviewWidgetApplied = "";
     try {
       if (currentSessionCtx) updateStatus(currentSessionCtx);
     } catch (_e) {
@@ -10605,6 +10668,9 @@ export default function workflowExtension(
     todoPanelPromptAfterSettle = false;
     lastCompletedSignature = null;
     todoPanelAppliedState = "unregistered";
+    // The host dropped every extension widget on the switch/reload; reset the
+    // cache so the first updateStatus re-applies (or clears) the review line.
+    reviewWidgetApplied = null;
     // A reloaded/forked session must never inherit a stale write denial.
     writeGateRunDenials.clear();
     writeGateTurnAnswer = null;
@@ -11062,6 +11128,10 @@ export default function workflowExtension(
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.policy, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
+    // The Terminal review line is a live surface; a quit/reload must not wait
+    // for teardown to clear it (teardown later drops currentSessionCtx).
+    setWorkflowWidget(ctx.ui, REVIEW_STATUS_WIDGET, []);
+    reviewWidgetApplied = null;
     // The host dropped the widget; a later session_start re-registers it.
     todoPanelAppliedState = "unregistered";
     // Drop any /commit authorization or flow: a reload/quit must never leave

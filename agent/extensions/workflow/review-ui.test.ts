@@ -19,6 +19,7 @@ import {
   formatReviewModeBand,
   formatReviewSubmittedEntry,
   formatReviewTranscriptLines,
+  isTerminalPiHost,
   registerReviewEntryRenderers,
   reviewBandKey,
   REVIEW_MODE_ENTRY_TYPE,
@@ -307,4 +308,19 @@ test("registerReviewEntryRenderers: registers every transcript entry type", () =
   ]);
   assert.equal(REVIEW_MODE_ENTRY_TYPE, "workflow-review-mode");
   assert.equal(REVIEW_TRANSCRIPT_ENTRY_TYPE, "workflow-review-transcript");
+});
+
+test("isTerminalPiHost excludes every piped / Desktop host", () => {
+  // Terminal Pi: an interactive TUI with a real TTY and no Desktop marker.
+  assert.equal(isTerminalPiHost({ isTTY: true }), true);
+  // Pi Desktop: piped stdio (host-supervisor.ts) plus its own marker.
+  assert.equal(isTerminalPiHost({ isTTY: false }), false);
+  assert.equal(isTerminalPiHost({}), false);
+  assert.equal(
+    isTerminalPiHost({ isTTY: true, desktopHostEntry: "/app/host/index.mjs" }),
+    false,
+    "PI_DESKTOP_HOST_ENTRY is a hard exclusion even on a TTY",
+  );
+  // RPC/print hosts are piped too.
+  assert.equal(isTerminalPiHost({ isTTY: undefined }), false);
 });

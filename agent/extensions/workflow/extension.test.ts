@@ -27,6 +27,7 @@ import {
   fakeSdk,
   makeFakeCtx,
   makeFakePi,
+  renderReviewWidget,
   renderTodoWidget,
   stripAnsi,
   submitThenFinish,
@@ -69,6 +70,13 @@ interface BootOptions {
     pass2?: (c: FakeCapture) => Promise<void>;
   };
   branch?: unknown[];
+  /**
+   * Host kind for the Terminal review widget: false models Pi Desktop (no
+   * widget; the working row is the live line). Defaults to terminal-shaped.
+   */
+  isTerminalHost?: boolean;
+  /** `ctx.isIdle()` at boot; a test can flip it later with `setIdle`. */
+  idle?: boolean;
 }
 
 async function boot(over: BootOptions = {}) {
@@ -159,12 +167,27 @@ async function boot(over: BootOptions = {}) {
     // the native questionnaire. Keep the fallback path fast in tests.
     plannotatorRequestTimeoutMs: 50,
     plannotatorRecoveryTimeoutMs: 50,
+    // The test runner's stdout is piped, so the production predicate would be
+    // false. Default to terminal-shaped; Desktop-shaped tests pass
+    // `isTerminalHost: false`.
+    isTerminalHost: () => over.isTerminalHost !== false,
   });
-  const { ctx, notifies, statuses, widgets, widgetCalls, confirms, customs } =
-    makeFakeCtx({
+  const {
+    ctx,
+    notifies,
+    statuses,
+    widgets,
+    widgetCalls,
+    workingMessages,
+    workingVisible,
+    setIdle,
+    confirms,
+    customs,
+  } = makeFakeCtx({
     cwd,
     hasUI: over.hasUI === true,
     branch: over.branch ?? [],
+    ...(over.idle === undefined ? {} : { idle: over.idle }),
     ...(over.modelRegistry ? { modelRegistry: over.modelRegistry } : {}),
     ...(over.customAnswer === undefined
       ? {}
@@ -205,6 +228,9 @@ async function boot(over: BootOptions = {}) {
     statuses,
     widgets,
     widgetCalls,
+    workingMessages,
+    workingVisible,
+    setIdle,
     confirms,
     capture,
     customs,
@@ -274,6 +300,14 @@ async function waitFor(cond: () => boolean, ms = 1500): Promise<void> {
     if (cond()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+/** Wait until `n` reviewer passes have started. */
+async function waitForPrompts(capture: FakeCapture, n: number): Promise<void> {
+  for (let i = 0; i < 400 && capture.prompts.length < n; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(capture.prompts.length >= n, `reviewer pass ${n} started`);
 }
 
 /** A `QuestionnaireResult` for the native handoff modal. */
@@ -1612,6 +1646,214 @@ test("V: /review with no plan warns and never enters Review", async () => {
     );
     assert.deepEqual(allowed[0], { action: "continue" });
   } finally {
+    await b.cleanup();
+  }
+});
+
+test("T1: a terminal manual /review paints the live composer widget while idle", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    const plan = placePlan(b.cwd, "terminal-widget.md");
+    const running = runReview(b.pi, b.ctx, plan.rel);
+    await waitForPrompts(b.capture, 1);
+    const lines = renderReviewWidget(b.widgetCalls);
+    assert.ok(
+      lines.some((line) => line.includes("🔍 Reviewing plan…")),
+      "the composer line is live while an idle round runs",
+    );
+    const call = [...b.widgetCalls]
+      .reverse()
+      .find((entry) => entry.key === "workflow-review-status");
+    assert.ok(Array.isArray(call?.value), "the widget payload is a plain string[]");
+    assert.deepEqual(
+      (call?.options as { placement?: string } | undefined)?.placement,
+      "aboveEditor",
+    );
+
+    releases.shift()?.();
+    await running;
+    assert.deepEqual(
+      renderReviewWidget(b.widgetCalls),
+      [],
+      "the line disappears when the round lands",
+    );
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+test("T2: a Desktop-shaped host gets no widget but keeps the working message", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    isTerminalHost: false,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    const plan = placePlan(b.cwd, "desktop-widget.md");
+    const running = runReview(b.pi, b.ctx, plan.rel);
+    await waitForPrompts(b.capture, 1);
+    assert.deepEqual(
+      renderReviewWidget(b.widgetCalls),
+      [],
+      "Desktop already renders the idle working message as its working row",
+    );
+    assert.ok(
+      b.workingMessages.includes("🔍 Reviewing plan…"),
+      "the working row input is intact",
+    );
+    assert.ok(b.workingVisible.includes(true), "the working row was shown");
+
+    releases.shift()?.();
+    await running;
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+test("T3: a terminal automatic review adds no second live line", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    // Inside agent_end the run is still active: Pi's own working row owns the
+    // line, so the extension must not add a duplicate.
+    idle: false,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "terminal-auto.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const handoff = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+    await waitForPrompts(b.capture, 1);
+    assert.deepEqual(
+      renderReviewWidget(b.widgetCalls),
+      [],
+      "the run's working row already shows the message",
+    );
+    assert.ok(b.workingMessages.includes("🔍 Reviewing plan…"));
+
+    releases.shift()?.();
+    await handoff;
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+test("T4: pause/resume moves the terminal widget between forms", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    const plan = placePlan(b.cwd, "terminal-pause.md");
+    const running = runReview(b.pi, b.ctx, plan.rel);
+    await waitForPrompts(b.capture, 1);
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    releases.shift()?.();
+    await waitFor(() =>
+      renderReviewWidget(b.widgetCalls).some((line) =>
+        line.includes("Review paused"),
+      ),
+    );
+    assert.ok(
+      renderReviewWidget(b.widgetCalls).some((line) =>
+        line.includes("⏸ Review paused"),
+      ),
+      "the paused form is painted",
+    );
+    await running;
+
+    const resumed = b.pi.commands["review-resume"].handler("", b.ctx);
+    await waitForPrompts(b.capture, 2);
+    assert.ok(
+      renderReviewWidget(b.widgetCalls).some((line) =>
+        line.includes("🔍 Reviewing plan…"),
+      ),
+      "the running form returns after /review-resume",
+    );
+    releases.shift()?.();
+    await resumed;
+    assert.deepEqual(
+      renderReviewWidget(b.widgetCalls),
+      [],
+      "the line is cleared once the resumed round lands",
+    );
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+test("T5: /review-abort clears the terminal widget", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    const plan = placePlan(b.cwd, "terminal-abort.md");
+    const running = runReview(b.pi, b.ctx, plan.rel);
+    await waitForPrompts(b.capture, 1);
+    assert.ok(renderReviewWidget(b.widgetCalls).length > 0);
+
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    releases.shift()?.();
+    await running;
+    assert.deepEqual(
+      renderReviewWidget(b.widgetCalls),
+      [],
+      "the abort leaves no live review line",
+    );
+  } finally {
+    releaseAll(releases);
     await b.cleanup();
   }
 });

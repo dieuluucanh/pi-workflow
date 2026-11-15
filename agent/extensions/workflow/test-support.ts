@@ -503,6 +503,11 @@ export interface FakeCtxOptions {
   signal?: AbortSignal;
   /** Project-local settings trust (default true for existing fixtures). */
   projectTrusted?: boolean;
+  /**
+   * `ctx.isIdle()` — false while an agent run owns the session (the automatic
+   * review runs inside `agent_end`). Defaults to true.
+   */
+  idle?: boolean;
 }
 
 export function makeFakeCtx(over: FakeCtxOptions) {
@@ -518,11 +523,17 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   const selects: Array<{ title: string; options: unknown[] }> = [];
   /** One entry per `ctx.ui.custom` call (the native handoff modal). */
   const customs: Array<{ options?: unknown }> = [];
+  // A test can flip this to model a run that is still active (automatic
+  // review) versus an idle session (manual `/review`).
+  let idle = over.idle !== false;
+  const workingMessages: Array<string | undefined> = [];
+  const workingVisible: boolean[] = [];
   const ctx = {
     cwd: over.cwd,
     mode: "tui",
     hasUI: over.hasUI === true,
     signal: over.signal,
+    isIdle: () => idle,
     isProjectTrusted: () => over.projectTrusted !== false,
     modelRegistry: over.modelRegistry ?? {
       find: (provider: string, id: string) => ({ provider, id }),
@@ -564,6 +575,12 @@ export function makeFakeCtx(over: FakeCtxOptions) {
         widgets.push(value);
         widgetCalls.push({ key, value, options });
       },
+      setWorkingMessage(message: string | undefined) {
+        workingMessages.push(message);
+      },
+      setWorkingVisible(visible: boolean) {
+        workingVisible.push(visible);
+      },
       setEditorComponent() {},
       getEditorText() {
         return "";
@@ -580,6 +597,12 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     statuses,
     widgets,
     widgetCalls,
+    workingMessages,
+    workingVisible,
+    /** Flip `ctx.isIdle()` for a test that needs an active run. */
+    setIdle(value: boolean) {
+      idle = value;
+    },
     confirms,
     selects,
     customs,
@@ -589,6 +612,21 @@ export function makeFakeCtx(over: FakeCtxOptions) {
 /** Visible text without SGR color/reset sequences. */
 export function stripAnsi(text: string): string {
   return String(text).replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Render the latest `workflow-review-status` widget. Returns `[]` when the
+ * widget is cleared (hidden) or was never mounted. The value is a plain string
+ * array by design (see `setWorkflowWidget`).
+ */
+export function renderReviewWidget(
+  widgetCalls: Array<{ key: string; value: unknown; options?: unknown }>,
+): string[] {
+  const call = [...widgetCalls]
+    .reverse()
+    .find((entry) => entry.key === "workflow-review-status");
+  if (!call || call.value === undefined) return [];
+  return Array.isArray(call.value) ? (call.value as string[]) : [];
 }
 
 /**

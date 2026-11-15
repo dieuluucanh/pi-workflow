@@ -962,11 +962,11 @@ export function shouldRouteInputToReviewer(input: {
 }
 
 /**
- * One-line summary for the status strip / notify calls.
- * Example: `🔍 review · pass 2/2 · 3 findings · ● verifying`
+ * The `pass 1/2 · 3 findings · ● verifying` detail, without a prefix.
+ * Shared by the footer summary and the Terminal composer line so both name the
+ * same phase.
  */
-export function reviewStateSummary(state: ReviewState | undefined): string {
-  if (!state) return "";
+function reviewStateDetails(state: ReviewState): string {
   const bits: string[] = [];
   bits.push(`pass ${state.pass}/2`);
   if (state.round > 1) bits.push(`round ${state.round}`);
@@ -976,7 +976,16 @@ export function reviewStateSummary(state: ReviewState | undefined): string {
     bits.push(`● ${reviewPhaseLabel(state.phase)}`);
   else if (state.phase === "done") bits.push("✓ done");
   else if (state.phase !== "idle") bits.push(reviewPhaseLabel(state.phase));
-  return `🔍 review · ${bits.join(" · ")}`;
+  return bits.join(" · ");
+}
+
+/**
+ * One-line summary for the status strip / notify calls.
+ * Example: `🔍 review · pass 2/2 · 3 findings · ● verifying`
+ */
+export function reviewStateSummary(state: ReviewState | undefined): string {
+  if (!state) return "";
+  return `🔍 review · ${reviewStateDetails(state)}`;
 }
 
 /**
@@ -1653,12 +1662,13 @@ export function reviewStatusVisible(input: {
 }
 
 /**
- * The text for the live review status surface, or `""` when nothing is live.
+ * The text for the live footer status segment, or `""` when nothing is live.
  *
- * Single source for the footer segment and the review widget: a retained
- * `reviewState` is used for `/review-status` and the summary band, but it is
- * never painted as a live line once its round is over. While paused it shows
- * the paused form (never the retained terminal summary).
+ * A retained `reviewState` is used for `/review-status` and the summary band,
+ * but it is never painted as a live line once its round is over. While paused
+ * it shows the paused form (never the retained terminal summary). The Terminal
+ * composer widget uses `reviewLiveLine` instead, because it must also cover the
+ * cold-boot window with a turn-derived line.
  */
 export function reviewStatusText(input: {
   state: ReviewState | undefined;
@@ -1682,6 +1692,41 @@ export function reviewStatusText(input: {
         input.handoff === true,
       )
     : "";
+}
+
+/**
+ * The paused line shared by the host working message and the Terminal widget.
+ * One owner so the two surfaces cannot drift.
+ */
+export const REVIEW_PAUSED_LINE =
+  "⏸ Review paused — /review-resume to continue, /review-abort to stop";
+
+/**
+ * Text for the composer-area review widget in **terminal Pi**.
+ *
+ * Pi Desktop renders `ctx.ui.setWorkingMessage` even while the tab is idle
+ * (`SessionView.tsx` `extensionBusy`), so a manual `/review` already has a live
+ * working row there. Pi Terminal only renders the working row during a run, so
+ * a manual round needs this widget instead. The caller gates it on
+ * `isTerminalPiHost()` and `ctx.isIdle()`; this function only decides the text
+ * from the turn state.
+ *
+ * A retained terminal phase belongs to the previous round: during this round's
+ * cold boot paint the turn-derived generic line, never the stale verdict.
+ */
+export function reviewLiveLine(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+}): string {
+  if (input.paused === true) return REVIEW_PAUSED_LINE;
+  if (input.roundInFlight !== true && input.roundActive !== true) return "";
+  const phase = input.state?.phase;
+  if (!input.state || phase === undefined || !reviewIsActive(phase)) {
+    return "🔍 Reviewing plan…";
+  }
+  return `🔍 Reviewing plan… · ${reviewStateDetails(input.state)}`;
 }
 
 /**

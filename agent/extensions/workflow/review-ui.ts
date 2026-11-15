@@ -40,6 +40,22 @@ export const REVIEW_MODE_ENTRY_TYPE = "workflow-review-mode";
 /** Custom entry type for streamed reviewer transcript chunks. */
 export const REVIEW_TRANSCRIPT_ENTRY_TYPE = "workflow-review-transcript";
 
+/**
+ * True only for terminal Pi (an interactive TUI on a real terminal).
+ *
+ * Pi Desktop spawns its host with piped stdio and sets `PI_DESKTOP_HOST_ENTRY`,
+ * so it fails both checks — even though it reports `ctx.mode === "tui"` and
+ * renders extension widgets. The review widget must stay Terminal-only because
+ * Desktop already renders an idle extension working message as its working row
+ * (`SessionView.tsx` `extensionBusy`).
+ */
+export function isTerminalPiHost(input: {
+  isTTY?: boolean;
+  desktopHostEntry?: string | undefined;
+}): boolean {
+  return input.desktopHostEntry === undefined && input.isTTY === true;
+}
+
 /** Transcript kinds plus the synthetic line for a user's routed note. */
 export type ReviewEntryLineKind = ReviewLineKind | "user";
 

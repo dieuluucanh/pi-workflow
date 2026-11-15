@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   buildWorkflowStatusSegments,
   setWorkflowStatus,
+  setWorkflowWidget,
   WORKFLOW_STATUS_KEYS,
 } from "./workflow-status.ts";
 
@@ -113,4 +114,40 @@ test("setWorkflowStatus clears a key when the segment disappears", () => {
     ["workflow-profile", "⚡ cheap"],
     ["workflow-profile", undefined],
   ]);
+});
+
+test("setWorkflowWidget sets lines, clears with [], and passes placement", () => {
+  const calls: Array<{
+    key: string;
+    lines: string[] | undefined;
+    options?: { placement?: "aboveEditor" | "belowEditor" };
+  }> = [];
+  const ui = {
+    setWidget: (
+      key: string,
+      lines: string[] | undefined,
+      options?: { placement?: "aboveEditor" | "belowEditor" },
+    ) => calls.push({ key, lines, options }),
+  };
+  setWorkflowWidget(ui, "workflow-review-status", ["a", "b"], {
+    placement: "aboveEditor",
+  });
+  setWorkflowWidget(ui, "workflow-review-status", []);
+  assert.deepEqual(calls, [
+    {
+      key: "workflow-review-status",
+      lines: ["a", "b"],
+      options: { placement: "aboveEditor" },
+    },
+    {
+      key: "workflow-review-status",
+      lines: undefined,
+      options: undefined,
+    },
+  ]);
+});
+
+test("setWorkflowWidget is a no-op for a host without a widget API", () => {
+  assert.doesNotThrow(() => setWorkflowWidget(undefined, "k", ["a"]));
+  assert.doesNotThrow(() => setWorkflowWidget({}, "k", ["a"]));
 });

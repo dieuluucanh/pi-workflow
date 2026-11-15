@@ -63,6 +63,7 @@ import {
   reviewGatePhaseOnResume,
   reviewHandoffParks,
   reviewIsActive,
+  reviewLiveLine,
   reviewModeLockFooter,
   reviewModeLockKind,
   reviewModeLockNotice,
@@ -93,6 +94,7 @@ import {
   type ReviewExecutionResult,
   type ReviewStatusInput,
   REVIEW_BUILTIN_TOOLS,
+  REVIEW_PAUSED_LINE,
   reviewToolAllowlist,
   MAX_REVIEW_LINES,
 } from "./review.ts";
@@ -2621,6 +2623,55 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
     "🔍 review · starting",
     "the cold-boot window is visible as starting",
   );
+});
+
+test("reviewLiveLine is the Terminal composer line for a live review", () => {
+  // Nothing live: hidden (the caller also gates on host + idle).
+  assert.equal(reviewLiveLine({ state: undefined }), "");
+  assert.equal(reviewLiveLine({ state: undefined, paused: false }), "");
+
+  // Cold boot: a round is registered but no state event has landed yet.
+  assert.equal(
+    reviewLiveLine({ state: undefined, roundInFlight: true }),
+    "🔍 Reviewing plan…",
+    "the round owns the line from the first tick",
+  );
+
+  // Live state appends the shared phase detail (same bits as the footer).
+  const live = createReviewState({ planHash: "h", modelLabel: "m" });
+  live.phase = "verifying";
+  live.pass = 2;
+  live.findings = [
+    {
+      id: "f1",
+      severity: 8,
+      confidence: 90,
+      category: "correctness",
+      summary: "one",
+      rationale: "r",
+      disposition: "accepted",
+    },
+  ];
+  assert.equal(
+    reviewLiveLine({ state: live, roundActive: true }),
+    "🔍 Reviewing plan… · pass 2/2 · 1 finding · ● verifying",
+  );
+
+  // A retained terminal phase from the previous round must not repaint its
+  // verdict during the cold boot; the turn-derived generic line is safe.
+  const aborted = createReviewState({ planHash: "h", modelLabel: "m" });
+  aborted.phase = "aborted";
+  assert.equal(
+    reviewLiveLine({ state: aborted, roundInFlight: true }),
+    "🔍 Reviewing plan…",
+  );
+  assert.equal(
+    reviewLiveLine({ state: aborted, roundInFlight: true, paused: true }),
+    REVIEW_PAUSED_LINE,
+  );
+
+  // Terminal state with no owning turn stays hidden.
+  assert.equal(reviewLiveLine({ state: aborted }), "");
 });
 
 test("nextReviewRound restarts a new cycle even after the cap", () => {

@@ -21,6 +21,29 @@ of package detection.
   `/review-abort` first).
 - Argument completions for the mode and the write scope.
 
+### Fixed — manual `/review` shows the live “Reviewing” line in Pi Terminal
+
+A manual `/review` runs as an extension command on an idle session. Pi Desktop
+renders an extension working message as its working row above the todo list even
+while the tab is idle (`SessionView.tsx` `extensionBusy`), so the line was
+already correct there. Pi Terminal only creates its working row during a run, so
+`setWorkingMessage("🔍 Reviewing plan…")` was invisible for the whole manual
+round.
+
+- The extension now also paints a plain-text `workflow-review-status` widget
+  above the editor while a round or pause owns the turn. It is **Terminal-only**
+  (`process.stdout.isTTY` and no `PI_DESKTOP_HOST_ENTRY`) and **idle-only**
+  (`ctx.isIdle()`), so Pi Desktop keeps its single working row and a Terminal
+  automatic review keeps its existing spinner — no duplicate lines.
+- Text: `🔍 Reviewing plan…` in the cold-boot window,
+  `🔍 Reviewing plan… · pass 1/2 · 3 findings · ● verifying` once state lands,
+  and `⏸ Review paused — /review-resume to continue, /review-abort to stop`
+  while paused (one constant shared with the working message).
+- Live-only: cleared on round end, pause exit, abort, teardown, shutdown and
+  reload; a retained terminal phase never repaints its verdict.
+- The last applied text is cached so routine `updateStatus` calls do not
+  re-register the widget.
+
 ### Fixed — truthful Plannotator detection
 
 `ensurePlannotatorListeners()` marked Plannotator active unconditionally, so

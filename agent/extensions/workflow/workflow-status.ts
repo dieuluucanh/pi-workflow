@@ -93,3 +93,28 @@ export function setWorkflowStatus(
 ): void {
   ui.setStatus?.(key, text.length > 0 ? text : undefined);
 }
+
+/**
+ * Sets a string-line widget only while it has lines; `[]` removes it.
+ *
+ * String lines (never a component factory) keep the widget portable: Terminal's
+ * `setExtensionWidget` renders them directly, and Desktop's UI port hands arrays
+ * to its native widget strip. `undefined` (not an empty array) is what actually
+ * unmounts it.
+ */
+export function setWorkflowWidget(
+  ui:
+    | {
+        setWidget?: (
+          key: string,
+          lines: string[] | undefined,
+          options?: { placement?: "aboveEditor" | "belowEditor" },
+        ) => void;
+      }
+    | undefined,
+  key: string,
+  lines: readonly string[],
+  options?: { placement?: "aboveEditor" | "belowEditor" },
+): void {
+  ui?.setWidget?.(key, lines.length > 0 ? [...lines] : undefined, options);
+}

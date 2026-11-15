@@ -37,8 +37,16 @@
       "passes": 2,
       "verify": true,
       "fallbackOnError": "skip",
+      "providerRecovery": "fallback",
+      "providerRetries": 1,
+      "chunkedSubmit": "auto",
+      "chunkChars": 6000,
+      "recoveryBudgetMs": 0,
       "exploreBudget": 3,
-      "timeoutMs": 0
+      "timeoutMs": 0,
+      "contextChars": 15000,
+      "contextEntries": 30,
+      "contextToolChars": 1000
     },
     "writePolicy": {
       "mode": "allow",
@@ -60,7 +68,7 @@
       "allowedPaths": []
     },
     "folderPolicy": {
-      "mode": "repo",
+      "mode": "any",
       "outside": "ask",
       "grantScope": "project",
       "sensitiveTemplates": "allow",
