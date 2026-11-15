@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.12.0] - 2026-11-15
 
 ### Added — `workflow.handoff` + `/handoff`
 
