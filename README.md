@@ -15,7 +15,7 @@ Each extension is its own npm package (install just what you want):
 
 | Path | npm package | Description |
 | --- | --- | --- |
-| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, shared folder/read permissions, Review Mode, questionnaire (1–4 Qs, dedup), subagent `explore`, pinned `workflow_todo` panel, `/rewind` shadow-checkpoint, Plannotator bridge |
+| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, shared folder/read permissions, Review Mode, questionnaire (1–4 Qs, dedup), subagent `explore`, pinned `workflow_todo` panel, `/rewind` shadow-checkpoint, Plannotator bridge with a native handoff fallback |
 | `agent/extensions/autocompact/` | `@dieulc/autocompact` | Intelligent compaction: plan/todo-aware summary, 70% pre-warming, cheap model override, `/autocompact` |
 | `agent/extensions/server-logs/` | `@dieulc/server-logs` | Docker + systemd log inspection tools (remote SSH or local) |
 | `agent/extensions/browser-inspector/` | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP: console, network, screenshots (fresh browser or real session) |

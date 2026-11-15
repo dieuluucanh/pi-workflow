@@ -39,10 +39,16 @@ interface BootOptions {
   verify?: boolean;
   hasUI?: boolean;
   plannotator?: boolean;
+  /**
+   * Answer every `plan-review` request with `{status:"error"}` — the broken
+   * Plannotator path the native fallback must survive.
+   */
+  plannotatorError?: boolean;
   /** Per-review-id answer for `plannotator:request` `review-status`. */
   plannotatorStatus?: Record<string, unknown>;
   startReason?: "startup" | "reload" | "resume" | "fork" | "new";
-  customAnswer?: string | null;
+  /** Value returned by `ctx.ui.custom` (native handoff questionnaire result). */
+  customAnswer?: unknown;
   editorAnswer?: string | null;
   /** `ctx.ui.select` answer (closed-review inline handoff). */
   selectAnswer?: string;
@@ -104,10 +110,11 @@ async function boot(over: BootOptions = {}) {
           reviewId,
           planPath: request.payload?.planFilePath,
         });
-        request.respond?.({
-          status: "handled",
-          result: { reviewId },
-        });
+        request.respond?.(
+          over.plannotatorError === true
+            ? { status: "error" }
+            : { status: "handled", result: { reviewId } },
+        );
       } else if (request?.action === "review-status") {
         const reviewId = String(request.payload?.reviewId ?? "");
         reviewStatusRequests.push(reviewId);
@@ -121,8 +128,16 @@ async function boot(over: BootOptions = {}) {
       }
     });
   }
-  await workflowExtension(pi as never, { loadSdk: async () => sdk as never });
-  const { ctx, notifies, statuses, widgets, widgetCalls, confirms } = makeFakeCtx({
+  await workflowExtension(pi as never, {
+    loadSdk: async () => sdk as never,
+    // The fake host has no Plannotator listener unless `plannotator: true`, so
+    // an untuned handoff would wait the production 15 s before falling back to
+    // the native questionnaire. Keep the fallback path fast in tests.
+    plannotatorRequestTimeoutMs: 50,
+    plannotatorRecoveryTimeoutMs: 50,
+  });
+  const { ctx, notifies, statuses, widgets, widgetCalls, confirms, customs } =
+    makeFakeCtx({
     cwd,
     hasUI: over.hasUI === true,
     branch: over.branch ?? [],
@@ -167,6 +182,7 @@ async function boot(over: BootOptions = {}) {
     widgetCalls,
     confirms,
     capture,
+    customs,
     plannotatorRequests,
     reviewStatusRequests,
     cleanup,
@@ -233,6 +249,31 @@ async function waitFor(cond: () => boolean, ms = 1500): Promise<void> {
     if (cond()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+/** A `QuestionnaireResult` for the native handoff modal. */
+function handoffAnswer(
+  choice: "approve" | "feedback" | "skip" | { freeform: string },
+): unknown {
+  if (typeof choice === "object") {
+    return {
+      cancelled: false,
+      answers: [
+        { question: "Plan ready — how do you want to proceed?", answer: choice.freeform, wasCustom: true },
+      ],
+    };
+  }
+  const labels = {
+    approve: "Approve plan and go ahead (Build)",
+    feedback: "Give feedback (stay in Plan)",
+    skip: "Skip for now (stay in Plan)",
+  };
+  return {
+    cancelled: false,
+    answers: [
+      { question: "Plan ready — how do you want to proceed?", answer: labels[choice], wasCustom: false },
+    ],
+  };
 }
 
 /** The reviewer writes the rewrite plus a "Review changes" appendix. */
@@ -567,7 +608,7 @@ test("K: a same-plan feedback prompt keeps findings but restarts the round", asy
 test("M: inline Refine starts a new cycle and carries findings", async () => {
   const b = await boot({
     hasUI: true,
-    customAnswer: "refine",
+    customAnswer: handoffAnswer("feedback"),
     editorAnswer: "Please add an export test.",
   });
   try {
@@ -1630,11 +1671,11 @@ test("W: Build -> Plan -> a new plan gets a fresh review", async () => {
   }
 });
 
-test("X: closing the browser review presents an inline handoff", async () => {
+test("X: closing the browser review falls back to the native handoff", async () => {
   const b = await boot({
     hasUI: true,
     plannotator: true,
-    selectAnswer: "Execute the plan in Build Mode",
+    customAnswer: handoffAnswer("approve"),
   });
   try {
     await freshPrompt(b.pi, b.ctx);
@@ -1643,6 +1684,7 @@ test("X: closing the browser review presents an inline handoff", async () => {
     await writeResult(b.pi, b.ctx, plan.rel);
     await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
     assert.equal(b.plannotatorRequests.length, 1, "the browser review opened");
+    assert.equal(b.customs.length, 0, "the browser owned the decision");
 
     b.pi.events.emit("plannotator:session-closed", {
       reviewId: "review-1",
@@ -1653,19 +1695,33 @@ test("X: closing the browser review presents an inline handoff", async () => {
         JSON.stringify(s.content).includes("Execute the plan"),
       ),
     );
+    assert.equal(b.customs.length, 1, "the native handoff opened");
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
+      "the plan was printed into the transcript",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-handoff-result" &&
+          e.data?.choice === "execute" &&
+          e.data?.source === "native",
+      ),
+      "the execute choice is attributed to the native handoff",
+    );
     assert.ok(
       b.statuses.some(
         (value) => typeof value === "string" && value.includes("▶ build"),
       ),
-      "the inline handoff executed and entered Build",
+      "the native handoff executed and entered Build",
     );
   } finally {
     await b.cleanup();
   }
 });
 
-test("Y: cancelling the closed-review inline handoff does not stick Review", async () => {
-  const b = await boot({ hasUI: true, plannotator: true, selectAnswer: undefined });
+test("Y: dismissing the closed-review handoff does not stick Review", async () => {
+  const b = await boot({ hasUI: true, plannotator: true, customAnswer: null });
   try {
     await freshPrompt(b.pi, b.ctx);
     await switchToPlan(b.pi, b.ctx);
@@ -1676,8 +1732,10 @@ test("Y: cancelling the closed-review inline handoff does not stick Review", asy
       reviewId: "review-1",
       outcome: "closed",
     });
-    await waitFor(() =>
-      b.notifies.some((n) => n.message.includes("Plan review closed — the plan is at")),
+    await waitFor(() => notified(b.notifies, "Dismissed. Type your follow-up."));
+    assert.ok(
+      notified(b.notifies, "Dismissed. Type your follow-up."),
+      "the native handoff was dismissed",
     );
     const modes = b.statuses.filter(
       (value): value is string =>
@@ -1690,7 +1748,358 @@ test("Y: cancelling the closed-review inline handoff does not stick Review", asy
       modes.at(-1)?.includes("⏸ plan"),
       `cancelling returns to Plan, got ${modes.at(-1)}`,
     );
+    // The turn must be closed: prompts and modes are accepted again.
+    const input = await b.pi.emit(
+      "input",
+      { text: "do the next thing", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(input[0], { action: "continue" });
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"));
   } finally {
+    await b.cleanup();
+  }
+});
+
+// ── Native handoff fallback (2026-11-15 plan) ────────────────────────
+
+test("HF1: a Plannotator error falls back to the native handoff", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    plannotatorError: true,
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf1-plannotator-error.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(b.plannotatorRequests.length, 1, "the browser was tried once");
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    const printed = b.pi.entries.find(
+      (e: any) => e.type === "workflow-handoff-plan",
+    );
+    assert.ok(printed, "the plan was printed into the transcript");
+    assert.ok(
+      String((printed as any).data?.planText).includes("Result<string, ExportError>"),
+      "the reviewed plan is in the entry",
+    );
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "skip sent no execute turn",
+    );
+    assert.ok(
+      notified(b.notifies, "Plannotator handoff unavailable"),
+      "the failure is announced",
+    );
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"), "the turn is closed");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF2: approving the native handoff enters Build before execute", async () => {
+  const b = await boot({ hasUI: true, customAnswer: handoffAnswer("approve") });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf2-approve.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    const toolIdx = b.pi.timeline.findIndex(
+      (t: any) => t.kind === "tools" && (t.tools ?? []).includes("edit"),
+    );
+    const sendIdx = b.pi.timeline.findIndex(
+      (t: any) =>
+        t.kind === "send" &&
+        JSON.stringify(t.content).includes("Execute the plan"),
+    );
+    assert.ok(toolIdx >= 0, "the tool set was swapped to Build");
+    assert.ok(sendIdx > toolIdx, "execute was sent after the Build swap");
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "the session is in Build mode",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF3: a failed Build entry drops the execute turn", async () => {
+  const b = await boot({ hasUI: true, customAnswer: handoffAnswer("approve") });
+  const realSetActiveTools = b.pi.setActiveTools.bind(b.pi);
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf3-build-fails.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    (b.pi as any).setActiveTools = () => {
+      throw new Error("tools boom");
+    };
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.ok(
+      notified(b.notifies, "Could not enter Build mode") ||
+        notified(b.notifies, "Build was not entered"),
+      "the Build failure is reported",
+    );
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "no execute turn was sent",
+    );
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "the session stayed in Plan mode",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) => e.type === "workflow-review-turn-closed",
+      ),
+      "the review turn was closed",
+    );
+  } finally {
+    (b.pi as any).setActiveTools = realSetActiveTools;
+    await b.cleanup();
+  }
+});
+
+test("HF4: /review-abort exits a pending browser handoff locally", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf4-abort-handoff.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the browser review opened");
+    assert.equal(b.customs.length, 0, "the browser owned the decision");
+
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.equal(
+      b.plannotatorRequests.length,
+      1,
+      "abort never re-opened the browser",
+    );
+    assert.equal(b.customs.length, 1, "the native handoff opened");
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
+      "the plan was printed into the transcript",
+    );
+
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(
+      notified(b.notifies, "Nothing to abort"),
+      "a second abort is a no-op, not a soft-lock",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF5: dismissing a native handoff releases prompts and modes", async () => {
+  const b = await boot({ hasUI: true, customAnswer: null });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf5-dismiss.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.ok(notified(b.notifies, "Dismissed. Type your follow-up."));
+
+    const input = await b.pi.emit(
+      "input",
+      { text: "carry on", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(input[0], { action: "continue" });
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"));
+    await b.pi.commands.build.handler("", b.ctx);
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "a mode switch works after dismissal",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF6: a manual /review falls back natively when Plannotator errors", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    plannotatorError: true,
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    const plan = placePlan(b.cwd, "hf6-manual.md");
+    await runReview(b.pi, b.ctx, plan.rel);
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    assert.ok(notified(b.notifies, "Plannotator handoff unavailable"));
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
+      "the plan was printed into the transcript",
+    );
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"), "no stale turn");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF7: resuming a paused review falls back natively", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    plannotatorError: true,
+    customAnswer: handoffAnswer("skip"),
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf7-resume.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const handoff = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+    await waitFor(() => b.capture.prompts.length >= 1);
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    releases.shift()?.();
+    await waitFor(() =>
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" && value.includes("🔍 review — paused"),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const resumed = b.pi.commands["review-resume"].handler("", b.ctx);
+    await waitFor(() => b.capture.prompts.length >= 2);
+    releases.shift()?.();
+    await resumed;
+    await handoff;
+
+    assert.ok(b.customs.length >= 1, "the native fallback opened");
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
+      "the plan was printed into the transcript",
+    );
+  } finally {
+    while (releases.length > 0) releases.shift()?.();
+    await b.cleanup();
+  }
+});
+
+test("HF8: a headless handoff closes the review turn", async () => {
+  const b = await boot({ hasUI: false, enabled: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf8-headless.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(b.customs.length, 0, "no modal on a headless host");
+    assert.ok(
+      b.pi.sent.some(
+        (s: any) => (s.content as any)?.customType === "workflow-handoff-fallback",
+      ),
+      "the headless fallback message was sent",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-turn-closed" &&
+          e.data?.reason === "headless-handoff",
+      ),
+      "the review turn was closed",
+    );
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"), "no lock is left");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HF9: aborting a paused gated review presents exactly once", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hf9-paused-gated.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const handoff = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+    await waitFor(() => b.capture.prompts.length >= 1);
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    releases.shift()?.();
+    await waitFor(() =>
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" && value.includes("🔍 review — paused"),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(b.plannotatorRequests.length, 0, "no handoff while paused");
+
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    await handoff;
+    assert.equal(
+      b.plannotatorRequests.length,
+      1,
+      "the parked handoff presented once, never twice",
+    );
+    assert.equal(b.customs.length, 0, "no second native modal was stacked");
+  } finally {
+    while (releases.length > 0) releases.shift()?.();
     await b.cleanup();
   }
 });

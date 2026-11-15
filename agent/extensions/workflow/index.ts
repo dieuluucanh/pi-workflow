@@ -5,8 +5,11 @@
  * - plan/build modes with tool gating
  * - parallel exploration via subagent (pi --mode json)
  * - questionnaire (multi-choice, recommendation first, with Type-something editor)
- * - plan file to .pi/plans/*.md + inline Markdown handoff (no truncation, terminal scrollback)
- * - decision gate: 1 Execute / 2 Refine / 3 Freeform
+ * - plan file to .pi/plans/*.md + the plan printed into the transcript as a
+ *   durable display-only entry (scrollable, never LLM context)
+ * - handoff questionnaire (Approve / Feedback / Skip) pinned at the bottom;
+ *   Plannotator first, this is the native fallback on error/timeout/close
+ * - `/review-abort` is a strict local exit (never re-opens Plannotator)
  * - todo tool (persisted via details) + live widget/status tracking
  * - /rewind (tree nav) + /btw (queue note) + Escape abort (signal)
  */
@@ -25,18 +28,15 @@ import type {
 import {
   CONFIG_DIR_NAME,
   getAgentDir,
-  getMarkdownTheme,
   withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import {
   Container,
-  Markdown,
   Text,
   Key,
   isKeyRelease,
   matchesKey,
   SelectList,
-  ScrollView,
   Editor,
   type EditorTheme,
   type SelectItem,
@@ -290,6 +290,14 @@ import {
   type QuestionnaireQuestion,
   type QuestionnaireResult,
 } from "./questionnaire-view.ts";
+import {
+  buildHandoffQuestion,
+  capHandoffPlanText,
+  handoffChoiceFromResult,
+  HANDOFF_PLAN_ENTRY_TYPE,
+  type HandoffPlanEntryData,
+  type HandoffReason,
+} from "./handoff-view.ts";
 import {
   coerceModelDefault,
   describeModelDefaultApply,
@@ -1548,6 +1556,12 @@ export default function workflowExtension(
    */
   let quietAbortHash: string | undefined;
   /**
+   * Dedupe key of the last plan printed for a handoff
+   * (`planPath:planHash`). Reset by `beginReviewCycle()` so a new cycle can
+   * print the same revision again.
+   */
+  let handoffPrintKey: string | undefined;
+  /**
    * Explore recon summaries carried by the last manifest (step 8). When > 0
    * the reviewer verifies instead of re-exploring: its explore budget is 0.
    */
@@ -1559,6 +1573,8 @@ export default function workflowExtension(
    * persisted — a reload starts fresh instead of a phantom handoff.
    */
   let reviewGatePhase: ReviewHandoffPhase = "idle";
+  /** True while the native handoff questionnaire is on screen. */
+  let handoffModalOpen = false;
   /** Single-settle resolver the gated `runHandoff` awaits (see review.ts). */
   const reviewHandoffGate: ReviewHandoffGate = createReviewHandoffGate();
 
@@ -1586,6 +1602,7 @@ export default function workflowExtension(
       roundActive,
       paused,
       gatePhase,
+      turn: reviewTurn,
       handoff: reviewTurn === "handoff" || awaitingDecision,
       transition: reviewTurn === "transition",
     });
@@ -2498,6 +2515,70 @@ export default function workflowExtension(
       void _e;
     }
   }
+
+  /**
+   * End the review turn from any failure/teardown exit.
+   *
+   * Order matters: the gate is settled FIRST — a later `suspendReview()` also
+   * settles the same exactly-once gate with `activeReview?.planText`, which may
+   * already be gone by then. The gate phase is reset too, otherwise a stale
+   * `"paused"` gate keeps `reviewModeLockKind()` returning `"paused"` after the
+   * turn ends (the exact soft-lock this replaces).
+   *
+   * `abortedReviewHash` is deliberately NOT cleared: `/review-abort` sets it
+   * before calling this so the aborted revision is not auto-reviewed again
+   * until the plan changes. `quietAbortHash` is only dropped when the caller
+   * asks for it (a teardown), never on a normal abort.
+   */
+  async function closeReviewTurn(opts: {
+    reason: string;
+    planText?: string;
+    clearAbortMarkers?: boolean;
+  }): Promise<void> {
+    try {
+      settleReviewGate({ outcome: "unreviewed", planText: opts.planText });
+    } catch (_e) {
+      void _e;
+    }
+    pausedReview = undefined;
+    if (opts.clearAbortMarkers === true) {
+      abortedReviewHash = undefined;
+      quietAbortHash = undefined;
+    }
+    clearPendingHandoffDecision();
+    try {
+      await suspendReview();
+    } catch (_e) {
+      void _e;
+    }
+    reviewGatePhase = "idle";
+    reviewGateCycleId = 0;
+    setReviewWorkingMessage(undefined);
+    flushReviewEntries(true);
+    endReviewTurn();
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    const ctx = currentSessionCtx;
+    if (ctx) {
+      try {
+        updateStatus(ctx as any);
+      } catch (_e) {
+        void _e;
+      }
+    }
+    try {
+      pi.appendEntry("workflow-review-turn-closed", {
+        at: Date.now(),
+        reason: opts.reason,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   /**
    * Execute one review round and fold the outcome into extension state.
    *
@@ -2958,6 +3039,7 @@ export default function workflowExtension(
     reviewRound = 0;
     lastReviewedPlanHash = undefined;
     abortedReviewHash = undefined;
+    handoffPrintKey = undefined;
     if (!hadActive) quietAbortHash = undefined;
 
     const rawNext = opts.planPath ?? currentPlanFile ?? null;
@@ -3900,6 +3982,7 @@ export default function workflowExtension(
             [
               `Review paused at round ${paused.round} (plan hash ${paused.planHash})`,
               "  /review-resume to continue, /review-abort to stop.",
+              ...reviewTurnStatusLines(),
               pendingHandoffStatusLine(),
               reviewModeLockStatusLine(lockKind),
             ]
@@ -3921,6 +4004,7 @@ export default function workflowExtension(
             reviewEnabled()
               ? "Review Mode is enabled but no review has run yet."
               : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} /review runs a one-shot review.`,
+            ...reviewTurnStatusLines(),
             pendingHandoffStatusLine(),
             reviewModeLockStatusLine(lockKind),
           ]
@@ -3951,6 +4035,7 @@ export default function workflowExtension(
         reviewRuntime?.isRoundActive()
           ? "  live    : round in flight — /role and /profile switches apply next round; /review say <msg> to steer"
           : "",
+        ...reviewTurnStatusLines(),
         pendingHandoffStatusLine(),
         reviewModeLockStatusLine(lockKind),
         ...s.findings.map(
@@ -4073,9 +4158,12 @@ export default function workflowExtension(
       // here would race the handoff it is about to render. Steer the running
       // round with `/review say`, pause with ESC, or stop it with
       // `/review-abort` instead; resume a paused one with `/review-resume`.
-      if (reviewGatePhase !== "idle") {
+      // A gate from a superseded cycle must not refuse a fresh manual round.
+      const currentGatePhase =
+        reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
+      if (currentGatePhase !== "idle") {
         ctx.ui.notify(
-          reviewGatePhase === "paused"
+          currentGatePhase === "paused"
             ? "A handoff review is paused — /review-resume to continue it, /review-abort to hand off the plan as-is."
             : "A handoff review is running — /review say <msg> to steer it, ESC to pause, /review-abort to hand off the plan as-is.",
           "info",
@@ -4130,12 +4218,12 @@ export default function workflowExtension(
         ? ""
         : " (Review Mode stays OFF — /review-mode on for automatic review.)";
       if (
-        await openManualHandoff(
+        (await openHandoffForSettledRound(
           result,
           target.abs,
           ctx as any,
           offSuffix,
-        )
+        )) !== "none"
       ) {
         return;
       }
@@ -4150,12 +4238,17 @@ export default function workflowExtension(
       // Manual control: pause works whether or not Review Mode is on.
       // Gate only on round ownership below — no `enabled` check here.
       if (!activeReview) {
-        ctx.ui.notify(
-          currentPausedReview()
-            ? "Review is already paused — /review-resume to continue, /review-abort to stop."
-            : "No review round running.",
-          "info",
-        );
+        let notice = "No review round running.";
+        if (currentPausedReview()) {
+          notice =
+            "Review is already paused — /review-resume to continue, /review-abort to stop.";
+        } else if (awaitingDecision || reviewTurn === "handoff") {
+          notice =
+            "A handoff is waiting — /review-abort to hand off now, or answer the handoff prompt.";
+        } else if (reviewTurn !== "idle") {
+          notice = "No review round running — /review-abort to clear the review turn.";
+        }
+        ctx.ui.notify(notice, "info");
         return;
       }
       // Shared with the ESC listener: snapshots once, drops an open handoff
@@ -4173,7 +4266,14 @@ export default function workflowExtension(
       // Gate only on paused-session state below — no `enabled` check here.
       const paused = currentPausedReview();
       if (!paused) {
-        ctx.ui.notify("No paused review — nothing to resume.", "info");
+        let notice = "No paused review — nothing to resume.";
+        if (awaitingDecision || reviewTurn === "handoff") {
+          notice =
+            "Nothing to resume — the review already finished; answer the handoff or /review-abort.";
+        } else if (reviewTurn !== "idle") {
+          notice = "Nothing to resume — /review-abort to clear the review turn.";
+        }
+        ctx.ui.notify(notice, "info");
         return;
       }
       // Round ownership, not just the runtime flag: a round that is still
@@ -4185,7 +4285,9 @@ export default function workflowExtension(
       }
       // A gated resume is settled by its parked runHandoff; a manual pause
       // (idle gate) opens its own browser handoff after the round lands.
-      const gatedResume = reviewGatePhase !== "idle";
+      const gatedResume =
+        (reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle") !==
+        "idle";
       // A resumed gated review is auditing again. Without this, the parked
       // handoff keeps `reviewGatePhase === "paused"` for the whole round and
       // the lock/footer report the wrong state (plan 2026-10-25 follow-up).
@@ -4231,7 +4333,7 @@ export default function workflowExtension(
           });
         }
         if (!gatedResume && reviewResumeSettles(result)) {
-          await openManualHandoff(
+          await openHandoffForSettledRound(
             result,
             currentPlanFile ?? "",
             ctx as any,
@@ -4264,7 +4366,7 @@ export default function workflowExtension(
         });
       }
       if (!gatedResume && reviewResumeSettles(result)) {
-        await openManualHandoff(result, currentPlanFile ?? "", ctx as any);
+        await openHandoffForSettledRound(result, currentPlanFile ?? "", ctx as any);
       } else {
         ctx.ui.notify(reviewResumeNotice(result), "info");
       }
@@ -4276,75 +4378,64 @@ export default function workflowExtension(
       "Stop the Review round (or discard a paused one) — the author's plan stands",
     handler: async (_args, ctx) => {
       // Explicit review exit: intentionally unguarded by the mode-switch lock.
-      // Aborting clears `pausedReview`/the round, which releases the lock and
-      // settles an open handoff gate with the author's plan.
+      // Strictly local: it never re-opens Plannotator. A pending browser answer
+      // is resolved deterministically so a late tab cannot act afterwards, and
+      // every branch ends with the review turn closed (no residual soft-lock).
       const rt = reviewRuntime;
       const active =
         activeReview !== undefined || rt?.isRoundActive() === true;
       const paused = currentPausedReview();
-      // A browser/inline decision can own the turn with no round and no pause.
-      if (!active && !paused && awaitingDecision) {
-        const planPath = pendingHandoffPlanPath ?? currentPlanFile ?? "";
-        const planText =
-          (planPath &&
-            (() => {
-              try {
-                return fs.existsSync(planPath)
-                  ? fs.readFileSync(planPath, "utf8")
-                  : undefined;
-              } catch {
-                return undefined;
-              }
-            })()) ??
-          "";
-        if (pendingHandoffReviewUrl) {
-          setReviewTurn("handoff");
-          ctx.ui.notify(
-            "Review skipped — approve or annotate in the review tab.",
-            "info",
-          );
-          return;
-        }
-        if (planText && planPath) {
-          const handed = await openManualHandoff(
-            { planText, outcome: "aborted", paused: false },
-            planPath,
-            ctx as any,
-          );
-          if (!handed) setReviewTurn("handoff");
-          return;
-        }
-        clearPendingHandoffDecision();
-        setReviewTurn("idle");
+      const gatePhase =
+        reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
+      const reviewOwned =
+        active ||
+        paused !== undefined ||
+        awaitingDecision ||
+        reviewTurn !== "idle" ||
+        gatePhase !== "idle";
+      if (!reviewOwned) {
         ctx.ui.notify(
-          `Review skipped — the plan file is ${planPath || "unavailable"}.`,
+          "Nothing to abort — no review, pause, or handoff is active.",
           "info",
         );
-        return;
-      }
-      if (!active && !paused) {
-        ctx.ui.notify("No review running or paused.", "info");
         return;
       }
       const targetHash =
         paused?.planHash ??
         (activeReview ? planHash(activeReview.planText) : undefined);
-      // Text the gate hands off when one is open (resolved below after the
-      // abort lands; falls back to the author's draft when unknown).
-      const abortedText =
-        paused?.planText ?? activeReview?.planText;
-      const pausedPlanPath = currentPlanFile ?? "";
+      // Text the gate hands off when one is open; the file is authoritative.
+      const abortedText = paused?.planText ?? activeReview?.planText;
+      const planPath =
+        pendingHandoffPlanPath ??
+        currentPlanFile ??
+        planWritePathThisRun ??
+        "";
+      const planTextFromFile = (() => {
+        try {
+          return planPath && fs.existsSync(planPath)
+            ? fs.readFileSync(planPath, "utf8")
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      })();
+      const handoffText = planTextFromFile ?? abortedText ?? "";
+      const handoffSource: ReviewHandoffSource =
+        pendingHandoffSource ?? "manual";
       // A parked automatic handoff owns its own presentation: settle the gate
       // and let `runHandoff` render, never present twice.
-      const gated = reviewGatePhase !== "idle" && !reviewHandoffGate.settled();
-      pausedReview = undefined;
+      const gated = gatePhase !== "idle" && !reviewHandoffGate.settled();
       // An aborted revision is not auto-reviewed again until the plan changes.
       if (targetHash) abortedReviewHash = targetHash;
       reviewRound = 0;
+
+      // 1. Round in flight: the waiting `/review` or `runHandoff` caller owns
+      // the presentation once the round resolves — never present from here.
       if (active) {
         // The command announces the abort; the resolving round stays silent
         // for this revision (quietAbortHash) so the user is told once.
         if (targetHash) quietAbortHash = targetHash;
+        pausedReview = undefined;
         try {
           activeReview?.controller.abort();
         } catch (_e) {
@@ -4359,38 +4450,103 @@ export default function workflowExtension(
           "Review stopped — the author's plan stands unreviewed.",
           "info",
         );
-        if (gated) {
-          setReviewTurn("handoff");
-          settleReviewGate({ outcome: "unreviewed", planText: abortedText });
-          return;
-        }
-        // A manual /review command is awaiting this round; it will present the
-        // aborted plan through `openManualHandoff` (shouldHandoffManualResult
-        // now includes aborted). Keep Review visible until then.
         setReviewTurn("handoff");
+        if (gated) {
+          settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+        }
         return;
       }
-      flushReviewEntries(true);
-      emitReviewBand({ mode: "review-done", reason: "aborted by user" });
-      ctx.ui.notify(
-        "Paused review discarded — the author's plan stands.",
-        "info",
-      );
+
+      // 2. A parked `runHandoff` owns the presentation: settle its gate so it
+      // renders exactly once, and never open a second modal from here.
       if (gated) {
+        if (targetHash) quietAbortHash = targetHash;
+        if (paused) {
+          pausedReview = undefined;
+          flushReviewEntries(true);
+          emitReviewBand({ mode: "review-done", reason: "aborted by user" });
+        }
+        clearPendingHandoffDecision();
         setReviewTurn("handoff");
         settleReviewGate({ outcome: "unreviewed", planText: abortedText });
-        return;
-      }
-      if (abortedText && pausedPlanPath) {
-        await openManualHandoff(
-          { planText: abortedText, outcome: "aborted", paused: false },
-          pausedPlanPath,
-          ctx as any,
+        ctx.ui.notify(
+          paused
+            ? "Paused review discarded — the author's plan stands."
+            : "Review stopped — the author's plan stands.",
+          "info",
         );
         return;
       }
-      setReviewTurn("idle");
-      updateStatus(ctx as any);
+
+      // 3. A native handoff modal is already open: close the turn and
+      // invalidate the pending answer instead of stacking a second modal.
+      if (handoffModalOpen) {
+        reviewCycleId += 1;
+        await closeReviewTurn({
+          reason: "abort-native-handoff",
+          planText: abortedText,
+        });
+        ctx.ui.notify(
+          `Review aborted — dismiss the open handoff prompt. The plan stays at ${planPath || "(unknown)"}.`,
+          "info",
+        );
+        return;
+      }
+
+      // 4. Paused round: drop the snapshot, close the turn, ask natively.
+      if (paused) {
+        if (targetHash) quietAbortHash = targetHash;
+        pausedReview = undefined;
+        flushReviewEntries(true);
+        emitReviewBand({ mode: "review-done", reason: "aborted by user" });
+        await closeReviewTurn({
+          reason: "abort-paused",
+          planText: abortedText,
+        });
+        ctx.ui.notify(
+          "Paused review discarded — the author's plan stands.",
+          "info",
+        );
+      } else if (awaitingDecision) {
+        // 5. Pending browser decision: resolve the waiter so a late answer
+        // cannot act, then close and ask natively.
+        settlePlanReviewRequest({
+          status: "error",
+          reason: "aborted by user",
+        });
+        await closeReviewTurn({
+          reason: "abort-handoff",
+          planText: abortedText,
+        });
+        ctx.ui.notify("Review skipped — the author's plan stands.", "info");
+      } else {
+        // 6. Residual turn/gate only (a leaked handoff turn): clean it up,
+        // then ask natively.
+        await closeReviewTurn({
+          reason: "abort-residual",
+          planText: abortedText,
+        });
+      }
+
+      if (handoffText && planPath) {
+        await presentPlanHandoff(ctx as any, {
+          planText: handoffText,
+          planPath,
+          source: handoffSource,
+          presentation: "native-only",
+          reason: "aborted",
+        });
+        return;
+      }
+      try {
+        (ctx as any).ui?.requestRender?.();
+      } catch (_e) {
+        void _e;
+      }
+      ctx.ui.notify(
+        `Review aborted — the plan file is ${planPath || "unavailable"}.`,
+        "info",
+      );
     },
   });
 
@@ -5115,45 +5271,76 @@ export default function workflowExtension(
     } else if (blockModeSwitchDuringReview(ctx)) {
       return false;
     }
-    workflowMode = "build";
-    syncLegacyFlags();
-    // The plan is being handed to Build; this Plan cycle cannot hand off again.
-    resetPlanRunProvenance();
-    clearPendingHandoffDecision();
-    // Approve path: Plan mode is off in favour of Build, but the reviewer
-    // session stays warm — a landing review must not rewrite the plan the
-    // user just approved (step 10).
-    await suspendReview();
-    currentPlanFile = planPath;
+    // Fail-safe: `true` promises "mode, tools and model are all Build". A throw
+    // past this point must restore the previous mode/tool set instead of
+    // leaving a half-switched session (the 2026-11-15 Plan-mode execute bug).
+    const prevMode = workflowMode;
+    const prevTools = pi.getActiveTools();
+    const prevToolsBeforePlan = toolsBeforePlanMode;
     try {
-      await beginReviewCycle({
-        reason: "build",
-        keepFindings: false,
-        planPath,
-      });
-    } catch (_e) {
-      void _e;
+      workflowMode = "build";
+      syncLegacyFlags();
+      // The plan is being handed to Build; this Plan cycle cannot hand off again.
+      resetPlanRunProvenance();
+      clearPendingHandoffDecision();
+      // Approve path: Plan mode is off in favour of Build, but the reviewer
+      // session stays warm — a landing review must not rewrite the plan the
+      // user just approved (step 10).
+      await suspendReview();
+      currentPlanFile = planPath;
+      try {
+        await beginReviewCycle({
+          reason: "build",
+          keepFindings: false,
+          planPath,
+        });
+      } catch (_e) {
+        void _e;
+      }
+      pi.setActiveTools(
+        toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
+      );
+      toolsBeforePlanMode = undefined;
+      // Populate/refresh todos from the plan file (merge preserves progress).
+      const loaded = loadTodosFromPlan(planPath, ctx.cwd);
+      try {
+        await applyModeModel(ctx);
+      } catch (_e) {
+        void _e;
+      }
+      updateStatus(ctx);
+      persistState();
+      ctx.ui.notify(
+        loaded.replaced
+          ? `Build mode: ${loaded.count} todos loaded from plan.`
+          : `Build mode: ${loaded.count} todos synced from plan (progress kept).`,
+        "info",
+      );
+      return true;
+    } catch (e: any) {
+      workflowMode = prevMode;
+      try {
+        syncLegacyFlags();
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        pi.setActiveTools(prevTools);
+      } catch (_e) {
+        void _e;
+      }
+      toolsBeforePlanMode = prevToolsBeforePlan;
+      try {
+        updateStatus(ctx);
+      } catch (_e) {
+        void _e;
+      }
+      ctx.ui.notify(
+        `Could not enter Build mode (${String(e?.message ?? e)}); staying in ${prevMode ?? "Default"} mode.`,
+        "warning",
+      );
+      return false;
     }
-    pi.setActiveTools(
-      toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
-    );
-    toolsBeforePlanMode = undefined;
-    // Populate/refresh todos from the plan file (merge preserves progress).
-    const loaded = loadTodosFromPlan(planPath, ctx.cwd);
-    try {
-      await applyModeModel(ctx);
-    } catch (_e) {
-      void _e;
-    }
-    updateStatus(ctx);
-    persistState();
-    ctx.ui.notify(
-      loaded.replaced
-        ? `Build mode: ${loaded.count} todos loaded from plan.`
-        : `Build mode: ${loaded.count} todos synced from plan (progress kept).`,
-      "info",
-    );
-    return true;
   }
 
   // ── Plannotator bridge helpers ─────────────────────────────────
@@ -5219,12 +5406,55 @@ export default function workflowExtension(
   }
 
   /**
+   * Print the plan into the transcript as a durable entry (display-only, never
+   * LLM context). Deduped per plan revision so an abort after an already
+   * rendered handoff does not duplicate the whole plan.
+   */
+  function printHandoffPlan(
+    planText: string,
+    planPath: string,
+    reason: HandoffReason,
+    extra?: { verdict?: string; findingCount?: number },
+  ): boolean {
+    try {
+      if (!planText) return false;
+      const key = `${planPath}:${planHash(planText)}`;
+      if (key === handoffPrintKey) return false;
+      handoffPrintKey = key;
+      const capped = capHandoffPlanText(planText, planPath);
+      const data: HandoffPlanEntryData = {
+        planPath,
+        planText: capped.text,
+        reason,
+        truncated: capped.truncated,
+        at: Date.now(),
+        ...(typeof extra?.verdict === "string" && extra.verdict
+          ? { verdict: extra.verdict }
+          : {}),
+        ...(typeof extra?.findingCount === "number"
+          ? { findingCount: extra.findingCount }
+          : {}),
+      };
+      pi.appendEntry(HANDOFF_PLAN_ENTRY_TYPE, data);
+      return true;
+    } catch (_e) {
+      void _e;
+      return false;
+    }
+  }
+
+  /**
    * Ask Plannotator to open a plan review and wait for its lifecycle.
    *
    * The `respond` callback is the fast path; `plannotator:session-opened` is
    * the authoritative one (it carries the URL and survives a slow handler).
    * A timeout clears the gate so the caller can render its own fallback; it
    * never retries, because a late event would then open a duplicate review.
+   *
+   * Turn ownership: this helper sets `"handoff"` while the browser owns the
+   * decision. On failure it clears ONLY the browser correlation — closing the
+   * review turn (or presenting the native fallback) belongs to the caller
+   * (`presentPlanHandoff` / `closeReviewTurn`), never to this function.
    */
   async function requestPlanReview(input: {
     planText: string;
@@ -5491,39 +5721,319 @@ export default function workflowExtension(
   }
 
   /**
-   * Open the browser handoff for a settled manual `/review` or resume.
-   * Returns true when the browser owns the decision (or the result is not
-   * handoff-eligible); false when the round paused/aborted and the caller
-   * should show its normal resume notice.
+   * Apply a handoff "refine" decision: switch a manual review back to Plan,
+   * start a feedback cycle, and send the revision follow-up.
+   *
+   * Shared by the browser Deny path and the native questionnaire so both keep
+   * the same manual-cycle, findings and todo-list semantics. Ends the turn;
+   * callers may safely close it again (idempotent).
    */
-  async function openManualHandoff(
+  async function applyHandoffRefine(
+    ctx: ExtensionContext,
+    feedback: string,
+    opts: {
+      source: "plannotator" | "native";
+      manualSource?: boolean;
+      /** Browser Deny keeps the historical "deny" cycle reason. */
+      reason?: "deny" | "refine";
+    },
+  ): Promise<void> {
+    setReviewTurn("transition");
+    if (opts.manualSource === true && workflowMode !== "plan") {
+      // A manual review can be launched from Default/Build. Its feedback is a
+      // plan revision, so switch to Plan before the follow-up turn starts.
+      try {
+        await setPlanMode(ctx as any, { quiet: true, fromReview: true });
+      } catch (_e) {
+        void _e;
+      }
+      notifyReview(
+        "Review feedback — switched to Plan mode for the revision.",
+        "info",
+      );
+    }
+    clearPendingHandoffDecision();
+    // Feedback cycle: the next plan revision gets a fresh review round, and the
+    // outstanding findings are carried forward so the reviewer can confirm they
+    // were actually addressed rather than re-raising them.
+    await beginReviewCycle({
+      reason: opts.reason ?? "deny",
+      keepFindings: true,
+    });
+    setReviewTurn("idle");
+    // The feedback turn is not a fresh user prompt: keeping the refine reason
+    // preserves manualReviewCycle, so a manual review with automatic Review
+    // Mode off still re-reviews the revision.
+    reviewFeedbackTurn = true;
+    persistState();
+    try {
+      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
+      const planTodoListMessage = {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        display: true,
+      };
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      if ((pi as any).sendUserMessage) {
+        (pi as any).sendUserMessage(feedback || "Please revise the plan.", {
+          deliverAs: "followUp",
+        });
+      } else {
+        (pi as any).sendMessage?.(feedback || "Please revise the plan.", {
+          deliverAs: "followUp",
+        });
+      }
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: "refine",
+        source: opts.source,
+        feedback,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Present a settled plan handoff: Plannotator first (unless `native-only`),
+   * then the workflow-native questionnaire.
+   *
+   * The plan itself is printed into the transcript (durable, display-only) so
+   * the questionnaire stays a compact bottom overlay instead of a pinned plan
+   * pane. Every path ends with the review turn closed: a Plannotator outage can
+   * no longer strand the lock, and no execute turn is sent unless Build was
+   * actually entered.
+   */
+  async function presentPlanHandoff(
+    ctx: ExtensionContext,
+    input: {
+      planText: string;
+      planPath: string;
+      source: ReviewHandoffSource;
+      presentation: "plannotator-then-native" | "native-only";
+      reason: HandoffReason;
+      verdict?: string;
+      findingCount?: number;
+    },
+  ): Promise<"browser" | "native" | "none"> {
+    const manualSource =
+      input.source === "manual" ||
+      pendingHandoffSource === "manual" ||
+      manualReviewCycle;
+    if (input.presentation === "plannotator-then-native") {
+      const handoff = await requestPlanReview({
+        planText: input.planText,
+        planPath: input.planPath,
+        source: input.source,
+        ctx,
+      });
+      if (handoff.ok) {
+        // The browser owns the decision; a manual cycle must stay manual so a
+        // later Deny still re-reviews the revision.
+        if (input.source === "manual") manualReviewCycle = true;
+        return "browser";
+      }
+    }
+    printHandoffPlan(input.planText, input.planPath, input.reason, {
+      verdict: input.verdict,
+      findingCount: input.findingCount,
+    });
+    if ((ctx as any).hasUI !== true) {
+      try {
+        (pi as any).sendMessage?.(
+          {
+            customType: "workflow-handoff-fallback",
+            content: `**Plan ready**\n\nThe plan is at ${input.planPath}.\n\nType "Execute the plan" to build, or tell me what to refine.`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } catch (_e) {
+        void _e;
+      }
+      return "none";
+    }
+    const cycle = reviewCycleId;
+    setReviewTurn("handoff");
+    overlayDepth += 1;
+    handoffModalOpen = true;
+    let result: QuestionnaireResult | null = null;
+    try {
+      const question = buildHandoffQuestion({
+        planPath: input.planPath,
+        reason: input.reason,
+        ...(input.verdict !== undefined ? { verdict: input.verdict } : {}),
+        ...(input.findingCount !== undefined
+          ? { findingCount: input.findingCount }
+          : {}),
+      });
+      result = await ctx.ui.custom<QuestionnaireResult | null>(
+        (tui, theme, _kb, done) =>
+          createQuestionnaireView(tui, theme, { questions: [question], done }),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: QUESTIONNAIRE_OVERLAY_MAX_HEIGHT,
+            margin: 0,
+          },
+        },
+      );
+    } catch (_e) {
+      void _e;
+      result = null;
+    } finally {
+      overlayDepth = Math.max(0, overlayDepth - 1);
+      handoffModalOpen = false;
+    }
+    // A queued prompt or supersede during the modal invalidates the answer.
+    if (cycle !== reviewCycleId) {
+      endReviewTurn();
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        updateStatus(ctx as any);
+      } catch (_e) {
+        void _e;
+      }
+      return "native";
+    }
+    const choice = handoffChoiceFromResult(result);
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: choice.choice,
+        source: "native",
+        planPath: input.planPath,
+        ...(choice.choice === "refine" && choice.feedback
+          ? { feedback: choice.feedback }
+          : {}),
+      });
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      if (choice.choice === "execute") {
+        setReviewTurn("transition");
+        let entered = false;
+        try {
+          entered = await enterBuildModeFromPlan(ctx as any, input.planPath, {
+            fromReview: true,
+          });
+        } catch (e: any) {
+          ctx.ui.notify(
+            `Could not enter Build mode (${String(e?.message ?? e)}); the plan was not executed.`,
+            "warning",
+          );
+        }
+        if (!entered || workflowMode !== "build") {
+          ctx.ui.notify(
+            `Build was not entered — the plan stays at ${input.planPath || "(unknown)"}.`,
+            "warning",
+          );
+          printHandoffPlan(input.planText, input.planPath, "build-failed");
+          // Close the turn explicitly: the finally below only ends the phase,
+          // and the forensic entry must say why the handoff ended here.
+          await closeReviewTurn({
+            reason: "handoff-build-failed",
+            planText: input.planText,
+          });
+          return "native";
+        }
+        sendExecuteMessages(ctx as any, input.planPath, undefined, "native");
+        return "native";
+      }
+      if (choice.choice === "refine") {
+        let feedback = choice.feedback;
+        if (!feedback) {
+          overlayDepth += 1;
+          try {
+            const typed = await (ctx as any).ui.editor(
+              "Refine the plan:",
+              "",
+            );
+            feedback = typeof typed === "string" ? typed : undefined;
+          } catch (_e) {
+            void _e;
+          } finally {
+            overlayDepth = Math.max(0, overlayDepth - 1);
+          }
+        }
+        if (feedback && feedback.trim()) {
+          await applyHandoffRefine(ctx, feedback.trim(), {
+            source: "native",
+            manualSource,
+            reason: "refine",
+          });
+        } else {
+          ctx.ui.notify(
+            "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
+            "info",
+          );
+        }
+        return "native";
+      }
+      ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+      return "native";
+    } finally {
+      endReviewTurn();
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        updateStatus(ctx as any);
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        (ctx as any).ui?.requestRender?.();
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
+  /**
+   * Open the handoff for a settled manual `/review` or resume.
+   *
+   * Plannotator first; when it is unavailable the native questionnaire takes
+   * over — a warning-and-return used to strand the review turn. Returns which
+   * UI owns the decision, or `"none"` when the result is not handoff-eligible
+   * and the caller should show its normal resume notice.
+   */
+  async function openHandoffForSettledRound(
     result: ReviewExecutionResult,
     planPath: string,
     ctx: ExtensionContext,
     suffix = "",
-  ): Promise<boolean> {
-    if (!shouldHandoffManualResult(result)) return false;
-    const previousManualCycle = manualReviewCycle;
-    manualReviewCycle = true;
-    const handoff = await requestPlanReview({
+  ): Promise<"browser" | "native" | "none"> {
+    if (!shouldHandoffManualResult(result)) return "none";
+    const presented = await presentPlanHandoff(ctx, {
       planText: result.planText,
       planPath,
       source: "manual",
-      ctx,
+      presentation: "plannotator-then-native",
+      reason: "reviewed",
+      ...(reviewState?.verdict ? { verdict: reviewState.verdict } : {}),
+      ...(reviewState ? { findingCount: reviewState.findings.length } : {}),
     });
-    if (handoff.ok) {
+    if (presented === "browser") {
       ctx.ui.notify(
         "Plan opened in browser for review. Approve or annotate there." + suffix,
         "info",
       );
-      return true;
     }
-    manualReviewCycle = previousManualCycle;
-    ctx.ui.notify(
-      `Manual review finished, but Plannotator is unavailable (${handoff.reason}). The reviewed plan is at ${planPath}.`,
-      "warning",
-    );
-    return true;
+    return presented;
   }
 
   /** One execute handoff: todo list + the Build-starting message. */
@@ -5531,7 +6041,30 @@ export default function workflowExtension(
     ctx: ExtensionContext,
     planPath: string,
     feedback?: string,
-  ): void {
+    source: "plannotator" | "native" = "plannotator",
+  ): boolean {
+    // Defense in depth: an execute turn must never run while Plan mode still
+    // refuses writes (the 2026-11-15 "starts building but stays in plan" bug).
+    if (workflowMode !== "build") {
+      try {
+        pi.appendEntry("workflow-handoff-blocked-build", {
+          at: Date.now(),
+          planPath,
+          mode: workflowMode,
+        });
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        ctx.ui.notify(
+          `Plan execute blocked — the session is still in ${workflowMode ?? "Default"} mode. Switch with /build or Tab, then continue.`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+      return false;
+    }
     try {
       const remainingList = formatTodoNumberedList(todoItems);
       const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
@@ -5559,12 +6092,13 @@ export default function workflowExtension(
       pi.appendEntry("workflow-handoff-result", {
         at: Date.now(),
         choice: "execute",
-        source: "plannotator",
+        source,
         planPath,
       });
     } catch (_e) {
       void _e;
     }
+    return true;
   }
 
   async function handlePlannotatorApprove(
@@ -5586,6 +6120,9 @@ export default function workflowExtension(
         "a browser decision arrived while a new review round was running",
         { force: true },
       );
+      // Only a stale handoff turn is ours to drop; a running round keeps its
+      // own `running` turn.
+      if (reviewTurn === "handoff") endReviewTurn();
       return;
     }
     // No prompt means no decision to consume. A fresh prompt/mode switch
@@ -5663,8 +6200,23 @@ export default function workflowExtension(
       );
     }
     if (!enteredBuild) {
-      setReviewTurn("handoff");
-      updateStatus(ctx as any);
+      // Never leave a cleared decision owning the turn: print the plan so it
+      // stays reachable, then close the turn. Re-presenting a modal here would
+      // loop on a consistently failing Build.
+      const planTextForPrint = (() => {
+        try {
+          return fs.readFileSync(resolvedPlan, "utf8");
+        } catch (_e) {
+          void _e;
+          return planContent ?? "";
+        }
+      })();
+      printHandoffPlan(planTextForPrint, resolvedPlan, "build-failed");
+      await closeReviewTurn({ reason: "approve-build-failed" });
+      ctx.ui.notify(
+        `Build was not entered — the plan stays at ${resolvedPlan || "(unknown)"}.`,
+        "warning",
+      );
       return;
     }
     setReviewTurn("idle");
@@ -5683,61 +6235,15 @@ export default function workflowExtension(
         "a browser decision arrived while a new review round was running",
         { force: true },
       );
+      if (reviewTurn === "handoff") endReviewTurn();
       return;
     }
     if (!awaitingDecision) return;
     const manualSource = pendingHandoffSource === "manual";
-    setReviewTurn("transition");
-    if (manualSource && workflowMode !== "plan") {
-      // A manual review can be launched from Default/Build. Its feedback is a
-      // plan revision, so switch to Plan before the follow-up turn starts.
-      try {
-        await setPlanMode(ctx as any, { quiet: true, fromReview: true });
-      } catch (_e) {
-        void _e;
-      }
-      notifyReview(
-        "Review feedback — switched to Plan mode for the revision.",
-        "info",
-      );
-    }
-    clearPendingHandoffDecision();
-    // Feedback cycle: the next plan revision gets a fresh review round, and the
-    // outstanding findings are carried forward so the reviewer can confirm they
-    // were actually addressed rather than re-raising them.
-    await beginReviewCycle({ reason: "deny", keepFindings: true });
-    setReviewTurn("idle");
-    // The feedback turn is not a fresh user prompt: keeping the refine reason
-    // preserves manualReviewCycle, so a manual review with automatic Review
-    // Mode off still re-reviews the revision.
-    reviewFeedbackTurn = true;
-    persistState();
     try {
-      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
-      const planTodoListMessage = {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-        display: true,
-      };
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
-      if ((pi as any).sendUserMessage) {
-        (pi as any).sendUserMessage(feedback || "Please revise the plan.", {
-          deliverAs: "followUp",
-        });
-      } else {
-        (pi as any).sendMessage?.(feedback || "Please revise the plan.", {
-          deliverAs: "followUp",
-        });
-      }
-    } catch (_e) {
-      void _e;
-    }
-    try {
-      pi.appendEntry("workflow-handoff-result", {
-        at: Date.now(),
-        choice: "refine",
+      await applyHandoffRefine(ctx as any, feedback, {
         source: "plannotator",
-        feedback,
+        manualSource,
       });
     } catch (_e) {
       void _e;
@@ -5745,88 +6251,35 @@ export default function workflowExtension(
   }
 
   /**
-   * The browser review closed without a decision. The user must still get a
-   * handoff: present a compact inline Approve/Revise choice with the author's
-   * plan. Reopening the browser here could loop on every close, so this path is
-   * deliberately inline-only. Never leaves Review stuck: cancel/idle clears it.
+   * The browser review closed without a decision. The user still gets a
+   * handoff: the native questionnaire (printed plan + bottom-pinned modal).
+   * Reopening the browser here could loop on every close, so this path is
+   * deliberately native-only.
    */
   async function presentClosedHandoff(
     ctx: ExtensionContext,
     planPath: string,
     planText: string,
   ): Promise<void> {
+    const source: ReviewHandoffSource = pendingHandoffSource ?? "manual";
     clearPendingHandoffDecision();
-    setReviewTurn("handoff");
     if (!planText || !planPath) {
-      endReviewTurn();
+      await closeReviewTurn({ reason: "review-closed-no-plan" });
       ctx.ui.notify(
         `Plan review closed — the plan file is ${planPath || "unavailable"}.`,
         "info",
       );
       return;
     }
-    if ((ctx as any).hasUI !== true) {
-      try {
-        (pi as any).sendMessage?.(
-          {
-            customType: "workflow-handoff-fallback",
-            content: `**Plan ready**\n\nPlan review closed without a decision. The plan is at ${planPath}.\n\nType "Execute the plan" to build, or tell me what to refine.`,
-            display: true,
-          },
-          { triggerTurn: false },
-        );
-      } catch (_e) {
-        void _e;
-      }
-      endReviewTurn();
-      return;
-    }
-    const execute = "Execute the plan in Build Mode";
-    const refine = "Refine the plan in Plan Mode";
-    let choice: string | undefined;
-    try {
-      choice = await (ctx as any).ui.select(
-        "Plan review closed — choose next step",
-        [execute, refine],
-      );
-    } catch {
-      choice = undefined;
-    }
-    if (choice === execute) {
-      setReviewTurn("transition");
-      const ok = await enterBuildModeFromPlan(ctx as any, planPath, {
-        fromReview: true,
-      });
-      if (!ok) {
-        setReviewTurn("handoff");
-        return;
-      }
-      setReviewTurn("idle");
-      sendExecuteMessages(ctx, planPath);
-      return;
-    }
-    if (choice === refine) {
-      setReviewTurn("transition");
-      if (workflowMode !== "plan") {
-        try {
-          await setPlanMode(ctx as any, { quiet: true, fromReview: true });
-        } catch (_e) {
-          void _e;
-        }
-      }
-      await beginReviewCycle({ reason: "refine", keepFindings: true });
-      setReviewTurn("idle");
-      ctx.ui.notify(
-        "Plan review closed — staying in Plan mode. Tell me what to change.",
-        "info",
-      );
-      return;
-    }
-    endReviewTurn();
-    ctx.ui.notify(
-      `Plan review closed — the plan is at ${planPath}.`,
-      "info",
-    );
+    await presentPlanHandoff(ctx, {
+      planText,
+      planPath,
+      source,
+      presentation: "native-only",
+      reason: "closed",
+      ...(reviewState?.verdict ? { verdict: reviewState.verdict } : {}),
+      ...(reviewState ? { findingCount: reviewState.findings.length } : {}),
+    });
   }
 
   function ensurePlannotatorListeners() {
@@ -12529,18 +12982,20 @@ export default function workflowExtension(
     ensurePlannotatorListeners();
     // Safety valve for a prompt that bypassed `input` (host queue, another
     // extension): never let a Review turn run concurrently with a plan/build
-    // turn. Stop the reviewer first, then let the queued prompt proceed.
+    // turn. Release the turn BEFORE suspending: `suspendReview` repaints the
+    // status, and a lock derived from the about-to-be-ended turn would flash
+    // `🔒 modes locked` on the new prompt's first frame.
     if (reviewTurnOwns(reviewTurn) && reviewTurn !== "transition") {
       // Invalidate the parked handoff BEFORE settling its gate: otherwise the
       // runHandoff continuation can observe the old cycle token and render the
       // abandoned plan alongside the new prompt.
       reviewCycleId += 1;
+      endReviewTurn();
       try {
         await suspendReview();
       } catch (_e) {
         void _e;
       }
-      endReviewTurn();
       notifyReview(
         "Review stopped — a prompt was already queued; the plan was not reviewed.",
         "info",
@@ -12838,6 +13293,29 @@ export default function workflowExtension(
     return `  handoff : browser pending — ${lastReviewId ?? "review id unknown"}${
       pendingHandoffReviewUrl ? ` @ ${pendingHandoffReviewUrl}` : ""
     } (${pendingHandoffSource ?? "auto"}, ${age}s)`;
+  }
+
+  /**
+   * `/review-status` rows for the exclusive turn and the gated handoff.
+   * Names a residual turn explicitly: that is the state that used to be
+   * invisible while `/review-abort` answered "No review running or paused".
+   */
+  function reviewTurnStatusLines(): string[] {
+    const gatePhase =
+      reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
+    const lines = [
+      `  turn    : ${reviewTurn}   gate: ${gatePhase}${lastReviewId ? ` (${lastReviewId})` : ""}`,
+    ];
+    const residual =
+      reviewTurn !== "idle" &&
+      activeReview === undefined &&
+      currentPausedReview() === undefined &&
+      !awaitingDecision &&
+      gatePhase === "idle";
+    if (residual) {
+      lines.push("  residual: /review-abort to clear the review turn");
+    }
+    return lines;
   }
 
   function clearPendingHandoffDecision(): boolean {
@@ -13468,7 +13946,10 @@ export default function workflowExtension(
             (ctx as any).signal as AbortSignal | undefined,
             manualReviewCycle ? "manual" : "auto",
           );
-          if (handoffCycle !== reviewCycleId) return;
+          if (handoffCycle !== reviewCycleId) {
+            endReviewTurn();
+            return;
+          }
           const reviewedText = reviewed.planText;
           // Fresh read: the phase may have moved to "paused" (ESC /
           // /review-pause) while the round was returning. The `as` widens
@@ -13491,7 +13972,10 @@ export default function workflowExtension(
             const res = await reviewHandoffGate.wait(
               (ctx as any).signal as AbortSignal | undefined,
             );
-            if (handoffCycle !== reviewCycleId) return;
+            if (handoffCycle !== reviewCycleId) {
+              endReviewTurn();
+              return;
+            }
             if (res === undefined) {
               // Host abort while parked: stop the reviewer, drop the pause,
               // do not auto-review this revision again, and hand the author's
@@ -13543,8 +14027,14 @@ export default function workflowExtension(
         }
         // A mode switch mid-gate (e.g. Tab-to-Build) already left plan mode:
         // the gate settled as skipped, so there is nothing to hand off.
-        if (workflowMode !== "plan") return;
-        if (handoffCycle !== reviewCycleId) return;
+        if (workflowMode !== "plan") {
+          endReviewTurn();
+          return;
+        }
+        if (handoffCycle !== reviewCycleId) {
+          endReviewTurn();
+          return;
+        }
       }
       // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
       if (!hasUI && planTextForRender && !awaitingDecision) {
@@ -13576,387 +14066,29 @@ export default function workflowExtension(
         } catch (_e) {
           void _e;
         }
+        // Headless has no modal: the turn must not outlive the message.
+        await closeReviewTurn({
+          reason: "headless-handoff",
+          planText: planTextForRender,
+        });
         return;
       }
       if (planTextForRender && hasUI && !awaitingDecision) {
-        // ── Plannotator webview branch (browser review) ──────────
-        if (plannotatorActive) {
-          const handoff = await requestPlanReview({
-            planText: planTextForRender,
-            planPath,
-            source: "auto",
-            ctx: ctx as ExtensionContext,
-            cycleId: handoffCycle,
-          });
-          if (handoff.ok) return;
-          // The helper already cleared the gate; fall through to inline.
-        }
-        awaitingDecision = true;
-        lastHandoffAt = Date.now();
-        pendingHandoffPlanPath = planPath;
-        pendingHandoffPlanHash = planHash(planTextForRender);
-        persistState();
-        const handoffStart = Date.now();
-        try {
-          const planContent = planTextForRender;
-          const items: SelectItem[] = [
-            {
-              value: "execute",
-              label: "1. Execute the plan in Build Mode",
-              description:
-                "Create todos, switch to build, start implementing (recommended)",
-            },
-            {
-              value: "refine",
-              label: "2. Refine the plan in Plan Mode",
-              description:
-                "Stay in plan mode, ask more questions, update the plan file",
-            },
-            {
-              value: "freeform",
-              label: "3. Type something else",
-              description: "Dismiss — type your own follow-up",
-            },
-          ];
-          // Fallback inline handoff — split plan (scrollable, fill available) + choices (static at bottom).
-          // Plannotator is primary; this branch is only reached on timeout/error or !hasUI.
-          // Leaf custom component renders as flat lines, so ScrollView alone would not clip — manual slice
-          // is required to bound the viewport. Plan slice fills available space above static choices.
-          const choice = await ctx.ui.custom<string | null>(
-            (tui: any, theme: any, _kb: any, done: any) => {
-              const mdTheme = getMarkdownTheme();
-              const planMd = new Markdown(planContent, 0, 0, mdTheme);
-              const planScroll = new ScrollView(planMd as any, {
-                overscroll: "contain",
-                scrollbar: "auto",
-                follow: "none",
-                primary: false,
-              });
-              try {
-                (planScroll as any).setScrollbarActive?.(true);
-              } catch (_e) {
-                void _e;
-              }
-              let collapsed = false;
-              const buildHeader = () =>
-                new Text(
-                  theme.fg(
-                    "accent",
-                    theme.bold(
-                      ` Plan: ${path.basename(planPath!)} ` +
-                        (collapsed
-                          ? "(collapsed — press c to expand)"
-                          : "(press c to collapse)"),
-                    ),
-                  ),
-                  1,
-                  0,
-                );
-              let headerText = buildHeader();
-              const choices = new Container();
-              choices.addChild(
-                new Text(
-                  theme.fg(
-                    "accent",
-                    theme.bold(" Plan complete — choose next step "),
-                  ),
-                  1,
-                  0,
-                ),
-              );
-              const list = new SelectList(items, Math.min(items.length, 8), {
-                selectedPrefix: (t: string) => theme.fg("accent", t),
-                selectedText: (t: string) => theme.fg("accent", t),
-                description: (t: string) => theme.fg("muted", t),
-                scrollInfo: (t: string) => theme.fg("dim", t),
-                noMatch: (t: string) => theme.fg("warning", t),
-              });
-              (list as any).onSelect = (it: SelectItem) => done(it.value);
-              (list as any).onCancel = () => done(null);
-              choices.addChild(list as any);
-              choices.addChild(
-                new Text(
-                  theme.fg(
-                    "dim",
-                    " ↑↓ navigate • enter select • esc dismiss • c collapse ",
-                  ),
-                  1,
-                  0,
-                ),
-              );
-              return {
-                render: (w: number) => {
-                  try {
-                    const termRows: number =
-                      (tui as any)?.terminal?.rows ??
-                      (tui as any)?.height ??
-                      30;
-                    const choiceLines = choices.render(w);
-                    const choiceH = choiceLines.length;
-                    const RESERVE = 3;
-                    const MIN_PLAN = 6;
-                    const MAX_PLAN = Math.max(MIN_PLAN, termRows - choiceH - 1);
-                    const planViewport = collapsed
-                      ? 0
-                      : Math.max(
-                          MIN_PLAN,
-                          Math.min(MAX_PLAN, termRows - 1 - choiceH - RESERVE),
-                        );
-                    const out: string[] = [];
-                    const hdr = buildHeader().render(w);
-                    out.push(...hdr);
-                    if (!collapsed) {
-                      const all: string[] = (planScroll as any).render
-                        ? (planScroll as any).render(w)
-                        : (planMd as any).render(w);
-                      try {
-                        (planScroll as any).updateLayout(
-                          all.length,
-                          planViewport,
-                          () => tui.requestRender(),
-                        );
-                      } catch (_e) {
-                        void _e;
-                      }
-                      const maxSt = Math.max(0, all.length - planViewport);
-                      if (((planScroll as any).scrollTop ?? 0) > maxSt) {
-                        try {
-                          (planScroll as any).scrollTo(maxSt);
-                        } catch (_e) {
-                          void _e;
-                        }
-                      }
-                      const st = Math.max(
-                        0,
-                        Math.min((planScroll as any).scrollTop ?? 0, maxSt),
-                      );
-                      out.push(...all.slice(st, st + planViewport));
-                    }
-                    out.push(...choiceLines);
-                    return out;
-                  } catch (_e) {
-                    void _e;
-                  }
-                  try {
-                    return choices.render(w);
-                  } catch (_ee) {
-                    void _ee;
-                    return [];
-                  }
-                },
-                invalidate: () => {
-                  try {
-                    (planScroll as any).invalidate?.();
-                  } catch (_e) {
-                    void _e;
-                  }
-                  try {
-                    choices.invalidate();
-                  } catch (_e) {
-                    void _e;
-                  }
-                  try {
-                    headerText.invalidate?.();
-                  } catch (_e) {
-                    void _e;
-                  }
-                },
-                handleInput: (d: string) => {
-                  if (d === "c" || d === "C") {
-                    collapsed = !collapsed;
-                    try {
-                      headerText = buildHeader();
-                    } catch (_e) {
-                      void _e;
-                    }
-                    try {
-                      (planScroll as any).scrollTo(0);
-                    } catch (_e) {
-                      void _e;
-                    }
-                    tui.requestRender();
-                    return;
-                  }
-                  const isWheel =
-                    d.startsWith("\x1b[<") || d.startsWith("\x1b[M");
-                  const isPageUp =
-                    matchesKey(d, Key.pageUp) || d.includes("[5~");
-                  const isPageDown =
-                    matchesKey(d, Key.pageDown) || d.includes("[6~");
-                  if (isWheel) {
-                    let dir = 0;
-                    if (d.includes(";")) {
-                      dir = d.includes("64") ? -1 : d.includes("65") ? 1 : 0;
-                      if (dir === 0)
-                        dir = d.includes("M") && d.includes("64") ? -3 : 3;
-                    } else {
-                      dir = d.charCodeAt(3) === 97 ? -3 : 3;
-                    }
-                    try {
-                      (planScroll as any).scrollBy(dir * 3);
-                    } catch (_e) {
-                      void _e;
-                    }
-                    tui.requestRender();
-                    return;
-                  }
-                  if (isPageUp || isPageDown) {
-                    const termRows: number =
-                      (tui as any)?.terminal?.rows ??
-                      (tui as any)?.height ??
-                      30;
-                    const delta = isPageUp
-                      ? -Math.max(6, Math.floor(termRows * 0.5))
-                      : Math.max(6, Math.floor(termRows * 0.5));
-                    try {
-                      (planScroll as any).scrollBy(delta);
-                    } catch (_e) {
-                      void _e;
-                    }
-                    tui.requestRender();
-                    return;
-                  }
-                  (list as any).handleInput(d);
-                  tui.requestRender();
-                },
-              };
-            },
-          );
-          try {
-            pi.appendEntry("workflow-handoff-result", {
-              at: Date.now(),
-              choice,
-              durationMs: Date.now() - handoffStart,
-              planPath,
-            });
-          } catch (_e) {
-            void _e;
-          }
-
-          if (choice === "execute") {
-            const resolvedPlan = planPath!;
-            let fallbackWrote = false;
-            try {
-              if (!fs.existsSync(resolvedPlan)) {
-                fs.mkdirSync(path.dirname(resolvedPlan), { recursive: true });
-                fs.writeFileSync(resolvedPlan, planTextForRender, "utf8");
-                fallbackWrote = true;
-              }
-            } catch (_e) {
-              void _e;
-            }
-            if (fallbackWrote) {
-              try {
-                ctx.ui.notify(
-                  "Plan was not on disk before handoff — persisted now as fallback (fix: write should happen in plan mode via write tool)",
-                  "warning",
-                );
-              } catch (_e) {
-                void _e;
-              }
-              try {
-                pi.appendEntry("workflow-fallback-write", {
-                  planPath: resolvedPlan,
-                  at: Date.now(),
-                });
-              } catch (_e) {
-                void _e;
-              }
-            }
-            enterBuildModeFromPlan(ctx as any, resolvedPlan);
-            updateStatus(ctx as any);
-            try {
-              const remainingList = formatTodoNumberedList(todoItems);
-              const todoListText = formatTodoNumberedList(todoItems, {
-                glyph: true,
-              });
-              const planTodoListMessage = {
-                customType: "workflow-todo-list",
-                content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-                display: true,
-              };
-              const firstTodo = todoItems[0];
-              const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : todoItems[0].text}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
-              (pi as any).sendMessage?.(planTodoListMessage, {
-                deliverAs: "followUp",
-              });
-              (pi as any).sendMessage?.(
-                {
-                  customType: "workflow-plan-execute",
-                  content: execMessage,
-                  display: true,
-                },
-                { triggerTurn: true, deliverAs: "followUp" },
-              );
-            } catch (_e) {
-              void _e;
-            }
-          } else if (choice === "refine") {
-            try {
-              overlayDepth += 1;
-              let refinement: string | null;
-              try {
-                refinement = await (ctx as any).ui.editor(
-                  "Refine the plan:",
-                  "",
-                );
-                if (refinement?.trim()) {
-                  try {
-                    await beginReviewCycle({
-                      reason: "refine",
-                      keepFindings: true,
-                    });
-                  } catch (_e) {
-                    void _e;
-                  }
-                  const todoListText = formatTodoNumberedList(todoItems, {
-                    glyph: true,
-                  });
-                  const planTodoListMessage = {
-                    customType: "workflow-todo-list",
-                    content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-                    display: true,
-                  };
-                  (pi as any).sendMessage?.(planTodoListMessage, {
-                    deliverAs: "followUp",
-                  });
-                  if ((pi as any).sendUserMessage) {
-                    (pi as any).sendUserMessage(refinement.trim(), {
-                      deliverAs: "followUp",
-                    });
-                  } else {
-                    (pi as any).sendMessage?.(refinement.trim(), {
-                      deliverAs: "followUp",
-                    });
-                  }
-                } else {
-                  ctx.ui.notify(
-                    "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
-                    "info",
-                  );
-                }
-              } finally {
-                overlayDepth = Math.max(0, overlayDepth - 1);
-              }
-            } catch (_e) {
-              void _e;
-              ctx.ui.notify(
-                "Refine: stay in plan mode. Tell me what to change, or ask more via questionnaire.",
-                "info",
-              );
-            }
-          } else {
-            ctx.ui.notify("Dismissed. Type your follow-up.", "info");
-          }
-        } finally {
-          clearPendingHandoffDecision();
-          persistState();
-          try {
-            (ctx as any).ui?.requestRender?.();
-          } catch (_e) {
-            void _e;
-          }
-        }
+        // One presenter for every handoff path: Plannotator first, then the
+        // native questionnaire (printed plan + bottom-pinned modal). It also
+        // closes the review turn and verifies Build before sending execute.
+        const presented = await presentPlanHandoff(ctx as ExtensionContext, {
+          planText: planTextForRender,
+          planPath,
+          source: manualReviewCycle ? "manual" : "auto",
+          presentation: "plannotator-then-native",
+          reason: "reviewed",
+          ...(reviewState?.verdict ? { verdict: reviewState.verdict } : {}),
+          ...(reviewState
+            ? { findingCount: reviewState.findings.length }
+            : {}),
+        });
+        if (presented === "browser") return;
       } else if (!planTextForRender) {
         // Never silent: no plan text found — diagnose and stay in plan mode
         try {
@@ -14038,6 +14170,8 @@ export default function workflowExtension(
         }
         if (age > 60_000) {
           clearPendingHandoffDecision();
+          // The stale gate owned the turn; release it with the decision.
+          if (reviewTurn === "handoff") endReviewTurn();
           persistState();
           try {
             ctx.ui.notify("Recovered stale handoff gate — retrying", "info");

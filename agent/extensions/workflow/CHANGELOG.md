@@ -2,6 +2,56 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — `/review-abort` is a real local exit
+
+A Plannotator failure could soft-lock Review: `/review-abort` re-opened the
+browser handoff, `requestPlanReview` cleared the pending decision but left
+`reviewTurn = "handoff"`, and the next abort answered *“No review running or
+paused.”* while the mode/prompt locks stayed on.
+
+- Abort is now a **strict local exit**: it stops the reviewer, resolves any
+  in-flight browser request, settles the gate with the author's plan, clears the
+  pause/decision, closes the review turn and presents the native handoff. It
+  never re-opens Plannotator.
+- Abort is **idempotent**. A residual turn, gate, pause or pending decision is
+  always cleaned; only a fully idle state answers
+  `Nothing to abort — no review, pause, or handoff is active.`
+- A round still in flight keeps the single-presentation rule: the waiting
+  `/review` / `runHandoff` caller presents once, never twice.
+
+### Changed — the handoff is a printed plan plus a bottom-sheet questionnaire
+
+The plan no longer lives inside the handoff pane (it pinned the modal and hid
+the choices behind a collapse key).
+
+- The plan is appended to the transcript as a display-only `workflow-handoff-plan`
+  entry (`pi.appendEntry` + renderer, never LLM context), bounded at 40K chars
+  with a trailer naming the full file.
+- The choices are the existing questionnaire view, bottom-pinned: **Approve plan
+  and go ahead (Build)**, **Give feedback (stay in Plan)**, **Skip for now (stay
+  in Plan)**, plus the built-in freeform row (typed text is feedback).
+- Every handoff path uses one presenter: automatic handoff, `/review`,
+  `/review-resume`, a closed browser tab and abort. Plannotator is tried first
+  except on abort; a Plannotator error/timeout/missing bridge now falls back to
+  the questionnaire instead of a warning-and-return.
+- **No execute turn without a verified Build**: `enterBuildModeFromPlan()` must
+  return `true` *and* the session must be in Build before the execute follow-up
+  is sent; `sendExecuteMessages()` refuses otherwise
+  (`workflow-handoff-blocked-build`). This fixes the reported “starts building
+  but stays in Plan mode” failure.
+
+### Changed — the review turn is the lock's single source of truth
+
+`reviewModeLockKind()` now takes the turn phase, so a leftover `running` /
+`handoff` / `paused` / `transition` turn locks modes exactly like the round and
+pause predicates. Every failure/teardown exit closes the turn through one
+`closeReviewTurn()` finalizer, the headless fallback and closed-tab paths no
+longer leak it, and `/review-status` reports `turn`, `gate` and a `residual`
+hint. `/review-pause` / `/review-resume` name a waiting handoff instead of
+claiming nothing is running.
+
 ## [0.11.1] - 2026-11-15
 
 ### Features

@@ -491,8 +491,8 @@ export interface FakeCtxOptions {
   selectAnswer?: string | undefined;
   /** Per-dialog answers, consumed in order before falling back to selectAnswer. */
   selectAnswers?: Array<string | undefined>;
-  /** Value returned by `ui.custom` (the inline handoff choice). */
-  customAnswer?: string | null;
+  /** Value returned by `ui.custom` (native handoff questionnaire result). */
+  customAnswer?: unknown;
   /** Value returned by `ui.editor` (e.g. the inline Refine text). */
   editorAnswer?: string | null;
   /** Value returned by `ui.confirm` (default true). */
@@ -514,6 +514,8 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   }> = [];
   const confirms: Array<{ title: string; message: string }> = [];
   const selects: Array<{ title: string; options: unknown[] }> = [];
+  /** One entry per `ctx.ui.custom` call (the native handoff modal). */
+  const customs: Array<{ options?: unknown }> = [];
   const ctx = {
     cwd: over.cwd,
     mode: "tui",
@@ -536,7 +538,8 @@ export function makeFakeCtx(over: FakeCtxOptions) {
         }
         return over.selectAnswer;
       },
-      async custom() {
+      async custom(_factory?: unknown, options?: unknown) {
+        customs.push({ options });
         return over.customAnswer ?? null;
       },
       async editor() {
@@ -577,6 +580,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     widgetCalls,
     confirms,
     selects,
+    customs,
   };
 }
 

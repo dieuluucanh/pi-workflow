@@ -17,16 +17,23 @@
  * entry must render something readable instead of throwing.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
-import type {
-  EntryRenderer,
-  ThemeColor,
+import { Markdown, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  getMarkdownTheme,
+  type EntryRenderer,
+  type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import {
   REVIEW_SUBMITTED_ENTRY_TYPE,
   type ReviewLineKind,
   type ReviewTranscriptOp,
 } from "./review.ts";
+import {
+  HANDOFF_PLAN_ENTRY_TYPE,
+  capHandoffPlanText,
+  handoffReasonLabel,
+  type HandoffPlanEntryData,
+} from "./handoff-view.ts";
 
 /** Custom entry type for Plan/Review/Review-done bands. */
 export const REVIEW_MODE_ENTRY_TYPE = "workflow-review-mode";
@@ -412,6 +419,59 @@ export function createReviewEntryComponent(
   };
 }
 
+/**
+ * Render the `workflow-handoff-plan` entry: the plan is printed into the
+ * transcript (scrollable, durable) while the handoff questionnaire stays a
+ * compact bottom overlay. `Markdown` is deliberate here — the other renderers
+ * emit pre-formatted lines truncated with `truncateToWidth`, which would clip
+ * long plan lines instead of wrapping them.
+ */
+export function createHandoffPlanComponent(
+  data: HandoffPlanEntryData | undefined,
+  theme: ThemeLike,
+): ReviewEntryComponent {
+  const planPath =
+    data && typeof data.planPath === "string" ? data.planPath : "";
+  const reason =
+    data && typeof data.reason === "string" ? data.reason : "reviewed";
+  const base = (() => {
+    if (!planPath) return "(no plan file)";
+    const parts = planPath.split(/[\\/]/).filter(Boolean);
+    return parts.at(-1) ?? planPath;
+  })();
+  const capped = capHandoffPlanText(data?.planText, planPath);
+  let markdown: Markdown | undefined;
+  return {
+    render(width: number): string[] {
+      const w = Math.max(1, Math.trunc(Number(width) || 80));
+      const header =
+        theme.fg("accent", theme.bold("▌ PLAN HANDOFF")) +
+        theme.fg("muted", `  ${base} · ${handoffReasonLabel(reason)}`);
+      const out: string[] = [truncateToWidth(header, w, "…")];
+      try {
+        const body = markdown
+          ? markdown.render(w)
+          : new Markdown(capped.text, 0, 0, getMarkdownTheme()).render(w);
+        out.push(...body);
+      } catch {
+        // A malformed plan must render something readable, never throw.
+        for (const line of capped.text.split(/\r?\n/)) {
+          out.push(truncateToWidth(line, w, "…"));
+        }
+      }
+      return out;
+    },
+    invalidate(): void {
+      try {
+        markdown?.invalidate();
+      } catch {
+        /* ignore */
+      }
+      markdown = undefined;
+    },
+  };
+}
+
 /** The subset of `ExtensionAPI` this module needs (test-friendly). */
 export interface EntryRendererHost {
   registerEntryRenderer<T = unknown>(
@@ -441,5 +501,10 @@ export function registerReviewEntryRenderers(host: EntryRendererHost): void {
     REVIEW_SUBMITTED_ENTRY_TYPE,
     (entry, _options, theme) =>
       createReviewEntryComponent(formatReviewSubmittedEntry(entry?.data, theme)),
+  );
+  host.registerEntryRenderer<HandoffPlanEntryData>(
+    HANDOFF_PLAN_ENTRY_TYPE,
+    (entry, _options, theme) =>
+      createHandoffPlanComponent(entry?.data, theme),
   );
 }

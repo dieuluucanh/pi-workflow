@@ -1813,6 +1813,12 @@ export interface ReviewModeLockInput {
   paused?: boolean;
   /** The gated handoff phase; `"auditing"` counts as running. */
   gatePhase?: ReviewHandoffPhase;
+  /**
+   * The exclusive review turn (`reviewTurn`). Authoritative: a non-idle turn
+   * always owns the session, even when no round/pause/gate/decision exists —
+   * that is what closes the "locked but nothing abortable" soft-lock.
+   */
+  turn?: ReviewTurnPhase;
   /** The browser/inline decision owns the session. */
   handoff?: boolean;
   /** A decision is being applied (stop reviewer -> mode -> follow-up). */
@@ -1839,6 +1845,13 @@ export function reviewModeLockKind(
   }
   if (input.gatePhase === "paused") return "paused";
   if (input.gatePhase === "auditing") return "running";
+  // The exclusive turn is the single source of truth for the remaining
+  // phases: a bare `running`/`handoff`/`paused`/`transition` turn must lock
+  // modes even when the round/pause/gate predicates are all clear.
+  if (input.turn === "transition") return "transition";
+  if (input.turn === "paused") return "paused";
+  if (input.turn === "handoff") return "handoff";
+  if (input.turn === "running") return "running";
   if (input.transition === true) return "transition";
   if (input.handoff === true) return "handoff";
   return undefined;
@@ -1900,7 +1913,7 @@ export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
     return "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop.";
   }
   if (kind === "handoff") {
-    return "Review decision pending — mode switching is locked. Approve or annotate in the review tab, or /review-abort to skip.";
+    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review-abort to hand the plan off now.";
   }
   if (kind === "transition") {
     return "Review decision is being applied — mode switching is briefly locked.";

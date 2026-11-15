@@ -2707,7 +2707,7 @@ test("reviewFooterSegment composes the footer review state", () => {
 
 // ══ Mode-switch lock (plan 2026-10-25) ═══════════════════════════════
 
-test("reviewModeLockKind locks running and paused reviews only", () => {
+test("reviewModeLockKind locks running, paused, handoff and transition", () => {
   assert.equal(reviewModeLockKind({}), undefined);
   assert.equal(
     reviewModeLockKind({ gatePhase: "idle" }),
@@ -2733,6 +2733,26 @@ test("reviewModeLockKind locks running and paused reviews only", () => {
     "running",
     "a resumed round must not be masked by a stale paused gate phase",
   );
+  // The exclusive turn is authoritative even when no round/pause/gate/decision
+  // exists: a leaked turn must never silently unlock the modes (2026-11-15).
+  assert.equal(reviewModeLockKind({ turn: "running" }), "running");
+  assert.equal(reviewModeLockKind({ turn: "paused" }), "paused");
+  assert.equal(reviewModeLockKind({ turn: "handoff" }), "handoff");
+  assert.equal(reviewModeLockKind({ turn: "transition" }), "transition");
+  assert.equal(reviewModeLockKind({ turn: "idle" }), undefined);
+  // A live round/pause still wins over a stale turn phase.
+  assert.equal(
+    reviewModeLockKind({ turn: "handoff", roundActive: true }),
+    "running",
+  );
+  assert.equal(
+    reviewModeLockKind({ turn: "handoff", paused: true }),
+    "paused",
+  );
+  assert.equal(
+    reviewModeLockKind({ turn: "running", gatePhase: "paused" }),
+    "paused",
+  );
 });
 
 test("reviewGatePhaseOnResume makes a gated pause auditing again", () => {
@@ -2755,7 +2775,16 @@ test("reviewModeLockNotice names only the allowed review exits", () => {
   assert.ok(!paused.includes("ESC"), "ESC is a pause, not a resume");
   assert.ok(
     reviewModeLockNotice("handoff").includes("decision pending"),
-    "handoff names the browser decision",
+    "handoff names the pending decision",
+  );
+  const handoffNotice = reviewModeLockNotice("handoff");
+  assert.ok(
+    handoffNotice.includes("Approve / Feedback / Skip"),
+    "handoff names the native questionnaire options",
+  );
+  assert.ok(
+    !handoffNotice.includes("review tab"),
+    "handoff does not promise a browser-only exit",
   );
   assert.ok(
     reviewModeLockNotice("transition").includes("being applied"),

@@ -291,7 +291,7 @@ test("createReviewEntryComponent: every line is width-bounded", () => {
   c.invalidate();
 });
 
-test("registerReviewEntryRenderers: registers exactly the three entry types", () => {
+test("registerReviewEntryRenderers: registers every transcript entry type", () => {
   const registered: string[] = [];
   const host: EntryRendererHost = {
     registerEntryRenderer(customType, _renderer) {
@@ -300,6 +300,7 @@ test("registerReviewEntryRenderers: registers exactly the three entry types", ()
   };
   registerReviewEntryRenderers(host);
   assert.deepEqual([...registered].sort(), [
+    "workflow-handoff-plan",
     "workflow-review-mode",
     "workflow-review-submitted",
     "workflow-review-transcript",
