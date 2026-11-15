@@ -5,6 +5,7 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isCommandAllowedForRole } from "./permissions.ts";
@@ -72,6 +73,103 @@ export function translateForeignPath(value: unknown): {
     return { path: raw, uncertain: true };
   }
   return { path: raw };
+}
+
+/** Options for the Git-Bash `/tmp` translator (injectable for tests). */
+export interface MsysPathOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  exists?: (value: string) => boolean;
+  /** Only translate when the session cwd is a native Windows path. */
+  cwd?: string;
+}
+
+/** A native Windows absolute path (drive-absolute or UNC). */
+export function isNativeWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+let msysTempCache: { key: string; root: string | undefined } | undefined;
+
+function msysTempCacheKey(env: NodeJS.ProcessEnv): string {
+  return [
+    env.MSYSTEM ?? "",
+    env.SHELL ?? "",
+    env.ProgramFiles ?? "",
+    env.PI_MSYS_TMP ?? "",
+    env.TMP ?? "",
+    env.TEMP ?? "",
+    env.TMPDIR ?? "",
+    env.LOCALAPPDATA ?? "",
+    env.USERPROFILE ?? "",
+  ].join("\0");
+}
+
+/**
+ * The real Windows directory behind Git-Bash's `/tmp`.
+ *
+ * Only meaningful for MSYS/Git-Bash (Pi's default Windows shell): Git for
+ * Windows is detected by `%ProgramFiles%\Git\bin\bash.exe`, `MSYSTEM`, or a
+ * bash `SHELL`. Candidates are tried in order and the first existing one
+ * wins. Injected `env`/`exists` options bypass the cache (tests); no
+ * `cygpath` subprocess.
+ */
+export function resolveMsysTempRoot(
+  opts: MsysPathOptions = {},
+): string | undefined {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return undefined;
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? fs.existsSync;
+  const injected =
+    opts.env !== undefined ||
+    opts.exists !== undefined ||
+    opts.platform !== undefined;
+  const key = msysTempCacheKey(env);
+  if (!injected && msysTempCache?.key === key) return msysTempCache.root;
+  const enabled =
+    Boolean(env.PI_MSYS_TMP) ||
+    Boolean(env.MSYSTEM) ||
+    /bash(?:\.exe)?$/i.test(env.SHELL ?? "") ||
+    Boolean(
+      env.ProgramFiles &&
+        exists(path.join(env.ProgramFiles, "Git", "bin", "bash.exe")),
+    );
+  if (!enabled) {
+    if (!injected) msysTempCache = { key, root: undefined };
+    return undefined;
+  }
+  const candidates: string[] = [];
+  if (env.PI_MSYS_TMP && isNativeWindowsPath(env.PI_MSYS_TMP))
+    candidates.push(env.PI_MSYS_TMP);
+  for (const value of [env.TMP, env.TEMP, env.TMPDIR]) {
+    if (value && isNativeWindowsPath(value)) candidates.push(value);
+  }
+  if (env.LOCALAPPDATA)
+    candidates.push(path.join(env.LOCALAPPDATA, "Temp"));
+  if (env.USERPROFILE)
+    candidates.push(path.join(env.USERPROFILE, "AppData", "Local", "Temp"));
+  const root = candidates.find((candidate) => exists(candidate));
+  if (!injected) msysTempCache = { key, root };
+  return root;
+}
+
+/**
+ * Translate the literal `/tmp` prefix (and only that) to the real Windows
+ * temp directory for a POSIX shell. Direct tool paths keep Node semantics
+ * (`/tmp` really is `C:/tmp` there), so callers opt in.
+ */
+export function translateMsysTempPath(
+  value: string,
+  opts: MsysPathOptions = {},
+): string {
+  if (!value) return value;
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return value;
+  if (!/^\/tmp(?=\/|$)/.test(value)) return value;
+  if (opts.cwd && !isNativeWindowsPath(opts.cwd)) return value;
+  const root = resolveMsysTempRoot(opts);
+  return root ? `${root}${value.slice(4)}` : value;
 }
 
 /**

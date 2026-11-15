@@ -19,8 +19,10 @@ import {
   DEFAULT_FOLDER_POLICY_CONFIG,
   DEFAULT_SENSITIVE_EXEMPTIONS,
   DEFAULT_SENSITIVE_PATTERNS,
+  EXCLUDE_USAGE,
   FOLDER_POLICY_KEY,
   baseFolderRoots,
+  broadGrantRootReason,
   canonicalizePolicyPath,
   coerceFolderPolicyConfig,
   combineGateDecisions,
@@ -30,6 +32,7 @@ import {
   detectRepoRoot,
   effectiveSensitiveExemptions,
   evaluateFolderTargets,
+  evaluateBaseCoverage,
   extractFolderPolicyRaw,
   folderPolicyArgumentCompletions,
   folderPolicyConfigPaths,
@@ -42,9 +45,11 @@ import {
   mergeFolderPolicyConfig,
   normalizeExcludePattern,
   normalizePolicyPath,
+  parseExcludeArgs,
   readFolderPolicyConfig,
   resolveFolderRoots,
   revokeFolderPolicyListEntry,
+  splitPolicyArgs,
   writeFolderPolicyConfig,
 } from "./folder-policy.ts";
 import { WORKFLOW_SETTINGS_KEY, commitConfigPaths } from "./commit-policy.ts";
@@ -892,6 +897,61 @@ test("broad: roots/home are refused, project folders are not", () => {
   assert.equal(isBroadGrantRoot(path.join(os.homedir(), "projects", "app")), false);
 });
 
+test("broad: reasons name the root/home/protected folder", () => {
+  assert.match(
+    broadGrantRootReason(path.parse(process.cwd()).root) ?? "",
+    /filesystem root/,
+  );
+  assert.match(broadGrantRootReason(os.homedir()) ?? "", /home folder/);
+  assert.match(
+    broadGrantRootReason(path.join(os.homedir(), "..")) ?? "",
+    /parent folder of your home/,
+  );
+  assert.equal(
+    broadGrantRootReason(
+      path.join(path.parse(process.cwd()).root, "pi-grant-probe"),
+    ),
+    undefined,
+  );
+  if (process.platform === "win32") {
+    assert.match(
+      broadGrantRootReason(path.join(os.homedir(), "AppData")) ?? "",
+      /protected system folder/,
+    );
+  } else {
+    assert.match(broadGrantRootReason("/etc") ?? "", /protected system folder/);
+    assert.equal(broadGrantRootReason("/etc/ssl/certs"), undefined);
+  }
+});
+
+test("broad: protected roots only, not every depth-1 folder", () => {
+  const root = path.parse(process.cwd()).root;
+  // The reported case: a drive/FS top-level folder is neither a root nor home.
+  assert.equal(isBroadGrantRoot(path.join(root, "pi-grant-probe")), false);
+  assert.equal(isBroadGrantRoot(path.join(os.homedir(), "..")), true);
+  if (process.platform === "win32") {
+    const home = os.homedir();
+    assert.equal(isBroadGrantRoot(path.join(home, "AppData")), true);
+    assert.equal(isBroadGrantRoot(path.join(home, "AppData", "Local")), true);
+    assert.equal(
+      isBroadGrantRoot(path.join(home, "AppData", "Local", "Temp")),
+      false,
+    );
+    assert.equal(isBroadGrantRoot(path.join(root, "tmp")), false);
+    assert.equal(
+      isBroadGrantRoot(
+        path.join(process.env.SystemRoot ?? path.join(root, "Windows")),
+      ),
+      true,
+    );
+  } else {
+    assert.equal(isBroadGrantRoot("/etc"), true);
+    assert.equal(isBroadGrantRoot("/etc/ssl/certs"), false);
+    assert.equal(isBroadGrantRoot("/tmp"), false);
+    assert.equal(isBroadGrantRoot("/var/tmp"), false);
+  }
+});
+
 test("completions: subcommands and scopes follow the full-argument contract", () => {
   const first = folderPolicyArgumentCompletions("");
   assert.ok(first?.some((item) => item.value === "repo"));
@@ -1219,5 +1279,215 @@ test("lock: PI_FOLDER_POLICY_DENY carries exclusions and sensitive extras", () =
       delete process.env.PI_FOLDER_POLICY_SOURCE;
     else process.env.PI_FOLDER_POLICY_SOURCE = previous.source;
     cleanup();
+  }
+});
+
+// ── /folder-policy argument parsing ──────────────────────────────────
+
+test("args: the splitter honours quotes, keeps backslashes and rejects an open quote", () => {
+  assert.deepEqual(splitPolicyArgs("exclude C:/Personal").tokens, [
+    "exclude",
+    "C:/Personal",
+  ]);
+  assert.deepEqual(splitPolicyArgs('exclude "C:/My Documents"').tokens, [
+    "exclude",
+    "C:/My Documents",
+  ]);
+  assert.deepEqual(splitPolicyArgs("exclude 'D:/Data/R&D'").tokens, [
+    "exclude",
+    "D:/Data/R&D",
+  ]);
+  // Windows backslashes are literal, never escapes.
+  assert.deepEqual(splitPolicyArgs("exclude C:\\Personal\\x").tokens, [
+    "exclude",
+    "C:\\Personal\\x",
+  ]);
+  // The other quote kind is literal inside a quoted word.
+  assert.deepEqual(splitPolicyArgs(`exclude "C:/it's here"`).tokens, [
+    "exclude",
+    "C:/it's here",
+  ]);
+  assert.deepEqual(splitPolicyArgs("   ").tokens, []);
+  assert.deepEqual(splitPolicyArgs(undefined).tokens, []);
+  // An explicitly empty quoted argument is kept so the caller can reject it.
+  assert.deepEqual(splitPolicyArgs('exclude ""').tokens, ["exclude", ""]);
+  const unbalanced = splitPolicyArgs('exclude "C:/My Documents');
+  assert.deepEqual(unbalanced.tokens, []);
+  assert.match(String(unbalanced.error), /Unbalanced double quote/);
+  assert.match(String(splitPolicyArgs("exclude 'x").error), /single quote/);
+});
+
+test("args: exclude parsing is flags-only and rejects leftovers", () => {
+  assert.deepEqual(parseExcludeArgs(["C:/Personal"]), {
+    ok: true,
+    action: "add",
+    scope: "global",
+    pattern: "C:/Personal",
+  });
+  assert.deepEqual(parseExcludeArgs(["C:/Personal", "--project"]), {
+    ok: true,
+    action: "add",
+    scope: "project",
+    pattern: "C:/Personal",
+  });
+  assert.deepEqual(parseExcludeArgs(["add", "C:/My Documents"]), {
+    ok: true,
+    action: "add",
+    scope: "global",
+    pattern: "C:/My Documents",
+  });
+  assert.deepEqual(parseExcludeArgs(["revoke", "C:/Personal", "--global"]), {
+    ok: true,
+    action: "revoke",
+    scope: "global",
+    pattern: "C:/Personal",
+  });
+  assert.equal(
+    (parseExcludeArgs(["remove", "x"]) as { action: string }).action,
+    "revoke",
+  );
+  assert.deepEqual(parseExcludeArgs([]), {
+    ok: true,
+    action: "list",
+    scope: "global",
+  });
+  assert.deepEqual(parseExcludeArgs(["list", "--project"]), {
+    ok: true,
+    action: "list",
+    scope: "project",
+  });
+  // A folder literally named `project` is a pattern, not a scope flip.
+  assert.deepEqual(parseExcludeArgs(["add", "project"]), {
+    ok: true,
+    action: "add",
+    scope: "global",
+    pattern: "project",
+  });
+  const trailing = parseExcludeArgs(["C:/X", "project"]);
+  assert.equal(trailing.ok, false);
+  assert.match(
+    String((trailing as { message: string }).message),
+    /Unexpected argument `project`/,
+  );
+  for (const bad of [
+    ["add"],
+    ["revoke"],
+    ["list", "extra"],
+    ["--global", "--project", "C:/X"],
+    ["--nope", "C:/X"],
+    ["C:/X", "extra"],
+  ]) {
+    const result = parseExcludeArgs(bad);
+    assert.equal(result.ok, false, `expected ${bad.join(" ")} to be rejected`);
+    assert.match(
+      String((result as { message: string }).message),
+      /Usage|Unknown flag/,
+    );
+  }
+  // The usage line is part of every rejection so the user can recover.
+  assert.match(
+    EXCLUDE_USAGE,
+    /exclude <path>\|add <path>\|revoke <path>\|list/,
+  );
+});
+
+// ── base coverage: per capability, grant-aware ──────────────────────
+
+test("base coverage: each capability is judged with its own grants", () => {
+  const { cwd, cleanup } = tmpCwd();
+  try {
+    const config = { ...DEFAULT_FOLDER_POLICY_CONFIG, mode: "cwd" as const };
+    // No exclusion: every capability is clean and nothing is attributed to a grant.
+    const plain = evaluateBaseCoverage({ config, cwd });
+    assert.deepEqual(
+      plain.map((entry) => entry.capability),
+      ["read", "write", "commit"],
+    );
+    assert.ok(plain.every((entry) => entry.excluded.length === 0));
+    assert.ok(plain.every((entry) => entry.rescuedBy === undefined));
+
+    // The base itself is excluded: every capability is blocked, no rescue.
+    const excluded = { ...config, excludePaths: [cwd] };
+    const blocked = evaluateBaseCoverage({ config: excluded, cwd });
+    assert.ok(blocked.every((entry) => entry.excluded.length === 1));
+    assert.ok(blocked.every((entry) => entry.rescuedBy === undefined));
+
+    // A read grant exactly on the excluded base rescues read only.
+    const readOnly = evaluateBaseCoverage({
+      config: excluded,
+      cwd,
+      grantsByCapability: { read: [cwd] },
+    });
+    const read = readOnly.find((entry) => entry.capability === "read");
+    assert.equal(read?.excluded.length, 0);
+    assert.ok(read?.rescuedBy);
+    for (const capability of ["write", "commit"] as const) {
+      const entry = readOnly.find((item) => item.capability === capability);
+      assert.equal(entry?.excluded.length, 1, `${capability} stays blocked`);
+      assert.equal(entry?.rescuedBy, undefined);
+    }
+
+    // The session folder strictly inside the exclusion is rescued implicitly.
+    const inner = path.join(cwd, "project");
+    fs.mkdirSync(inner, { recursive: true });
+    const nested = evaluateBaseCoverage({
+      config: { ...DEFAULT_FOLDER_POLICY_CONFIG, mode: "cwd", excludePaths: [cwd] },
+      cwd: inner,
+    });
+    assert.ok(nested.every((entry) => entry.excluded.length === 0));
+    assert.ok(nested.every((entry) => entry.rescuedBy === undefined));
+  } finally {
+    cleanup();
+  }
+});
+
+// ── completions and the parser must agree ───────────────────────────
+
+test("completions: every advertised exclude form is accepted by the parser", () => {
+  const verbs = folderPolicyArgumentCompletions("exclude ") ?? [];
+  assert.ok(verbs.some((item) => item.value === "exclude add"));
+  assert.ok(verbs.some((item) => item.value === "exclude revoke"));
+  assert.ok(verbs.some((item) => item.value === "exclude list"));
+  for (const candidate of verbs) {
+    const split = splitPolicyArgs(candidate.value);
+    assert.equal(split.error, undefined, candidate.value);
+    const parsed = parseExcludeArgs(split.tokens.slice(1));
+    // `add`/`revoke` are prefixes that still need a path; `list` is complete.
+    if (
+      candidate.value === "exclude add" ||
+      candidate.value === "exclude revoke"
+    ) {
+      assert.equal(parsed.ok, false, candidate.value);
+      assert.match(
+        String((parsed as { message: string }).message),
+        /needs a path/,
+      );
+    } else {
+      assert.equal(parsed.ok, true, `${candidate.value} should parse`);
+    }
+  }
+
+  // Scope flags are offered only where the parser accepts them (after a verb).
+  const scoped = folderPolicyArgumentCompletions("exclude add ") ?? [];
+  assert.ok(scoped.length > 0);
+  for (const candidate of scoped) {
+    const split = splitPolicyArgs(candidate.value);
+    const parsed = parseExcludeArgs(split.tokens.slice(1));
+    // A bare `add --project` still needs a path: the flag parses, the verb fails.
+    assert.equal(parsed.ok, false, candidate.value);
+    assert.match(
+      String((parsed as { message: string }).message),
+      /needs a path/,
+    );
+  }
+
+  // No completion advertises a flag the parser would reject.
+  assert.equal(folderPolicyArgumentCompletions("exclude --bogus "), null);
+  const withPath = folderPolicyArgumentCompletions("exclude add --project ");
+  assert.equal(withPath, null, "free-form paths have no completion");
+  // Every completion that includes a flag still parses once a path is present.
+  for (const flag of ["--global", "--project"]) {
+    const parsed = parseExcludeArgs(["add", "C:/X", flag]);
+    assert.equal(parsed.ok, true, `${flag} should be accepted`);
   }
 });

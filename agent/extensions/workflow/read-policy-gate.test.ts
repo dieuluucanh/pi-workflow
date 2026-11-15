@@ -35,7 +35,7 @@ async function boot(
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx, selects } = makeFakeCtx({
+  const { ctx, selects, notifies } = makeFakeCtx({
     cwd,
     hasUI,
     projectTrusted,
@@ -52,7 +52,7 @@ async function boot(
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { cwd, pi, ctx, selects, cleanup };
+  return { cwd, pi, ctx, selects, notifies, cleanup };
 }
 
 function call(
@@ -351,6 +351,110 @@ test("read: Always allow persists a project-scoped read grant", async () => {
         p.includes("shared"),
       ),
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: Always allow persists a top-level folder (the reported case)", async () => {
+  const { cwd, pi, ctx, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+      },
+    },
+    true,
+    true,
+    "Always allow this folder",
+  );
+  try {
+    // A drive/file-system top-level folder: depth 1, but neither a root nor
+    // home. The old depth<=1 rule refused it as "too broad".
+    const target = path.join(path.parse(cwd).root, "pi-grant-probe", "x.ts");
+    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.ok(
+      project.workflow.readPolicy.allowedPaths.some((p: string) =>
+        p.includes("pi-grant-probe"),
+      ),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: a protected root offers no Always and runs once", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+      },
+    },
+    true,
+    true,
+    "Allow once (this turn)",
+  );
+  try {
+    assert.equal(await call(pi, ctx, "read", { path: path.parse(cwd).root }), undefined);
+    assert.equal(selects.length, 1);
+    assert.ok(
+      !selects[0]?.options.some((option) =>
+        String(option).startsWith("Always allow"),
+      ),
+      "a filesystem root must not offer a one-click grant",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: a forced Always on a protected root allows once and warns", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+      },
+    },
+    true,
+    true,
+    "Always allow this folder",
+  );
+  try {
+    assert.equal(await call(pi, ctx, "read", { path: path.parse(cwd).root }), undefined);
+    assert.ok(
+      notifies.some((entry) => entry.level === "warning"),
+      "the refused grant must be reported, not silently persisted",
+    );
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(project.workflow?.readPolicy?.allowedPaths ?? [], []);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: an untrusted project's Always allows once and warns", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+      },
+    },
+    true,
+    false,
+    "Always allow this folder",
+  );
+  try {
+    const target = path.join(cwd, "..", "outside-untrusted", "x.ts");
+    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
+    assert.ok(notifies.some((entry) => entry.level === "warning"));
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(project.workflow?.readPolicy?.allowedPaths ?? [], []);
   } finally {
     await cleanup();
   }

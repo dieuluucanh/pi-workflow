@@ -181,7 +181,9 @@ export function classifyReadCall(
   const result: ReadCallClassification = { tool, targets: [], uncertain: [] };
 
   if (tool === "bash" || tool === "powershell") {
-    const analysis = analyzeShellPaths(obj.command, cwd);
+    const analysis = analyzeShellPaths(obj.command, cwd, {
+      family: tool === "powershell" ? "powershell" : "posix",
+    });
     result.targets = analysis.reads;
     result.uncertain = analysis.uncertain;
     return result;

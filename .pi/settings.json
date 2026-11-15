@@ -2,10 +2,19 @@
   "workflow": {
     "readPolicy": {
       "allowedPaths": [
-        "c:/users/lenovo/projects"
+        "c:/users/lenovo/projects",
+        "c:/users/lenovo/appdata/local/temp"
       ],
       "shell": "paths",
       "guardedTools": []
+    },
+    "writePolicy": {
+      "mode": "allow",
+      "allowedPaths": [
+        "c:/users/lenovo/appdata/local/temp"
+      ],
+      "allowedCommands": [],
+      "mutatingTools": []
     }
   }
 }

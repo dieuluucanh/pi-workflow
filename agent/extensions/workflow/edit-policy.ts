@@ -719,10 +719,11 @@ export function sanitizeWriteInstruction(raw: unknown): string {
  */
 export function writeGateOptions(
   kind: WriteGateOptionKind,
+  opts: { allowAlways?: boolean } = {},
 ): readonly string[] {
   return [
     "Allow once (this turn)",
-    writeGateAlwaysLabel(kind),
+    ...(opts.allowAlways !== false ? [writeGateAlwaysLabel(kind)] : []),
     "Deny",
     WRITE_DENY_WITH_INSTRUCTIONS_LABEL,
   ];
@@ -1017,9 +1018,13 @@ export function writeGateTitle(
   items: readonly WriteGateItem[],
   source: WriteGateSource = "write",
   base?: string,
+  opts: { grantBlockedReason?: string } = {},
 ): string {
   const outside =
     source === "folder" && base ? `\nOutside: ${base}` : "";
+  const blocked = opts.grantBlockedReason
+    ? `\nGrant not available: ${opts.grantBlockedReason}`
+    : "";
   const header =
     source === "folder"
       ? "Folder policy 'ask': allow this write outside the permitted folders?"
@@ -1034,7 +1039,8 @@ export function writeGateTitle(
       header +
       outside +
       (target ? `\nTarget: ${target}` : "") +
-      (reason && reason !== target ? `\nReason: ${reason}` : "")
+      (reason && reason !== target ? `\nReason: ${reason}` : "") +
+      blocked
     );
   }
   const lines = items
@@ -1048,7 +1054,7 @@ export function writeGateTitle(
       : source === "mixed"
         ? `Permission required: allow these ${items.length} writes? (write policy and folder policy are 'ask')`
         : `Write policy 'ask': allow these ${items.length} writes?`;
-  return `${many}${outside}\n${lines.join("\n")}`;
+  return `${many}${outside}\n${lines.join("\n")}${blocked}`;
 }
 
 // ── Argument completions (/write-policy) ────────────────────────────

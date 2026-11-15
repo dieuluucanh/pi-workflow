@@ -22,8 +22,8 @@
     "command-code/deepseek/deepseek-v4.1-flash"
   ],
   "defaultThinkingLevel": "high",
-  "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4.1-flash",
+  "defaultProvider": "command-code",
+  "defaultModel": "deepseek/deepseek-v4.1-flash",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -50,14 +50,26 @@
       "mutatingTools": []
     },
     "modelDefault": {
-      "provider": "opencode-go",
-      "id": "deepseek-v4.1-flash",
+      "provider": "command-code",
+      "id": "deepseek/deepseek-v4.1-flash",
       "thinking": "high"
     },
-    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
+    "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
     "commitPolicy": {
-      "mode": "allow",
+      "mode": "never",
       "allowedPaths": []
+    },
+    "folderPolicy": {
+      "mode": "repo",
+      "outside": "ask",
+      "grantScope": "project",
+      "sensitiveTemplates": "allow",
+      "sensitivePatterns": [],
+      "sensitiveExemptions": [],
+      "excludePaths": [
+        "C:/",
+        "C:/Personal"
+      ]
     }
   },
   "extensionChangelogVersions": {

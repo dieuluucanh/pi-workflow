@@ -47,7 +47,7 @@ async function boot(
   await workflowExtension(pi as never, {
     loadSdk: async () => ({}) as never,
   });
-  const { ctx, selects } = makeFakeCtx({
+  const { ctx, selects, notifies } = makeFakeCtx({
     cwd,
     hasUI: true,
     projectTrusted: options.projectTrusted !== false,
@@ -65,7 +65,7 @@ async function boot(
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   };
-  return { root, cwd, agentDir, pi, ctx, selects, cleanup };
+  return { root, cwd, agentDir, pi, ctx, selects, notifies, cleanup };
 }
 
 let callSeq = 0;
@@ -281,8 +281,8 @@ test("commit: a staged .env blocks git commit", async () => {
   }
 });
 
-test("commit: unsafe folder grant is refused when the project is untrusted", async () => {
-  const { agentDir, pi, ctx, cleanup } = await boot(
+test("commit: an untrusted project's Always allows once and warns", async () => {
+  const { agentDir, pi, ctx, notifies, cleanup } = await boot(
     {
       workflow: {
         folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
@@ -302,8 +302,16 @@ test("commit: unsafe folder grant is refused when the project is untrusted", asy
       "utf8",
     );
     const result = await commitCall(pi, ctx, "git -C ../other add x.txt");
-    assert.ok(result && (result as any).block);
-    assert.match(String((result as any).reason), /trusted|trust/i);
+    assert.equal(
+      result,
+      undefined,
+      "an approved commit must not be denied just because the grant cannot persist",
+    );
+    assert.ok(notifies.some((entry) => entry.level === "warning"));
+    const project = JSON.parse(
+      fs.readFileSync(path.join(ctx.cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(project.workflow?.commitPolicy?.allowedPaths ?? [], []);
   } finally {
     await cleanup();
   }

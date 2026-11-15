@@ -14,6 +14,7 @@ import * as path from "node:path";
 
 import { analyzeShellPaths, type ShellPathAnalysis } from "./shell-paths.ts";
 import { normalizePolicyPath } from "./folder-policy.ts";
+import { resolveMsysTempRoot, translateMsysTempPath } from "./utils.ts";
 
 const CWD = path.resolve(process.cwd());
 
@@ -250,4 +251,125 @@ test("no invention: read-only unknown commands with plain args have no targets",
 test("empty/non-string commands are total", () => {
   assert.deepEqual(analyzeShellPaths("", CWD).reads, []);
   assert.deepEqual(analyzeShellPaths(undefined, CWD).writes, []);
+});
+
+// ── Git-Bash /tmp (win32 only) ──────────────────────────────────────
+
+// The analyzer gains an optional `family` in step 4; call it through a widened
+// signature here so the red tests typecheck before the implementation lands.
+const analyzeWithOptions = analyzeShellPaths as unknown as (
+  command: unknown,
+  cwd: string,
+  options?: { family?: "posix" | "powershell" | "cmd" },
+) => ShellPathAnalysis;
+
+function withMsysEnv<T>(fn: () => T): T {
+  const previous = process.env.MSYSTEM;
+  process.env.MSYSTEM = "MINGW64";
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.MSYSTEM;
+    else process.env.MSYSTEM = previous;
+  }
+}
+
+test("shell: git-bash /tmp resolves to the real temp dir on win32", () => {
+  if (process.platform !== "win32") return;
+  const local = process.env.LOCALAPPDATA;
+  assert.ok(local, "LOCALAPPDATA is set on Windows");
+  withMsysEnv(() => {
+    assert.deepEqual(
+      readPaths(analyzeWithOptions("tail -20 /tmp/tc.log", CWD, { family: "posix" })),
+      [norm(path.join(local, "Temp", "tc.log"))],
+    );
+  });
+});
+
+test("shell: powershell keeps C:/tmp (no MSYS translation)", () => {
+  if (process.platform !== "win32") return;
+  withMsysEnv(() => {
+    assert.deepEqual(
+      readPaths(
+        analyzeWithOptions("Get-Content /tmp/tc.log", CWD, { family: "powershell" }),
+      ),
+      [norm("/tmp/tc.log")],
+    );
+  });
+});
+
+test("shell: a POSIX-style cwd is not MSYS-translated", () => {
+  if (process.platform !== "win32") return;
+  withMsysEnv(() => {
+    assert.deepEqual(
+      readPaths(analyzeWithOptions("tail /tmp/tc.log", "/tmp/proj", { family: "posix" })),
+      ["c:/tmp/tc.log"],
+    );
+  });
+});
+
+test("shell: /tmpfoo is not /tmp", () => {
+  if (process.platform !== "win32") return;
+  withMsysEnv(() => {
+    assert.deepEqual(
+      readPaths(analyzeWithOptions("tail /tmpfoo/x", CWD, { family: "posix" })),
+      [norm("/tmpfoo/x")],
+    );
+  });
+});
+
+test("msys: /tmp translation is prefix-exact, opt-in and injectable", () => {
+  if (process.platform !== "win32") return;
+  const env = {
+    MSYSTEM: "MINGW64",
+    LOCALAPPDATA: "C:\\Users\\Test\\AppData\\Local",
+  };
+  const exists = () => true;
+  const root = resolveMsysTempRoot({ env, platform: "win32", exists });
+  assert.equal(root, path.join(env.LOCALAPPDATA, "Temp"));
+  assert.equal(
+    translateMsysTempPath("/tmp/x", { env, platform: "win32", exists }),
+    `${root}/x`,
+  );
+  assert.equal(
+    translateMsysTempPath("/tmpfoo/x", { env, platform: "win32", exists }),
+    "/tmpfoo/x",
+  );
+  assert.equal(
+    translateMsysTempPath("/tmp/x", {
+      env,
+      platform: "win32",
+      exists,
+      cwd: "/tmp/proj",
+    }),
+    "/tmp/x",
+  );
+  assert.equal(
+    translateMsysTempPath("/tmp/x", {
+      env: { ...env, PI_MSYS_TMP: "D:\\scratch" },
+      platform: "win32",
+      exists,
+    }),
+    "D:\\scratch/x",
+  );
+  assert.equal(
+    translateMsysTempPath("/tmp/x", {
+      env: { ...env, TMP: "E:\\tmp" },
+      platform: "win32",
+      exists,
+    }),
+    "E:\\tmp/x",
+  );
+  assert.equal(
+    translateMsysTempPath("/tmp/x", { env, platform: "linux" }),
+    "/tmp/x",
+  );
+  assert.equal(
+    resolveMsysTempRoot({
+      env: { LOCALAPPDATA: "C:\\X" },
+      platform: "win32",
+      exists,
+    }),
+    undefined,
+  );
 });

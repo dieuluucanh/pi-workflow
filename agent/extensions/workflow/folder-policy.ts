@@ -50,6 +50,7 @@ import {
   joinArgumentValue,
   suppressExactArgumentMatch,
   translateForeignPath,
+  translateMsysTempPath,
 } from "./utils.ts";
 import {
   COMMIT_CONFIG_DIR,
@@ -247,6 +248,10 @@ function unionStrings(a: readonly string[], b: readonly string[]): string[] {
  * expansion, Git-Bash/Cygwin/WSL translation, forward slashes, duplicate
  * separators and a trailing separator except for a root. Case is left as
  * written — the glob compiler matches case-insensitively.
+ *
+ * On Windows, `C:Personal` is drive-relative in a shell and, as a glob, would
+ * be a basename that never matches an absolute path. It is repaired to
+ * `C:/Personal` so a stored exclusion is never silently inert.
  */
 export function normalizeExcludePattern(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -254,6 +259,9 @@ export function normalizeExcludePattern(value: unknown): string {
   if (!trimmed) return "";
   const foreign = translateForeignPath(expandTilde(trimmed));
   let out = toPosixPath(stripWindowsPrefix(foreign.path || trimmed));
+  if (process.platform === "win32" && /^[A-Za-z]:(?![\\/])/.test(out)) {
+    out = `${out.slice(0, 2)}/${out.slice(2)}`;
+  }
   if (out.startsWith("./")) out = out.slice(2);
   const unc = out.startsWith("//");
   out = out.replace(/\/{2,}/g, "/");
@@ -267,6 +275,26 @@ export function normalizeExcludePattern(value: unknown): string {
     out = out.slice(0, -1);
   }
   return out;
+}
+
+/**
+ * True when an exclusion pattern is an OS/drive/share root or the home
+ * directory.
+ *
+ * Deliberately narrower than `isBroadGrantRoot`, which refuses one-click
+ * *grants* of protected roots. An exclusion is a
+ * narrowing action, so excluding a specific top-level folder
+ * (`C:/Personal`) is a precise, normal request and must not be reported as a
+ * broad root. Only paths where "everything below is now unreachable" is the
+ * point — `/`, `C:/`, `//server/share`, `~` — get the note.
+ */
+export function isBroadExcludePattern(pattern: unknown): boolean {
+  const normalized = normalizeExcludePattern(pattern);
+  if (!normalized) return false;
+  const root = pathRootOf(normalized);
+  if (normalized.toLowerCase() === root.toLowerCase()) return true;
+  const home = normalizePolicyPath(os.homedir(), os.homedir());
+  return Boolean(home) && normalized.toLowerCase() === home;
 }
 
 /** Coerce a list of exclusion globs: normalise, drop empties, dedupe. */
@@ -969,7 +997,15 @@ export function resolveFolderRoots(
   const base = locked
     ? { lexical: [], canonical: [] }
     : buildRootSet(baseFolderRoots(config, cwd), cwd);
-  const explicit = locked ? { lexical: [], canonical: [] } : buildRootSet(grants, cwd);
+  // A grant typed as `/tmp` means the Git-Bash temp dir on Windows; the
+  // dialog already stores the translated native path, but a manual
+  // `/read-policy allow /tmp` should behave the same.
+  const explicitGrants = locked
+    ? grants
+    : grants.map((grant) => translateMsysTempPath(grant, { cwd }));
+  const explicit = locked
+    ? { lexical: [], canonical: [] }
+    : buildRootSet(explicitGrants, cwd);
   const lockedSet = locked
     ? buildRootSet(lockedRoots ?? [], cwd)
     : { lexical: [], canonical: [] };
@@ -1043,18 +1079,184 @@ export function outsideProjectRootForTarget(
   return commonRoot ? `${commonRoot}/${child}` : `/${child}`;
 }
 
-/** A broad grant: filesystem root, home, drive root, or depth ≤ 1. */
-export function isBroadGrantRoot(value: string): boolean {
-  const normalized = normalizePolicyPath(value, process.cwd());
-  if (!normalized) return true;
-  const root = normalizePolicyPath(path.parse(normalized).root, process.cwd());
-  if (normalized === root) return true;
-  const home = normalizePolicyPath(os.homedir(), process.cwd());
-  if (home && (normalized === home || isInsidePolicyPath(home, normalized)))
-    return true;
-  const rel = toPosixPath(path.relative(root, normalized));
-  const depth = rel.split("/").filter(Boolean).length;
-  return depth <= 1;
+/**
+ * Folders a dialog must not grant wholesale: home, and the system/profile
+ * umbrellas below it. The filesystem/drive root and home's ancestors are
+ * handled in `broadGrantRootReason` (they depend on the candidate itself).
+ *
+ * The "contains" direction is deliberate: granting `C:/Windows` or
+ * `AppData/Local` is broad, while a concrete folder inside one of them
+ * (`C:/Windows/Temp`, `AppData/Local/Temp`, `/etc/ssl/certs`) is grantable.
+ * The OS temp dir is intentionally absent.
+ */
+function addProtectedRoot(
+  out: Set<string>,
+  value: string | undefined,
+  cwd: string,
+): void {
+  if (!value) return;
+  const normalized = normalizePolicyPath(value, cwd);
+  if (normalized) out.add(normalized);
+}
+
+let protectedRootsCache: { key: string; roots: string[] } | undefined;
+
+function protectedRootsCacheKey(cwd: string): string {
+  return [
+    process.platform,
+    cwd,
+    os.homedir(),
+    process.env.SystemRoot ?? "",
+    process.env.windir ?? "",
+    process.env.ProgramFiles ?? "",
+    process.env["ProgramFiles(x86)"] ?? "",
+    process.env.ProgramData ?? "",
+    process.env.ALLUSERSPROFILE ?? "",
+    process.env.PUBLIC ?? "",
+  ].join("\0");
+}
+
+/** The protected system/profile umbrellas for this platform. Exported for tests. */
+export function protectedGrantRoots(cwd: string): string[] {
+  const key = protectedRootsCacheKey(cwd);
+  if (protectedRootsCache?.key === key) return protectedRootsCache.roots;
+  const out = new Set<string>();
+  addProtectedRoot(out, os.homedir(), cwd);
+  if (process.platform === "win32") {
+    const systemRoot =
+      process.env.SystemRoot || process.env.windir || "C:/Windows";
+    addProtectedRoot(out, systemRoot, cwd);
+    addProtectedRoot(out, path.join(systemRoot, "System32"), cwd);
+    addProtectedRoot(out, path.join(systemRoot, "SysWOW64"), cwd);
+    addProtectedRoot(out, process.env.ProgramFiles || "C:/Program Files", cwd);
+    addProtectedRoot(out, process.env["ProgramFiles(x86)"], cwd);
+    addProtectedRoot(
+      out,
+      process.env.ProgramData || process.env.ALLUSERSPROFILE || "C:/ProgramData",
+      cwd,
+    );
+    addProtectedRoot(out, process.env.ALLUSERSPROFILE, cwd);
+    addProtectedRoot(out, process.env.PUBLIC, cwd);
+    const home = os.homedir();
+    addProtectedRoot(out, path.join(home, "AppData"), cwd);
+    addProtectedRoot(out, path.join(home, "AppData", "Local"), cwd);
+    addProtectedRoot(out, path.join(home, "AppData", "Roaming"), cwd);
+    addProtectedRoot(out, path.join(home, "AppData", "LocalLow"), cwd);
+    const driveRoot = path.parse(
+      normalizePolicyPath(home, cwd) || home,
+    ).root;
+    addProtectedRoot(out, path.join(driveRoot, "$Recycle.Bin"), cwd);
+    addProtectedRoot(out, path.join(driveRoot, "System Volume Information"), cwd);
+    addProtectedRoot(out, path.join(driveRoot, "Recovery"), cwd);
+  } else {
+    for (const root of [
+      "/etc",
+      "/usr",
+      "/bin",
+      "/sbin",
+      "/lib",
+      "/lib64",
+      "/boot",
+      "/dev",
+      "/proc",
+      "/sys",
+      "/var",
+      "/opt",
+      "/srv",
+      "/mnt",
+      "/media",
+      "/root",
+      "/home",
+      "/Users",
+      "/System",
+      "/Library",
+      "/Applications",
+      "/private",
+      "/Volumes",
+    ]) {
+      addProtectedRoot(out, root, cwd);
+    }
+  }
+  const roots = [...out].sort((a, b) => a.localeCompare(b));
+  protectedRootsCache = { key, roots };
+  return roots;
+}
+
+/**
+ * Why a persistent grant of this folder is too broad, or undefined when it is
+ * grantable. Broad means the filesystem/drive root, home or an ancestor of
+ * home, or a folder that equals/contains a protected system umbrellas.
+ */
+export function broadGrantRootReason(
+  value: string,
+  cwd = process.cwd(),
+): string | undefined {
+  const normalized = normalizePolicyPath(value, cwd);
+  if (!normalized) return "an empty path";
+  const root = normalizePolicyPath(path.parse(normalized).root, cwd);
+  if (normalized === root) return "the filesystem root";
+  const home = normalizePolicyPath(os.homedir(), cwd);
+  if (home) {
+    if (normalized === home) return "your home folder";
+    if (isInsidePolicyPath(home, normalized))
+      return "a parent folder of your home folder";
+  }
+  for (const protectedRoot of protectedGrantRoots(cwd)) {
+    if (normalized === protectedRoot)
+      return `a protected system folder \`${protectedRoot}\``;
+    if (isInsidePolicyPath(protectedRoot, normalized))
+      return `a folder that contains the protected system folder \`${protectedRoot}\``;
+  }
+  return undefined;
+}
+
+/**
+ * A broad grant is refused a one-click "Always allow". Depth is not the test:
+ * a concrete top-level folder (`C:/tmp`, `D:/work`, `/tmp`) is grantable; a
+ * root, home, or a system/profile umbrella is not.
+ */
+export function isBroadGrantRoot(
+  value: string,
+  cwd = process.cwd(),
+): boolean {
+  return broadGrantRootReason(value, cwd) !== undefined;
+}
+
+/**
+ * The folder a dialog's "Always allow" should persist for one target.
+ *
+ * Starts from the outside-project grouping, then: an excluded subtree keeps
+ * the target's own folder (a grant above the exclusion rescues nothing), and
+ * a grouped root that is broad falls back to the target's own folder. If the
+ * own folder is broad too, `broad` carries the reason and the caller must not
+ * offer a persistent grant.
+ */
+export function dialogGrantRootForTarget(
+  target: FolderTarget,
+  baseRoot: string | undefined,
+  cwd: string,
+): { root: string; broad: string | undefined } {
+  const own = grantRootForTarget(target);
+  const ownResult = () => ({
+    root: own,
+    broad: broadGrantRootReason(own, cwd),
+  });
+  const outside = baseRoot
+    ? outsideProjectRootForTarget(target, baseRoot)
+    : undefined;
+  if (!outside) return ownResult();
+  const excludeRoot = target.excludeRoot;
+  if (
+    excludeRoot &&
+    !isInsidePolicyPath(
+      normalizePolicyPath(outside, cwd),
+      normalizePolicyPath(excludeRoot, cwd),
+    )
+  ) {
+    return ownResult();
+  }
+  if (broadGrantRootReason(outside, cwd)) return ownResult();
+  return { root: outside, broad: undefined };
 }
 
 /** UNC / network share detection (Windows and POSIX). */
@@ -1521,7 +1723,7 @@ export function evaluateFolderTargets(
         continue;
       }
     }
-    if (isBroadGrantRoot(lexical)) evaluation.broad.push(target);
+    if (isBroadGrantRoot(lexical, cwd)) evaluation.broad.push(target);
     const network = isNetworkPath(lexical) || isNetworkPath(canonical);
     if (network) evaluation.network.push(target);
     // Network paths need an explicit per-capability grant even in `any` mode.
@@ -1647,6 +1849,227 @@ export function describeFolderEvaluation(
   return lines;
 }
 
+// ── Base coverage (per capability) ─────────────────────────────────
+
+/** The three capabilities that share the folder floor. */
+export type BaseCapability = "read" | "write" | "commit";
+
+const BASE_CAPABILITIES: readonly BaseCapability[] = [
+  "read",
+  "write",
+  "commit",
+];
+
+/** One capability's verdict for the session base folder. */
+export interface BaseCoverageEntry {
+  capability: BaseCapability;
+  /** The base *is* an excluded root and nothing rescued it: hard block. */
+  excluded: ExcludedTarget[];
+  /** An exclusion (or the floor) puts the base outside for this capability. */
+  outside: FolderTarget[];
+  /** An explicit grant that re-opened the base inside an exclusion. */
+  rescuedBy?: string;
+}
+
+/**
+ * Evaluate the session base folder once per capability, each with **its own**
+ * grants.
+ *
+ * The plain folder evaluation cannot answer "is the session crippled?"
+ * because read/write/commit have separate `allowedPaths`: a read grant can
+ * rescue reads while writes and commits stay refused. Callers use this to warn
+ * only about the capabilities that would actually be refused.
+ */
+export function evaluateBaseCoverage(input: {
+  config: FolderPolicyConfig;
+  cwd: string;
+  grantsByCapability?: Partial<
+    Record<BaseCapability, readonly string[]>
+  >;
+  lockedRoots?: readonly string[];
+}): BaseCoverageEntry[] {
+  const { config, cwd, grantsByCapability = {}, lockedRoots } = input;
+  const base = baseFolderRoots(config, cwd)[0] ?? cwd;
+  const exclusion = createExclusionMatcher(config).match(base, cwd);
+  const exclusionRoot =
+    exclusion.excluded && exclusion.root
+      ? normalizePolicyPath(exclusion.root, cwd)
+      : "";
+  return BASE_CAPABILITIES.map((capability) => {
+    const grants = [...(grantsByCapability[capability] ?? [])];
+    const evaluation = evaluateFolderTargets(
+      [{ path: base, kind: "dir" }],
+      { config, grants, cwd, lockedRoots, action: capability },
+    );
+    const entry: BaseCoverageEntry = {
+      capability,
+      excluded: evaluation.excluded,
+      outside: evaluation.outside,
+    };
+    // No refusal at the base + an exclusion covers it ⇒ a grant rescued it.
+    if (
+      exclusionRoot &&
+      entry.excluded.length === 0 &&
+      entry.outside.length === 0
+    ) {
+      for (const grant of grants) {
+        const normalized = normalizePolicyPath(grant, cwd);
+        if (normalized && isInsidePolicyPath(normalized, exclusionRoot)) {
+          entry.rescuedBy = normalized;
+          break;
+        }
+      }
+    }
+    return entry;
+  });
+}
+
+// ── /folder-policy argument parsing ─────────────────────────────────
+
+/** One-line usage for `/folder-policy exclude`, shared by every message. */
+export const EXCLUDE_USAGE =
+  "Usage: /folder-policy exclude <path>|add <path>|revoke <path>|list [--global|--project]";
+
+/**
+ * Split a slash-command argument string into tokens.
+ *
+ * Quotes (`"…"` and `'…'`) group a path that contains spaces; the opening
+ * quote's partner closes it, so the other quote kind is literal. Backslashes
+ * are **never** escapes — a Windows path must survive verbatim (this is why
+ * `shell-text.tokenizeWords` is not reused: it POSIX-unescapes `\P`).
+ * An unbalanced quote is reported instead of being guessed at.
+ */
+export function splitPolicyArgs(text: unknown): {
+  tokens: string[];
+  error?: string;
+} {
+  const source = typeof text === "string" ? text : "";
+  const tokens: string[] = [];
+  let current = "";
+  let hasToken = false;
+  let quote: "'" | '"' | undefined;
+  for (const ch of source) {
+    if (quote) {
+      if (ch === quote) quote = undefined;
+      else current += ch;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hasToken = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push(current);
+        current = "";
+        hasToken = false;
+      }
+      continue;
+    }
+    current += ch;
+    hasToken = true;
+  }
+  if (quote) {
+    return {
+      tokens: [],
+      error: `Unbalanced ${quote === '"' ? "double" : "single"} quote. Close it, or quote the whole path once.`,
+    };
+  }
+  if (hasToken) tokens.push(current);
+  return { tokens };
+}
+
+export type ExcludeAction = "add" | "revoke" | "list";
+
+export type ExcludeArgsResult =
+  | {
+      ok: true;
+      action: ExcludeAction;
+      scope: "global" | "project";
+      /** Present for add/revoke; absent for list. */
+      pattern?: string;
+    }
+  | { ok: false; message: string };
+
+/**
+ * Interpret the tokens after `exclude`.
+ *
+ * Scope is **flags only** (`--global` / `--project`). A standalone
+ * `global`/`project` is just an argument, so a folder literally named
+ * `project` can be excluded and a trailing word can never silently retarget
+ * the write to another settings file. Anything else unexpected is rejected
+ * rather than dropped.
+ */
+export function parseExcludeArgs(
+  tokens: readonly string[],
+): ExcludeArgsResult {
+  let scope: "global" | "project" | undefined;
+  const rest: string[] = [];
+  for (const token of tokens) {
+    if (token === "--global" || token === "--project") {
+      const next = token === "--global" ? "global" : "project";
+      if (scope && scope !== next)
+        return {
+          ok: false,
+          message: `Choose one scope, not both --global and --project.\n${EXCLUDE_USAGE}`,
+        };
+      scope = next;
+      continue;
+    }
+    if (token.startsWith("--"))
+      return {
+        ok: false,
+        message: `Unknown flag \`${token}\`.\n${EXCLUDE_USAGE}`,
+      };
+    rest.push(token);
+  }
+  const resolvedScope = scope ?? "global";
+  if (rest.length === 0)
+    return { ok: true, action: "list", scope: resolvedScope };
+  const first = (rest[0] ?? "").toLowerCase();
+  if (first === "list") {
+    if (rest.length > 1)
+      return {
+        ok: false,
+        message: `\`exclude list\` takes no path.\n${EXCLUDE_USAGE}`,
+      };
+    return { ok: true, action: "list", scope: resolvedScope };
+  }
+  if (first === "add" || first === "revoke" || first === "remove") {
+    const action: ExcludeAction = first === "add" ? "add" : "revoke";
+    if (rest.length < 2)
+      return {
+        ok: false,
+        message: `\`exclude ${first}\` needs a path.\n${EXCLUDE_USAGE}`,
+      };
+    if (rest.length > 2)
+      return {
+        ok: false,
+        message: `Unexpected argument \`${rest[2]}\`. Quote paths that contain spaces, and use --global/--project for the scope.\n${EXCLUDE_USAGE}`,
+      };
+    return {
+      ok: true,
+      action,
+      scope: resolvedScope,
+      pattern: rest[1] ?? "",
+    };
+  }
+  // Bare form: `exclude <path>` adds.
+  if (rest.length > 1)
+    return {
+      ok: false,
+      message: `Unexpected argument \`${rest[1]}\`. Quote paths that contain spaces, and use --global/--project for the scope.\n${EXCLUDE_USAGE}`,
+    };
+  return {
+    ok: true,
+    action: "add",
+    scope: resolvedScope,
+    pattern: rest[0] ?? "",
+  };
+}
+
 // ── /folder-policy completions ───────────────────────────────────────
 
 const FOLDER_POLICY_SUBS: readonly {
@@ -1664,7 +2087,8 @@ const FOLDER_POLICY_SUBS: readonly {
   { name: "sensitive", description: "list the sensitive deny list and exemptions" },
   {
     name: "exclude",
-    description: "deny a folder outright: add|revoke|list <glob> [--global|--project]",
+    description:
+      "deny a path outright: <path>|add|revoke|list [--global|--project]; quote paths with spaces",
   },
 ];
 
@@ -1702,8 +2126,8 @@ export function folderPolicyArgumentCompletions(
       add("allow", "allow .env.example/.sample/.template/.dist");
       add("block", "treat templates as sensitive");
     } else if (first === "exclude") {
-      add("add", "append an exclude glob (the bare form also adds)");
-      add("revoke", "remove exactly one exclude glob");
+      add("add", "append an exclude path (the bare form also adds)");
+      add("revoke", "remove exactly one exclude path");
       add("list", "show the effective exclude list");
       add("--global", "write ~/.pi/agent/settings.json (default)");
       add("--project", "write <cwd>/.pi/settings.json");

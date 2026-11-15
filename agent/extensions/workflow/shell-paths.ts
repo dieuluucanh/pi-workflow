@@ -25,6 +25,14 @@ import {
   type FolderTarget,
   normalizePolicyPath,
 } from "./folder-policy.ts";
+import { translateMsysTempPath } from "./utils.ts";
+
+export type ShellPathFamily = "posix" | "powershell" | "cmd";
+
+export interface ShellPathOptions {
+  /** MSYS `/tmp` translation is a POSIX-shell concern (default: "posix"). */
+  family?: ShellPathFamily;
+}
 
 export type GitCommitHit = "add" | "commit" | "push";
 
@@ -225,6 +233,7 @@ function dedupeTargets(targets: FolderTarget[]): FolderTarget[] {
 export function analyzeShellPaths(
   command: unknown,
   cwd: string,
+  options: ShellPathOptions = {},
 ): ShellPathAnalysis {
   const analysis: ShellPathAnalysis = {
     reads: [],
@@ -234,13 +243,18 @@ export function analyzeShellPaths(
   if (typeof command !== "string" || !command.trim()) return analysis;
   const parsed = analyzeCommand(command);
   let virtualCwd = normalizePolicyPath(cwd, cwd);
+  const family = options.family ?? "posix";
+  const translate = (value: string): string =>
+    family === "posix" ? translateMsysTempPath(value, { cwd }) : value;
+  const normalizeShellPath = (value: string, base = virtualCwd): string =>
+    normalizePolicyPath(translate(value), base);
 
   // Best-effort command substitution: `echo $(cat ../x)` / backticks. Only
   // simple, non-nested bodies are parsed; the rest stays uncertain.
   for (const match of command.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)) {
     const inner = (match[1] ?? match[2] ?? "").trim();
     if (!inner) continue;
-    const nested = analyzeShellPaths(inner, virtualCwd);
+    const nested = analyzeShellPaths(inner, virtualCwd, { family });
     for (const target of nested.reads) analysis.reads.push(target);
     for (const target of nested.writes) analysis.writes.push(target);
     for (const reason of nested.uncertain) analysis.uncertain.push(reason);
@@ -248,7 +262,7 @@ export function analyzeShellPaths(
   }
 
   const addRead = (value: string, kind: FolderTarget["kind"] = "file") => {
-    const normalized = normalizePolicyPath(value, virtualCwd);
+    const normalized = normalizeShellPath(value);
     if (!normalized || normalized === "-") return;
     if (/^\d+$/.test(normalized)) return;
     if (normalized.endsWith("/dev/null") || normalized.endsWith("/dev/stdin"))
@@ -258,7 +272,7 @@ export function analyzeShellPaths(
     analysis.reads.push({ path: normalized, kind });
   };
   const addWrite = (value: string, kind: FolderTarget["kind"] = "file") => {
-    const normalized = normalizePolicyPath(value, virtualCwd);
+    const normalized = normalizeShellPath(value);
     if (!normalized || normalized === "-") return;
     if (normalized.endsWith("/dev/null")) return;
     analysis.writes.push({ path: normalized, kind });
@@ -269,6 +283,8 @@ export function analyzeShellPaths(
       analysis,
       addRead,
       addWrite,
+      family,
+      normalizePath: (value: string) => normalizeShellPath(value),
       get cwd() {
         return virtualCwd;
       },
@@ -286,6 +302,9 @@ export function analyzeShellPaths(
 interface SegmentContext {
   analysis: ShellPathAnalysis;
   cwd: string;
+  family: ShellPathFamily;
+  /** Translate + normalize one shell path against the current cwd. */
+  normalizePath: (value: string) => string;
   addRead: (value: string, kind?: FolderTarget["kind"]) => void;
   addWrite: (value: string, kind?: FolderTarget["kind"]) => void;
 }
@@ -317,7 +336,7 @@ function analyzeSegment(segment: SegmentAnalysis, ctx: SegmentContext): void {
       ctx.analysis.uncertain.push(`cd ${target}`);
       return;
     }
-    const next = normalizePolicyPath(target, ctx.cwd);
+    const next = ctx.normalizePath(target);
     if (next) ctx.cwd = next;
     return;
   }
@@ -759,7 +778,7 @@ function analyzeShell(
         ctx.analysis.uncertain.push(`${command} ${word} without a command`);
         return;
       }
-      mergeAnalysis(ctx, analyzeShellPaths(inner, ctx.cwd));
+      mergeAnalysis(ctx, analyzeShellPaths(inner, ctx.cwd, { family: ctx.family }));
       return;
     }
     if (isFlag(word)) continue;
@@ -827,7 +846,7 @@ function analyzeGit(words: string[], ctx: SegmentContext): void {
   const subcommand = (command[index] ?? "").toLowerCase();
   const args = command.slice(index + 1);
   const repoRoot = rootFlag
-    ? normalizePolicyPath(rootFlag, ctx.cwd)
+    ? ctx.normalizePath(rootFlag)
     : normalizePolicyPath(ctx.cwd, ctx.cwd);
   if (rootFlag) {
     // Git metadata and worktree are both read; the commit policy uses repoRoot.
@@ -884,7 +903,9 @@ function analyzeGit(words: string[], ctx: SegmentContext): void {
     ctx.analysis.git = {
       hit: subcommand,
       repoRoot,
-      explicitPaths: explicitPaths.map((p) => normalizePolicyPath(p, repoRoot)),
+      explicitPaths: explicitPaths.map((p) =>
+        normalizePolicyPath(ctx.normalizePath(p), repoRoot),
+      ),
       allPaths,
       amend,
       usesCwd,
@@ -953,7 +974,7 @@ function addGitRead(
   value: string,
   repoRoot: string,
 ): void {
-  const normalized = normalizePolicyPath(value, repoRoot);
+  const normalized = normalizePolicyPath(ctx.normalizePath(value), repoRoot);
   if (normalized) ctx.analysis.reads.push({ path: normalized, kind: "file" });
 }
 

@@ -37,9 +37,8 @@ import type {
   FolderOutsideAction,
 } from "./folder-policy.ts";
 import {
+  dialogGrantRootForTarget,
   grantRootForTarget,
-  isInsidePolicyPath,
-  normalizePolicyPath,
   outsideProjectRootForTarget,
 } from "./folder-policy.ts";
 
@@ -396,7 +395,10 @@ export type ReadGateChoice =
   | "deny";
 
 /** Labels for the ask dialog; the parser and the UI share this table. */
-export function readGateOptions(kind: ReadGateItemKind): readonly string[] {
+export function readGateOptions(
+  kind: ReadGateItemKind,
+  opts: { allowAlways?: boolean } = {},
+): readonly string[] {
   const always =
     kind === "folder"
       ? "Always allow this folder"
@@ -407,7 +409,7 @@ export function readGateOptions(kind: ReadGateItemKind): readonly string[] {
           : "";
   return [
     "Allow once (this turn)",
-    ...(always ? [always] : []),
+    ...(opts.allowAlways !== false && always ? [always] : []),
     "Deny",
     READ_DENY_WITH_INSTRUCTIONS_LABEL,
   ];
@@ -510,26 +512,14 @@ export function readGateItemFromTarget(
   tool: string,
   target: FolderTarget,
   why: string,
+  cwd: string,
   baseRoot?: string,
 ): ReadGateItem {
-  const outsideProject =
-    baseRoot !== undefined ? outsideProjectRootForTarget(target, baseRoot) : undefined;
-  const ownFolder = grantRootForTarget(target);
-  // A grant that sits above the exclusion cannot rescue anything: fall back to
-  // the target's own folder so "Always allow" actually works.
-  const excludeRoot = target.excludeRoot;
-  const rescueCapable =
-    outsideProject !== undefined &&
-    (excludeRoot === undefined ||
-      isInsidePolicyPath(
-        normalizePolicyPath(outsideProject, process.cwd()),
-        normalizePolicyPath(excludeRoot, process.cwd()),
-      ));
-  const grantRoot = rescueCapable ? outsideProject : ownFolder;
+  const { root } = dialogGrantRootForTarget(target, baseRoot, cwd);
   return {
     tool,
     target,
-    grantRoot: grantRoot || ownFolder,
+    grantRoot: root,
     why,
     key: readGateTargetKey(target),
   };
@@ -589,12 +579,16 @@ export function readGateDetail(
 export function readGateTitle(
   items: readonly ReadGateItem[],
   base?: string,
+  opts: { grantBlockedReason?: string } = {},
 ): string {
   const detail = readGateDetail(items);
   return (
     `Read policy: allow ${describeReadGateItems(items)}?` +
     (base ? `\nOutside: ${base}` : "") +
-    (detail ? `\n${detail}` : "")
+    (detail ? `\n${detail}` : "") +
+    (opts.grantBlockedReason
+      ? `\nGrant not available: ${opts.grantBlockedReason}`
+      : "")
   );
 }
 

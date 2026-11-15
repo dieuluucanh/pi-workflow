@@ -18,7 +18,10 @@ import * as path from "node:path";
 import {
   DEFAULT_FOLDER_POLICY_CONFIG,
   createExclusionMatcher,
+  evaluateFolderTargets,
+  isBroadExcludePattern,
   matchExcludedPath,
+  normalizeExcludePattern,
   normalizePolicyPath,
   pathPrefixes,
 } from "./folder-policy.ts";
@@ -295,4 +298,105 @@ test("match: home directory exclusion reaches its contents", () => {
     matchExcludedPath(path.join(home, "Documents", "x.txt"), config, home).excluded,
     true,
   );
+});
+
+// ── pattern normalisation: drive-relative spellings ──────────────────
+
+test("normalise: Windows drive-relative patterns are repaired, not left inert", () => {
+  if (process.platform !== "win32") {
+    // NOOP on POSIX: a `c:` prefix is not a drive there.
+    assert.equal(normalizeExcludePattern("c:Personal"), "c:Personal");
+    return;
+  }
+  assert.equal(normalizeExcludePattern("C:Personal"), "C:/Personal");
+  assert.equal(normalizeExcludePattern("c:Personal"), "c:/Personal");
+  assert.equal(normalizeExcludePattern("C:Personal/"), "C:/Personal");
+  // The repaired form actually excludes the folder.
+  const config = withExcludes([normalizeExcludePattern("C:Personal")]);
+  const hit = matchExcludedPath("C:/Personal/secret.txt", config, "C:/work");
+  assert.equal(hit.excluded, true);
+  assert.equal(hit.root, "c:/personal");
+  // Already-slashed spellings are untouched.
+  assert.equal(normalizeExcludePattern("C:/Personal"), "C:/Personal");
+  assert.equal(normalizeExcludePattern("C:/"), "C:/");
+});
+
+// ── broadness: roots and home only ───────────────────────────────────
+
+test("broad: only a filesystem/drive/share root or the home directory", () => {
+  assert.equal(isBroadExcludePattern("/"), true);
+  assert.equal(isBroadExcludePattern("//server/share"), true);
+  assert.equal(isBroadExcludePattern(os.homedir()), true);
+  assert.equal(isBroadExcludePattern("~"), true);
+  if (process.platform === "win32") {
+    assert.equal(isBroadExcludePattern("C:/"), true);
+    assert.equal(isBroadExcludePattern("c:/"), true);
+    // A specific top-level folder is a precise exclusion, not a broad root.
+    assert.equal(isBroadExcludePattern("C:/Personal"), false);
+    assert.equal(isBroadExcludePattern("D:/Data"), false);
+  }
+  assert.equal(isBroadExcludePattern("C:/Users/Someone/Projects"), false);
+  assert.equal(isBroadExcludePattern(path.join(os.homedir(), "Projects")), false);
+  assert.equal(isBroadExcludePattern("**/node_modules"), false);
+  assert.equal(isBroadExcludePattern(""), false);
+  assert.equal(isBroadExcludePattern(42), false);
+});
+
+// ── enforcement regression: normalisation must not move the semantics ──
+
+test("enforcement: the excluded root blocks, a child is outside, a grant rescues one subtree", () => {
+  const { dir, cleanup } = tmpDir();
+  try {
+    const excluded = path.join(dir, "Personal");
+    const granted = path.join(excluded, "sub");
+    const config = withExcludes([excluded]);
+    const evaluate = (target: string, grants: string[] = []) =>
+      evaluateFolderTargets([{ path: target, kind: "file" }], {
+        config,
+        grants,
+        cwd: dir,
+        action: "read",
+      });
+
+    // The root itself is a hard block (never a dialog, never outside).
+    const atRoot = evaluateFolderTargets(
+      [{ path: excluded, kind: "dir" }],
+      { config, grants: [], cwd: dir, action: "read" },
+    );
+    assert.equal(atRoot.excluded.length, 1);
+    assert.equal(atRoot.outside.length, 0);
+    assert.equal(atRoot.allowed.length, 0);
+
+    // A child is outside and is attributed to the excluded root.
+    const child = evaluate(path.join(excluded, "secret.txt"));
+    assert.equal(child.excluded.length, 0);
+    assert.equal(child.outside.length, 1);
+    assert.equal(child.allowed.length, 0);
+    assert.equal(child.outside[0]?.excludeRoot, norm(excluded));
+
+    // A grant inside re-opens exactly that subtree, nothing else.
+    const rescued = evaluate(path.join(granted, "x.ts"), [granted]);
+    assert.equal(rescued.allowed.length, 1);
+    assert.equal(rescued.outside.length, 0);
+    const sibling = evaluate(path.join(excluded, "other", "y.ts"), [granted]);
+    assert.equal(sibling.allowed.length, 0);
+    assert.equal(sibling.outside.length, 1);
+
+    // Normalisation is enforcement-neutral: the repaired drive-relative
+    // spelling produces the same verdict as the slashed one.
+    if (process.platform === "win32") {
+      const slashed = { ...config, excludePaths: ["C:/Personal"] };
+      const repaired = { ...config, excludePaths: ["C:Personal"] };
+      for (const candidate of [slashed, repaired]) {
+        const verdict = evaluateFolderTargets(
+          [{ path: "C:/Personal/secret.txt", kind: "file" }],
+          { config: candidate, grants: [], cwd: "C:/work", action: "read" },
+        );
+        assert.equal(verdict.outside.length, 1);
+        assert.equal(verdict.allowed.length, 0);
+      }
+    }
+  } finally {
+    cleanup();
+  }
 });

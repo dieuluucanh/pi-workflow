@@ -126,19 +126,24 @@ import {
   decideFolderGate,
   describeFolderEvaluation,
   detectRepoRoot,
+  dialogGrantRootForTarget,
+  broadGrantRootReason,
   isBroadGrantRoot,
-  isInsidePolicyPath,
-  outsideProjectRootForTarget,
   evaluateFolderTargets,
+  evaluateBaseCoverage,
   matchSensitivePath,
   readFolderPolicyConfig,
   writeFolderPolicyConfig,
   revokeFolderPolicyListEntry,
   folderPolicyArgumentCompletions,
   folderPolicyConfigPaths,
+  EXCLUDE_USAGE,
   grantRootForTarget,
+  isBroadExcludePattern,
   isWorkflowSettingsPath,
   normalizeExcludePattern,
+  parseExcludeArgs,
+  splitPolicyArgs,
   DEFAULT_SENSITIVE_PATTERNS,
   type FolderPolicyConfig,
   type FolderTarget,
@@ -3450,13 +3455,18 @@ export default function workflowExtension(
       const cwd = (ctx as any)?.cwd ?? process.cwd();
       const agentDir = getAgentDir();
       const trusted = (ctx as any).isProjectTrusted?.() === true;
-      const tokens = String(args || "").trim().split(/\s+/).filter(Boolean);
+      const split = splitPolicyArgs(args);
+      if (split.error) {
+        ctx.ui.notify(`${split.error}\n${EXCLUDE_USAGE}`, "warning");
+        return;
+      }
+      const tokens = split.tokens;
       const sub = (tokens[0] || "status").toLowerCase();
       const second = (tokens[1] || "").toLowerCase();
-      // Explicit flags win; a trailing bare `global`/`project` is accepted for
-      // consistency with the older verbs. Default is global: excludePaths is
-      // most useful as a machine-wide floor.
-      const scope: "global" | "project" = tokens.includes("--project")
+      // Legacy bare-token scope for the mode verbs. `exclude` parses its own
+      // scope (flags only) because a standalone `project`/`global` word there
+      // is a path, not a scope.
+      const modeScope: "global" | "project" = tokens.includes("--project")
         ? "project"
         : tokens.includes("--global")
           ? "global"
@@ -3465,13 +3475,21 @@ export default function workflowExtension(
             : "global";
       const resolved = readFolderPolicyConfig(cwd, agentDir, { trusted });
       const baseRoot = baseFolderRoots(resolved.config, cwd)[0] ?? cwd;
-      const baseVerdict = (config: typeof resolved.config) =>
-        evaluateFolderTargets([{ path: baseRoot, kind: "dir" }], {
+      // Per capability, with that capability's real grants: a read grant can
+      // rescue reads while writes and commits stay refused at the base.
+      const baseCoverage = (config: typeof resolved.config) =>
+        evaluateBaseCoverage({
           config,
-          grants: [],
           cwd,
           lockedRoots: resolved.locked?.roots,
-          action: "read",
+          grantsByCapability: {
+            read: readReadPolicyConfig(cwd, agentDir, { trusted }).config
+              .allowedPaths,
+            write: readWritePolicyConfig(cwd, agentDir, { trusted }).config
+              .allowedPaths,
+            commit: readCommitPolicyConfig(cwd, agentDir, { trusted }).config
+              .allowedPaths,
+          },
         });
       if (sub === "status") {
         const paths = folderPolicyConfigPaths(cwd, agentDir);
@@ -3490,62 +3508,88 @@ export default function workflowExtension(
             : []),
           `Global: ${paths.global}`,
           `Project: ${paths.project}${resolved.sources.projectIgnored ? " (ignored: project not trusted)" : ""}`,
-          "Usage: /folder-policy repo|cwd|parent|any [global|project] · outside ask|block · grant project|global · templates allow|block · sensitive · exclude [add|revoke|list] <glob> [--global|--project]",
+          "Usage: /folder-policy repo|cwd|parent|any [global|project] · outside ask|block · grant project|global · templates allow|block · sensitive · exclude <path>|add <path>|revoke <path>|list [--global|--project] (quote paths with spaces)",
         ];
-        const verdict = baseVerdict(resolved.config);
-        if (verdict.excluded.length > 0) {
-          const hit = verdict.excluded[0];
+        const coverage = baseCoverage(resolved.config);
+        const blocked = coverage.filter(
+          (entry) => entry.excluded.length > 0 || entry.outside.length > 0,
+        );
+        const rescued = coverage.filter((entry) => entry.rescuedBy);
+        if (blocked.length > 0) {
+          const hit = blocked[0]?.excluded[0] ?? blocked[0]?.outside[0];
           ctx.ui.notify(
             [
               ...lines,
               "",
-              `WARNING: the session folder itself is excluded (${hit.pattern}).`,
-              "Every gated read/write/commit at or under it is refused until a more specific grant exists.",
-              `Revoke it with: /folder-policy exclude revoke ${hit.pattern}`,
+              `WARNING: the session folder itself is excluded (${hit?.path ?? baseRoot}).`,
+              `Refused at the session folder: ${blocked.map((entry) => entry.capability).join(", ")}.`,
+              ...(rescued.length > 0
+                ? [
+                    `Still covered by a grant: ${rescued
+                      .map((entry) => `${entry.capability} (${entry.rescuedBy})`)
+                      .join(", ")}.`,
+                  ]
+                : []),
+              "Grant a sub-folder explicitly, or revoke with:",
+              "  /folder-policy exclude revoke <path>",
             ].join("\n"),
             "error",
           );
           return;
         }
-        ctx.ui.notify(lines.join("\n"), "info");
+        ctx.ui.notify(
+          [
+            ...lines,
+            ...(rescued.length > 0
+              ? [
+                  `  (the session folder is inside an exclusion, but ${rescued
+                    .map((entry) => entry.capability)
+                    .join(", ")} is covered by a grant)`,
+                ]
+              : []),
+          ].join("\n"),
+          "info",
+        );
         return;
       }
       if (sub === "exclude") {
-        const actionTokens = tokens
-          .slice(1)
-          .filter(
-            (token) =>
-              !token.startsWith("--") &&
-              token !== "global" &&
-              token !== "project",
-          );
-        const action = (actionTokens[0] ?? "list").toLowerCase();
-        const listLines = (): string[] => [
-          `Excluded folders (${resolved.config.excludePaths.length}):`,
-          ...(resolved.config.excludePaths.length > 0
-            ? resolved.config.excludePaths.map((p) => `  ${p}`)
-            : ["  (none)"]),
-          "The excluded folder itself is refused (no dialog, no grant). A sub-folder",
-          "is outside: it can be approved once, or always via a grant inside it.",
-          "Sensitive files stay blocked even inside an approved sub-folder.",
-          "Usage: /folder-policy exclude <glob>|add <glob>|revoke <glob>|list [--global|--project]",
-        ];
-        if (action === "list") {
-          ctx.ui.notify(listLines().join("\n"), "info");
+        const parsed = parseExcludeArgs(tokens.slice(1));
+        if (!parsed.ok) {
+          ctx.ui.notify(`${parsed.message}\n${EXCLUDE_USAGE}`, "warning");
           return;
         }
-        const rawPattern =
-          action === "add" || action === "revoke"
-            ? (actionTokens[1] ?? "")
-            : (actionTokens[0] ?? "");
-        const revoke = action === "revoke";
-        if (action !== "add" && !revoke && action !== "remove") {
-          // `exclude <glob>` — the bare form adds.
-          // (fall through with actionTokens[0] as the pattern)
+        const settingsPaths = folderPolicyConfigPaths(cwd, agentDir);
+        const activeLines = (config: typeof resolved.config): string[] => [
+          `Active exclusions (${config.excludePaths.length}):`,
+          ...(config.excludePaths.length > 0
+            ? config.excludePaths.map((rule) => `  ${rule}`)
+            : ["  (none)"]),
+        ];
+        if (parsed.action === "list") {
+          ctx.ui.notify(
+            [
+              `Excluded paths (${resolved.config.excludePaths.length}):`,
+              ...(resolved.config.excludePaths.length > 0
+                ? resolved.config.excludePaths.map((rule) => `  ${rule}`)
+                : ["  (none)"]),
+              ...(resolved.sources.projectIgnored
+                ? ["Project settings are ignored: this project is not trusted."]
+                : []),
+              "The excluded path itself is refused (no dialog, no grant). A path below it",
+              "is outside: it can be approved once, or always via a grant inside it.",
+              "Sensitive files stay blocked even inside an approved sub-folder.",
+              `Global: ${settingsPaths.global}`,
+              `Project: ${settingsPaths.project}`,
+            ].join("\n"),
+            "info",
+          );
+          return;
         }
-        if (revoke || action === "remove") {
+        const rawPattern = parsed.pattern ?? "";
+        const trimmedInput = rawPattern.trim();
+        if (parsed.action === "revoke") {
           const result = revokeFolderPolicyListEntry(
-            scope,
+            parsed.scope,
             cwd,
             agentDir,
             "excludePaths",
@@ -3558,10 +3602,15 @@ export default function workflowExtension(
             );
             return;
           }
+          const after = readFolderPolicyConfig(cwd, agentDir, { trusted });
           ctx.ui.notify(
-            result.removed
-              ? `Removed from the exclude list (${scope}): ${rawPattern}\nSettings: ${result.path}`
-              : `Not in the exclude list (${scope}): ${rawPattern}\nSettings: ${result.path}`,
+            [
+              result.removed
+                ? `Removed (${parsed.scope}): ${trimmedInput}`
+                : `Not in the exclude list (${parsed.scope}): ${trimmedInput}`,
+              `Settings: ${result.path}`,
+              ...activeLines(after.config),
+            ].join("\n"),
             result.removed ? "info" : "warning",
           );
           updateStatus(ctx as any);
@@ -3570,12 +3619,12 @@ export default function workflowExtension(
         const pattern = normalizeExcludePattern(rawPattern);
         if (!pattern || pattern === "*" || pattern === "**" || pattern === "**/*") {
           ctx.ui.notify(
-            "Refusing that exclude pattern: it would block every path. Give a folder such as C:/ or ~.",
-            "error",
+            "Refusing that exclude pattern: it would block every path. Give a path such as C:/ or ~ (quoting paths that contain spaces).",
+            "warning",
           );
           return;
         }
-        const written = writeFolderPolicyConfig(scope, cwd, agentDir, {
+        const written = writeFolderPolicyConfig(parsed.scope, cwd, agentDir, {
           excludePaths: [pattern],
         });
         if (!written.ok) {
@@ -3586,29 +3635,56 @@ export default function workflowExtension(
           return;
         }
         const after = readFolderPolicyConfig(cwd, agentDir, { trusted });
-        const verdict = baseVerdict(after.config);
-        const warnings: string[] = [];
-        if (verdict.excluded.length > 0) {
-          warnings.push(
+        const coverage = baseCoverage(after.config);
+        const blocked = coverage.filter(
+          (entry) => entry.excluded.length > 0 || entry.outside.length > 0,
+        );
+        const rescued = coverage.filter((entry) => entry.rescuedBy);
+        const notes: string[] = [];
+        // A successful write is never an error. Only a rule that cripples the
+        // session folder (and that no grant rescues) escalates.
+        let level: "info" | "warning" | "error" = "info";
+        if (blocked.length > 0) {
+          notes.push(
             `WARNING: this also covers the session folder (${baseRoot}).`,
-            "Every gated read/write/commit at or under it is now refused.",
+            `Refused at the session folder: ${blocked.map((entry) => entry.capability).join(", ")}.`,
+            ...(rescued.length > 0
+              ? [
+                  `Still covered by a grant: ${rescued
+                    .map((entry) => `${entry.capability} (${entry.rescuedBy})`)
+                    .join(", ")}.`,
+                ]
+              : []),
             "Grant a sub-folder explicitly, or revoke with:",
             `  /folder-policy exclude revoke ${pattern}`,
           );
-        } else if (isBroadGrantRoot(pattern)) {
-          warnings.push(
-            `Note: ${pattern} is a broad root. Nothing in it is reachable until`,
-            "a sub-folder is approved once or granted explicitly.",
-            "Dialogs never offer a one-click grant for a root or the home folder.",
+          level = "error";
+        } else if (rescued.length > 0) {
+          notes.push(
+            `Note: this also covers the session folder, but ${rescued
+              .map((entry) => entry.capability)
+              .join(", ")} is covered by an explicit grant.`,
           );
+          level = "warning";
+        } else if (isBroadExcludePattern(pattern)) {
+          notes.push(
+            `Note: ${pattern} is an OS/drive root or your home directory.`,
+            "Nothing inside it is reachable until a sub-folder is approved once or",
+            "granted explicitly; dialogs cannot grant a root or home in one click.",
+          );
+          level = "warning";
         }
         ctx.ui.notify(
           [
-            `Excluded (${scope}): ${pattern}`,
+            `Excluded (${parsed.scope}): ${pattern}` +
+              (trimmedInput && trimmedInput !== pattern
+                ? ` (normalised from ${trimmedInput})`
+                : ""),
             `Settings: ${written.path}`,
-            ...warnings,
+            ...activeLines(after.config),
+            ...notes,
           ].join("\n"),
-          warnings.length > 0 ? "error" : "info",
+          level,
         );
         updateStatus(ctx as any);
         return;
@@ -3638,10 +3714,10 @@ export default function workflowExtension(
         ctx.ui.notify("Usage: /folder-policy repo|cwd|parent|any · outside ask|block · grant project|global · templates allow|block · sensitive", "info");
         return;
       }
-      const written = writeFolderPolicyConfig(scope, cwd, agentDir, patch as any);
+      const written = writeFolderPolicyConfig(modeScope, cwd, agentDir, patch as any);
       ctx.ui.notify(
         written.ok
-          ? `Folder policy updated (${scope}): ${written.path}`
+          ? `Folder policy updated (${modeScope}): ${written.path}`
           : `Could not write folder policy: ${written.error ?? "unknown error"}`,
         written.ok ? "info" : "error",
       );
@@ -10700,25 +10776,39 @@ export default function workflowExtension(
           "but no interactive UI is available. Leave the change uncommitted and let the user decide.",
       };
     }
-    const commitGrant = folderOutside
-      ? (outsideProjectRootForTarget({ path: repoRoot, kind: "dir" }, baseRoot) ??
-        repoRoot)
-      : repoRoot;
+    const repoGrant = dialogGrantRootForTarget(
+      { path: repoRoot, kind: "dir" },
+      baseRoot,
+      cwd,
+    );
     // When the ask is caused by a staged path inside an excluded folder, the
     // grant must sit inside the exclusion too (a repo-root grant is above it).
     const rescueGrant =
       pathOutside && outsidePathTarget
         ? grantRootForTarget(outsidePathTarget)
         : undefined;
-    const persistGrant = rescueGrant ?? commitGrant;
+    const persistGrant = rescueGrant ?? repoGrant.root;
+    const persistBroad = broadGrantRootReason(persistGrant, cwd);
+    const commitScopeOk = folderConfig.grantScope === "global" || trusted;
+    const persistable = !persistBroad && commitScopeOk;
+    const commitRemedyScope = commitScopeOk ? folderConfig.grantScope : "global";
+    const commitGrantBlockedReason =
+      folderOutside && !persistable
+        ? persistBroad
+          ? `${persistBroad}; add it to workflow.commitPolicy.allowedPaths in the ${commitRemedyScope} settings (/commit-policy status shows the path)`
+          : "this project is not trusted; add it to workflow.commitPolicy.allowedPaths in the global settings (/commit-policy status shows the path)"
+        : undefined;
     let sel: unknown;
     try {
       sel = await ui.select(
         `${folderOutside ? "Folder" : "Commit"} policy 'ask': allow \`git ${hit}\`?` +
           `\nRepository: ${repoRoot}` +
           (rescueGrant ? `\nExcluded staged path: ${outsidePathTarget?.path}` : "") +
-          (folderOutside ? `\nOutside: ${baseRoot}` : ""),
-        folderOutside
+          (folderOutside ? `\nOutside: ${baseRoot}` : "") +
+          (commitGrantBlockedReason
+            ? `\nGrant not available: ${commitGrantBlockedReason}`
+            : ""),
+        folderOutside && persistable
           ? ["Allow once", "Always allow this repository folder", "Deny"]
           : ["Allow once", "Deny"],
       );
@@ -10727,13 +10817,29 @@ export default function workflowExtension(
     }
     const answer = String(sel ?? "");
     if (answer.startsWith("Always allow")) {
+      // The dialog omits "Always" when persistence is impossible; a stale or
+      // forced answer still must not turn an approval into a denial.
+      const allowOnceWithWarning = (message: string) => {
+        try {
+          (ctx as any).ui?.notify?.(message, "warning");
+        } catch (_e) {
+          void _e;
+        }
+        return undefined;
+      };
+      if (persistBroad) {
+        return allowOnceWithWarning(
+          `Folder policy: ${persistBroad} cannot be granted from a dialog. ` +
+            "This commit was allowed once, but no grant was saved. " +
+            `Add it to workflow.commitPolicy.allowedPaths in the ${commitRemedyScope} settings (/commit-policy status shows the path).`,
+        );
+      }
       if (folderConfig.grantScope === "project" && !trusted) {
-        return {
-          block: true,
-          reason:
-            "Folder policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
-            "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
-        };
+        return allowOnceWithWarning(
+          "Folder policy: this project is not trusted, so a project-scoped grant would be ignored. " +
+            "This commit was allowed once, but no grant was saved. " +
+            "Add it to workflow.commitPolicy.allowedPaths in the global settings, or trust the project.",
+        );
       }
       const written = writeCommitPolicyConfig(
         folderConfig.grantScope,
@@ -10742,10 +10848,18 @@ export default function workflowExtension(
         { allowedPaths: [persistGrant] },
       );
       if (!written.ok) {
-        return {
-          block: true,
-          reason: `Could not save the commit folder grant (${written.error ?? "unknown error"}); the commit was not allowed.`,
-        };
+        return allowOnceWithWarning(
+          `Folder policy: could not save the commit folder grant (${written.error ?? "unknown error"}). ` +
+            "This commit was allowed once, but no grant was saved.",
+        );
+      }
+      try {
+        (ctx as any).ui?.notify?.(
+          `Commit policy: always allowed ${persistGrant}`,
+          "info",
+        );
+      } catch (_e) {
+        void _e;
       }
       return undefined;
     }
@@ -10823,7 +10937,9 @@ export default function workflowExtension(
     }
     if (toolName === "bash" || toolName === "powershell") {
       const command = String(input?.command ?? "");
-      return analyzeShellPaths(command, cwd).writes;
+      return analyzeShellPaths(command, cwd, {
+        family: toolName === "powershell" ? "powershell" : "posix",
+      }).writes;
     }
     return [];
   }
@@ -10837,24 +10953,15 @@ export default function workflowExtension(
     const grantEntries = targets
       .map((target) => {
         const exact = normalizeWritePath(target.path, cwd);
-        const outsideRoot = outsideProjectRootForTarget(target, baseRoot);
-        // A grant that sits above an exclusion cannot rescue anything: fall
-        // back to the target's own folder so "Always allow" actually works.
-        const rescueCapable =
-          outsideRoot !== undefined &&
-          (target.excludeRoot === undefined ||
-            isInsidePolicyPath(
-              normalizeWritePath(outsideRoot, cwd),
-              normalizeWritePath(target.excludeRoot, cwd),
-            ));
-        const path = rescueCapable ? outsideRoot : exact;
+        // The outside-project grouping, the exclusion rescue and the
+        // broad-root fallback live in one shared helper so read, write and
+        // commit cannot disagree about what "Always allow" persists.
+        const { root } = dialogGrantRootForTarget(target, baseRoot, cwd);
         // A dir/repo target (or a glob's static prefix) is granted as a
         // folder; so is a containing folder computed for an outside file. A
         // file directly in the common parent is granted as that file alone.
-        const folder =
-          target.kind !== "file" ||
-          (rescueCapable && outsideRoot !== exact);
-        return { path, folder };
+        const folder = target.kind !== "file" || root !== exact;
+        return { path: root, folder };
       })
       .filter((entry) => entry.path.length > 0);
     if (grantEntries.length === 0) return item;
@@ -11260,10 +11367,30 @@ export default function workflowExtension(
       }
 
       // (c) The first gated call of the turn → ask ONCE.
-      const options = writeGateOptions(writeGateItemsKind(items));
+      const grantPaths = [
+        ...new Set(items.flatMap((item) => item.grantPaths ?? [])),
+      ];
+      const broad = grantPaths.find((root) => isBroadGrantRoot(root, cwd));
+      const broadReason = broad ? broadGrantRootReason(broad, cwd) : undefined;
+      const scopeOk = folderConfig.grantScope === "global" || trusted;
+      const persistable = !broad && scopeOk;
+      const remedyScope = scopeOk ? folderConfig.grantScope : "global";
+      const writeGrantBlockedReason = !persistable
+        ? broad
+          ? `${broadReason ?? "a protected root"}; add it to workflow.writePolicy.allowedPaths in the ${remedyScope} settings (/write-policy status shows the path)`
+          : "this project is not trusted; add it to workflow.writePolicy.allowedPaths in the global settings (/write-policy status shows the path)"
+        : undefined;
+      const options = writeGateOptions(writeGateItemsKind(items), {
+        allowAlways: persistable,
+      });
       let sel: unknown;
       try {
-        sel = await ui.select(writeGateTitle(items, gateSource, baseRoot), options);
+        sel = await ui.select(
+          writeGateTitle(items, gateSource, baseRoot, {
+            grantBlockedReason: writeGrantBlockedReason,
+          }),
+          options,
+        );
       } catch (_e) {
         void _e;
         sel = undefined;
@@ -11285,14 +11412,31 @@ export default function workflowExtension(
           for (const p of item.grantPaths ?? []) allowedPaths.push(p);
           if (item.grantCommand) allowedCommands.push(item.grantCommand);
         }
+        // The dialog omits "Always" when persistence is impossible, but a
+        // stale/forced answer must never turn an approval into a denial.
+        const allowOnceWithWarning = (message: string) => {
+          try {
+            (ctx as any).ui?.notify?.(message, "warning");
+          } catch (_e) {
+            void _e;
+          }
+          writeGateTurnAnswer = { choice: "allow-once", instruction: "" };
+          return undefined;
+        };
+        if (broad) {
+          return allowOnceWithWarning(
+            `${gatePolicyLabel}: ${broadReason ?? "a protected root"} cannot be granted from a dialog. ` +
+              "This write was allowed once, but no grant was saved. " +
+              `Add it to workflow.writePolicy.allowedPaths in the ${remedyScope} settings (/write-policy status shows the path).`,
+          );
+        }
         const grantScope = folderConfig.grantScope;
         if (grantScope === "project" && !trusted) {
-          return {
-            block: true,
-            reason:
-              `${gatePolicyLabel} 'ask': this project is not trusted, so a project-scoped grant would be ignored. ` +
-              "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
-          };
+          return allowOnceWithWarning(
+            `${gatePolicyLabel}: this project is not trusted, so a project-scoped grant would be ignored. ` +
+              "This write was allowed once, but no grant was saved. " +
+              "Add it to workflow.writePolicy.allowedPaths in the global settings, or trust the project.",
+          );
         }
         const written = writeWritePolicyConfig(grantScope, cwd, getAgentDir(), {
           allowedPaths,
@@ -11310,14 +11454,11 @@ export default function workflowExtension(
           writeGateTurnAnswer = { choice, instruction: "" };
           return undefined;
         }
-        // The grant could not be persisted — do not silently allow a write
-        // the user asked to remember. Fall through to the denial below.
-        return {
-          block: true,
-          reason:
-            `${gatePolicyLabel} 'ask': could not save the permission grant (${written.error ?? "unknown error"}), so the write was not allowed. ` +
-            `Target: ${target}`,
-        };
+        return allowOnceWithWarning(
+          `${gatePolicyLabel}: could not save the permission grant (${written.error ?? "unknown error"}). ` +
+            "This write was allowed once, but no grant was saved. " +
+            `Add it to workflow.writePolicy.allowedPaths in the ${remedyScope} settings (/write-policy status shows the path).`,
+        );
       }
 
       // ── Denial ──
@@ -11443,6 +11584,7 @@ export default function workflowExtension(
           name,
           target,
           target.reason ?? "outside the folder",
+          cwd,
           baseRoot,
         );
         if (seen.has(item.key)) continue;
@@ -11661,10 +11803,30 @@ export default function workflowExtension(
         return undefined;
       }
 
-      const options = readGateOptions(readGateItemsKind(items));
+      const roots = [
+        ...new Set(items.map((item) => item.grantRoot).filter(Boolean)),
+      ];
+      const broad = roots.find((root) => isBroadGrantRoot(root, cwd));
+      const broadReason = broad ? broadGrantRootReason(broad, cwd) : undefined;
+      const scopeOk = folderConfig.grantScope === "global" || trusted;
+      const persistable = roots.length > 0 && !broad && scopeOk;
+      const exactTarget = items[0]?.target.path ?? roots[0] ?? "";
+      const remedyScope = scopeOk ? folderConfig.grantScope : "global";
+      const grantBlockedReason =
+        !persistable && roots.length > 0
+          ? broad
+            ? `${broadReason ?? "a protected root"}; persist the exact target with /read-policy allow ${exactTarget} ${remedyScope}`
+            : `this project is not trusted; persist with /read-policy allow ${exactTarget} global`
+          : undefined;
+      const options = readGateOptions(readGateItemsKind(items), {
+        allowAlways: persistable || roots.length === 0,
+      });
       let sel: unknown;
       try {
-        sel = await ui.select(readGateTitle(items, baseRoot), options);
+        sel = await ui.select(
+          readGateTitle(items, baseRoot, { grantBlockedReason }),
+          options,
+        );
       } catch {
         sel = undefined;
       }
@@ -11676,30 +11838,40 @@ export default function workflowExtension(
         return undefined;
       }
       if (choice === "always") {
-        const roots = [
-          ...new Set(items.map((item) => item.grantRoot).filter(Boolean)),
-        ];
         if (roots.length === 0) {
           for (const reason of uncertain)
             readGateTurnUncertainAllowed.add(reason);
           readGateTurnAnswer = { choice: "always", instruction: "" };
           return undefined;
         }
-        const broad = roots.find((root) => isBroadGrantRoot(root));
+        // The dialog omits "Always" when persistence is impossible, but a
+        // stale/forced answer must never turn an approval into a denial.
+        const allowOnceWithWarning = (message: string) => {
+          try {
+            (ctx as any).ui?.notify?.(message, "warning");
+          } catch (_e) {
+            void _e;
+          }
+          for (const item of items)
+            if (item.grantRoot) readGateTurnGrantedRoots.add(item.grantRoot);
+          for (const reason of uncertain)
+            readGateTurnUncertainAllowed.add(reason);
+          readGateTurnAnswer = { choice: "allow-once", instruction: "" };
+          return undefined;
+        };
         if (broad) {
-          return {
-            block: true,
-            reason:
-              `Read policy: \`${broad}\` is too broad to persist from a dialog. Choose Allow once, or use /folder-policy any deliberately.`,
-          };
+          return allowOnceWithWarning(
+            `Read policy: ${broadReason ?? "a protected root"} cannot be granted from a dialog. ` +
+              "This read was allowed once, but no grant was saved. " +
+              `Persist it deliberately with /read-policy allow ${exactTarget} ${remedyScope}.`,
+          );
         }
         if (folderConfig.grantScope === "project" && !trusted) {
-          return {
-            block: true,
-            reason:
-              "Read policy 'ask': this project is not trusted, so a project-scoped grant would be ignored. " +
-              "Choose Allow once, trust the project first, or set folderPolicy.grantScope to 'global'.",
-          };
+          return allowOnceWithWarning(
+            "Read policy: this project is not trusted, so a project-scoped grant would be ignored. " +
+              "This read was allowed once, but no grant was saved. " +
+              `Persist it with /read-policy allow ${exactTarget} global, or trust the project.`,
+          );
         }
         const written = writeReadPolicyConfig(
           folderConfig.grantScope,
@@ -11708,10 +11880,19 @@ export default function workflowExtension(
           { allowedPaths: roots },
         );
         if (!written.ok) {
-          return {
-            block: true,
-            reason: `Read policy 'ask': could not save the permission grant (${written.error ?? "unknown error"}).`,
-          };
+          return allowOnceWithWarning(
+            `Read policy: could not save the permission grant (${written.error ?? "unknown error"}). ` +
+              "This read was allowed once, but no grant was saved. " +
+              `Persist it with /read-policy allow ${exactTarget} ${remedyScope}.`,
+          );
+        }
+        try {
+          (ctx as any).ui?.notify?.(
+            `Read policy: always allowed ${roots.join(", ")}`,
+            "info",
+          );
+        } catch (_e) {
+          void _e;
         }
         for (const root of roots) readGateTurnGrantedRoots.add(root);
         for (const reason of uncertain) readGateTurnUncertainAllowed.add(reason);

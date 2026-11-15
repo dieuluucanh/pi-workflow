@@ -260,6 +260,57 @@ test("write: Always allow persists a project-scoped write grant", async () => {
   }
 });
 
+test("write: Always allow persists a top-level folder", async () => {
+  const { cwd, pi, ctx, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+        writePolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswer: "Always allow this folder" },
+  );
+  try {
+    const target = path.join(path.parse(cwd).root, "pi-grant-probe", "out.txt");
+    assert.equal(await toolCall(pi, ctx, "write", { path: target }), undefined);
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.ok(
+      project.workflow.writePolicy.allowedPaths.some((p: string) =>
+        p.includes("pi-grant-probe"),
+      ),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: a protected root allows once and warns", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
+        writePolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswer: "Always allow this folder" },
+  );
+  try {
+    assert.equal(
+      await toolCall(pi, ctx, "write", { path: path.parse(cwd).root }),
+      undefined,
+    );
+    assert.ok(notifies.some((entry) => entry.level === "warning"));
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(project.workflow?.writePolicy?.allowedPaths ?? [], []);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("write: a path-less mutating tool follows the write mode, not folder uncertainty", async () => {
   const allowed = await boot({
     workflow: {
@@ -298,8 +349,8 @@ test("write: a path-less mutating tool follows the write mode, not folder uncert
   }
 });
 
-test("write: Always allow refuses a project grant when the project is untrusted", async () => {
-  const { cwd, pi, ctx, cleanup } = await boot(
+test("write: an untrusted project's Always allows once and warns", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot(
     {
       workflow: {
         folderPolicy: { mode: "cwd", outside: "ask", grantScope: "project" },
@@ -312,8 +363,12 @@ test("write: Always allow refuses a project grant when the project is untrusted"
     const result = await toolCall(pi, ctx, "write", {
       path: path.join(cwd, "..", "outside.txt"),
     });
-    assert.ok(result && (result as any).block);
-    assert.match(String((result as any).reason), /trusted|trust/i);
+    assert.equal(result, undefined, "an approved write must not be denied just because the grant cannot persist");
+    assert.ok(notifies.some((entry) => entry.level === "warning"));
+    const project = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(project.workflow?.writePolicy?.allowedPaths ?? [], []);
   } finally {
     await cleanup();
   }
@@ -762,8 +817,11 @@ test("cmd: a catch-all exclude pattern is refused and changes nothing", async ()
       notifies.length = 0;
       await cmd.handler(`exclude ${bad}`, ctx);
       assert.ok(
-        notifies.some((n) => n.level === "error"),
+        notifies.some((n) => n.level === "warning"),
         `expected ${bad} to be refused`,
+      );
+      assert.ok(
+        notifies.some((n) => /Refusing that exclude pattern/.test(n.message)),
       );
     }
     const exists = fs.existsSync(path.join(agentDir, "settings.json"));
@@ -802,6 +860,197 @@ test("cmd: status warns loudly when the session folder is excluded", async () =>
     const message = notifies.map((n) => String(n.message)).join("\n");
     assert.match(message, /WARNING: the session folder itself is excluded/);
     assert.match(message, /exclude revoke/);
+  } finally {
+    await cleanup();
+  }
+});
+
+function readGlobalExcludes(agentDir: string): string[] {
+  const fp = path.join(agentDir, "settings.json");
+  if (!fs.existsSync(fp)) return [];
+  const raw = JSON.parse(fs.readFileSync(fp, "utf8"));
+  return raw.workflow?.folderPolicy?.excludePaths ?? [];
+}
+
+test("cmd: adding a specific folder is one info block with the active list", async () => {
+  const { cwd, agentDir, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    notifies.length = 0;
+    await cmd.handler("exclude C:/Personal", ctx);
+    assert.equal(notifies.length, 1, "one notification, not a list + a result");
+    const note = notifies[0]!;
+    assert.equal(note.level, "info", "a successful write must not be an error");
+    assert.match(note.message, /Excluded \(global\): C:\/Personal/);
+    assert.match(note.message, /Active exclusions \(1\)/);
+    assert.match(note.message, /settings\.json/);
+    assert.doesNotMatch(note.message, /broad root/i);
+    assert.doesNotMatch(note.message, /Error/);
+    assert.deepEqual(readGlobalExcludes(agentDir), ["C:/Personal"]);
+
+    // The follow-up calls agree with the write.
+    notifies.length = 0;
+    await cmd.handler("exclude list", ctx);
+    assert.match(notifies[0]!.message, /Excluded paths \(1\)/);
+    assert.match(notifies[0]!.message, /C:\/Personal/);
+    notifies.length = 0;
+    await cmd.handler("status", ctx);
+    assert.match(notifies[0]!.message, /excluded: 1 rule\(s\)/);
+    assert.ok(cwd);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: quoted paths with spaces are stored once, unquoted", async () => {
+  const { cwd, agentDir, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    const target = path.join(cwd, "My Documents");
+    notifies.length = 0;
+    await cmd.handler(`exclude "${target}"`, ctx);
+    assert.equal(notifies[0]!.level, "info", String(notifies[0]!.message));
+    assert.deepEqual(readGlobalExcludes(agentDir), [
+      target.replace(/\\/g, "/"),
+    ]);
+    // An unbalanced quote is refused, not half-applied.
+    notifies.length = 0;
+    await cmd.handler('exclude "C:/Bare', ctx);
+    assert.equal(notifies[0]!.level, "warning");
+    assert.match(notifies[0]!.message, /Unbalanced double quote/);
+    assert.equal(readGlobalExcludes(agentDir).length, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: a folder named project is a path, and leftover tokens are rejected", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    // `project` is a pattern, not a scope switch.
+    notifies.length = 0;
+    await cmd.handler("exclude add project --global", ctx);
+    assert.equal(notifies[0]!.level, "info", String(notifies[0]!.message));
+    assert.deepEqual(readGlobalExcludes(path.join(cwd, "..", "agent")), [
+      "project",
+    ]);
+    // A trailing scope word is not silently accepted any more.
+    notifies.length = 0;
+    await cmd.handler("exclude C:/X project", ctx);
+    assert.equal(notifies[0]!.level, "warning");
+    assert.match(notifies[0]!.message, /Unexpected argument/);
+    const projectSettings = path.join(cwd, ".pi", "settings.json");
+    if (fs.existsSync(projectSettings)) {
+      const raw = JSON.parse(fs.readFileSync(projectSettings, "utf8"));
+      assert.deepEqual(raw.workflow?.folderPolicy?.excludePaths ?? [], []);
+    }
+    // Both scope flags is a usage error, not a guess.
+    notifies.length = 0;
+    await cmd.handler("exclude C:/Y --global --project", ctx);
+    assert.equal(notifies[0]!.level, "warning");
+    assert.match(notifies[0]!.message, /both --global and --project/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: drive-relative input is repaired and revocable either way", async () => {
+  if (process.platform !== "win32") return;
+  const { agentDir, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    notifies.length = 0;
+    await cmd.handler("exclude C:Personal", ctx);
+    assert.equal(notifies[0]!.level, "info", String(notifies[0]!.message));
+    assert.match(notifies[0]!.message, /normalised from C:Personal/);
+    assert.deepEqual(readGlobalExcludes(agentDir), ["C:/Personal"]);
+    notifies.length = 0;
+    await cmd.handler("exclude revoke c:personal", ctx);
+    assert.equal(notifies[0]!.level, "info", String(notifies[0]!.message));
+    assert.deepEqual(readGlobalExcludes(agentDir), []);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: a rule covering the session folder names only the blocked capabilities", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    notifies.length = 0;
+    await cmd.handler(`exclude ${cwd}`, ctx);
+    const note = notifies[0]!;
+    assert.equal(note.level, "error", String(note.message));
+    assert.match(note.message, /Refused at the session folder: read, write, commit/);
+    assert.match(note.message, /exclude revoke/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: a read grant rescues read only; write and commit stay reported", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    // Install the grant now that cwd is known (the gate re-reads per call).
+    const settingsPath = path.join(cwd, ".pi", "settings.json");
+    const current = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    current.workflow.readPolicy = { allowedPaths: [cwd] };
+    fs.writeFileSync(settingsPath, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+
+    const cmd = pi.commands["folder-policy"];
+    notifies.length = 0;
+    await cmd.handler(`exclude ${cwd}`, ctx);
+    const note = notifies[0]!;
+    assert.equal(note.level, "error", String(note.message));
+    assert.match(note.message, /Refused at the session folder: write, commit/);
+    assert.match(note.message, /Still covered by a grant: read \(/);
+    assert.doesNotMatch(note.message, /Refused at the session folder: read/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: full grant coverage downgrades the warning and says so", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const settingsPath = path.join(cwd, ".pi", "settings.json");
+    const current = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    current.workflow.readPolicy = { allowedPaths: [cwd] };
+    current.workflow.writePolicy = { mode: "allow", allowedPaths: [cwd] };
+    current.workflow.commitPolicy = { mode: "allow", allowedPaths: [cwd] };
+    fs.writeFileSync(settingsPath, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+
+    const cmd = pi.commands["folder-policy"];
+    notifies.length = 0;
+    await cmd.handler(`exclude ${cwd}`, ctx);
+    const note = notifies[0]!;
+    assert.equal(note.level, "warning", String(note.message));
+    assert.match(note.message, /covered by an explicit grant/);
+    assert.doesNotMatch(note.message, /Refused at the session folder/);
   } finally {
     await cleanup();
   }

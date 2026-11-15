@@ -272,6 +272,19 @@ test("options: labels are the single source of parsing", () => {
   assert.equal(readGateAlwaysLabel("command"), "");
 });
 
+test("options: allowAlways false omits the Always row", () => {
+  assert.deepEqual(readGateOptions("folder", { allowAlways: false }), [
+    "Allow once (this turn)",
+    "Deny",
+    READ_DENY_WITH_INSTRUCTIONS_LABEL,
+  ]);
+  assert.deepEqual(readGateOptions("command", { allowAlways: false }), [
+    "Allow once (this turn)",
+    "Deny",
+    READ_DENY_WITH_INSTRUCTIONS_LABEL,
+  ]);
+});
+
 test("parse: deny-with before deny; unknown/cancel denies", () => {
   assert.equal(parseReadGateChoice("Allow once (this turn)"), "allow-once");
   assert.equal(parseReadGateChoice("Always allow these folders"), "always");
@@ -364,11 +377,35 @@ test("outside grant roots group to the first outside folder", () => {
 test("dialog title lists the base, target path and grant folder", () => {
   const base = normalizePolicyPath("/repo", "/repo");
   const target = normalizePolicyPath("/repo/../other/src/a.ts", "/repo");
-  const item = readGateItemFromTarget("read", { path: target, kind: "file" }, "outside", base);
+  const item = readGateItemFromTarget(
+    "read",
+    { path: target, kind: "file" },
+    "outside",
+    base,
+    base,
+  );
   const title = readGateTitle([item], base);
   assert.match(title, /\/repo/);
   assert.match(title, /other\/src\/a\.ts/);
   assert.match(title, /other/);
+});
+
+test("dialog title explains a grant it cannot persist", () => {
+  const base = normalizePolicyPath("/repo", "/repo");
+  const target = normalizePolicyPath("/repo/../other/src/a.ts", "/repo");
+  const item = readGateItemFromTarget(
+    "read",
+    { path: target, kind: "file" },
+    "outside",
+    base,
+    base,
+  );
+  const title = readGateTitle([item], base, {
+    grantBlockedReason:
+      "a protected root; persist with /read-policy allow /other/src/a.ts",
+  });
+  assert.match(title, /Grant not available:/);
+  assert.match(title, /read-policy allow/);
 });
 
 test("status: includes shared folder scope and read grants", () => {

@@ -7,16 +7,19 @@
  * the folder decision, the shell read/write analyzer and the read decision.
  * It does not touch the user's settings.json.
  */
+import * as os from "node:os";
 import * as path from "node:path";
 
 import {
   DEFAULT_FOLDER_POLICY_CONFIG,
   evaluateFolderTargets,
+  isBroadGrantRoot,
   matchSensitivePath,
   mergeFolderPolicyConfig,
 } from "../folder-policy.ts";
 import { analyzeShellPaths } from "../shell-paths.ts";
 import { decideReadGate } from "../read-policy.ts";
+import { translateMsysTempPath } from "../utils.ts";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -112,6 +115,64 @@ check(
   "merge: project mode wins",
   mergeFolderPolicyConfig({ mode: "cwd" }, { mode: "parent" }).mode,
   "parent",
+);
+
+check(
+  "broad: a concrete top-level folder is grantable",
+  isBroadGrantRoot(path.join(path.parse(cwd).root, "pi-grant-probe")),
+  false,
+);
+check(
+  "broad: the filesystem root is refused",
+  isBroadGrantRoot(path.parse(cwd).root),
+  true,
+);
+check(
+  "broad: the home directory is refused",
+  isBroadGrantRoot(os.homedir()),
+  true,
+);
+if (process.platform === "win32") {
+  check(
+    "broad: the AppData umbrella is refused",
+    isBroadGrantRoot(path.join(os.homedir(), "AppData")),
+    true,
+  );
+  check(
+    "broad: the temp folder below AppData is grantable",
+    isBroadGrantRoot(path.join(os.homedir(), "AppData", "Local", "Temp")),
+    false,
+  );
+} else {
+  check("broad: /etc is refused", isBroadGrantRoot("/etc"), true);
+  check("broad: /tmp is grantable", isBroadGrantRoot("/tmp"), false);
+}
+const msysEnv = {
+  ...process.env,
+  MSYSTEM: "MINGW64",
+  LOCALAPPDATA: "C:/Users/Test/AppData/Local",
+};
+delete msysEnv.TMP;
+delete msysEnv.TEMP;
+delete msysEnv.TMPDIR;
+delete msysEnv.PI_MSYS_TMP;
+check(
+  "msys: /tmp maps to the injected temp root",
+  translateMsysTempPath("/tmp/x", {
+    env: msysEnv,
+    platform: "win32",
+    exists: () => true,
+  }),
+  `${path.join("C:/Users/Test/AppData/Local", "Temp")}/x`,
+);
+check(
+  "msys: /tmpfoo is not /tmp",
+  translateMsysTempPath("/tmpfoo/x", {
+    env: msysEnv,
+    platform: "win32",
+    exists: () => true,
+  }),
+  "/tmpfoo/x",
 );
 
 if (failures > 0) {
