@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.12.1] - 2026-11-16
 
 ### Changed — folder exclusions are now two tiers (breaking)
 
