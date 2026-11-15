@@ -2,6 +2,16 @@
 
 All notable changes to this package are documented in this file.
 
+## [0.11.1] - 2026-11-15
+
+### Features
+
+- harden the folder floor, exclusions and Git-Bash paths (17ebfca)
+
+### Other changes
+
+- add folderPolicy.excludePaths as scope subtraction (14aee11)
+
 ## [0.11.0] - 2026-11-14
 
 ### Added — Review is an exclusive turn with an explicit state machine
