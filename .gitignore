@@ -26,3 +26,6 @@ agent/memory/MEMORY.md
 # local config backups (may contain credentials)
 agent/models.json.bak-*
 agent/models.*.bak
+
+# project-local workflow grants (machine-specific paths)
+/.pi/settings.json
