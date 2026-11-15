@@ -207,3 +207,102 @@ test("tool_result: non-read tool is untouched", () => {
     undefined,
   );
 });
+
+// ── excludePaths ─────────────────────────────────────────────────────
+
+const EXCLUDED = path.join(CWD, "excluded-tree");
+const EXCLUDED_CONFIG = {
+  ...DEFAULT_FOLDER_POLICY_CONFIG,
+  excludePaths: [EXCLUDED],
+};
+
+test("exclude: grep lines inside an excluded folder are withheld", () => {
+  const result = redactSensitiveText(
+    [
+      `${path.join(EXCLUDED, "a.ts")}:1: const leaked = true`,
+      "src/app.ts:3: const ok = true",
+    ].join("\n"),
+    "grep",
+    { path: CWD },
+    CWD,
+    EXCLUDED_CONFIG,
+  );
+  assert.equal(result.redacted, true);
+  assert.doesNotMatch(result.text, /leaked/);
+  assert.match(result.text, /src\/app\.ts:3/);
+});
+
+test("exclude: an explicit grant re-opens the subtree for output", () => {
+  const result = redactSensitiveText(
+    `${path.join(EXCLUDED, "a.ts")}:1: const visible = true`,
+    "grep",
+    { path: CWD },
+    CWD,
+    EXCLUDED_CONFIG,
+    { grants: [EXCLUDED] },
+  );
+  assert.equal(result.redacted, false);
+  assert.match(result.text, /visible/);
+});
+
+test("exclude: ls entries inside an excluded folder are dropped", () => {
+  const result = redactSensitiveText(
+    ["excluded-tree/", "src/", "README.md"].join("\n"),
+    "ls",
+    {},
+    CWD,
+    EXCLUDED_CONFIG,
+  );
+  assert.equal(result.redacted, true);
+  assert.doesNotMatch(result.text, /excluded-tree/);
+  assert.match(result.text, /src\//);
+  assert.match(result.text, /README\.md/);
+});
+
+test("exclude: find results inside an excluded folder are dropped", () => {
+  const result = redactSensitiveText(
+    ["excluded-tree/a.ts", "src/app.ts"].join("\n"),
+    "find",
+    { path: CWD },
+    CWD,
+    EXCLUDED_CONFIG,
+  );
+  assert.equal(result.redacted, true);
+  assert.doesNotMatch(result.text, /excluded-tree/);
+  assert.match(result.text, /src\/app\.ts/);
+});
+
+test("exclude: bash diff sections for excluded paths are withheld", () => {
+  const result = redactSensitiveText(
+    [
+      "diff --git a/excluded-tree/a.ts b/excluded-tree/a.ts",
+      "--- a/excluded-tree/a.ts",
+      "+++ b/excluded-tree/a.ts",
+      "+const leaked = true;",
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "+const ok = true;",
+    ].join("\n"),
+    "bash",
+    {},
+    CWD,
+    EXCLUDED_CONFIG,
+  );
+  assert.equal(result.redacted, true);
+  assert.doesNotMatch(result.text, /leaked/);
+  assert.match(result.text, /const ok = true/);
+});
+
+test("exclude: redactToolResult withholds a read of an excluded folder", () => {
+  const result = redactToolResult(
+    {
+      toolName: "read",
+      input: { path: path.join(EXCLUDED, "a.ts") },
+      content: [{ type: "text", text: "const leaked = true;" }],
+    },
+    EXCLUDED_CONFIG,
+    CWD,
+  );
+  assert.match(String(result?.content?.[0]?.text), /blocked by read policy/);
+});

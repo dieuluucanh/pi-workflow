@@ -698,3 +698,39 @@ test("isCommitConfirmation: the new short question + context still matches", () 
     true,
   );
 });
+
+test("decideCommitGate: an excluded path blocks before the authorization exemption", () => {
+  // Even an armed `/commit` authorization cannot commit an excluded path.
+  assert.equal(
+    decideCommitGate({
+      policy: "ask",
+      hit: "commit",
+      hasTodos: false,
+      auth: activeAuth(0),
+      now: 1,
+      excluded: true,
+    }),
+    "block",
+  );
+  assert.equal(
+    decideCommitGate({
+      policy: "allow",
+      hit: "commit",
+      hasTodos: false,
+      now: 1,
+      excluded: true,
+    }),
+    "block",
+  );
+  // Without the flag the same inputs still allow, so the assertion isolates it.
+  assert.equal(
+    decideCommitGate({
+      policy: "ask",
+      hit: "commit",
+      hasTodos: false,
+      auth: activeAuth(0),
+      now: 1,
+    }),
+    "allow",
+  );
+});

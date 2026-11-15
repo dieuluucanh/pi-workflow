@@ -479,3 +479,330 @@ test("write: Build asks for an outside write with a Folder policy dialog", async
     await cleanup();
   }
 });
+
+// ── excludePaths ─────────────────────────────────────────────────────
+
+/** A parent folder that contains the temp project (the "broad root" case). */
+function parentOf(cwd: string): string {
+  return path.dirname(cwd);
+}
+
+test("write: excluded root is refused with no dialog under writePolicy allow", async () => {
+  const parentHolder: { parent?: string } = {};
+  const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
+  parentHolder.parent = parentOf(probe.cwd);
+  await probe.cleanup();
+
+  const parent = parentHolder.parent;
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: {
+        mode: "cwd",
+        outside: "ask",
+        excludePaths: [parent],
+      },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const result = await toolCall(pi, ctx, "bash", {
+      command: `rm -rf "${parent}"`,
+    });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.match(String((result as any).reason), /exclude revoke/);
+    assert.equal(selects.length, 0);
+    // The session folder is strictly inside the exclusion and still works.
+    assert.equal(
+      await toolCall(pi, ctx, "write", { path: path.join(cwd, "a.ts") }),
+      undefined,
+    );
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: a descendant of an excluded folder asks and 'always' rescues it", async () => {
+  const parentHolder: { parent?: string } = {};
+  const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
+  parentHolder.parent = parentOf(probe.cwd);
+  await probe.cleanup();
+
+  const parent = parentHolder.parent;
+  const target = path.join(parent, "sibling", "note.txt");
+  const { pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: {
+          mode: "cwd",
+          outside: "ask",
+          excludePaths: [parent],
+        },
+        writePolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswers: ["Always allow this folder"] },
+  );
+  try {
+    assert.equal(await toolCall(pi, ctx, "write", { path: target }), undefined);
+    assert.equal(selects.length, 1);
+    assert.match(selects[0]?.title ?? "", /Folder policy/i);
+    // Persisted grant sits inside the exclusion → no second prompt.
+    assert.equal(await toolCall(pi, ctx, "write", { path: target }), undefined);
+    assert.equal(selects.length, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: outside=block refuses an excluded descendant without a dialog", async () => {
+  const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
+  const parent = parentOf(probe.cwd);
+  await probe.cleanup();
+  const { pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "block", excludePaths: [parent] },
+      writePolicy: { mode: "allow" },
+    },
+  });
+  try {
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(parent, "sibling", "x.txt"),
+    });
+    assert.ok(result && (result as any).block);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: a grant above the exclusion does not rescue it", async () => {
+  const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
+  const parent = parentOf(probe.cwd);
+  const grandparent = parentOf(parent);
+  await probe.cleanup();
+  const { pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      writePolicy: { mode: "allow", allowedPaths: [grandparent] },
+    },
+  });
+  try {
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(parent, "x.txt"),
+    });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /Folder policy|permitted/i);
+    assert.equal(selects.length, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: shell redirect into an excluded descendant follows the floor", async () => {
+  const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
+  const parent = parentOf(probe.cwd);
+  await probe.cleanup();
+  const { pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+        writePolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswers: ["Allow once (this turn)"] },
+  );
+  try {
+    const result = await toolCall(pi, ctx, "bash", {
+      command: `echo hi > "${path.join(parent, "x.txt")}"`,
+    });
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 1, "a descendant asks once");
+    assert.match(selects[0]?.title ?? "", /Folder policy/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+// ── workflow settings are user-owned ─────────────────────────────────
+
+test("settings: write/edit to the project settings file is refused in every mode", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const target = path.join(cwd, ".pi", "settings.json");
+    const viaWrite = await toolCall(pi, ctx, "write", {
+      path: target,
+      content: "{}",
+    });
+    assert.ok(viaWrite && (viaWrite as any).block);
+    assert.match(String((viaWrite as any).reason), /user-owned/i);
+    const viaEdit = await toolCall(pi, ctx, "edit", {
+      path: target,
+      oldText: "a",
+      newText: "b",
+    });
+    assert.ok(viaEdit && (viaEdit as any).block);
+    // Build mode does not bypass it either.
+    await enterBuildWithTodo(pi, ctx);
+    const inBuild = await toolCall(pi, ctx, "write", {
+      path: target,
+      content: "{}",
+    });
+    assert.ok(inBuild && (inBuild as any).block);
+    assert.match(String((inBuild as any).reason), /user-owned/i);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("settings: shell writes to the global settings file are refused", async () => {
+  const { agentDir, pi, ctx, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const target = path.join(agentDir, "settings.json");
+    const redirect = await toolCall(pi, ctx, "bash", {
+      command: `echo '{}' > "${target}"`,
+    });
+    assert.ok(redirect && (redirect as any).block);
+    assert.match(String((redirect as any).reason), /user-owned/i);
+    const sedInPlace = await toolCall(pi, ctx, "bash", {
+      command: `sed -i 's/a/b/' "${target}"`,
+    });
+    assert.ok(sedInPlace && (sedInPlace as any).block);
+    assert.match(String((sedInPlace as any).reason), /user-owned/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("settings: ordinary files still work and slash commands still persist", async () => {
+  const { cwd, pi, ctx, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    assert.equal(
+      await toolCall(pi, ctx, "write", { path: path.join(cwd, "a.ts"), content: "x" }),
+      undefined,
+    );
+    const readPolicy = pi.commands["read-policy"];
+    assert.ok(readPolicy, "/read-policy registered");
+    await readPolicy.handler(`allow ${path.join(cwd, "extra")} project`, ctx);
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.ok(
+      raw.workflow.readPolicy.allowedPaths.some((entry: string) =>
+        entry.endsWith("extra"),
+      ),
+      "the slash command bypasses the tool gate",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+// ── /folder-policy exclude ───────────────────────────────────────────
+
+test("cmd: /folder-policy exclude adds, lists and revokes (global by default)", async () => {
+  const { cwd, agentDir, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    assert.ok(cmd, "/folder-policy registered");
+    const target = path.join(cwd, "vendor");
+    await cmd.handler(`exclude ${target}`, ctx);
+    let raw = JSON.parse(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, [
+      target.replace(/\\/g, "/"),
+    ]);
+    notifies.length = 0;
+    await cmd.handler("exclude list", ctx);
+    assert.ok(notifies.some((n) => String(n.message).includes(target.replace(/\\/g, "/"))));
+
+    await cmd.handler(`exclude revoke ${target}`, ctx);
+    raw = JSON.parse(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, []);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: /folder-policy exclude --project writes the project settings", async () => {
+  const { cwd, pi, ctx, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    const target = path.join(cwd, "vendor");
+    await cmd.handler(`exclude ${target} --project`, ctx);
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, [
+      target.replace(/\\/g, "/"),
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: a catch-all exclude pattern is refused and changes nothing", async () => {
+  const { agentDir, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    for (const bad of ["*", "**", "**/*"]) {
+      notifies.length = 0;
+      await cmd.handler(`exclude ${bad}`, ctx);
+      assert.ok(
+        notifies.some((n) => n.level === "error"),
+        `expected ${bad} to be refused`,
+      );
+    }
+    const exists = fs.existsSync(path.join(agentDir, "settings.json"));
+    if (exists) {
+      const raw = JSON.parse(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+      assert.deepEqual(raw.workflow?.folderPolicy?.excludePaths ?? [], []);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cmd: status warns loudly when the session folder is excluded", async () => {
+  const { cwd, pi, ctx, notifies, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const cmd = pi.commands["folder-policy"];
+    // Install an exclusion that covers the session folder, then ask for status.
+    fs.rmSync(path.join(cwd, ".pi", "settings.json"), { force: true });
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [cwd] },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    notifies.length = 0;
+    await cmd.handler("status", ctx);
+    const message = notifies.map((n) => String(n.message)).join("\n");
+    assert.match(message, /WARNING: the session folder itself is excluded/);
+    assert.match(message, /exclude revoke/);
+  } finally {
+    await cleanup();
+  }
+});

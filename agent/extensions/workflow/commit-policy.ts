@@ -523,6 +523,8 @@ export interface CommitGateInput {
   folder?: "allow" | "ask" | "block";
   /** A sensitive path would be added/committed. */
   sensitive?: boolean;
+  /** The repository or a staged path is an excluded folder. */
+  excluded?: boolean;
 }
 
 /**
@@ -534,6 +536,9 @@ export interface CommitGateInput {
 export function decideCommitGate(input: CommitGateInput): CommitGateDecision {
   const { policy, hit, hasTodos } = input;
   if (input.sensitive) return "block";
+  // An excluded path is refused before the authorization exemption is
+  // consulted, so a blocked attempt never burns a `/commit` authorization.
+  if (input.excluded) return "block";
   if (input.folder === "block") return "block";
   if (
     hit === "commit" &&
@@ -565,6 +570,9 @@ export function writeCommitPolicyConfig(
 ): { path: string; ok: boolean; error?: string } {
   const paths = commitConfigPaths(cwd, agentDir);
   const fp = scope === "project" ? paths.project : paths.global;
+  if (process.env.PI_FOLDER_POLICY_LOCKED === "1") {
+    return { path: fp, ok: false, error: "commit policy is locked for this subagent" };
+  }
   try {
     const existing = readJsonSafe(fp);
     const root: JsonObject = existing ? { ...existing } : {};

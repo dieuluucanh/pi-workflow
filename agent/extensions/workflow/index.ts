@@ -122,17 +122,23 @@ import {
 } from "./commit-policy.ts";
 import {
   baseFolderRoots,
+  buildFolderPolicyDeny,
   decideFolderGate,
   describeFolderEvaluation,
   detectRepoRoot,
   isBroadGrantRoot,
+  isInsidePolicyPath,
   outsideProjectRootForTarget,
   evaluateFolderTargets,
   matchSensitivePath,
   readFolderPolicyConfig,
   writeFolderPolicyConfig,
+  revokeFolderPolicyListEntry,
   folderPolicyArgumentCompletions,
   folderPolicyConfigPaths,
+  grantRootForTarget,
+  isWorkflowSettingsPath,
+  normalizeExcludePattern,
   DEFAULT_SENSITIVE_PATTERNS,
   type FolderPolicyConfig,
   type FolderTarget,
@@ -470,6 +476,7 @@ async function runSingleAgent(
   agent: AgentConfig,
   task: string,
   signal?: AbortSignal,
+  folderEnv?: Record<string, string>,
 ): Promise<{ messages: any[]; stderr: string; exitCode: number; usage: any }> {
   const tmpDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "pi-subagent-"),
@@ -513,11 +520,13 @@ async function runSingleAgent(
         // project's settings.
         env: {
           ...subagentEnv(process.env, agent.role),
-          PI_FOLDER_POLICY_LOCKED: "1",
-          PI_FOLDER_POLICY_ROOTS: JSON.stringify([
-            detectRepoRoot(cwd) ?? cwd,
-          ]),
-          PI_FOLDER_POLICY_SOURCE: "parent",
+          ...(folderEnv ?? {
+            PI_FOLDER_POLICY_LOCKED: "1",
+            PI_FOLDER_POLICY_ROOTS: JSON.stringify([
+              detectRepoRoot(cwd) ?? cwd,
+            ]),
+            PI_FOLDER_POLICY_SOURCE: "parent",
+          }),
         },
       },
     );
@@ -1860,6 +1869,32 @@ export default function workflowExtension(
   }
 
   /**
+   * Environment for a spawned subagent: the role, the parent-approved roots
+   * (repo root of the task folder plus the task folder itself) and the
+   * parent's deny layer (sensitive extras + `excludePaths`). The child cannot
+   * widen its own scope: it ignores project settings entirely.
+   */
+  function subagentFolderEnv(cwd: string): Record<string, string> {
+    const parentCwd = (currentSessionCtx as any)?.cwd ?? cwd;
+    const trusted = (currentSessionCtx as any)?.isProjectTrusted?.() === true;
+    let deny = "";
+    try {
+      deny = buildFolderPolicyDeny(
+        readFolderPolicyConfig(parentCwd, getAgentDir(), { trusted }).config,
+      );
+    } catch (_e) {
+      void _e;
+    }
+    const roots = [...new Set([detectRepoRoot(cwd) ?? cwd, cwd])];
+    return {
+      PI_FOLDER_POLICY_LOCKED: "1",
+      PI_FOLDER_POLICY_ROOTS: JSON.stringify(roots),
+      PI_FOLDER_POLICY_SOURCE: "parent",
+      PI_FOLDER_POLICY_DENY: deny,
+    };
+  }
+
+  /**
    * Current plan-file text (absolute or cwd-relative), or `undefined` when there
    * is no plan path, the file is gone, or it is unreadable. Never throws.
    *
@@ -2123,7 +2158,13 @@ export default function workflowExtension(
       if (m) agent.model = `${m.provider}/${m.id}`;
       if (m?.thinking) agent.thinking = m.thinking;
 
-      const res = await runSingleAgent(cwd, agent, task, signal);
+      const res = await runSingleAgent(
+        cwd,
+        agent,
+        task,
+        signal,
+        subagentFolderEnv(cwd),
+      );
       const out = getFinalOutput(res.messages);
       if (!out && res.exitCode !== 0) {
         throw new Error(
@@ -2143,6 +2184,20 @@ export default function workflowExtension(
     reviewRuntime = createReviewRuntime({
       cwd,
       agentDir,
+      // The reviewer is an isolated session: hand it the parent's deny layer
+      // (sensitive extras + excludePaths) and read grants so its guarded
+      // read/grep/find/ls and review_bash cannot see an excluded tree.
+      folderPolicy: () => {
+        const cwdNow = reviewCwd();
+        const trusted =
+          (currentSessionCtx as any)?.isProjectTrusted?.() === true;
+        return {
+          config: readFolderPolicyConfig(cwdNow, getAgentDir(), { trusted })
+            .config,
+          grants: readReadPolicyConfig(cwdNow, getAgentDir(), { trusted }).config
+            .allowedPaths,
+        };
+      },
       config: () => reviewConfigNow()?.config,
       reviewerModel: () => {
         // The round snapshot wins while set (see executeReviewRound): a
@@ -3398,23 +3453,164 @@ export default function workflowExtension(
       const tokens = String(args || "").trim().split(/\s+/).filter(Boolean);
       const sub = (tokens[0] || "status").toLowerCase();
       const second = (tokens[1] || "").toLowerCase();
-      const scope: "global" | "project" = tokens.includes("project")
+      // Explicit flags win; a trailing bare `global`/`project` is accepted for
+      // consistency with the older verbs. Default is global: excludePaths is
+      // most useful as a machine-wide floor.
+      const scope: "global" | "project" = tokens.includes("--project")
         ? "project"
-        : "global";
+        : tokens.includes("--global")
+          ? "global"
+          : tokens.includes("project")
+            ? "project"
+            : "global";
       const resolved = readFolderPolicyConfig(cwd, agentDir, { trusted });
+      const baseRoot = baseFolderRoots(resolved.config, cwd)[0] ?? cwd;
+      const baseVerdict = (config: typeof resolved.config) =>
+        evaluateFolderTargets([{ path: baseRoot, kind: "dir" }], {
+          config,
+          grants: [],
+          cwd,
+          lockedRoots: resolved.locked?.roots,
+          action: "read",
+        });
       if (sub === "status") {
         const paths = folderPolicyConfigPaths(cwd, agentDir);
         const lines = [
           `Folder policy: ${resolved.config.mode} (${resolved.sources.mode === "default" ? "default" : resolved.sources.mode + " settings"})`,
           `  outside: ${resolved.config.outside}; grantScope: ${resolved.config.grantScope}; templates: ${resolved.config.sensitiveTemplates}`,
-          `  base: ${detectRepoRoot(cwd) ?? cwd}`,
+          `  base: ${baseRoot}`,
           "  unverifiable writes: not prompted (use /write-policy ask for strictness)",
           `  sensitive: ${DEFAULT_SENSITIVE_PATTERNS.length} default, ${resolved.config.sensitivePatterns.length} extra, ${resolved.config.sensitiveExemptions.length} exemption(s)`,
+          `  excluded: ${resolved.config.excludePaths.length} rule(s)`,
+          ...(resolved.config.excludePaths.length > 0
+            ? [
+                ...resolved.config.excludePaths.map((p) => `    ${p}`),
+                "    (an excluded folder itself is refused; a sub-folder needs an explicit grant)",
+              ]
+            : []),
           `Global: ${paths.global}`,
           `Project: ${paths.project}${resolved.sources.projectIgnored ? " (ignored: project not trusted)" : ""}`,
-          "Usage: /folder-policy repo|cwd|parent|any [global|project] · outside ask|block · grant project|global · templates allow|block · sensitive",
+          "Usage: /folder-policy repo|cwd|parent|any [global|project] · outside ask|block · grant project|global · templates allow|block · sensitive · exclude [add|revoke|list] <glob> [--global|--project]",
         ];
+        const verdict = baseVerdict(resolved.config);
+        if (verdict.excluded.length > 0) {
+          const hit = verdict.excluded[0];
+          ctx.ui.notify(
+            [
+              ...lines,
+              "",
+              `WARNING: the session folder itself is excluded (${hit.pattern}).`,
+              "Every gated read/write/commit at or under it is refused until a more specific grant exists.",
+              `Revoke it with: /folder-policy exclude revoke ${hit.pattern}`,
+            ].join("\n"),
+            "error",
+          );
+          return;
+        }
         ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+      if (sub === "exclude") {
+        const actionTokens = tokens
+          .slice(1)
+          .filter(
+            (token) =>
+              !token.startsWith("--") &&
+              token !== "global" &&
+              token !== "project",
+          );
+        const action = (actionTokens[0] ?? "list").toLowerCase();
+        const listLines = (): string[] => [
+          `Excluded folders (${resolved.config.excludePaths.length}):`,
+          ...(resolved.config.excludePaths.length > 0
+            ? resolved.config.excludePaths.map((p) => `  ${p}`)
+            : ["  (none)"]),
+          "The excluded folder itself is refused (no dialog, no grant). A sub-folder",
+          "is outside: it can be approved once, or always via a grant inside it.",
+          "Sensitive files stay blocked even inside an approved sub-folder.",
+          "Usage: /folder-policy exclude <glob>|add <glob>|revoke <glob>|list [--global|--project]",
+        ];
+        if (action === "list") {
+          ctx.ui.notify(listLines().join("\n"), "info");
+          return;
+        }
+        const rawPattern =
+          action === "add" || action === "revoke"
+            ? (actionTokens[1] ?? "")
+            : (actionTokens[0] ?? "");
+        const revoke = action === "revoke";
+        if (action !== "add" && !revoke && action !== "remove") {
+          // `exclude <glob>` — the bare form adds.
+          // (fall through with actionTokens[0] as the pattern)
+        }
+        if (revoke || action === "remove") {
+          const result = revokeFolderPolicyListEntry(
+            scope,
+            cwd,
+            agentDir,
+            "excludePaths",
+            rawPattern,
+          );
+          if (!result.ok) {
+            ctx.ui.notify(
+              `Could not update the exclude list: ${result.error ?? "unknown error"}`,
+              "error",
+            );
+            return;
+          }
+          ctx.ui.notify(
+            result.removed
+              ? `Removed from the exclude list (${scope}): ${rawPattern}\nSettings: ${result.path}`
+              : `Not in the exclude list (${scope}): ${rawPattern}\nSettings: ${result.path}`,
+            result.removed ? "info" : "warning",
+          );
+          updateStatus(ctx as any);
+          return;
+        }
+        const pattern = normalizeExcludePattern(rawPattern);
+        if (!pattern || pattern === "*" || pattern === "**" || pattern === "**/*") {
+          ctx.ui.notify(
+            "Refusing that exclude pattern: it would block every path. Give a folder such as C:/ or ~.",
+            "error",
+          );
+          return;
+        }
+        const written = writeFolderPolicyConfig(scope, cwd, agentDir, {
+          excludePaths: [pattern],
+        });
+        if (!written.ok) {
+          ctx.ui.notify(
+            `Could not write the exclude list: ${written.error ?? "unknown error"}`,
+            "error",
+          );
+          return;
+        }
+        const after = readFolderPolicyConfig(cwd, agentDir, { trusted });
+        const verdict = baseVerdict(after.config);
+        const warnings: string[] = [];
+        if (verdict.excluded.length > 0) {
+          warnings.push(
+            `WARNING: this also covers the session folder (${baseRoot}).`,
+            "Every gated read/write/commit at or under it is now refused.",
+            "Grant a sub-folder explicitly, or revoke with:",
+            `  /folder-policy exclude revoke ${pattern}`,
+          );
+        } else if (isBroadGrantRoot(pattern)) {
+          warnings.push(
+            `Note: ${pattern} is a broad root. Nothing in it is reachable until`,
+            "a sub-folder is approved once or granted explicitly.",
+            "Dialogs never offer a one-click grant for a root or the home folder.",
+          );
+        }
+        ctx.ui.notify(
+          [
+            `Excluded (${scope}): ${pattern}`,
+            `Settings: ${written.path}`,
+            ...warnings,
+          ].join("\n"),
+          warnings.length > 0 ? "error" : "info",
+        );
+        updateStatus(ctx as any);
         return;
       }
       if (sub === "sensitive") {
@@ -8985,6 +9181,7 @@ export default function workflowExtension(
               ag.role ? ag : { ...ag, role: "explorer" },
               job.task,
               signal,
+              subagentFolderEnv(job.cwd ?? cwd),
             );
             if (signal?.aborted) {
               results[idx] = {
@@ -10263,21 +10460,25 @@ export default function workflowExtension(
       : { root: candidate, uncertain: true };
   }
 
-  function commitSensitiveHit(
-    scope: NonNullable<ReturnType<typeof analyzeShellPaths>["git"]>,
-    folderConfig: FolderPolicyConfig,
-  ): { path: string; pattern: string } | { failed: string } | undefined {
-    const check = (paths: readonly string[]) => {
-      for (const p of paths) {
-        const hit = matchSensitivePath(p, folderConfig, scope.repoRoot);
-        if (hit.sensitive)
-          return { path: p, pattern: hit.pattern ?? "sensitive" };
-      }
-      return undefined;
-    };
-    const explicit = check(scope.explicitPaths);
-    if (explicit) return explicit;
+  interface CommitPathScan {
+    /** Explicit operands first, then index/working-tree paths. */
+    paths: string[];
+    failed?: string;
+  }
 
+  /**
+   * One git scan per `git add|commit`, shared by the sensitive and the
+   * exclusion checks (they must not disagree about which paths are involved,
+   * and running git twice doubled the timeout exposure).
+   */
+  function scanCommitPaths(
+    scope: NonNullable<ReturnType<typeof analyzeShellPaths>["git"]>,
+  ): CommitPathScan {
+    const paths: string[] = [];
+    const push = (values: readonly string[]) => {
+      for (const value of values) if (!paths.includes(value)) paths.push(value);
+    };
+    push(scope.explicitPaths);
     if (scope.hit === "add" && scope.allPaths) {
       const status = runGitZ(scope.repoRoot, [
         "status",
@@ -10286,9 +10487,8 @@ export default function workflowExtension(
         "--untracked-files=all",
       ]);
       if (!status.ok)
-        return { failed: status.error ?? "git status failed" };
-      const hit = check(status.paths);
-      if (hit) return hit;
+        return { paths, failed: status.error ?? "git status failed" };
+      push(status.paths);
     }
     if (scope.hit === "commit") {
       const staged = runGitZ(scope.repoRoot, [
@@ -10298,9 +10498,8 @@ export default function workflowExtension(
         "-z",
       ]);
       if (!staged.ok)
-        return { failed: staged.error ?? "git diff --cached failed" };
-      const hit = check(staged.paths);
-      if (hit) return hit;
+        return { paths, failed: staged.error ?? "git diff --cached failed" };
+      push(staged.paths);
       if (scope.allPaths) {
         const status = runGitZ(scope.repoRoot, [
           "status",
@@ -10309,10 +10508,23 @@ export default function workflowExtension(
           "--untracked-files=all",
         ]);
         if (!status.ok)
-          return { failed: status.error ?? "git status failed" };
-        const modified = check(status.paths);
-        if (modified) return modified;
+          return { paths, failed: status.error ?? "git status failed" };
+        push(status.paths);
       }
+    }
+    return { paths };
+  }
+
+  /** First sensitive path in a scan, in scan order. */
+  function commitSensitiveHit(
+    scan: CommitPathScan,
+    scope: NonNullable<ReturnType<typeof analyzeShellPaths>["git"]>,
+    folderConfig: FolderPolicyConfig,
+  ): { path: string; pattern: string } | undefined {
+    for (const p of scan.paths) {
+      const hit = matchSensitivePath(p, folderConfig, scope.repoRoot);
+      if (hit.sensitive)
+        return { path: p, pattern: hit.pattern ?? "sensitive" };
     }
     return undefined;
   }
@@ -10352,27 +10564,56 @@ export default function workflowExtension(
     );
     if (resolvedRoot.uncertain)
       folderEvaluation.uncertain.push(repoRoot);
-    const folderOutside = folderEvaluation.outside.length > 0;
     const baseRoot = baseFolderRoots(folderConfig, cwd)[0] ?? cwd;
-    const folderDecision = decideFolderGate({
-      sensitive: false,
-      outside: folderEvaluation.outside.length > 0,
-      outsideAction: folderConfig.outside,
-      uncertain: folderEvaluation.uncertain.length > 0,
-    });
     // decideFolderGate already turns uncertainty into ask (outside: ask) or
     // block (outside: block); there is no "allow" case left to escalate.
-    const sensitiveHit = gitScope
-      ? commitSensitiveHit(gitScope, folderConfig)
-      : undefined;
-    if (sensitiveHit && "failed" in sensitiveHit) {
+    const scan = gitScope ? scanCommitPaths(gitScope) : undefined;
+    if (scan?.failed) {
       return {
         block: true,
         reason:
-          `Commit policy: the sensitive-file check could not run (${sensitiveHit.failed}). ` +
+          `Commit policy: the sensitive-file/exclusion check could not run (${scan.failed}). ` +
           "Refusing to commit unverified. Do not retry; ask the user to commit manually or fix git access.",
       };
     }
+    const sensitiveHit =
+      scan && gitScope ? commitSensitiveHit(scan, gitScope, folderConfig) : undefined;
+    // The exclusion rule is applied to the same scanned paths with the same
+    // rescue semantics as the folder floor. Git paths are repository-relative.
+    const pathEvaluation =
+      scan && scan.paths.length > 0
+        ? evaluateFolderTargets(
+            scan.paths.map((p) => ({
+              path: path.isAbsolute(p) ? p : path.join(repoRoot, p),
+              kind: "file" as const,
+            })),
+            {
+              config: folderConfig,
+              grants: policyConfig.allowedPaths,
+              cwd,
+              action: "commit",
+            },
+          )
+        : undefined;
+    const excludedHit =
+      folderEvaluation.excluded[0] ?? pathEvaluation?.excluded[0];
+    // A staged path below an excluded folder is "outside" (the commit does not
+    // name it, so the floor decides ask/block for the whole commit). Only
+    // exclusion-caused outside targets carry `excludeRoot`; an ordinary
+    // outside repository keeps its existing attribution below.
+    const outsidePathTarget = pathEvaluation?.outside.find(
+      (target) => target.excludeRoot !== undefined,
+    );
+    const pathOutside = outsidePathTarget !== undefined;
+    const folderOutside =
+      folderEvaluation.outside.length > 0 || pathOutside;
+    const folderDecision = decideFolderGate({
+      sensitive: false,
+      excluded: folderEvaluation.excluded.length > 0,
+      outside: folderOutside,
+      outsideAction: folderConfig.outside,
+      uncertain: folderEvaluation.uncertain.length > 0,
+    });
     const now = Date.now();
     const decision = decideCommitGate({
       policy,
@@ -10381,7 +10622,8 @@ export default function workflowExtension(
       auth: commitAuthorization,
       now,
       folder: folderDecision,
-      sensitive: Boolean(sensitiveHit && !("failed" in sensitiveHit)),
+      sensitive: Boolean(sensitiveHit),
+      excluded: Boolean(excludedHit),
     });
     if (decision === "allow") {
       // Count a granted `git commit` against the authorization, but only when
@@ -10404,7 +10646,16 @@ export default function workflowExtension(
     }
 
     if (decision === "block") {
-      if (sensitiveHit && !("failed" in sensitiveHit)) {
+      if (excludedHit) {
+        return {
+          block: true,
+          reason:
+            `Folder policy: \`${excludedHit.path}\` is excluded by \`workflow.folderPolicy.excludePaths\` (${excludedHit.pattern}). ` +
+            "Committing an excluded path is refused even when the commit mode is 'allow'. " +
+            "Do not retry. Remove it from the index, or ask the user to revoke the rule with `/folder-policy exclude revoke`.",
+        };
+      }
+      if (sensitiveHit) {
         return {
           block: true,
           reason:
@@ -10415,12 +10666,14 @@ export default function workflowExtension(
       if (folderDecision === "block" && policy !== "never") {
         return {
           block: true,
-          reason:
-            `Folder policy is 'block' (workflow.folderPolicy): \`git ${hit}\` targets ${repoRoot}, ` +
-            (folderOutside
-              ? `which is outside the permitted folders (${baseRoot}). `
-              : "which could not be verified against the permitted folders. ") +
-            "Do not retry. Ask the user to grant that repository folder or change /folder-policy.",
+          reason: pathOutside
+            ? `Folder policy is 'block' (workflow.folderPolicy): the staged path \`${outsidePathTarget?.path}\` is inside an excluded folder. ` +
+              "Committing it is refused even when the commit mode is 'allow'. Do not retry; unstage it, or ask the user to revoke the rule with `/folder-policy exclude revoke`."
+            : `Folder policy is 'block' (workflow.folderPolicy): \`git ${hit}\` targets ${repoRoot}, ` +
+              (folderOutside
+                ? `which is outside the permitted folders (${baseRoot}). `
+                : "which could not be verified against the permitted folders. ") +
+              "Do not retry. Ask the user to grant that repository folder or change /folder-policy.",
         };
       }
       return {
@@ -10451,11 +10704,19 @@ export default function workflowExtension(
       ? (outsideProjectRootForTarget({ path: repoRoot, kind: "dir" }, baseRoot) ??
         repoRoot)
       : repoRoot;
+    // When the ask is caused by a staged path inside an excluded folder, the
+    // grant must sit inside the exclusion too (a repo-root grant is above it).
+    const rescueGrant =
+      pathOutside && outsidePathTarget
+        ? grantRootForTarget(outsidePathTarget)
+        : undefined;
+    const persistGrant = rescueGrant ?? commitGrant;
     let sel: unknown;
     try {
       sel = await ui.select(
         `${folderOutside ? "Folder" : "Commit"} policy 'ask': allow \`git ${hit}\`?` +
           `\nRepository: ${repoRoot}` +
+          (rescueGrant ? `\nExcluded staged path: ${outsidePathTarget?.path}` : "") +
           (folderOutside ? `\nOutside: ${baseRoot}` : ""),
         folderOutside
           ? ["Allow once", "Always allow this repository folder", "Deny"]
@@ -10478,7 +10739,7 @@ export default function workflowExtension(
         folderConfig.grantScope,
         cwd,
         getAgentDir(),
-        { allowedPaths: [commitGrant] },
+        { allowedPaths: [persistGrant] },
       );
       if (!written.ok) {
         return {
@@ -10577,21 +10838,32 @@ export default function workflowExtension(
       .map((target) => {
         const exact = normalizeWritePath(target.path, cwd);
         const outsideRoot = outsideProjectRootForTarget(target, baseRoot);
-        const path = outsideRoot ?? exact;
+        // A grant that sits above an exclusion cannot rescue anything: fall
+        // back to the target's own folder so "Always allow" actually works.
+        const rescueCapable =
+          outsideRoot !== undefined &&
+          (target.excludeRoot === undefined ||
+            isInsidePolicyPath(
+              normalizeWritePath(outsideRoot, cwd),
+              normalizeWritePath(target.excludeRoot, cwd),
+            ));
+        const path = rescueCapable ? outsideRoot : exact;
         // A dir/repo target (or a glob's static prefix) is granted as a
         // folder; so is a containing folder computed for an outside file. A
         // file directly in the common parent is granted as that file alone.
         const folder =
           target.kind !== "file" ||
-          (outsideRoot !== undefined && outsideRoot !== exact);
+          (rescueCapable && outsideRoot !== exact);
         return { path, folder };
       })
       .filter((entry) => entry.path.length > 0);
     if (grantEntries.length === 0) return item;
     const unique = [...new Set(grantEntries.map((entry) => entry.path))].sort();
+    const exclusionReason = targets.find((target) => target.reason)?.reason;
     return {
       ...item,
       target: unique.join(", "),
+      why: exclusionReason ?? item.why,
       grantPaths: [...new Set([...(item.grantPaths ?? []), ...unique])],
       grantKind: grantEntries.every((entry) => entry.folder)
         ? "folder"
@@ -10768,6 +11040,22 @@ export default function workflowExtension(
         classification,
         cwd,
       );
+      // Workflow settings are user-owned: an agent that could rewrite them
+      // could delete its own exclusions. Applies in every mode, including
+      // Build, and is never softened by a grant. Slash commands write through
+      // fs and are unaffected.
+      const settingsTarget = folderTargets.find((folderTarget) =>
+        isWorkflowSettingsPath(folderTarget.path, cwd, getAgentDir()),
+      );
+      if (settingsTarget) {
+        return {
+          block: true,
+          reason:
+            `Write policy: \`${settingsTarget.path}\` is the workflow settings file, which is user-owned. ` +
+            "The agent may not rewrite permissions or the exclude list, even with a write grant or in Build mode. " +
+            "Do not retry. Ask the user to run the matching slash command (/folder-policy, /read-policy, /write-policy, /commit-policy) or edit the file themselves.",
+        };
+      }
       for (const folderTarget of folderTargets) {
         const hit = matchSensitivePath(folderTarget.path, folderConfig, cwd);
         if (hit.sensitive) {
@@ -10790,6 +11078,7 @@ export default function workflowExtension(
       });
       const folderDecision = decideFolderGate({
         sensitive: false,
+        excluded: folderEvaluation.excluded.length > 0,
         outside: folderEvaluation.outside.length > 0,
         outsideAction: folderConfig.outside,
         // Only a concrete target path that cannot be canonicalised is folder
@@ -10841,6 +11130,18 @@ export default function workflowExtension(
         : "";
 
       if (decision === "block") {
+        // An excluded folder (or the excluded root itself) is the most
+        // specific reason: name the rule and the revoke command.
+        if (folderEvaluation.excluded.length > 0) {
+          const hit = folderEvaluation.excluded[0];
+          return {
+            block: true,
+            reason:
+              `Folder policy: \`${hit.path}\` is excluded by \`workflow.folderPolicy.excludePaths\` (${hit.pattern}). ` +
+              "Writing to an excluded folder is refused in every mode, including Build, and cannot be overridden by a write grant. " +
+              `Do not retry. A specific sub-folder can still be requested; ask the user to revoke the rule with \`/folder-policy exclude revoke\`. Target: ${target}`,
+          };
+        }
         if (folderDecision === "block" && effectiveWriteMode !== "never") {
           return {
             block: true,
@@ -11141,7 +11442,7 @@ export default function workflowExtension(
         const item = readGateItemFromTarget(
           name,
           target,
-          "outside the folder",
+          target.reason ?? "outside the folder",
           baseRoot,
         );
         if (seen.has(item.key)) continue;
@@ -11251,10 +11552,24 @@ export default function workflowExtension(
         };
       }
 
+      // An excluded folder is refused outright: no dialog, no grant.
+      if (evaluation.excluded.length > 0) {
+        const hit = evaluation.excluded[0];
+        return {
+          block: true,
+          reason: buildReadDenyReason({
+            kind: "excluded",
+            target: hit.path,
+            pattern: hit.pattern,
+          }),
+        };
+      }
+
       const outside = evaluation.outside;
       const uncertain = classification.uncertain;
       let decision = decideReadGate({
         sensitive: false,
+        excluded: evaluation.excluded.length > 0,
         outside: outside.length > 0,
         outsideAction: folderConfig.outside,
         granted: false,
@@ -11680,6 +11995,14 @@ export default function workflowExtension(
           action: "commit",
         },
       );
+      if (folder.excluded.length > 0) {
+        const hit = folder.excluded[0];
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: ${repoRoot} is excluded by workflow.folderPolicy.excludePaths (${hit.pattern}). Revoke it with /folder-policy exclude revoke or commit manually.`,
+          "warning",
+        );
+        return;
+      }
       if (folder.outside.length > 0) {
         ctx?.ui?.notify?.(
           `Per-step commit skipped: ${repoRoot} is outside the permitted folders (use /folder-policy or grant it first).`,
@@ -11722,6 +12045,16 @@ export default function workflowExtension(
           action: "commit",
         },
       );
+      if (
+        statusFolder.excluded.length > 0
+      ) {
+        const hit = statusFolder.excluded[0];
+        ctx?.ui?.notify?.(
+          `Per-step commit skipped: ${hit.path} is excluded by workflow.folderPolicy.excludePaths (${hit.pattern}). Revoke it with /folder-policy exclude revoke or commit manually.`,
+          "warning",
+        );
+        return;
+      }
       if (statusFolder.outside.length > 0 || statusFolder.uncertain.length > 0) {
         ctx?.ui?.notify?.(
           `Per-step commit skipped: staged paths leave the permitted folders or could not be verified. Review the working tree and commit manually.`,
@@ -11791,10 +12124,19 @@ export default function workflowExtension(
   pi.on("tool_result", async (event, ctx) => {
     try {
       const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const trusted = (ctx as any)?.isProjectTrusted?.() === true;
       const folderConfig = readFolderPolicyConfig(cwd, getAgentDir(), {
-        trusted: (ctx as any)?.isProjectTrusted?.() === true,
+        trusted,
       }).config;
-      return redactToolResult(event as any, folderConfig, cwd) as any;
+      // Roots that can re-open an excluded path: the session floor plus the
+      // read grants (an approved sub-folder must stay readable).
+      const readGrants = readReadPolicyConfig(cwd, getAgentDir(), {
+        trusted,
+      }).config.allowedPaths;
+      return redactToolResult(event as any, folderConfig, cwd, {
+        base: baseFolderRoots(folderConfig, cwd),
+        grants: [...readGrants, ...readGateTurnGrantedRoots],
+      }) as any;
     } catch (error: unknown) {
       const tool = String((event as any)?.toolName ?? "");
       if (

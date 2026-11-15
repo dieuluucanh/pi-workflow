@@ -308,3 +308,137 @@ test("commit: unsafe folder grant is refused when the project is untrusted", asy
     await cleanup();
   }
 });
+
+// ── excludePaths ─────────────────────────────────────────────────────
+
+test("commit: a repository that IS an excluded folder is refused without a dialog", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a\n");
+    git(cwd, ["add", "-A"]);
+    // The gate re-reads settings on every call, so the exclusion can be
+    // installed with the now-known cwd (repo root == excluded root).
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "cwd",
+              outside: "ask",
+              excludePaths: [cwd],
+            },
+            commitPolicy: { mode: "allow" },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.match(String((result as any).reason), /exclude revoke/);
+    assert.equal(selects.length, 0, "an excluded repository must not prompt");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: a repository strictly inside an excluded parent still commits", async () => {
+  const probe = await boot({ workflow: { commitPolicy: { mode: "allow" } } });
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a\n");
+    git(cwd, ["add", "-A"]);
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: a staged path inside an excluded folder is refused under outside=block", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: {
+        mode: "cwd",
+        outside: "block",
+        excludePaths: [path.join(".", "excluded-dir")],
+      },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.mkdirSync(path.join(cwd, "excluded-dir"), { recursive: true });
+    fs.writeFileSync(path.join(cwd, "excluded-dir", "a.txt"), "a\n");
+    fs.writeFileSync(path.join(cwd, "b.txt"), "b\n");
+    git(cwd, ["add", "b.txt", "excluded-dir/a.txt"]);
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.match(String((result as any).reason), /exclude revoke/);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: a staged path in an excluded folder asks under outside=ask and 'always' rescues it", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: {
+          mode: "cwd",
+          outside: "ask",
+          excludePaths: [path.join(".", "excluded-dir")],
+        },
+        commitPolicy: { mode: "allow" },
+      },
+    },
+    { selectAnswers: ["Always allow this repository folder", "Deny"] },
+  );
+  try {
+    git(cwd, ["init"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    fs.mkdirSync(path.join(cwd, "excluded-dir"), { recursive: true });
+    fs.writeFileSync(path.join(cwd, "excluded-dir", "a.txt"), "a\n");
+    fs.writeFileSync(path.join(cwd, "b.txt"), "b\n");
+    git(cwd, ["add", "b.txt", "excluded-dir/a.txt"]);
+    const result = await commitCall(pi, ctx, "git commit -m x");
+    assert.equal(result, undefined);
+    assert.equal(selects.length, 1);
+    assert.match(selects[0]?.title ?? "", /Folder policy 'ask'/);
+    assert.match(selects[0]?.title ?? "", /Excluded staged path/);
+    // The grant was persisted inside the exclusion; commit again is free.
+    const again = await commitCall(pi, ctx, "git commit -m y");
+    assert.equal(again, undefined);
+    assert.equal(selects.length, 1);
+  } finally {
+    await cleanup();
+  }
+});

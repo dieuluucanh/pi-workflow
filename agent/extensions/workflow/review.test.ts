@@ -5301,3 +5301,79 @@ test("plan-2026-10-23: reviewer model change reboots the session", async () => {
   assert.equal(creations.n, 2, "model change reboots the session");
   await rt.teardown();
 });
+
+// ══ excludePaths in the reviewer ══════════════════════════════════════
+
+test("reviewer guarded read: an excluded path inside the repo is refused, a grant re-opens it", async () => {
+  const { DEFAULT_FOLDER_POLICY_CONFIG } = await import(
+    "./folder-policy.ts"
+  );
+  const cwd = "/p";
+  const target = "/p/excluded/a.ts";
+  const parentConfig = {
+    ...DEFAULT_FOLDER_POLICY_CONFIG,
+    excludePaths: ["/p/excluded"],
+  };
+  const fakeDefinition = (name: string) => ({
+    name,
+    parameters: {},
+    execute: async () => ({
+      content: [{ type: "text", text: "read ok" }],
+    }),
+  });
+  const baseDeps = {
+    cwd,
+    log: () => {},
+    explore: {
+      budget: () => 0,
+      run: async () => "",
+      onUsed: () => {},
+      log: () => {},
+    },
+    submit: {
+      planPath: () => "p.md",
+      originalPlan: () => "",
+      modelLabel: () => "m",
+      submit: async () => ({ ok: true }),
+      log: () => {},
+    },
+    passDone: {
+      hasSubmitted: () => false,
+      onPassDone: () => {},
+      willVerify: () => false,
+      log: () => {},
+    },
+  };
+  const sdk = {
+    createBashToolDefinition: () => ({
+      parameters: {},
+      execute: async () => ({ content: [] }),
+    }),
+    createReadToolDefinition: () => fakeDefinition("read"),
+    createGrepToolDefinition: () => fakeDefinition("grep"),
+    createFindToolDefinition: () => fakeDefinition("find"),
+    createLsToolDefinition: () => fakeDefinition("ls"),
+  } as never;
+
+  const blocked = createReviewTools(sdk, {
+    ...baseDeps,
+    folderPolicy: () => ({ config: parentConfig, grants: [] }),
+  } as never);
+  const blockedRead = blocked.tools.find(
+    (tool) => (tool as { name?: string }).name === "read",
+  ) as { execute: (...args: unknown[]) => Promise<any> };
+  const refused = await blockedRead.execute("id", { path: target });
+  assert.equal(refused.isError, true);
+  assert.match(String(refused.content[0]?.text), /REFUSED/);
+
+  const granted = createReviewTools(sdk, {
+    ...baseDeps,
+    folderPolicy: () => ({ config: parentConfig, grants: ["/p/excluded"] }),
+  } as never);
+  const allowedRead = granted.tools.find(
+    (tool) => (tool as { name?: string }).name === "read",
+  ) as { execute: (...args: unknown[]) => Promise<any> };
+  const allowed = await allowedRead.execute("id", { path: target });
+  assert.notEqual(allowed.isError, true);
+  assert.match(String(allowed.content[0]?.text), /read ok/);
+});

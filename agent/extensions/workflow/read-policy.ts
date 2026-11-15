@@ -38,6 +38,8 @@ import type {
 } from "./folder-policy.ts";
 import {
   grantRootForTarget,
+  isInsidePolicyPath,
+  normalizePolicyPath,
   outsideProjectRootForTarget,
 } from "./folder-policy.ts";
 
@@ -327,6 +329,8 @@ export type ReadGateDecision = "allow" | "ask" | "block";
 export interface ReadGateInput {
   /** A target matches the sensitive deny list. */
   sensitive: boolean;
+  /** A target IS an excluded folder (never askable). */
+  excluded?: boolean;
   /** A target is outside the folder roots. */
   outside: boolean;
   outsideAction: FolderOutsideAction;
@@ -339,6 +343,7 @@ export interface ReadGateInput {
 
 /**
  *   sensitive            → block (never softened by a grant)
+ *   excluded             → block (never askable)
  *   outside + block      → block
  *   outside + ask        → ask unless already granted
  *   uncertain + strict   → ask
@@ -346,6 +351,7 @@ export interface ReadGateInput {
  */
 export function decideReadGate(input: ReadGateInput): ReadGateDecision {
   if (input.sensitive) return "block";
+  if (input.excluded) return "block";
   if (input.outside) {
     if (input.outsideAction === "block") return "block";
     if (!input.granted) return "ask";
@@ -435,7 +441,7 @@ export function sanitizeReadInstruction(raw: unknown): string {
 }
 
 export interface ReadDenyReasonInput {
-  kind: "sensitive" | "outside" | "uncertain" | "blocked";
+  kind: "sensitive" | "excluded" | "outside" | "uncertain" | "blocked";
   target: string;
   pattern?: string;
   outsideAction?: FolderOutsideAction;
@@ -454,6 +460,13 @@ export function buildReadDenyReason(input: ReadDenyReasonInput): string {
         `Read policy: \`${input.target}\` is a sensitive file` +
         (input.pattern ? ` (${input.pattern})` : "") +
         ". This cannot be overridden by a folder grant. Do not retry; ask the user if they want to add a manual `sensitiveExemptions` entry." +
+        guidance
+      );
+    case "excluded":
+      return (
+        `Read policy: \`${input.target}\` is excluded by \`workflow.folderPolicy.excludePaths\`` +
+        (input.pattern ? ` (${input.pattern})` : "") +
+        ". The excluded folder itself is off-limits and cannot be approved from a dialog. Do not retry; a specific sub-folder can still be requested (it needs the user's approval), or ask the user to revoke the rule with `/folder-policy exclude revoke`." +
         guidance
       );
     case "blocked":
@@ -499,13 +512,24 @@ export function readGateItemFromTarget(
   why: string,
   baseRoot?: string,
 ): ReadGateItem {
-  const grantRoot =
-    (baseRoot && outsideProjectRootForTarget(target, baseRoot)) ||
-    grantRootForTarget(target);
+  const outsideProject =
+    baseRoot !== undefined ? outsideProjectRootForTarget(target, baseRoot) : undefined;
+  const ownFolder = grantRootForTarget(target);
+  // A grant that sits above the exclusion cannot rescue anything: fall back to
+  // the target's own folder so "Always allow" actually works.
+  const excludeRoot = target.excludeRoot;
+  const rescueCapable =
+    outsideProject !== undefined &&
+    (excludeRoot === undefined ||
+      isInsidePolicyPath(
+        normalizePolicyPath(outsideProject, process.cwd()),
+        normalizePolicyPath(excludeRoot, process.cwd()),
+      ));
+  const grantRoot = rescueCapable ? outsideProject : ownFolder;
   return {
     tool,
     target,
-    grantRoot,
+    grantRoot: grantRoot || ownFolder,
     why,
     key: readGateTargetKey(target),
   };

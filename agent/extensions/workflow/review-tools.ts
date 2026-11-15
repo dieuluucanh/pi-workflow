@@ -58,6 +58,11 @@ export interface ReviewBashDeps {
     cwd: string;
     /** Surface refusals and anomalies to the parent session. */
     log: (message: string, level?: "info" | "warning" | "error") => void;
+    /** The parent's folder policy + read grants (see ReviewToolDeps). */
+    folderPolicy?: () => {
+        config: FolderPolicyConfig;
+        grants: readonly string[];
+    };
 }
 
 /** Injectable shell-tool builder so this module is testable without the SDK. */
@@ -155,18 +160,24 @@ export function createReviewBashTool(
                 };
             }
 
-            const guard = reviewerReadGuard(deps.cwd);
+            const guard = reviewerReadGuard(deps.cwd, deps.folderPolicy?.());
             const readPaths = analyzeShellPaths(command, deps.cwd).reads;
             const readEval = evaluateFolderTargets(readPaths, {
                 config: guard.config,
-                grants: [],
+                grants: guard.grants,
                 cwd: deps.cwd,
                 lockedRoots: [guard.root],
+                explicitGrants: guard.grants,
                 action: "read",
             });
-            if (readEval.sensitive.length > 0 || readEval.outside.length > 0) {
+            if (
+                readEval.sensitive.length > 0 ||
+                readEval.excluded.length > 0 ||
+                readEval.outside.length > 0
+            ) {
                 const target =
                     readEval.sensitive[0]?.path ??
+                    readEval.excluded[0]?.path ??
                     readEval.outside[0]?.path ??
                     "the requested path";
                 deps.log(
@@ -192,7 +203,14 @@ export function createReviewBashTool(
                     onUpdate,
                     ctx,
                 )) as ReviewToolTextResult;
-                return redactReviewResult(result, "bash", rawParams, deps.cwd, guard.config);
+                return redactReviewResult(
+                    result,
+                    "bash",
+                    rawParams,
+                    deps.cwd,
+                    guard.config,
+                    { base: [guard.root] },
+                );
             } catch (e: unknown) {
                 return {
                     content: [
@@ -380,6 +398,15 @@ export interface ReviewToolDeps {
     explore: ReviewExploreDeps;
     submit: ReviewSubmitDeps;
     passDone: ReviewPassDoneDeps;
+    /**
+     * The parent's effective folder policy (sensitive extras, `excludePaths`)
+     * and read grants. The reviewer is a separate session with no ambient
+     * extensions, so without this it would ignore the user's deny layer.
+     */
+    folderPolicy?: () => {
+        config: FolderPolicyConfig;
+        grants: readonly string[];
+    };
 }
 
 // ── Steps 9-11: review_submit_plan ───────────────────────────────────
@@ -499,6 +526,10 @@ export function createReviewPlanBeginTool(deps: ReviewSubmitDeps): {
             ),
         }),
         async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
+            // SAFETY: Pi calls every tool `execute(toolCallId, params, …)`,
+            // so index 1 is the model-supplied params object. This tool's
+            // schema declares `totalChunks`, which is narrowed below before
+            // use — nothing else is read off the value.
             const [, rawParams] = args as unknown as [
                 string,
                 { totalChunks?: unknown },
@@ -574,6 +605,9 @@ export function createReviewPlanChunkTool(deps: ReviewSubmitDeps): {
             }),
         }),
         async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
+            // SAFETY: Pi calls every tool `execute(toolCallId, params, …)`,
+            // so index 1 is the model-supplied params object. `index` and
+            // `content` are narrowed below before use.
             const [, rawParams] = args as unknown as [
                 string,
                 { index?: unknown; content?: unknown },
@@ -1057,16 +1091,22 @@ export function createReviewPassDoneTool(deps: ReviewPassDoneDeps): {
 interface ReviewerReadGuard {
     root: string;
     config: FolderPolicyConfig;
+    /** Explicit grants that can re-open an excluded subtree. */
+    grants: readonly string[];
 }
 
-function reviewerReadGuard(cwd: string): ReviewerReadGuard {
+function reviewerReadGuard(
+    cwd: string,
+    parent?: { config: FolderPolicyConfig; grants: readonly string[] },
+): ReviewerReadGuard {
     return {
         root: detectRepoRoot(cwd) ?? cwd,
         config: {
-            ...DEFAULT_FOLDER_POLICY_CONFIG,
+            ...(parent?.config ?? DEFAULT_FOLDER_POLICY_CONFIG),
             mode: "cwd",
             outside: "block",
         },
+        grants: parent?.grants ?? [],
     };
 }
 
@@ -1108,13 +1148,17 @@ function guardReviewerTarget(
     const hit = matchSensitivePath(value, guard.config, cwd);
     const evaluation = evaluateFolderTargets([target], {
         config: guard.config,
-        grants: [],
+        grants: guard.grants,
         cwd,
         lockedRoots: [guard.root],
+        explicitGrants: guard.grants,
         action: "read",
     });
     if (hit.sensitive || evaluation.sensitive.length > 0)
         return reviewerRefusal(target);
+    // The excluded folder itself, or a path inside it that no approved grant
+    // re-opens, is refused to the reviewer too.
+    if (evaluation.excluded.length > 0) return reviewerRefusal(target);
     if (evaluation.outside.length > 0) return reviewerRefusal(target);
     return undefined;
 }
@@ -1125,11 +1169,19 @@ function redactReviewResult(
     input: Record<string, unknown>,
     cwd: string,
     config: FolderPolicyConfig,
+    roots?: { base?: readonly string[]; grants?: readonly string[] },
 ): ReviewToolTextResult {
     let redacted = false;
     const content = (result.content ?? []).map((block) => {
         if (block?.type !== "text") return block;
-        const next = redactSensitiveText(block.text, tool, input, cwd, config);
+        const next = redactSensitiveText(
+            block.text,
+            tool,
+            input,
+            cwd,
+            config,
+            roots,
+        );
         if (next.redacted) redacted = true;
         return next.redacted ? { ...block, text: next.text } : block;
     });
@@ -1140,10 +1192,11 @@ function redactReviewResult(
 function createGuardedBuiltinTools(
     sdk: PiCodingAgentSdk | undefined,
     cwd: string,
+    parent?: { config: FolderPolicyConfig; grants: readonly string[] },
 ): { tools: unknown[]; unavailable: string[] } {
     const tools: unknown[] = [];
     const unavailable: string[] = [];
-    const guard = reviewerReadGuard(cwd);
+    const guard = reviewerReadGuard(cwd, parent);
     const builders: Array<[string, string, unknown]> = [
         ["read", "read", (sdk as any)?.createReadToolDefinition],
         ["grep", "grep", (sdk as any)?.createGrepToolDefinition],
@@ -1169,7 +1222,9 @@ function createGuardedBuiltinTools(
                 const result = (await definition.execute(
                     ...args,
                 )) as ReviewToolTextResult;
-                return redactReviewResult(result, tool, input, cwd, guard.config);
+                return redactReviewResult(result, tool, input, cwd, guard.config, {
+                    base: [guard.root],
+                });
             },
         });
     }
@@ -1196,7 +1251,11 @@ export function createReviewTools(
     // The reviewer session has NO ambient extensions, so its built-in
     // read/grep/find/ls are otherwise a complete bypass of the read gate.
     // Custom tools with those names override the built-ins.
-    const guarded = createGuardedBuiltinTools(sdk, deps.cwd);
+    const guarded = createGuardedBuiltinTools(
+        sdk,
+        deps.cwd,
+        deps.folderPolicy?.(),
+    );
     tools.push(...guarded.tools);
     unavailable.push(...guarded.unavailable);
 

@@ -45,7 +45,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
-| `/folder-policy [repo\|cwd\|parent\|any] [global\|project]` | Shared folder scope for read, write **and** commit (default `repo`: nearest `.git` root, fallback cwd). `outside ask\|block`, `grant project\|global`, `templates allow\|block`, `sensitive` |
+| `/folder-policy [repo\|cwd\|parent\|any] [global\|project]` | Shared folder scope for read, write **and** commit (default `repo`: nearest `.git` root, fallback cwd). `outside ask\|block`, `grant project\|global`, `templates allow\|block`, `sensitive`, `exclude [add\|revoke\|list] <glob> [--global\|--project]` |
 | `/read-policy [status\|allow <path>\|revoke <path>\|shell paths\|strict] [global\|project]` | Read grants, shell analysis mode and the shared folder scope. Sensitive files are always blocked |
 | `/permissions [explain] <command>` | Explain a shell command's verdict without running it: each segment's class, the Plan/Review/Explorer answer and whether the write policy would treat it as a write |
 
@@ -365,11 +365,48 @@ Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global
 
 **Sensitive files are always blocked.** The default deny list covers `.env*` (templates such as `.env.example` are exempt by default), `.npmrc`/`.netrc`/`.git-credentials`, `auth.json`, `credentials*`, `secrets.*`, SSH/GPG/cloud stores, key/cert stores, `.git/config`, `.tfstate`/`.tfvars` and keychains. A folder grant never re-enables one; add a manual `folderPolicy.sensitiveExemptions` entry only when a template/fixture is genuinely needed. `/folder-policy sensitive` lists the effective rules.
 
+### Excluded folders
+
+`folderPolicy.excludePaths` protects a folder you do **not** want the agent to hold standing permission over — typically an OS root or your home directory:
+
+```jsonc
+// ~/.pi/agent/settings.json — global is the usual scope here
+{ "workflow": { "folderPolicy": { "excludePaths": ["C:/", "C:/Users/Lenovo"] } } }
+```
+
+An exclusion is **scope subtraction, not a secret**, so it differs from `sensitivePatterns` in one decisive way: a more specific approval can re-open a sub-folder.
+
+| Target | No grant | Grant on the excluded folder | Grant inside it | Grant above it |
+| --- | --- | --- | --- | --- |
+| the excluded folder itself | **blocked** (no dialog) | allowed | blocked | blocked |
+| a file/folder below it | outside → ask / block | allowed | allowed | outside |
+| the session folder, strictly inside | allowed | allowed | allowed | allowed |
+| the session folder **is** the excluded folder | **blocked** | allowed | blocked | blocked |
+
+- The excluded folder itself never prompts and never offers a grant; the refusal names the rule and `exclude revoke`.
+- Below it, normal `outside` rules apply: `outside: "ask"` lets the agent request one specific sub-folder (that approval is a grant inside the exclusion, so it sticks), `outside: "block"` refuses without a dialog.
+- The session folder (and a spawned subagent's locked roots) only rescue automatically when **strictly inside** an exclusion, so opening your home directory as the cwd does not silently hand over the whole home.
+- A grant at or above the excluded root never rescues; dialogs also refuse a one-click grant of a filesystem root or the home directory, so “Always allow” cannot undo the protection by accident. A deliberate `/read-policy allow C:/` does — that is an explicit user decision.
+- Sensitive-file rules still win inside an approved subtree.
+
+Commands (global by default — `--project` opts into `<cwd>/.pi/settings.json`):
+
+```
+/folder-policy exclude C:/ --global     # add (the bare form adds)
+/folder-policy exclude add ~ --project  # add to the project file
+/folder-policy exclude list             # effective rules
+/folder-policy exclude revoke C:/       # remove exactly one entry
+```
+
+Global and project `excludePaths` are **unioned**: a project can add an exclusion, never remove a global one. Project settings are only read when the project is trusted. `/folder-policy status` warns loudly when the session folder itself is excluded (every gated call at or under it would fail) and names the revoke command. Catch-all patterns (`*`, `**`, `**/*`) are refused.
+
+**Workflow settings are user-owned.** Tool writes (`edit`, `write`, shell redirects/`sed -i`) that target the global `~/.pi/agent/settings.json` or the project `.pi/settings.json` are refused in every mode, including Build — otherwise the agent could delete its own exclusions. The slash commands write those files through the filesystem and still work; ask the user to run one, or to edit the file themselves.
+
 **Read gate.** `read`, `ls`, `grep`, `find`, pi-lens read tools, `explore` cwd/tasks, local `fetch_content`/`browser_*` file URLs and balanced shell reads (`cat`, `rg`, `git show/-C`, redirections, `cp`/`tar` sources) are path-gated. `grep`/`find`/`ls` output, sensitive git diff sections and truncated `bash` full-output paths are redacted. `readPolicy.shell: "strict"` also asks for inline/interpreter commands that cannot be statically verified.
 
 **Grants.** “Always allow” writes to the capability's `allowedPaths` in project settings by default (`folderPolicy.grantScope: "project"`); the project must be trusted. Existing global write grants remain honoured. “Always allow” cannot grant a filesystem root/home from a dialog — use `/folder-policy any` deliberately.
 
-**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. A shell command whose writes cannot be located — `npm run build`, `node script`, `npx`, a `sed`/`awk` program, `powershell`, or a path-less tool in `mutatingTools` — is **not** treated as an outside write: under `writePolicy: "allow"` (and in Build) it runs without a dialog. That is deliberate: the analyzer cannot see inside project code, and asking made ordinary in-repo builds and tests look like a permission violation. Use `writePolicy: "ask"` for a prompt on every mutating call, or an OS container/VM for a hard boundary. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions; `review_bash` uses the same read guard. Spawned subagents receive locked roots and cannot expand via a sibling project's settings.
+**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. A shell command whose writes cannot be located — `npm run build`, `node script`, `npx`, a `sed`/`awk` program, `powershell`, or a path-less tool in `mutatingTools` — is **not** treated as an outside write: under `writePolicy: "allow"` (and in Build) it runs without a dialog. That is deliberate: the analyzer cannot see inside project code, and asking made ordinary in-repo builds and tests look like a permission violation. Use `writePolicy: "ask"` for a prompt on every mutating call, or an OS container/VM for a hard boundary. The same honesty applies to `excludePaths`: `grep -r` still traverses excluded files before the output is redacted, project-wide tools (`symbol_search`, `project_report`, a path-less `lens_diagnostics`) can surface names or symbols from an excluded folder, and opaque code is not path-analysed — the exclusions stop the agent's *tools* from reading or writing there, not an arbitrary subprocess. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions, and inherits the parent's exclusions and read grants; `review_bash` uses the same guard. Spawned subagents receive locked roots plus the parent's deny layer (`PI_FOLDER_POLICY_DENY`) and cannot expand via a sibling project's settings.
 
 **Migration.** The default `folderPolicy.mode: "repo"` + `outside: "ask"` also constrains writes/commits. Set `folderPolicy.mode: "any"` to restore the old “write anywhere” behaviour (sensitive files remain blocked); this now also disables the unresolvable-target asks. Use `cwd`/`parent` to keep a narrower floor.
 
@@ -387,6 +424,8 @@ The default exists because prompt-only rules are soft: models habitually commit 
 | Aider | auto-commits every edit | `--no-auto-commits`, `--commit-prompt` (the configurable-commit pole) |
 
 ### Modes
+
+Exclusions and sensitive files apply to commits too: `git add <sensitive|excluded>`, `git add .`/`-A` when such a path would be included, and a staged sensitive/excluded path before `git commit` are refused. `/commit` bypasses the commit *mode* (with your confirmation), never the sensitive-file or exclusion checks. Per-step auto-commit skips with a notice when the repository — or any dirty path it would stage — is excluded.
 
 | Mode | Meaning |
 | --- | --- |
@@ -443,7 +482,8 @@ The status line always shows the active permission (`◦ commits:never · writes
 
 ### Scope and carve-outs
 
-- **Default mode only for the write mode.** Plan mode keeps its stricter read-only rules (writes only to `.pi/plans/`), and Build stays the execution escape hatch: it never inherits `writePolicy: ask/never`. The shared folder floor still applies in Build and Default (outside targets and sensitive files).
+- **Default mode only for the write mode.** Plan mode keeps its stricter read-only rules (writes only to `.pi/plans/`), and Build stays the execution escape hatch: it never inherits `writePolicy: ask/never`. The shared folder floor still applies in Build and Default (outside targets, sensitive files and [excluded folders](#excluded-folders)).
+- **Settings files are user-owned.** A write whose target is the global `~/.pi/agent/settings.json` or the project `.pi/settings.json` is refused in every mode, so the agent cannot delete its own exclusions; the slash commands still write them.
 - **Subagents are unaffected.** A spawned child carries `PI_WORKFLOW_ROLE` and is already read-only through the role gate — and it has no UI to answer a prompt with.
 - **`.pi/plans/` writes stay allowed** in every mode, so a session that leaves Plan mode mid-flow is not stranded.
 - **Third-party write tools need opting in.** `ast_grep_replace` (pi-lens) rewrites files, and the `office_*` tools (pi-office-protocol) write documents; neither is covered by the built-in scope. List them in `mutatingTools` to gate them (see below). A path-less mutating tool follows the write mode: no prompt under `allow`/Build, prompted under `ask`.
@@ -614,6 +654,32 @@ Write Permission settings live under `workflow.writePolicy` (same global/project
 
 `"writePolicy": "ask"` (a bare mode string) is accepted as shorthand for `{ "mode": "ask" }`. Booleans, numbers and unknown modes fall back to the default. `/write-policy` writes this key read-modify-write, preserving every other settings key; the three list fields are **additive** — a write never drops the entries already stored (remove one by editing the JSON directly).
 
+Folder Policy settings live under `workflow.folderPolicy` (scalars project-over-global; `sensitivePatterns`, `sensitiveExemptions` and `excludePaths` are **unioned**, so a trusted project can add a rule but never remove a global one):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"repo"` | Base folder: `repo` (nearest `.git`, fallback cwd), `cwd`, `parent` (siblings), `any` (containment off; sensitive files and exclusions still apply) |
+| `outside` | `"ask"` | `ask` = prompt once per turn for a target outside the floor (headless fails closed); `block` = refuse without a dialog |
+| `grantScope` | `"project"` | Where “Always allow” persists grants (`project` \| `global`); a project grant needs a trusted project |
+| `sensitiveTemplates` | `"allow"` | `block` treats `.env.example`-style templates as sensitive |
+| `sensitivePatterns` | `[]` | Extra always-blocked globs (additive on top of the built-in list) |
+| `sensitiveExemptions` | `[]` | Manual exemptions; never written by a dialog |
+| `excludePaths` | `[]` | Folders the agent has no standing permission over. See [Excluded folders](#excluded-folders) for the rescue rule |
+
+```jsonc
+{
+  "workflow": {
+    "folderPolicy": {
+      "mode": "repo",
+      "outside": "ask",
+      "excludePaths": ["C:/", "~"]
+    }
+  }
+}
+```
+
+`"folderPolicy": "ask"` is **not** shorthand — a bare string is read as a `mode` (`"repo"`, `"cwd"`, `"parent"`, `"any"`), matching the earlier release. Project settings (all four `workflow.*` policies) are ignored unless the project is trusted; `/folder-policy status` says when it ignored them.
+
 ## How it works
 
 See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `shell-paths.ts` (path extraction for the shared floor), `folder-policy.ts` (the shared containment floor and sensitive-file rules), `read-policy.ts` / `read-policy-tools.ts` / `read-policy-redact.ts` (the read gate, tool classification and output redaction), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `todo-panel.ts` (pure todo-panel state matrix, list identity, summary and row rendering), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `provider-retarget.ts` (guarded, backed-up `provider` ref migration for profiles/roles — pure document rewrite plus a two-phase file apply), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers), `review-handoff.ts` (pure pending-gate correlation, supersede and reload-recovery decisions). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
@@ -670,7 +736,7 @@ What to do:
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts folder-exclude.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):

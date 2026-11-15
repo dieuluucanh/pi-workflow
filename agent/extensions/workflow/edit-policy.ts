@@ -310,6 +310,9 @@ export function writeWritePolicyConfig(
 ): { path: string; ok: boolean; error?: string } {
   const paths = writePolicyConfigPaths(cwd, agentDir);
   const fp = scope === "project" ? paths.project : paths.global;
+  if (process.env.PI_FOLDER_POLICY_LOCKED === "1") {
+    return { path: fp, ok: false, error: "write policy is locked for this subagent" };
+  }
   try {
     const existing = readJsonSafe(fp);
     const root: JsonObject = existing ? { ...existing } : {};

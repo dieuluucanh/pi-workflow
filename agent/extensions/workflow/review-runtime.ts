@@ -75,6 +75,15 @@ const SETTLE_IN_FLIGHT_FALLBACK_MS = 60_000;
 export interface ReviewRuntimeDeps {
   cwd: string;
   agentDir: string;
+  /**
+   * The parent's effective folder policy (sensitive extras, `excludePaths`)
+   * and read grants, handed to the reviewer's guarded tools. Optional so
+   * existing tests and embedders keep working.
+   */
+  folderPolicy?: () => {
+    config: import("./folder-policy.ts").FolderPolicyConfig;
+    grants: readonly string[];
+  };
   config: () => ReviewModeConfig | undefined;
   /** Resolve the reviewer role's model (falls back to the planner when unset). */
   reviewerModel: () =>
@@ -822,6 +831,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const built = createReviewTools(sdk, {
           cwd: deps.cwd,
           log: deps.log,
+          folderPolicy: deps.folderPolicy,
           explore: {
             // Step 8: Planner recon rides along in the prompt — when it is
             // present the reviewer verifies instead of re-exploring.

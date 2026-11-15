@@ -40,9 +40,11 @@ import {
   isNetworkPath,
   matchSensitivePath,
   mergeFolderPolicyConfig,
+  normalizeExcludePattern,
   normalizePolicyPath,
   readFolderPolicyConfig,
   resolveFolderRoots,
+  revokeFolderPolicyListEntry,
   writeFolderPolicyConfig,
 } from "./folder-policy.ts";
 import { WORKFLOW_SETTINGS_KEY, commitConfigPaths } from "./commit-policy.ts";
@@ -100,6 +102,30 @@ test("coerce: defaults, bare mode, garbage and wrong types", () => {
     }).sensitivePatterns,
     ["**/*.sql"],
   );
+  // Exclusions are normalised globs, never throw, and default to empty.
+  assert.deepEqual(coerceFolderPolicyConfig(undefined).excludePaths, []);
+  assert.deepEqual(
+    coerceFolderPolicyConfig({
+      excludePaths: [" C:\\Users\\Me\\ ", "", 7, "c:/users/me"],
+    }).excludePaths,
+    ["C:/Users/Me"],
+  );
+  assert.deepEqual(
+    coerceFolderPolicyConfig({ excludePaths: "C:/" }).excludePaths,
+    [],
+  );
+});
+
+test("exclude: patterns normalise shell spellings, keep roots intact", () => {
+  assert.equal(normalizeExcludePattern("  C:\\Users\\Me\\Projects  "), "C:/Users/Me/Projects");
+  assert.equal(normalizeExcludePattern("C:/"), "C:/",);
+  assert.equal(normalizeExcludePattern("/"), "/");
+  assert.equal(normalizeExcludePattern("//server/share/"), "//server/share");
+  assert.equal(normalizeExcludePattern("./build"), "build");
+  assert.equal(normalizeExcludePattern("a//b"), "a/b");
+  assert.equal(normalizeExcludePattern(""), "");
+  assert.equal(normalizeExcludePattern(42), "");
+  assert.equal(normalizeExcludePattern("~"), os.homedir().replace(/\\/g, "/"));
 });
 
 test("extract: pulls workflow.folderPolicy only from valid settings", () => {
@@ -131,12 +157,14 @@ test("merge: scalars project-over-global, pattern lists unioned", () => {
       outside: "ask",
       sensitivePatterns: ["**/*.a"],
       sensitiveExemptions: ["**/global.env"],
+      excludePaths: ["C:/", "~"],
     },
     {
       mode: "parent",
       outside: "block",
       sensitivePatterns: ["**/*.b"],
       sensitiveExemptions: ["**/project.env"],
+      excludePaths: ["/mnt/shared", "C:/"] as string[],
     },
   );
   assert.equal(merged.mode, "parent");
@@ -146,6 +174,7 @@ test("merge: scalars project-over-global, pattern lists unioned", () => {
     "**/global.env",
     "**/project.env",
   ]);
+  assert.deepEqual(merged.excludePaths, ["C:/", os.homedir().replace(/\\/g, "/"), "/mnt/shared"]);
 });
 
 // ── read / write / trust / lock ─────────────────────────────────────
@@ -227,6 +256,24 @@ test("read: project settings ignored unless trusted", () => {
   }
 });
 
+test("exclude: project excludes are ignored unless the project is trusted", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    writeJson(path.join(cwd, ".pi", "settings.json"), {
+      [WORKFLOW_SETTINGS_KEY]: {
+        [FOLDER_POLICY_KEY]: { excludePaths: ["C:/"] },
+      },
+    });
+    const untrusted = readFolderPolicyConfig(cwd, agentDir, { trusted: false });
+    assert.deepEqual(untrusted.config.excludePaths, []);
+    assert.equal(untrusted.sources.projectIgnored, true);
+    const trusted = readFolderPolicyConfig(cwd, agentDir, { trusted: true });
+    assert.deepEqual(trusted.config.excludePaths, ["C:/"]);
+  } finally {
+    cleanup();
+  }
+});
+
 test("write: read-modify-write preserves other keys and unions lists", () => {
   const { cwd, agentDir, cleanup } = tmpCwd();
   try {
@@ -236,6 +283,7 @@ test("write: read-modify-write preserves other keys and unions lists", () => {
         [FOLDER_POLICY_KEY]: {
           mode: "cwd",
           sensitivePatterns: ["**/*.a"],
+          excludePaths: ["C:\\"] as string[],
         },
         reviewMode: { enabled: true },
       },
@@ -243,6 +291,7 @@ test("write: read-modify-write preserves other keys and unions lists", () => {
     const res = writeFolderPolicyConfig("global", cwd, agentDir, {
       mode: "parent",
       sensitivePatterns: ["**/*.b"],
+      excludePaths: ["/mnt/shared", "c:/"] as string[],
     });
     assert.equal(res.ok, true);
     const raw = JSON.parse(fs.readFileSync(res.path, "utf8"));
@@ -253,7 +302,100 @@ test("write: read-modify-write preserves other keys and unions lists", () => {
       "**/*.a",
       "**/*.b",
     ]);
+    // Additive and de-duplicated after normalisation.
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, ["C:/", "/mnt/shared"]);
   } finally {
+    cleanup();
+  }
+});
+
+test("exclude: revoke removes exactly one entry and keeps every other key", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  try {
+    writeJson(path.join(agentDir, "settings.json"), {
+      theme: "dark",
+      [WORKFLOW_SETTINGS_KEY]: {
+        [FOLDER_POLICY_KEY]: {
+          mode: "cwd",
+          sensitivePatterns: ["**/*.sql"],
+          excludePaths: ["C:\\", "~"],
+        },
+        writePolicy: { mode: "allow" },
+      },
+    });
+    const res = revokeFolderPolicyListEntry(
+      "global",
+      cwd,
+      agentDir,
+      "excludePaths",
+      "c:\\",
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.removed, true);
+    const raw = JSON.parse(fs.readFileSync(res.path, "utf8"));
+    assert.equal(raw.theme, "dark");
+    assert.equal(raw.workflow.writePolicy.mode, "allow");
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, [
+      os.homedir().replace(/\\/g, "/"),
+    ]);
+    assert.deepEqual(raw.workflow.folderPolicy.sensitivePatterns, ["**/*.sql"]);
+    assert.equal(raw.workflow.folderPolicy.mode, "cwd");
+    // A second revoke of the same entry is a no-op, not an error.
+    const again = revokeFolderPolicyListEntry(
+      "global",
+      cwd,
+      agentDir,
+      "excludePaths",
+      "C:/",
+    );
+    assert.equal(again.ok, true);
+    assert.equal(again.removed, false);
+    // Missing files and unrelated keys are handled without throwing.
+    const missing = revokeFolderPolicyListEntry(
+      "project",
+      cwd,
+      agentDir,
+      "excludePaths",
+      "C:/",
+    );
+    assert.equal(missing.ok, true);
+    assert.equal(missing.removed, false);
+    assert.equal(
+      revokeFolderPolicyListEntry("global", cwd, agentDir, "excludePaths", "  ")
+        .removed,
+      false,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: revoke is refused while a subagent lock is active", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  const previous = process.env.PI_FOLDER_POLICY_LOCKED;
+  try {
+    writeJson(path.join(agentDir, "settings.json"), {
+      [WORKFLOW_SETTINGS_KEY]: {
+        [FOLDER_POLICY_KEY]: { excludePaths: ["C:/"] },
+      },
+    });
+    process.env.PI_FOLDER_POLICY_LOCKED = "1";
+    const res = revokeFolderPolicyListEntry(
+      "global",
+      cwd,
+      agentDir,
+      "excludePaths",
+      "C:/",
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.removed, false);
+    assert.match(String(res.error), /locked/);
+    const raw = JSON.parse(fs.readFileSync(res.path, "utf8"));
+    assert.deepEqual(raw.workflow.folderPolicy.excludePaths, ["C:/"]);
+  } finally {
+    if (previous === undefined)
+      delete process.env.PI_FOLDER_POLICY_LOCKED;
+    else process.env.PI_FOLDER_POLICY_LOCKED = previous;
     cleanup();
   }
 });
@@ -722,6 +864,7 @@ test("describeFolderEvaluation: counts and lists every verdict", () => {
   const lines = describeFolderEvaluation(
     {
       sensitive: [{ path: "c:/work/.env", pattern: "**/.env" }],
+      excluded: [{ path: "c:/", pattern: "C:/", root: "c:/" }],
       outside: [{ path: "c:/other/x.ts", kind: "file" }],
       allowed: [{ path: "c:/work/src/a.ts", kind: "file" }],
       network: [{ path: "//server/share/x.ts", kind: "file" }],
@@ -731,9 +874,13 @@ test("describeFolderEvaluation: counts and lists every verdict", () => {
     "c:/work",
   );
   assert.match(lines[0] ?? "", /c:\/work/);
-  assert.match(lines[1] ?? "", /1 inside, 1 outside, 1 sensitive, 1 unverifiable/);
+  assert.match(
+    lines[1] ?? "",
+    /1 inside, 1 outside, 1 excluded, 1 sensitive, 1 unverifiable/,
+  );
   assert.ok(lines.some((line) => line.includes("inside: c:/work/src/a.ts")));
   assert.ok(lines.some((line) => line.includes("outside: c:/other/x.ts")));
+  assert.ok(lines.some((line) => line.includes("excluded: c:/ (C:/)")));
   assert.ok(lines.some((line) => line.includes("network: //server/share/x.ts")));
   assert.ok(lines.some((line) => line.includes("sensitive: c:/work/.env (**/.env)")));
   assert.ok(lines.some((line) => line.includes("unverifiable: c:/work/bad")));
@@ -753,6 +900,17 @@ test("completions: subcommands and scopes follow the full-argument contract", ()
   const scope = folderPolicyArgumentCompletions("outside ask ");
   assert.ok(scope?.some((item) => item.value === "outside ask project"));
   assert.equal(folderPolicyArgumentCompletions("outside ask project"), null);
+  // exclude: the verbs, then the scope flags (or a free-form glob → null).
+  const exclude = folderPolicyArgumentCompletions("exclude ");
+  assert.ok(exclude?.some((item) => item.value === "exclude add"));
+  assert.ok(exclude?.some((item) => item.value === "exclude revoke"));
+  assert.ok(exclude?.some((item) => item.value === "exclude list"));
+  const excludeScope = folderPolicyArgumentCompletions("exclude add ");
+  assert.ok(excludeScope?.some((item) => item.value === "exclude add --project"));
+  assert.ok(excludeScope?.some((item) => item.value === "exclude add --global"));
+  assert.equal(folderPolicyArgumentCompletions("exclude add C:/"), null);
+  // A verb the handler never implemented must not be advertised.
+  assert.ok(!folderPolicyArgumentCompletions("sensitive ")?.length);
 });
 
 test("sensitive list is exported and contains no duplicate entries", () => {
@@ -764,4 +922,302 @@ test("sensitive list is exported and contains no duplicate entries", () => {
     new Set(DEFAULT_SENSITIVE_EXEMPTIONS).size,
     DEFAULT_SENSITIVE_EXEMPTIONS.length,
   );
+});
+
+// ── excludePaths: scope subtraction and the rescue rule ──────────────
+
+function excludeTree() {
+  const { cwd, cleanup } = tmpCwd();
+  const parent = path.dirname(cwd);
+  const excluded = path.join(parent, "excluded");
+  const inner = path.join(excluded, "proj");
+  const sibling = path.join(excluded, "other");
+  fs.mkdirSync(inner, { recursive: true });
+  fs.mkdirSync(sibling, { recursive: true });
+  return { parent, excluded, inner, sibling, cleanup };
+}
+
+function evalWith(
+  target: string,
+  options: {
+    cwd: string;
+    excluded: string;
+    grants?: string[];
+    mode?: "repo" | "cwd" | "parent" | "any";
+    outside?: "ask" | "block";
+  },
+) {
+  return evaluateFolderTargets([{ path: target, kind: "file" }], {
+    config: {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      mode: options.mode ?? "cwd",
+      outside: options.outside ?? "ask",
+      excludePaths: [options.excluded],
+    },
+    grants: options.grants ?? [],
+    cwd: options.cwd,
+    action: "read",
+  });
+}
+
+test("exclude: the excluded root blocks and its descendants are outside", () => {
+  const { excluded, sibling, cleanup } = excludeTree();
+  try {
+    const cwd = sibling;
+    const atRoot = evalWith(excluded, { cwd, excluded });
+    assert.equal(atRoot.excluded.length, 1);
+    assert.equal(atRoot.excluded[0]?.path, normalizePolicyPath(excluded, cwd));
+    assert.equal(atRoot.outside.length, 0);
+    assert.equal(atRoot.allowed.length, 0);
+
+    const below = evalWith(path.join(sibling, "a.ts"), { cwd, excluded });
+    // cwd is strictly inside the exclusion, so the session folder rescues it.
+    assert.equal(below.allowed.length, 1);
+    assert.equal(below.excluded.length, 0);
+
+    const other = evalWith(path.join(excluded, "elsewhere", "a.ts"), {
+      cwd,
+      excluded,
+    });
+    assert.equal(other.outside.length, 1);
+    assert.match(String(other.outside[0]?.reason), /inside excluded/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: base equal to the excluded root is blocked, not silently allowed", () => {
+  const { excluded, cleanup } = excludeTree();
+  try {
+    const atBase = evalWith(excluded, { cwd: excluded, excluded });
+    assert.equal(atBase.excluded.length, 1);
+    assert.equal(atBase.allowed.length, 0);
+
+    const child = evalWith(path.join(excluded, "child.txt"), {
+      cwd: excluded,
+      excluded,
+    });
+    assert.equal(child.excluded.length, 0);
+    assert.equal(child.outside.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: base strictly inside the excluded root stays allowed", () => {
+  const { excluded, inner, cleanup } = excludeTree();
+  try {
+    const inside = evalWith(path.join(inner, "a.ts"), { cwd: inner, excluded });
+    assert.equal(inside.allowed.length, 1);
+    assert.equal(inside.outside.length, 0);
+    assert.equal(inside.excluded.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: an explicit grant inside the exclusion rescues it", () => {
+  const { excluded, sibling, cleanup } = excludeTree();
+  try {
+    const cwd = sibling;
+    // Grant exactly on the excluded root (a deliberate /read-policy allow).
+    const atRoot = evalWith(excluded, { cwd, excluded, grants: [excluded] });
+    assert.equal(atRoot.excluded.length, 0);
+    assert.equal(atRoot.allowed.length, 1);
+
+    // Grant strictly below it, covering the target.
+    const deeper = evalWith(path.join(excluded, "keep", "x.ts"), {
+      cwd,
+      excluded,
+      grants: [path.join(excluded, "keep")],
+    });
+    assert.equal(deeper.outside.length, 0);
+    assert.equal(deeper.allowed.length, 1);
+
+    // A grant ABOVE the exclusion never rescues.
+    const above = evalWith(path.join(excluded, "x.ts"), {
+      cwd,
+      excluded,
+      grants: [path.dirname(excluded)],
+    });
+    assert.equal(above.allowed.length, 0);
+    assert.equal(above.outside.length, 1);
+    const aboveAtRoot = evalWith(excluded, {
+      cwd,
+      excluded,
+      grants: [path.dirname(excluded)],
+    });
+    assert.equal(aboveAtRoot.excluded.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: sensitive still wins inside a rescued subtree", () => {
+  const { excluded, sibling, cleanup } = excludeTree();
+  try {
+    const env = path.join(excluded, "keep", ".env");
+    const res = evalWith(env, {
+      cwd: sibling,
+      excluded,
+      grants: [path.join(excluded, "keep")],
+    });
+    assert.equal(res.sensitive.length, 1);
+    assert.equal(res.allowed.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: any mode still refuses the excluded root", () => {
+  const { excluded, cleanup } = excludeTree();
+  try {
+    const cwd = path.dirname(excluded);
+    const atRoot = evalWith(excluded, { cwd, excluded, mode: "any" });
+    assert.equal(atRoot.excluded.length, 1);
+    assert.equal(atRoot.allowed.length, 0);
+    const below = evalWith(path.join(excluded, "x.ts"), {
+      cwd,
+      excluded,
+      mode: "any",
+    });
+    assert.equal(below.allowed.length, 0);
+    assert.equal(below.outside.length, 1);
+    // An explicit grant restores the `any` behaviour for that subtree.
+    const granted = evalWith(path.join(excluded, "x.ts"), {
+      cwd,
+      excluded,
+      mode: "any",
+      grants: [excluded],
+    });
+    assert.equal(granted.allowed.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: a symlink into an excluded tree is outside", () => {
+  const { parent, excluded, cleanup } = excludeTree();
+  try {
+    const link = path.join(parent, "link");
+    try {
+      fs.symlinkSync(
+        excluded,
+        link,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch {
+      return; // symlink privilege unavailable on this runner
+    }
+    const res = evalWith(path.join(link, "x.ts"), {
+      cwd: parent,
+      excluded,
+    });
+    assert.equal(res.outside.length, 1);
+    assert.equal(res.allowed.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: decideFolderGate blocks an excluded target before asking", () => {
+  assert.equal(
+    decideFolderGate({
+      sensitive: false,
+      excluded: true,
+      outside: false,
+      outsideAction: "ask",
+    }),
+    "block",
+  );
+  assert.equal(
+    decideFolderGate({
+      sensitive: false,
+      excluded: true,
+      outside: true,
+      outsideAction: "ask",
+    }),
+    "block",
+  );
+  // The outside action still governs descendants (listed as outside).
+  assert.equal(
+    decideFolderGate({
+      sensitive: false,
+      excluded: false,
+      outside: true,
+      outsideAction: "block",
+    }),
+    "block",
+  );
+});
+
+// ── locked subagents inherit the deny layer ──────────────────────────
+
+test("lock: PI_FOLDER_POLICY_DENY carries exclusions and sensitive extras", () => {
+  const { cwd, agentDir, cleanup } = tmpCwd();
+  const previous = {
+    locked: process.env.PI_FOLDER_POLICY_LOCKED,
+    roots: process.env.PI_FOLDER_POLICY_ROOTS,
+    deny: process.env.PI_FOLDER_POLICY_DENY,
+    source: process.env.PI_FOLDER_POLICY_SOURCE,
+  };
+  try {
+    process.env.PI_FOLDER_POLICY_LOCKED = "1";
+    process.env.PI_FOLDER_POLICY_ROOTS = JSON.stringify([cwd]);
+    process.env.PI_FOLDER_POLICY_SOURCE = "parent";
+    process.env.PI_FOLDER_POLICY_DENY = JSON.stringify({
+      sensitiveTemplates: "block",
+      sensitivePatterns: ["**/*.sql"],
+      sensitiveExemptions: ["**/demo.sql"],
+      excludePaths: ["C:/"],
+    });
+    const resolved = readFolderPolicyConfig(cwd, agentDir, { trusted: true });
+    assert.equal(resolved.config.mode, "cwd");
+    assert.equal(resolved.config.outside, "block");
+    assert.equal(resolved.config.sensitiveTemplates, "block");
+    assert.deepEqual(resolved.config.sensitivePatterns, ["**/*.sql"]);
+    assert.deepEqual(resolved.config.sensitiveExemptions, ["**/demo.sql"]);
+    assert.deepEqual(resolved.config.excludePaths, ["C:/"]);
+    // The deny layer is enforced, not decorative.
+    assert.equal(matchSensitivePath(`${cwd}/dump.sql`, resolved.config, cwd).sensitive, true);
+    const atRoot = evaluateFolderTargets([{ path: "C:/", kind: "dir" }], {
+      config: resolved.config,
+      grants: [],
+      cwd,
+      lockedRoots: resolved.locked?.roots,
+      action: "read",
+    });
+    assert.equal(atRoot.excluded.length, 1);
+    const belowRoot = evaluateFolderTargets(
+      [{ path: "c:/x", kind: "file" }],
+      {
+        config: resolved.config,
+        grants: [],
+        cwd,
+        lockedRoots: resolved.locked?.roots,
+        action: "read",
+      },
+    );
+    assert.equal(belowRoot.outside.length, 1);
+    assert.match(String(belowRoot.outside[0]?.reason), /excluded/);
+
+    // A malformed payload must not throw or widen anything.
+    process.env.PI_FOLDER_POLICY_DENY = "{not json";
+    const fallback = readFolderPolicyConfig(cwd, agentDir, { trusted: true });
+    assert.deepEqual(fallback.config.excludePaths, []);
+    assert.deepEqual(fallback.config.sensitivePatterns, []);
+  } finally {
+    if (previous.locked === undefined)
+      delete process.env.PI_FOLDER_POLICY_LOCKED;
+    else process.env.PI_FOLDER_POLICY_LOCKED = previous.locked;
+    if (previous.roots === undefined)
+      delete process.env.PI_FOLDER_POLICY_ROOTS;
+    else process.env.PI_FOLDER_POLICY_ROOTS = previous.roots;
+    if (previous.deny === undefined) delete process.env.PI_FOLDER_POLICY_DENY;
+    else process.env.PI_FOLDER_POLICY_DENY = previous.deny;
+    if (previous.source === undefined)
+      delete process.env.PI_FOLDER_POLICY_SOURCE;
+    else process.env.PI_FOLDER_POLICY_SOURCE = previous.source;
+    cleanup();
+  }
 });

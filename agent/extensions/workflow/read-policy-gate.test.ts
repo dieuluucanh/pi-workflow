@@ -355,3 +355,115 @@ test("read: Always allow persists a project-scoped read grant", async () => {
     await cleanup();
   }
 });
+
+// ── excludePaths ─────────────────────────────────────────────────────
+
+test("read: an excluded parent keeps the project reachable without a dialog", async () => {
+  const probe = await boot();
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+    },
+  });
+  try {
+    // cwd sits strictly inside the excluded parent: the session base rescues it.
+    assert.equal(
+      await call(pi, ctx, "read", { path: path.join(cwd, "a.ts") }),
+      undefined,
+    );
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: the excluded folder itself is blocked with no dialog", async () => {
+  const probe = await boot();
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const { pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+    },
+  });
+  try {
+    const blocked = await call(pi, ctx, "ls", { path: parent });
+    assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /excluded/i);
+    assert.match(
+      String((blocked as any).reason),
+      /folder-policy exclude revoke/,
+    );
+    assert.equal(selects.length, 0, "an excluded folder must never prompt");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: a descendant of an excluded folder asks once and can be granted", async () => {
+  const probe = await boot();
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const target = path.join(parent, "outside-sibling", "x.ts");
+  const { pi, ctx, selects, cleanup } = await boot(
+    {
+      workflow: {
+        folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      },
+    },
+    true,
+    true,
+    "Always allow this folder",
+  );
+  try {
+    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
+    assert.equal(selects.length, 1);
+    // The persisted grant is inside the exclusion, so the subtree now works
+    // without a second prompt.
+    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
+    assert.equal(selects.length, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: outside 'block' refuses an excluded descendant without a dialog", async () => {
+  const probe = await boot();
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const { pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "block", excludePaths: [parent] },
+    },
+  });
+  try {
+    const blocked = await call(pi, ctx, "read", {
+      path: path.join(parent, "sibling", "x.ts"),
+    });
+    assert.ok(blocked && (blocked as any).block);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: a sensitive file stays blocked inside a granted excluded subtree", async () => {
+  const probe = await boot();
+  const parent = path.dirname(probe.cwd);
+  await probe.cleanup();
+  const { pi, ctx, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      readPolicy: { allowedPaths: [parent] },
+    },
+  });
+  try {
+    const blocked = await call(pi, ctx, "read", { path: path.join(parent, ".env") });
+    assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /sensitive/i);
+  } finally {
+    await cleanup();
+  }
+});

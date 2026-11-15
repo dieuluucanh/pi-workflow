@@ -18,8 +18,22 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { FolderPolicyConfig } from "./folder-policy.ts";
-import { matchSensitivePath, toPosixPath } from "./folder-policy.ts";
+import type {
+  ExclusionRescueRoots,
+  FolderPolicyConfig,
+} from "./folder-policy.ts";
+import {
+  matchSensitivePath,
+  matchUnrescuedExclusion,
+  toPosixPath,
+} from "./folder-policy.ts";
+
+/**
+ * Roots that can re-open an excluded path for this result. Without them an
+ * exclusion match is withheld, so a caller that forgets to pass roots fails
+ * closed rather than leaking the excluded tree.
+ */
+export type RedactRoots = ExclusionRescueRoots;
 
 export interface RedactableBlock {
   type: string;
@@ -57,8 +71,27 @@ function searchBase(input: Record<string, unknown>, cwd: string): string {
   }
 }
 
-function isSensitive(pathValue: string, config: FolderPolicyConfig, cwd: string): boolean {
+function isSensitive(
+  pathValue: string,
+  config: FolderPolicyConfig,
+  cwd: string,
+): boolean {
   return matchSensitivePath(pathValue, config, cwd).sensitive;
+}
+
+/**
+ * Sensitive always wins; an excluded path is withheld unless an approved root
+ * (see `matchUnrescuedExclusion`) re-opens it.
+ */
+function isProtected(
+  pathValue: string,
+  config: FolderPolicyConfig,
+  cwd: string,
+  roots: RedactRoots | undefined,
+): boolean {
+  if (isSensitive(pathValue, config, cwd)) return true;
+  if (config.excludePaths.length === 0) return false;
+  return matchUnrescuedExclusion(pathValue, config, cwd, roots ?? {}).excluded;
 }
 
 function resolveOutputPath(
@@ -83,6 +116,7 @@ function redactGrep(
   input: Record<string, unknown>,
   cwd: string,
   config: FolderPolicyConfig,
+  roots?: RedactRoots,
 ): RedactTextResult {
   const base = searchBase(input, cwd);
   const out: string[] = [];
@@ -99,7 +133,7 @@ function redactGrep(
       continue;
     }
     const resolved = resolveOutputPath(rawPath, base, cwd);
-    if (isSensitive(resolved, config, cwd)) {
+    if (isProtected(resolved, config, cwd, roots)) {
       redacted = true;
       continue;
     }
@@ -108,7 +142,7 @@ function redactGrep(
   if (redacted && out.every((line) => !line.trim())) {
     return {
       text:
-        "[matches in sensitive files were withheld by read policy]",
+        "[matches in protected files were withheld by read policy]",
       redacted: true,
     };
   }
@@ -120,6 +154,7 @@ function redactFind(
   input: Record<string, unknown>,
   cwd: string,
   config: FolderPolicyConfig,
+  roots?: RedactRoots,
 ): RedactTextResult {
   const base = searchBase(input, cwd);
   const out: string[] = [];
@@ -131,7 +166,7 @@ function redactFind(
       continue;
     }
     const resolved = resolveOutputPath(trimmed.replace(/\/$/, ""), base, cwd);
-    if (isSensitive(resolved, config, cwd)) {
+    if (isProtected(resolved, config, cwd, roots)) {
       redacted = true;
       continue;
     }
@@ -148,6 +183,7 @@ function redactLs(
   input: Record<string, unknown>,
   cwd: string,
   config: FolderPolicyConfig,
+  roots?: RedactRoots,
 ): RedactTextResult {
   const raw = input.path;
   const base =
@@ -162,7 +198,7 @@ function redactLs(
       out.push(line);
       continue;
     }
-    if (isSensitive(path.join(base, entry), config, cwd)) {
+    if (isProtected(path.join(base, entry), config, cwd, roots)) {
       redacted = true;
       continue;
     }
@@ -178,6 +214,7 @@ function redactBash(
   text: string,
   cwd: string,
   config: FolderPolicyConfig,
+  roots?: RedactRoots,
 ): RedactTextResult {
   const lines = text.split("\n");
   const out: string[] = [];
@@ -189,8 +226,8 @@ function redactBash(
       const targetA = resolveOutputPath(diffHeader[1], cwd, cwd);
       const targetB = resolveOutputPath(diffHeader[2], cwd, cwd);
       inSensitiveDiff =
-        isSensitive(targetA, config, cwd) ||
-        isSensitive(targetB, config, cwd);
+        isProtected(targetA, config, cwd, roots) ||
+        isProtected(targetB, config, cwd, roots);
       if (inSensitiveDiff) {
         redacted = true;
         out.push("[diff section withheld by read policy]");
@@ -211,7 +248,7 @@ function redactBash(
     const prefixed = /^(.+?)(?::(\d+):|-(\d+)-)(.*)$/.exec(line);
     if (prefixed && !prefixed[1].includes("://")) {
       const resolved = resolveOutputPath(prefixed[1], cwd, cwd);
-      if (isSensitive(resolved, config, cwd)) {
+      if (isProtected(resolved, config, cwd, roots)) {
         redacted = true;
         continue;
       }
@@ -233,13 +270,14 @@ export function redactSensitiveText(
   input: Record<string, unknown>,
   cwd: string,
   config: FolderPolicyConfig,
+  roots?: RedactRoots,
 ): RedactTextResult {
   if (!text) return { text, redacted: false };
-  if (kind === "grep") return redactGrep(text, input, cwd, config);
-  if (kind === "find") return redactFind(text, input, cwd, config);
-  if (kind === "ls") return redactLs(text, input, cwd, config);
+  if (kind === "grep") return redactGrep(text, input, cwd, config, roots);
+  if (kind === "find") return redactFind(text, input, cwd, config, roots);
+  if (kind === "ls") return redactLs(text, input, cwd, config, roots);
   if (kind === "bash" || kind === "powershell")
-    return redactBash(text, cwd, config);
+    return redactBash(text, cwd, config, roots);
   return { text, redacted: false };
 }
 
@@ -258,6 +296,7 @@ export function redactToolResult(
   event: RedactableToolResult,
   config: FolderPolicyConfig,
   cwd: string,
+  roots?: RedactRoots,
 ): RedactedToolResult | undefined {
   const tool = String(event.toolName ?? "");
   const readTools = new Set([
@@ -269,12 +308,12 @@ export function redactToolResult(
   ]);
   if (readTools.has(tool)) {
     const target = inputPath(event.input);
-    if (target && isSensitive(path.resolve(cwd, target), config, cwd)) {
+    if (target && isProtected(path.resolve(cwd, target), config, cwd, roots)) {
       return {
         content: [
           {
             type: "text",
-            text: "[blocked by read policy: sensitive file]",
+            text: "[blocked by read policy: protected file]",
           },
         ],
         structuredContent: undefined,
@@ -294,6 +333,7 @@ export function redactToolResult(
       event.input ?? {},
       cwd,
       config,
+      roots,
     );
     if (!result.redacted) return block;
     changed = true;
