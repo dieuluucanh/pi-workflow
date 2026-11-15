@@ -11,6 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
@@ -462,22 +463,26 @@ test("read: an untrusted project's Always allows once and warns", async () => {
 
 // ── excludePaths ─────────────────────────────────────────────────────
 
-test("read: an excluded parent keeps the project reachable without a dialog", async () => {
-  const probe = await boot();
-  const parent = path.dirname(probe.cwd);
-  await probe.cleanup();
+test("read: a session folder inside a specific rule is fully blocked", async () => {
   const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
-      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      folderPolicy: {
+        mode: "cwd",
+        outside: "ask",
+        excludePaths: [os.tmpdir()],
+      },
     },
   });
   try {
-    // cwd sits strictly inside the excluded parent: the session base rescues it.
-    assert.equal(
-      await call(pi, ctx, "read", { path: path.join(cwd, "a.ts") }),
-      undefined,
+    // cwd is strictly inside a hard-deny rule: every read is refused.
+    const blocked = await call(pi, ctx, "read", { path: path.join(cwd, "a.ts") });
+    assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /excluded/i);
+    assert.match(
+      String((blocked as any).reason),
+      /folder-policy exclude revoke/,
     );
-    assert.equal(selects.length, 0);
+    assert.equal(selects.length, 0, "an excluded session must never prompt");
   } finally {
     await cleanup();
   }
@@ -506,7 +511,7 @@ test("read: the excluded folder itself is blocked with no dialog", async () => {
   }
 });
 
-test("read: a descendant of an excluded folder asks once and can be granted", async () => {
+test("read: a descendant of a specific rule is blocked with no dialog", async () => {
   const probe = await boot();
   const parent = path.dirname(probe.cwd);
   await probe.cleanup();
@@ -522,12 +527,14 @@ test("read: a descendant of an excluded folder asks once and can be granted", as
     "Always allow this folder",
   );
   try {
-    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
-    assert.equal(selects.length, 1);
-    // The persisted grant is inside the exclusion, so the subtree now works
-    // without a second prompt.
-    assert.equal(await call(pi, ctx, "read", { path: target }), undefined);
-    assert.equal(selects.length, 1);
+    const blocked = await call(pi, ctx, "read", { path: target });
+    assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /excluded/i);
+    assert.equal(
+      selects.length,
+      0,
+      "a denied subtree never prompts and cannot be granted",
+    );
   } finally {
     await cleanup();
   }
@@ -547,13 +554,79 @@ test("read: outside 'block' refuses an excluded descendant without a dialog", as
       path: path.join(parent, "sibling", "x.ts"),
     });
     assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /excluded/i);
     assert.equal(selects.length, 0);
   } finally {
     await cleanup();
   }
 });
 
-test("read: a sensitive file stays blocked inside a granted excluded subtree", async () => {
+test("read: a broad-root descendant follows the mode", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot();
+  try {
+    const root = path.parse(cwd).root;
+    // A `C:/`-style ceiling must not deny a project below it in `any` mode.
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "any",
+              outside: "ask",
+              excludePaths: [root],
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    assert.equal(
+      await call(pi, ctx, "read", {
+        path: path.join(cwd, "..", "sibling", "x.ts"),
+      }),
+      undefined,
+    );
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: a broad root cannot be rescued by a grant", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot();
+  try {
+    const root = path.parse(cwd).root;
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "any",
+              outside: "ask",
+              excludePaths: [root],
+            },
+            readPolicy: { allowedPaths: [root] },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const blocked = await call(pi, ctx, "ls", { path: root });
+    assert.ok(blocked && (blocked as any).block);
+    assert.match(String((blocked as any).reason), /excluded/i);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("read: sensitive still wins inside a denied subtree", async () => {
   const probe = await boot();
   const parent = path.dirname(probe.cwd);
   await probe.cleanup();

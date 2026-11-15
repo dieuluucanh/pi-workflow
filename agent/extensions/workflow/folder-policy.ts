@@ -24,12 +24,16 @@
  * capability-shared deny list. A folder grant never softens it: the sensitive
  * check runs before containment and before any policy grant.
  *
- * `excludePaths` is a different layer: an excluded folder is *scope
- * subtraction*, not a secret. The excluded path itself is refused outright (no
- * dialog, no grant); a path below it is "outside" and can still be requested
- * one specific subfolder at a time, and an explicit capability grant inside
- * the exclusion re-opens exactly that subtree. This is what lets a user deny a
- * whole OS root or home directory without making their projects unreachable.
+ * `excludePaths` is a different layer with two tiers:
+ *
+ *   - a *specific* rule (`C:/Personal`, `**\/node_modules`) is a hard deny: the
+ *     folder and every descendant are refused outright (no dialog, no grant,
+ *     no rescue) in every mode, including when the session folder is inside it;
+ *   - a *broad root* (`C:/`, `~`, `/`, `//server/share`, and the same with
+ *     `/**`) is a grant ceiling: only the root itself is blocked, and its
+ *     descendants follow the normal folder policy. That is what lets a user
+ *     refuse a standing grant on a whole drive or home directory without
+ *     making their projects unreachable.
  *
  * Settings live under `workflow.folderPolicy` in `~/.pi/agent/settings.json`
  * (global) or `<cwd>/.pi/settings.json` (project). Project settings are only
@@ -83,11 +87,11 @@ export interface FolderPolicyConfig {
   /** Manual glob exemptions. No dialog writes this list. */
   sensitiveExemptions: string[];
   /**
-   * Folders the agent has no standing permission over (typically an OS root
-   * or the home directory). The excluded path itself is blocked without a
-   * dialog; descendants are outside the floor and need an explicit grant that
-   * sits inside the exclusion. See `evaluateFolderTargets` for the rescue
-   * rule. Sensitive-file rules still apply on top.
+   * Folders the agent may not touch. A specific entry is a hard deny for the
+   * folder and its whole subtree (no dialog, no grant). A broad root (OS/
+   * drive/share root, home, or the same with `/**`) blocks only that root; its
+   * descendants follow `mode`. See `evaluateFolderTargets`. Sensitive-file
+   * rules still apply on top.
    */
   excludePaths: string[];
 }
@@ -278,23 +282,50 @@ export function normalizeExcludePattern(value: unknown): string {
 }
 
 /**
- * True when an exclusion pattern is an OS/drive/share root or the home
- * directory.
+ * The folder a rule names, with a trailing double-star suffix folded back to
+ * its base: `C:/**` -> `C:/`, `/**` -> `/`, while `C:/Personal/**` ->
+ * `C:/Personal`.
+ */
+function exclusionPatternBase(pattern: unknown): string {
+  const normalized = normalizeExcludePattern(pattern);
+  if (!normalized.endsWith("/**")) return normalized;
+  const head = normalized.slice(0, -3);
+  if (!head) return "/";
+  return normalizeExcludePattern(`${head}/`);
+}
+
+/**
+ * True when an exclusion rule is an OS/drive/share root or the home directory
+ * (a broad root, with or without a trailing double-star suffix).
  *
  * Deliberately narrower than `isBroadGrantRoot`, which refuses one-click
- * *grants* of protected roots. An exclusion is a
- * narrowing action, so excluding a specific top-level folder
- * (`C:/Personal`) is a precise, normal request and must not be reported as a
- * broad root. Only paths where "everything below is now unreachable" is the
- * point — `/`, `C:/`, `//server/share`, `~` — get the note.
+ * *grants* of protected roots. A specific folder (`C:/Personal`) is a precise
+ * hard deny and must not be reported as a broad root.
  */
 export function isBroadExcludePattern(pattern: unknown): boolean {
-  const normalized = normalizeExcludePattern(pattern);
-  if (!normalized) return false;
-  const root = pathRootOf(normalized);
-  if (normalized.toLowerCase() === root.toLowerCase()) return true;
+  const bare = exclusionPatternBase(pattern);
+  if (!bare) return false;
+  const root = pathRootOf(bare);
+  if (bare.toLowerCase() === root.toLowerCase()) return true;
   const home = normalizePolicyPath(os.homedir(), os.homedir());
-  return Boolean(home) && normalized.toLowerCase() === home;
+  return Boolean(home) && bare.toLowerCase() === home.toLowerCase();
+}
+
+/**
+ * The root a rule names, in comparison form, for deciding whether a *broad*
+ * rule blocks the target itself. Never use `ExclusionMatch.exact` for that: a
+ * double-star glob also matches the target as its own prefix, so `exact` is
+ * true for descendants too.
+ */
+export function exclusionRuleRoot(pattern: unknown): string {
+  const bare = exclusionPatternBase(pattern);
+  if (!bare) return "";
+  return normalizePolicyPath(bare, bare);
+}
+
+/** True when the rule that matched is a broad root (a ceiling, not a deny). */
+export function isBroadExclusionMatch(match: ExclusionMatch): boolean {
+  return Boolean(match.excluded && isBroadExcludePattern(match.pattern));
 }
 
 /** Coerce a list of exclusion globs: normalise, drop empties, dedupe. */
@@ -892,14 +923,6 @@ export interface ResolvedFolderRoots {
   lexical: string[];
   canonical: string[];
   unrestricted: boolean;
-  /** Roots by origin, so the exclusion rescue rule knows what is explicit. */
-  base: FolderRootSet;
-  /** The session working directory (implicit). */
-  anchor: FolderRootSet;
-  /** Capability grants and approved "allow once" roots (explicit). */
-  explicit: FolderRootSet;
-  /** Parent-approved roots for a locked subagent (implicit). */
-  locked: FolderRootSet;
 }
 
 /** Normalise + canonicalise a root list into both comparison forms. */
@@ -916,18 +939,6 @@ function buildRootSet(
     const resolved = canonicalizePolicyPath(normalized, cwd);
     if (resolved.path && !canonical.includes(resolved.path))
       canonical.push(resolved.path);
-  }
-  return { lexical, canonical };
-}
-
-function mergeRootSets(...sets: readonly FolderRootSet[]): FolderRootSet {
-  const lexical: string[] = [];
-  const canonical: string[] = [];
-  for (const set of sets) {
-    for (const entry of set.lexical)
-      if (!lexical.includes(entry)) lexical.push(entry);
-    for (const entry of set.canonical)
-      if (!canonical.includes(entry)) canonical.push(entry);
   }
   return { lexical, canonical };
 }
@@ -994,31 +1005,23 @@ export function resolveFolderRoots(
   lockedRoots?: readonly string[],
 ): ResolvedFolderRoots {
   const locked = lockedRoots && lockedRoots.length > 0;
-  const base = locked
-    ? { lexical: [], canonical: [] }
-    : buildRootSet(baseFolderRoots(config, cwd), cwd);
   // A grant typed as `/tmp` means the Git-Bash temp dir on Windows; the
   // dialog already stores the translated native path, but a manual
-  // `/read-policy allow /tmp` should behave the same.
+  // `/read-policy allow /tmp` should behave the same. A locked subagent drops
+  // the parent's grants and keeps only its approved roots.
   const explicitGrants = locked
-    ? grants
+    ? []
     : grants.map((grant) => translateMsysTempPath(grant, { cwd }));
-  const explicit = locked
-    ? { lexical: [], canonical: [] }
-    : buildRootSet(explicitGrants, cwd);
-  const lockedSet = locked
-    ? buildRootSet(lockedRoots ?? [], cwd)
-    : { lexical: [], canonical: [] };
-  const anchor = buildRootSet([cwd], cwd);
-  const effective = mergeRootSets(base, explicit, lockedSet);
+  const effective = buildRootSet(
+    locked
+      ? (lockedRoots ?? [])
+      : [...baseFolderRoots(config, cwd), ...explicitGrants],
+    cwd,
+  );
   return {
     lexical: effective.lexical,
     canonical: effective.canonical,
     unrestricted: config.mode === "any" && !locked,
-    base,
-    anchor,
-    explicit,
-    locked: lockedSet,
   };
 }
 
@@ -1225,11 +1228,9 @@ export function isBroadGrantRoot(
 /**
  * The folder a dialog's "Always allow" should persist for one target.
  *
- * Starts from the outside-project grouping, then: an excluded subtree keeps
- * the target's own folder (a grant above the exclusion rescues nothing), and
- * a grouped root that is broad falls back to the target's own folder. If the
- * own folder is broad too, `broad` carries the reason and the caller must not
- * offer a persistent grant.
+ * Starts from the outside-project grouping, then falls back to the target's
+ * own folder when that grouped root is broad. If the own folder is broad too,
+ * `broad` carries the reason and the caller must not offer a persistent grant.
  */
 export function dialogGrantRootForTarget(
   target: FolderTarget,
@@ -1245,16 +1246,6 @@ export function dialogGrantRootForTarget(
     ? outsideProjectRootForTarget(target, baseRoot)
     : undefined;
   if (!outside) return ownResult();
-  const excludeRoot = target.excludeRoot;
-  if (
-    excludeRoot &&
-    !isInsidePolicyPath(
-      normalizePolicyPath(outside, cwd),
-      normalizePolicyPath(excludeRoot, cwd),
-    )
-  ) {
-    return ownResult();
-  }
   if (broadGrantRootReason(outside, cwd)) return ownResult();
   return { root: outside, broad: undefined };
 }
@@ -1487,12 +1478,6 @@ export interface FolderTarget {
   path: string;
   kind: FolderTargetKind;
   reason?: string;
-  /**
-   * Set when `reason` describes an exclusion: the matched excluded root. The
-   * dialogs use it to make sure the grant they offer actually sits inside the
-   * exclusion (otherwise "Always allow" would store a grant that cannot help).
-   */
-  excludeRoot?: string;
 }
 
 export interface SensitiveTarget {
@@ -1510,7 +1495,10 @@ export interface ExcludedTarget {
 
 export interface FolderEvaluation {
   sensitive: SensitiveTarget[];
-  /** Targets at (or canonically at) an excluded root: hard block, no dialog. */
+  /**
+   * Targets denied by a hard-deny rule (the rule's root or a descendant):
+   * hard block, no dialog, no grant.
+   */
   excluded: ExcludedTarget[];
   outside: FolderTarget[];
   allowed: FolderTarget[];
@@ -1525,12 +1513,6 @@ export interface FolderEvaluationOptions {
   cwd: string;
   /** Parent-approved roots for a locked subagent. */
   lockedRoots?: readonly string[];
-  /**
-   * Explicit grants that can re-open an excluded subtree in a locked session
-   * (the reviewer inherits the parent's read grants). They never widen the
-   * locked scope (`lexical`/`canonical`), only the rescue rule.
-   */
-  explicitGrants?: readonly string[];
   /** Only used for diagnostics; containment is the same for all actions. */
   action?: "read" | "write" | "commit";
 }
@@ -1552,129 +1534,38 @@ function isAllowedByRoots(
 }
 
 /**
- * Does an approved root re-open this target despite the exclusion?
- *
- * `allowEqual` is the whole difference between an explicit grant and an
- * implicit root: a user-approved grant may sit exactly on the excluded folder
- * (`/read-policy allow ~/Projects`), while an implicit root — the base folder,
- * the session cwd, a locked subagent root — must be *strictly* inside it, so
- * opening the home directory as the session folder never blanket-allows home.
- * A root at or above the exclusion never rescues.
+ * Exclusion test for callers that are not evaluating a full folder floor
+ * (output redaction, the reviewer guard). A specific rule denies its root and
+ * every descendant; a broad root denies only the root itself, so a project
+ * inside it stays reachable.
  */
-function rescuesExclusion(
-  set: FolderRootSet,
-  allowEqual: boolean,
-  target: string,
-  exclusionRoot: string,
-): boolean {
-  return set.lexical.some((root) => {
-    if (root === exclusionRoot && !allowEqual) return false;
-    if (!isInsidePolicyPath(root, exclusionRoot)) return false;
-    return isInsidePolicyPath(target, root);
-  }) &&
-    (set.canonical.length === 0 ||
-      set.canonical.some((root) => {
-        if (root === exclusionRoot && !allowEqual) return false;
-        if (!isInsidePolicyPath(root, exclusionRoot)) return false;
-        return isInsidePolicyPath(target, root);
-      }));
-}
-
-/**
- * True when an explicit grant or an implicit root covers the target inside
- * the excluded folder. Both comparison forms must agree, so a symlink that
- * points out of the granted folder does not sneak past the exclusion.
- */
-function isRescuedFromExclusion(
-  lexical: string,
-  canonical: string,
-  exclusionRoot: string,
-  roots: ResolvedFolderRoots,
-): boolean {
-  const rootLexical = normalizePolicyPath(exclusionRoot, exclusionRoot);
-  if (!rootLexical) return false;
-  const rootCanonical =
-    canonicalizePolicyPath(rootLexical, rootLexical).path || rootLexical;
-  const lexicalOk =
-    rescuesExclusion(roots.explicit, true, lexical, rootLexical) ||
-    rescuesExclusion(roots.base, false, lexical, rootLexical) ||
-    rescuesExclusion(roots.anchor, false, lexical, rootLexical) ||
-    rescuesExclusion(roots.locked, false, lexical, rootLexical);
-  if (!lexicalOk) return false;
-  return (
-    rescuesExclusion(roots.explicit, true, canonical, rootCanonical) ||
-    rescuesExclusion(roots.base, false, canonical, rootCanonical) ||
-    rescuesExclusion(roots.anchor, false, canonical, rootCanonical) ||
-    rescuesExclusion(roots.locked, false, canonical, rootCanonical)
-  );
-}
-
-/** Roots a caller can supply to the exclusion rescue rule. */
-export interface ExclusionRescueRoots {
-  /** Implicit roots: rescue only when *strictly* inside the exclusion. */
-  base?: readonly string[];
-  /** Explicit grants: rescue when at or inside the exclusion. */
-  grants?: readonly string[];
-  /** Parent-approved roots for a locked subagent (implicit). */
-  locked?: readonly string[];
-}
-
-/**
- * Exclusion test with the rescue rule, for callers that are not evaluating a
- * full folder floor (output redaction, the reviewer guard). Returns the match
- * only when the target stays excluded; `{excluded:false}` means either no
- * exclusion matched or an approved root re-opened it.
- */
-export function matchUnrescuedExclusion(
+export function matchDeniedExclusion(
   value: unknown,
   config: FolderPolicyConfig,
   cwd: string,
-  rescue: ExclusionRescueRoots = {},
 ): ExclusionMatch {
   const match = createExclusionMatcher(config).match(value, cwd);
-  if (!match.excluded || !match.root) return NOT_EXCLUDED;
+  if (!match.excluded) return NOT_EXCLUDED;
+  if (!isBroadExclusionMatch(match)) return match;
+  const ruleRoot = exclusionRuleRoot(match.pattern);
   const lexical = normalizePolicyPath(value, cwd);
-  if (!lexical) return NOT_EXCLUDED;
-  const canonical = canonicalizePolicyPath(lexical, cwd).path || lexical;
-  const roots: ResolvedFolderRoots = {
-    lexical: [],
-    canonical: [],
-    unrestricted: false,
-    base: buildRootSet(rescue.base ?? [], cwd),
-    anchor: buildRootSet([cwd], cwd),
-    explicit: buildRootSet(rescue.grants ?? [], cwd),
-    locked: buildRootSet(rescue.locked ?? [], cwd),
-  };
-  return isRescuedFromExclusion(lexical, canonical, match.root, roots)
-    ? NOT_EXCLUDED
-    : match;
+  return ruleRoot && lexical === ruleRoot ? match : NOT_EXCLUDED;
 }
 
 /**
- * Classify targets against the folder floor. Sensitive wins; an excluded
- * folder itself is refused outright, its descendants fall back to `outside`
- * unless an approved root rescues them; network paths need an explicit grant
- * even in `any` mode; canonicalisation failures are reported so the caller can
- * ask instead of silently trusting them.
+ * Classify targets against the folder floor. Sensitive wins. A *specific*
+ * exclusion denies its root and every descendant outright (no dialog, no
+ * grant); a *broad root* denies only the root and leaves descendants to the
+ * normal containment/network rules. Network paths need an explicit grant even
+ * in `any` mode; canonicalisation failures are reported so the caller can ask
+ * instead of silently trusting them.
  */
 export function evaluateFolderTargets(
   targets: readonly FolderTarget[],
   options: FolderEvaluationOptions,
 ): FolderEvaluation {
   const { config, grants, cwd, lockedRoots } = options;
-  const resolvedRoots = resolveFolderRoots(config, grants, cwd, lockedRoots);
-  // A locked session replaces `grants` with its approved roots, but a caller
-  // (the reviewer) may still carry explicit grants for the rescue rule only.
-  const roots =
-    options.explicitGrants && options.explicitGrants.length > 0
-      ? {
-          ...resolvedRoots,
-          explicit: mergeRootSets(
-            resolvedRoots.explicit,
-            buildRootSet(options.explicitGrants, cwd),
-          ),
-        }
-      : resolvedRoots;
+  const roots = resolveFolderRoots(config, grants, cwd, lockedRoots);
   const matcher = createExclusionMatcher(config);
   const evaluation: FolderEvaluation = {
     sensitive: [],
@@ -1704,21 +1595,20 @@ export function evaluateFolderTargets(
       continue;
     }
     // Exclusion is a scope rule applied after the (absolute) sensitive list.
+    // A specific rule denies the root and every descendant; a broad root is a
+    // grant ceiling and blocks only its own root.
     const exclusion = matcher.match(lexical, cwd);
     if (exclusion.excluded && exclusion.root) {
-      if (!isRescuedFromExclusion(lexical, canonical, exclusion.root, roots)) {
-        if (exclusion.exact) {
-          evaluation.excluded.push({
-            path: lexical,
-            pattern: exclusion.pattern ?? exclusion.root,
-            root: normalizePolicyPath(exclusion.root, cwd),
-          });
-          continue;
-        }
-        evaluation.outside.push({
-          ...target,
-          reason: `inside excluded \`${normalizePolicyPath(exclusion.root, cwd)}\` (${exclusion.pattern ?? "excludePaths"})`,
-          excludeRoot: normalizePolicyPath(exclusion.root, cwd),
+      const broad = isBroadExclusionMatch(exclusion);
+      const ruleRoot = broad ? exclusionRuleRoot(exclusion.pattern) : "";
+      const blocksTarget = !broad || (ruleRoot !== "" && lexical === ruleRoot);
+      if (blocksTarget) {
+        evaluation.excluded.push({
+          path: lexical,
+          pattern: exclusion.pattern ?? exclusion.root,
+          root: broad
+            ? normalizePolicyPath(ruleRoot, cwd)
+            : normalizePolicyPath(exclusion.root, cwd),
         });
         continue;
       }
@@ -1751,7 +1641,7 @@ export interface FolderGateInput {
   sensitive: boolean;
   outside: boolean;
   outsideAction: FolderOutsideAction;
-  /** A target is the excluded root itself: hard block, never a dialog. */
+  /** A target is denied by an exclusion rule: hard block, never a dialog. */
   excluded?: boolean;
   /** An allow-once/always grant already covers every outside target. */
   granted?: boolean;
@@ -1863,64 +1753,36 @@ const BASE_CAPABILITIES: readonly BaseCapability[] = [
 /** One capability's verdict for the session base folder. */
 export interface BaseCoverageEntry {
   capability: BaseCapability;
-  /** The base *is* an excluded root and nothing rescued it: hard block. */
+  /** The base is denied by an exclusion rule: hard block, no grant. */
   excluded: ExcludedTarget[];
-  /** An exclusion (or the floor) puts the base outside for this capability. */
+  /** The floor puts the base outside for this capability. */
   outside: FolderTarget[];
-  /** An explicit grant that re-opened the base inside an exclusion. */
-  rescuedBy?: string;
 }
 
 /**
- * Evaluate the session base folder once per capability, each with **its own**
- * grants.
+ * Evaluate the session base folder once per capability.
  *
- * The plain folder evaluation cannot answer "is the session crippled?"
- * because read/write/commit have separate `allowedPaths`: a read grant can
- * rescue reads while writes and commits stay refused. Callers use this to warn
- * only about the capabilities that would actually be refused.
+ * Callers use this to warn only about the capabilities that would actually be
+ * refused. Exclusions are capability-shared: a hard-deny rule cannot be
+ * rescued by any grant, so grants are irrelevant here.
  */
 export function evaluateBaseCoverage(input: {
   config: FolderPolicyConfig;
   cwd: string;
-  grantsByCapability?: Partial<
-    Record<BaseCapability, readonly string[]>
-  >;
   lockedRoots?: readonly string[];
 }): BaseCoverageEntry[] {
-  const { config, cwd, grantsByCapability = {}, lockedRoots } = input;
+  const { config, cwd, lockedRoots } = input;
   const base = baseFolderRoots(config, cwd)[0] ?? cwd;
-  const exclusion = createExclusionMatcher(config).match(base, cwd);
-  const exclusionRoot =
-    exclusion.excluded && exclusion.root
-      ? normalizePolicyPath(exclusion.root, cwd)
-      : "";
   return BASE_CAPABILITIES.map((capability) => {
-    const grants = [...(grantsByCapability[capability] ?? [])];
     const evaluation = evaluateFolderTargets(
       [{ path: base, kind: "dir" }],
-      { config, grants, cwd, lockedRoots, action: capability },
+      { config, grants: [], cwd, lockedRoots, action: capability },
     );
-    const entry: BaseCoverageEntry = {
+    return {
       capability,
       excluded: evaluation.excluded,
       outside: evaluation.outside,
     };
-    // No refusal at the base + an exclusion covers it ⇒ a grant rescued it.
-    if (
-      exclusionRoot &&
-      entry.excluded.length === 0 &&
-      entry.outside.length === 0
-    ) {
-      for (const grant of grants) {
-        const normalized = normalizePolicyPath(grant, cwd);
-        if (normalized && isInsidePolicyPath(normalized, exclusionRoot)) {
-          entry.rescuedBy = normalized;
-          break;
-        }
-      }
-    }
-    return entry;
   });
 }
 

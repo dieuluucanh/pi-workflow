@@ -13,6 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
@@ -567,24 +568,30 @@ test("write: excluded root is refused with no dialog under writePolicy allow", a
     assert.match(String((result as any).reason), /excluded/i);
     assert.match(String((result as any).reason), /exclude revoke/);
     assert.equal(selects.length, 0);
-    // The session folder is strictly inside the exclusion and still works.
+    // The session folder itself is outside this rule and stays writable.
     assert.equal(
       await toolCall(pi, ctx, "write", { path: path.join(cwd, "a.ts") }),
       undefined,
     );
+    assert.equal(selects.length, 0);
+    // A descendant of the rule is denied, not asked.
+    const denied = await toolCall(pi, ctx, "write", {
+      path: path.join(parent, "sibling", "x.txt"),
+      content: "x",
+    });
+    assert.ok(denied && (denied as any).block);
+    assert.match(String((denied as any).reason), /excluded/i);
     assert.equal(selects.length, 0);
   } finally {
     await cleanup();
   }
 });
 
-test("write: a descendant of an excluded folder asks and 'always' rescues it", async () => {
-  const parentHolder: { parent?: string } = {};
+test("write: a descendant of a specific rule is blocked with no dialog", async () => {
   const probe = await boot({ workflow: { writePolicy: { mode: "allow" } } });
-  parentHolder.parent = parentOf(probe.cwd);
+  const parent = parentOf(probe.cwd);
   await probe.cleanup();
 
-  const parent = parentHolder.parent;
   const target = path.join(parent, "sibling", "note.txt");
   const { pi, ctx, selects, cleanup } = await boot(
     {
@@ -600,12 +607,10 @@ test("write: a descendant of an excluded folder asks and 'always' rescues it", a
     { selectAnswers: ["Always allow this folder"] },
   );
   try {
-    assert.equal(await toolCall(pi, ctx, "write", { path: target }), undefined);
-    assert.equal(selects.length, 1);
-    assert.match(selects[0]?.title ?? "", /Folder policy/i);
-    // Persisted grant sits inside the exclusion → no second prompt.
-    assert.equal(await toolCall(pi, ctx, "write", { path: target }), undefined);
-    assert.equal(selects.length, 1);
+    const result = await toolCall(pi, ctx, "write", { path: target });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.equal(selects.length, 0, "a denied subtree never prompts");
   } finally {
     await cleanup();
   }
@@ -626,6 +631,7 @@ test("write: outside=block refuses an excluded descendant without a dialog", asy
       path: path.join(parent, "sibling", "x.txt"),
     });
     assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
     assert.equal(selects.length, 0);
   } finally {
     await cleanup();
@@ -648,8 +654,8 @@ test("write: a grant above the exclusion does not rescue it", async () => {
       path: path.join(parent, "x.txt"),
     });
     assert.ok(result && (result as any).block);
-    assert.match(String((result as any).reason), /Folder policy|permitted/i);
-    assert.equal(selects.length, 1);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.equal(selects.length, 0);
   } finally {
     await cleanup();
   }
@@ -672,9 +678,124 @@ test("write: shell redirect into an excluded descendant follows the floor", asyn
     const result = await toolCall(pi, ctx, "bash", {
       command: `echo hi > "${path.join(parent, "x.txt")}"`,
     });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.equal(selects.length, 0, "a denied descendant never asks");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: a broad-root descendant follows the mode", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const root = path.parse(cwd).root;
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "any",
+              outside: "ask",
+              excludePaths: [root],
+            },
+            writePolicy: { mode: "allow" },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, "..", "sibling", "x.txt"),
+      content: "x",
+    });
     assert.equal(result, undefined);
-    assert.equal(selects.length, 1, "a descendant asks once");
-    assert.match(selects[0]?.title ?? "", /Folder policy/i);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("write: a broad root cannot be rescued by a write grant", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: { writePolicy: { mode: "allow" } },
+  });
+  try {
+    const root = path.parse(cwd).root;
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "any",
+              outside: "ask",
+              excludePaths: [root],
+            },
+            writePolicy: { mode: "allow", allowedPaths: [root] },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const result = await toolCall(pi, ctx, "write", {
+      path: root,
+      content: "x",
+    });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.equal(selects.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("session: a denied session folder warns at startup", async () => {
+  const { notifies, cleanup } = await boot({
+    workflow: {
+      folderPolicy: {
+        mode: "cwd",
+        outside: "ask",
+        excludePaths: [os.tmpdir()],
+      },
+    },
+  });
+  try {
+    const warning = notifies.find((entry) => /excluded/i.test(entry.message));
+    assert.ok(warning, "the startup warning names the exclusion");
+    assert.equal(warning.level, "warning");
+    assert.match(warning.message, /folder-policy exclude revoke/);
+    assert.match(warning.message, /read, write, commit/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("plan: a denied session folder cannot write plan files", async () => {
+  const { cwd, pi, ctx, cleanup } = await boot({
+    workflow: {
+      folderPolicy: {
+        mode: "cwd",
+        outside: "ask",
+        excludePaths: [os.tmpdir()],
+      },
+    },
+  });
+  try {
+    await pi.commands.plan.handler("", ctx);
+    const result = await toolCall(pi, ctx, "write", {
+      path: path.join(cwd, ".pi", "plans", "2026-11-15-denied.md"),
+      content: "# plan\n",
+    });
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
   } finally {
     await cleanup();
   }
@@ -1002,7 +1123,7 @@ test("cmd: a rule covering the session folder names only the blocked capabilitie
   }
 });
 
-test("cmd: a read grant rescues read only; write and commit stay reported", async () => {
+test("cmd: a grant does not rescue a denied session folder", async () => {
   const { cwd, pi, ctx, notifies, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
@@ -1021,15 +1142,17 @@ test("cmd: a read grant rescues read only; write and commit stay reported", asyn
     await cmd.handler(`exclude ${cwd}`, ctx);
     const note = notifies[0]!;
     assert.equal(note.level, "error", String(note.message));
-    assert.match(note.message, /Refused at the session folder: write, commit/);
-    assert.match(note.message, /Still covered by a grant: read \(/);
-    assert.doesNotMatch(note.message, /Refused at the session folder: read/);
+    assert.match(
+      note.message,
+      /Refused at the session folder: read, write, commit/,
+    );
+    assert.doesNotMatch(note.message, /Still covered by a grant/);
   } finally {
     await cleanup();
   }
 });
 
-test("cmd: full grant coverage downgrades the warning and says so", async () => {
+test("cmd: grants never downgrade a denied session folder", async () => {
   const { cwd, pi, ctx, notifies, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "cwd", outside: "ask" },
@@ -1048,9 +1171,12 @@ test("cmd: full grant coverage downgrades the warning and says so", async () => 
     notifies.length = 0;
     await cmd.handler(`exclude ${cwd}`, ctx);
     const note = notifies[0]!;
-    assert.equal(note.level, "warning", String(note.message));
-    assert.match(note.message, /covered by an explicit grant/);
-    assert.doesNotMatch(note.message, /Refused at the session folder/);
+    assert.equal(note.level, "error", String(note.message));
+    assert.match(
+      note.message,
+      /Refused at the session folder: read, write, commit/,
+    );
+    assert.doesNotMatch(note.message, /covered by an explicit grant/);
   } finally {
     await cleanup();
   }

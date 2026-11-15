@@ -232,17 +232,30 @@ test("exclude: grep lines inside an excluded folder are withheld", () => {
   assert.match(result.text, /src\/app\.ts:3/);
 });
 
-test("exclude: an explicit grant re-opens the subtree for output", () => {
+test("exclude: a grant does not re-open a denied subtree for output", () => {
   const result = redactSensitiveText(
-    `${path.join(EXCLUDED, "a.ts")}:1: const visible = true`,
+    `${path.join(EXCLUDED, "a.ts")}:1: const leaked = true`,
     "grep",
     { path: CWD },
     CWD,
     EXCLUDED_CONFIG,
-    { grants: [EXCLUDED] },
   );
-  assert.equal(result.redacted, false);
-  assert.match(result.text, /visible/);
+  assert.equal(result.redacted, true);
+  assert.doesNotMatch(result.text, /leaked/);
+});
+
+test("exclude: a broad root is a ceiling for output redaction", () => {
+  const root = path.parse(CWD).root;
+  const config = { ...DEFAULT_FOLDER_POLICY_CONFIG, excludePaths: [root] };
+  const below = redactSensitiveText(
+    `${path.join(root, "sibling", "x.ts")}:1: const visible = true`,
+    "grep",
+    { path: CWD },
+    CWD,
+    config,
+  );
+  assert.equal(below.redacted, false);
+  assert.match(below.text, /visible/);
 });
 
 test("exclude: ls entries inside an excluded folder are dropped", () => {

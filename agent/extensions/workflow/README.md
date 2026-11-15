@@ -370,33 +370,40 @@ Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global
 
 ## Folder and read permission
 
-**One shared floor.** `workflow.folderPolicy` decides which folders read, write and commit may touch. `mode: "repo"` (default) is the nearest `.git` ancestor (fallback: the session cwd); `cwd` is the exact working directory; `parent` is the parent of that base (siblings); `any` disables containment. `outside: "ask"` prompts once per turn (headless fails closed); `outside: "block"` refuses silently, and an unresolvable write/commit target is refused without a dialog (the read gate keeps its own `readPolicy.shell` opt-in). A policy can only be **stricter** than this floor — `writePolicy: "allow"` cannot write outside it. Both Default and Build respect the floor. For writes it asks only for a *proven* outside target, a sensitive file, or an explicit path that cannot be resolved; a command whose writes merely cannot be located is not treated as outside (see “Not a sandbox”). Windows Git-Bash/Cygwin/WSL spellings (`/c/...`, `/cygdrive/c/...`, `/mnt/c/...`) and `file://` paths are translated to native paths before matching. For **shell commands** on Windows, Git-Bash's `/tmp` is also resolved to the real Git-Bash temp directory (`%LOCALAPPDATA%\Temp`, or a native `TMP`/`TEMP`; detected via Git for Windows or `MSYSTEM`, overridable with `PI_MSYS_TMP`), while direct tool paths keep Node's meaning (`/tmp` is `C:/tmp` there). A folder grant covers the first folder outside the base (the outside project), while a file sitting directly in the common parent is granted as that file only. Read, write and commit dialogs list the base/current folder and every requested target path; a prompt caused by the floor is titled **Folder policy 'ask'**, not “Write policy”.
+**One shared floor.** `workflow.folderPolicy` decides which folders read, write and commit may touch. `mode: "repo"` (default) is the nearest `.git` ancestor (fallback: the session cwd); `cwd` is the exact working directory; `parent` is the parent of that base (siblings); `any` disables containment. `outside: "ask"` prompts once per turn (headless fails closed); `outside: "block"` refuses silently, and an unresolvable write/commit target is refused without a dialog (the read gate keeps its own `readPolicy.shell` opt-in). A policy can only be **stricter** than this floor — `writePolicy: "allow"` cannot write outside it. Both Default and Build respect the floor. `excludePaths` adds **two tiers** on top: a specific folder is a hard deny for its whole subtree, while a broad root (`C:/`, `~`, a share root) is only a ceiling. For writes it asks only for a *proven* outside target, a sensitive file, or an explicit path that cannot be resolved; a command whose writes merely cannot be located is not treated as outside (see “Not a sandbox”). Windows Git-Bash/Cygwin/WSL spellings (`/c/...`, `/cygdrive/c/...`, `/mnt/c/...`) and `file://` paths are translated to native paths before matching. For **shell commands** on Windows, Git-Bash's `/tmp` is also resolved to the real Git-Bash temp directory (`%LOCALAPPDATA%\Temp`, or a native `TMP`/`TEMP`; detected via Git for Windows or `MSYSTEM`, overridable with `PI_MSYS_TMP`), while direct tool paths keep Node's meaning (`/tmp` is `C:/tmp` there). A folder grant covers the first folder outside the base (the outside project), while a file sitting directly in the common parent is granted as that file only. Read, write and commit dialogs list the base/current folder and every requested target path; a prompt caused by the floor is titled **Folder policy 'ask'**, not “Write policy”.
 
 **Sensitive files are always blocked.** The default deny list covers `.env*` (templates such as `.env.example` are exempt by default), `.npmrc`/`.netrc`/`.git-credentials`, `auth.json`, `credentials*`, `secrets.*`, SSH/GPG/cloud stores, key/cert stores, `.git/config`, `.tfstate`/`.tfvars` and keychains. A folder grant never re-enables one; add a manual `folderPolicy.sensitiveExemptions` entry only when a template/fixture is genuinely needed. `/folder-policy sensitive` lists the effective rules.
 
 ### Excluded folders
 
-`folderPolicy.excludePaths` protects a folder you do **not** want the agent to hold standing permission over — typically an OS root or your home directory:
+`folderPolicy.excludePaths` has **two tiers**. Which one applies is decided by the *path*, not by whether the pattern contains a wildcard:
+
+| Rule | Examples | The rule's root | Everything below it |
+| --- | --- | --- | --- |
+| **broad root** (a grant ceiling) | `C:/`, `/`, `~`, `//server/share`, and the same with `/**` | **blocked** (no dialog, no grant) | follow the folder `mode` — `any` allows, `repo`/`cwd`/`parent` apply their normal containment |
+| **specific folder** (a hard deny) | `C:/Personal`, `C:/Users/Me/Private`, `**/node_modules` | **blocked** | **blocked** — no dialog, no grant, no rescue |
 
 ```jsonc
 // ~/.pi/agent/settings.json — global is the usual scope here
-{ "workflow": { "folderPolicy": { "excludePaths": ["C:/", "C:/Users/Lenovo"] } } }
+{
+  "workflow": {
+    "folderPolicy": {
+      "mode": "any",
+      "excludePaths": ["C:/", "C:/Personal"]
+    }
+  }
+}
 ```
 
-An exclusion is **scope subtraction, not a secret**, so it differs from `sensitivePatterns` in one decisive way: a more specific approval can re-open a sub-folder.
+With that policy `C:/Users/Me/Projects/app/README.md` is readable (the `C:/` ceiling does not deny it), while `C:/Personal` and every file under it are refused, and `ls C:/` is refused.
 
-| Target | No grant | Grant on the excluded folder | Grant inside it | Grant above it |
-| --- | --- | --- | --- | --- |
-| the excluded folder itself | **blocked** (no dialog) | allowed | blocked | blocked |
-| a file/folder below it | outside → ask / block | allowed | allowed | outside |
-| the session folder, strictly inside | allowed | allowed | allowed | allowed |
-| the session folder **is** the excluded folder | **blocked** | allowed | blocked | blocked |
-
-- The excluded folder itself never prompts and never offers a grant; the refusal names the rule and `exclude revoke`.
-- Below it, normal `outside` rules apply: `outside: "ask"` lets the agent request one specific sub-folder (that approval is a grant inside the exclusion, so it sticks), `outside: "block"` refuses without a dialog.
-- The session folder (and a spawned subagent's locked roots) only rescue automatically when **strictly inside** an exclusion, so opening your home directory as the cwd does not silently hand over the whole home.
-- A grant at or above the excluded root never rescues; dialogs also refuse a one-click grant of a filesystem/drive root, the home directory, a parent of home, or a protected system/profile umbrella (`C:/Windows`, `Program Files`, `ProgramData`, the `AppData` umbrella, `/etc`, `/usr`, `/var`, `/System`, …), so “Always allow” cannot undo the protection by accident. A concrete folder *inside* one of those is still grantable, and a deliberate `/read-policy allow C:/` does re-open the root — that is an explicit user decision.
-- Sensitive-file rules still win inside an approved subtree.
+- **Nothing re-opens a deny rule.** `readPolicy`/`writePolicy`/`commitPolicy.allowedPaths`, an “Always allow” answer, a reviewer/subagent's locked roots and the session folder itself all lose to it. `/folder-policy exclude revoke <path>` (a slash command, not an agent tool) is the only way back.
+- **A session opened inside a deny rule is blocked.** Read, write and commit are all refused, and `session_start` prints one warning naming the rule and the revoke command. Plan-mode `.pi/plans` writes are refused too.
+- **A ceiling never denies its descendants.** `/folder-policy status` and `exclude list` label each rule `[ceiling: …]` or `[deny: …]`; a grant stored inside a deny rule is reported as ignored.
+- **Sensitive files still win** in both tiers: `.env`, credentials, key stores, … remain blocked even where the folder is allowed.
+- **Dialogs never grant a broad root.** A filesystem/drive root, home, a parent of home, or a protected system/profile umbrella (`C:/Windows`, `Program Files`, `ProgramData`, the `AppData` umbrella, `/etc`, `/usr`, `/var`, `/System`, …) cannot be granted in one click; a concrete folder *inside* one of those still can.
+- **Catch-all patterns** (`*`, `**`, `**/*`) are refused; roots are accepted.
+- **A deny rule needs a specific folder.** `["C:/", "C:/Users/Lenovo"]` protects those two roots from standing grants but does **not** deny everything under home — add explicit rules such as `C:/Users/Lenovo/Private` (see **Migration**).
 
 Commands (global by default — `--project` opts into `<cwd>/.pi/settings.json`):
 
@@ -415,9 +422,9 @@ Input handling worth knowing:
 - **Paths with spaces** are supported with quotes (`"…"` or `'…'`); backslashes stay literal, so Windows paths survive. An unbalanced quote is refused, not half-applied.
 - **`C:Personal`** (drive-relative, no separator) is repaired to **`C:/Personal`** on Windows and the message says `(normalised from C:Personal)`. Without that repair a slash-less pattern would be a basename glob that never matches an absolute path — a listed rule that does nothing. Revoking works with either spelling.
 - **Message levels:** a successful write is `info` (and prints the settings file plus the resulting `Active exclusions (N)` list, so a stale list can never look like a contradiction); a refused/ambiguous input or a non-blocking note is `warning`; `error` means the new rule blocks a capability at your session folder.
-- **“Broad root” means an OS/drive/share root or your home directory** (`/`, `C:/`, `//server/share`, `~`). Excluding an ordinary folder such as `C:/Personal` is a precise request and gets no such note. Catch-all patterns (`*`, `**`, `**/*`) are refused; roots are allowed with the note.
+- **“Broad root” means an OS/drive/share root or your home directory** (`/`, `C:/`, `//server/share`, `~`, optionally with `/**`). A broad root is a **ceiling**: only that root is blocked. Excluding an ordinary folder such as `C:/Personal` is a **hard deny** for its whole subtree and gets no such note. Catch-all patterns (`*`, `**`, `**/*`) are refused; roots are allowed with the note.
 
-Global and project `excludePaths` are **unioned**: a project can add an exclusion, never remove a global one. Project settings are only read when the project is trusted (`exclude list` says when it ignored them). When a rule covers the session folder, the warning is **per capability and grant-aware**: read, write and commit are each evaluated with that capability's own `allowedPaths`, so it names only the capabilities that are actually refused (e.g. `Refused at the session folder: write, commit` + `Still covered by a grant: read`). `/folder-policy status` uses the same check.
+Global and project `excludePaths` are **unioned**: a project can add a rule, never remove a global one. Project settings are only read when the project is trusted (`exclude list` says when it ignored them). When a rule covers the session folder, the warning names every capability it refuses (a deny rule refuses `read, write, commit`) and states that a grant cannot rescue it. `/folder-policy status` uses the same check.
 
 **Workflow settings are user-owned.** Tool writes (`edit`, `write`, shell redirects/`sed -i`) that target the global `~/.pi/agent/settings.json` or the project `.pi/settings.json` are refused in every mode, including Build — otherwise the agent could delete its own exclusions. The slash commands write those files through the filesystem and still work; ask the user to run one, or to edit the file themselves.
 
@@ -425,9 +432,11 @@ Global and project `excludePaths` are **unioned**: a project can add an exclusio
 
 **Grants.** “Always allow” writes to the capability's `allowedPaths` in project settings by default (`folderPolicy.grantScope: "project"`); the project must be trusted. Existing global write grants remain honoured. A dialog may remember a concrete folder — including a drive-top folder such as `C:/tmp` and the real Git-Bash temp dir — but not a filesystem/drive root, the home directory, a parent of home, or a protected system/profile umbrella (`C:/Windows`, `Program Files`, `ProgramData`, the `AppData` umbrella, `/etc`, `/usr`, `/var`, `/System`, …); a concrete folder *inside* one of those is grantable. When a grant cannot be persisted (broad root, or an untrusted project with project scope) the dialog **omits** the “Always allow” row, explains why, and names the deliberate path: `/read-policy allow <target> [global|project]` for reads; write and commit grants go in `workflow.writePolicy.allowedPaths` / `workflow.commitPolicy.allowedPaths` (see `/write-policy status` and `/commit-policy status`). If an approval still arrives, the operation runs **once**, nothing is saved, and a warning says so. “Broad” for an **exclusion** is deliberately different and narrower (only an OS/drive/share root or home) because an exclusion is a narrowing action. Use `/folder-policy any` deliberately to disable the floor for read, write and commit.
 
-**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. A shell command whose writes cannot be located — `npm run build`, `node script`, `npx`, a `sed`/`awk` program, `powershell`, or a path-less tool in `mutatingTools` — is **not** treated as an outside write: under `writePolicy: "allow"` (and in Build) it runs without a dialog. That is deliberate: the analyzer cannot see inside project code, and asking made ordinary in-repo builds and tests look like a permission violation. Use `writePolicy: "ask"` for a prompt on every mutating call, or an OS container/VM for a hard boundary. The same honesty applies to `excludePaths`: `grep -r` still traverses excluded files before the output is redacted, project-wide tools (`symbol_search`, `project_report`, a path-less `lens_diagnostics`) can surface names or symbols from an excluded folder, and opaque code is not path-analysed — the exclusions stop the agent's *tools* from reading or writing there, not an arbitrary subprocess. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions, and inherits the parent's exclusions and read grants; `review_bash` uses the same guard. Spawned subagents receive locked roots plus the parent's deny layer (`PI_FOLDER_POLICY_DENY`) and cannot expand via a sibling project's settings.
+**Not a sandbox.** Arbitrary code (`node -e`, `python -c`, package scripts), renames of sensitive files and git history are documented residuals. A shell command whose writes cannot be located — `npm run build`, `node script`, `npx`, a `sed`/`awk` program, `powershell`, or a path-less tool in `mutatingTools` — is **not** treated as an outside write: under `writePolicy: "allow"` (and in Build) it runs without a dialog. That is deliberate: the analyzer cannot see inside project code, and asking made ordinary in-repo builds and tests look like a permission violation. Use `writePolicy: "ask"` for a prompt on every mutating call, or an OS container/VM for a hard boundary. The same honesty applies to `excludePaths`: `grep -r` still traverses a denied folder before the output is redacted, project-wide tools (`symbol_search`, `project_report`, a path-less `lens_diagnostics`) can surface names or symbols from it, and opaque code is not path-analysed — the rules stop the agent's *tools* from reading or writing there, not an arbitrary subprocess. A broad root does not deny its descendants; only a specific rule does. The Review Mode reviewer gets guarded built-in `read`/`grep`/`find`/`ls` tools even though its session has no ambient extensions, and inherits the parent's exclusions; a deny rule beats the reviewer's locked repo root too. `review_bash` uses the same guard. Spawned subagents receive locked roots plus the parent's deny layer (`PI_FOLDER_POLICY_DENY`) and cannot expand via a sibling project's settings.
 
 **Migration.** The default `folderPolicy.mode: "repo"` + `outside: "ask"` also constrains writes/commits. Set `folderPolicy.mode: "any"` to restore the old “write anywhere” behaviour (sensitive files remain blocked); this now also disables the unresolvable-target asks. Use `cwd`/`parent` to keep a narrower floor.
+
+Exclusion semantics changed: a specific folder (`C:/Personal`) now denies its **whole subtree** with no dialog and no grant, and neither a stored `allowedPaths` entry nor a locked reviewer root can re-open it — revoke the rule instead. Broad roots (`C:/`, `~`, `/`, a share root) remain ceilings: they block only their own root, so an existing `["C:/", "C:/Users/Lenovo"]` no longer denies your projects. To keep private content unreachable, add explicit deny rules such as `C:/Users/Lenovo/Private`; `sensitivePatterns` still blocks secrets.
 
 ## Commit policy
 
@@ -700,7 +709,7 @@ Folder Policy settings live under `workflow.folderPolicy` (scalars project-over-
 | `sensitiveTemplates` | `"allow"` | `block` treats `.env.example`-style templates as sensitive |
 | `sensitivePatterns` | `[]` | Extra always-blocked globs (additive on top of the built-in list) |
 | `sensitiveExemptions` | `[]` | Manual exemptions; never written by a dialog |
-| `excludePaths` | `[]` | Folders the agent has no standing permission over. See [Excluded folders](#excluded-folders) for the rescue rule |
+| `excludePaths` | `[]` | Folders the agent may not touch. A **specific folder** is a hard deny for its whole subtree (no dialog, no grant); a **broad root** (OS/drive/share root, home, or the same with `/**`) blocks only that root. See [Excluded folders](#excluded-folders) |
 
 ```jsonc
 {

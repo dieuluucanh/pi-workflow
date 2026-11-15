@@ -2,6 +2,39 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Changed — folder exclusions are now two tiers (breaking)
+
+- A **specific** `folderPolicy.excludePaths` rule (`C:/Personal`,
+  `C:/Users/Me/Private`, `**/node_modules`) is a **hard deny** for the folder and
+  every descendant, in every mode. It opens no dialog and cannot be granted:
+  `readPolicy`/`writePolicy`/`commitPolicy.allowedPaths`, an "Always allow"
+  answer, a reviewer/subagent's locked roots and the session folder itself no
+  longer re-open it. Revoke with `/folder-policy exclude revoke <path>`.
+- A **broad root** (`C:/`, `/`, `~`, `//server/share`, optionally with `/**`) is
+  a **grant ceiling**: only that root is blocked; descendants follow `mode`.
+  `["C:/", "C:/Personal"]` therefore leaves `C:/Users/.../project` reachable in
+  `mode: "any"` while `C:/Personal` stays fully blocked.
+- A session opened inside a deny rule now refuses read, write and commit, warns
+  once at `session_start`, and refuses plan-mode `.pi/plans` writes. The warning
+  names the rule and the revoke command.
+- `/folder-policy status` and `exclude list` label every rule
+  `[ceiling: …]` or `[deny: …]`; grants stored inside a deny rule are reported as
+  ignored. The broad-root add note now explains that only the root is blocked
+  and that a specific folder is needed to deny a subtree.
+- Redaction and the Review Mode guard share the same two tiers: output under a
+  deny rule is always withheld; output under a broad root is not.
+- Migration: a stored `["C:/", "C:/Users/Lenovo"]` no longer denies content
+  under home (home is a ceiling). Add explicit deny rules such as
+  `C:/Users/Lenovo/Private`.
+
+### Fixed
+
+- `folderPolicy.mode: "any"` no longer turns a broad exclusion into an
+  allowlist: a `C:/` rule used to classify every C: path as outside and prompt
+  for it. Broad roots now block only their own root.
+
 ## [0.12.0] - 2026-11-15
 
 ### Added — `workflow.handoff` + `/handoff`

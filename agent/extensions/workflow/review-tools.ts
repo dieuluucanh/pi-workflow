@@ -167,7 +167,6 @@ export function createReviewBashTool(
                 grants: guard.grants,
                 cwd: deps.cwd,
                 lockedRoots: [guard.root],
-                explicitGrants: guard.grants,
                 action: "read",
             });
             if (
@@ -209,7 +208,6 @@ export function createReviewBashTool(
                     rawParams,
                     deps.cwd,
                     guard.config,
-                    { base: [guard.root] },
                 );
             } catch (e: unknown) {
                 return {
@@ -1151,7 +1149,6 @@ function guardReviewerTarget(
         grants: guard.grants,
         cwd,
         lockedRoots: [guard.root],
-        explicitGrants: guard.grants,
         action: "read",
     });
     if (hit.sensitive || evaluation.sensitive.length > 0)
@@ -1169,7 +1166,6 @@ function redactReviewResult(
     input: Record<string, unknown>,
     cwd: string,
     config: FolderPolicyConfig,
-    roots?: { base?: readonly string[]; grants?: readonly string[] },
 ): ReviewToolTextResult {
     let redacted = false;
     const content = (result.content ?? []).map((block) => {
@@ -1180,7 +1176,6 @@ function redactReviewResult(
             input,
             cwd,
             config,
-            roots,
         );
         if (next.redacted) redacted = true;
         return next.redacted ? { ...block, text: next.text } : block;
@@ -1222,9 +1217,7 @@ function createGuardedBuiltinTools(
                 const result = (await definition.execute(
                     ...args,
                 )) as ReviewToolTextResult;
-                return redactReviewResult(result, tool, input, cwd, guard.config, {
-                    base: [guard.root],
-                });
+                return redactReviewResult(result, tool, input, cwd, guard.config);
             },
         });
     }

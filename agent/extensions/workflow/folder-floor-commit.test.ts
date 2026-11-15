@@ -362,13 +362,10 @@ test("commit: a repository that IS an excluded folder is refused without a dialo
   }
 });
 
-test("commit: a repository strictly inside an excluded parent still commits", async () => {
-  const probe = await boot({ workflow: { commitPolicy: { mode: "allow" } } });
-  const parent = path.dirname(probe.cwd);
-  await probe.cleanup();
+test("commit: a repository strictly inside a specific rule is refused", async () => {
   const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
-      folderPolicy: { mode: "cwd", outside: "ask", excludePaths: [parent] },
+      folderPolicy: { mode: "cwd", outside: "ask" },
       commitPolicy: { mode: "allow" },
     },
   });
@@ -378,9 +375,31 @@ test("commit: a repository strictly inside an excluded parent still commits", as
     git(cwd, ["config", "user.name", "Test"]);
     fs.writeFileSync(path.join(cwd, "a.txt"), "a\n");
     git(cwd, ["add", "-A"]);
+    // The gate re-reads settings on every call: the repo root is now strictly
+    // inside the rule.
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "cwd",
+              outside: "ask",
+              excludePaths: [path.dirname(cwd)],
+            },
+            commitPolicy: { mode: "allow" },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
     const result = await commitCall(pi, ctx, "git commit -m x");
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 0);
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.match(String((result as any).reason), /exclude revoke/);
+    assert.equal(selects.length, 0, "a denied repository must not prompt");
   } finally {
     await cleanup();
   }
@@ -415,7 +434,7 @@ test("commit: a staged path inside an excluded folder is refused under outside=b
   }
 });
 
-test("commit: a staged path in an excluded folder asks under outside=ask and 'always' rescues it", async () => {
+test("commit: a staged path in a specific rule is refused with no dialog", async () => {
   const { cwd, pi, ctx, selects, cleanup } = await boot(
     {
       workflow: {
@@ -438,13 +457,45 @@ test("commit: a staged path in an excluded folder asks under outside=ask and 'al
     fs.writeFileSync(path.join(cwd, "b.txt"), "b\n");
     git(cwd, ["add", "b.txt", "excluded-dir/a.txt"]);
     const result = await commitCall(pi, ctx, "git commit -m x");
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 1);
-    assert.match(selects[0]?.title ?? "", /Folder policy 'ask'/);
-    assert.match(selects[0]?.title ?? "", /Excluded staged path/);
-    // The grant was persisted inside the exclusion; commit again is free.
-    const again = await commitCall(pi, ctx, "git commit -m y");
-    assert.equal(again, undefined);
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /excluded/i);
+    assert.match(String((result as any).reason), /exclude revoke/);
+    assert.equal(selects.length, 0, "a denied staged path must not prompt");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("commit: a broad root leaves an outside repo as an ordinary folder ask", async () => {
+  const { cwd, pi, ctx, selects, cleanup } = await boot({
+    workflow: {
+      folderPolicy: { mode: "cwd", outside: "ask" },
+      commitPolicy: { mode: "allow" },
+    },
+  });
+  try {
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      `${JSON.stringify(
+        {
+          workflow: {
+            folderPolicy: {
+              mode: "cwd",
+              outside: "ask",
+              excludePaths: [path.parse(cwd).root],
+            },
+            commitPolicy: { mode: "allow" },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const result = await commitCall(pi, ctx, "git -C ../other add x.txt");
+    assert.ok(result && (result as any).block);
+    assert.match(String((result as any).reason), /^Folder policy 'ask'/);
+    assert.doesNotMatch(String((result as any).reason), /excluded/i);
     assert.equal(selects.length, 1);
   } finally {
     await cleanup();

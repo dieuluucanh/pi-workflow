@@ -468,7 +468,7 @@ export function buildReadDenyReason(input: ReadDenyReasonInput): string {
       return (
         `Read policy: \`${input.target}\` is excluded by \`workflow.folderPolicy.excludePaths\`` +
         (input.pattern ? ` (${input.pattern})` : "") +
-        ". The excluded folder itself is off-limits and cannot be approved from a dialog. Do not retry; a specific sub-folder can still be requested (it needs the user's approval), or ask the user to revoke the rule with `/folder-policy exclude revoke`." +
+        ". The excluded folder and everything below it are blocked in every mode and cannot be granted. Do not retry; ask the user to revoke the rule with `/folder-policy exclude revoke`." +
         guidance
       );
     case "blocked":

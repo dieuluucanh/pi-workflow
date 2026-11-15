@@ -5,8 +5,9 @@
  *
  * Covers the pattern normalisation contract, prefix walking (drive/UNC/POSIX
  * roots), subtree matching, deepest-match attribution, sibling boundaries and
- * canonical (symlink-resolved) matching. The rescue rule that turns a match
- * into allow/ask/block lives in `folder-policy.test.ts`.
+ * canonical (symlink-resolved) matching. The policy decision (a specific rule
+ * hard-denies its whole subtree; a broad root only blocks its own root) lives
+ * in `folder-policy.test.ts`.
  */
 
 import { test } from "node:test";
@@ -328,6 +329,11 @@ test("broad: only a filesystem/drive/share root or the home directory", () => {
   assert.equal(isBroadExcludePattern("//server/share"), true);
   assert.equal(isBroadExcludePattern(os.homedir()), true);
   assert.equal(isBroadExcludePattern("~"), true);
+  // A trailing `/**` is the same broad root; a specific folder stays specific.
+  assert.equal(isBroadExcludePattern("/**"), true);
+  assert.equal(isBroadExcludePattern("//server/share/**"), true);
+  assert.equal(isBroadExcludePattern(`${os.homedir()}/**`), true);
+  assert.equal(isBroadExcludePattern("C:/Personal/**"), false);
   if (process.platform === "win32") {
     assert.equal(isBroadExcludePattern("C:/"), true);
     assert.equal(isBroadExcludePattern("c:/"), true);
@@ -344,7 +350,7 @@ test("broad: only a filesystem/drive/share root or the home directory", () => {
 
 // ── enforcement regression: normalisation must not move the semantics ──
 
-test("enforcement: the excluded root blocks, a child is outside, a grant rescues one subtree", () => {
+test("enforcement: a specific rule hard-denies the root and its whole subtree", () => {
   const { dir, cleanup } = tmpDir();
   try {
     const excluded = path.join(dir, "Personal");
@@ -367,20 +373,34 @@ test("enforcement: the excluded root blocks, a child is outside, a grant rescues
     assert.equal(atRoot.outside.length, 0);
     assert.equal(atRoot.allowed.length, 0);
 
-    // A child is outside and is attributed to the excluded root.
-    const child = evaluate(path.join(excluded, "secret.txt"));
-    assert.equal(child.excluded.length, 0);
-    assert.equal(child.outside.length, 1);
-    assert.equal(child.allowed.length, 0);
-    assert.equal(child.outside[0]?.excludeRoot, norm(excluded));
+    // Every descendant is a hard block too — a grant never re-opens it.
+    for (const grants of [[] as string[], [excluded], [granted], [dir]]) {
+      const child = evaluate(path.join(excluded, "secret.txt"), grants);
+      assert.equal(
+        child.excluded.length,
+        1,
+        `the subtree stays denied (grants: ${grants.join(", ") || "none"})`,
+      );
+      assert.equal(child.outside.length, 0);
+      assert.equal(child.allowed.length, 0);
+      assert.equal(
+        child.excluded[0]?.pattern,
+        normalizeExcludePattern(excluded),
+      );
+    }
 
-    // A grant inside re-opens exactly that subtree, nothing else.
-    const rescued = evaluate(path.join(granted, "x.ts"), [granted]);
-    assert.equal(rescued.allowed.length, 1);
-    assert.equal(rescued.outside.length, 0);
-    const sibling = evaluate(path.join(excluded, "other", "y.ts"), [granted]);
-    assert.equal(sibling.allowed.length, 0);
-    assert.equal(sibling.outside.length, 1);
+    // `mode: "any"` does not soften a specific rule.
+    const anyMode = evaluateFolderTargets(
+      [{ path: path.join(excluded, "x.ts"), kind: "file" }],
+      {
+        config: { ...config, mode: "any" },
+        grants: [],
+        cwd: dir,
+        action: "read",
+      },
+    );
+    assert.equal(anyMode.excluded.length, 1);
+    assert.equal(anyMode.allowed.length, 0);
 
     // Normalisation is enforcement-neutral: the repaired drive-relative
     // spelling produces the same verdict as the slashed one.
@@ -392,10 +412,60 @@ test("enforcement: the excluded root blocks, a child is outside, a grant rescues
           [{ path: "C:/Personal/secret.txt", kind: "file" }],
           { config: candidate, grants: [], cwd: "C:/work", action: "read" },
         );
-        assert.equal(verdict.outside.length, 1);
+        assert.equal(verdict.excluded.length, 1);
         assert.equal(verdict.allowed.length, 0);
       }
     }
+  } finally {
+    cleanup();
+  }
+});
+
+test("enforcement: a broad root blocks only its own root; descendants follow the mode", () => {
+  const { dir, cleanup } = tmpDir();
+  try {
+    const root = normalizePolicyPath(path.parse(dir).root, dir);
+    const config = {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      mode: "any" as const,
+      excludePaths: [root],
+    };
+    const evaluate = (
+      target: string,
+      grants: string[] = [],
+      mode: "any" | "cwd" = "any",
+    ) =>
+      evaluateFolderTargets([{ path: target, kind: "file" }], {
+        config: { ...config, mode },
+        grants,
+        cwd: dir,
+        action: "read",
+      });
+
+    // The ceiling itself is blocked, even with a grant on it.
+    for (const grants of [[] as string[], [root]]) {
+      const atRoot = evaluate(root, grants);
+      assert.equal(atRoot.excluded.length, 1, "the broad root is blocked");
+      assert.equal(atRoot.allowed.length, 0);
+    }
+
+    // Descendants are not excluded by a ceiling.
+    const below = evaluate(path.join(dir, "elsewhere", "x.ts"));
+    assert.equal(below.allowed.length, 1);
+    assert.equal(below.excluded.length, 0);
+    assert.equal(below.outside.length, 0);
+
+    // Under real containment the same descendant is ordinary outside.
+    const contained = evaluate(
+      path.join(dir, "..", "sibling", "x.ts"),
+      [],
+      "cwd",
+    );
+    assert.equal(contained.outside.length, 1);
+    assert.doesNotMatch(
+      String(contained.outside[0]?.reason),
+      /inside excluded/,
+    );
   } finally {
     cleanup();
   }

@@ -13,7 +13,10 @@ import * as path from "node:path";
 import {
   DEFAULT_FOLDER_POLICY_CONFIG,
   evaluateFolderTargets,
+  isBroadExcludePattern,
+  isBroadExclusionMatch,
   isBroadGrantRoot,
+  matchDeniedExclusion,
   matchSensitivePath,
   mergeFolderPolicyConfig,
 } from "../folder-policy.ts";
@@ -147,6 +150,87 @@ if (process.platform === "win32") {
   check("broad: /etc is refused", isBroadGrantRoot("/etc"), true);
   check("broad: /tmp is grantable", isBroadGrantRoot("/tmp"), false);
 }
+
+// ── exclusions: two tiers (broad ceiling vs specific hard deny) ──────
+const platformRoot = path.parse(cwd).root;
+const broadExclusion = {
+  ...DEFAULT_FOLDER_POLICY_CONFIG,
+  mode: "any",
+  excludePaths: [platformRoot],
+};
+const broadDescendant = path.join(cwd, "..", "sibling", "x.ts");
+const broadBelow = evaluateFolderTargets(
+  [{ path: broadDescendant, kind: "file" }],
+  { config: broadExclusion, grants: [], cwd },
+);
+check(
+  "exclude: a broad-root descendant is allowed in any mode",
+  broadBelow.allowed.length,
+  1,
+);
+check(
+  "exclude: a broad-root descendant is not excluded",
+  broadBelow.excluded.length,
+  0,
+);
+const broadAtRoot = evaluateFolderTargets(
+  [{ path: platformRoot, kind: "dir" }],
+  { config: broadExclusion, grants: [platformRoot], cwd },
+);
+check(
+  "exclude: the broad root is blocked even with a grant",
+  broadAtRoot.excluded.length,
+  1,
+);
+check("exclude: the broad root is not allowed", broadAtRoot.allowed.length, 0);
+
+const personal = path.join(cwd, "personal");
+const specificExclusion = {
+  ...DEFAULT_FOLDER_POLICY_CONFIG,
+  mode: "any",
+  excludePaths: [personal],
+};
+const specificChild = evaluateFolderTargets(
+  [{ path: path.join(personal, "x.ts"), kind: "file" }],
+  { config: specificExclusion, grants: [personal], cwd },
+);
+check(
+  "exclude: a specific rule denies its subtree even with a grant",
+  specificChild.excluded.length,
+  1,
+);
+check("exclude: a specific rule never asks", specificChild.outside.length, 0);
+check(
+  "exclude: /** is the same broad root",
+  isBroadExcludePattern(`${platformRoot}**`),
+  true,
+);
+check(
+  "exclude: a specific folder with /** is not broad",
+  isBroadExcludePattern(path.join(platformRoot, "Personal", "**")),
+  false,
+);
+check(
+  "exclude: broadness is classified by the rule, not the matched prefix",
+  isBroadExclusionMatch({
+    excluded: true,
+    pattern: `${platformRoot}**`,
+    root: broadDescendant,
+    exact: true,
+  }),
+  true,
+);
+check(
+  "exclude: a specific descendant is denied for output/redaction",
+  matchDeniedExclusion(path.join(personal, "x.ts"), specificExclusion, cwd)
+    .excluded,
+  true,
+);
+check(
+  "exclude: a broad descendant is not denied for output/redaction",
+  matchDeniedExclusion(broadDescendant, broadExclusion, cwd).excluded,
+  false,
+);
 const msysEnv = {
   ...process.env,
   MSYSTEM: "MINGW64",

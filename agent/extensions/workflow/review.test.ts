@@ -5384,7 +5384,7 @@ test("plan-2026-10-23: reviewer model change reboots the session", async () => {
 
 // ══ excludePaths in the reviewer ══════════════════════════════════════
 
-test("reviewer guarded read: an excluded path inside the repo is refused, a grant re-opens it", async () => {
+test("reviewer guarded read: a specific rule is denied and nothing re-opens it; a broad root is a ceiling", async () => {
   const { DEFAULT_FOLDER_POLICY_CONFIG } = await import(
     "./folder-policy.ts"
   );
@@ -5450,10 +5450,28 @@ test("reviewer guarded read: an excluded path inside the repo is refused, a gran
     ...baseDeps,
     folderPolicy: () => ({ config: parentConfig, grants: ["/p/excluded"] }),
   } as never);
-  const allowedRead = granted.tools.find(
+  const grantedRead = granted.tools.find(
     (tool) => (tool as { name?: string }).name === "read",
   ) as { execute: (...args: unknown[]) => Promise<any> };
-  const allowed = await allowedRead.execute("id", { path: target });
-  assert.notEqual(allowed.isError, true);
-  assert.match(String(allowed.content[0]?.text), /read ok/);
+  const stillRefused = await grantedRead.execute("id", { path: target });
+  assert.equal(stillRefused.isError, true);
+  assert.match(String(stillRefused.content[0]?.text), /REFUSED/);
+
+  // A broad root excludes only the root itself; the repo inside it is fine.
+  const broad = createReviewTools(sdk, {
+    ...baseDeps,
+    folderPolicy: () => ({
+      config: {
+        ...parentConfig,
+        excludePaths: [path.parse(cwd).root],
+      },
+      grants: [],
+    }),
+  } as never);
+  const broadRead = broad.tools.find(
+    (tool) => (tool as { name?: string }).name === "read",
+  ) as { execute: (...args: unknown[]) => Promise<any> };
+  const broadAllowed = await broadRead.execute("id", { path: target });
+  assert.notEqual(broadAllowed.isError, true);
+  assert.match(String(broadAllowed.content[0]?.text), /read ok/);
 });

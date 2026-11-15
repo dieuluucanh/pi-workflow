@@ -984,7 +984,7 @@ test("sensitive list is exported and contains no duplicate entries", () => {
   );
 });
 
-// ── excludePaths: scope subtraction and the rescue rule ──────────────
+// ── excludePaths: two tiers — hard deny vs broad-root ceiling ────────
 
 function excludeTree() {
   const { cwd, cleanup } = tmpCwd();
@@ -1002,6 +1002,8 @@ function evalWith(
   options: {
     cwd: string;
     excluded: string;
+    /** Full rule list (defaults to `[excluded]`). */
+    excludes?: string[];
     grants?: string[];
     mode?: "repo" | "cwd" | "parent" | "any";
     outside?: "ask" | "block";
@@ -1012,7 +1014,7 @@ function evalWith(
       ...DEFAULT_FOLDER_POLICY_CONFIG,
       mode: options.mode ?? "cwd",
       outside: options.outside ?? "ask",
-      excludePaths: [options.excluded],
+      excludePaths: options.excludes ?? [options.excluded],
     },
     grants: options.grants ?? [],
     cwd: options.cwd,
@@ -1020,143 +1022,200 @@ function evalWith(
   });
 }
 
-test("exclude: the excluded root blocks and its descendants are outside", () => {
+test("exclude: a specific rule hard-denies the root and every descendant", () => {
   const { excluded, sibling, cleanup } = excludeTree();
   try {
-    const cwd = sibling;
+    const cwd = path.dirname(excluded);
     const atRoot = evalWith(excluded, { cwd, excluded });
     assert.equal(atRoot.excluded.length, 1);
     assert.equal(atRoot.excluded[0]?.path, normalizePolicyPath(excluded, cwd));
     assert.equal(atRoot.outside.length, 0);
     assert.equal(atRoot.allowed.length, 0);
 
-    const below = evalWith(path.join(sibling, "a.ts"), { cwd, excluded });
-    // cwd is strictly inside the exclusion, so the session folder rescues it.
-    assert.equal(below.allowed.length, 1);
-    assert.equal(below.excluded.length, 0);
+    // Descendants are denied too — no dialog, no grant.
+    for (const grants of [
+      [] as string[],
+      [excluded],
+      [path.join(excluded, "keep")],
+      [cwd],
+    ]) {
+      const child = evalWith(path.join(sibling, "a.ts"), {
+        cwd,
+        excluded,
+        grants,
+      });
+      assert.equal(
+        child.excluded.length,
+        1,
+        `the subtree stays denied (grants: ${grants.join(", ") || "none"})`,
+      );
+      assert.equal(child.outside.length, 0);
+      assert.equal(child.allowed.length, 0);
+      assert.equal(
+        child.excluded[0]?.pattern,
+        normalizeExcludePattern(excluded),
+      );
+    }
 
-    const other = evalWith(path.join(excluded, "elsewhere", "a.ts"), {
+    // `mode: "any"` does not soften a specific rule.
+    const anyMode = evalWith(path.join(sibling, "a.ts"), {
       cwd,
       excluded,
+      mode: "any",
     });
-    assert.equal(other.outside.length, 1);
-    assert.match(String(other.outside[0]?.reason), /inside excluded/);
+    assert.equal(anyMode.excluded.length, 1);
+    assert.equal(anyMode.allowed.length, 0);
   } finally {
     cleanup();
   }
 });
 
-test("exclude: base equal to the excluded root is blocked, not silently allowed", () => {
-  const { excluded, cleanup } = excludeTree();
+test("exclude: a session base inside a specific rule is not rescued", () => {
+  const { excluded, inner, cleanup } = excludeTree();
   try {
-    const atBase = evalWith(excluded, { cwd: excluded, excluded });
-    assert.equal(atBase.excluded.length, 1);
-    assert.equal(atBase.allowed.length, 0);
+    // cwd is strictly inside the exclusion.
+    const inside = evalWith(path.join(inner, "a.ts"), {
+      cwd: inner,
+      excluded,
+    });
+    assert.equal(inside.excluded.length, 1);
+    assert.equal(inside.allowed.length, 0);
+    assert.equal(inside.outside.length, 0);
 
-    const child = evalWith(path.join(excluded, "child.txt"), {
+    // cwd is the excluded root itself.
+    const atBase = evalWith(path.join(excluded, "child.txt"), {
       cwd: excluded,
       excluded,
     });
-    assert.equal(child.excluded.length, 0);
-    assert.equal(child.outside.length, 1);
+    assert.equal(atBase.excluded.length, 1);
+    assert.equal(atBase.allowed.length, 0);
   } finally {
     cleanup();
   }
 });
 
-test("exclude: base strictly inside the excluded root stays allowed", () => {
-  const { excluded, inner, cleanup } = excludeTree();
+test("exclude: a specific rule nested under a broad root still denies its subtree", () => {
+  const { cwd, cleanup } = tmpCwd();
   try {
-    const inside = evalWith(path.join(inner, "a.ts"), { cwd: inner, excluded });
-    assert.equal(inside.allowed.length, 1);
-    assert.equal(inside.outside.length, 0);
-    assert.equal(inside.excluded.length, 0);
+    const root = normalizePolicyPath(path.parse(cwd).root, cwd);
+    const personal = path.join(cwd, "personal");
+    const other = path.join(cwd, "other");
+    fs.mkdirSync(personal, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const config = {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      mode: "any" as const,
+      excludePaths: [root, personal],
+    };
+    const evaluate = (target: string) =>
+      evaluateFolderTargets([{ path: target, kind: "file" }], {
+        config,
+        grants: [],
+        cwd,
+        action: "read",
+      });
+
+    assert.equal(evaluate(personal).excluded.length, 1);
+    assert.equal(evaluate(path.join(personal, "x.ts")).excluded.length, 1);
+    // Outside the specific rule the broad root is only a ceiling.
+    assert.equal(evaluate(path.join(other, "x.ts")).allowed.length, 1);
   } finally {
     cleanup();
   }
 });
 
-test("exclude: an explicit grant inside the exclusion rescues it", () => {
-  const { excluded, sibling, cleanup } = excludeTree();
-  try {
-    const cwd = sibling;
-    // Grant exactly on the excluded root (a deliberate /read-policy allow).
-    const atRoot = evalWith(excluded, { cwd, excluded, grants: [excluded] });
-    assert.equal(atRoot.excluded.length, 0);
-    assert.equal(atRoot.allowed.length, 1);
-
-    // Grant strictly below it, covering the target.
-    const deeper = evalWith(path.join(excluded, "keep", "x.ts"), {
-      cwd,
-      excluded,
-      grants: [path.join(excluded, "keep")],
-    });
-    assert.equal(deeper.outside.length, 0);
-    assert.equal(deeper.allowed.length, 1);
-
-    // A grant ABOVE the exclusion never rescues.
-    const above = evalWith(path.join(excluded, "x.ts"), {
-      cwd,
-      excluded,
-      grants: [path.dirname(excluded)],
-    });
-    assert.equal(above.allowed.length, 0);
-    assert.equal(above.outside.length, 1);
-    const aboveAtRoot = evalWith(excluded, {
-      cwd,
-      excluded,
-      grants: [path.dirname(excluded)],
-    });
-    assert.equal(aboveAtRoot.excluded.length, 1);
-  } finally {
-    cleanup();
-  }
-});
-
-test("exclude: sensitive still wins inside a rescued subtree", () => {
+test("exclude: sensitive still wins inside a denied subtree", () => {
   const { excluded, sibling, cleanup } = excludeTree();
   try {
     const env = path.join(excluded, "keep", ".env");
-    const res = evalWith(env, {
-      cwd: sibling,
-      excluded,
-      grants: [path.join(excluded, "keep")],
-    });
+    const res = evalWith(env, { cwd: sibling, excluded });
     assert.equal(res.sensitive.length, 1);
+    assert.equal(res.excluded.length, 0);
     assert.equal(res.allowed.length, 0);
   } finally {
     cleanup();
   }
 });
 
-test("exclude: any mode still refuses the excluded root", () => {
-  const { excluded, cleanup } = excludeTree();
+test("exclude: a broad root blocks only its own root; descendants follow the mode", () => {
+  const { cwd, cleanup } = tmpCwd();
   try {
-    const cwd = path.dirname(excluded);
-    const atRoot = evalWith(excluded, { cwd, excluded, mode: "any" });
-    assert.equal(atRoot.excluded.length, 1);
-    assert.equal(atRoot.allowed.length, 0);
-    const below = evalWith(path.join(excluded, "x.ts"), {
-      cwd,
-      excluded,
-      mode: "any",
-    });
-    assert.equal(below.allowed.length, 0);
-    assert.equal(below.outside.length, 1);
-    // An explicit grant restores the `any` behaviour for that subtree.
-    const granted = evalWith(path.join(excluded, "x.ts"), {
-      cwd,
-      excluded,
-      mode: "any",
-      grants: [excluded],
-    });
-    assert.equal(granted.allowed.length, 1);
+    const root = normalizePolicyPath(path.parse(cwd).root, cwd);
+    const descendant = path.join(cwd, "sibling", "x.ts");
+    const evaluate = (
+      target: string,
+      grants: string[] = [],
+      mode: "any" | "cwd" = "any",
+    ) =>
+      evaluateFolderTargets([{ path: target, kind: "file" }], {
+        config: {
+          ...DEFAULT_FOLDER_POLICY_CONFIG,
+          mode,
+          excludePaths: [root],
+        },
+        grants,
+        cwd,
+        action: "read",
+      });
+
+    for (const grants of [[] as string[], [root]]) {
+      const atRoot = evaluate(root, grants);
+      assert.equal(atRoot.excluded.length, 1, "the broad root is blocked");
+      assert.equal(atRoot.allowed.length, 0);
+    }
+
+    const below = evaluate(descendant);
+    assert.equal(below.allowed.length, 1);
+    assert.equal(below.excluded.length, 0);
+    assert.equal(below.outside.length, 0);
+
+    const contained = evaluate(
+      path.join(cwd, "..", "sibling", "x.ts"),
+      [],
+      "cwd",
+    );
+    assert.equal(contained.outside.length, 1);
+    assert.doesNotMatch(
+      String(contained.outside[0]?.reason),
+      /inside excluded/,
+    );
   } finally {
     cleanup();
   }
 });
 
-test("exclude: a symlink into an excluded tree is outside", () => {
+test("exclude: a `/**` broad spelling still blocks only its root", () => {
+  const { cwd, cleanup } = tmpCwd();
+  try {
+    const root = normalizePolicyPath(path.parse(cwd).root, cwd);
+    const config = {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      mode: "any" as const,
+      excludePaths: [`${root}**`],
+    };
+    const evaluate = (target: string) =>
+      evaluateFolderTargets([{ path: target, kind: "file" }], {
+        config,
+        grants: [],
+        cwd,
+        action: "read",
+      });
+
+    // `deepestFirst` reports the target itself for a `/**` glob, so the
+    // policy must classify the rule, not the match.
+    const below = evaluate(path.join(cwd, "sibling", "x.ts"));
+    assert.equal(below.allowed.length, 1);
+    assert.equal(below.excluded.length, 0);
+
+    const atRoot = evaluate(root);
+    assert.equal(atRoot.excluded.length, 1);
+    assert.equal(atRoot.allowed.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: a symlink into a denied tree is excluded", () => {
   const { parent, excluded, cleanup } = excludeTree();
   try {
     const link = path.join(parent, "link");
@@ -1173,8 +1232,66 @@ test("exclude: a symlink into an excluded tree is outside", () => {
       cwd: parent,
       excluded,
     });
-    assert.equal(res.outside.length, 1);
+    assert.equal(res.excluded.length, 1);
     assert.equal(res.allowed.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("exclude: helpers classify the rule, not the matched prefix", async () => {
+  const mod: Record<string, any> = (await import("./folder-policy.ts")) as any;
+  assert.equal(typeof mod.exclusionRuleRoot, "function");
+  assert.equal(typeof mod.isBroadExclusionMatch, "function");
+  assert.equal(typeof mod.matchDeniedExclusion, "function");
+
+  const root = normalizePolicyPath(path.parse(process.cwd()).root, process.cwd());
+  assert.equal(mod.exclusionRuleRoot(`${root}**`), root);
+
+  assert.equal(
+    mod.isBroadExclusionMatch({
+      excluded: true,
+      pattern: `${root}**`,
+      root: path.join(root, "x"),
+      exact: true,
+    }),
+    true,
+  );
+  assert.equal(
+    mod.isBroadExclusionMatch({
+      excluded: true,
+      pattern: path.join(root, "Personal"),
+      root: path.join(root, "Personal"),
+      exact: false,
+    }),
+    false,
+  );
+
+  const { cwd, cleanup } = tmpCwd();
+  try {
+    const broad = {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      excludePaths: [root],
+    };
+    assert.equal(
+      mod.matchDeniedExclusion(path.join(cwd, "sibling", "x.ts"), broad, cwd)
+        .excluded,
+      false,
+    );
+    assert.equal(mod.matchDeniedExclusion(root, broad, cwd).excluded, true);
+
+    const personal = path.join(cwd, "personal");
+    const specific = {
+      ...DEFAULT_FOLDER_POLICY_CONFIG,
+      excludePaths: [personal],
+    };
+    const inside = mod.matchDeniedExclusion(
+      path.join(personal, "x.ts"),
+      specific,
+      cwd,
+    );
+    assert.equal(inside.excluded, true);
+    assert.equal(inside.exact, false);
   } finally {
     cleanup();
   }
@@ -1199,7 +1316,7 @@ test("exclude: decideFolderGate blocks an excluded target before asking", () => 
     }),
     "block",
   );
-  // The outside action still governs descendants (listed as outside).
+  // An ordinary outside target still follows the outside action.
   assert.equal(
     decideFolderGate({
       sensitive: false,
@@ -1229,7 +1346,7 @@ test("lock: PI_FOLDER_POLICY_DENY carries exclusions and sensitive extras", () =
       sensitiveTemplates: "block",
       sensitivePatterns: ["**/*.sql"],
       sensitiveExemptions: ["**/demo.sql"],
-      excludePaths: ["C:/"],
+      excludePaths: [path.join(cwd, "private")],
     });
     const resolved = readFolderPolicyConfig(cwd, agentDir, { trusted: true });
     assert.equal(resolved.config.mode, "cwd");
@@ -1237,19 +1354,14 @@ test("lock: PI_FOLDER_POLICY_DENY carries exclusions and sensitive extras", () =
     assert.equal(resolved.config.sensitiveTemplates, "block");
     assert.deepEqual(resolved.config.sensitivePatterns, ["**/*.sql"]);
     assert.deepEqual(resolved.config.sensitiveExemptions, ["**/demo.sql"]);
-    assert.deepEqual(resolved.config.excludePaths, ["C:/"]);
+    assert.deepEqual(resolved.config.excludePaths, [
+      normalizeExcludePattern(path.join(cwd, "private")),
+    ]);
     // The deny layer is enforced, not decorative.
     assert.equal(matchSensitivePath(`${cwd}/dump.sql`, resolved.config, cwd).sensitive, true);
-    const atRoot = evaluateFolderTargets([{ path: "C:/", kind: "dir" }], {
-      config: resolved.config,
-      grants: [],
-      cwd,
-      lockedRoots: resolved.locked?.roots,
-      action: "read",
-    });
-    assert.equal(atRoot.excluded.length, 1);
-    const belowRoot = evaluateFolderTargets(
-      [{ path: "c:/x", kind: "file" }],
+    // A specific rule carried by the deny layer blocks its whole subtree.
+    const denied = evaluateFolderTargets(
+      [{ path: path.join(cwd, "private", "x.ts"), kind: "file" }],
       {
         config: resolved.config,
         grants: [],
@@ -1258,8 +1370,20 @@ test("lock: PI_FOLDER_POLICY_DENY carries exclusions and sensitive extras", () =
         action: "read",
       },
     );
-    assert.equal(belowRoot.outside.length, 1);
-    assert.match(String(belowRoot.outside[0]?.reason), /excluded/);
+    assert.equal(denied.excluded.length, 1);
+    assert.equal(denied.allowed.length, 0);
+    // A grant cannot re-open it, even in a locked session.
+    const stillDenied = evaluateFolderTargets(
+      [{ path: path.join(cwd, "private", "x.ts"), kind: "file" }],
+      {
+        config: resolved.config,
+        grants: [path.join(cwd, "private")],
+        cwd,
+        lockedRoots: resolved.locked?.roots,
+        action: "read",
+      },
+    );
+    assert.equal(stillDenied.excluded.length, 1);
 
     // A malformed payload must not throw or widen anything.
     process.env.PI_FOLDER_POLICY_DENY = "{not json";
@@ -1393,49 +1517,38 @@ test("args: exclude parsing is flags-only and rejects leftovers", () => {
 
 // ── base coverage: per capability, grant-aware ──────────────────────
 
-test("base coverage: each capability is judged with its own grants", () => {
+test("base coverage: a specific rule denies every capability at the base", () => {
   const { cwd, cleanup } = tmpCwd();
   try {
     const config = { ...DEFAULT_FOLDER_POLICY_CONFIG, mode: "cwd" as const };
-    // No exclusion: every capability is clean and nothing is attributed to a grant.
+    // No exclusion: every capability is clean.
     const plain = evaluateBaseCoverage({ config, cwd });
     assert.deepEqual(
       plain.map((entry) => entry.capability),
       ["read", "write", "commit"],
     );
     assert.ok(plain.every((entry) => entry.excluded.length === 0));
-    assert.ok(plain.every((entry) => entry.rescuedBy === undefined));
 
-    // The base itself is excluded: every capability is blocked, no rescue.
-    const excluded = { ...config, excludePaths: [cwd] };
-    const blocked = evaluateBaseCoverage({ config: excluded, cwd });
+    // The base itself is a specific exclusion: no capability can rescue it.
+    const denied = { ...config, excludePaths: [cwd] };
+    const blocked = evaluateBaseCoverage({ config: denied, cwd });
     assert.ok(blocked.every((entry) => entry.excluded.length === 1));
-    assert.ok(blocked.every((entry) => entry.rescuedBy === undefined));
 
-    // A read grant exactly on the excluded base rescues read only.
-    const readOnly = evaluateBaseCoverage({
-      config: excluded,
-      cwd,
-      grantsByCapability: { read: [cwd] },
-    });
-    const read = readOnly.find((entry) => entry.capability === "read");
-    assert.equal(read?.excluded.length, 0);
-    assert.ok(read?.rescuedBy);
-    for (const capability of ["write", "commit"] as const) {
-      const entry = readOnly.find((item) => item.capability === capability);
-      assert.equal(entry?.excluded.length, 1, `${capability} stays blocked`);
-      assert.equal(entry?.rescuedBy, undefined);
-    }
-
-    // The session folder strictly inside the exclusion is rescued implicitly.
+    // The session folder strictly inside the rule is denied too (no implicit
+    // rescue).
     const inner = path.join(cwd, "project");
     fs.mkdirSync(inner, { recursive: true });
-    const nested = evaluateBaseCoverage({
-      config: { ...DEFAULT_FOLDER_POLICY_CONFIG, mode: "cwd", excludePaths: [cwd] },
-      cwd: inner,
+    const nested = evaluateBaseCoverage({ config: denied, cwd: inner });
+    assert.ok(nested.every((entry) => entry.excluded.length === 1));
+
+    // A broad root that contains the base (but is not the base) is a ceiling,
+    // not a denial.
+    const root = normalizePolicyPath(path.parse(cwd).root, cwd);
+    const broad = evaluateBaseCoverage({
+      config: { ...config, mode: "any" as const, excludePaths: [root] },
+      cwd,
     });
-    assert.ok(nested.every((entry) => entry.excluded.length === 0));
-    assert.ok(nested.every((entry) => entry.rescuedBy === undefined));
+    assert.ok(broad.every((entry) => entry.excluded.length === 0));
   } finally {
     cleanup();
   }
