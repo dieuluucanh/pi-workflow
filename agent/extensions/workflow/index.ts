@@ -299,6 +299,19 @@ import {
   type HandoffReason,
 } from "./handoff-view.ts";
 import {
+  DEFAULT_HANDOFF_CONFIG,
+  describeHandoffMode,
+  handoffArgumentCompletions,
+  handoffConfigPaths,
+  isHandoffMode,
+  readHandoffConfig,
+  resolveHandoffTimeout,
+  shouldUsePlannotator,
+  writeHandoffConfig,
+  type HandoffMode,
+  type ResolvedHandoffConfig,
+} from "./handoff-config.ts";
+import {
   coerceModelDefault,
   describeModelDefaultApply,
   formatPersistedModel,
@@ -743,7 +756,15 @@ export default function workflowExtension(
   let btwNotes: string[] = [];
 
   // ── Plannotator bridge state ──────────────────────────────────
+  /**
+   * True only when a Plannotator HOST is present: the package is listed in
+   * settings, a foreign listener is on the request bus, or a live session
+   * event was seen. Our own listener registration never sets it.
+   */
   let plannotatorActive = false;
+  /** Strongest evidence behind `plannotatorActive`, for `/handoff status`. */
+  let plannotatorDetectionSource: "package" | "bus" | "session" | "none" =
+    "none";
   let lastReviewId: string | null = null;
   let plannotatorListenersRegistered = false;
   let currentSessionCtx: ExtensionContext | null = null;
@@ -1888,6 +1909,48 @@ export default function workflowExtension(
 
   function reviewCwd(): string {
     return currentSessionCtx?.cwd ?? process.cwd();
+  }
+
+  /**
+   * Effective `workflow.handoff` config. Never throws: an unreadable or
+   * corrupt settings file behaves like the default (`auto`, 15 s). Read per
+   * decision (like the policy configs) so a settings edit, /reload or a
+   * project-scope change takes effect on the next handoff.
+   */
+  function handoffConfigNow(): ResolvedHandoffConfig {
+    try {
+      return readHandoffConfig(reviewCwd(), reviewAgentDir());
+    } catch (_e) {
+      void _e;
+      return {
+        config: { ...DEFAULT_HANDOFF_CONFIG },
+        sources: {
+          global: false,
+          project: false,
+          mode: "default",
+          timeout: "default",
+        },
+      };
+    }
+  }
+
+  /**
+   * Whether this handoff should open the browser. `auto` follows live
+   * detection; `plannotator` forces an attempt; `native` never touches the bus.
+   */
+  function usePlannotatorHandoff(): boolean {
+    return shouldUsePlannotator(
+      handoffConfigNow().config.mode,
+      plannotatorActive,
+    );
+  }
+
+  /** Per-attempt browser timeout (deps test seam wins over user config). */
+  function handoffTimeoutMs(): number {
+    return resolveHandoffTimeout(
+      deps.plannotatorRequestTimeoutMs,
+      handoffConfigNow().config.timeoutMs,
+    );
   }
 
   /**
@@ -3327,7 +3390,7 @@ export default function workflowExtension(
 
       if (enable) {
         ctx.ui.notify(
-          `Review Mode ENABLED (${scope}) — after Plan Mode finishes, an independent reviewer audits the plan and hands it to Plannotator.\nTip: /review runs a one-shot review any time, even with Review Mode off.\nSettings: ${res.path}`,
+          `Review Mode ENABLED (${scope}) — after Plan Mode finishes, an independent reviewer audits the plan and hands it to Plannotator or the native questionnaire (see /handoff).\nTip: /review runs a one-shot review any time, even with Review Mode off.\nSettings: ${res.path}`,
           "info",
         );
         updateStatus(ctx as any);
@@ -3342,6 +3405,117 @@ export default function workflowExtension(
         "info",
       );
     },
+  });
+
+  // ── /handoff: view/set the plan handoff target (workflow.handoff) ──
+  // Available in every mode: it only writes settings JSON. The mode decides
+  // which presenter opens at handoff time (browser review vs native sheet) and
+  // applies with Review Mode on or off.
+  pi.registerCommand("handoff", {
+    description:
+      "View or set the plan handoff target: /handoff auto|native|plannotator [global|project]",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = reviewAgentDir();
+      const tokens = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "").toLowerCase();
+      const paths = handoffConfigPaths(cwd, agentDir);
+      const sourceLabel = (source: string): string =>
+        source === "default" ? "default" : `${source} settings`;
+      const detectionLabel = (): string => {
+        switch (plannotatorDetectionSource) {
+          case "package":
+            return "@plannotator/pi-extension in settings.packages";
+          case "bus":
+            return "a listener on the plannotator:request bus";
+          case "session":
+            return "a live browser session";
+          default:
+            return "no Plannotator host detected";
+        }
+      };
+      const usage = [
+        "Usage: /handoff auto|native|plannotator [global|project]",
+        "  auto        Plannotator when a host is detected, native otherwise",
+        "  native      always the native questionnaire — never opens the browser",
+        "  plannotator always try Plannotator; native fallback on timeout/error",
+      ].join("\n");
+
+      if (!sub || sub === "status") {
+        const resolved = readHandoffConfig(cwd, agentDir);
+        const effective = shouldUsePlannotator(
+          resolved.config.mode,
+          plannotatorActive,
+        )
+          ? "browser review (Plannotator)"
+          : "native questionnaire";
+        ctx.ui.notify(
+          [
+            `Handoff: ${resolved.config.mode} (${sourceLabel(resolved.sources.mode)}) — ${describeHandoffMode(resolved.config.mode)}`,
+            `  detected : ${detectionLabel()}`,
+            `  effective: ${effective}`,
+            `  timeout  : ${resolved.config.timeoutMs} ms (${sourceLabel(resolved.sources.timeout)})`,
+            `Global settings: ${paths.global}`,
+            `Project settings: ${paths.project}`,
+            usage,
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (!isHandoffMode(sub)) {
+        ctx.ui.notify(usage, "info");
+        return;
+      }
+
+      // A pending decision owns the turn: switching the target mid-flight
+      // would orphan the browser tab (or the open native sheet).
+      if (awaitingDecision || handoffModalOpen) {
+        ctx.ui.notify(
+          "A handoff decision is pending — approve/deny in the browser tab or run /review-abort first.",
+          "info",
+        );
+        return;
+      }
+
+      // Scope is any explicit `global`/`project` token after the subcommand.
+      const scope: "global" | "project" =
+        tokens.includes("project") && !tokens.includes("global")
+          ? "project"
+          : "global";
+      const res = writeHandoffConfig(scope, cwd, agentDir, {
+        mode: sub as HandoffMode,
+      });
+      if (!res.ok) {
+        ctx.ui.notify(
+          `Could not write handoff settings: ${res.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+      const after = readHandoffConfig(cwd, agentDir);
+      const effective = shouldUsePlannotator(
+        after.config.mode,
+        plannotatorActive,
+      )
+        ? "browser review"
+        : "native questionnaire";
+      ctx.ui.notify(
+        [
+          `Handoff → ${sub} (${scope})`,
+          `  ${describeHandoffMode(sub as HandoffMode)}`,
+          `  effective: ${effective} (detected: ${detectionLabel()})`,
+          `Settings: ${res.path}`,
+        ].join("\n"),
+        "info",
+      );
+    },
+    getArgumentCompletions: (prefix: string) =>
+      handoffArgumentCompletions(prefix),
   });
 
   // ── /commit-policy: view/set the commit policy (workflow.commitPolicy) ──
@@ -5464,7 +5638,13 @@ export default function workflowExtension(
     cycleId?: number;
   }): Promise<{ ok: true; reviewId?: string } | { ok: false; reason: string }> {
     const bus: any = (pi as any).events;
-    if (!plannotatorActive || !bus || typeof bus.emit !== "function") {
+    if (!usePlannotatorHandoff()) {
+      return {
+        ok: false,
+        reason: "native handoff selected in workflow.handoff",
+      };
+    }
+    if (!bus || typeof bus.emit !== "function") {
       return { ok: false, reason: "Plannotator is not available in this session" };
     }
     if (!input.planText.trim() || !input.planPath) {
@@ -5491,7 +5671,7 @@ export default function workflowExtension(
     // turn. The reviewer has finished, but prompts and modes stay locked.
     setReviewTurn("handoff");
     persistState();
-    const timeoutMs = Math.max(50, deps.plannotatorRequestTimeoutMs ?? 15_000);
+    const timeoutMs = Math.max(50, handoffTimeoutMs());
     const response = await new Promise<PlanReviewRequestOutcome>((resolve) => {
       let settled = false;
       const settle = (outcome: PlanReviewRequestOutcome): void => {
@@ -5587,7 +5767,7 @@ export default function workflowExtension(
     savedPath?: string;
   }> {
     const bus: any = (pi as any).events;
-    if (!plannotatorActive || !bus || typeof bus.emit !== "function") {
+    if (!usePlannotatorHandoff() || !bus || typeof bus.emit !== "function") {
       return { status: "missing" };
     }
     const timeoutMs = Math.max(50, deps.plannotatorRecoveryTimeoutMs ?? 3_000);
@@ -5654,7 +5834,10 @@ export default function workflowExtension(
         const changed = clearPendingHandoffDecision();
         if (changed) persistState();
         endReviewTurn();
-        record("clear", { why: "no restorable review" });
+        record("clear", {
+          why: "no restorable review",
+          mode: handoffConfigNow().config.mode,
+        });
         return;
       }
       const currentFile = readCurrentPlanText(reviewCwd());
@@ -5706,7 +5889,11 @@ export default function workflowExtension(
       const changed = clearPendingHandoffDecision();
       if (changed) persistState();
       endReviewTurn();
-      record("clear", { why: decision.reason, reviewId: lastReviewId ?? "" });
+      record("clear", {
+        why: decision.reason,
+        reviewId: lastReviewId ?? "",
+        mode: handoffConfigNow().config.mode,
+      });
       notifyReview(
         `Previous browser review could not be recovered — ${decision.reason}.`,
         "warning",
@@ -5825,17 +6012,23 @@ export default function workflowExtension(
       pendingHandoffSource === "manual" ||
       manualReviewCycle;
     if (input.presentation === "plannotator-then-native") {
-      const handoff = await requestPlanReview({
-        planText: input.planText,
-        planPath: input.planPath,
-        source: input.source,
-        ctx,
-      });
-      if (handoff.ok) {
-        // The browser owns the decision; a manual cycle must stay manual so a
-        // later Deny still re-reviews the revision.
-        if (input.source === "manual") manualReviewCycle = true;
-        return "browser";
+      // `native` mode (or `auto` with no detected host) skips the bus entirely:
+      // no request, no timeout, no "unavailable" warning — straight to the
+      // native questionnaire below.
+      const wantBrowser = usePlannotatorHandoff();
+      if (wantBrowser) {
+        const handoff = await requestPlanReview({
+          planText: input.planText,
+          planPath: input.planPath,
+          source: input.source,
+          ctx,
+        });
+        if (handoff.ok) {
+          // The browser owns the decision; a manual cycle must stay manual so a
+          // later Deny still re-reviews the revision.
+          if (input.source === "manual") manualReviewCycle = true;
+          return "browser";
+        }
       }
     }
     printHandoffPlan(input.planText, input.planPath, input.reason, {
@@ -6282,6 +6475,55 @@ export default function workflowExtension(
     });
   }
 
+  /**
+   * Recompute whether a Plannotator host is present.
+   *
+   * Call this BEFORE `ensurePlannotatorListeners()`: the listener-count signal
+   * must not count our own request handler (the self-inflation that used to
+   * make `plannotatorActive` effectively always true). Sticky — evidence only
+   * upgrades (bus < package < session), never downgrades.
+   */
+  const PLANN_DETECT_RANK = { none: 0, bus: 1, package: 2, session: 3 } as const;
+  function notePlannotatorDetected(
+    source: "package" | "bus" | "session",
+  ): void {
+    if (
+      PLANN_DETECT_RANK[source] <=
+      PLANN_DETECT_RANK[plannotatorDetectionSource]
+    ) {
+      return;
+    }
+    plannotatorActive = true;
+    plannotatorDetectionSource = source;
+  }
+  function refreshPlannotatorDetection(ctx?: any): void {
+    if (plannotatorDetectionSource === "session") return;
+    try {
+      const settings: any =
+        ctx?.settings ?? (currentSessionCtx as any)?.settings ?? {};
+      const pkgs: unknown = settings.packages;
+      if (
+        Array.isArray(pkgs) &&
+        pkgs.some((p: unknown) => String(p).includes("plannotator"))
+      ) {
+        notePlannotatorDetected("package");
+        return;
+      }
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      const bus: any = (pi as any).events;
+      if (!bus || typeof bus.listenerCount !== "function") return;
+      const own = plannotatorListenersRegistered ? 1 : 0;
+      if (bus.listenerCount(PLANNOTATOR_REQUEST) > own) {
+        notePlannotatorDetected("bus");
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function ensurePlannotatorListeners() {
     if (plannotatorListenersRegistered) return;
     try {
@@ -6289,6 +6531,9 @@ export default function workflowExtension(
       if (!bus || typeof bus.on !== "function") return;
       // plan-approved (external executionMode) — direct handoff
       bus.on(PLANNOTATOR_PLAN_APPROVED, (event: any) => {
+        // A leftover browser tab must not approve a plan after the user
+        // switched the handoff target to native (or detection says no host).
+        if (!usePlannotatorHandoff()) return;
         void handlePlannotatorApprove(
           event?.planFilePath,
           event?.planContent,
@@ -6305,6 +6550,7 @@ export default function workflowExtension(
       bus.on(PLANNOTATOR_REVIEW_RESULT, (event: any) => {
         try {
           if (!event || typeof event.reviewId !== "string") return;
+          if (!usePlannotatorHandoff()) return;
           // Strict correlation: a review result without the current handoff's
           // review id is stale (e.g. an old browser tab after a new prompt).
           if (!lastReviewId || event.reviewId !== lastReviewId) return;
@@ -6352,6 +6598,8 @@ export default function workflowExtension(
             typeof event.requestId === "string" &&
             event.requestId === pendingHandoffRequestId;
           if (!matchesWaiting && !matchesCurrent) return;
+          // A matching session-open is definitive proof of a live host.
+          notePlannotatorDetected("session");
           adoptPlannotatorSession({
             reviewId: event.reviewId,
             url: event.url,
@@ -6408,7 +6656,6 @@ export default function workflowExtension(
         }
       });
       plannotatorListenersRegistered = true;
-      plannotatorActive = true;
       const ctx = getActiveCtx();
       if (ctx) updateStatus(ctx as any);
     } catch (_e) {
@@ -10756,34 +11003,10 @@ export default function workflowExtension(
     // Give Tab back to autocomplete while a suggestion list is visible; the raw
     // `tab` shortcut keeps cycling modes otherwise.
     ensureWorkflowTabEditor(ctx as any);
-    // Register plannotator bridge (idempotent) and detect presence
+    // Register the Plannotator bridge (idempotent). Detection runs FIRST so
+    // our own request listener cannot be mistaken for a host.
+    refreshPlannotatorDetection(ctx as any);
     ensurePlannotatorListeners();
-    // Also detect via presence of plannotator package in settings
-    try {
-      const settings: any = (ctx as any).settings ?? {};
-      const pkgs: string[] = settings.packages ?? [];
-      if (pkgs.some((p: string) => String(p).includes("plannotator"))) {
-        plannotatorActive = true;
-        updateStatus(ctx as any);
-      }
-    } catch (_e) {
-      void _e;
-    }
-    // Fallback: check if bus already has plannotator listeners (plannotator loaded before workflow)
-    try {
-      const bus: any = (pi as any).events;
-      const hasPlannotator =
-        bus &&
-        typeof bus.listenerCount === "function" &&
-        bus.listenerCount(PLANNOTATOR_REQUEST) > 0;
-      if (hasPlannotator) {
-        plannotatorActive = true;
-        ensurePlannotatorListeners();
-        updateStatus(ctx as any);
-      }
-    } catch (_e) {
-      void _e;
-    }
     // Recovery is asynchronous (it may query Plannotator); session start must
     // not wait up to the status timeout. The gate is restored/cleared before
     // the next user turn.
@@ -12979,6 +13202,9 @@ export default function workflowExtension(
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
+    // A bridge can load after workflow (or after /reload): re-detect before
+    // registering so `auto` reflects the real presence at handoff time.
+    refreshPlannotatorDetection(ctx as any);
     ensurePlannotatorListeners();
     // Safety valve for a prompt that bypassed `input` (host queue, another
     // extension): never let a Review turn run concurrently with a plan/build
@@ -14041,7 +14267,7 @@ export default function workflowExtension(
         try {
           const preview = planTextForRender.slice(0, 4000);
           const list = formatTodoNumberedList(todoItems);
-          const content = plannotatorActive
+          const content = usePlannotatorHandoff()
             ? `**Plan ready** (${todoItems.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
             : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.${commitDirectiveLine(ctx)}`;
           (pi as any).sendMessage?.(
@@ -14058,7 +14284,7 @@ export default function workflowExtension(
         // Also notify
         try {
           ctx.ui.notify(
-            plannotatorActive
+            usePlannotatorHandoff()
               ? "Plan ready — awaiting browser review (or type Execute to build directly)"
               : "Plan ready — type Execute to build or tell me what to refine.",
             "info",
@@ -14115,7 +14341,7 @@ export default function workflowExtension(
       } else if (awaitingDecision) {
         // Stale guard — if plannotator review is still pending, don't reset
         const age = lastHandoffAt ? Date.now() - lastHandoffAt : 0;
-        if (plannotatorActive && lastReviewId) {
+        if (usePlannotatorHandoff() && lastReviewId) {
           try {
             const bus: any = (pi as any).events;
             const statusRes: any = await new Promise((resolve) => {
@@ -14181,7 +14407,7 @@ export default function workflowExtension(
         } else {
           try {
             ctx.ui.notify(
-              plannotatorActive && lastReviewId
+              usePlannotatorHandoff() && lastReviewId
                 ? "Plan review still open in browser — approve or annotate there."
                 : "Plan handoff already pending — dismiss the existing prompt first.",
               "info",

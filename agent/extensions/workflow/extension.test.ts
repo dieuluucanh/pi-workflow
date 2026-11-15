@@ -55,6 +55,15 @@ interface BootOptions {
   /** `ctx.ui.confirm` answer (default true). */
   confirmAnswer?: boolean;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
+  /**
+   * Extra project `<cwd>/.pi/settings.json` content. `workflow` is merged one
+   * level so `{ workflow: { handoff: "native" } }` keeps `reviewMode`.
+   */
+  settings?: Record<string, unknown>;
+  /** Global `<agentDir>/settings.json` content (scope-precedence tests). */
+  globalSettings?: Record<string, unknown>;
+  /** Fake `ctx.settings` (e.g. `{ packages: ["npm:@plannotator/pi-extension"] }`). */
+  ctxSettings?: Record<string, unknown>;
   script?: {
     pass1?: (c: FakeCapture) => Promise<void>;
     pass2?: (c: FakeCapture) => Promise<void>;
@@ -67,10 +76,18 @@ async function boot(over: BootOptions = {}) {
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   fs.mkdirSync(path.join(cwd, ".pi", "plans"), { recursive: true });
+  const extraSettings = over.settings ?? {};
+  const extraWorkflow =
+    extraSettings.workflow &&
+    typeof extraSettings.workflow === "object" &&
+    !Array.isArray(extraSettings.workflow)
+      ? (extraSettings.workflow as Record<string, unknown>)
+      : {};
   fs.writeFileSync(
     path.join(cwd, ".pi", "settings.json"),
     JSON.stringify(
       {
+        ...extraSettings,
         workflow: {
           reviewMode: {
             enabled: over.enabled !== false,
@@ -79,12 +96,19 @@ async function boot(over: BootOptions = {}) {
             verify: over.verify === true,
             timeoutMs: 5000,
           },
+          ...extraWorkflow,
         },
       },
       null,
       2,
     ),
   );
+  if (over.globalSettings) {
+    fs.writeFileSync(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify(over.globalSettings, null, 2),
+    );
+  }
   const { capture, sdk } = fakeSdk(
     over.script ?? { pass1: submitThenFinish(REWRITTEN_PLAN) },
   );
@@ -142,18 +166,19 @@ async function boot(over: BootOptions = {}) {
     hasUI: over.hasUI === true,
     branch: over.branch ?? [],
     ...(over.modelRegistry ? { modelRegistry: over.modelRegistry } : {}),
-    ...(over.customAnswer !== undefined
-      ? { customAnswer: over.customAnswer }
-      : {}),
-    ...(over.editorAnswer !== undefined
-      ? { editorAnswer: over.editorAnswer }
-      : {}),
-    ...(over.selectAnswer !== undefined
-      ? { selectAnswer: over.selectAnswer }
-      : {}),
-    ...(over.confirmAnswer !== undefined
-      ? { confirmAnswer: over.confirmAnswer }
-      : {}),
+    ...(over.customAnswer === undefined
+      ? {}
+      : { customAnswer: over.customAnswer }),
+    ...(over.editorAnswer === undefined
+      ? {}
+      : { editorAnswer: over.editorAnswer }),
+    ...(over.selectAnswer === undefined
+      ? {}
+      : { selectAnswer: over.selectAnswer }),
+    ...(over.confirmAnswer === undefined
+      ? {}
+      : { confirmAnswer: over.confirmAnswer }),
+    ...(over.ctxSettings ? { settings: over.ctxSettings } : {}),
   });
   await pi.emit("session_start", { reason: over.startReason ?? "startup" }, ctx);
   const cleanup = async () => {
@@ -958,6 +983,7 @@ test("Q: a stale browser Deny cannot suppress the running round's handoff", asyn
 
 async function reloadWithPending(
   status: Record<string, unknown>,
+  over: BootOptions = {},
 ): Promise<{
   b: Awaited<ReturnType<typeof boot>>;
   made: ReturnType<typeof makeFakeCtx>;
@@ -967,6 +993,7 @@ async function reloadWithPending(
     hasUI: true,
     plannotator: true,
     plannotatorStatus: status,
+    ...over,
   });
   const plan = placePlan(b.cwd, "reload-pending.md");
   const branch = [
@@ -2100,6 +2127,373 @@ test("HF9: aborting a paused gated review presents exactly once", async () => {
     assert.equal(b.customs.length, 0, "no second native modal was stacked");
   } finally {
     while (releases.length > 0) releases.shift()?.();
+    await b.cleanup();
+  }
+});
+
+// ── Handoff target toggle (workflow.handoff, 2026-11-15 plan) ────────
+
+test("HD1: auto + a detected host opens the browser handoff", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd1-auto-browser.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(b.plannotatorRequests.length, 1, "the browser was asked");
+    assert.equal(b.customs.length, 0, "the native modal stayed closed");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD2: auto + no host goes native immediately, without a warning", async () => {
+  const b = await boot({ hasUI: true, customAnswer: handoffAnswer("approve") });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd2-auto-native.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(
+      b.plannotatorRequests.length,
+      0,
+      "no request was emitted without a host",
+    );
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    assert.ok(
+      !notified(b.notifies, "Plannotator handoff unavailable"),
+      "an intentional native handoff is not a failure",
+    );
+    assert.ok(
+      !b.pi.entries.some(
+        (e: any) => e.type === "workflow-handoff-plannotator-failed",
+      ),
+      "no failure entry was written",
+    );
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "approving still starts the execute turn",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD3: handoff=native never opens the browser even with a host", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    settings: { workflow: { handoff: "native" } },
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd3-native-host.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(b.plannotatorRequests.length, 0, "the bus was not used");
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "approval entered Build",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD4: handoff=plannotator forces the attempt and falls back", async () => {
+  const b = await boot({
+    hasUI: true,
+    settings: { workflow: { handoff: "plannotator" } },
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd4-forced.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) => e.type === "workflow-handoff-plannotator-failed",
+      ),
+      "the attempt was forced even without a detected host",
+    );
+    assert.equal(b.customs.length, 1, "the native fallback opened");
+    assert.ok(
+      notified(b.notifies, "Plannotator handoff unavailable"),
+      "the forced-mode failure is announced",
+    );
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) => e.type === "workflow-handoff-plannotator-failed",
+      ),
+      "the failed attempt is recorded",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD5: stale browser approvals are ignored in native mode", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    settings: { workflow: { handoff: "native" } },
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd5-stale-approve.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.customs.length, 1, "the native handoff opened");
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    b.pi.events.emit("plannotator:plan-approved", {
+      planFilePath: plan.abs,
+      planContent: ORIGINAL_PLAN,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "a leftover tab cannot start the execute turn",
+    );
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "the session stayed in Plan mode",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD6: reload in native mode clears a pending browser gate", async () => {
+  const { b, made } = await reloadWithPending(
+    { "review-1": { status: "pending" } },
+    { settings: { workflow: { handoff: "native" } } },
+  );
+  try {
+    await waitFor(() =>
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-handoff-recovery" && e.data?.action === "clear",
+      ),
+    );
+    assert.deepEqual(
+      b.reviewStatusRequests,
+      [],
+      "native mode never queries the browser",
+    );
+    const cleared = b.pi.entries.find(
+      (e: any) =>
+        e.type === "workflow-handoff-recovery" && e.data?.action === "clear",
+    );
+    assert.ok(cleared, "the stale gate was cleared");
+    assert.equal((cleared as any).data?.mode, "native");
+    assert.ok(
+      !notified(made.notifies, "Browser review still open"),
+      "no browser prompt is announced",
+    );
+    const modes = made.statuses.filter(
+      (value): value is string =>
+        typeof value === "string" &&
+        (value.includes("🔍 review") ||
+          value.includes("⏸ plan") ||
+          value.includes("▶ build")),
+    );
+    assert.ok(
+      modes.at(-1)?.includes("⏸ plan"),
+      `the cleared gate returns to the author mode, got ${modes.at(-1)}`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD7: headless native handoff uses the text fallback, not SSH hint", async () => {
+  const b = await boot({
+    hasUI: false,
+    enabled: true,
+    settings: { workflow: { handoff: "native" } },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd7-headless.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    const fallback = b.pi.sent.find(
+      (s: any) => (s.content as any)?.customType === "workflow-handoff-fallback",
+    );
+    assert.ok(fallback, "the headless fallback message was sent");
+    const text = JSON.stringify((fallback as any).content);
+    assert.ok(
+      text.includes("Execute the plan"),
+      "the headless message points at the execute prompt",
+    );
+    assert.ok(!text.includes("SSH port forwarding"), "no browser hint");
+    assert.ok(!text.includes("PLANNOTATOR_REMOTE"), "no bridge env hint");
+    assert.ok(
+      b.pi.entries.some(
+        (e: any) =>
+          e.type === "workflow-review-turn-closed" &&
+          e.data?.reason === "headless-handoff",
+      ),
+      "the review turn was closed",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD8: /handoff reports status and writes the requested scope", async () => {
+  const b = await boot({ hasUI: true });
+  const settingsPath = path.join(b.cwd, ".pi", "settings.json");
+  try {
+    await b.pi.commands.handoff.handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Handoff: auto (default)"));
+    assert.ok(notified(b.notifies, "no Plannotator host detected"));
+    assert.ok(notified(b.notifies, "effective: native questionnaire"));
+
+    await b.pi.commands.handoff.handler("sideways", b.ctx);
+    assert.ok(notified(b.notifies, "Usage: /handoff auto|native|plannotator"));
+
+    await b.pi.commands.handoff.handler("native project", b.ctx);
+    let settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.deepEqual(settings.workflow.handoff, { mode: "native" });
+    assert.equal(
+      settings.workflow.reviewMode.enabled,
+      true,
+      "the review config was preserved",
+    );
+    assert.ok(notified(b.notifies, "Handoff → native (project)"));
+
+    await b.pi.commands.handoff.handler("auto global", b.ctx);
+    const globalPath = path.join(b.agentDir, "settings.json");
+    const global = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+    assert.equal(global.workflow.handoff.mode, "auto");
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.deepEqual(
+      settings.workflow.handoff,
+      { mode: "native" },
+      "the project override is unchanged",
+    );
+    assert.ok(notified(b.notifies, "Handoff → auto (global)"));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD9: /handoff refuses to switch while a decision is pending", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  const settingsPath = path.join(b.cwd, ".pi", "settings.json");
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd9-pending.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the browser owns the gate");
+
+    await b.pi.commands.handoff.handler("native", b.ctx);
+    assert.ok(notified(b.notifies, "A handoff decision is pending"));
+    let settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.equal(
+      settings.workflow.handoff,
+      undefined,
+      "the refused write changed nothing",
+    );
+
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    await b.pi.commands.handoff.handler("native project", b.ctx);
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.deepEqual(settings.workflow.handoff, { mode: "native" });
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD10: a corrupt workflow.handoff value behaves as auto", async () => {
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    settings: { workflow: { handoff: 42 } },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd10-corrupt.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    assert.equal(
+      b.plannotatorRequests.length,
+      1,
+      "auto retried the detected host",
+    );
+    assert.equal(b.customs.length, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD11: a manual /review honours handoff=native", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    settings: { workflow: { handoff: "native" } },
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    const plan = placePlan(b.cwd, "hd11-manual-native.md");
+    await runReview(b.pi, b.ctx, plan.rel);
+
+    assert.equal(b.plannotatorRequests.length, 0, "no browser request");
+    assert.equal(b.customs.length, 1, "the native questionnaire opened");
+    assert.ok(
+      !notified(b.notifies, "Plannotator handoff unavailable"),
+      "no failure warning for the selected native target",
+    );
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
+      "the plan was printed into the transcript",
+    );
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    assert.ok(notified(b.notifies, "Nothing to abort"), "no stale turn");
+  } finally {
     await b.cleanup();
   }
 });

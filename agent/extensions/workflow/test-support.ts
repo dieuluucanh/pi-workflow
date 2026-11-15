@@ -498,6 +498,8 @@ export interface FakeCtxOptions {
   /** Value returned by `ui.confirm` (default true). */
   confirmAnswer?: boolean;
   modelRegistry?: { find?: (provider: string, id: string) => unknown };
+  /** Fake `ctx.settings` (e.g. `{ packages: [...] }`) for detection tests. */
+  settings?: Record<string, unknown>;
   signal?: AbortSignal;
   /** Project-local settings trust (default true for existing fixtures). */
   projectTrusted?: boolean;
@@ -525,7 +527,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     modelRegistry: over.modelRegistry ?? {
       find: (provider: string, id: string) => ({ provider, id }),
     },
-    settings: {},
+    settings: over.settings ?? {},
     sessionManager: {
       getBranch: () => over.branch ?? [],
       buildContextEntries: () => over.branch ?? [],

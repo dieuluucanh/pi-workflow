@@ -4,6 +4,41 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — `workflow.handoff` + `/handoff`
+
+The plan handoff presenter is now an explicit setting instead of a side effect
+of package detection.
+
+- `workflow.handoff`: `"auto"` (default — Plannotator when a host is detected,
+  native otherwise), `"native"` (never open the browser: no request, no wait, no
+  "unavailable" warning), or `"plannotator"` (always attempt, even undetected;
+  native fallback on timeout/error). The object form `{ mode, timeoutMs }` sets
+  the per-attempt timeout (default 15 s, clamped 1–300 s).
+- `/handoff [auto|native|plannotator] [global|project]` reports the effective
+  mode, the detection evidence (`settings.packages`, bus listener, live session
+  or none) and the real target, and writes the key read-modify-write. It refuses
+  to switch while a handoff decision is pending (approve/deny in the tab or
+  `/review-abort` first).
+- Argument completions for the mode and the write scope.
+
+### Fixed — truthful Plannotator detection
+
+`ensurePlannotatorListeners()` marked Plannotator active unconditionally, so
+removing the package still emitted `plannotator:request` and stalled every
+handoff for the full 15 s timeout before the native fallback.
+
+- Detection is a real host check: package in `settings.packages`, a **foreign**
+  `plannotator:request` listener (our own handler is subtracted), or a live
+  `session-opened`. Refreshed on `session_start` and before every prompt.
+- `auto` with no host renders the native questionnaire immediately, with no
+  `Plannotator handoff unavailable` warning and no failure entry.
+- Reload recovery in `native` mode never queries Plannotator; a gate left over
+  from a previous mode is cleared and the review turn is released.
+- Stale `plan-approved` / `review-result` events from a leftover browser tab are
+  ignored when the effective mode does not use Plannotator.
+- The headless fallback text no longer prints the SSH-forwarding hint in `native`
+  mode.
+
 ### Fixed — `/review-abort` is a real local exit
 
 A Plannotator failure could soft-lock Review: `/review-abort` re-opened the
