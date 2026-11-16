@@ -108,6 +108,7 @@ test("buildHandoffQuestion pluralizes and omits missing detail", () => {
 test("handoffReasonLabel covers every reason", () => {
   const reasons = [
     "reviewed",
+    "handoff",
     "aborted",
     "unavailable",
     "closed",
@@ -117,6 +118,7 @@ test("handoffReasonLabel covers every reason", () => {
     assert.ok(handoffReasonLabel(reason).length > 0, reason);
   }
   assert.ok(handoffReasonLabel("build-failed").includes("Build"));
+  assert.ok(handoffReasonLabel("handoff").includes("approve"));
 });
 
 test("handoffChoiceFromResult maps the approve row to execute", () => {

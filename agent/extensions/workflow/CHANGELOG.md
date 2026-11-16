@@ -2,6 +2,49 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — a plain plan handoff is no longer Review Mode
+
+With Review Mode off, finishing Plan painted `🔍 review — awaiting decision`,
+locks `/plan`, `/build`, `Tab`/`Ctrl+Alt+P` and even `/review-mode off`, and could
+strand the turn when the in-app Plannotator tab rendered blank.
+
+- A plan handoff now has an explicit **owner**. Only an actual reviewer round
+  (automatic or manual `/review`) enters the exclusive Review turn. A plain
+  handoff is a Plan/Build sub-state (`⏸ plan — handoff pending`) and leaves
+  modes and prompts free; a mode switch or a new prompt supersedes it, and a
+  late browser approve/deny is ignored.
+- The plan is **always printed into the transcript** before the browser request
+  (deduped per revision), so a blank/unusable host web tab is never the only
+  copy of the plan.
+- **`/handoff fallback`** converts the pending browser decision to the native
+  questionnaire without changing `workflow.handoff`. It is allowed through the
+  Review input gate. A repeat call is idempotent.
+- **`/review-mode off`** is allowed once the reviewer has finished (no running
+  round, pause or gated audit). A pending handoff is downgraded to plain and
+  keeps its browser correlation; an open native prompt or a live round is
+  refused with the correct exit. This also makes `off` override a project
+  `enabled: true` when that scope would otherwise defeat it.
+- The footer, `/review-status` and reload recovery distinguish the plain
+  handoff from a review-owned one; older session entries default to plain so
+  the false Review lock cannot return.
+
+### Fixed — stale manual cycle after restart
+
+A persisted `manualReviewCycle` survived `startup`/`new` recovery and made the
+next Plan submission run a manual-trigger reviewer while `workflow.reviewMode.enabled`
+was false. It is now cleared when no pending handoff survives; a genuine manual
+handoff still keeps its cycle.
+
+### Fixed — Review Mode settings writes no longer shadow each other
+
+`writeReviewModeConfig` wrote the complete coerced config, so `/review-mode
+timeout` pinned `enabled` (and every default) into that scope. Writes now touch
+only the patched fields. `/review-mode on|off` makes the requested value
+effective across scopes when the other scope would defeat it and reports both
+paths; `status` names a shadowed explicit `enabled`.
+
 ## [0.12.1] - 2026-11-16
 
 ### Changed — folder exclusions are now two tiers (breaking)

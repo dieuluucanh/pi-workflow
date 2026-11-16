@@ -339,6 +339,11 @@ const HANDOFF_SCOPES: readonly { token: string; description: string }[] = [
   { token: "project", description: "write to <cwd>/.pi/settings.json" },
 ];
 
+/** `/handoff fallback`: convert the pending handoff to the native sheet now. */
+export const HANDOFF_FALLBACK_TOKEN = "fallback";
+export const HANDOFF_FALLBACK_DESCRIPTION =
+  "present the pending plan handoff in the native questionnaire now";
+
 /**
  * Argument completions for `/handoff` (pure; unit-tested).
  *
@@ -356,13 +361,20 @@ export function handoffArgumentCompletions(
   // ── Mode position: no whitespace typed yet ──────────────────────────
   if (!raw.trim() || !/\s/.test(raw)) {
     const lower = raw.trim().toLowerCase();
-    const matching = HANDOFF_MODES.filter((mode) => mode.startsWith(lower));
-    if (matching.length === 0) return null;
-    return matching.map((mode) => ({
+    const modes = HANDOFF_MODES.filter((mode) => mode.startsWith(lower));
+    const items: ArgumentCompletion[] = modes.map((mode) => ({
       value: `${mode} `,
       label: mode,
       description: describeHandoffMode(mode),
     }));
+    if (HANDOFF_FALLBACK_TOKEN.startsWith(lower)) {
+      items.push({
+        value: HANDOFF_FALLBACK_TOKEN,
+        label: HANDOFF_FALLBACK_TOKEN,
+        description: HANDOFF_FALLBACK_DESCRIPTION,
+      });
+    }
+    return items.length > 0 ? items : null;
   }
 
   // ── Scope position: a mode is already committed ─────────────────────

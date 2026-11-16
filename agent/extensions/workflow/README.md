@@ -37,15 +37,16 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/btw` | Queue note for next turn |
 | `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included; type to filter models by `provider/id` or display name). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
 | `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default… (fuzzy type-to-filter; completed actions close the picker). CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]`, `retarget-provider <old> <new> [global\|project] [--apply]` |
-| `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout |
-| `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes to global settings by default |
+| `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout, and any shadowed scope. `off` is allowed while a finished handoff is pending (it becomes a plain handoff) but refused while a reviewer round/pause/gate is active (`/review-abort` first) |
+| `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes only `timeoutMs` to global settings by default; it never pins `enabled` |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
 | `/review [path]` | Run a one-shot review round now. Without a path it uses this run's plan write, then the session's latest plan write; works with Review Mode on or off (mode stays OFF). An explicit path must be under `.pi/plans/` |
 | `/review-pause` | Pause the in-flight review round (keeps the reviewer session warm). Same as ESC while a review owns the turn |
 | `/review-resume` | Continue a paused round on the warm session, or start fresh if the plan changed since the pause |
 | `/review-abort` | Stop the round or discard the pause. A waiting handoff is handed off to the author's plan through the native questionnaire — never re-opened in Plannotator. Releases the mode-switch and prompt locks |
-| `/handoff [auto\|native\|plannotator] [global\|project]` | View or set the plan handoff target (`workflow.handoff`). `auto` (default) uses Plannotator when a host is detected, `native` never opens the browser, `plannotator` always tries. Refused while a handoff decision is pending |
+| `/handoff [auto\|native\|plannotator] [global\|project]` | View or set the plan handoff target (`workflow.handoff`). `auto` (default) uses Plannotator when a host is detected, `native` never opens the browser, `plannotator` always tries. Refused while a handoff decision is pending — use the next command instead |
+| `/handoff fallback` | Present the pending plan handoff in the native questionnaire now, without changing `workflow.handoff`. The escape when the in-app review tab is blank or unusable |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
 | `/write-policy [allow\|ask\|never] [global\|project]` | View or set the write permission for Default mode (default `allow`: the agent writes freely; `ask` prompts per write; `never` blocks writes — see [Write permission](#write-permission)) |
@@ -53,7 +54,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/read-policy [status\|allow <path>\|revoke <path>\|shell paths\|strict] [global\|project]` | Read grants, shell analysis mode and the shared folder scope. Sensitive files are always blocked |
 | `/permissions [explain] <command>` | Explain a shell command's verdict without running it: each segment's class, the Plan/Review/Explorer answer and whether the write policy would treat it as a write |
 
-Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while Review owns the turn — `running`, `paused`, waiting on a handoff decision, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review).
+Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a **reviewer round or review-owned handoff** owns the turn — `running`, `paused`, or a handoff produced by `/review`/Review Mode, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review). A **plain plan handoff** (Review Mode off) does not lock modes or prompts: switching or typing a new prompt supersedes it, and the plan file stays on disk.
 
 ## Model Profiles
 
@@ -255,10 +256,10 @@ These are **display-only custom entries** (`pi.appendEntry` + `pi.registerEntryR
 
 #### Where your next message goes
 
-Review is an **exclusive turn**: while it owns the session (`running`, `paused`, `handoff`, `transition`), prompts are locked. Only `/review…` controls, `/model`, `/thinking`, `/profile` and `/role` pass the input gate; anything else is refused with a notice instead of becoming a queued turn. When no review owns the turn, input follows the **active mode**, decided automatically — there is nothing to focus or toggle:
+Review is an **exclusive turn** while a real reviewer owns it (`running`, `paused`, a **review-owned** `handoff`, `transition`): prompts are locked. Only `/review…` controls, `/handoff` (including `/handoff fallback`), `/model`, `/thinking`, `/profile` and `/role` pass the input gate; anything else is refused with a notice instead of becoming a queued turn. A **plain plan handoff** (Review Mode off) is not a review turn: modes and prompts stay free, and a prompt or mode switch supersedes it. When no review owns the turn, input follows the **active mode**, decided automatically — there is nothing to focus or toggle:
 
 - **Plan Mode** → the message goes to the plan agent.
-- **Neither** (including while the plan sits in Plannotator or in the native handoff) → the message goes to the plan agent, so you can still refine the plan.
+- **A plain handoff / the plan sitting in Plannotator or the native handoff with Review Mode off** → the message goes to the plan agent, so you can still refine the plan (and the handoff is superseded).
 
 Use `/review say <message>` to steer the in-flight reviewer explicitly (echoed as `you → reviewer`); `/btw <note>` queues a note for the next turn when no review owns the turn.
 
@@ -280,7 +281,8 @@ A paused review is in-memory and belongs to the cycle that recorded it: it canno
 
 **Manual handoff and later rounds.** A settled manual `/review` opens Plannotator with the reviewed plan, even with automatic Review Mode off; if Plannotator is unavailable it falls back to the native questionnaire. `workflow.handoff` (or `/handoff`) decides which presenter is used: `native` skips the browser entirely (no wait, no warning), `plannotator` forces the attempt, and `auto` follows live host detection. In Default/Build, Approve enters Build and Feedback switches to Plan before sending feedback. The manual cycle keeps re-reviewing and re-handing off after a feedback round until Approve, a fresh prompt or Build. Every new round supersedes an older pending browser gate, so round 2 and later always reopen the current plan; a stale Deny arriving during a round is discarded. After `reload`/`resume`/`fork`, the replacement session asks Plannotator `review-status`: a matching pending review keeps its gate, a completed decision is applied, and a missing/changed review is cleared with a reason. Desktop brings a notification review tab to the front and reloads an existing same-URL review tab; tool-result localhost URLs stay in the background.
 
-- **Review is an exclusive turn.** `ReviewTurnPhase` moves `idle → running → paused → handoff → transition → idle`. Every non-idle phase locks both prompts (see [Where your next message goes](#where-your-next-message-goes)) and mode switches: `Tab` (when no suggestion list is open), `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. The turn is the lock's single source of truth (a leaked turn can never half-unlock the session), and every exit closes it. `/review-mode off` is no longer offered as an exit while Review owns the turn. Approve is atomic (stop reviewer → Build → follow-up), and a failed Build closes the turn instead of keeping a phantom handoff.
+- **Review is an exclusive turn.** `ReviewTurnPhase` moves `idle → running → paused → handoff → transition → idle` for a **reviewer round or a review-owned handoff**. Every non-idle phase locks both prompts (see [Where your next message goes](#where-your-next-message-goes)) and mode switches: `Tab` (when no suggestion list is open), `Ctrl+Alt+P`, `/plan`, `/build`, `/default`, browser approve and external plan-mode changes are refused with one notice, and the footer shows `🔒 modes locked`. The turn is the lock's single source of truth (a leaked turn can never half-unlock the session), and every exit closes it. `/review-mode off` is allowed once the reviewer has finished (no running round/pause/gate); with a pending handoff it downgrades that handoff to plain instead of abandoning it. Approve is atomic (stop reviewer → Build → follow-up), and a failed Build closes the turn instead of keeping a phantom handoff.
+- **A plain handoff is not Review.** When Review Mode is off (or a manual cycle is not involved), finishing Plan opens the plan handoff as a Plan sub-state (`⏸ plan — handoff pending`, never `🔍 review`). Modes and prompts stay free; switching mode or typing a new prompt supersedes the handoff, and a late browser approve/deny is ignored. The plan is always printed into the transcript, so a browser tab that cannot render is never the only copy. `/handoff fallback` converts the pending browser decision to the native questionnaire without changing `workflow.handoff`; `/review-mode off` does the same downgrade while disabling automatic review.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. One long-lived terminal listener maps it to `/review-pause` semantics (warm session kept) and stays registered through the paused window: a second ESC while a gated review is paused is swallowed with a hint instead of aborting the parked plan turn (that abort used to poison the turn's signal and stall every `/review-resume`). With no review owning the turn it passes ESC through, so the editor and questionnaire keep it. Headless/RPC hosts have no listener and keep `/review-abort` as their stop path.
 - `/review-pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
 - `/review-resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result. A resumed round is **running** again — the notice/footer return to the running form, and a second ESC can pause it. It runs on a fresh controller and deliberately does **not** inherit the parked turn's signal, so an interrupted parent turn cannot instantly re-abort every resume; ESC, `/review-pause` and `/review-abort` are its stop paths. The transcript says so explicitly (`▌ REVIEW MODE  resumed · round N · model` followed by `reviewer resumed`). A rewrite the reviewer wrote to the plan file before the pause is **not** mistaken for an edit of yours: resume compares the file against a hash snapshot taken at pause time (refreshed when the round settles), so only a change made after the pause starts a fresh round. Its notice names the real outcome (rewritten, unchanged, paused, aborted, skipped or fallback).
@@ -616,7 +618,7 @@ Review Mode settings live under `workflow.reviewMode`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | Automatic-review toggle. When false, the handoff review/prefetch/planner note are off; the manual `/review*` commands still work |
+| `enabled` | `false` | Automatic-review toggle. When false, the automatic handoff review/prefetch/planner note are off and the plan handoff is **plain** (modes/prompts stay free); the manual `/review*` commands still work |
 | `rounds` | `1` | Max Plan↔Review rounds per plan/feedback cycle. A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
 | `passes` | `2` | `1` = review+rewrite only; `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
@@ -641,7 +643,7 @@ Review Mode settings live under `workflow.reviewMode`:
 }
 ```
 
-`"reviewMode": true` is accepted as shorthand for `{ "enabled": true }`.
+`"reviewMode": true` is accepted as shorthand for `{ "enabled": true }`. `/review-mode` writes **only the patched fields**: `/review-mode timeout` changes `timeoutMs` without materializing `enabled` (so it cannot silently turn automatic review on/off). `on`/`off` is made effective across scopes when the other scope would otherwise defeat it — e.g. a project `enabled: true` is also set to `false` by a plain `/review-mode off` — and both settings paths are reported. `/review-mode status` names any shadowed explicit `enabled` value.
 
 Handoff target settings live under `workflow.handoff` (same global/project precedence, project wins field-by-field). They apply with Review Mode on or off:
 
@@ -658,7 +660,7 @@ Handoff target settings live under `workflow.handoff` (same global/project prece
 }
 ```
 
-`"handoff": "native"` (a bare mode string) is accepted as shorthand for `{ "mode": "native" }`. Invalid modes and non-finite timeouts fall back to the default. `/handoff` writes this key read-modify-write, touching only the patched field so a project mode override does not shadow a global `timeoutMs`. A browser gate left over from a previous mode is cleared (never queried) when the mode is `native`.
+`"handoff": "native"` (a bare mode string) is accepted as shorthand for `{ "mode": "native" }`. Invalid modes and non-finite timeouts fall back to the default. `/handoff` writes this key read-modify-write, touching only the patched field so a project mode override does not shadow a global `timeoutMs`. A browser gate left over from a previous mode is cleared (never queried) when the mode is `native`. `timeoutMs` is the **bus request** wait, not a limit on how long the browser decision may take; use `/handoff fallback` (or `/review-abort`) to convert an unanswered pending handoff to the native questionnaire.
 
 Commit Policy settings live under `workflow.commitPolicy` (same global/project precedence, project wins field-by-field):
 
@@ -774,6 +776,17 @@ What to do:
 1. **Check the provider** — the truncated message is the provider's own reply (rate limit, quota, overloaded, auth, or a mid-stream cut). Retry the review with `/review` once the provider recovers; a review that dies this way can simply be re-run.
 2. **A long review shares one API key with the parent** — planner + reviewer often hit the same key, so a long review can exhaust rate limits. Stagger heavy Plan Mode work or raise the provider's quota.
 3. **Switch the reviewer model** if the failures recur — `/profile use <name>` or `/role set reviewer <provider/model>` (see [Review Mode](#review-mode)); pick a model whose provider is currently healthy.
+
+### The in-app review tab is blank
+
+Plannotator's loopback URL is valid — the same URL loads when you use the tab's **globe / Open in browser** button. The failure is the host's embedded web surface (Pi Desktop's isolated `WebContentsView`), not the plan server. The workflow no longer depends on it:
+
+- the plan is **always printed into the transcript** before the browser request (deduped per revision), so the text is not lost;
+- a **plain handoff** (Review Mode off) does not lock modes or prompts, so `Tab` / `/build` and a new prompt still work;
+- **`/handoff fallback`** presents the pending decision in the native questionnaire without changing `workflow.handoff`;
+- **`/handoff native`** disables the browser presenter for future handoffs entirely.
+
+`timeoutMs` only bounds the bus request (`plannotator:request`), not how long the browser decision may take. If the embedded tab stays blank, use the globe or `/handoff fallback`. This is a host-side rendering issue; a separate Pi Desktop investigation should capture the web tab's console/URL.
 
 ## Development
 

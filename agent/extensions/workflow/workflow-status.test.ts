@@ -70,6 +70,50 @@ test("the Review turn replaces the author mode and carries its phase", () => {
   );
 });
 
+test("a plain handoff is a sub-state of the author mode, never Review", () => {
+  const plan = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 1,
+    total: 4,
+    commitMode: "never",
+    handoffPending: true,
+  });
+  assert.equal(plan.mode, "⏸ plan 1/4 — handoff pending");
+  assert.ok(!plan.mode.includes("review"), "Review Mode off must not paint Review");
+  assert.equal(
+    buildWorkflowStatusSegments({
+      mode: "build",
+      done: 2,
+      total: 3,
+      commitMode: "never",
+      handoffPending: true,
+    }).mode,
+    "▶ build 2/3 — handoff pending",
+  );
+  assert.equal(
+    buildWorkflowStatusSegments({
+      mode: null,
+      done: 0,
+      total: 0,
+      commitMode: "never",
+      handoffPending: true,
+    }).mode,
+    "◦ commits:never — handoff pending",
+  );
+  // A real Review turn wins over the plain handoff flag.
+  assert.equal(
+    buildWorkflowStatusSegments({
+      mode: "plan",
+      done: 1,
+      total: 4,
+      commitMode: "never",
+      reviewPhase: "handoff",
+      handoffPending: true,
+    }).mode,
+    "🔍 review — awaiting decision",
+  );
+});
+
 test("default mode stays parseable and carries the write policy", () => {
   assert.deepEqual(
     buildWorkflowStatusSegments({

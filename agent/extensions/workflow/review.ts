@@ -468,11 +468,42 @@ export function readReviewModeConfig(
 }
 
 /**
+ * The explicit `enabled` values per scope, or `undefined` when that scope's
+ * fragment does not set the field. Used by `/review-mode` to make an on/off
+ * request effective across scopes and to report a shadowed value.
+ */
+export function reviewModeEnabledValues(
+  cwd: string,
+  agentDir: string,
+): { global?: boolean; project?: boolean } {
+  const paths = reviewConfigPaths(cwd, agentDir);
+  const valueOf = (settings: unknown): boolean | undefined => {
+    const raw = extractReviewModeRaw(settings);
+    if (typeof raw === "boolean") return raw;
+    if (
+      raw &&
+      typeof raw === "object" &&
+      !Array.isArray(raw) &&
+      Object.prototype.hasOwnProperty.call(raw, "enabled")
+    ) {
+      return (raw as Record<string, unknown>).enabled === true;
+    }
+    return undefined;
+  };
+  const globalValue = valueOf(readJsonSafe(paths.global));
+  const projectValue = valueOf(readJsonSafe(paths.project));
+  return {
+    ...(globalValue !== undefined ? { global: globalValue } : {}),
+    ...(projectValue !== undefined ? { project: projectValue } : {}),
+  };
+}
+
+/**
  * The automatic-review gate: true only when the persisted
  * `workflow.reviewMode.enabled` flag is on. This gates AUTOMATIC review
  * only (background handoff kickoff, reviewer prefetch, planner prompt
- * note). Manual one-shot commands (`/review`, `/review say|pause|resume|
- * abort|status`) intentionally bypass this gate — see `canRunManualReview`.
+ * note). Manual one-shot commands (`/review`, `/review say|pause|resume|abort|status`)
+ * intentionally bypass this gate — see `canRunManualReview`.
  * Never throws.
  */
 export function isReviewEnabled(cwd: string, agentDir: string): boolean {
@@ -528,8 +559,22 @@ export function writeReviewModeConfig(
       wfExisting && typeof wfExisting === "object" && !Array.isArray(wfExisting)
         ? { ...(wfExisting as JsonObject) }
         : {};
-    const current = coerceReviewModeConfig(wf[REVIEW_MODE_KEY]);
-    const next = coerceReviewModeConfig({ ...current, ...patch }, current);
+    // Write only the patched fields. Materialising the whole coerced config
+    // used to pin `enabled` (and every default) into the target scope: a
+    // `/review-mode timeout` could silently flip/disable automatic review, and
+    // a global `off` could be shadowed by a stale project fragment.
+    const existingRaw = wf[REVIEW_MODE_KEY];
+    const existingFragment: JsonObject =
+      existingRaw && typeof existingRaw === "object" && !Array.isArray(existingRaw)
+        ? { ...(existingRaw as JsonObject) }
+        : typeof existingRaw === "boolean"
+          ? { enabled: existingRaw }
+          : {};
+    const coerced = coerceReviewModeConfig({ ...existingFragment, ...patch });
+    const next: JsonObject = { ...existingFragment };
+    for (const key of Object.keys(patch) as Array<keyof ReviewModeConfig>) {
+      next[key] = coerced[key] as unknown;
+    }
     wf[REVIEW_MODE_KEY] = next;
     root[WORKFLOW_SETTINGS_KEY] = wf;
     fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -1800,6 +1845,31 @@ export type ReviewTurnPhase =
   | "handoff"
   | "transition";
 
+/**
+ * A pending plan handoff (browser or native) that is not a reviewer round.
+ *
+ * `plain` is the normal automatic Plan handoff with Review Mode off: it owns
+ * the pending decision but NOT the exclusive Review turn, so modes and prompts
+ * stay free. `review` is a handoff produced by an actual reviewer round (or a
+ * manual `/review`) and keeps the strict Review lock.
+ */
+export type PlanHandoffPhase = "idle" | "pending";
+export type PlanHandoffOwner = "plain" | "review";
+
+/** Only a review-owned handoff enters the exclusive Review turn. */
+export function handoffOwnsReviewTurn(
+  owner: PlanHandoffOwner | undefined,
+): boolean {
+  return owner === "review";
+}
+
+/** The Review turn a handoff enters for its owner (`idle` when plain). */
+export function reviewTurnForHandoff(
+  owner: PlanHandoffOwner | undefined,
+): ReviewTurnPhase {
+  return handoffOwnsReviewTurn(owner) ? "handoff" : "idle";
+}
+
 export function reviewTurnOwns(phase: ReviewTurnPhase): boolean {
   return phase !== "idle";
 }
@@ -1810,6 +1880,7 @@ export function reviewInputAllowed(text: string): boolean {
   if (!value.startsWith("/")) return false;
   return (
     /^\/review(?:\s|-|$)/i.test(value) ||
+    /^\/handoff(?:\s|$)/i.test(value) ||
     /^\/model(?:\s|$)/i.test(value) ||
     /^\/thinking(?:\s|$)/i.test(value) ||
     /^\/profile(?:\s|$)/i.test(value) ||
@@ -1838,7 +1909,7 @@ export function reviewInputDecision(
           : "running";
   return {
     action: "block",
-    notice: `Review is ${state} — prompts are locked. /review-pause, /review-resume, /review-abort, or change model/profile.`,
+    notice: `Review is ${state} — prompts are locked. /review-pause, /review-resume, /review-abort, /handoff fallback, or change model/profile.`,
   };
 }
 
@@ -1868,6 +1939,12 @@ export interface ReviewModeLockInput {
   handoff?: boolean;
   /** A decision is being applied (stop reviewer -> mode -> follow-up). */
   transition?: boolean;
+  /**
+   * Who owns a pending handoff. `plain` means no reviewer ran: even a stale
+   * `handoff` flag or turn must not lock the modes. Omitted keeps the
+   * historical `handoff`/turn meaning for existing callers.
+   */
+  handoffOwner?: PlanHandoffOwner;
 }
 
 /**
@@ -1890,15 +1967,17 @@ export function reviewModeLockKind(
   }
   if (input.gatePhase === "paused") return "paused";
   if (input.gatePhase === "auditing") return "running";
+  const plainHandoff = input.handoffOwner === "plain";
   // The exclusive turn is the single source of truth for the remaining
   // phases: a bare `running`/`handoff`/`paused`/`transition` turn must lock
-  // modes even when the round/pause/gate predicates are all clear.
+  // modes even when the round/pause/gate predicates are all clear. A plain
+  // handoff is the one exception: it was never a Review turn.
   if (input.turn === "transition") return "transition";
   if (input.turn === "paused") return "paused";
-  if (input.turn === "handoff") return "handoff";
+  if (input.turn === "handoff") return plainHandoff ? undefined : "handoff";
   if (input.turn === "running") return "running";
   if (input.transition === true) return "transition";
-  if (input.handoff === true) return "handoff";
+  if (input.handoff === true && !plainHandoff) return "handoff";
   return undefined;
 }
 

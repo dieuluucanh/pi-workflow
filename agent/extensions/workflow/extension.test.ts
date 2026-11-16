@@ -125,6 +125,7 @@ async function boot(over: BootOptions = {}) {
     requestId?: string;
     reviewId: string;
     planPath?: string;
+    planContent?: string;
   }> = [];
   const reviewStatusRequests: string[] = [];
   let reviewSeq = 0;
@@ -141,6 +142,7 @@ async function boot(over: BootOptions = {}) {
           requestId: request.requestId,
           reviewId,
           planPath: request.payload?.planFilePath,
+          planContent: request.payload?.planContent,
         });
         request.respond?.(
           over.plannotatorError === true
@@ -1018,6 +1020,7 @@ test("Q: a stale browser Deny cannot suppress the running round's handoff", asyn
 async function reloadWithPending(
   status: Record<string, unknown>,
   over: BootOptions = {},
+  plain = false,
 ): Promise<{
   b: Awaited<ReturnType<typeof boot>>;
   made: ReturnType<typeof makeFakeCtx>;
@@ -1045,6 +1048,9 @@ async function reloadWithPending(
         pendingHandoffPlanHash: planHash(ORIGINAL_PLAN),
         pendingHandoffSource: "auto",
         pendingHandoffCycleId: 1,
+        ...(plain
+          ? { pendingHandoffReviewOwned: false, planHandoffPhase: "pending" }
+          : {}),
       },
     },
   ];
@@ -2683,6 +2689,389 @@ test("HD9: /handoff refuses to switch while a decision is pending", async () => 
     await b.pi.commands.handoff.handler("native project", b.ctx);
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     assert.deepEqual(settings.workflow.handoff, { mode: "native" });
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD12: /handoff fallback converts a plain browser handoff to native", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    plannotator: true,
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd12-fallback.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the browser owns the plain handoff");
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "Review Mode off never paints Review",
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("⏸ plan") &&
+          value.includes("handoff pending"),
+      ),
+      "the footer names the plain handoff",
+    );
+
+    await b.pi.commands.handoff.handler("fallback", b.ctx);
+    assert.ok(b.customs.length >= 1, "the native questionnaire opened");
+    assert.equal(
+      b.pi.entries.filter((e: any) => e.type === "workflow-handoff-plan")
+        .length,
+      1,
+      "the plan printed exactly once",
+    );
+    await waitFor(() =>
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+    );
+    assert.ok(
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "approve entered Build and sent execute",
+    );
+    await b.pi.commands.handoff.handler("fallback", b.ctx);
+    assert.ok(
+      notified(b.notifies, "Nothing to fall back"),
+      "a repeat is idempotent",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD13: /review-mode off downgrades a plain handoff and keeps the browser decision", async () => {
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd13-plain-off.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1);
+
+    await b.pi.commands["review-mode"].handler("off", b.ctx);
+    assert.ok(notified(b.notifies, "Review Mode disabled"));
+    assert.ok(
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("⏸ plan") &&
+          value.includes("handoff pending"),
+      ),
+      "the pending handoff stays visible as a plain decision",
+    );
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "disabling never paints Review",
+    );
+
+    // The browser correlation survives the downgrade: a late approval builds.
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "the late approval still enters Build",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD14: /review-mode off is refused while a reviewer round runs", async () => {
+  const releases: Array<() => void> = [];
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd14-running-off.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const running = b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel) },
+      b.ctx,
+    );
+    await waitForPrompts(b.capture, 1);
+    await b.pi.commands["review-mode"].handler("off", b.ctx);
+    assert.ok(notified(b.notifies, "running or paused"));
+    releases.shift()?.();
+    await running;
+  } finally {
+    releaseAll(releases);
+    await b.cleanup();
+  }
+});
+
+test("HD15: /review-mode off downgrades a finished review handoff", async () => {
+  const b = await boot({ hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd15-review-off.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1);
+    assert.ok(
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("🔍 review — awaiting decision"),
+      ),
+      "the review-owned handoff starts as Review",
+    );
+
+    await b.pi.commands["review-mode"].handler("off", b.ctx);
+    assert.ok(notified(b.notifies, "Review Mode disabled"));
+    assert.ok(
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("⏸ plan") &&
+          value.includes("handoff pending"),
+      ),
+      "the downgraded handoff is a Plan sub-state",
+    );
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() =>
+      b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD16: a stale manual cycle does not run a review after startup", async () => {
+  const branch = [
+    {
+      type: "custom",
+      customType: "workflow",
+      data: {
+        mode: "plan",
+        todos: [],
+        manualReviewCycle: true,
+        awaitingDecision: false,
+      },
+    },
+  ];
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true, branch });
+  try {
+    const plan = placePlan(b.cwd, "hd16-stale-manual.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(
+      b.capture.prompts.length,
+      0,
+      "a restored stale manual flag must not run a reviewer",
+    );
+    assert.equal(
+      b.plannotatorRequests.length,
+      1,
+      "the plain plan handoff still opens",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD17: /review-mode off overrides a project enabled:true", async () => {
+  const b = await boot({ hasUI: true });
+  try {
+    const settingsPath = path.join(b.cwd, ".pi", "settings.json");
+    let settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.equal(
+      settings.workflow.reviewMode.enabled,
+      true,
+      "the project override starts ON",
+    );
+    await b.pi.commands["review-mode"].handler("off", b.ctx);
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.equal(
+      settings.workflow.reviewMode.enabled,
+      false,
+      "the project override is made effective",
+    );
+    assert.ok(notified(b.notifies, "Review Mode disabled"));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD18: a plain handoff carries the plan and does not lock modes/prompts", async () => {
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd18-plain.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1);
+    assert.ok(
+      String(b.plannotatorRequests[0]?.planContent ?? "").includes(
+        "# Plan: Add CSV export",
+      ),
+      "the browser request carries the plan text",
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("handoff pending") &&
+          !value.includes("review"),
+      ),
+      "the footer names the plain handoff",
+    );
+    const input = await b.pi.emit(
+      "input",
+      { text: "refine this plan", source: "interactive" },
+      b.ctx,
+    );
+    assert.deepEqual(input[0], { action: "continue" }, "prompts stay free");
+    await b.pi.commands.build.handler("", b.ctx);
+    assert.ok(
+      !notified(b.notifies, "mode switching is locked"),
+      "a plain handoff never locks the mode switch",
+    );
+    assert.ok(
+      b.statuses.some(
+        (value) => typeof value === "string" && value.includes("▶ build"),
+      ),
+      "Build was entered",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD19: a forced browser timeout falls back natively without Review", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    settings: { workflow: { handoff: { mode: "plannotator" } } },
+    customAnswer: handoffAnswer("skip"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd19-timeout.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.ok(b.customs.length >= 1, "the native questionnaire opened");
+    assert.ok(
+      b.pi.entries.filter((e: any) => e.type === "workflow-handoff-plan")
+        .length === 1,
+      "the plan printed once",
+    );
+    assert.ok(
+      !b.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "the timeout fallback never paints Review",
+    );
+    await b.pi.commands.build.handler("", b.ctx);
+    assert.ok(!notified(b.notifies, "mode switching is locked"));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD20: reload keeps a plain handoff plain and fallback-ready", async () => {
+  const { b, made } = await reloadWithPending(
+    { "review-1": { status: "pending" } },
+    { enabled: false, customAnswer: handoffAnswer("skip") },
+    true,
+  );
+  try {
+    await waitFor(() => b.reviewStatusRequests.includes("review-1"));
+    assert.ok(
+      made.statuses.some(
+        (value) =>
+          typeof value === "string" &&
+          value.includes("handoff pending") &&
+          !value.includes("review"),
+      ),
+      "the restored plain handoff is a Plan sub-state",
+    );
+    assert.ok(
+      !made.statuses.some(
+        (value) => typeof value === "string" && value.includes("🔍 review"),
+      ),
+      "the reload did not resurrect the false Review lock",
+    );
+    await b.pi.commands.handoff.handler("fallback", made.ctx);
+    assert.ok(made.customs.length >= 1, "the native fallback opened after reload");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("HD21: a fresh prompt supersedes a plain handoff; a late approve is ignored", async () => {
+  const b = await boot({ enabled: false, hasUI: true, plannotator: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "hd21-supersede.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1);
+
+    await freshPrompt(b.pi, b.ctx);
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.ok(
+      !b.pi.sent.some((s: any) =>
+        JSON.stringify(s.content).includes("Execute the plan"),
+      ),
+      "a stale browser approval cannot execute the superseded plan",
+    );
+    const lastStatus = [...b.statuses]
+      .reverse()
+      .find((value) => typeof value === "string");
+    assert.ok(
+      !String(lastStatus).includes("handoff pending"),
+      "the new prompt cleared the plain handoff label",
+    );
   } finally {
     await b.cleanup();
   }

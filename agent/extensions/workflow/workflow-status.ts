@@ -26,6 +26,12 @@ export interface WorkflowStatusInput {
    * mode in the segment; `transition` is internal and renders as running.
    */
   reviewPhase?: "idle" | "running" | "paused" | "handoff" | "transition" | null;
+  /**
+   * A pending plan handoff that did not come from a reviewer. Rendered as a
+   * sub-state of the active mode (e.g. `⏸ plan — handoff pending`), never as
+   * Review: Review Mode off must not look like Review.
+   */
+  handoffPending?: boolean;
   done: number;
   total: number;
   stale?: boolean;
@@ -71,15 +77,19 @@ export function buildWorkflowStatusSegments(
           ? "🔍 review — awaiting decision"
           : "🔍 review";
     mode = base;
-  } else if (input.mode === "build") {
-    mode = total > 0 ? `▶ build ${done}/${total}${stale}` : `▶ build${stale}`;
-  } else if (input.mode === "plan") {
-    mode = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
-  } else if (total > 0) {
-    // The default mode must stay parseable by the Desktop badge decoder.
-    mode = `◦ ${done}/${total}${stale}`;
   } else {
-    mode = `◦ commits:${input.commitMode}${stale}`;
+    let base: string;
+    if (input.mode === "build") {
+      base = total > 0 ? `▶ build ${done}/${total}${stale}` : `▶ build${stale}`;
+    } else if (input.mode === "plan") {
+      base = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
+    } else if (total > 0) {
+      // The default mode must stay parseable by the Desktop badge decoder.
+      base = `◦ ${done}/${total}${stale}`;
+    } else {
+      base = `◦ commits:${input.commitMode}${stale}`;
+    }
+    mode = input.handoffPending ? `${base} — handoff pending` : base;
   }
 
   return { mode, profile, policy };

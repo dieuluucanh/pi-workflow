@@ -56,6 +56,7 @@ import {
   planHash as planHashReexported,
   readProviderErrorEvent,
   readReviewModeConfig,
+  reviewModeEnabledValues,
   resolveReviewPrompt,
   reviewElapsedMs,
   reviewEscapeAction,
@@ -66,6 +67,7 @@ import {
   reviewLiveLine,
   reviewModeLockFooter,
   reviewModeLockKind,
+  reviewInputDecision,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
   reviewNoticeText,
@@ -77,6 +79,7 @@ import {
   reviewResumeSettles,
   reviewStatusText,
   reviewStatusVisible,
+  reviewTurnForHandoff,
   reviewRunLabel,
   sanitizeFindings,
   shouldPauseReviewOnEscape,
@@ -88,6 +91,7 @@ import {
   translateReviewEvent,
   formatActionLabel,
   formatReviewStatusLines,
+  handoffOwnsReviewTurn,
   parseReviewTimeoutArg,
   timeoutSourceOf,
   truncateErrorText,
@@ -404,6 +408,41 @@ test("review config: write preserves unrelated settings keys", () => {
   assert.equal(after.workflow.other, 1, "sibling workflow keys preserved");
   assert.equal(after.workflow.reviewMode.enabled, true);
   assert.equal(after.workflow.reviewMode.rounds, 3);
+});
+
+test("review config: a timeout write does not pin enabled in that scope", () => {
+  const { cwd, agentDir } = tmpProject();
+  fs.writeFileSync(
+    path.join(agentDir, "settings.json"),
+    JSON.stringify({ workflow: { reviewMode: { enabled: true } } }),
+    "utf8",
+  );
+  writeReviewModeConfig("project", cwd, agentDir, { timeoutMs: 60_000 });
+  const project = JSON.parse(
+    fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8"),
+  );
+  assert.equal(
+    project.workflow.reviewMode.enabled,
+    undefined,
+    "a timeout patch must not materialize the global enabled value",
+  );
+  assert.equal(project.workflow.reviewMode.timeoutMs, 60_000);
+  const resolved = readReviewModeConfig(cwd, agentDir);
+  assert.equal(resolved.config.enabled, true, "global enabled still wins");
+  assert.equal(resolved.config.timeoutMs, 60_000);
+  assert.equal(resolved.sources.timeout, "project");
+});
+
+test("review config: explicit enabled values are reported per scope", () => {
+  const { cwd, agentDir } = tmpProject();
+  assert.deepEqual(reviewModeEnabledValues(cwd, agentDir), {});
+  writeReviewModeConfig("global", cwd, agentDir, { enabled: true, timeoutMs: 0 });
+  assert.deepEqual(reviewModeEnabledValues(cwd, agentDir), { global: true });
+  writeReviewModeConfig("project", cwd, agentDir, { enabled: false });
+  assert.deepEqual(reviewModeEnabledValues(cwd, agentDir), {
+    global: true,
+    project: false,
+  });
 });
 
 test("review config: timeout provenance is project > global > default", () => {
@@ -2804,6 +2843,45 @@ test("reviewModeLockKind locks running, paused, handoff and transition", () => {
     reviewModeLockKind({ turn: "running", gatePhase: "paused" }),
     "paused",
   );
+});
+
+test("a plain plan handoff never owns the Review turn or its lock", () => {
+  assert.equal(handoffOwnsReviewTurn("plain"), false);
+  assert.equal(handoffOwnsReviewTurn("review"), true);
+  assert.equal(handoffOwnsReviewTurn(undefined), false);
+  assert.equal(reviewTurnForHandoff("plain"), "idle");
+  assert.equal(reviewTurnForHandoff("review"), "handoff");
+  assert.equal(reviewTurnForHandoff(undefined), "idle");
+  // Review Mode off: a pending browser/native decision must not lock modes.
+  assert.equal(
+    reviewModeLockKind({ turn: "idle", handoff: true, handoffOwner: "plain" }),
+    undefined,
+  );
+  // A contradictory stale turn is still plain when the owner says so: the
+  // dead-end direction is worse than a missed lock.
+  assert.equal(
+    reviewModeLockKind({ turn: "handoff", handoffOwner: "plain" }),
+    undefined,
+  );
+  // The same inputs without an owner keep the historical review lock.
+  assert.equal(reviewModeLockKind({ turn: "handoff" }), "handoff");
+  assert.equal(
+    reviewModeLockKind({ turn: "handoff", handoffOwner: "review" }),
+    "handoff",
+  );
+});
+
+test("reviewInputDecision allows /handoff fallback during a review handoff", () => {
+  assert.deepEqual(reviewInputDecision("/handoff fallback", "handoff"), {
+    action: "allow",
+  });
+  assert.deepEqual(reviewInputDecision("/handoff", "handoff"), {
+    action: "allow",
+  });
+  const blocked = reviewInputDecision("/plan", "handoff");
+  assert.equal(blocked.action, "block");
+  const notice = blocked.action === "block" ? blocked.notice : "";
+  assert.ok(notice.includes("/handoff fallback"));
 });
 
 test("reviewGatePhaseOnResume makes a gated pause auditing again", () => {

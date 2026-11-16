@@ -300,14 +300,18 @@ test("handoff: isHandoffMode and describeHandoffMode are total", () => {
 
 // ── /handoff argument completions ────────────────────────────────────
 
-test("handoff completions: mode position lists modes with trailing space", () => {
+test("handoff completions: mode position lists modes and fallback", () => {
   assert.deepEqual(
     handoffArgumentCompletions("")?.map((i) => i.value),
-    ["auto ", "native ", "plannotator "],
+    ["auto ", "native ", "plannotator ", "fallback"],
   );
   assert.deepEqual(
     handoffArgumentCompletions("nat")?.map((i) => i.value),
     ["native "],
+  );
+  assert.deepEqual(
+    handoffArgumentCompletions("fall")?.map((i) => i.value),
+    ["fallback"],
   );
   assert.equal(handoffArgumentCompletions("zzz"), null);
 });
@@ -325,6 +329,11 @@ test("handoff completions: scope position returns full-argument values", () => {
     handoffArgumentCompletions("native project"),
     null,
     "exact-match suppression",
+  );
+  assert.equal(
+    handoffArgumentCompletions("fallback "),
+    null,
+    "fallback takes no scope",
   );
   assert.equal(
     handoffArgumentCompletions("native project "),

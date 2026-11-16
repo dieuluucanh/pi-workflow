@@ -43,6 +43,7 @@ export const HANDOFF_PLAN_MAX_CHARS = 40_000;
 /** Why the native handoff is being shown. Persisted with the entry. */
 export type HandoffReason =
   | "reviewed"
+  | "handoff"
   | "aborted"
   | "unavailable"
   | "closed"
@@ -87,6 +88,8 @@ export function handoffReasonLabel(reason: HandoffReason): string {
       return "browser review closed without a decision";
     case "build-failed":
       return "Build was not entered — the plan stays in Plan mode";
+    case "handoff":
+      return "plan ready — approve to build, or give feedback";
     case "reviewed":
     default:
       return "review finished";
