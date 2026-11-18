@@ -363,6 +363,7 @@ import {
   reviewStatusText,
   reviewTurnForHandoff,
   REVIEW_PAUSED_LINE,
+  REVIEW_RUNNING_LINE,
   shouldRouteInputToReviewer,
   writeReviewModeConfig,
   writeReviewPrompt,
@@ -1364,6 +1365,11 @@ export default function workflowExtension(
     if (view.settled && todoStale) todoStale = false;
     if (view.state === todoPanelAppliedState) return;
     todoPanelAppliedState = view.state;
+    // The review widget must stay below the todo widget (Pi renders
+    // `aboveEditor` widgets in Map insertion order). Re-registering the todo
+    // widget moves it after the review widget, so force the next review
+    // status refresh to re-add its widget after this one.
+    reviewWidgetApplied = null;
     try {
       if (view.state === "hidden") {
         ctx.ui.setWidget("workflow-todos", undefined);
@@ -1494,6 +1500,7 @@ export default function workflowExtension(
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
       todoPanelAppliedState = "hidden";
+      reviewWidgetApplied = null;
     }
     // One status owner: every footer refresh (mode switch, model change, round
     // phase, pause) also re-evaluates the review widget. This is what clears a
@@ -2268,11 +2275,13 @@ export default function workflowExtension(
       // but the footer segment must disappear as soon as the round ends. A
       // retained terminal phase is not painted during a new round's cold boot,
       // and a pause from an old cycle is ignored by `currentPausedReview`.
-      const reviewText = reviewStatusText({
+      const turnText = reviewStatusText({
         state: reviewState,
         roundInFlight: activeReview !== undefined,
         roundActive,
         paused,
+        handoff: reviewTurn === "handoff",
+        transition: reviewTurn === "transition",
       });
       let lockText = "";
       try {
@@ -2292,9 +2301,10 @@ export default function workflowExtension(
               } · /handoff fallback`
             : "handoff pending — native questionnaire"
           : "";
-      const text = [reviewText, handoffText, lockText]
-        .filter(Boolean)
-        .join(" · ");
+      // One line owns the status and the terminal widget. The plain-handoff
+      // note is status-only: it is empty while a review owns the turn.
+      const lineText = [turnText, lockText].filter(Boolean).join(" · ");
+      const text = [lineText, handoffText].filter(Boolean).join(" · ");
       setWorkflowStatus(
         ctx.ui,
         WORKFLOW_STATUS_KEYS.review,
@@ -2305,14 +2315,8 @@ export default function workflowExtension(
       // Pi Desktop already renders the idle working message as its working row,
       // so it must not get a second line. `isIdle()` also keeps the automatic
       // review (`agent_end` is still inside the run) on its existing spinner.
-      const liveText = reviewLiveLine({
-        state: reviewState,
-        roundInFlight: activeReview !== undefined,
-        roundActive,
-        paused,
-      });
       const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
-      const widgetText = reviewWidgetHost() && idle ? liveText : "";
+      const widgetText = reviewWidgetHost() && idle ? lineText : "";
       if (widgetText !== reviewWidgetApplied) {
         reviewWidgetApplied = widgetText;
         setWorkflowWidget(
@@ -2801,8 +2805,9 @@ export default function workflowExtension(
     // Working signal: the footer segment (via updateStatus) follows the round;
     // the Desktop working row and the Terminal `workflow-review-status` widget
     // both derive from it (see updateReviewStatus). The spinner row needs an
-    // explicit message while the child session streams off the main turn.
-    setReviewWorkingMessage("🔍 Reviewing plan…");
+    // explicit message while the child session streams off the main turn; the
+    // shared running line means an automatic terminal round gets the hints too.
+    setReviewWorkingMessage(REVIEW_RUNNING_LINE);
     setReviewTurn("running");
     // Paint the live review line now, not after the child session's first
     // state event: a manual `/review` must look alive from the first tick.

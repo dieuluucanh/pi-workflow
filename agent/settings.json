@@ -21,7 +21,7 @@
     "opencode-go/mimo-v2.6-flash",
     "command-code/deepseek/deepseek-v4.1-flash"
   ],
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "max",
   "defaultProvider": "command-code",
   "defaultModel": "deepseek/deepseek-v4.1-flash",
   "terminal": {
@@ -60,11 +60,11 @@
     "modelDefault": {
       "provider": "command-code",
       "id": "deepseek/deepseek-v4.1-flash",
-      "thinking": "high"
+      "thinking": "max"
     },
     "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
     "commitPolicy": {
-      "mode": "ask",
+      "mode": "never",
       "allowedPaths": []
     },
     "folderPolicy": {

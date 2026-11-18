@@ -513,6 +513,7 @@ export interface FakeCtxOptions {
 export function makeFakeCtx(over: FakeCtxOptions) {
   const notifies: Array<{ message: string; level?: string }> = [];
   const statuses: unknown[] = [];
+  const statusCalls: Array<{ key: string; value: unknown }> = [];
   const widgets: unknown[] = [];
   const widgetCalls: Array<{
     key: string;
@@ -568,8 +569,9 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       notify(message: string, level?: string) {
         notifies.push({ message, level });
       },
-      setStatus(_key: string, value: unknown) {
+      setStatus(key: string, value: unknown) {
         statuses.push(value);
+        statusCalls.push({ key, value });
       },
       setWidget(key: string, value: unknown, options?: unknown) {
         widgets.push(value);
@@ -595,6 +597,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     ctx,
     notifies,
     statuses,
+    statusCalls,
     widgets,
     widgetCalls,
     workingMessages,
@@ -627,6 +630,15 @@ export function renderReviewWidget(
     .find((entry) => entry.key === "workflow-review-status");
   if (!call || call.value === undefined) return [];
   return Array.isArray(call.value) ? (call.value as string[]) : [];
+}
+
+/** Latest `ctx.ui.setStatus` value for one key (undefined when never set). */
+export function latestStatus(
+  statusCalls: Array<{ key: string; value: unknown }>,
+  key: string,
+): unknown {
+  const call = [...statusCalls].reverse().find((entry) => entry.key === key);
+  return call?.value;
 }
 
 /**

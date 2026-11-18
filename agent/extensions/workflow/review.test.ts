@@ -64,6 +64,7 @@ import {
   reviewGatePhaseOnResume,
   reviewHandoffParks,
   reviewIsActive,
+  reviewLine,
   reviewLiveLine,
   reviewModeLockFooter,
   reviewModeLockKind,
@@ -98,7 +99,11 @@ import {
   type ReviewExecutionResult,
   type ReviewStatusInput,
   REVIEW_BUILTIN_TOOLS,
+  REVIEW_HANDOFF_LINE,
   REVIEW_PAUSED_LINE,
+  REVIEW_RUNNING_HINT,
+  REVIEW_RUNNING_LINE,
+  REVIEW_TRANSITION_LINE,
   reviewToolAllowlist,
   MAX_REVIEW_LINES,
 } from "./review.ts";
@@ -2615,26 +2620,26 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
     true,
   );
   // Cold boot: roundActive flips before the first live phase event, so a
-  // retained terminal state from the previous round must not be painted.
+  // retained terminal state from the previous round is visible as the generic
+  // turn-derived line, never as its stale verdict.
   assert.equal(
     reviewStatusVisible({ roundActive: true, phase: "aborted" }),
-    false,
+    true,
   );
-  assert.equal(reviewStatusVisible({ roundActive: true, phase: "done" }), false);
+  assert.equal(reviewStatusVisible({ roundActive: true, phase: "done" }), true);
   assert.equal(
     reviewStatusVisible({ roundInFlight: true, phase: "failed" }),
-    false,
+    true,
   );
+  assert.equal(reviewStatusVisible({ handoff: true }), true);
+  assert.equal(reviewStatusVisible({ transition: true }), true);
 
   // Regression: a retained terminal state must render the PAUSED text while
   // paused, never "… aborted", and the widget is hidden when not visible.
   const aborted = createReviewState({ planHash: "h", modelLabel: "m" });
   aborted.phase = "aborted";
   assert.ok(reviewFooterSegment(aborted, false).includes("aborted"));
-  assert.equal(
-    reviewFooterSegment(aborted, true),
-    "🔍 review paused — /review-resume to continue",
-  );
+  assert.equal(reviewFooterSegment(aborted, true), REVIEW_PAUSED_LINE);
   assert.ok(!reviewFooterSegment(aborted, true).includes("aborted"));
 
   // reviewStatusText is the single composer used by the footer/widget.
@@ -2645,8 +2650,8 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
       roundInFlight: false,
       paused: false,
     }),
-    "",
-    "a terminal state is not live during a new round's cold boot",
+    REVIEW_RUNNING_LINE,
+    "a retained terminal phase paints the generic cold-boot line",
   );
   assert.equal(
     reviewStatusText({
@@ -2655,12 +2660,24 @@ test("reviewStatusVisible: only a live round or a pause shows the review line", 
       roundInFlight: false,
       paused: true,
     }),
-    "🔍 review paused — /review-resume to continue",
+    REVIEW_PAUSED_LINE,
   );
   assert.equal(
     reviewStatusText({ state: undefined, roundInFlight: true }),
-    "🔍 review · starting",
-    "the cold-boot window is visible as starting",
+    REVIEW_RUNNING_LINE,
+    "the cold-boot window is visible with the running hints",
+  );
+  assert.equal(
+    reviewStatusText({ state: undefined, roundInFlight: false, handoff: true }),
+    REVIEW_HANDOFF_LINE,
+  );
+  assert.equal(
+    reviewStatusText({
+      state: undefined,
+      roundInFlight: false,
+      transition: true,
+    }),
+    REVIEW_TRANSITION_LINE,
   );
 });
 
@@ -2672,8 +2689,8 @@ test("reviewLiveLine is the Terminal composer line for a live review", () => {
   // Cold boot: a round is registered but no state event has landed yet.
   assert.equal(
     reviewLiveLine({ state: undefined, roundInFlight: true }),
-    "🔍 Reviewing plan…",
-    "the round owns the line from the first tick",
+    REVIEW_RUNNING_LINE,
+    "the round owns the line from the first tick, with its hints",
   );
 
   // Live state appends the shared phase detail (same bits as the footer).
@@ -2693,21 +2710,37 @@ test("reviewLiveLine is the Terminal composer line for a live review", () => {
   ];
   assert.equal(
     reviewLiveLine({ state: live, roundActive: true }),
-    "🔍 Reviewing plan… · pass 2/2 · 1 finding · ● verifying",
+    `${REVIEW_RUNNING_LINE} · pass 2/2 · 1 finding · ● verifying`,
   );
+  assert.ok(reviewLiveLine({ state: live, roundActive: true }).includes(REVIEW_RUNNING_HINT));
 
   // A retained terminal phase from the previous round must not repaint its
-  // verdict during the cold boot; the turn-derived generic line is safe.
+  // verdict during the cold boot; the generic running line is safe.
   const aborted = createReviewState({ planHash: "h", modelLabel: "m" });
   aborted.phase = "aborted";
   assert.equal(
     reviewLiveLine({ state: aborted, roundInFlight: true }),
-    "🔍 Reviewing plan…",
+    REVIEW_RUNNING_LINE,
   );
   assert.equal(
     reviewLiveLine({ state: aborted, roundInFlight: true, paused: true }),
     REVIEW_PAUSED_LINE,
   );
+  assert.equal(
+    reviewLiveLine({ state: aborted, roundInFlight: false, handoff: true }),
+    REVIEW_HANDOFF_LINE,
+  );
+  assert.equal(
+    reviewLiveLine({ state: aborted, roundInFlight: false, transition: true }),
+    REVIEW_TRANSITION_LINE,
+  );
+
+  // reviewLine is the one formatter shared by the status and the widget.
+  assert.equal(
+    reviewLine({ state: live, roundActive: true }),
+    reviewLiveLine({ state: live, roundActive: true }),
+  );
+  assert.equal(reviewLine({ state: undefined, paused: true }), REVIEW_PAUSED_LINE);
 
   // Terminal state with no owning turn stays hidden.
   assert.equal(reviewLiveLine({ state: aborted }), "");
@@ -2775,22 +2808,33 @@ test("reviewFooterSegment composes the footer review state", () => {
   assert.equal(reviewFooterSegment(undefined, false), "");
   assert.equal(
     reviewFooterSegment(undefined, false, true),
-    "🔍 review · starting",
+    REVIEW_RUNNING_LINE,
     "a round in flight has a live line before its first state",
   );
   assert.equal(
     reviewFooterSegment(undefined, true),
-    "🔍 review paused — /review-resume to continue",
+    REVIEW_PAUSED_LINE,
+  );
+  assert.equal(
+    reviewFooterSegment(undefined, false, false, true),
+    REVIEW_HANDOFF_LINE,
+  );
+  assert.equal(
+    reviewFooterSegment(undefined, false, false, false, true),
+    REVIEW_TRANSITION_LINE,
   );
   const s = createReviewState({
     planHash: "abc",
     modelLabel: "p/m",
     round: 1,
   });
-  assert.equal(reviewFooterSegment(s, false), reviewStateSummary(s));
+  assert.equal(
+    reviewFooterSegment(s, false),
+    `${REVIEW_RUNNING_LINE} · ${reviewStateSummary(s).slice("🔍 review · ".length)}`,
+  );
   assert.equal(
     reviewFooterSegment(s, true),
-    "🔍 review paused — /review-resume to continue",
+    REVIEW_PAUSED_LINE,
     "the paused form wins over the live phase",
   );
 });

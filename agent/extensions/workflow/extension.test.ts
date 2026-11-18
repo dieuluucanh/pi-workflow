@@ -18,7 +18,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
-import { planHash } from "./review.ts";
+import {
+  REVIEW_HANDOFF_LINE,
+  REVIEW_PAUSED_LINE,
+  REVIEW_RUNNING_HINT,
+  REVIEW_RUNNING_LINE,
+  planHash,
+} from "./review.ts";
 import { todoListKey } from "./todo-panel.ts";
 import type { TodoItem } from "./utils.ts";
 import {
@@ -27,6 +33,7 @@ import {
   fakeSdk,
   makeFakeCtx,
   makeFakePi,
+  latestStatus,
   renderReviewWidget,
   renderTodoWidget,
   stripAnsi,
@@ -178,6 +185,7 @@ async function boot(over: BootOptions = {}) {
     ctx,
     notifies,
     statuses,
+    statusCalls,
     widgets,
     widgetCalls,
     workingMessages,
@@ -228,6 +236,7 @@ async function boot(over: BootOptions = {}) {
     ctx,
     notifies,
     statuses,
+    statusCalls,
     widgets,
     widgetCalls,
     workingMessages,
@@ -1678,6 +1687,16 @@ test("T1: a terminal manual /review paints the live composer widget while idle",
       lines.some((line) => line.includes("🔍 Reviewing plan…")),
       "the composer line is live while an idle round runs",
     );
+    assert.ok(
+      lines.some((line) => line.includes(REVIEW_RUNNING_HINT)),
+      "the terminal widget carries the pause/abort hints",
+    );
+    const reviewStatus = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      typeof reviewStatus === "string" &&
+        reviewStatus.includes(REVIEW_RUNNING_HINT),
+      "workflow-review carries the same live line as the widget",
+    );
     const call = [...b.widgetCalls]
       .reverse()
       .find((entry) => entry.key === "workflow-review-status");
@@ -1689,10 +1708,11 @@ test("T1: a terminal manual /review paints the live composer widget while idle",
 
     releases.shift()?.();
     await running;
-    assert.deepEqual(
-      renderReviewWidget(b.widgetCalls),
-      [],
-      "the line disappears when the round lands",
+    assert.ok(
+      renderReviewWidget(b.widgetCalls).some((line) =>
+        line.includes(REVIEW_HANDOFF_LINE),
+      ),
+      "the finished round moves to the handoff line",
     );
   } finally {
     releaseAll(releases);
@@ -1700,7 +1720,7 @@ test("T1: a terminal manual /review paints the live composer widget while idle",
   }
 });
 
-test("T2: a Desktop-shaped host gets no widget but keeps the working message", async () => {
+test("T2: a Desktop-shaped host gets the status line but no widget", async () => {
   const releases: Array<() => void> = [];
   const b = await boot({
     enabled: false,
@@ -1724,10 +1744,16 @@ test("T2: a Desktop-shaped host gets no widget but keeps the working message", a
       "Desktop already renders the idle working message as its working row",
     );
     assert.ok(
-      b.workingMessages.includes("🔍 Reviewing plan…"),
-      "the working row input is intact",
+      b.workingMessages.includes(REVIEW_RUNNING_LINE),
+      "the working row input carries the hints",
     );
     assert.ok(b.workingVisible.includes(true), "the working row was shown");
+    const reviewStatus = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      typeof reviewStatus === "string" &&
+        reviewStatus.includes(REVIEW_RUNNING_HINT),
+      "the Desktop host still receives the native status line",
+    );
 
     releases.shift()?.();
     await running;
@@ -1768,7 +1794,7 @@ test("T3: a terminal automatic review adds no second live line", async () => {
       [],
       "the run's working row already shows the message",
     );
-    assert.ok(b.workingMessages.includes("🔍 Reviewing plan…"));
+    assert.ok(b.workingMessages.includes(REVIEW_RUNNING_LINE));
 
     releases.shift()?.();
     await handoff;
@@ -1804,9 +1830,15 @@ test("T4: pause/resume moves the terminal widget between forms", async () => {
     );
     assert.ok(
       renderReviewWidget(b.widgetCalls).some((line) =>
-        line.includes("⏸ Review paused"),
+        line.includes(REVIEW_PAUSED_LINE),
       ),
-      "the paused form is painted",
+      "the paused form is painted with both hints",
+    );
+    const pausedStatus = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      typeof pausedStatus === "string" &&
+        pausedStatus.includes(REVIEW_PAUSED_LINE),
+      "workflow-review carries the full paused line",
     );
     await running;
 
@@ -1814,7 +1846,7 @@ test("T4: pause/resume moves the terminal widget between forms", async () => {
     await waitForPrompts(b.capture, 2);
     assert.ok(
       renderReviewWidget(b.widgetCalls).some((line) =>
-        line.includes("🔍 Reviewing plan…"),
+        line.includes(REVIEW_RUNNING_HINT),
       ),
       "the running form returns after /review-resume",
     );
@@ -1822,8 +1854,8 @@ test("T4: pause/resume moves the terminal widget between forms", async () => {
     await resumed;
     assert.deepEqual(
       renderReviewWidget(b.widgetCalls),
-      [],
-      "the line is cleared once the resumed round lands",
+      [`${REVIEW_HANDOFF_LINE} · 🔒 modes locked`],
+      "the finished round moves the widget to the handoff line",
     );
   } finally {
     releaseAll(releases);
@@ -1831,7 +1863,7 @@ test("T4: pause/resume moves the terminal widget between forms", async () => {
   }
 });
 
-test("T5: /review-abort clears the terminal widget", async () => {
+test("T5: /review-abort moves the terminal widget to the handoff line", async () => {
   const releases: Array<() => void> = [];
   const b = await boot({
     enabled: false,
@@ -1853,10 +1885,17 @@ test("T5: /review-abort clears the terminal widget", async () => {
     await b.pi.commands["review-abort"].handler("", b.ctx);
     releases.shift()?.();
     await running;
-    assert.deepEqual(
-      renderReviewWidget(b.widgetCalls),
-      [],
-      "the abort leaves no live review line",
+    assert.ok(
+      renderReviewWidget(b.widgetCalls).some((line) =>
+        line.includes(REVIEW_HANDOFF_LINE),
+      ),
+      "the abort hands off with the skip hint, not a stale running line",
+    );
+    const reviewStatus = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      typeof reviewStatus === "string" &&
+        reviewStatus.includes(REVIEW_HANDOFF_LINE),
+      "the review status names the handoff",
     );
   } finally {
     releaseAll(releases);
@@ -2851,6 +2890,12 @@ test("HD15: /review-mode off downgrades a finished review handoff", async () => 
           value.includes("🔍 review — awaiting decision"),
       ),
       "the review-owned handoff starts as Review",
+    );
+    const handoffStatus = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      typeof handoffStatus === "string" &&
+        handoffStatus.includes(REVIEW_HANDOFF_LINE),
+      "workflow-review names the handoff and the abort hint",
     );
 
     await b.pi.commands["review-mode"].handler("off", b.ctx);

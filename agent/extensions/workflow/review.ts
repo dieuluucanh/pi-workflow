@@ -1656,10 +1656,30 @@ export function reviewEscapeAction(input: {
   return "pass";
 }
 
+/** Hints shown on the live running line in both hosts. */
+export const REVIEW_RUNNING_HINT =
+  "ESC or /review-pause to pause · /review-abort to stop";
+
+/** Cold-boot and running prefix; the state detail is appended when it lands. */
+export const REVIEW_RUNNING_LINE = `🔍 Reviewing plan… · ${REVIEW_RUNNING_HINT}`;
+
 /**
- * Footer segment for a live review phase, composed into the single
- * `"workflow"` status by `updateStatus`. Empty when no review is live, so
- * callers can append unconditionally.
+ * The paused line shared by the host working message, the footer status and
+ * the Terminal widget. One owner so the surfaces cannot drift.
+ */
+export const REVIEW_PAUSED_LINE =
+  "⏸ Review paused — /review-resume to continue, /review-abort to stop";
+
+/** The reviewer finished; the plan waits for Approve/Revise. */
+export const REVIEW_HANDOFF_LINE =
+  "🔍 review · awaiting decision — /review-abort to skip";
+
+/** A decision is being applied; the turn is briefly not actionable. */
+export const REVIEW_TRANSITION_LINE = "🔍 review · applying the decision…";
+
+/**
+ * Footer segment for a live review phase. Kept as the direct form used by
+ * tests and older callers; `reviewLine` is the host-facing composer.
  */
 export function reviewFooterSegment(
   state: ReviewState | undefined,
@@ -1668,22 +1688,28 @@ export function reviewFooterSegment(
   starting = false,
   /** The reviewer finished; the plan is waiting for Approve/Revise. */
   handoff = false,
+  /** The decision is being applied (a retained state is not a verdict). */
+  transition = false,
 ): string {
-  if (paused) return "🔍 review paused — /review-resume to continue";
-  if (handoff) return "🔍 review · awaiting decision";
-  if (!state) return starting ? "🔍 review · starting" : "";
-  return reviewStateSummary(state);
+  if (paused) return REVIEW_PAUSED_LINE;
+  if (handoff) return REVIEW_HANDOFF_LINE;
+  if (transition) return REVIEW_TRANSITION_LINE;
+  if (!state) return starting ? REVIEW_RUNNING_LINE : "";
+  // A retained terminal phase belongs to the previous round: during a new
+  // round's cold boot paint the generic line, never the stale verdict.
+  if (starting && !reviewIsActive(state.phase)) return REVIEW_RUNNING_LINE;
+  return `${REVIEW_RUNNING_LINE} · ${reviewStateDetails(state)}`;
 }
 
 /**
- * Whether the review status surfaces (footer segment and status widget) should
- * be visible at all.
+ * Whether a review line should be visible at all.
  *
  * A review owns the turn only while a round is in flight (including the
- * cold-start `activeReview` window before `isRoundActive()` flips) or a pause
- * exists. `reviewState` alone is deliberately NOT enough: it is retained after
- * a round for `/review-status` and the REVIEW SUMMARY band, and using it to
- * drive the widget left a stale "🔍 review … aborted" line in Plan/Build mode.
+ * cold-start `activeReview` window before `isRoundActive()` flips) or a pause,
+ * handoff or decision transition exists. `reviewState` alone is deliberately
+ * NOT enough: it is retained after a round for `/review-status` and the REVIEW
+ * SUMMARY band. A retained terminal phase during a live round is still visible,
+ * but renders the generic turn-derived line, never its stale verdict.
  */
 export function reviewStatusVisible(input: {
   roundInFlight?: boolean;
@@ -1691,29 +1717,54 @@ export function reviewStatusVisible(input: {
   paused?: boolean;
   /** The reviewer finished and the browser/inline handoff owns the turn. */
   handoff?: boolean;
-  /**
-   * The retained round state's phase, when one exists. A retained *terminal*
-   * phase must not make the line visible during a new round's cold boot
-   * (`roundActive` flips before the first live phase event).
-   */
+  /** The decision is being applied. */
+  transition?: boolean;
+  /** Retained phase, accepted for compatibility; see the comment above. */
   phase?: ReviewPhase;
 }): boolean {
   if (input.paused === true) return true;
   if (input.handoff === true) return true;
-  if (input.roundInFlight !== true && input.roundActive !== true) return false;
-  // `undefined` means the round has not emitted a state yet; there is nothing
-  // stale to paint and the lock/working message still describe the round.
-  return input.phase === undefined || reviewIsActive(input.phase);
+  if (input.transition === true) return true;
+  return input.roundInFlight === true || input.roundActive === true;
+}
+
+/**
+ * The one live Review line shared by the `workflow-review` status, the
+ * Terminal composer widget and the host working message.
+ *
+ * Empty when no review owns the turn. Paused/handoff/transition win over a
+ * retained state; a live round with no usable phase (cold boot, or a retained
+ * terminal phase) paints the generic running line.
+ */
+export function reviewLine(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  handoff?: boolean;
+  transition?: boolean;
+}): string {
+  const visible = reviewStatusVisible({
+    roundInFlight: input.roundInFlight,
+    roundActive: input.roundActive,
+    paused: input.paused,
+    handoff: input.handoff,
+    transition: input.transition,
+    phase: input.state?.phase,
+  });
+  if (!visible) return "";
+  return reviewFooterSegment(
+    input.state,
+    input.paused === true,
+    input.roundInFlight === true || input.roundActive === true,
+    input.handoff === true,
+    input.transition === true,
+  );
 }
 
 /**
  * The text for the live footer status segment, or `""` when nothing is live.
- *
- * A retained `reviewState` is used for `/review-status` and the summary band,
- * but it is never painted as a live line once its round is over. While paused
- * it shows the paused form (never the retained terminal summary). The Terminal
- * composer widget uses `reviewLiveLine` instead, because it must also cover the
- * cold-boot window with a turn-derived line.
+ * Kept as the status-facing name; it is the same formatter as `reviewLine`.
  */
 export function reviewStatusText(input: {
   state: ReviewState | undefined;
@@ -1721,57 +1772,28 @@ export function reviewStatusText(input: {
   roundActive?: boolean;
   paused?: boolean;
   handoff?: boolean;
+  transition?: boolean;
 }): string {
-  const visible = reviewStatusVisible({
-    roundInFlight: input.roundInFlight,
-    roundActive: input.roundActive,
-    paused: input.paused,
-    handoff: input.handoff,
-    phase: input.state?.phase,
-  });
-  return visible
-    ? reviewFooterSegment(
-        input.state,
-        input.paused === true,
-        input.roundInFlight === true,
-        input.handoff === true,
-      )
-    : "";
+  return reviewLine(input);
 }
-
-/**
- * The paused line shared by the host working message and the Terminal widget.
- * One owner so the two surfaces cannot drift.
- */
-export const REVIEW_PAUSED_LINE =
-  "⏸ Review paused — /review-resume to continue, /review-abort to stop";
 
 /**
  * Text for the composer-area review widget in **terminal Pi**.
  *
- * Pi Desktop renders `ctx.ui.setWorkingMessage` even while the tab is idle
- * (`SessionView.tsx` `extensionBusy`), so a manual `/review` already has a live
- * working row there. Pi Terminal only renders the working row during a run, so
- * a manual round needs this widget instead. The caller gates it on
- * `isTerminalPiHost()` and `ctx.isIdle()`; this function only decides the text
- * from the turn state.
- *
- * A retained terminal phase belongs to the previous round: during this round's
- * cold boot paint the turn-derived generic line, never the stale verdict.
+ * Pi Terminal only renders the working row during a run, so a manual round
+ * needs this widget instead. The caller gates it on `isTerminalPiHost()` and
+ * `ctx.isIdle()`; this function only decides the text from the turn state.
+ * It is the same line as the `workflow-review` status so both hosts agree.
  */
 export function reviewLiveLine(input: {
   state: ReviewState | undefined;
   roundInFlight?: boolean;
   roundActive?: boolean;
   paused?: boolean;
+  handoff?: boolean;
+  transition?: boolean;
 }): string {
-  if (input.paused === true) return REVIEW_PAUSED_LINE;
-  if (input.roundInFlight !== true && input.roundActive !== true) return "";
-  const phase = input.state?.phase;
-  if (!input.state || phase === undefined || !reviewIsActive(phase)) {
-    return "🔍 Reviewing plan…";
-  }
-  return `🔍 Reviewing plan… · ${reviewStateDetails(input.state)}`;
+  return reviewLine(input);
 }
 
 /**

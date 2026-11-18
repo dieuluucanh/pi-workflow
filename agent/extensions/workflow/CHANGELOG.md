@@ -4,6 +4,24 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — the live Review line is shared and hint-complete
+
+- One formatter (`reviewLine`) now feeds the `workflow-review` status, the
+  terminal `workflow-review-status` widget and the host working message. The
+  running form carries `ESC or /review-pause to pause · /review-abort to stop`;
+  the paused form carries both `/review-resume` and `/review-abort`; the handoff
+  form adds `/review-abort to skip`; a transition form covers the decision
+  window. Hints come before the phase detail so a narrow terminal keeps them.
+- **Pi Desktop** consumes the same `workflow-review` status for its single
+  review row (below the todo panel, above the composer). Pi Terminal keeps the
+  widget below the todo widget; a todo-panel re-registration now forces the
+  review widget to be re-added after it, so the order stays stable.
+- An automatic manual round's working row also carries the hints, so a terminal
+  automatic review no longer has a hint-less spinner line.
+- Compatibility: an older Pi Desktop still sees the mode status and degrades to
+  its existing row; the matching Pi Desktop release reads `workflow-review` and
+  falls back to its own canonical line when the status is absent.
+
 ### Fixed — a plain plan handoff is no longer Review Mode
 
 With Review Mode off, finishing Plan painted `🔍 review — awaiting decision`,
