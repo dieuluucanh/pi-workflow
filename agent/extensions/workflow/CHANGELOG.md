@@ -4,6 +4,20 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — sticky todo panel display and Pi Desktop controls
+
+- The panel choice is now scoped to the plan lineage, not the list identity:
+  Build `add`/`update` and a same-path Review rewrite keep the expanded,
+  collapsed or hidden choice. A different plan, `/todos clear`, reload and
+  rewind keep their existing reset rules.
+- A visible row/status change re-registers the widget so Pi Desktop repaints
+  immediately (the host only repaints on `setWidget`).
+- New `workflow-todos` status: `☐ Todos 3/12 · hidden` (plus stale/cancelled
+  markers) while the panel is hidden or Review owns the turn.
+- Pi Desktop: the native Todo bar and menu expose the four verbs, the desktop
+  toggle is `Ctrl+Alt+L` (Sessions keeps `Ctrl+Alt+O`), and `Ctrl+Alt+O` is
+  registered only on terminal hosts.
+
 ### Changed — the live Review line is shared and hint-complete
 
 - One formatter (`reviewLine`) now feeds the `workflow-review` status, the

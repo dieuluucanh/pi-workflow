@@ -144,6 +144,7 @@ test("the status keys are stable", () => {
     profile: "workflow-profile",
     policy: "workflow-policy",
     review: "workflow-review",
+    todos: "workflow-todos",
   });
 });
 

@@ -3381,7 +3381,7 @@ test("Z6: ctrl+alt+o toggles the panel", async () => {
   }
 });
 
-test("Z7: a status-only mutation repaints without re-registering the widget", async () => {
+test("Z7: a status mutation re-registers the widget so the live rows repaint", async () => {
   const list = seededTodos([
     { text: "One", status: "in_progress" },
     { text: "Two" },
@@ -3397,7 +3397,7 @@ test("Z7: a status-only mutation repaints without re-registering the widget", as
       b.ctx,
     );
     const after = b.widgetCalls.filter((c) => c.key === "workflow-todos").length;
-    assert.equal(after, before, "same expanded state must not be re-registered");
+    assert.equal(after, before + 1, "a visible row change re-registers the widget");
     const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
     assert.deepEqual(
       rows,
@@ -3409,7 +3409,7 @@ test("Z7: a status-only mutation repaints without re-registering the widget", as
   }
 });
 
-test("Z8: workflow_todo add persists and re-expands a hidden panel", async () => {
+test("Z8: workflow_todo add keeps a hidden panel hidden in the same plan", async () => {
   const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
   try {
     await b.pi.commands.todos.handler("hide", b.ctx);
@@ -3426,8 +3426,8 @@ test("Z8: workflow_todo add persists and re-expands a hidden panel", async () =>
     const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
     assert.deepEqual(
       rows,
-      ["▶ 3. Three"],
-      "the new step is a full expanded row, not the collapsed summary",
+      [],
+      "the sticky hidden choice survives an agent-added step",
     );
 
     const persisted = [...b.pi.entries]
@@ -3509,6 +3509,44 @@ test("Z11: a settled list drops the stale marker from the footer", async () => {
       !buildStatuses.at(-1)!.includes("⚠"),
       `settled footer must be stale-free: ${buildStatuses.at(-1)}`,
     );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z12: a hidden panel publishes a compact status and clears it when shown", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    await b.pi.commands.todos.handler("hide", b.ctx);
+    assert.match(
+      stripAnsi(String(latestStatus(b.statusCalls, "workflow-todos"))),
+      /☑ Todos 2\/2 · hidden/,
+    );
+
+    await b.pi.commands.todos.handler("expand", b.ctx);
+    assert.equal(latestStatus(b.statusCalls, "workflow-todos"), undefined);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("Z13: a collapsed panel stays collapsed when a step is added", async () => {
+  const b = await boot({ branch: workflowBranch(SETTLED_TODOS), hasUI: true });
+  try {
+    await b.pi.commands.todos.handler("collapse", b.ctx);
+    assert.equal(renderTodoWidget(b.widgetCalls).length, 1);
+
+    await b.pi.tools["workflow_todo"].execute(
+      "todo-3",
+      { action: "add", text: "Three" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+
+    const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
+    assert.equal(rows.length, 1, "the sticky collapsed choice survives the add");
+    assert.match(rows[0] ?? "", /Todos/);
   } finally {
     await b.cleanup();
   }

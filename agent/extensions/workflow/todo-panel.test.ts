@@ -17,7 +17,9 @@ import {
   renderTodoSummary,
   todoCompletionSignature,
   todoListKey,
+  todoPanelContentKey,
   todoPanelSummary,
+  todoStatusText,
   type TodoPanelTheme,
   type TodoPanelView,
 } from "./todo-panel.ts";
@@ -60,6 +62,7 @@ function view(over: Partial<TodoPanelView> = {}): TodoPanelView {
     done: 1,
     total: 1,
     cancelled: 0,
+    stale: false,
     summary: "☑ Todos 1/1 · all done · /todos expand",
     ...over,
   };
@@ -392,6 +395,95 @@ test("buildTodoRows keeps the completed-list fallback anchored at the top", () =
   assert.deepEqual(rows, ["☑ S(1. One)", "☑ S(2. Two)"]);
 });
 
+test("deriveTodoPanel: a same-scope preference survives list edits", () => {
+  const list = items([{ text: "One" }, { text: "Two" }]);
+  const renamed = items([{ text: "One renamed" }, { text: "Two" }]);
+  assert.equal(
+    deriveTodoPanel({
+      items: renamed,
+      preference: "hidden",
+      preferenceScope: "/plan/a.md",
+      scopeKey: "/plan/a.md",
+    }).state,
+    "hidden",
+  );
+  assert.equal(
+    deriveTodoPanel({
+      items: renamed,
+      preference: "collapsed",
+      preferenceScope: "/plan/a.md",
+      scopeKey: "/plan/a.md",
+    }).state,
+    "collapsed",
+  );
+  assert.notEqual(todoListKey(list), todoListKey(renamed));
+});
+
+test("deriveTodoPanel: a different scope returns to automatic", () => {
+  const list = items([{ text: "A" }, { text: "B" }]);
+  assert.equal(
+    deriveTodoPanel({
+      items: list,
+      preference: "hidden",
+      preferenceScope: "/plan/old.md",
+      scopeKey: "/plan/new.md",
+    }).state,
+    "expanded",
+  );
+  assert.equal(
+    deriveTodoPanel({ items: list, preference: "auto", scopeKey: "session" }).state,
+    "expanded",
+  );
+});
+
+test("todoPanelContentKey changes with rows, state, mode and stale", () => {
+  const base = items([{ text: "One" }]);
+  const key = todoPanelContentKey({ items: base, state: "expanded", mode: "build" });
+  assert.equal(
+    todoPanelContentKey({ items: base, state: "expanded", mode: "build" }),
+    key,
+  );
+  assert.notEqual(
+    todoPanelContentKey({ items: items([{ text: "Two" }]), state: "expanded", mode: "build" }),
+    key,
+  );
+  assert.notEqual(
+    todoPanelContentKey({ items: base, state: "collapsed", mode: "build" }),
+    key,
+  );
+  assert.notEqual(
+    todoPanelContentKey({ items: base, state: "expanded", mode: "plan" }),
+    key,
+  );
+  assert.notEqual(
+    todoPanelContentKey({ items: base, state: "expanded", mode: "build", stale: true }),
+    key,
+  );
+});
+
+test("todoStatusText is compact and exact", () => {
+  assert.equal(
+    todoStatusText(
+      view({
+        state: "expanded",
+        settled: false,
+        done: 3,
+        total: 12,
+        summary: "☐ Todos 3/12 · next 4. Test · /todos expand",
+      }),
+    ),
+    "☐ Todos 3/12 · expanded",
+  );
+  assert.equal(
+    todoStatusText(view({ state: "hidden", settled: false, done: 3, total: 12, stale: true })),
+    "☐ Todos 3/12 ⚠ · hidden",
+  );
+  assert.equal(
+    todoStatusText(view({ state: "collapsed", settled: true, done: 1, total: 2, cancelled: 1 })),
+    "☑ Todos 1/2 · 1 cancelled · collapsed",
+  );
+});
+
 test("readPersistedTodoPanel: defaults, valid data and garbage", () => {
   assert.deepEqual(readPersistedTodoPanel(undefined), EMPTY_PERSISTED_TODO_PANEL);
   assert.deepEqual(readPersistedTodoPanel(null), EMPTY_PERSISTED_TODO_PANEL);
@@ -403,34 +495,46 @@ test("readPersistedTodoPanel: defaults, valid data and garbage", () => {
   assert.deepEqual(readPersistedTodoPanel({ todos: [] }), EMPTY_PERSISTED_TODO_PANEL);
 
   const stored = {
-    override: "hidden",
-    overrideKey: "abc123",
+    preference: "hidden",
+    preferenceScope: "/plan/a.md",
     promptAfterSettle: true,
     completedSignature: "deadbeef",
   };
-  assert.deepEqual(
-    readPersistedTodoPanel({ todoPanel: stored }),
-    stored,
-    "entry container form",
-  );
-  assert.deepEqual(readPersistedTodoPanel(stored), stored, "direct object form");
+  assert.deepEqual(readPersistedTodoPanel({ todoPanel: stored }), {
+    ...stored,
+    legacyOverride: null,
+    legacyOverrideKey: null,
+  });
+  assert.deepEqual(readPersistedTodoPanel(stored), {
+    ...stored,
+    legacyOverride: null,
+    legacyOverrideKey: null,
+  });
 
-  // Unknown override values fall back to automatic; the key is still restored.
+  // A legacy entry exposes its choice and key for the caller to migrate.
   assert.deepEqual(
     readPersistedTodoPanel({
       todoPanel: {
-        override: "wat",
+        override: "hidden",
         overrideKey: "abc",
         promptAfterSettle: "yes",
         completedSignature: 42,
       },
     }),
     {
-      override: null,
-      overrideKey: "abc",
+      preference: "auto",
+      preferenceScope: null,
       promptAfterSettle: false,
       completedSignature: null,
+      legacyOverride: "hidden",
+      legacyOverrideKey: "abc",
     },
+  );
+
+  // Unknown preference values fall back to automatic.
+  assert.equal(
+    readPersistedTodoPanel({ todoPanel: { preference: "wat" } }).preference,
+    "auto",
   );
 });
 
@@ -438,13 +542,13 @@ test("readPersistedTodoPanel restores a mismatched key verbatim for expiry", () 
   const restored = readPersistedTodoPanel({
     todoPanel: { override: "hidden", overrideKey: "old-list" },
   });
-  assert.equal(restored.overrideKey, "old-list");
+  assert.equal(restored.legacyOverrideKey, "old-list");
   const list = items([{ text: "A" }]);
   assert.equal(
     deriveTodoPanel({
       items: list,
-      override: restored.override,
-      overrideKey: restored.overrideKey,
+      override: restored.legacyOverride,
+      overrideKey: restored.legacyOverrideKey,
     }).state,
     "expanded",
   );

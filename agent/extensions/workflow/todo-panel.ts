@@ -18,6 +18,8 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isDone, itemStatus, todoKey, todoRef, type TodoItem } from "./utils.ts";
 
 export type TodoPanelState = "expanded" | "collapsed" | "hidden";
+export type TodoPanelPreference = "auto" | TodoPanelState;
+/** Legacy per-list choice, read from pre-0.13 entries and migrated by index.ts. */
 export type TodoPanelOverride = TodoPanelState | null;
 export type TodoPanelMode = "plan" | "build" | null;
 
@@ -32,9 +34,15 @@ export interface TodoPanelTheme {
 
 export interface TodoPanelInput {
   items: TodoItem[];
-  /** Explicit user choice; ignored when `overrideKey` no longer matches the list. */
+  /** Sticky user choice; `auto` follows the sequence. */
+  preference?: TodoPanelPreference;
+  /** The plan lineage the preference belongs to. */
+  preferenceScope?: string | null;
+  /** The current plan lineage (normalized plan path, or `"session"`). */
+  scopeKey?: string | null;
+  /** Legacy per-list override; honoured only when the key matches. */
   override?: TodoPanelOverride;
-  /** Identity of the list the override belongs to (see `todoListKey`). */
+  /** Legacy list identity for `override`. */
   overrideKey?: string | null;
   /** A fresh user prompt arrived after the list settled. */
   promptAfterSettle?: boolean;
@@ -49,23 +57,29 @@ export interface TodoPanelView {
   done: number;
   total: number;
   cancelled: number;
+  stale: boolean;
   next?: TodoItem;
   summary: string;
 }
 
 /** Shape persisted in the `workflow` custom entry. */
 export interface PersistedTodoPanel {
-  override: TodoPanelOverride;
-  overrideKey: string | null;
+  preference: TodoPanelPreference;
+  preferenceScope: string | null;
   promptAfterSettle: boolean;
   completedSignature: string | null;
+  /** Read-only fields from a pre-0.13 entry; a caller migrates or drops them. */
+  legacyOverride: TodoPanelState | null;
+  legacyOverrideKey: string | null;
 }
 
 export const EMPTY_PERSISTED_TODO_PANEL: PersistedTodoPanel = {
-  override: null,
-  overrideKey: null,
+  preference: "auto",
+  preferenceScope: null,
   promptAfterSettle: false,
   completedSignature: null,
+  legacyOverride: null,
+  legacyOverrideKey: null,
 };
 
 /** FNV-1a (32-bit) — short, stable, dependency-free. */
@@ -137,36 +151,39 @@ export function isTodoListSettled(items: TodoItem[]): boolean {
  *
  * Precedence:
  * 1. empty list → hidden;
- * 2. explicit hidden → hidden, for any list state;
- * 3. settled + explicit expanded/collapsed → that state (survives the prompt);
+ * 2. explicit hidden (same plan lineage, or a matching legacy key) → hidden;
+ * 3. explicit expanded/collapsed (same lineage) → that state, in any list
+ *    state and across a prompt;
  * 4. settled + a user prompt happened → hidden;
  * 5. settled → collapsed (the “all done” moment);
- * 6. open + explicit collapsed → collapsed;
- * 7. open → expanded.
+ * 6. open → expanded.
  */
 export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
   const items = input.items;
   const listKey = todoListKey(items);
-  const override =
-    input.overrideKey != null && input.overrideKey === listKey
-      ? (input.override ?? null)
-      : null;
+  const preferred =
+    input.preference !== undefined &&
+    input.preference !== "auto" &&
+    input.preferenceScope != null &&
+    input.preferenceScope === input.scopeKey
+      ? input.preference
+      : input.override != null &&
+          input.overrideKey != null &&
+          input.overrideKey === listKey
+        ? input.override
+        : null;
   const settled = isTodoListSettled(items);
   let state: TodoPanelState;
   if (items.length === 0) {
     state = "hidden";
-  } else if (override === "hidden") {
+  } else if (preferred === "hidden") {
     state = "hidden";
+  } else if (preferred === "expanded" || preferred === "collapsed") {
+    state = preferred;
   } else if (settled) {
-    if (override === "expanded" || override === "collapsed") {
-      state = override;
-    } else if (input.promptAfterSettle === true) {
-      state = "hidden";
-    } else {
-      state = "collapsed";
-    }
+    state = input.promptAfterSettle === true ? "hidden" : "collapsed";
   } else {
-    state = override === "collapsed" ? "collapsed" : "expanded";
+    state = "expanded";
   }
 
   return {
@@ -176,9 +193,39 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
     done: countDone(items),
     total: items.length,
     cancelled: countCancelled(items),
+    stale: input.stale === true,
     next: firstOpenItem(items),
     summary: todoPanelSummary(items, { stale: input.stale }),
   };
+}
+
+/**
+ * Stable key of everything the pinned widget renders, so a status/text change
+ * re-registers it (and the desktop repaints) while an unrelated mode/model
+ * refresh does not. Status churn alone must not force a rebuild elsewhere.
+ */
+export function todoPanelContentKey(input: {
+  items: TodoItem[];
+  state: TodoPanelState;
+  mode: TodoPanelMode;
+  stale?: boolean;
+}): string {
+  const rows = input.items
+    .map(
+      (it) =>
+        `${todoRef(it)}\u0001${todoKey(it)}\u0001${it.group ?? ""}\u0001${it.label ?? ""}\u0001${itemStatus(it)}`,
+    )
+    .join("\u0002");
+  return `${input.state}|${input.mode ?? ""}|${input.stale === true ? 1 : 0}|${shortHash(rows)}`;
+}
+
+/** Compact status line for the hidden/Review cases (theme-free). */
+export function todoStatusText(view: TodoPanelView): string {
+  if (view.total === 0) return "";
+  const mark = view.settled ? "☑" : "☐";
+  const cancelled = view.cancelled > 0 ? ` · ${view.cancelled} cancelled` : "";
+  const stale = view.stale ? " ⚠" : "";
+  return `${mark} Todos ${view.done}/${view.total}${stale}${cancelled} · ${view.state}`;
 }
 
 /**
@@ -302,9 +349,9 @@ export function buildTodoRows(
 
 /**
  * Defensive reader for the persisted `todoPanel` object. Accepts either the
- * `workflow` entry data or the panel object itself. Unknown/missing fields fall
- * back to automatic behaviour; a mismatched `overrideKey` is restored verbatim
- * so `deriveTodoPanel` can expire it naturally.
+ * `workflow` entry data or the panel object itself. New fields are authoritative;
+ * `override`/`overrideKey` are returned as legacy values so the caller can
+ * migrate only when they still match the restored list.
  */
 export function readPersistedTodoPanel(data: unknown): PersistedTodoPanel {
   const container =
@@ -316,19 +363,30 @@ export function readPersistedTodoPanel(data: unknown): PersistedTodoPanel {
       ? container.todoPanel
       : data;
   const obj = raw && typeof raw === "object" ? (raw as any) : {};
-  const override =
+  const preference =
+    obj.preference === "auto" ||
+    obj.preference === "expanded" ||
+    obj.preference === "collapsed" ||
+    obj.preference === "hidden"
+      ? obj.preference
+      : "auto";
+  const legacyOverride =
     obj.override === "expanded" ||
     obj.override === "collapsed" ||
     obj.override === "hidden"
       ? obj.override
       : null;
   return {
-    override,
-    overrideKey: typeof obj.overrideKey === "string" ? obj.overrideKey : null,
+    preference,
+    preferenceScope:
+      typeof obj.preferenceScope === "string" ? obj.preferenceScope : null,
     promptAfterSettle: obj.promptAfterSettle === true,
     completedSignature:
       typeof obj.completedSignature === "string"
         ? obj.completedSignature
         : null,
+    legacyOverride,
+    legacyOverrideKey:
+      typeof obj.overrideKey === "string" ? obj.overrideKey : null,
   };
 }

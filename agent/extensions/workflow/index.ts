@@ -250,7 +250,10 @@ import {
   renderTodoSummary,
   todoCompletionSignature,
   todoListKey,
-  type TodoPanelOverride,
+  todoPanelContentKey,
+  todoStatusText,
+  type PersistedTodoPanel,
+  type TodoPanelPreference,
   type TodoPanelState,
 } from "./todo-panel.ts";
 import {
@@ -745,13 +748,13 @@ export default function workflowExtension(
   // ── Todo panel presentation (pinned widget above the editor) ──
   // The widget can never scroll with the transcript, so it collapses to one
   // line when the plan settles and hides at the next user prompt. Overrides
-  // are scoped to `todoPanelOverrideKey` (ref/text/group identity), so status
+  // are scoped to `todoPanelPreferenceScope` (ref/text/group identity), so status
   // churn keeps the user's choice while a new/renamed list expires it.
-  let todoPanelOverride: TodoPanelOverride = null;
-  let todoPanelOverrideKey: string | null = null;
+  let todoPanelPreference: TodoPanelPreference = "auto";
+  let todoPanelPreferenceScope: string | null = null;
   let todoPanelPromptAfterSettle = false;
   let lastCompletedSignature: string | null = null;
-  let todoPanelAppliedState: TodoPanelState | "unregistered" = "unregistered";
+  let todoPanelAppliedKey: string = "unregistered";
   let footerInjectedThisTurn = false;
   let lastStaleNoticeAt: number | undefined;
   // Path+content hash of the last plan-file reconciliation (skip no-op merges).
@@ -1337,24 +1340,65 @@ export default function workflowExtension(
   }
 
   /**
+   * The plan lineage a display preference belongs to. A same-path Review
+   * rewrite keeps it; a different plan (or `/todos clear`) returns to auto.
+   */
+  function todoPanelScopeFor(
+    cwd: string,
+    planFile: string | null | undefined,
+  ): string {
+    const plan = planFile ?? todoPlanPath ?? currentPlanFile;
+    if (!plan) return "session";
+    try {
+      return path.isAbsolute(plan) ? path.resolve(plan) : path.resolve(cwd, plan);
+    } catch {
+      return plan;
+    }
+  }
+
+  function todoPanelScope(cwd: string): string {
+    return todoPanelScopeFor(cwd, undefined);
+  }
+
+  /** New fields are authoritative; a legacy override migrates only when its list key still matches. */
+  function applyRestoredTodoPanel(
+    panel: PersistedTodoPanel,
+    cwd: string,
+    planFile: string | null | undefined,
+  ): void {
+    if (panel.preference !== "auto" || panel.preferenceScope !== null) {
+      todoPanelPreference = panel.preference;
+      todoPanelPreferenceScope = panel.preferenceScope;
+      return;
+    }
+    if (
+      panel.legacyOverride !== null &&
+      panel.legacyOverrideKey !== null &&
+      panel.legacyOverrideKey === todoListKey(todoItems)
+    ) {
+      todoPanelPreference = panel.legacyOverride;
+      todoPanelPreferenceScope = todoPanelScopeFor(cwd, planFile);
+    }
+  }
+
+  /**
    * Reconcile the pinned todo widget with the derived presentation state.
-   * Called from `updateStatus` after the footer writes; only re-registers the
-   * component when the state changes (marking a step done repaints through
-   * the host, so the widget is not disposed/rebuilt on every refresh).
+   * Called from `updateStatus` after the footer writes. The content key, not
+   * just the state, decides whether to re-register: a status/text change must
+   * repaint (the desktop only repaints on `setWidget`), while a mode/model
+   * refresh with unchanged rows must not dispose/rebuild the component.
    */
   function refreshTodoPanel(ctx: ExtensionContext) {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const scope = todoPanelScope(cwd);
     const view = deriveTodoPanel({
       items: todoItems,
-      override: todoPanelOverride,
-      overrideKey: todoPanelOverrideKey,
+      preference: todoPanelPreference,
+      preferenceScope: todoPanelPreferenceScope,
+      scopeKey: scope,
       promptAfterSettle: todoPanelPromptAfterSettle,
       stale: todoStale,
     });
-    // A choice made for a different list must not hide a new task.
-    if (todoPanelOverrideKey !== view.listKey) {
-      todoPanelOverride = null;
-      todoPanelOverrideKey = null;
-    }
     if (!view.settled && todoPanelPromptAfterSettle) {
       todoPanelPromptAfterSettle = false;
     }
@@ -1363,8 +1407,14 @@ export default function workflowExtension(
       lastCompletedSignature = null;
     }
     if (view.settled && todoStale) todoStale = false;
-    if (view.state === todoPanelAppliedState) return;
-    todoPanelAppliedState = view.state;
+    const contentKey = todoPanelContentKey({
+      items: todoItems,
+      state: view.state,
+      mode: workflowMode,
+      stale: todoStale,
+    });
+    if (contentKey === todoPanelAppliedKey) return view;
+    todoPanelAppliedKey = contentKey;
     // The review widget must stay below the todo widget (Pi renders
     // `aboveEditor` widgets in Map insertion order). Re-registering the todo
     // widget moves it after the review widget, so force the next review
@@ -1373,7 +1423,7 @@ export default function workflowExtension(
     try {
       if (view.state === "hidden") {
         ctx.ui.setWidget("workflow-todos", undefined);
-        return;
+        return view;
       }
       ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
         const render = (w: number) => {
@@ -1381,8 +1431,9 @@ export default function workflowExtension(
           // mode, even though it was registered for an earlier state.
           const live = deriveTodoPanel({
             items: todoItems,
-            override: todoPanelOverride,
-            overrideKey: todoPanelOverrideKey,
+            preference: todoPanelPreference,
+            preferenceScope: todoPanelPreferenceScope,
+            scopeKey: scope,
             promptAfterSettle: todoPanelPromptAfterSettle,
             stale: todoStale,
           });
@@ -1396,19 +1447,23 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    return view;
   }
 
-  function setTodoPanelOverride(
+  function setTodoPanelPreference(
     ctx: ExtensionContext,
-    override: TodoPanelOverride,
+    preference: TodoPanelPreference,
     note?: string,
   ) {
-    if (!todoItems.length && override === "expanded") {
+    if (!todoItems.length && preference === "expanded") {
       ctx.ui.notify("No todos.", "info");
       return;
     }
-    todoPanelOverride = override;
-    todoPanelOverrideKey = override === null ? null : todoListKey(todoItems);
+    todoPanelPreference = preference;
+    todoPanelPreferenceScope =
+      preference === "auto"
+        ? null
+        : todoPanelScope((ctx as any)?.cwd ?? process.cwd());
     updateStatus(ctx);
     try {
       persistState();
@@ -1495,13 +1550,30 @@ export default function workflowExtension(
       WORKFLOW_STATUS_KEYS.policy,
       ctx.ui.theme.fg("dim", segments.policy),
     );
+    let todoPanelView: ReturnType<typeof refreshTodoPanel> | null = null;
     if (todoItems.length > 0) {
-      refreshTodoPanel(ctx);
+      todoPanelView = refreshTodoPanel(ctx);
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
-      todoPanelAppliedState = "hidden";
+      todoPanelAppliedKey = "hidden";
       reviewWidgetApplied = null;
     }
+    // The compact status is the desktop's only presence/progress signal while
+    // the panel is hidden or Review owns the turn. Outside those cases the
+    // `workflow` segment already carries `n/m`.
+    const showTodoStatus =
+      todoPanelView !== null &&
+      (todoPanelView.state === "hidden" || reviewTurn !== "idle");
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.todos,
+      showTodoStatus && todoPanelView
+        ? ctx.ui.theme.fg(
+            todoPanelView.settled ? "success" : "muted",
+            todoStatusText(todoPanelView),
+          )
+        : "",
+    );
     // One status owner: every footer refresh (mode switch, model change, round
     // phase, pause) also re-evaluates the review widget. This is what clears a
     // stale "🔍 review … aborted" line as soon as the review ends.
@@ -5415,8 +5487,8 @@ export default function workflowExtension(
       defaultModel,
       lastModeSwitch,
       todoPanel: {
-        override: todoPanelOverride,
-        overrideKey: todoPanelOverrideKey,
+        preference: todoPanelPreference,
+        preferenceScope: todoPanelPreferenceScope,
         promptAfterSettle: todoPanelPromptAfterSettle,
         completedSignature: lastCompletedSignature,
       },
@@ -7176,7 +7248,8 @@ export default function workflowExtension(
   // Todo panel toggle: expanded ↔ collapsed, and hidden → expanded.
   // Ctrl+Alt+T is the Linux default for opening a terminal, so this uses O.
   try {
-    pi.registerShortcut(Key.ctrlAlt("o"), {
+    if (reviewWidgetHost()) {
+      pi.registerShortcut(Key.ctrlAlt("o"), {
       description: "Toggle the workflow todo panel",
       handler: async (ctx: any) => {
         if (overlayDepth > 0) return;
@@ -7186,17 +7259,19 @@ export default function workflowExtension(
         }
         const view = deriveTodoPanel({
           items: todoItems,
-          override: todoPanelOverride,
-          overrideKey: todoPanelOverrideKey,
+          preference: todoPanelPreference,
+          preferenceScope: todoPanelPreferenceScope,
+          scopeKey: todoPanelScope((ctx as any)?.cwd ?? process.cwd()),
           promptAfterSettle: todoPanelPromptAfterSettle,
           stale: todoStale,
         });
-        setTodoPanelOverride(
+        setTodoPanelPreference(
           ctx as any,
           view.state === "expanded" ? "collapsed" : "expanded",
         );
       },
     });
+    }
   } catch (_e) {
     void _e;
   }
@@ -7588,8 +7663,8 @@ export default function workflowExtension(
           const c = todoItems.length;
           todoItems = [];
           todoPlanPath = undefined;
-          todoPanelOverride = null;
-          todoPanelOverrideKey = null;
+          todoPanelPreference = "auto";
+          todoPanelPreferenceScope = null;
           todoPanelPromptAfterSettle = false;
           lastCompletedSignature = null;
           try {
@@ -7657,19 +7732,19 @@ export default function workflowExtension(
       }
 
       if (sub === "show" || sub === "expand") {
-        setTodoPanelOverride(ctx, "expanded");
+        setTodoPanelPreference(ctx, "expanded");
         return;
       }
       if (sub === "collapse") {
-        setTodoPanelOverride(ctx, "collapsed");
+        setTodoPanelPreference(ctx, "collapsed");
         return;
       }
       if (sub === "hide") {
-        setTodoPanelOverride(ctx, "hidden");
+        setTodoPanelPreference(ctx, "hidden");
         return;
       }
       if (sub === "auto") {
-        setTodoPanelOverride(ctx, null);
+        setTodoPanelPreference(ctx, "auto");
         return;
       }
       if (sub === "clear") {
@@ -7693,8 +7768,8 @@ export default function workflowExtension(
         }
         todoItems = [];
         todoPlanPath = undefined;
-        todoPanelOverride = null;
-        todoPanelOverrideKey = null;
+        todoPanelPreference = "auto";
+        todoPanelPreferenceScope = null;
         todoPanelPromptAfterSettle = false;
         lastCompletedSignature = null;
         updateStatus(ctx);
@@ -10930,11 +11005,11 @@ export default function workflowExtension(
     // The branch is the source of truth for the panel's presentation. The
     // host has cleared every extension widget on a session switch/reload, so
     // the reconciler must register it again from the restored state.
-    todoPanelOverride = null;
-    todoPanelOverrideKey = null;
+    todoPanelPreference = "auto";
+    todoPanelPreferenceScope = null;
     todoPanelPromptAfterSettle = false;
     lastCompletedSignature = null;
-    todoPanelAppliedState = "unregistered";
+    todoPanelAppliedKey = "unregistered";
     // The host dropped every extension widget on the switch/reload; reset the
     // cache so the first updateStatus re-applies (or clears) the review line.
     reviewWidgetApplied = null;
@@ -11025,8 +11100,7 @@ export default function workflowExtension(
             // must not erase a value restored from an earlier entry.
             if (d.todoPanel && typeof d.todoPanel === "object") {
               const panel = readPersistedTodoPanel(d);
-              todoPanelOverride = panel.override;
-              todoPanelOverrideKey = panel.overrideKey;
+              applyRestoredTodoPanel(panel, (ctx as any)?.cwd ?? process.cwd(), d.planFile);
               todoPanelPromptAfterSettle = panel.promptAfterSettle;
               lastCompletedSignature = panel.completedSignature;
             }
@@ -11447,13 +11521,14 @@ export default function workflowExtension(
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.profile, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.policy, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.todos, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
     // The Terminal review line is a live surface; a quit/reload must not wait
     // for teardown to clear it (teardown later drops currentSessionCtx).
     setWorkflowWidget(ctx.ui, REVIEW_STATUS_WIDGET, []);
     reviewWidgetApplied = null;
     // The host dropped the widget; a later session_start re-registers it.
-    todoPanelAppliedState = "unregistered";
+    todoPanelAppliedKey = "unregistered";
     // Drop any /commit authorization or flow: a reload/quit must never leave
     // an exemption armed for whatever runs next.
     commitAuthorization = null;
@@ -11470,11 +11545,11 @@ export default function workflowExtension(
     todoPlanPath = undefined;
     btwNotes = [];
     // A rewind is a branch boundary: the panel choice belongs to the branch.
-    todoPanelOverride = null;
-    todoPanelOverrideKey = null;
+    todoPanelPreference = "auto";
+    todoPanelPreferenceScope = null;
     todoPanelPromptAfterSettle = false;
     lastCompletedSignature = null;
-    todoPanelAppliedState = "unregistered";
+    todoPanelAppliedKey = "unregistered";
     // A rewind is a branch boundary: no per-run write from the old branch
     // may authorize a handoff or a manual review on the new one.
     resetPlanRunProvenance();
@@ -11492,8 +11567,11 @@ export default function workflowExtension(
           }
           if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
             const panel = readPersistedTodoPanel(e.data);
-            todoPanelOverride = panel.override;
-            todoPanelOverrideKey = panel.overrideKey;
+            applyRestoredTodoPanel(
+              panel,
+              (ctx as any)?.cwd ?? process.cwd(),
+              e.data.planFile,
+            );
             todoPanelPromptAfterSettle = panel.promptAfterSettle;
             lastCompletedSignature = panel.completedSignature;
           }

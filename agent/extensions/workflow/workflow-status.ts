@@ -17,6 +17,7 @@ export const WORKFLOW_STATUS_KEYS = {
   profile: "workflow-profile",
   policy: "workflow-policy",
   review: "workflow-review",
+  todos: "workflow-todos",
 } as const;
 
 export interface WorkflowStatusInput {
