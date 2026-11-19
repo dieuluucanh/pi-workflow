@@ -2,14 +2,14 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.13.0] - 2026-11-19
 
 ### Changed — sticky todo panel display and Pi Desktop controls
 
 - The panel choice is now scoped to the plan lineage, not the list identity:
   Build `add`/`update` and a same-path Review rewrite keep the expanded,
   collapsed or hidden choice. A different plan, `/todos clear`, reload and
-  rewind keep their existing reset rules.
+  rewind reset it to automatic, as before.
 - A visible row/status change re-registers the widget so Pi Desktop repaints
   immediately (the host only repaints on `setWidget`).
 - New `workflow-todos` status: `☐ Todos 3/12 · hidden` (plus stale/cancelled
@@ -30,8 +30,9 @@ All notable changes to this package are documented in this file.
   review row (below the todo panel, above the composer). Pi Terminal keeps the
   widget below the todo widget; a todo-panel re-registration now forces the
   review widget to be re-added after it, so the order stays stable.
-- An automatic manual round's working row also carries the hints, so a terminal
-  automatic review no longer has a hint-less spinner line.
+- Every review round's working row now carries the hints — including an
+  automatic review inside the plan turn, which previously showed a hint-less
+  spinner line in Terminal.
 - Compatibility: an older Pi Desktop still sees the mode status and degrades to
   its existing row; the matching Pi Desktop release reads `workflow-review` and
   falls back to its own canonical line when the status is absent.

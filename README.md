@@ -40,7 +40,7 @@ pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
 # pinned, for reproducible installs
-pi install npm:@dieulc/workflow@0.12.1
+pi install npm:@dieulc/workflow@0.13.0
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
