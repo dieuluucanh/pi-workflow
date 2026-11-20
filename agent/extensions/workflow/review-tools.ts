@@ -45,6 +45,15 @@ import type {
     ReviewVerdict,
 } from "./review.ts";
 import { sanitizeFindings } from "./review.ts";
+import {
+    classifyShellFailureText,
+    detectEmptyInterpreterProbe,
+    emptyProbeReason,
+    normalizeShellTimeout,
+    shellFailureGuidance,
+    type ShellGuardRecovery,
+    type ShellLimits,
+} from "./shell-guard.ts";
 
 /** Result shape shared by every review tool. */
 export interface ReviewToolTextResult {
@@ -63,6 +72,17 @@ export interface ReviewBashDeps {
         config: FolderPolicyConfig;
         grants: readonly string[];
     };
+    /**
+     * Request-scoped shell guard. Resolved per execute so a warm reviewer
+     * session sees the current round's budget, not the one it was built with.
+     */
+    shellGuard?: () =>
+        | {
+              limits: ShellLimits;
+              state: ShellGuardRecovery;
+              onTrip?: (reason: string) => void;
+          }
+        | undefined;
 }
 
 /** Injectable shell-tool builder so this module is testable without the SDK. */
@@ -70,6 +90,46 @@ export type BashToolDefinitionBuilder = (cwd: string) => {
     parameters: TSchema;
     execute: (...args: unknown[]) => Promise<unknown>;
 };
+
+/** Resolved reviewer shell-guard dependency. */
+type ReviewShellGuard = NonNullable<
+    ReturnType<NonNullable<ReviewBashDeps["shellGuard"]>>
+>;
+
+function reviewResultText(result: ReviewToolTextResult): string {
+    return (result.content ?? [])
+        .map((part) =>
+            part && typeof part === "object" && typeof part.text === "string"
+                ? part.text
+                : "",
+        )
+        .filter(Boolean)
+        .join("\n");
+}
+
+/**
+ * Observe one reviewer shell result. Only a native deadline consumes the
+ * budget; a user abort, permission refusal or ordinary test failure does not.
+ */
+function guardReviewShellResult(
+    result: ReviewToolTextResult,
+    command: string,
+    shellGuard: ReviewShellGuard | undefined,
+): ReviewToolTextResult {
+    if (!shellGuard) return result;
+    const kind = classifyShellFailureText(reviewResultText(result));
+    if (!kind) return result;
+    const decision = shellGuard.state.recordFailure({ kind, command });
+    if (decision.action === "stop") shellGuard.onTrip?.(decision.reason);
+    return {
+        ...result,
+        content: [
+            ...(result.content ?? []),
+            { type: "text", text: shellFailureGuidance(kind, decision) },
+        ],
+        isError: true,
+    };
+}
 
 /**
  * `review_bash` — the reviewer's only shell access.
@@ -194,6 +254,65 @@ export function createReviewBashTool(
                 };
             }
 
+            const shellGuard = deps.shellGuard?.();
+            if (shellGuard) {
+                const probe = detectEmptyInterpreterProbe(command);
+                if (probe.kind === "empty-probe") {
+                    const decision = shellGuard.state.recordFailure({
+                        kind: "empty-probe",
+                        command,
+                    });
+                    if (decision.action === "stop") {
+                        shellGuard.onTrip?.(decision.reason);
+                    }
+                    deps.log(
+                        "Review Mode refused an empty interpreter probe.",
+                        "warning",
+                    );
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text:
+                                    emptyProbeReason(probe) +
+                                    shellFailureGuidance("empty-probe", decision),
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                const normalized = normalizeShellTimeout(
+                    rawParams,
+                    shellGuard.limits,
+                    "review_bash",
+                );
+                if (!normalized.ok) {
+                    const decision = shellGuard.state.recordFailure({
+                        kind: "invalid-timeout",
+                        command,
+                    });
+                    if (decision.action === "stop") {
+                        shellGuard.onTrip?.(decision.reason);
+                    }
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text:
+                                    normalized.error +
+                                    shellFailureGuidance("invalid-timeout", decision),
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                // The reviewer's optional timeout gets the same finite bound
+                // as the main session's; Pi arms process-tree cancellation on
+                // the value it receives.
+                (rawParams as { timeout?: number }).timeout =
+                    normalized.timeoutSeconds;
+            }
+
             try {
                 const result = (await inner.execute(
                     toolCallId,
@@ -202,8 +321,9 @@ export function createReviewBashTool(
                     onUpdate,
                     ctx,
                 )) as ReviewToolTextResult;
+                const guarded = guardReviewShellResult(result, command, shellGuard);
                 return redactReviewResult(
-                    result,
+                    guarded,
                     "bash",
                     rawParams,
                     deps.cwd,
@@ -396,6 +516,8 @@ export interface ReviewToolDeps {
     explore: ReviewExploreDeps;
     submit: ReviewSubmitDeps;
     passDone: ReviewPassDoneDeps;
+    /** Request-scoped shell guard for `review_bash`. */
+    shellGuard?: ReviewBashDeps["shellGuard"];
     /**
      * The parent's effective folder policy (sensitive extras, `excludePaths`)
      * and read grants. The reviewer is a separate session with no ambient

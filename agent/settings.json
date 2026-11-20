@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.5.0",
+  "lastChangelogVersion": "1.5.2",
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
@@ -19,9 +19,12 @@
     "synthetic/hf:zai-org/GLM-5.3-Flash",
     "opencode-go/beam-free",
     "opencode-go/mimo-v2.6-flash",
-    "command-code/deepseek/deepseek-v4.1-flash"
+    "command-code/deepseek/deepseek-v4.1-flash",
+    "openai-codex/gpt-6.1-sol",
+    "openai-codex/gpt-6.1-terra",
+    "openai-codex/gpt-6-luna"
   ],
-  "defaultThinkingLevel": "max",
+  "defaultThinkingLevel": "high",
   "defaultProvider": "command-code",
   "defaultModel": "deepseek/deepseek-v4.1-flash",
   "terminal": {
@@ -60,7 +63,7 @@
     "modelDefault": {
       "provider": "command-code",
       "id": "deepseek/deepseek-v4.1-flash",
-      "thinking": "max"
+      "thinking": "high"
     },
     "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
     "commitPolicy": {
@@ -84,8 +87,9 @@
     }
   },
   "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.0",
-    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.47.0",
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.1",
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0",
     "{\"source\":\"npm:pi-memory\",\"scope\":\"user\"}": "0.4.2"
-  }
+  },
+  "deviceId": "6b67e4af-e228-4e81-b64c-7be5b7a132af"
 }

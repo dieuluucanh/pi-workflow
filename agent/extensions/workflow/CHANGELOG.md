@@ -2,6 +2,31 @@
 
 All notable changes to this package are documented in this file.
 
+## [Unreleased]
+
+### Fixed — shell probes can no longer hang a request indefinitely
+
+The 2026-11-20 `erp-atom` incident recorded two valid but empty
+`python - <<'EOF'` probes with no `timeout` waiting 52m27s and 21m56s. Pi's
+Bash tool has no default deadline, and Workflow supplied none.
+
+- Every model shell call now gets a finite native deadline: 120 s when
+  `timeout` is omitted, capped at 900 s by default (hard cap 3600 s). The new
+  `workflow.shellGuard` setting is user-owned, sparse, global/project scoped,
+  inherited by explorer children as an upper bound, and cannot be disabled by a
+  model. `/shell-guard [status|limits …|reset]` manages it.
+- Provably empty direct interpreter-stdin heredocs are refused before launch
+  (Python family), with an “empty interpreter probe” explanation. Non-empty
+  scripts, `-c`/`-m`, script files, quoted `<<`, `<<-` and ambiguous heredocs
+  keep the finite deadline instead of being rejected.
+- One changed approach is allowed after a qualifying failure; repeating the
+  same command or a second qualifying failure in the same request latches a
+  stop, blocks further shell calls and aborts the run. Timeouts never replay a
+  command and never roll back effects; partial output is preserved.
+- The isolated reviewer's `review_bash` has its own per-round budget and a
+  guard trip is not retried as a provider failure. `/shell-guard reset` clears
+  a stopped request while idle; a genuinely new idle prompt resets it too.
+
 ## [0.13.0] - 2026-11-19
 
 ### Changed — sticky todo panel display and Pi Desktop controls

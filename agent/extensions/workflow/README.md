@@ -13,6 +13,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, with a native handoff fallback (the plan is printed into the transcript as a durable entry; a bottom-sheet questionnaire offers Approve / Feedback / Skip). `workflow.handoff` + `/handoff` choose between `auto` (default), `native` (never open the browser) and `plannotator` (always try, native fallback). `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all). The thinking list follows the selected model's `thinkingLevelMap`; unsupported stored levels are clamped on save/activation with a warning.
 - **Write permission** — a user-controlled `allow`/`ask`/`never` permission for file writes in **Default** mode, the mode that is otherwise ungated. `/write-policy` sets it; see [Write permission](#write-permission) below.
+- **Shell guard** — finite native deadlines for every shell surface (120 s default, 900 s ceiling), a pre-launch refusal for provably empty interpreter-stdin heredocs, and a request-scoped recovery budget: one changed approach, then stop. Covers main `bash`/`powershell`, explorer subprocesses and the isolated reviewer's `review_bash`; never times out human dialogs. See [Shell guard](#shell-guard).
 - **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
 
 ## Install
@@ -53,8 +54,31 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/folder-policy [repo\|cwd\|parent\|any] [global\|project]` | Shared folder scope for read, write **and** commit (default `repo`: nearest `.git` root, fallback cwd). `outside ask\|block`, `grant project\|global`, `templates allow\|block`, `sensitive`, `exclude [add\|revoke\|list] <glob> [--global\|--project]` |
 | `/read-policy [status\|allow <path>\|revoke <path>\|shell paths\|strict] [global\|project]` | Read grants, shell analysis mode and the shared folder scope. Sensitive files are always blocked |
 | `/permissions [explain] <command>` | Explain a shell command's verdict without running it: each segment's class, the Plan/Review/Explorer answer and whether the write policy would treat it as a write |
+| `/shell-guard [status]` | Show the effective shell deadlines, their settings source, and this request's failure budget. `/shell-guard limits <default-seconds> <max-seconds> [global\|project]` sets them; `/shell-guard reset` clears a tripped request while idle |
 
 Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a **reviewer round or review-owned handoff** owns the turn — `running`, `paused`, or a handoff produced by `/review`/Review Mode, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review). A **plain plan handoff** (Review Mode off) does not lock modes or prompts: switching or typing a new prompt supersedes it, and the plan file stays on disk.
+
+## Shell guard
+
+The guard exists because of the 2026-11-20 `erp-atom` incident: two valid but **empty** `python - <<'EOF'` probes with no `timeout` waited 52m27s and 21m56s before the user aborted them. Pi's Bash tool has no default timeout; the model's `timeout` argument is optional. Prompt advice cannot make that finite, so the guard enforces it at the tool boundary.
+
+- **Every shell surface gets a finite deadline.** The model's omitted `timeout` becomes 120 s; an explicit value is capped at 900 s. Both are user-owned under `workflow.shellGuard` and deliberately finite: no `0`, `off` or `unlimited` escape. A model cannot widen them or edit the settings file.
+- **What it covers.** Main `bash` and `powershell`, explorer children (the parent's effective limits are carried in `PI_SHELL_GUARD_LIMITS` and can only narrow the child's own settings) and the isolated reviewer's `review_bash`. Role, folder, read, write and commit policies still run first and keep their own refusal reasons. Human questionnaire/permission waits are not shell execution and are never timed out.
+- **Empty probes are refused before launch.** Only a direct Python-family stdin script (`python - <<'EOF'`, including `python3`/`py` and a `.exe` path) with a provably empty body and a simple delimiter is blocked. Non-empty scripts, `-c`/`-m`, script files, quoted `<<`, `<<-`, multiple heredocs and missing terminators keep the finite deadline instead. The refusal says “empty interpreter probe”, never “malformed Bash”.
+- **Bounded recovery.** A first qualifying failure (native deadline, empty-probe refusal, invalid timeout value) returns the partial output/error with guidance and allows **one changed approach**. Repeating the same command, or any second qualifying failure in the same request, latches a stop: further shell calls are blocked and the run is aborted. Nothing is replayed automatically, and a timeout never rolls back side effects — inspect before retrying a mutating command.
+- **Request scope.** The budget resets on a genuinely new idle user prompt, a new/resumed session, a rewind, or `/shell-guard reset` while idle. A steer, follow-up, extension-authored message, native retry or compaction does not re-arm a tripped request.
+- **Honest output.** A native timeout keeps the partial output and names the deadline. `/shell-guard status` shows the effective limits, their source, inherited status and the current budget; audit entries record the reason, tool, call id, deadline and failure count — never raw command text or output.
+
+```text
+/shell-guard                                    # status
+/shell-guard limits 60 300                      # global: 60s default, 300s ceiling
+/shell-guard limits 300 900 project             # this repo only
+/shell-guard reset                              # idle: clear a stopped request
+```
+
+Settings are sparse and scoped: global applies by default, a **trusted** project may override either field, and a corrupt existing file is refused rather than replaced. The hard ceiling is 3600 s; raising the defaults is an explicit user edit, not a model action.
+
+> The backends remain cooperative at the host boundary: a third-party tool that ignores the supplied timeout or abort signal is not magically cancellable. The guard reports what it enforced instead of claiming universal process control.
 
 ## Model Profiles
 
@@ -727,9 +751,26 @@ Folder Policy settings live under `workflow.folderPolicy` (scalars project-over-
 
 `"folderPolicy": "ask"` is **not** shorthand — a bare string is read as a `mode` (`"repo"`, `"cwd"`, `"parent"`, `"any"`), matching the earlier release. Project settings (all four `workflow.*` policies) are ignored unless the project is trusted; `/folder-policy status` says when it ignored them. Dialog grants are limited to concrete folders: the filesystem/drive root, home and its parents, and protected system/profile umbrellas are refused as one-click grants (see [Grants](#folder-and-read-permission)).
 
+Shell Guard settings live under `workflow.shellGuard` (global, with a trusted project override per field):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `defaultTimeoutSeconds` | `120` | Deadline used when a shell call omits `timeout` |
+| `maxTimeoutSeconds` | `900` | Ceiling for an explicit timeout; deliberate user configuration may raise it up to the 3600 s hard cap |
+
+```json
+{
+  "workflow": {
+    "shellGuard": { "defaultTimeoutSeconds": 120, "maxTimeoutSeconds": 900 }
+  }
+}
+```
+
+Invalid numbers fall back to the base value and the pair is repaired so `default <= max`. There is no way to disable the deadline. Spawned explorer children inherit the parent's limits as an upper bound. See [`docs/incidents/2026-11-20-shell-probe-hangs.md`](../../../docs/incidents/2026-11-20-shell-probe-hangs.md) for the incident evidence.
+
 ## How it works
 
-See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `shell-paths.ts` (path extraction for the shared floor), `folder-policy.ts` (the shared containment floor and sensitive-file rules), `read-policy.ts` / `read-policy-tools.ts` / `read-policy-redact.ts` (the read gate, tool classification and output redaction), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `todo-panel.ts` (pure todo-panel state matrix, list identity, summary and row rendering), `roles.ts` (role registry, one model per role), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `provider-retarget.ts` (guarded, backed-up `provider` ref migration for profiles/roles — pure document rewrite plus a two-phase file apply), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers), `review-handoff.ts` (pure pending-gate correlation, supersede and reload-recovery decisions), `handoff-config.ts` (the `workflow.handoff` target config, coercion/merge/read-write, presenter decision and `/handoff` completions — no runtime imports, unit-testable), `handoff-view.ts` (pure native-handoff question/choice decisions: the plan-text cap, the bottom-sheet question and the Approve/Feedback/Skip mapping — no runtime imports, unit-testable). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
+See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `shell-paths.ts` (path extraction for the shared floor), `folder-policy.ts` (the shared containment floor and sensitive-file rules), `read-policy.ts` / `read-policy-tools.ts` / `read-policy-redact.ts` (the read gate, tool classification and output redaction), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `todo-panel.ts` (pure todo-panel state matrix, list identity, summary and row rendering), `roles.ts` (role registry, one model per role), `shell-guard.ts` (pure deadlines, the empty-probe recognizer and the request budget), `shell-guard-config.ts` (settings/provenance/inheritance and `/shell-guard` parsing), `shell-guard-runtime.ts` (the tool-lifecycle adapter), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `provider-retarget.ts` (guarded, backed-up `provider` ref migration for profiles/roles — pure document rewrite plus a two-phase file apply), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers), `review-handoff.ts` (pure pending-gate correlation, supersede and reload-recovery decisions), `handoff-config.ts` (the `workflow.handoff` target config, coercion/merge/read-write, presenter decision and `/handoff` completions — no runtime imports, unit-testable), `handoff-view.ts` (pure native-handoff question/choice decisions: the plan-text cap, the bottom-sheet question and the Approve/Feedback/Skip mapping — no runtime imports, unit-testable). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
 ### Todo protocol (industry-aligned)
 
@@ -794,7 +835,7 @@ Plannotator's loopback URL is valid — the same URL loads when you use the tab'
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts folder-exclude.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts shell-guard.test.ts shell-guard-config.test.ts shell-guard-extension.test.ts shell-guard-process.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts folder-exclude.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):

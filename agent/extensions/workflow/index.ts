@@ -404,6 +404,19 @@ import {
   type ReviewHandoffSource,
 } from "./review-handoff.ts";
 import { seedPromptHistory, WorkflowTabEditor } from "./tab-editor.ts";
+import {
+  createShellGuardRuntime,
+  type ShellGuardRuntime,
+} from "./shell-guard-runtime.ts";
+import {
+  effectiveShellLimits,
+  encodeShellLimitsEnv,
+  parseShellGuardArgs,
+  shellGuardArgumentCompletions,
+  writeShellGuardConfig,
+  SHELL_GUARD_LIMITS_ENV,
+} from "./shell-guard-config.ts";
+import { describeShellLimits, type ShellLimits } from "./shell-guard.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -516,6 +529,7 @@ async function runSingleAgent(
   task: string,
   signal?: AbortSignal,
   folderEnv?: Record<string, string>,
+  shellLimits?: ShellLimits,
 ): Promise<{ messages: any[]; stderr: string; exitCode: number; usage: any }> {
   const tmpDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "pi-subagent-"),
@@ -546,6 +560,15 @@ async function runSingleAgent(
       ? process.execPath
       : "pi";
   return new Promise((resolve) => {
+    // Carry the parent's effective shell deadlines into the child. The child's
+    // workflow extension re-reads its own settings, then applies these as an
+    // upper bound, so a project-level setting in the child cannot widen them.
+    let inheritedShellLimits: string | undefined;
+    try {
+      if (shellLimits) inheritedShellLimits = encodeShellLimitsEnv(shellLimits);
+    } catch (_e) {
+      void _e;
+    }
     const proc = spawn(
       piCmd,
       piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs],
@@ -559,6 +582,9 @@ async function runSingleAgent(
         // project's settings.
         env: {
           ...subagentEnv(process.env, agent.role),
+          ...(inheritedShellLimits
+            ? { [SHELL_GUARD_LIMITS_ENV]: inheritedShellLimits }
+            : {}),
           ...(folderEnv ?? {
             PI_FOLDER_POLICY_LOCKED: "1",
             PI_FOLDER_POLICY_ROOTS: JSON.stringify([
@@ -786,6 +812,52 @@ export default function workflowExtension(
   let lastReviewId: string | null = null;
   let plannotatorListenersRegistered = false;
   let currentSessionCtx: ExtensionContext | null = null;
+
+  // ── Shell hang guard (2026-11-20 incident) ────────────────────────
+  // One request-scoped runtime. The limits are re-read per call so a
+  // `/shell-guard limits` change applies without a reload.
+  let shellGuardRuntime: ShellGuardRuntime | undefined;
+  let shellGuardCtx: ExtensionContext | null = null;
+
+  function shellGuardLimitsFor(ctx: any) {
+    return effectiveShellLimits(
+      ctx?.cwd ?? process.cwd(),
+      getAgentDir(),
+      { trusted: ctx?.isProjectTrusted?.() === true },
+    );
+  }
+
+  function ensureShellGuard(ctx?: ExtensionContext | null): ShellGuardRuntime {
+    if (ctx) shellGuardCtx = ctx;
+    const live = ctx ?? shellGuardCtx ?? currentSessionCtx;
+    if (!shellGuardRuntime) {
+      shellGuardRuntime = createShellGuardRuntime({
+        limits: () => shellGuardLimitsFor(live).config,
+        notify: (message, level) => {
+          try {
+            (live as any)?.ui?.notify?.(message, level ?? "warning");
+          } catch (_e) {
+            void _e;
+          }
+        },
+        record: (data) => {
+          try {
+            pi.appendEntry("workflow-shell-guard", data);
+          } catch (_e) {
+            void _e;
+          }
+        },
+        abort: () => {
+          try {
+            (live as any)?.abort?.();
+          } catch (_e) {
+            void _e;
+          }
+        },
+      });
+    }
+    return shellGuardRuntime;
+  }
 
   // ── Checkpoint (shadow bare-repo) state ────────────────────────
   const checkpoints = new Map<string, string>();
@@ -2439,6 +2511,7 @@ export default function workflowExtension(
         task,
         signal,
         subagentFolderEnv(cwd),
+        shellGuardLimitsFor(currentSessionCtx).config,
       );
       const out = getFinalOutput(res.messages);
       if (!out && res.exitCode !== 0) {
@@ -2474,6 +2547,9 @@ export default function workflowExtension(
         };
       },
       config: () => reviewConfigNow()?.config,
+      // The reviewer is an isolated session with no ambient extensions; its
+      // review_bash needs the same finite shell deadlines as the main session.
+      shellGuardLimits: () => shellGuardLimitsFor(currentSessionCtx).config,
       reviewerModel: () => {
         // The round snapshot wins while set (see executeReviewRound): a
         // mid-round switch must not change the reviewer mid-pass. Outside a
@@ -4335,6 +4411,67 @@ export default function workflowExtension(
       ctx.ui.notify("Usage: /read-policy status|allow <path>|revoke <path>|shell paths|strict", "info");
     },
     getArgumentCompletions: (prefix: string) => readPolicyArgumentCompletions(prefix),
+  });
+
+  pi.registerCommand("shell-guard", {
+    description:
+      "Shell deadlines and the hang breaker: status, limits <default-seconds> <max-seconds> [global|project], reset",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const parsed = parseShellGuardArgs(args);
+      if (parsed.action === "error") {
+        ctx.ui.notify(parsed.error, "warning");
+        return;
+      }
+      if (parsed.action === "limits") {
+        const written = writeShellGuardConfig(
+          parsed.scope,
+          cwd,
+          agentDir,
+          parsed.limits,
+        );
+        ctx.ui.notify(
+          written.ok
+            ? `Shell guard limits → ${describeShellLimits(parsed.limits)} (${parsed.scope})\n${written.path}`
+            : `Could not write shell guard limits: ${written.error ?? "unknown error"}`,
+          written.ok ? "info" : "error",
+        );
+        return;
+      }
+      if (parsed.action === "reset") {
+        if ((ctx as any).isIdle?.() === false) {
+          ctx.ui.notify(
+            "Shell guard: cannot reset while a run is active. Wait for it to settle or press Esc.",
+            "warning",
+          );
+          return;
+        }
+        ensureShellGuard(ctx as ExtensionContext).reset("command-reset");
+        ctx.ui.notify("Shell guard: request budget cleared.", "info");
+        return;
+      }
+      const resolved = shellGuardLimitsFor(ctx as any);
+      const snapshot = ensureShellGuard(ctx as ExtensionContext).snapshot();
+      ctx.ui.notify(
+        [
+          `Shell guard: ${describeShellLimits(resolved.config)}`,
+          `  source: default=${resolved.sources.defaultTimeout} · maximum=${resolved.sources.maxTimeout}`,
+          `  inherited from parent: ${resolved.inherited ? "yes (cannot be widened)" : "no"}`,
+          resolved.sources.projectIgnored
+            ? "  project settings ignored: project not trusted"
+            : "  project settings: " + (resolved.sources.project ? "applied" : "none"),
+          `  this request: ${snapshot.failures} qualifying failure(s)${snapshot.stopped ? " · STOPPED" : ""}`,
+          snapshot.stopped
+            ? `  stopped: ${snapshot.stoppedReason ?? "a repeated shell failure"} — start a new prompt or run /shell-guard reset`
+            : "  recovery: one changed approach, then stop",
+          `  covers: bash, powershell, explorer shells, review_bash`,
+        ].join("\n"),
+        snapshot.stopped ? "warning" : "info",
+      );
+    },
+    getArgumentCompletions: (prefix: string) =>
+      shellGuardArgumentCompletions(prefix),
   });
 
   pi.registerCommand("permissions", {
@@ -10363,6 +10500,7 @@ export default function workflowExtension(
               job.task,
               signal,
               subagentFolderEnv(job.cwd ?? cwd),
+              shellGuardLimitsFor(ctx as any).config,
             );
             if (signal?.aborted) {
               results[idx] = {
@@ -10907,6 +11045,19 @@ export default function workflowExtension(
       }
       return { action: "continue" } as any;
     }
+    // A genuinely new, idle user prompt is the recovery boundary. Steering,
+    // follow-ups, extension-authored messages and automatic continuations must
+    // not re-arm a tripped request.
+    if (
+      event.source !== "extension" &&
+      event.streamingBehavior === undefined
+    ) {
+      try {
+        ensureShellGuard(_ctx).reset("new-user-request");
+      } catch (_e) {
+        void _e;
+      }
+    }
     if (typeof event.text === "string" && event.text.startsWith("/btw ")) {
       const note = event.text.slice(5).trim();
       if (note) {
@@ -11002,6 +11153,12 @@ export default function workflowExtension(
     // A session boundary owns the session-scoped plan fallback; the restore
     // loop below re-seeds it from the persisted `planFile`.
     resetSessionPlanProvenance();
+    // Recovery is request-scoped; a new/resumed/reloaded session starts clean.
+    try {
+      ensureShellGuard(ctx as ExtensionContext).reset("session-start");
+    } catch (_e) {
+      void _e;
+    }
     // The branch is the source of truth for the panel's presentation. The
     // host has cleared every extension widget on a session switch/reload, so
     // the reconciler must register it again from the restored state.
@@ -11540,6 +11697,13 @@ export default function workflowExtension(
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    // A rewind changes the active branch: a previous request's shell budget
+    // must not follow it.
+    try {
+      ensureShellGuard(ctx as ExtensionContext).reset("session-tree");
+    } catch (_e) {
+      void _e;
+    }
     // reconstruct after rewind
     todoItems = [];
     todoPlanPath = undefined;
@@ -13293,6 +13457,16 @@ export default function workflowExtension(
         } as any;
       }
     }
+    // ── Shell hang guard (last: every allowed shell path reaches it) ──
+    // Supplying a finite timeout and refusing empty interpreter probes is a
+    // safety invariant, not a permission. It runs after the role/folder/
+    // read/write/commit gates so a policy refusal keeps its own reason.
+    {
+      const guardBlock = ensureShellGuard(ctx as ExtensionContext).prepare(
+        event as any,
+      );
+      if (guardBlock) return guardBlock as any;
+    }
   });
 
   // ── Checkpoint lifecycle: track leaf entryId and prompt header ─
@@ -13523,6 +13697,29 @@ export default function workflowExtension(
         (ctx.sessionManager as any).getLeafEntry?.() ??
         ctx.sessionManager.getBranch()?.at(-1);
       if (leaf?.id) currentEntryId = leaf.id;
+    } catch (_e) {
+      void _e;
+    }
+  });
+
+  // Shell hang guard: a native deadline is surfaced in the result text. The
+  // guard appends guidance and trips the request after a repeat.
+  pi.on("tool_result", async (event, ctx) => {
+    try {
+      return ensureShellGuard(ctx as ExtensionContext).observeResult(
+        event as any,
+      ) as any;
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  });
+
+  // Some calls (blocked, invalid args) skip tool_result. The end event is the
+  // documented hook that sees every finalized call; call IDs deduplicate.
+  pi.on("tool_execution_end", async (event, ctx) => {
+    try {
+      ensureShellGuard(ctx as ExtensionContext).observeEnd(event as any);
     } catch (_e) {
       void _e;
     }

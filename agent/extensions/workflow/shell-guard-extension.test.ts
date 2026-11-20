@@ -1,0 +1,380 @@
+/**
+ * Extension-level regression tests for the shell hang guard.
+ *
+ * These drive the REAL workflow extension through the fake Pi host, plus the
+ * reviewer's `review_bash` wrapper with an injected shell builder. No provider
+ * or real child session is involved.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Type } from "typebox";
+
+import workflowExtension from "./index.ts";
+import { createReviewBashTool } from "./review-tools.ts";
+import { createShellGuardRecovery } from "./shell-guard.ts";
+import { DEFAULT_FOLDER_POLICY_CONFIG } from "./folder-policy.ts";
+import {
+  fakeSdk,
+  makeFakeCtx,
+  makeFakePi,
+  submitThenFinish,
+  tmpProject,
+  REWRITTEN_PLAN,
+} from "./test-support.ts";
+
+const INCIDENT_1 = `cd .; python - <<'EOF' 2>/dev/null || true
+EOF
+grep -n "0016_invoice_dimensions.sql" modules/finance/module.manifest.json`;
+
+const INCIDENT_2 = `python - <<'PY' 2>/dev/null || true
+PY
+grep -n "INSERT INTO core_documents" modules/finance/0018_invoice_documents.sql`;
+
+async function boot(over: { shellGuard?: Record<string, unknown> } = {}) {
+  const { root, cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+  fs.writeFileSync(
+    path.join(cwd, ".pi", "settings.json"),
+    JSON.stringify(
+      {
+        workflow: {
+          commitPolicy: { mode: "never" },
+          ...(over.shellGuard ? { shellGuard: over.shellGuard } : {}),
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  const { sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const pi = makeFakePi();
+  await workflowExtension(pi as never, {
+    loadSdk: async () => sdk as never,
+    plannotatorRequestTimeoutMs: 50,
+    plannotatorRecoveryTimeoutMs: 50,
+    isTerminalHost: () => true,
+  });
+  const fake = makeFakeCtx({ cwd, hasUI: true, idle: true });
+  await pi.emit("session_start", { reason: "startup" }, fake.ctx);
+  const cleanup = () => {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  };
+  return { pi, ctx: fake.ctx, fake, cwd, root, cleanup };
+}
+
+async function callTool(
+  pi: any,
+  ctx: any,
+  toolName: string,
+  toolCallId: string,
+  input: Record<string, unknown>,
+): Promise<any> {
+  const results = await pi.emit(
+    "tool_call",
+    { type: "tool_call", toolName, toolCallId, input },
+    ctx,
+  );
+  const blocks = results.filter((r: unknown) => r !== undefined);
+  return { input, block: blocks.at(-1) };
+}
+
+function lastNotice(notifies: Array<{ message: string; level?: string }>) {
+  return notifies.at(-1)?.message ?? "";
+}
+
+test("guard: both incident commands are refused with an empty-probe reason", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    for (const [i, command] of [INCIDENT_1, INCIDENT_2].entries()) {
+      const { block } = await callTool(pi, ctx, "bash", `incident-${i}`, {
+        command,
+      });
+      assert.equal(block?.block, true);
+      assert.match(String(block?.reason), /empty interpreter probe refused/);
+      assert.match(String(block?.reason), /not a syntax error/);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: an ordinary shell call gets the 120s default, explicit shorter wins", async () => {
+  const { pi, ctx, cleanup } = await boot();
+  try {
+    const plain = await callTool(pi, ctx, "bash", "a", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(plain.block, undefined);
+    assert.equal(plain.input.timeout, 120);
+
+    const explicit = await callTool(pi, ctx, "bash", "b", {
+      command: "npm test",
+      timeout: 30,
+    });
+    assert.equal(explicit.input.timeout, 30);
+
+    const capped = await callTool(pi, ctx, "bash", "c", {
+      command: "npm test",
+      timeout: 5_000,
+    });
+    assert.equal(capped.input.timeout, 900);
+
+    const powershell = await callTool(pi, ctx, "powershell", "d", {
+      command: "Get-ChildItem",
+    });
+    assert.equal(powershell.input.timeout, 120);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: project settings can tune both limits", async () => {
+  const { pi, ctx, cleanup } = await boot({
+    shellGuard: { defaultTimeoutSeconds: 45, maxTimeoutSeconds: 120 },
+  });
+  try {
+    const { input } = await callTool(pi, ctx, "bash", "tuned", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(input.timeout, 45);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: invalid timeout is refused, and a second failure stops the request", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    const invalid = await callTool(pi, ctx, "bash", "bad", {
+      command: "npm test",
+      timeout: 0,
+    });
+    assert.equal(invalid.block?.block, true);
+    assert.match(String(invalid.block?.reason), /greater than 0/);
+
+    const stopped = await callTool(pi, ctx, "bash", "next", {
+      command: "pnpm test",
+      timeout: 0,
+    });
+    assert.equal(stopped.block?.block, true);
+    assert.match(String(stopped.block?.reason), /greater than 0/);
+    assert.match(lastNotice(fake.notifies), /stopped this request/);
+    assert.equal(fake.aborts(), 1);
+
+    const afterTrip = await callTool(pi, ctx, "bash", "after", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(afterTrip.block?.block, true);
+    assert.match(String(afterTrip.block?.reason), /request is stopped/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: a timeout result gets guidance; repeating the command trips and aborts", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    const command = "npm test";
+    assert.equal(
+      (await callTool(pi, ctx, "bash", "t1", { command })).block,
+      undefined,
+    );
+
+    const first = await pi.emit(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "bash",
+        toolCallId: "t1",
+        isError: true,
+        durationMs: 120_000,
+        content: [
+          { type: "text", text: "partial output\n\nCommand timed out after 120 seconds" },
+        ],
+      },
+      ctx,
+    );
+    const firstPatch = first.filter((r: any) => r !== undefined).at(-1) as any;
+    assert.match(firstPatch.content.at(-1).text, /Do not replay/);
+    assert.equal(firstPatch.isError, true);
+    assert.equal(fake.aborts(), 0);
+
+    assert.equal(
+      (await callTool(pi, ctx, "bash", "t2", { command })).block,
+      undefined,
+    );
+    await pi.emit(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "bash",
+        toolCallId: "t2",
+        isError: true,
+        durationMs: 120_000,
+        content: [{ type: "text", text: "Command timed out after 120 seconds" }],
+      },
+      ctx,
+    );
+    assert.match(lastNotice(fake.notifies), /same shell command failed again/);
+    assert.equal(fake.aborts(), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: a user abort is not a qualifying failure", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    await callTool(pi, ctx, "bash", "u1", { command: "npm test" });
+    await pi.emit(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "bash",
+        toolCallId: "u1",
+        isError: true,
+        content: [{ type: "text", text: "Command aborted" }],
+      },
+      ctx,
+    );
+    const next = await callTool(pi, ctx, "bash", "u2", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(next.block, undefined);
+    assert.equal(fake.aborts(), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: a new idle user prompt resets; a steer or extension message does not", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    await callTool(pi, ctx, "bash", "r1", { command: "false", timeout: 0 });
+    await callTool(pi, ctx, "bash", "r2", { command: "false", timeout: 0 });
+    assert.match(
+      String(
+        (await callTool(pi, ctx, "bash", "r3", { command: "grep x f" })).block
+          ?.reason,
+      ),
+      /request is stopped/,
+    );
+
+    await pi.emit(
+      "input",
+      { text: "steer", source: "interactive", streamingBehavior: "steer" },
+      ctx,
+    );
+    assert.match(
+      String(
+        (await callTool(pi, ctx, "bash", "r4", { command: "grep x f" })).block
+          ?.reason,
+      ),
+      /request is stopped/,
+    );
+
+    await pi.emit(
+      "input",
+      { text: "new task", source: "extension" },
+      ctx,
+    );
+    assert.match(
+      String(
+        (await callTool(pi, ctx, "bash", "r5", { command: "grep x f" })).block
+          ?.reason,
+      ),
+      /request is stopped/,
+    );
+
+    await pi.emit("input", { text: "new task", source: "interactive" }, ctx);
+    const fresh = await callTool(pi, ctx, "bash", "r6", {
+      command: "grep x f",
+    });
+    assert.equal(fresh.block, undefined);
+    assert.equal(fresh.input.timeout, 120);
+    assert.equal(fake.aborts(), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: /shell-guard status reports limits and the request budget", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    await pi.commands["shell-guard"].handler("status", ctx);
+    const status = lastNotice(fake.notifies);
+    assert.match(status, /120s default/);
+    assert.match(status, /900s maximum/);
+    assert.match(status, /covers: bash, powershell, explorer shells, review_bash/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("review_bash: the isolated reviewer gets a finite timeout and the probe guard", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const builder = (_cwd: string) => ({
+    parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute(_id: string, params: any) {
+      seen.push({ ...params });
+      return { content: [{ type: "text", text: "ok" }], details: {} };
+    },
+  });
+  const state = createShellGuardRecovery();
+  const tool = createReviewBashTool(builder as never, {
+    cwd: process.cwd(),
+    log: () => {},
+    folderPolicy: () => ({
+      config: DEFAULT_FOLDER_POLICY_CONFIG,
+      grants: [],
+    }),
+    shellGuard: () => ({
+      limits: { defaultTimeoutSeconds: 120, maxTimeoutSeconds: 900 },
+      state,
+    }),
+  });
+
+  const empty = await tool.execute(
+    "1",
+    { command: "python - <<'PY'\nPY\n" },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  // The reviewer's role policy refuses every heredoc before the shell guard
+  // sees it; that refusal must stay authoritative.
+  assert.equal((empty as any).isError, true);
+  assert.match((empty as any).content[0].text, /heredoc/);
+  assert.equal(seen.length, 0);
+
+  const invalid = await tool.execute(
+    "2",
+    { command: "npm test", timeout: 0 },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  assert.equal((invalid as any).isError, true);
+  assert.match((invalid as any).content[0].text, /greater than 0/);
+  assert.equal(seen.length, 0);
+
+  await tool.execute(
+    "3",
+    { command: "grep -n foo bar.ts" },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  assert.equal(seen[0]?.timeout, 120);
+});

@@ -100,29 +100,29 @@
       "roles": {
         "planner": {
           "provider": "opencode-go",
-          "id": "longcat-2.5-free",
+          "id": "hy4-flash-free",
           "thinking": "high"
         },
         "explorer": {
           "provider": "opencode-go",
-          "id": "iceman-contributor-free",
-          "thinking": "low"
+          "id": "hy4-flash-free",
+          "thinking": "off"
         },
         "builder": {
           "provider": "opencode-go",
-          "id": "longcat-2.5-free",
-          "thinking": "medium"
+          "id": "hy4-flash-free",
+          "thinking": "high"
         },
         "reviewer": {
           "provider": "opencode-go",
-          "id": "longcat-2.5-free",
+          "id": "hy4-flash-free",
           "thinking": "high"
         }
       },
       "defaultModel": {
         "provider": "opencode-go",
-        "id": "longcat-2.5-free",
-        "thinking": "medium"
+        "id": "hy4-flash-free",
+        "thinking": "high"
       }
     },
     {
@@ -154,6 +154,37 @@
         "provider": "command-code",
         "id": "deepseek/deepseek-v4.1-flash",
         "thinking": "high"
+      }
+    },
+    {
+      "name": "openAI",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "max"
+        },
+        "explorer": {
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
+          "thinking": "high"
+        },
+        "builder": {
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
+          "thinking": "xhigh"
+        },
+        "reviewer": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "max"
+        }
+      },
+      "defaultModel": {
+        "provider": "openai-codex",
+        "id": "gpt-6-luna",
+        "thinking": "xhigh"
       }
     }
   ]

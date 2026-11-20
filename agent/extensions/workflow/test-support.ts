@@ -111,6 +111,8 @@ export function fakeSdk(script: {
   runtime?: unknown;
   /** Make the child's first prompt reject with this value (preflight-style). */
   failPrompt1?: unknown;
+  /** Text the fake review_bash backend returns (used by shell-guard tests). */
+  bashResultText?: string;
   /**
    * Report `isStreaming: true` while a pass script runs, so the runtime's
    * post-pass `abortChild()` path is exercised (default false preserves the
@@ -142,7 +144,12 @@ export function fakeSdk(script: {
     SessionManager: { inMemory: () => ({}) },
     createBashToolDefinition: () => ({
       parameters: {},
-      execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      execute: async () => ({
+        content: [
+          { type: "text", text: script.bashResultText ?? "ok" },
+        ],
+        ...(script.bashResultText ? { isError: true } : {}),
+      }),
     }),
     createAgentSession: async (opts: {
       tools?: string[];
@@ -529,12 +536,16 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   let idle = over.idle !== false;
   const workingMessages: Array<string | undefined> = [];
   const workingVisible: boolean[] = [];
+  let aborts = 0;
   const ctx = {
     cwd: over.cwd,
     mode: "tui",
     hasUI: over.hasUI === true,
     signal: over.signal,
     isIdle: () => idle,
+    abort: () => {
+      aborts += 1;
+    },
     isProjectTrusted: () => over.projectTrusted !== false,
     modelRegistry: over.modelRegistry ?? {
       find: (provider: string, id: string) => ({ provider, id }),
@@ -606,6 +617,8 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     setIdle(value: boolean) {
       idle = value;
     },
+    /** Count `ctx.abort()` calls (shell guard trips). */
+    aborts: () => aborts,
     confirms,
     selects,
     customs,

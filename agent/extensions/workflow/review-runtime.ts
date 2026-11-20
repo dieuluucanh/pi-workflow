@@ -56,6 +56,11 @@ import {
 import { appendProviderAuthHint } from "./review-providers.ts";
 import { isRecoverableProviderFailure } from "./review-recovery.ts";
 import { createReviewTools } from "./review-tools.ts";
+import {
+  createShellGuardRecovery,
+  DEFAULT_SHELL_LIMITS,
+  type ShellLimits,
+} from "./shell-guard.ts";
 import { buildPlanDiff, renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
 
 /** Event `type` from a child-session event, or "" for junk. Never throws. */
@@ -84,6 +89,12 @@ export interface ReviewRuntimeDeps {
     config: import("./folder-policy.ts").FolderPolicyConfig;
     grants: readonly string[];
   };
+  /**
+   * Effective finite shell limits for `review_bash`. The reviewer has no
+   * ambient extensions, so the main session's tool_call guard cannot protect
+   * it; the wrapper resolves these per execute.
+   */
+  shellGuardLimits?: () => ShellLimits;
   config: () => ReviewModeConfig | undefined;
   /** Resolve the reviewer role's model (falls back to the planner when unset). */
   reviewerModel: () =>
@@ -559,6 +570,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let settleCount = 0;
   let settleWaiters: Array<() => void> = [];
 
+  // Request-scoped shell guard for the reviewer child. A warm child is reused
+  // across independent rounds, so the state is replaced at every round start.
+  let currentShellRecovery = createShellGuardRecovery();
+  let shellGuardTrip: string | undefined;
+
   /**
    * Mark that a reviewer run has fully settled.
    *
@@ -832,6 +848,21 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           cwd: deps.cwd,
           log: deps.log,
           folderPolicy: deps.folderPolicy,
+          shellGuard: () => ({
+            limits: deps.shellGuardLimits?.() ?? (DEFAULT_SHELL_LIMITS as ShellLimits),
+            state: currentShellRecovery,
+            onTrip: (reason) => {
+              shellGuardTrip = reason;
+              // Cancel only the reviewer child. Do not await idle from inside
+              // its own tool execute: abort() would wait on the run that is
+              // currently executing this wrapper.
+              try {
+                void session?.abort();
+              } catch {
+                /* cancellation is best-effort */
+              }
+            },
+          }),
           explore: {
             // Step 8: Planner recon rides along in the prompt — when it is
             // present the reviewer verifies instead of re-exploring.
@@ -1106,6 +1137,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       roundActive = true;
       // Chunks from an earlier round must never leak into this one.
       resetPlanAssembler();
+      // A round is a new logical review request: its shell budget starts fresh.
+      currentShellRecovery = createShellGuardRecovery();
+      shellGuardTrip = undefined;
       // A review with nowhere to submit can only fail: do not spend a run on it.
       if (!input.planPath) {
         return fail("no plan path — the reviewer has nowhere to submit");
@@ -1328,6 +1362,18 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           reason: "aborted",
         };
       }
+      // A shell-guard trip is not a provider failure: never fall back to
+      // another model or retry the round. Keep real work if it was submitted.
+      if (shellGuardTrip) {
+        await abortChild();
+        const submittedPlan = p1.submitted?.planText;
+        const reason = `shell guard stopped the review: ${shellGuardTrip}`;
+        deps.log(
+          `${reason} — handing over ${submittedPlan ? "the submitted plan" : "the author's plan"}.`,
+          "warning",
+        );
+        return fail(reason, submittedPlan ?? originalPlan);
+      }
       if (p1.stop === "error") {
         await abortChild();
         const sendMessage = errorText(p1.error);
@@ -1447,6 +1493,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         // A round abort (or an abort-shaped stop) is not provider health.
         const p2Send = p2.error === undefined ? "" : errorText(p2.error);
         const p2Aborted =
+          shellGuardTrip !== undefined ||
           rc.signal.aborted ||
           isAbortStopText(p2Send) ||
           isAbortStopText(lastProviderError?.message);
@@ -1479,6 +1526,15 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           );
         }
         if (p2.stop === "timeout") await abortChild();
+      }
+
+      // A guard trip during self-verification ends that pass; pass 1's valid
+      // submission is still the best plan, so keep it rather than falling back.
+      if (shellGuardTrip) {
+        deps.log(
+          `shell guard stopped the verification pass: ${shellGuardTrip} — keeping pass 1's plan.`,
+          "warning",
+        );
       }
 
       if (state) {

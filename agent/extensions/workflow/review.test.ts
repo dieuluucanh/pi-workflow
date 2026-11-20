@@ -5597,3 +5597,45 @@ test("reviewer guarded read: a specific rule is denied and nothing re-opens it; 
   assert.notEqual(broadAllowed.isError, true);
   assert.match(String(broadAllowed.content[0]?.text), /read ok/);
 });
+
+test("runtime: a reviewer shell-guard trip stops the round without provider fallback", async () => {
+  const seenModels: string[] = [];
+  const { capture, sdk } = fakeSdk({
+    bashResultText: "partial output\n\nCommand timed out after 120 seconds",
+    pass1: async (c) => {
+      const bash = c.tools.review_bash as {
+        execute: (...args: unknown[]) => Promise<unknown>;
+      };
+      await bash.execute("s1", { command: "npm test", timeout: 30 }, undefined, undefined, {});
+      await bash.execute("s2", { command: "npm test", timeout: 30 }, undefined, undefined, {});
+    },
+  });
+  const { deps, logs } = runtimeDeps(sdk, {
+    // Unlimited review round: the shell guard must still apply.
+    config: { timeoutMs: 0 },
+    fallbacks: [{ provider: "q", id: "m2", thinking: "high" }],
+  });
+  (deps as Record<string, unknown>).shellGuardLimits = () => ({
+    defaultTimeoutSeconds: 120,
+    maxTimeoutSeconds: 900,
+  });
+  seenModels.push("");
+  const rt = createReviewRuntime(deps as never);
+
+  const res = await rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+
+  assert.equal(res.ok, false);
+  assert.match(String(res.reason), /shell guard stopped the review/);
+  assert.match(String(res.reason), /same shell command failed again/);
+  assert.equal(res.planText, ORIGINAL_PLAN, "the author's plan is preserved");
+  assert.ok(capture.aborts >= 1, "only the reviewer child was cancelled");
+  assert.equal(capture.prompts.length, 1, "no provider fallback attempt");
+  assert.ok(
+    logs.some((line) => /handing over the author's plan/.test(line)),
+    "the fallback is named",
+  );
+});
