@@ -13666,6 +13666,10 @@ export default function workflowExtension(
     ctx: any,
     trigger: string,
   ): Promise<void> {
+    // Orchestrator step 35: a managed child never commits because its local
+    // TODO, `[DONE]` tag or checkbox completed. Only parent-verified
+    // acceptance may commit, through the parent's own ledger/policy.
+    if (managedGate) return;
     try {
       const cwd = ctx?.cwd ?? process.cwd();
       if (!isGitRepoSync(cwd)) return;
