@@ -4,6 +4,44 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — Orchestrator (experimental)
+
+An opt-in engine for long, phased roadmaps. It is **not** a release of the
+live orchestration loop: the durable contracts, reducers and host seam are
+implemented and tested, while real provider/turn wiring, cross-platform
+terminal launches and Desktop E2E remain manual/next-step work.
+
+- New `/orchestrator` mode and Orchestrator role with planner fallback; mode
+  entry never launches work and the ordinary Plan → Review → Build flow is
+  unchanged.
+- Durable run journal with checksummed append, single writer, idempotent event
+  ids, torn-write recovery and intent/ack reconciliation; roadmap ingestion
+  keeps every requirement and treats `- [x]` as a claim, not proof.
+- Task-only execution TODOs, coverage-validated decomposition, context and
+  capability budgets, execution preview/approval and bounded assignment packets.
+- Normal visible Build children: durable metadata before launch, readiness and
+  lease-gated wake, cross-platform terminal adapters, Desktop related-session
+  hosting, Build environment parity and worker-local TODOs.
+- Evidence-backed parent acceptance (real diff, real check output, workspace and
+  roadmap revision fences), scoped repair with persisted budgets, context
+  rollover with a safe-boundary checkpoint, and a final integration gate driven
+  only by accepted task coverage.
+- Parent-only commits with a durable evidence-keyed ledger; managed children
+  suppress TODO/`[DONE]`/checkbox/report auto-commits and may not push.
+- Run controls (pause/resume/stop with quiesce-before-lease-release), restart/
+  branch reconciliation, drift detection that never widens policy automatically,
+  bounded parent context/compaction pointers, usage/caps/retention, an optional
+  independent verifier and a future stage interface.
+- Generic host contribution and related-session contract; Pi Desktop renders two
+  unrelated fixture extensions with arbitrary mode names and source-bound
+  related-session ownership, with no Workflow parsing.
+- Automated coverage: generated transition invariants, provider-free fake-agent
+  process crashes, real on-disk journal recovery, workspace/lease/baseline
+  edges, generic Desktop contract fixtures, full extension test suites.
+- Live acceptance is **NOT RUN**: see `docs/orchestrator-live-acceptance.md` for
+  the manual checklist (real models, Windows Terminal, macOS Terminal and
+  Linux/tmux signoff).
+
 ### Fixed — shell probes can no longer hang a request indefinitely
 
 The 2026-11-20 `erp-atom` incident recorded two valid but empty

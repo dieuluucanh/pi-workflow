@@ -27,6 +27,21 @@ Each extension is its own npm package (install just what you want):
 
 External packages listed in `agent/settings.json` auto-install on first trusted startup.
 
+### Orchestrator (experimental)
+
+`@dieulc/workflow` also contains the opt-in Orchestrator engine: a durable run
+journal, one cooperative workspace writer, normal visible Build child sessions,
+evidence-backed parent acceptance, scoped repair, context rollover, a final
+integration gate and parent-only commits. Generic Desktop contributions and
+related-session hosting are exercised by two unrelated fixture extensions — no
+Workflow names are needed in the host.
+
+Mode entry alone never launches work, existing Plan → Review → Build remains the
+default, and a managed child can never auto-commit, push or accept its own work.
+The engine is **experimental and not yet wired into a live orchestration loop**;
+see [`docs/orchestrator-live-acceptance.md`](docs/orchestrator-live-acceptance.md)
+for the automated evidence and the live signoff that has **not** been run.
+
 > This repo root is **not** a Pi package and is not published (`"private": true`). Install the extensions individually, or clone the repo for the dotfiles.
 
 ## Install

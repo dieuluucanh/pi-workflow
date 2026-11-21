@@ -15,6 +15,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Write permission** — a user-controlled `allow`/`ask`/`never` permission for file writes in **Default** mode, the mode that is otherwise ungated. `/write-policy` sets it; see [Write permission](#write-permission) below.
 - **Shell guard** — finite native deadlines for every shell surface (120 s default, 900 s ceiling), a pre-launch refusal for provably empty interpreter-stdin heredocs, and a request-scoped recovery budget: one changed approach, then stop. Covers main `bash`/`powershell`, explorer subprocesses and the isolated reviewer's `review_bash`; never times out human dialogs. See [Shell guard](#shell-guard).
 - **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
+- **Orchestrator (experimental)** — opt-in long-roadmap execution engine: task-only execution TODOs, durable run journal, visible normal Build children, parent-owned verification/acceptance, bounded repair and rollover, and parent-only commits. Mode entry never launches work; the ordinary Plan → Review → Build flow is unchanged. See [Orchestrator](#orchestrator-experimental) below.
 
 ## Install
 
@@ -57,6 +58,75 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/shell-guard [status]` | Show the effective shell deadlines, their settings source, and this request's failure budget. `/shell-guard limits <default-seconds> <max-seconds> [global\|project]` sets them; `/shell-guard reset` clears a tripped request while idle |
 
 Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a **reviewer round or review-owned handoff** owns the turn — `running`, `paused`, or a handoff produced by `/review`/Review Mode, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review). A **plain plan handoff** (Review Mode off) does not lock modes or prompts: switching or typing a new prompt supersedes it, and the plan file stays on disk.
+
+## Orchestrator (experimental)
+
+Orchestrator mode is an opt-in engine for a long, phased roadmap. It is
+**experimental**: the contracts and reducers are implemented and tested, but the
+live orchestration loop (real provider/turn wiring) is not released yet. Entering
+the mode changes nothing by itself and ordinary short Plan → Review → Build work
+keeps its current behavior.
+
+### Core rules
+
+- **Mode entry is not execution.** `/orchestrator` enters the mode; the first
+dispatch requires an execution approval that is separate from plan approval and
+from mode entry. A missing old role config falls back to the planner model
+without rewriting files; the worker model remains Builder.
+- **Identity is durable.** Run/task/attempt/session ids are stable; TODO numbers
+  are display refs only. A child's local step 1 is never the parent's roadmap
+  step 1, and child TODOs cannot complete a roadmap.
+- **One writer.** A cooperative workspace lease and the run state machine give
+  the workspace to exactly one attempt at a time. A stale lease generation
+  cannot write, pause, repair or resume.
+- **Candidates are not acceptance.** A worker report only proposes completion.
+  The parent captures the real diff, runs the required checks through the normal
+  gated tool path, records exit status/evidence, and accepts atomically only
+  against the exact candidate, workspace and roadmap revision.
+- **Bounded retries.** Repair and no-progress counters persist across retries and
+  rollovers. A failed verification never advances; exhausted budgets pause with
+  explicit retry/unblock/cancel controls.
+- **Normal children.** Each worker is an ordinary visible Pi session with normal
+  tools, UI, questions and local TODOs — not a hidden headless fork of the
+  parent history. Persisted creation is distinct from an authorized start: a
+  resume stays idle until one correlated wake starts the assignment.
+- **Parent-only commits.** Managed children suppress TODO/`[DONE]`/checkbox and
+  report auto-commits and may not push. An accepted task is committed at most
+  once, by the parent, from parent-attributable paths, under the existing
+  `never`/`ask`/`allow` policy. Baseline overlap is an attribution conflict, not
+  an automatic stage.
+- **Bounded parent context.** The parent carries a small run pointer/projection
+  (accepted/remaining, active task, next decision) and pages history on demand;
+  compaction keeps the pending verify/repair/accept decision instead of losing
+  it in prose.
+- **Recovery is conservative.** Reload compares the journal, active branch,
+  parent process identity and real session files. An uncertain kickoff is
+  reconciled by inspection, never replayed blindly; parent loss stops children;
+  fork/tree/rewind cannot reuse an active run/lease without an explicit clone.
+- **Final gate.** Roadmap completion comes from accepted task coverage, not from
+  every child TODO being done. A roadmap-level integration/manual check failure
+  keeps the run non-complete and returns a scoped repair proposal; a scope change
+  needs a new approval.
+
+### Host contract
+
+Plan/Build/Review/TODO presentation is published through a generic, bounded host
+contract. Pi Desktop renders arbitrary extension modes, actions, input
+availability and related sessions without parsing Workflow names; related-session
+ownership is derived from a registered command's source info, not from an owner
+string in the payload. Two unrelated fixture extensions cover this contract in
+both repos (`fixtures/two-extension-contract.json`).
+
+### What is not released yet
+
+- No live provider/turn loop is wired into the extension entrypoint; the modules
+  and their tests are present, the runtime integration is the remaining work.
+- Real Windows Terminal / macOS Terminal / Linux tmux launches, real model runs,
+  packaged Desktop E2E and cross-platform signoff have not been run.
+- The installed SDK's anonymous event bus is not publisher authentication;
+  extensions remain trusted executable code. See
+  [`../../../docs/orchestrator-live-acceptance.md`](../../../docs/orchestrator-live-acceptance.md)
+  for the exact checklist (currently **NOT RUN**).
 
 ## Shell guard
 

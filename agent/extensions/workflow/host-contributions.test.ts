@@ -237,3 +237,65 @@ test("ordering is owner-stable: order, then owner, then id", () => {
   sortContributions(input);
   assert.equal(input[0]?.ownerId, "b");
 });
+
+interface TwoExtensionFixture {
+  version: number;
+  extensions: Array<{ name: string; envelope: unknown }>;
+  expect: {
+    ownerIds: string[];
+    modes: string[];
+    inputAvailability: string[];
+    childRefs: string[];
+    commands: string[];
+  };
+}
+
+test("two unrelated fixture extensions share the generic contract without Workflow names", () => {
+  const fixturePath = path.join(HERE, "fixtures", "two-extension-contract.json");
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as TwoExtensionFixture;
+  assert.equal(fixture.version, 1);
+
+  const entries: Array<{ ownerId: string; contribution: Contribution }> = [];
+  const ownerIds: string[] = [];
+  for (const extension of fixture.extensions) {
+    const parsed = parseContributionEnvelope(extension.envelope);
+    assert.equal(parsed.ok, true, `${extension.name}: ${parsed.ok ? "" : parsed.error}`);
+    const envelope = (parsed as { ok: true; value: { envelope: ContributionEnvelope } }).value.envelope;
+    ownerIds.push(envelope.owner.id);
+    const applied = applyEnvelope(undefined, envelope);
+    assert.equal(applied.ok, true);
+    for (const contribution of (applied as { ok: true; value: { contributions: Map<string, Contribution> } }).value.contributions.values()) {
+      entries.push({ ownerId: envelope.owner.id, contribution });
+    }
+  }
+
+  assert.deepEqual(ownerIds, fixture.expect.ownerIds);
+  const sorted = sortContributions(entries);
+  assert.deepEqual(
+    sorted.flatMap((entry) => (entry.contribution.kind === "mode" ? [entry.contribution.label] : [])),
+    fixture.expect.modes,
+  );
+  assert.deepEqual(
+    sorted.flatMap((entry) =>
+      entry.contribution.kind === "input" ? [entry.contribution.availability] : [],
+    ),
+    fixture.expect.inputAvailability,
+  );
+  assert.deepEqual(
+    sorted.flatMap((entry) =>
+      entry.contribution.kind === "related-session" ? [entry.contribution.sessionRef] : [],
+    ),
+    fixture.expect.childRefs,
+  );
+  assert.deepEqual(
+    sorted.flatMap((entry) =>
+      entry.contribution.kind === "action" ? [entry.contribution.command.name] : [],
+    ),
+    fixture.expect.commands,
+  );
+  assert.equal(
+    JSON.stringify(entries).match(/workflow/i),
+    null,
+    "fixtures must not depend on Workflow names",
+  );
+});

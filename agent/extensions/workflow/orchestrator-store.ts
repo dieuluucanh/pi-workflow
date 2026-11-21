@@ -403,15 +403,18 @@ export function createRunJournal(options: {
       const replayed = replayJournal(runId, await io.read(journalPath));
       if (!replayed.ok) return replayed;
       await io.mkdir(dir);
-      // Rewrite a clean journal (drops a torn/tampered tail) and snapshot.
+      // Rewrite a clean journal (drops a torn/tampered tail) and snapshot. The
+      // returned state describes the recovered journal: nothing is truncated
+      // any more, so a caller cannot mistake the recovery result for a torn one.
+      const recovered: JournalState = { ...replayed.value.state, truncated: 0 };
       await io.writeAtomic(
         journalPath,
         replayed.value.validLines.length > 0
           ? `${replayed.value.validLines.join("\n")}\n`
           : "",
       );
-      await writeSnapshot(replayed.value.state);
-      return { ok: true, value: replayed.value.state };
+      await writeSnapshot(recovered);
+      return { ok: true, value: recovered };
     },
 
     async putArtifact(input) {
