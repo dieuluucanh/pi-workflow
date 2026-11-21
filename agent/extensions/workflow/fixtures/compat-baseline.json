@@ -44,6 +44,7 @@
     "default",
     "folder-policy",
     "handoff",
+    "orchestrator",
     "permissions",
     "plan",
     "profile",
@@ -65,6 +66,7 @@
     "builtIn": [
       "builder",
       "explorer",
+      "orchestrator",
       "planner",
       "reviewer"
     ],
@@ -73,7 +75,8 @@
       "planner",
       "explorer",
       "builder",
-      "reviewer"
+      "reviewer",
+      "orchestrator"
     ]
   },
   "statusKeys": {

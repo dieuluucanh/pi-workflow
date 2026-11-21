@@ -101,9 +101,18 @@ export interface ContributionPublisher {
   dispose(): void;
 }
 
-function sameIds(a: readonly Contribution[], b: readonly Contribution[]): boolean {
+
+/**
+ * Full content equality, not just ids: a progress count, label, enabled flag or
+ * panel-state detail must reach the host. Order is deterministic (`sortContributions`),
+ * and every contribution is plain JSON, so a stable serialization is exact.
+ */
+function sameContributions(a: readonly Contribution[], b: readonly Contribution[]): boolean {
   if (a.length !== b.length) return false;
-  return a.every((entry, index) => entry.id === b[index]?.id);
+  for (let index = 0; index < a.length; index += 1) {
+    if (JSON.stringify(a[index]) !== JSON.stringify(b[index])) return false;
+  }
+  return true;
 }
 
 /**
@@ -220,7 +229,7 @@ export function createContributionPublisher(
 
       // No change → no churn (but still fall back if the host is unsupported,
       // because the caller may rely on the fallback being current).
-      if (sameIds(contributions, ordered) && removed.length === 0) {
+      if (sameContributions(contributions, ordered) && removed.length === 0) {
         if (!publisher.supported()) fallback(ordered);
         return { ok: true, published: publisher.supported() };
       }

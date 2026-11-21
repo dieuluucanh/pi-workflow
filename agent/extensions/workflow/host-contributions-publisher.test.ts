@@ -108,6 +108,49 @@ test("publisher: an unchanged set is not re-emitted", () => {
   assert.equal(h.publisher.revision(), 1);
 });
 
+test("publisher: a content change republishes even when the ids are unchanged", () => {
+  // Progress counts, labels, enabled flags and panel-state details all travel
+  // in the same ids, so an id-only comparison would freeze the host's view.
+  const h = harness();
+  h.publisher.hello({ contractVersion: 1, kinds: [], slots: [] });
+  h.publisher.set([
+    {
+      id: "todos",
+      kind: "progress",
+      slot: "progress",
+      label: "Todos",
+      tone: "neutral",
+      order: 0,
+      done: 1,
+      total: 3,
+      actions: [],
+    },
+  ]);
+  assert.equal(h.publisher.revision(), 1);
+
+  const changed = h.publisher.set([
+    {
+      id: "todos",
+      kind: "progress",
+      slot: "progress",
+      label: "Todos",
+      tone: "neutral",
+      order: 0,
+      done: 2,
+      total: 3,
+      detail: "Expanded",
+      actions: [],
+    },
+  ]);
+  assert.equal(changed.published, true);
+  assert.equal(h.publisher.revision(), 2);
+  const envelope = h.updates().at(-1);
+  const progress = envelope?.contributions.find((entry) => entry.id === "todos");
+  assert.ok(progress && progress.kind === "progress");
+  assert.equal(progress.done, 2);
+  assert.equal(progress.detail, "Expanded");
+});
+
 test("publisher: removals are explicit, and clear withdraws everything", () => {
   const h = harness();
   h.publisher.hello({ contractVersion: 1, kinds: [], slots: [] });

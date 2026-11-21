@@ -113,6 +113,9 @@ export function resolveSessionRole(input?: {
   const fromEnv = normalizeRole(input?.envRole);
   if (fromEnv) return fromEnv;
   if (input?.workflowMode === "plan") return "planner";
+  // Orchestrator is a parent/verification mode: reuse the planner policy so it
+  // is read-only, not a second unrestricted Builder.
+  if (input?.workflowMode === "orchestrator") return "planner";
   if (input?.workflowMode === "build") return "builder";
   return undefined;
 }

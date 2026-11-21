@@ -1,0 +1,250 @@
+/**
+ * Workflow Extension — Workflow's own contributions to the generic contract.
+ *
+ * The generic protocol (`host-contributions.ts`) knows nothing about Plan,
+ * Build, Review or TODOs. This module is the only place that maps Workflow's
+ * state onto it, so a host can render Workflow's controls natively without
+ * parsing glyphs or knowing `/review-pause`.
+ *
+ * Terminal Pi keeps its existing status/widgets; this is additive. A host that
+ * does not speak the contract gets the publisher's fallback (step 7).
+ */
+
+import type { Contribution } from "./host-contributions.ts";
+import type { WorkflowMode } from "./workflow-mode.ts";
+
+export const WORKFLOW_OWNER_ID = "@dieulc/workflow";
+
+/** The effective todo-panel presentation, when the extension knows it. */
+export type WorkflowPanelState = "expanded" | "collapsed" | "hidden";
+
+export interface WorkflowContributionInput {
+  mode: WorkflowMode;
+  done: number;
+  total: number;
+  stale?: boolean;
+  /** Effective todo-panel state; display-only, never inferred by the host. */
+  panelState?: WorkflowPanelState | null;
+  /** Live review phase; `idle` means no review row. */
+  reviewPhase?: "idle" | "running" | "paused" | "handoff" | "transition" | null;
+  /** A pending handoff that is not review-owned. */
+  handoffPending?: boolean;
+  /** Panel/commit hints, optional (display only). */
+  commitMode?: string;
+  writeMode?: string | null;
+}
+
+/** Human-readable panel state for the generic progress detail (display only). */
+export function panelStateLabel(state: WorkflowPanelState): string {
+  return state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+/**
+ * Builds Workflow's contribution set. Order values are fixed so a mode badge
+ * stays left of progress and actions.
+ */
+export function buildWorkflowContributions(
+  input: WorkflowContributionInput,
+): Contribution[] {
+  const out: Contribution[] = [];
+  const phase = input.reviewPhase ?? "idle";
+  const reviewing = phase !== "idle";
+  const done = Math.max(0, Math.trunc(input.done));
+  const total = Math.max(0, Math.trunc(input.total));
+
+  if (reviewing) {
+    const base =
+      phase === "paused"
+        ? "🔍 review — paused"
+        : phase === "handoff"
+          ? "🔍 review — awaiting decision"
+          : "🔍 review";
+    out.push({
+      id: "mode",
+      kind: "mode",
+      slot: "mode",
+      label: base,
+      tone: phase === "paused" ? "warning" : "accent",
+      order: 0,
+      detail:
+        phase === "handoff"
+          ? "The plan is waiting for your decision in the review tab."
+          : "An independent reviewer owns this turn.",
+      actions: [],
+    });
+    out.push({
+      id: "review",
+      kind: "action",
+      slot: "action",
+      label: phase === "paused" ? "Resume review" : "Review status",
+      tone: "info",
+      order: 20,
+      command: { name: phase === "paused" ? "review-resume" : "review-status" },
+      enabled: phase !== "handoff",
+      ...(phase === "handoff" ? { disabledReason: "decide in the review tab" } : {}),
+    });
+    out.push({
+      id: "input",
+      kind: "input",
+      slot: "input",
+      availability: "locked",
+      tone: "warning",
+      order: 40,
+      reason: "A reviewer owns this turn; pause or stop it to prompt the plan agent.",
+    });
+    if (phase === "running" || phase === "paused") {
+      out.push({
+        id: "review-stop",
+        kind: "action",
+        slot: "action",
+        label: "Stop review",
+        tone: "warning",
+        order: 30,
+        command: { name: "review-abort" },
+        enabled: true,
+      });
+    }
+    return out;
+  }
+
+  const modeLabel =
+    input.mode === "build"
+      ? "▶ build"
+      : input.mode === "plan"
+        ? "⏸ plan"
+        : input.mode === "orchestrator"
+          ? "🧭 orchestrator"
+          : "◦ default";
+  out.push({
+    id: "mode",
+    kind: "mode",
+    slot: "mode",
+    label: modeLabel,
+    tone:
+      input.mode === "build"
+        ? "accent"
+        : input.mode === "plan"
+          ? "warning"
+          : input.mode === "orchestrator"
+            ? "info"
+            : "neutral",
+    order: 0,
+    detail: input.handoffPending ? "handoff pending" : undefined,
+    actions: [],
+  });
+
+  out.push({
+    id: "input",
+    kind: "input",
+    slot: "input",
+    availability: "available",
+    tone: "neutral",
+    order: 5,
+    reason: "Prompts go to the active workflow mode.",
+  });
+
+  if (total > 0) {
+    out.push({
+      id: "todos",
+      kind: "progress",
+      slot: "progress",
+      label: "Todos",
+      tone: "neutral",
+      order: 10,
+      done: Math.min(done, total),
+      total,
+      ...(input.stale ? { stale: true } : {}),
+      ...(input.panelState ? { detail: panelStateLabel(input.panelState) } : {}),
+      actions: [],
+    });
+  }
+
+  if (total > 0) {
+    const displayActions: Array<[string, string, string]> = [
+      ["todos-auto", "Automatic", "auto"],
+      ["todos-expand", "Show todos", "expand"],
+      ["todos-collapse", "Collapse todos", "collapse"],
+      ["todos-hide", "Hide todos", "hide"],
+    ];
+    for (const [id, label, args] of displayActions) {
+      out.push({
+        id,
+        kind: "action",
+        slot: "action",
+        label,
+        tone: "neutral",
+        order: 11,
+        command: { name: "todos", args },
+        enabled: true,
+      });
+    }
+    // A computed toggle keeps Ctrl+Alt+O equivalent without the host having to
+    // infer the panel's state from markup or status prose.
+    out.push({
+      id: "todos-toggle",
+      kind: "action",
+      slot: "action",
+      label: input.panelState === "expanded" ? "Collapse panel" : "Expand panel",
+      tone: "neutral",
+      order: 12,
+      command: {
+        name: "todos",
+        args: input.panelState === "expanded" ? "collapse" : "expand",
+      },
+      enabled: true,
+    });
+  }
+
+  out.push({
+    id: "mode-plan",
+    kind: "action",
+    slot: "action",
+    label: "Plan",
+    tone: "warning",
+    order: 20,
+    command: { name: "plan" },
+    enabled: input.mode !== "plan",
+    ...(input.mode === "plan" ? { disabledReason: "already in Plan" } : {}),
+  });
+  out.push({
+    id: "mode-orchestrator",
+    kind: "action",
+    slot: "action",
+    label: "Orchestrator",
+    tone: "info",
+    order: 22,
+    command: { name: "orchestrator" },
+    enabled: input.mode !== "orchestrator",
+    ...(input.mode === "orchestrator"
+      ? { disabledReason: "already in Orchestrator" }
+      : {}),
+  });
+  out.push({
+    id: "mode-build",
+    kind: "action",
+    slot: "action",
+    label: "Build",
+    tone: "accent",
+    order: 21,
+    command: { name: "build" },
+    enabled: input.mode !== "build",
+    ...(input.mode === "build" ? { disabledReason: "already in Build" } : {}),
+  });
+
+  if (input.commitMode || input.writeMode) {
+    const parts = [
+      input.commitMode ? `commits:${input.commitMode}` : "",
+      input.writeMode ? `writes:${input.writeMode}` : "",
+    ].filter(Boolean);
+    out.push({
+      id: "policy",
+      kind: "status",
+      slot: "status",
+      text: parts.join(" · "),
+      tone: "neutral",
+      order: 40,
+    });
+  }
+
+  return out;
+}

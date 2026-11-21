@@ -198,6 +198,7 @@ test("profiles: sanitizer drops bad entries, unknown role keys and invalid model
     "explorer",
     "builder",
     "reviewer",
+    "orchestrator",
   ]);
 });
 

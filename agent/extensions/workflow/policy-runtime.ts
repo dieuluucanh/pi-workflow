@@ -70,7 +70,7 @@ export interface PolicyInputs {
   /** `PI_WORKFLOW_ROLE` for a spawned subagent, if any. */
   envRole?: unknown;
   /** The live workflow mode (`null` = Default). */
-  workflowMode?: "plan" | "build" | null;
+  workflowMode?: "plan" | "build" | "orchestrator" | null;
   folder: FolderPolicyConfig;
   write: WritePolicyConfig;
   shellLimits?: ShellLimits;
@@ -95,7 +95,7 @@ export interface PolicySnapshot {
  */
 export function resolveRolePolicy(inputs: {
   envRole?: unknown;
-  workflowMode?: "plan" | "build" | null;
+  workflowMode?: "plan" | "build" | "orchestrator" | null;
 }): {
   role: WorkflowRole | undefined;
   policy: RolePolicy | undefined;

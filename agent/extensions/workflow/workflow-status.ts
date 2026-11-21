@@ -21,7 +21,7 @@ export const WORKFLOW_STATUS_KEYS = {
 } as const;
 
 export interface WorkflowStatusInput {
-  mode: "build" | "plan" | null;
+  mode: "build" | "plan" | "orchestrator" | null;
   /**
    * The exclusive Review turn. `running|paused|handoff` replaces the author
    * mode in the segment; `transition` is internal and renders as running.
@@ -84,6 +84,11 @@ export function buildWorkflowStatusSegments(
       base = total > 0 ? `▶ build ${done}/${total}${stale}` : `▶ build${stale}`;
     } else if (input.mode === "plan") {
       base = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
+    } else if (input.mode === "orchestrator") {
+      base =
+        total > 0
+          ? `🧭 orchestrator ${done}/${total}${stale}`
+          : `🧭 orchestrator${stale}`;
     } else if (total > 0) {
       // The default mode must stay parseable by the Desktop badge decoder.
       base = `◦ ${done}/${total}${stale}`;

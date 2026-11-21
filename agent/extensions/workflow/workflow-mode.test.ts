@@ -86,7 +86,26 @@ test("role and label: each mode names one semantic role", () => {
   assert.equal(modeLabel("build"), "build");
   assert.equal(modeLabel(null), "default");
   assert.equal(isWorkflowMode("plan"), true);
-  assert.equal(isWorkflowMode("orchestrator"), false);
+  assert.equal(isWorkflowMode("orchestrator"), true);
+  assert.equal(roleForMode("orchestrator"), "orchestrator");
+  assert.equal(modeLabel("orchestrator"), "orchestrator");
+});
+
+test("cycle: Orchestrator is opt-in and Tab leaves it for Default", () => {
+  // Not in the Tab order, so the default Plan→Build→Default cycle is unchanged.
+  assert.equal(cycleMode("orchestrator", 1), null);
+  assert.equal(cycleMode("orchestrator", -1), null);
+});
+
+test("codec: orchestrator round-trips and older readers see Default flags", () => {
+  const encoded = encodeWorkflowMode("orchestrator");
+  assert.equal(encoded.mode, "orchestrator");
+  // Legacy flags are false, so an older Workflow reads Default, never Plan/Build.
+  assert.equal(encoded.enabled, false);
+  assert.equal(encoded.executing, false);
+  const decoded = decodeWorkflowEntry(encoded);
+  assert.equal(decoded?.mode, "orchestrator");
+  assert.equal(decoded?.legacy, false);
 });
 
 test("codec: the current shape round-trips", () => {
@@ -119,7 +138,7 @@ test("codec: a legacy entry with neither flag keeps the previous mode", () => {
 test("codec: an unknown or corrupt mode degrades to Default, never crashes", () => {
   // A mode this build does not understand must not keep running plan/build
   // gating on a guess: Default (no workflow) is the safe state.
-  assert.equal(decodeWorkflowEntry({ mode: "orchestrator" })?.mode, null);
+  assert.equal(decodeWorkflowEntry({ mode: "someday" })?.mode, null);
   assert.equal(decodeWorkflowEntry({ mode: 42 }, "build")?.mode, null);
   assert.equal(decodeWorkflowEntry(null), undefined);
   assert.equal(decodeWorkflowEntry("plan"), undefined);

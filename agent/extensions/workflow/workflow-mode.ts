@@ -22,13 +22,13 @@
 
 import type { TodoItem } from "./utils.ts";
 
-/** `null` is Default (workflow off). Orchestrator is a separate phase. */
-export type WorkflowMode = "plan" | "build" | null;
+/** `null` is Default (workflow off). Orchestrator is opt-in, never in Tab. */
+export type WorkflowMode = "plan" | "build" | "orchestrator" | null;
 
-export const WORKFLOW_MODES: readonly WorkflowMode[] = ["plan", "build", null];
+export const WORKFLOW_MODES: readonly WorkflowMode[] = ["plan", "build", "orchestrator", null];
 
 export function isWorkflowMode(value: unknown): value is WorkflowMode {
-  return value === "plan" || value === "build" || value === null;
+  return value === "plan" || value === "build" || value === "orchestrator" || value === null;
 }
 
 // ── Tool policy ──────────────────────────────────────────────────────
@@ -51,6 +51,13 @@ export const PLAN_MODE_TOOLS = [
   "questionnaire",
   "workflow_todo",
 ] as const;
+
+/**
+ * Tools Orchestrator keeps active. It is a parent/verification mode: the same
+ * read-only exploration set as Plan, with project edits gated. Dispatch tools
+ * arrive in later phases; entering the mode must not launch anything.
+ */
+export const ORCHESTRATOR_MODE_TOOLS = [...PLAN_MODE_TOOLS] as const;
 
 /** Tools Build (the normal state) ensures are present. */
 export const NORMAL_MODE_TOOLS = [...PLAN_MODE_TOOLS] as const;
@@ -79,6 +86,11 @@ export function planModeTools(active: readonly string[]): string[] {
   ]);
 }
 
+/** Active tools for Orchestrator: read-only plus the gated plan-write path. */
+export function orchestratorModeTools(active: readonly string[]): string[] {
+  return planModeTools(active);
+}
+
 /**
  * Active tools for Build/Default. The workflow-managed names are placed first
  * and in a stable order so a persisted/debugged tool list is reproducible.
@@ -99,18 +111,22 @@ export function isManagedTool(name: string): boolean {
 
 /** Tab / Ctrl+Alt+P order: Default → Plan → Build → Default. */
 export function cycleMode(current: WorkflowMode, direction: 1 | -1 = 1): WorkflowMode {
+  // Orchestrator is opt-in and not in this cycle. Tab (either direction) leaves
+  // it for Default; /plan and /build switch directly.
+  if (current === "orchestrator") return null;
   const order: WorkflowMode[] = [null, "plan", "build"];
   const index = order.indexOf(current);
   const next = (index + direction + order.length) % order.length;
   return order[next] ?? null;
 }
 
-export type ModeRole = "planner" | "builder" | null;
+export type ModeRole = "planner" | "builder" | "orchestrator" | null;
 
 /** The semantic role a mode activates (the model binding lives in roles.ts). */
 export function roleForMode(mode: WorkflowMode): ModeRole {
   if (mode === "plan") return "planner";
   if (mode === "build") return "builder";
+  if (mode === "orchestrator") return "orchestrator";
   return null;
 }
 
@@ -118,6 +134,7 @@ export function roleForMode(mode: WorkflowMode): ModeRole {
 export function modeLabel(mode: WorkflowMode): string {
   if (mode === "plan") return "plan";
   if (mode === "build") return "build";
+  if (mode === "orchestrator") return "orchestrator";
   return "default";
 }
 
@@ -169,8 +186,16 @@ export function decodeWorkflowEntry(
   // our own `{mode: null}` output as legacy and mislabel it.
   if ("mode" in record) {
     // An unknown string is a newer mode this build does not understand: treat
-    // it as Default rather than crashing or guessing.
-    mode = record.mode === "plan" ? "plan" : record.mode === "build" ? "build" : null;
+    // it as Default rather than crashing or guessing. Orchestrator is the
+    // current opt-in mode; older readers still see Default.
+    mode =
+      record.mode === "plan"
+        ? "plan"
+        : record.mode === "build"
+          ? "build"
+          : record.mode === "orchestrator"
+            ? "orchestrator"
+            : null;
   } else if (typeof record.enabled === "boolean" || typeof record.executing === "boolean") {
     legacy = true;
     if (record.enabled === true) mode = "plan";

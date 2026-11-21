@@ -258,6 +258,12 @@ import {
 } from "./todo-panel.ts";
 import { createTodoStore } from "./todo-service.ts";
 import { classifyToolMutation, resolveRolePolicy } from "./policy-runtime.ts";
+import { createContributionPublisher } from "./host-contributions-publisher.ts";
+import {
+  buildWorkflowContributions,
+  WORKFLOW_OWNER_ID,
+  type WorkflowPanelState,
+} from "./workflow-contributions.ts";
 import {
   createManagedSessionGate,
   readManagedSessionContext,
@@ -265,6 +271,7 @@ import {
 } from "./managed-session.ts";
 import {
   buildModeTools,
+  orchestratorModeTools,
   cycleMode,
   decodeWorkflowEntry,
   encodeWorkflowMode,
@@ -722,6 +729,8 @@ export default function workflowExtension(
   // Read from THIS session's branch only: a process-global marker would leak
   // between sessions. `undefined` means an ordinary session.
   let managedGate: ManagedSessionGate | undefined;
+  /** Generic host-contract publisher (step 10); absent when the host has no bus. */
+  let contributionsPublisher: ReturnType<typeof createContributionPublisher> | undefined;
   // ── /commit flow authorization ──
   // The /commit flow is multi-turn (read diff → confirm → commit), so a
   // single-turn exemption is always disarmed before the commit runs. Instead:
@@ -790,6 +799,9 @@ export default function workflowExtension(
   let mutatedSinceLastTodoWrite = false;
   let lastRefMisses: { refs: string[] } | undefined;
   let todoStale = false;
+  // Effective panel presentation, published as display data so a host needs no
+  // markup/status parsing to render the same state.
+  let todoPanelState: WorkflowPanelState | null = null;
   // ── Todo panel presentation (pinned widget above the editor) ──
   // The widget can never scroll with the transcript, so it collapses to one
   // line when the plan settles and hides at the next user prompt. Overrides
@@ -1361,6 +1373,7 @@ export default function workflowExtension(
       return `${roleIcon(roleConfig.activeRole)} ${roleConfig.activeRole}`;
     if (workflowMode === "plan") return "🧠 planner";
     if (workflowMode === "build") return "🔨 builder";
+    if (workflowMode === "orchestrator") return "🧭 orchestrator";
     return "";
   }
 
@@ -1450,6 +1463,7 @@ export default function workflowExtension(
       todos.completedSignature = null;
     }
     if (view.settled && todoStale) todoStale = false;
+    todoPanelState = view.state;
     const contentKey = todoPanelContentKey({
       items: todos.items,
       state: view.state,
@@ -1577,7 +1591,9 @@ export default function workflowExtension(
           ? "accent"
           : workflowMode === "plan"
             ? "warning"
-            : "muted";
+            : workflowMode === "orchestrator"
+              ? "accent"
+              : "muted";
     setWorkflowStatus(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.mode,
@@ -1599,6 +1615,7 @@ export default function workflowExtension(
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
       todoPanelAppliedKey = "hidden";
+      todoPanelState = null;
       reviewWidgetApplied = null;
     }
     // The compact status is the desktop's only presence/progress signal while
@@ -1621,6 +1638,9 @@ export default function workflowExtension(
     // phase, pause) also re-evaluates the review widget. This is what clears a
     // stale "🔍 review … aborted" line as soon as the review ends.
     updateReviewStatus(ctx);
+    // Republish so the generic host sees the same mode/progress/panel state.
+    // The publisher drops an unchanged set, so a status refresh is cheap.
+    publishContributions();
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -5555,6 +5575,30 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * Publish Workflow's UI through the generic contract (step 10). The existing
+   * statuses/widgets stay authoritative for terminal Pi; this is additive and
+   * silently falls back when the host does not speak the contract.
+   */
+  function publishContributions(): void {
+    if (!contributionsPublisher) return;
+    try {
+      contributionsPublisher.set(
+        buildWorkflowContributions({
+          mode: workflowMode,
+          done: todos.items.filter((item) => isDone(item)).length,
+          total: todos.items.length,
+          stale: todoStale,
+          reviewPhase: reviewTurn,
+          handoffPending: awaitingDecision && reviewTurn === "idle",
+          panelState: todoPanelState,
+        }),
+      );
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
@@ -5596,6 +5640,7 @@ export default function workflowExtension(
       },
     } as any);
     lastPersistedPlanFile = currentPlanFile;
+    publishContributions();
   }
 
   async function setPlanMode(
@@ -5702,6 +5747,45 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+  }
+
+  /**
+   * Orchestrator is opt-in: it is deliberately absent from the Tab cycle. The
+   * setter only changes mode/role/tools and status; it never creates a child
+   * session, dispatch intent or prompt. Entering the mode must not launch work.
+   */
+  async function setOrchestratorMode(
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ) {
+    if (workflowMode === "orchestrator") {
+      ctx.ui.notify(
+        "Already in Orchestrator mode — no work is running until you approve an execution breakdown. Tab leaves it; /plan or /build switch directly.",
+        "info",
+      );
+      return;
+    }
+    if (blockModeSwitchDuringReview(ctx)) return;
+    if (workflowMode === null) captureDefaultModel(ctx);
+    workflowMode = "orchestrator";
+    syncLegacyFlags();
+    clearPendingHandoffDecision();
+    if (toolsBeforePlanMode === undefined)
+      toolsBeforePlanMode = pi.getActiveTools();
+    pi.setActiveTools(orchestratorModeTools(toolsBeforePlanMode));
+    if (!opts?.quiet) {
+      ctx.ui.notify(
+        "Orchestrator mode — roadmap and verification only. Nothing runs until you review and approve an execution breakdown. Tab leaves it; /plan or /build switch directly.",
+        "info",
+      );
+    }
+    try {
+      await applyModeModel(ctx, opts);
+    } catch (_e) {
+      void _e;
+    }
+    updateStatus(ctx);
+    persistState();
   }
 
   async function setDefaultMode(
@@ -7186,6 +7270,16 @@ export default function workflowExtension(
     pi.registerCommand("default", {
       description: "Switch to default mode (no workflow, full access)",
       handler: async (_args, ctx) => setDefaultMode(ctx as any),
+    });
+  } catch (_e) {
+    void _e;
+  }
+
+  try {
+    pi.registerCommand("orchestrator", {
+      description:
+        "Enter Orchestrator mode (opt-in; nothing launches until an approved breakdown)",
+      handler: async (_args, ctx) => setOrchestratorMode(ctx as any),
     });
   } catch (_e) {
     void _e;
@@ -11178,6 +11272,34 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    // Generic host contract: negotiate/announce once per session. A host that
+    // never answers keeps the statuses/widgets path only.
+    try {
+      contributionsPublisher?.dispose();
+      const bus: any = (pi as any).events;
+      const sessionId =
+        typeof (ctx.sessionManager as any).getSessionId === "function"
+          ? (ctx.sessionManager as any).getSessionId()
+          : "session";
+      contributionsPublisher = createContributionPublisher({
+        owner: { id: WORKFLOW_OWNER_ID },
+        sessionId,
+        clock: {
+          now: () => Date.now(),
+          setTimeout: (callback, ms) => setTimeout(callback, ms),
+          clearTimeout: (handle) => clearTimeout(handle as any),
+        },
+        emit: (event, payload) => {
+          bus?.emit?.(event, payload);
+        },
+        ...(typeof bus?.on === "function"
+          ? { listen: (event: string, handler: (payload: unknown) => void) => bus.on(event, handler) }
+          : {}),
+      });
+      contributionsPublisher.probe();
+    } catch (_e) {
+      void _e;
+    }
     // A session boundary owns the session-scoped plan fallback; the restore
     // loop below re-seeds it from the persisted `planFile`.
     resetSessionPlanProvenance();
@@ -11712,6 +11834,13 @@ export default function workflowExtension(
     pendingCommitFlow = null;
     // Release the reviewer session (and its custom tools) on shutdown so a
     // reload or quit never leaves an orphaned in-process session behind.
+    try {
+      contributionsPublisher?.clear();
+      contributionsPublisher?.dispose();
+    } catch (_e) {
+      void _e;
+    }
+    contributionsPublisher = undefined;
     await teardownReview({ keepHandoff: keepPending });
     currentSessionCtx = null;
   });
@@ -13396,7 +13525,7 @@ export default function workflowExtension(
     }
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
-      workflowMode === "plan"
+      (workflowMode === "plan" || workflowMode === "orchestrator")
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";

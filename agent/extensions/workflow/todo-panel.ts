@@ -21,7 +21,7 @@ export type TodoPanelState = "expanded" | "collapsed" | "hidden";
 export type TodoPanelPreference = "auto" | TodoPanelState;
 /** Legacy per-list choice, read from pre-0.13 entries and migrated by index.ts. */
 export type TodoPanelOverride = TodoPanelState | null;
-export type TodoPanelMode = "plan" | "build" | null;
+export type TodoPanelMode = "plan" | "build" | "orchestrator" | null;
 
 /** Row cap for the expanded panel (component factories bypass the host's 10-line limit). */
 export const TODO_PANEL_MAX_ROWS = 15;

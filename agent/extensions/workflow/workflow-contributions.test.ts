@@ -1,0 +1,208 @@
+/**
+ * Workflow's contribution mapping (step 10).
+ *
+ * The mapper is the only Workflow-aware part of the contract: Plan/Build appear
+ * as a badge plus commands, Review owns the badge while active, and TODOs are
+ * progress. A host renders these without parsing glyphs.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { buildWorkflowContributions } from "./workflow-contributions.ts";
+import { parseContributionEnvelope } from "./host-contributions.ts";
+
+const envelopeFor = (contributions: ReturnType<typeof buildWorkflowContributions>) =>
+  parseContributionEnvelope({
+    version: 1,
+    owner: { id: "@dieulc/workflow", version: "0.13.0" },
+    sessionId: "session-a",
+    epoch: 0,
+    revision: 1,
+    removed: [],
+    contributions,
+  });
+
+test("build: mode badge, progress and mode actions are valid contributions", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "build",
+    done: 3,
+    total: 8,
+    commitMode: "never",
+    writeMode: "allow",
+  });
+  const parsed = envelopeFor(contributions);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
+
+  const mode = contributions.find((entry) => entry.id === "mode");
+  assert.ok(mode && mode.kind === "mode");
+  assert.match(mode.label, /build/);
+
+  const todos = contributions.find((entry) => entry.id === "todos");
+  assert.ok(todos && todos.kind === "progress");
+  assert.equal(todos.done, 3);
+  assert.equal(todos.total, 8);
+
+  const build = contributions.find((entry) => entry.id === "mode-build");
+  assert.ok(build && build.kind === "action");
+  assert.equal(build.enabled, false, "the active mode is disabled, not hidden");
+});
+
+test("build: no todo row without a list, and clamping keeps it valid", () => {
+  const none = buildWorkflowContributions({ mode: null, done: 0, total: 0 });
+  assert.equal(none.some((entry) => entry.id === "todos"), false);
+  assert.equal(envelopeFor(none).ok, true);
+
+  const clamped = buildWorkflowContributions({ mode: "plan", done: 12, total: 8 });
+  const todos = clamped.find((entry) => entry.id === "todos");
+  assert.ok(todos && todos.kind === "progress");
+  assert.equal(todos.done, 8);
+  assert.equal(todos.total, 8);
+});
+
+test("build: a live review owns the badge and exposes its own controls", () => {
+  const running = buildWorkflowContributions({
+    mode: "plan",
+    done: 1,
+    total: 4,
+    reviewPhase: "running",
+  });
+  const badge = running.find((entry) => entry.id === "mode");
+  assert.ok(badge && badge.kind === "mode");
+  assert.match(badge.label, /review/);
+  const actions = running.filter((entry) => entry.kind === "action").map((entry) => entry.id);
+  assert.deepEqual(actions, ["review", "review-stop"]);
+  assert.equal(envelopeFor(running).ok, true);
+
+  const paused = buildWorkflowContributions({ mode: "plan", done: 0, total: 0, reviewPhase: "paused" });
+  const resume = paused.find((entry) => entry.id === "review");
+  assert.ok(resume && resume.kind === "action");
+  assert.equal(resume.command.name, "review-resume");
+
+  // A review turn never advertises Plan/Build switching.
+  assert.equal(paused.some((entry) => entry.id === "mode-build"), false);
+});
+
+test("build: a plain handoff stays a Plan sub-state, never Review", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "plan",
+    done: 2,
+    total: 5,
+    handoffPending: true,
+  });
+  const badge = contributions.find((entry) => entry.id === "mode");
+  assert.ok(badge && badge.kind === "mode");
+  assert.doesNotMatch(badge.label, /review/);
+  assert.equal(badge.detail, "handoff pending");
+});
+
+test("build: policy hints are display-only status", () => {
+  const contributions = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    commitMode: "ask",
+    writeMode: "never",
+  });
+  const policy = contributions.find((entry) => entry.id === "policy");
+  assert.ok(policy && policy.kind === "status");
+  assert.match(policy.text, /commits:ask/);
+  assert.match(policy.text, /writes:never/);
+});
+
+test("build: todo display actions include automatic and a state-aware toggle", () => {
+  const expanded = buildWorkflowContributions({
+    mode: "plan",
+    done: 2,
+    total: 5,
+    panelState: "expanded",
+  });
+  const ids = expanded.filter((entry) => entry.kind === "action").map((entry) => entry.id);
+  assert.deepEqual(ids, [
+    "todos-auto",
+    "todos-expand",
+    "todos-collapse",
+    "todos-hide",
+    "todos-toggle",
+    "mode-plan",
+    "mode-orchestrator",
+    "mode-build",
+  ]);
+  const progress = expanded.find((entry) => entry.id === "todos");
+  assert.ok(progress && progress.kind === "progress");
+  assert.equal(progress.detail, "Expanded");
+  const toggle = expanded.find((entry) => entry.id === "todos-toggle");
+  assert.ok(toggle && toggle.kind === "action");
+  assert.equal(toggle.command.name, "todos");
+  assert.equal(toggle.command.args, "collapse");
+  assert.equal(envelopeFor(expanded).ok, true);
+
+  // A collapsed/hidden panel toggles the other way; no state means expand.
+  for (const [state, args] of [
+    ["collapsed", "expand"],
+    ["hidden", "expand"],
+    [null, "expand"],
+  ] as const) {
+    const view = buildWorkflowContributions({
+      mode: "build",
+      done: 0,
+      total: 2,
+      panelState: state,
+    });
+    const entry = view.find((item) => item.id === "todos-toggle");
+    assert.ok(entry && entry.kind === "action");
+    assert.equal(entry.command.args, args);
+    assert.equal(envelopeFor(view).ok, true);
+  }
+});
+
+// ── Extension-level publishing ───────────────────────────────────────
+
+test("extension: a host hello makes Workflow publish its UI", async () => {
+  const { default: workflowExtension } = await import("./index.ts");
+  const { fakeSdk, makeFakeCtx, makeFakePi, submitThenFinish, tmpProject } = await import(
+    "./test-support.ts"
+  );
+  const { cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const pi = makeFakePi();
+  const envelopes: unknown[] = [];
+  // The fake host answers the probe with a hello and records updates.
+  pi.events.on("host-contributions:probe", () => {
+    pi.events.emit("host-contributions:hello", {
+      contractVersion: 1,
+      kinds: [],
+      slots: [],
+    });
+  });
+  pi.events.on("host-contributions:update", (payload: unknown) => {
+    envelopes.push(payload);
+  });
+  const { sdk } = fakeSdk({ pass1: submitThenFinish("# Plan: x") });
+  await workflowExtension(pi as never, {
+    loadSdk: async () => sdk as never,
+    plannnotatorRequestTimeoutMs: 20,
+    plannotatorRequestTimeoutMs: 20,
+    plannotatorRecoveryTimeoutMs: 20,
+    isTerminalHost: () => true,
+  } as never);
+  const made = makeFakeCtx({ cwd, hasUI: false, branch: [] });
+  try {
+    await pi.emit("session_start", { reason: "startup" }, made.ctx);
+    await pi.commands.build.handler("", made.ctx);
+    assert.ok(envelopes.length > 0, "a hello must lead to a published envelope");
+    const envelope = envelopes.at(-1) as {
+      version: number;
+      owner: { id: string };
+      contributions: Array<{ kind: string }>;
+    };
+    assert.equal(envelope.version, 1);
+    assert.equal(envelope.owner.id, "@dieulc/workflow");
+    assert.ok(envelope.contributions.some((entry) => entry.kind === "mode"));
+  } finally {
+    await pi.emit("session_shutdown", { reason: "quit" }, made.ctx);
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
