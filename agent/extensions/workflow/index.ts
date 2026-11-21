@@ -256,6 +256,22 @@ import {
   type TodoPanelPreference,
   type TodoPanelState,
 } from "./todo-panel.ts";
+import { createTodoStore } from "./todo-service.ts";
+import { classifyToolMutation, resolveRolePolicy } from "./policy-runtime.ts";
+import {
+  createManagedSessionGate,
+  readManagedSessionContext,
+  type ManagedSessionGate,
+} from "./managed-session.ts";
+import {
+  buildModeTools,
+  cycleMode,
+  decodeWorkflowEntry,
+  encodeWorkflowMode,
+  planModeTools,
+  roleForMode,
+  type WorkflowMode,
+} from "./workflow-mode.ts";
 import {
   defaultProfileConfig,
   loadProfilesDetailed,
@@ -693,16 +709,19 @@ export default function workflowExtension(
   // Review Mode streams the reviewer's output into the main transcript as
   // display-only entries. Registering once here keeps /reload idempotent.
   registerReviewEntryRenderers(pi);
-  type WorkflowMode = "plan" | "build";
-  let workflowMode: WorkflowMode | null = null;
+  let workflowMode: WorkflowMode = null;
   // overlay guard: depth of the ctx.ui.custom overlay stack (questionnaire/role
   // pickers/rewind/decision gate/refine editor). A counter — not a boolean —
   // so nested modals cannot clobber each other: each opener pushes, each
   // finally pops, and the Tab/Ctrl+Alt+P shortcuts stay quiet while > 0.
   let overlayDepth = 0;
-  let todoItems: TodoItem[] = [];
-  // Plan file the current todo list was derived from (drives merge vs replace).
-  let todoPlanPath: string | undefined;
+  // Session-scoped TODO storage. One instance per extension factory call, so
+  // two sessions can never share items, refs or panel preferences (step 3).
+  const todos = createTodoStore("ordinary");
+  // ── Managed worker identity (orchestrator step 6) ──
+  // Read from THIS session's branch only: a process-global marker would leak
+  // between sessions. `undefined` means an ordinary session.
+  let managedGate: ManagedSessionGate | undefined;
   // ── /commit flow authorization ──
   // The /commit flow is multi-turn (read diff → confirm → commit), so a
   // single-turn exemption is always disarmed before the commit runs. Instead:
@@ -774,12 +793,8 @@ export default function workflowExtension(
   // ── Todo panel presentation (pinned widget above the editor) ──
   // The widget can never scroll with the transcript, so it collapses to one
   // line when the plan settles and hides at the next user prompt. Overrides
-  // are scoped to `todoPanelPreferenceScope` (ref/text/group identity), so status
+  // are scoped to `todos.panelScope` (ref/text/group identity), so status
   // churn keeps the user's choice while a new/renamed list expires it.
-  let todoPanelPreference: TodoPanelPreference = "auto";
-  let todoPanelPreferenceScope: string | null = null;
-  let todoPanelPromptAfterSettle = false;
-  let lastCompletedSignature: string | null = null;
   let todoPanelAppliedKey: string = "unregistered";
   let footerInjectedThisTurn = false;
   let lastStaleNoticeAt: number | undefined;
@@ -1359,50 +1374,6 @@ export default function workflowExtension(
     void _executionMode;
   }
 
-  const PLAN_MODE_TOOLS = [
-    "read",
-    "bash",
-    "edit",
-    "write",
-    "grep",
-    "find",
-    "ls",
-    "explore",
-    "questionnaire",
-    "workflow_todo",
-  ];
-  const NORMAL_MODE_TOOLS = [
-    "read",
-    "bash",
-    "edit",
-    "write",
-    "grep",
-    "find",
-    "ls",
-    "explore",
-    "questionnaire",
-    "workflow_todo",
-  ];
-  const PLAN_DISABLED = new Set(["edit", "write"]);
-
-  function unique(arr: string[]): string[] {
-    return [...new Set(arr)];
-  }
-  function getPlanModeTools(active: string[]): string[] {
-    return unique([
-      ...active.filter((n) => !PLAN_DISABLED.has(n)),
-      ...PLAN_MODE_TOOLS,
-    ]);
-  }
-  function getNormalTools(active: string[]): string[] {
-    const managed = new Set([...PLAN_MODE_TOOLS, ...NORMAL_MODE_TOOLS]);
-    return unique([
-      ...NORMAL_MODE_TOOLS,
-      ...active.filter((n) => !managed.has(n)),
-    ]);
-  }
-  // alias for clarity: Build is the off-state of Plan
-  const getBuildTools = getNormalTools;
 
   /** Reset reminder/staleness tracking after a successful todo write. */
   function onTodoWrite() {
@@ -1419,7 +1390,7 @@ export default function workflowExtension(
     cwd: string,
     planFile: string | null | undefined,
   ): string {
-    const plan = planFile ?? todoPlanPath ?? currentPlanFile;
+    const plan = planFile ?? todos.planPath ?? currentPlanFile;
     if (!plan) return "session";
     try {
       return path.isAbsolute(plan) ? path.resolve(plan) : path.resolve(cwd, plan);
@@ -1439,17 +1410,17 @@ export default function workflowExtension(
     planFile: string | null | undefined,
   ): void {
     if (panel.preference !== "auto" || panel.preferenceScope !== null) {
-      todoPanelPreference = panel.preference;
-      todoPanelPreferenceScope = panel.preferenceScope;
+      todos.panelPreference = panel.preference;
+      todos.panelScope = panel.preferenceScope;
       return;
     }
     if (
       panel.legacyOverride !== null &&
       panel.legacyOverrideKey !== null &&
-      panel.legacyOverrideKey === todoListKey(todoItems)
+      panel.legacyOverrideKey === todoListKey(todos.items)
     ) {
-      todoPanelPreference = panel.legacyOverride;
-      todoPanelPreferenceScope = todoPanelScopeFor(cwd, planFile);
+      todos.panelPreference = panel.legacyOverride;
+      todos.panelScope = todoPanelScopeFor(cwd, planFile);
     }
   }
 
@@ -1464,23 +1435,23 @@ export default function workflowExtension(
     const cwd = (ctx as any)?.cwd ?? process.cwd();
     const scope = todoPanelScope(cwd);
     const view = deriveTodoPanel({
-      items: todoItems,
-      preference: todoPanelPreference,
-      preferenceScope: todoPanelPreferenceScope,
+      items: todos.items,
+      preference: todos.panelPreference,
+      preferenceScope: todos.panelScope,
       scopeKey: scope,
-      promptAfterSettle: todoPanelPromptAfterSettle,
+      promptAfterSettle: todos.promptAfterSettle,
       stale: todoStale,
     });
-    if (!view.settled && todoPanelPromptAfterSettle) {
-      todoPanelPromptAfterSettle = false;
+    if (!view.settled && todos.promptAfterSettle) {
+      todos.promptAfterSettle = false;
     }
     // Reopened list: a later completion may emit its own card again.
-    if (!view.settled && lastCompletedSignature !== null) {
-      lastCompletedSignature = null;
+    if (!view.settled && todos.completedSignature !== null) {
+      todos.completedSignature = null;
     }
     if (view.settled && todoStale) todoStale = false;
     const contentKey = todoPanelContentKey({
-      items: todoItems,
+      items: todos.items,
       state: view.state,
       mode: workflowMode,
       stale: todoStale,
@@ -1502,17 +1473,17 @@ export default function workflowExtension(
           // Re-derive so the component always shows live items and the live
           // mode, even though it was registered for an earlier state.
           const live = deriveTodoPanel({
-            items: todoItems,
-            preference: todoPanelPreference,
-            preferenceScope: todoPanelPreferenceScope,
+            items: todos.items,
+            preference: todos.panelPreference,
+            preferenceScope: todos.panelScope,
             scopeKey: scope,
-            promptAfterSettle: todoPanelPromptAfterSettle,
+            promptAfterSettle: todos.promptAfterSettle,
             stale: todoStale,
           });
           if (live.state === "hidden") return [];
           return live.state === "collapsed"
             ? [renderTodoSummary(theme, w, live)]
-            : buildTodoRows(theme, w, todoItems, workflowMode);
+            : buildTodoRows(theme, w, todos.items, workflowMode);
         };
         return { render, invalidate: () => {}, dispose: () => {} };
       });
@@ -1527,12 +1498,12 @@ export default function workflowExtension(
     preference: TodoPanelPreference,
     note?: string,
   ) {
-    if (!todoItems.length && preference === "expanded") {
+    if (!todos.items.length && preference === "expanded") {
       ctx.ui.notify("No todos.", "info");
       return;
     }
-    todoPanelPreference = preference;
-    todoPanelPreferenceScope =
+    todos.panelPreference = preference;
+    todos.panelScope =
       preference === "auto"
         ? null
         : todoPanelScope((ctx as any)?.cwd ?? process.cwd());
@@ -1590,9 +1561,9 @@ export default function workflowExtension(
       mode: workflowMode,
       reviewPhase: reviewTurn,
       handoffPending: planHandoffPhase === "pending",
-      done: todoItems.filter((t) => isDone(t)).length,
-      total: todoItems.length,
-      stale: todoStale && !isTodoListSettled(todoItems),
+      done: todos.items.filter((t) => isDone(t)).length,
+      total: todos.items.length,
+      stale: todoStale && !isTodoListSettled(todos.items),
       profileLabel,
       roleLabel,
       commitMode,
@@ -1623,7 +1594,7 @@ export default function workflowExtension(
       ctx.ui.theme.fg("dim", segments.policy),
     );
     let todoPanelView: ReturnType<typeof refreshTodoPanel> | null = null;
-    if (todoItems.length > 0) {
+    if (todos.items.length > 0) {
       todoPanelView = refreshTodoPanel(ctx);
     } else {
       ctx.ui.setWidget("workflow-todos", undefined);
@@ -5157,10 +5128,6 @@ export default function workflowExtension(
 
 
   // ── Mode → role model alignment (plan=planner, build=builder) ──────
-  const MODE_ROLE_MAP: Record<WorkflowMode, string> = {
-    plan: "planner",
-    build: "builder",
-  };
   let lastModeSwitch: {
     from: string;
     to: string;
@@ -5192,7 +5159,7 @@ export default function workflowExtension(
     mode: WorkflowMode | null,
   ): { role: Role; model: RoleModel } | undefined {
     if (!mode) return undefined;
-    const targetName = cfg.activeRole ?? MODE_ROLE_MAP[mode];
+    const targetName = cfg.activeRole ?? roleForMode(mode) ?? undefined;
     if (!targetName) return undefined;
     const role = getRole(cfg, targetName);
     if (!role || !role.model) return undefined;
@@ -5216,7 +5183,8 @@ export default function workflowExtension(
     const effectiveCfg: RoleConfig = { ...roleConfig, roles: effectiveRoles() };
     const resolved = resolveModeModel(effectiveCfg, workflowMode);
     if (!resolved) {
-      const targetName = effectiveCfg.activeRole ?? MODE_ROLE_MAP[workflowMode];
+      const targetName =
+        effectiveCfg.activeRole ?? roleForMode(workflowMode) ?? undefined;
       const role = targetName ? getRole(effectiveCfg, targetName) : undefined;
       if (targetName && !role) {
         ctx.ui.notify(
@@ -5590,12 +5558,9 @@ export default function workflowExtension(
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
-      // new canonical field
-      mode: workflowMode,
-      // legacy for backward compat (old sessions / external readers)
-      enabled: workflowMode === "plan",
-      todos: todoItems,
-      executing: workflowMode === "build",
+      // Canonical field plus the legacy booleans older readers expect.
+      ...encodeWorkflowMode(workflowMode),
+      todos: todos.items,
       toolsBeforePlanMode,
       planFile: currentPlanFile,
       awaitingDecision,
@@ -5624,10 +5589,10 @@ export default function workflowExtension(
       defaultModel,
       lastModeSwitch,
       todoPanel: {
-        preference: todoPanelPreference,
-        preferenceScope: todoPanelPreferenceScope,
-        promptAfterSettle: todoPanelPromptAfterSettle,
-        completedSignature: lastCompletedSignature,
+        preference: todos.panelPreference,
+        preferenceScope: todos.panelScope,
+        promptAfterSettle: todos.promptAfterSettle,
+        completedSignature: todos.completedSignature,
       },
     } as any);
     lastPersistedPlanFile = currentPlanFile;
@@ -5661,7 +5626,7 @@ export default function workflowExtension(
     clearPendingHandoffDecision();
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
-    pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+    pi.setActiveTools(planModeTools(toolsBeforePlanMode));
     if (!opts?.quiet) {
       ctx.ui.notify(
         "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab (when no suggestion list is open) to cycle: Plan → Build → Default. Or /build to switch to Build.",
@@ -5707,12 +5672,12 @@ export default function workflowExtension(
     resetPlanRunProvenance();
     clearPendingHandoffDecision();
     pi.setActiveTools(
-      toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
+      toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
     );
     toolsBeforePlanMode = undefined;
     // Tab-to-Build: load the active plan if nothing is loaded yet so this path
     // behaves like the handoff/approve path.
-    if (todoItems.length === 0 && currentPlanFile) {
+    if (todos.items.length === 0 && currentPlanFile) {
       loadTodosFromPlan(currentPlanFile, ctx.cwd);
     }
     if (!opts?.quiet) {
@@ -5761,7 +5726,7 @@ export default function workflowExtension(
     }
     // Keep the todo list + plan reference so progress survives mode cycling.
     // (/todos clear or approving a new plan resets it.)
-    todoPlanPath = todoPlanPath ?? currentPlanFile;
+    todos.planPath = todos.planPath ?? currentPlanFile;
     // Leaving the workflow mode ends any pending handoff cycle; the plan and
     // todos stay as reference, but no per-run eligibility survives.
     clearPendingHandoffDecision();
@@ -5790,9 +5755,10 @@ export default function workflowExtension(
     // silently changing mode and suspending the reviewer.
     if (blockModeSwitchDuringReview(ctx)) return;
     const opts: ModeSwitchOptions = { quiet: true };
-    if (workflowMode === null) await setPlanMode(ctx, opts);
-    else if (workflowMode === "plan") await setBuildMode(ctx, opts);
-    else await setDefaultMode(ctx, opts); // "build" → null (default)
+    const next = cycleMode(workflowMode, 1);
+    if (next === "plan") await setPlanMode(ctx, opts);
+    else if (next === "build") await setBuildMode(ctx, opts);
+    else await setDefaultMode(ctx, opts);
   }
 
   // legacy alias for backward compat
@@ -5838,30 +5804,11 @@ export default function workflowExtension(
       void _e;
     }
     if (extracted.length === 0)
-      return { count: todoItems.length, replaced: false, preserved: 0 };
-    const samePlan = (() => {
-      try {
-        return (
-          !!todoPlanPath &&
-          path.resolve(todoPlanPath) === path.resolve(planPath)
-        );
-      } catch {
-        return todoPlanPath === planPath;
-      }
-    })();
-    if (samePlan) {
-      const merged = mergeTodoItems(todoItems, extracted);
-      todoItems = merged.items;
-      todoPlanPath = planPath;
-      return {
-        count: todoItems.length,
-        replaced: false,
-        preserved: merged.preserved,
-      };
-    }
-    todoItems = ensureTodoLabels(extracted);
-    todoPlanPath = planPath;
-    return { count: todoItems.length, replaced: true, preserved: 0 };
+      return { count: todos.items.length, replaced: false, preserved: 0 };
+    // Same plan file → status-preserving merge; a different plan replaces the
+    // list. The store owns that rule so plan reconciliation and the tool cannot
+    // drift apart (step 3).
+    return todos.mergeExtracted(extracted, planPath, cwd);
   }
 
   async function enterBuildModeFromPlan(
@@ -5907,7 +5854,7 @@ export default function workflowExtension(
         void _e;
       }
       pi.setActiveTools(
-        toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
+        toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
       );
       toolsBeforePlanMode = undefined;
       // Populate/refresh todos from the plan file (merge preserves progress).
@@ -6409,10 +6356,10 @@ export default function workflowExtension(
     reviewFeedbackTurn = true;
     persistState();
     try {
-      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
+      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
       const planTodoListMessage = {
         customType: "workflow-todo-list",
-        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
         display: true,
       };
       (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
@@ -6725,16 +6672,16 @@ export default function workflowExtension(
       return false;
     }
     try {
-      const remainingList = formatTodoNumberedList(todoItems);
-      const todoListText = formatTodoNumberedList(todoItems, { glyph: true });
+      const remainingList = formatTodoNumberedList(todos.items);
+      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
       const planTodoListMessage = {
         customType: "workflow-todo-list",
-        content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
         display: true,
       };
-      const firstTodo = todoItems[0];
+      const firstTodo = todos.items[0];
       const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todoItems[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
+      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todos.items[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
       (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
       (pi as any).sendMessage?.(
         {
@@ -7390,16 +7337,16 @@ export default function workflowExtension(
       description: "Toggle the workflow todo panel",
       handler: async (ctx: any) => {
         if (overlayDepth > 0) return;
-        if (todoItems.length === 0) {
+        if (todos.items.length === 0) {
           ctx.ui.notify("No todos.", "info");
           return;
         }
         const view = deriveTodoPanel({
-          items: todoItems,
-          preference: todoPanelPreference,
-          preferenceScope: todoPanelPreferenceScope,
+          items: todos.items,
+          preference: todos.panelPreference,
+          preferenceScope: todos.panelScope,
           scopeKey: todoPanelScope((ctx as any)?.cwd ?? process.cwd()),
-          promptAfterSettle: todoPanelPromptAfterSettle,
+          promptAfterSettle: todos.promptAfterSettle,
           stale: todoStale,
         });
         setTodoPanelPreference(
@@ -7520,20 +7467,20 @@ export default function workflowExtension(
       const refError = (ref: string, resolved: any) =>
         resolved.ambiguous
           ? formatAmbiguity(resolved.ambiguous, ref)
-          : `Todo "${ref}" not found. Valid refs: ${todoItems.map((t) => todoRef(t)).join(", ") || "(none)"}`;
+          : `Todo "${ref}" not found. Valid refs: ${todos.items.map((t) => todoRef(t)).join(", ") || "(none)"}`;
       switch (params.action) {
         case "list":
           return {
             content: [
               {
                 type: "text",
-                text: renderList(todoItems),
+                text: renderList(todos.items),
               },
             ],
             details: {
               action: "list",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
             } as TodoDetails,
           };
         case "update": {
@@ -7542,8 +7489,7 @@ export default function workflowExtension(
             text: t.text,
             status: t.status as TodoStatus,
           }));
-          const res = applyTodoUpdate(todoItems, incoming);
-          todoItems = res.items;
+          const res = todos.update(incoming);
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -7561,13 +7507,13 @@ export default function workflowExtension(
             content: [
               {
                 type: "text",
-                text: `${summary}${warningText}\n${renderList(todoItems)}`,
+                text: `${summary}${warningText}\n${renderList(todos.items)}`,
               },
             ],
             details: {
               action: "update",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
               warnings: res.warnings,
             } as TodoDetails,
           };
@@ -7589,19 +7535,19 @@ export default function workflowExtension(
               ],
               details: {
                 action: params.action,
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: "ref required",
               } as TodoDetails,
             };
-          const resolved = resolveTodoRef(todoItems, ref);
+          const resolved = resolveTodoRef(todos.items, ref);
           if (!resolved.item) {
             return {
               content: [{ type: "text", text: refError(ref, resolved) }],
               details: {
                 action: params.action,
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: resolved.ambiguous ? "ambiguous" : "not found",
               } as TodoDetails,
             };
@@ -7628,8 +7574,8 @@ export default function workflowExtension(
             ],
             details: {
               action: params.action,
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
             } as TodoDetails,
           };
         }
@@ -7639,14 +7585,14 @@ export default function workflowExtension(
               content: [{ type: "text", text: "Error: text required" }],
               details: {
                 action: "add",
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: "text required",
               } as TodoDetails,
             };
           const text = normalizeStepText(params.text);
           const key = todoKey({ text, group: params.group });
-          const existing = todoItems.find((t) => todoKey(t) === key);
+          const existing = todos.items.find((t) => todoKey(t) === key);
           if (existing) {
             return {
               content: [
@@ -7657,13 +7603,13 @@ export default function workflowExtension(
               ],
               details: {
                 action: "add",
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: "duplicate",
               } as TodoDetails,
             };
           }
-          const step = todoItems.reduce((m, t) => Math.max(m, t.step), 0) + 1;
+          const step = todos.items.reduce((m, t) => Math.max(m, t.step), 0) + 1;
           const item: TodoItem = {
             step,
             text,
@@ -7674,7 +7620,7 @@ export default function workflowExtension(
             group: params.group,
             source: "agent",
           };
-          todoItems.push(item);
+          todos.items.push(item);
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -7693,8 +7639,8 @@ export default function workflowExtension(
             ],
             details: {
               action: "add",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
             } as TodoDetails,
           };
         }
@@ -7712,19 +7658,19 @@ export default function workflowExtension(
               ],
               details: {
                 action: "toggle",
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: "step or label required",
               } as TodoDetails,
             };
-          const resolved = resolveTodoRef(todoItems, ref);
+          const resolved = resolveTodoRef(todos.items, ref);
           if (!resolved.item) {
             return {
               content: [{ type: "text", text: refError(ref, resolved) }],
               details: {
                 action: "toggle",
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: resolved.ambiguous ? "ambiguous" : "not found",
               } as TodoDetails,
             };
@@ -7749,8 +7695,8 @@ export default function workflowExtension(
             ],
             details: {
               action: "toggle",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
             } as TodoDetails,
           };
         }
@@ -7760,8 +7706,8 @@ export default function workflowExtension(
               content: [{ type: "text", text: "Error: no active plan file" }],
               details: {
                 action: "sync",
-                todos: [...todoItems],
-                nextStep: todoItems.length + 1,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
                 error: "no plan file",
               } as TodoDetails,
             };
@@ -7791,19 +7737,19 @@ export default function workflowExtension(
             ],
             details: {
               action: "sync",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
             } as TodoDetails,
           };
         }
         case "clear": {
-          const c = todoItems.length;
-          todoItems = [];
-          todoPlanPath = undefined;
-          todoPanelPreference = "auto";
-          todoPanelPreferenceScope = null;
-          todoPanelPromptAfterSettle = false;
-          lastCompletedSignature = null;
+          const c = todos.items.length;
+          todos.items = [];
+          todos.planPath = undefined;
+          todos.panelPreference = "auto";
+          todos.panelScope = null;
+          todos.promptAfterSettle = false;
+          todos.completedSignature = null;
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -7825,8 +7771,8 @@ export default function workflowExtension(
             ],
             details: {
               action: "list",
-              todos: [...todoItems],
-              nextStep: todoItems.length + 1,
+              todos: [...todos.items],
+              nextStep: todos.items.length + 1,
               error: "unknown",
             } as TodoDetails,
           };
@@ -7854,17 +7800,17 @@ export default function workflowExtension(
       ].join("\n");
 
       if (!sub) {
-        const list = todoItems.length
-          ? `Steps are numbered GLOBALLY 1..${todoItems.length}:
+        const list = todos.items.length
+          ? `Steps are numbered GLOBALLY 1..${todos.items.length}:
 ` +
-            todoItems
+            todos.items
               .map((t) => {
                 const g = t.group ? `[${t.group}] ` : "";
                 return `${g}${formatTodoLine(t)}`;
               })
               .join("\n")
           : "No todos.";
-        ctx.ui.notify(`Todos (${todoItems.length}):\n${list}`, "info");
+        ctx.ui.notify(`Todos (${todos.items.length}):\n${list}`, "info");
         return;
       }
 
@@ -7885,7 +7831,7 @@ export default function workflowExtension(
         return;
       }
       if (sub === "clear") {
-        const count = todoItems.length;
+        const count = todos.items.length;
         if (count === 0) {
           ctx.ui.notify("No todos.", "info");
           return;
@@ -7903,12 +7849,12 @@ export default function workflowExtension(
           ctx.ui.notify("Clear cancelled.", "info");
           return;
         }
-        todoItems = [];
-        todoPlanPath = undefined;
-        todoPanelPreference = "auto";
-        todoPanelPreferenceScope = null;
-        todoPanelPromptAfterSettle = false;
-        lastCompletedSignature = null;
+        todos.items = [];
+        todos.planPath = undefined;
+        todos.panelPreference = "auto";
+        todos.panelScope = null;
+        todos.promptAfterSettle = false;
+        todos.completedSignature = null;
         updateStatus(ctx);
         try {
           persistState();
@@ -10360,6 +10306,65 @@ export default function workflowExtension(
     }
   }
 
+  // ── Managed worker readiness (orchestrator step 6) ───────────────
+  // A worker may read the assignment and its TODOs, but it cannot mutate the
+  // workspace or run a shell command until it explicitly acknowledges. The
+  // tool is always registered so an ordinary session gets a truthful refusal
+  // instead of "unknown tool".
+  pi.registerTool({
+    name: "workflow_worker_ready",
+    label: "Worker Ready",
+    description:
+      "Acknowledge the assigned task in a managed worker session. Call once after reading the assignment, before editing files or running shell commands.",
+    promptSnippet:
+      "Acknowledge the assignment before mutating a managed worker session",
+    promptGuidelines: [
+      "workflow_worker_ready: in a managed worker session, read the assignment and call this before edit/write/bash.",
+    ],
+    parameters: Type.Object({}),
+    async execute() {
+      type ReadyDetails = {
+        acknowledged: boolean;
+        reason?: string;
+        runId?: string;
+        taskId?: string;
+        attemptId?: string;
+      };
+      if (!managedGate) {
+        const details: ReadyDetails = { acknowledged: false, reason: "not_managed" };
+        return {
+          content: [
+            {
+              type: "text",
+              text: "This is not a managed worker session; nothing to acknowledge.",
+            },
+          ],
+          details,
+        };
+      }
+      const first = managedGate.phase() !== "ready";
+      const ok = managedGate.acknowledgeStart();
+      const task = managedGate.context;
+      const details: ReadyDetails = {
+        acknowledged: ok,
+        runId: task.runId,
+        taskId: task.taskId,
+        attemptId: task.attemptId,
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: ok
+              ? `${first ? "Assignment acknowledged" : "Already acknowledged"} — task ${task.taskId} (run ${task.runId}). You may now edit files and run shell commands within the assigned scope.`
+              : "This worker session is closed; the parent decides whether to reopen the task.",
+          },
+        ],
+        details,
+      };
+    },
+  });
+
   // ── Explore tool (parallel subagents) ────────────────────────────
 
   pi.registerTool({
@@ -11150,6 +11155,29 @@ export default function workflowExtension(
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
+    // Managed worker identity first: every later handler (prompt context, the
+    // readiness gate, handoff suppression) reads it.
+    managedGate = undefined;
+    try {
+      const managed = readManagedSessionContext(
+        ctx.sessionManager.getBranch() as never,
+      );
+      if (managed.ok) {
+        managedGate = createManagedSessionGate(
+          managed.context,
+          typeof (ctx.sessionManager as any).getSessionId === "function"
+            ? (ctx.sessionManager as any).getSessionId()
+            : undefined,
+        );
+      } else if (managed.reason !== "absent") {
+        ctx.ui.notify(
+          `Managed session bootstrap ignored: ${managed.reason}. Starting as an ordinary session.`,
+          "warning",
+        );
+      }
+    } catch (_e) {
+      void _e;
+    }
     // A session boundary owns the session-scoped plan fallback; the restore
     // loop below re-seeds it from the persisted `planFile`.
     resetSessionPlanProvenance();
@@ -11162,10 +11190,10 @@ export default function workflowExtension(
     // The branch is the source of truth for the panel's presentation. The
     // host has cleared every extension widget on a session switch/reload, so
     // the reconciler must register it again from the restored state.
-    todoPanelPreference = "auto";
-    todoPanelPreferenceScope = null;
-    todoPanelPromptAfterSettle = false;
-    lastCompletedSignature = null;
+    todos.panelPreference = "auto";
+    todos.panelScope = null;
+    todos.promptAfterSettle = false;
+    todos.completedSignature = null;
     todoPanelAppliedKey = "unregistered";
     // The host dropped every extension widget on the switch/reload; reset the
     // cache so the first updateStatus re-applies (or clears) the review line.
@@ -11238,30 +11266,22 @@ export default function workflowExtension(
         if (e.type === "custom" && e.customType === "workflow") {
           const d = e.data as any;
           if (d) {
-            if (typeof d.mode === "string") {
-              workflowMode =
-                d.mode === "plan"
-                  ? "plan"
-                  : d.mode === "build"
-                    ? "build"
-                    : null;
-            } else {
-              // legacy: enabled (plan) / executing (build)
-              if (d.enabled) workflowMode = "plan";
-              else if (d.executing) workflowMode = "build";
-              else if (workflowMode === null) workflowMode = null;
-            }
+            // One codec for both shapes: `mode` (current) or the legacy
+            // `enabled`/`executing` booleans. A legacy entry with neither flag
+            // keeps the mode restored from an earlier entry.
+            const decoded = decodeWorkflowEntry(d, workflowMode);
+            if (decoded) workflowMode = decoded.mode;
             syncLegacyFlags();
-            if (Array.isArray(d.todos)) todoItems = ensureTodoLabels(d.todos);
+            if (Array.isArray(d.todos)) todos.items = ensureTodoLabels(d.todos);
             // Entries written before this feature have no `todoPanel`; they
             // must not erase a value restored from an earlier entry.
             if (d.todoPanel && typeof d.todoPanel === "object") {
               const panel = readPersistedTodoPanel(d);
               applyRestoredTodoPanel(panel, (ctx as any)?.cwd ?? process.cwd(), d.planFile);
-              todoPanelPromptAfterSettle = panel.promptAfterSettle;
-              lastCompletedSignature = panel.completedSignature;
+              todos.promptAfterSettle = panel.promptAfterSettle;
+              todos.completedSignature = panel.completedSignature;
             }
-            todoPlanPath = d.planFile;
+            todos.planPath = d.planFile;
             toolsBeforePlanMode = d.toolsBeforePlanMode;
             // An entry without a planFile must not erase a value restored
             // from an earlier entry (the entry shape has changed over time).
@@ -11586,7 +11606,7 @@ export default function workflowExtension(
       syncLegacyFlags();
       if (toolsBeforePlanMode === undefined)
         toolsBeforePlanMode = pi.getActiveTools();
-      pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+      pi.setActiveTools(planModeTools(toolsBeforePlanMode));
       try {
         fs.mkdirSync(path.join(ctx.cwd, CONFIG_DIR_NAME, "plans"), {
           recursive: true,
@@ -11705,14 +11725,14 @@ export default function workflowExtension(
       void _e;
     }
     // reconstruct after rewind
-    todoItems = [];
-    todoPlanPath = undefined;
+    todos.items = [];
+    todos.planPath = undefined;
     btwNotes = [];
     // A rewind is a branch boundary: the panel choice belongs to the branch.
-    todoPanelPreference = "auto";
-    todoPanelPreferenceScope = null;
-    todoPanelPromptAfterSettle = false;
-    lastCompletedSignature = null;
+    todos.panelPreference = "auto";
+    todos.panelScope = null;
+    todos.promptAfterSettle = false;
+    todos.completedSignature = null;
     todoPanelAppliedKey = "unregistered";
     // A rewind is a branch boundary: no per-run write from the old branch
     // may authorize a handoff or a manual review on the new one.
@@ -11726,8 +11746,8 @@ export default function workflowExtension(
       for (const e of branch as any[]) {
         if (e.type === "custom" && e.customType === "workflow") {
           if (Array.isArray(e.data?.todos)) {
-            todoItems = ensureTodoLabels(e.data.todos);
-            if (e.data.planFile) todoPlanPath = e.data.planFile;
+            todos.items = ensureTodoLabels(e.data.todos);
+            if (e.data.planFile) todos.planPath = e.data.planFile;
           }
           if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
             const panel = readPersistedTodoPanel(e.data);
@@ -11736,8 +11756,8 @@ export default function workflowExtension(
               (ctx as any)?.cwd ?? process.cwd(),
               e.data.planFile,
             );
-            todoPanelPromptAfterSettle = panel.promptAfterSettle;
-            lastCompletedSignature = panel.completedSignature;
+            todos.promptAfterSettle = panel.promptAfterSettle;
+            todos.completedSignature = panel.completedSignature;
           }
         }
         if (
@@ -11746,7 +11766,7 @@ export default function workflowExtension(
           e.message.toolName === "workflow_todo" &&
           Array.isArray(e.message.details?.todos)
         ) {
-          todoItems = ensureTodoLabels(e.message.details.todos);
+          todos.items = ensureTodoLabels(e.message.details.todos);
         }
       }
       // Re-derive the plan from the branch we rewound to. Keeping the old
@@ -11995,7 +12015,7 @@ export default function workflowExtension(
     const decision = decideCommitGate({
       policy,
       hit: hit as CommitGateHit,
-      hasTodos: todoItems.length > 0,
+      hasTodos: todos.items.length > 0,
       auth: commitAuthorization,
       now,
       folder: folderDecision,
@@ -12009,7 +12029,7 @@ export default function workflowExtension(
       const authWasDecisive =
         hit === "commit" &&
         commitAuthorization !== null &&
-        !(policy === "allow" && todoItems.length === 0);
+        !(policy === "allow" && todos.items.length === 0);
       if (authWasDecisive && commitAuthorization) {
         const auth = commitAuthorization;
         if (!isAuthorizationActive(auth, now)) {
@@ -13289,17 +13309,29 @@ export default function workflowExtension(
 
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
+    // ── Managed worker readiness ── A worker reads its assignment first; a
+    // mutation or shell call before acknowledgement is refused with a reason,
+    // not silently allowed. Read-only inspection and its own TODOs stay open.
+    if (managedGate) {
+      const mutation = classifyToolMutation(event.toolName, event.input);
+      if (mutation.mutating || mutation.shell) {
+        const reason = managedGate.mutationBlockReason(event.toolName);
+        if (reason) return { block: true, reason } as any;
+      }
+    }
     // Resolve the role per call: an env-carried role (spawned subagent) wins,
     // then the workflow mode (plan → planner, build → builder). Read lazily —
     // `workflowMode` is null while the extension body is evaluated and changes
     // on every Tab/mode switch.
-    const gateRole: WorkflowRole | undefined = resolveSessionRole({
+    // Role resolution is centralized in policy-runtime.ts (step 5): env role
+    // wins, then the live mode. The gate keeps every policy decision it had.
+    const gate = resolveRolePolicy({
       envRole: process.env[WORKFLOW_ROLE_ENV],
       workflowMode,
     });
-    const gatePolicy = gateRole ? policyForRole(gateRole) : undefined;
-    const restricted =
-      gatePolicy !== undefined && gatePolicy.commandClass !== "full";
+    const gateRole: WorkflowRole | undefined = gate.role;
+    const gatePolicy = gate.policy;
+    const restricted = gate.policy !== undefined && gate.commandClass !== "full";
 
     // PowerShell syntax cannot be classified by the POSIX allowlist: fail closed.
     if (restricted && event.toolName === "powershell") {
@@ -13444,7 +13476,7 @@ export default function workflowExtension(
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
       workflowMode === "build" &&
-      todoItems.length === 0
+      todos.items.length === 0
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
@@ -13476,7 +13508,7 @@ export default function workflowExtension(
   function seedCommittedStepRefs(): void {
     if (stepCommitsSeeded) return;
     stepCommitsSeeded = true;
-    for (const t of todoItems) {
+    for (const t of todos.items) {
       if (!isDone(t) || itemStatus(t) === "cancelled") continue;
       committedStepRefs.add(todoRef(t));
     }
@@ -13485,7 +13517,7 @@ export default function workflowExtension(
   /** Done steps that have not been committed yet (in canonical order). */
   function uncommittedDoneSteps(): StepCommitCandidate[] {
     const out: StepCommitCandidate[] = [];
-    for (const t of todoItems) {
+    for (const t of todos.items) {
       if (!isDone(t) || itemStatus(t) === "cancelled") continue;
       const ref = todoRef(t);
       if (committedStepRefs.has(ref)) continue;
@@ -13598,7 +13630,7 @@ export default function workflowExtension(
       const mode = commitConfig.mode;
       const decision = stepCommitDecision({
         mode,
-        hasTodos: todoItems.length > 0,
+        hasTodos: todos.items.length > 0,
         dirty,
         isInRepo: true,
         completed,
@@ -13929,10 +13961,10 @@ export default function workflowExtension(
     // this — they can be self-initiated while the user is still reading.
     if (
       event.messageType === "user" &&
-      isTodoListSettled(todoItems) &&
-      !todoPanelPromptAfterSettle
+      isTodoListSettled(todos.items) &&
+      !todos.promptAfterSettle
     ) {
-      todoPanelPromptAfterSettle = true;
+      todos.promptAfterSettle = true;
       updateStatus(ctx);
       try {
         persistState();
@@ -14049,8 +14081,8 @@ export default function workflowExtension(
     // Throttled passive reminder (Claude Code cadence) whenever a todo list
     // exists — any mode. Unresolved refs from the previous turn bypass the
     // throttle once so the model can learn the right numbers.
-    if (todoItems.length > 0) {
-      const remaining = todoItems.filter(
+    if (todos.items.length > 0) {
+      const remaining = todos.items.filter(
         (t) => !isDone(t) && itemStatus(t) !== "cancelled",
       );
       const remind = shouldRemind({
@@ -14063,7 +14095,7 @@ export default function workflowExtension(
         filtered.push({
           role: "custom",
           customType: "workflow-todo-context",
-          content: buildTodoContextBlock(todoItems, {
+          content: buildTodoContextBlock(todos.items, {
             misses: misses ? { refs: misses.refs } : undefined,
           }),
           display: false,
@@ -14082,10 +14114,10 @@ export default function workflowExtension(
     // after EVERY assistant response, but /commit is multi-turn (read diff →
     // confirm → commit), so disarming per turn kills the exemption before the
     // commit turn. Lifetime is the run: `agent_settled` clears it.
-    if (todoItems.length === 0) return;
+    if (todos.items.length === 0) return;
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);
-    const result = markCompletedRefs(text, todoItems);
+    const result = markCompletedRefs(text, todos.items);
     // Fallback per-step commit for steps completed via [DONE:ref] tags in the
     // response text (the workflow_todo path already committed at its
     // tool_result; the committed-ref set makes this a no-op then).
@@ -14329,9 +14361,9 @@ export default function workflowExtension(
         event.toolName === "write" ||
         event.toolName === "bash") &&
       !footerInjectedThisTurn &&
-      todoItems.length > 0
+      todos.items.length > 0
     ) {
-      const footer = buildTodoFooter(todoItems);
+      const footer = buildTodoFooter(todos.items);
       if (footer) {
         const existing = (event.content ?? [])
           .map((b: any) => (b?.type === "text" ? String(b.text ?? "") : ""))
@@ -14502,7 +14534,7 @@ export default function workflowExtension(
         if (currentPlanFile !== lastPersistedPlanFile) persistState();
       }
       if (workflowMode === "plan") {
-        const eligible = shouldHandoffPlan({
+        const eligible = !managedGate && shouldHandoffPlan({
           mode: workflowMode,
           planWrittenThisRun,
           planWrittenInPlanMode: planWrittenInPlanModeThisRun,
@@ -14553,8 +14585,8 @@ export default function workflowExtension(
       // counts as progress even if the model never called the tool. Merging is
       // status-aware (never un-completes); agent-added items survive.
       try {
-        const planCandidate = todoPlanPath ?? currentPlanFile;
-        if (planCandidate && todoItems.length > 0) {
+        const planCandidate = todos.planPath ?? currentPlanFile;
+        if (planCandidate && todos.items.length > 0) {
           const abs = path.isAbsolute(planCandidate)
             ? planCandidate
             : path.join((ctx as any).cwd, planCandidate);
@@ -14565,10 +14597,10 @@ export default function workflowExtension(
               lastReconcileKey = key;
               const planExtracted = extractPlanStepsFromMarkdown(planText);
               if (planExtracted.length > 0) {
-                const before = todoItems.filter((t) => isDone(t)).length;
-                const merged = mergeTodoItems(todoItems, planExtracted);
-                todoItems = merged.items;
-                const after = todoItems.filter((t) => isDone(t)).length;
+                const before = todos.items.filter((t) => isDone(t)).length;
+                const merged = mergeTodoItems(todos.items, planExtracted);
+                todos.items = merged.items;
+                const after = todos.items.filter((t) => isDone(t)).length;
                 if (after > before || merged.preserved > 0) {
                   updateStatus(ctx as any);
                   persistState();
@@ -14589,11 +14621,11 @@ export default function workflowExtension(
           .find((m: any) => m.role === "assistant");
         const stopReason = lastAssistantMsg?.stopReason;
         const aborted = stopReason === "aborted" || stopReason === "error";
-        const remainingCount = todoItems.filter(
+        const remainingCount = todos.items.filter(
           (t) => !isDone(t) && itemStatus(t) !== "cancelled",
         ).length;
         if (
-          todoItems.length > 0 &&
+          todos.items.length > 0 &&
           remainingCount > 0 &&
           mutatedSinceLastTodoWrite &&
           !aborted
@@ -14616,21 +14648,21 @@ export default function workflowExtension(
         void _e;
       }
       // Build completion
-      if (workflowMode === "build" && todoItems.length > 0) {
-        const allDone = isTodoListSettled(todoItems);
+      if (workflowMode === "build" && todos.items.length > 0) {
+        const allDone = isTodoListSettled(todos.items);
         if (allDone) {
           // One card per list revision: a settled list stays settled across
           // turns, and re-sending the same card on every agent_end buried the
           // transcript in duplicates. A new/renamed list or changed statuses
           // produce a new signature and therefore a new card.
-          const signature = todoCompletionSignature(todoItems);
-          if (signature !== lastCompletedSignature) {
-            lastCompletedSignature = signature;
+          const signature = todoCompletionSignature(todos.items);
+          if (signature !== todos.completedSignature) {
+            todos.completedSignature = signature;
             try {
               (pi as any).sendMessage?.(
                 {
                   customType: "workflow-complete",
-                  content: `**Build Complete! ✓**\n\n${todoItems.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
+                  content: `**Build Complete! ✓**\n\n${todos.items.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
                   display: true,
                 },
                 { triggerTurn: false },
@@ -14643,10 +14675,10 @@ export default function workflowExtension(
           todoStale = false;
           updateStatus(ctx as any);
           persistState();
-        } else if (lastCompletedSignature !== null) {
+        } else if (todos.completedSignature !== null) {
           // The list reopened (new step or a reverted status): allow the next
           // completion to emit its own card. Persisted on the next mutation.
-          lastCompletedSignature = null;
+          todos.completedSignature = null;
         }
         return;
       }
@@ -14688,12 +14720,12 @@ export default function workflowExtension(
       const samePlan = (() => {
         try {
           return (
-            !!todoPlanPath &&
+            !!todos.planPath &&
             !!planCandidate &&
-            path.resolve(todoPlanPath) === path.resolve(planCandidate)
+            path.resolve(todos.planPath) === path.resolve(planCandidate)
           );
         } catch {
-          return todoPlanPath === planCandidate;
+          return todos.planPath === planCandidate;
         }
       })();
       if (planExtracted.length > 0) {
@@ -14702,23 +14734,23 @@ export default function workflowExtension(
           // exact plan content; a `- [x]` tick changes the key and re-merges.
           if (!(planKey && planKey === lastReconcileKey)) {
             if (planKey) lastReconcileKey = planKey;
-            todoItems = mergeTodoItems(todoItems, planExtracted).items;
+            todos.items = mergeTodoItems(todos.items, planExtracted).items;
           }
         } else {
-          todoItems = ensureTodoLabels(planExtracted);
-          if (planCandidate) todoPlanPath = planCandidate;
+          todos.items = ensureTodoLabels(planExtracted);
+          if (planCandidate) todos.planPath = planCandidate;
         }
       } else if (!samePlan) {
         // A new plan file with no parsable steps must not inherit the previous
         // task's todos; the synthesis block below fills a single title step.
-        todoItems = [];
-        if (planCandidate) todoPlanPath = planCandidate;
-      } else if (todoItems.length === 0 && lastAssistant) {
+        todos.items = [];
+        if (planCandidate) todos.planPath = planCandidate;
+      } else if (todos.items.length === 0 && lastAssistant) {
         try {
           const chat = extractTodoItems(
             getTextContent(lastAssistant as AssistantMessage),
           );
-          if (chat.length > 0) todoItems = ensureTodoLabels(chat);
+          if (chat.length > 0) todos.items = ensureTodoLabels(chat);
         } catch (_e) {
           void _e;
         }
@@ -14728,7 +14760,7 @@ export default function workflowExtension(
       // from its title so the handoff still appears.
       let _synthesizedFromTitle = false;
       void _synthesizedFromTitle;
-      if (todoItems.length === 0) {
+      if (todos.items.length === 0) {
         // Try to synthesize from plan file title or last assistant text
         let synthText: string | undefined;
         // Prefer reading the resolved plan file if we can find one
@@ -14749,7 +14781,7 @@ export default function workflowExtension(
           if (t) synthText = t.split("\n")[0].trim().slice(0, 80);
         }
         if (synthText) {
-          todoItems = ensureTodoLabels([
+          todos.items = ensureTodoLabels([
             {
               step: 1,
               text: synthText,
@@ -14761,7 +14793,7 @@ export default function workflowExtension(
           _synthesizedFromTitle = true;
         } else {
           // Ultimate fallback: single generic step so gate can appear
-          todoItems = ensureTodoLabels([
+          todos.items = ensureTodoLabels([
             {
               step: 1,
               text: "Review and execute the plan",
@@ -14846,9 +14878,9 @@ export default function workflowExtension(
         try {
           const steps = extractPlanStepsFromMarkdown(finalText);
           if (steps.length > 0) {
-            todoItems =
-              todoItems.length > 0
-                ? mergeTodoItems(todoItems, steps).items
+            todos.items =
+              todos.items.length > 0
+                ? mergeTodoItems(todos.items, steps).items
                 : ensureTodoLabels(steps);
             updateStatus(ctx as any);
             persistState();
@@ -14971,10 +15003,10 @@ export default function workflowExtension(
       if (!hasUI && planTextForRender && !awaitingDecision) {
         try {
           const preview = planTextForRender.slice(0, 4000);
-          const list = formatTodoNumberedList(todoItems);
+          const list = formatTodoNumberedList(todos.items);
           const content = usePlannotatorHandoff()
-            ? `**Plan ready** (${todoItems.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
-            : `**Plan ready** (${todoItems.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.${commitDirectiveLine(ctx)}`;
+            ? `**Plan ready** (${todos.items.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
+            : `**Plan ready** (${todos.items.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.${commitDirectiveLine(ctx)}`;
           (pi as any).sendMessage?.(
             {
               customType: "workflow-handoff-fallback",
@@ -15036,7 +15068,7 @@ export default function workflowExtension(
             at: Date.now(),
             reason: "no-plan-text",
             planPath,
-            todoLen: todoItems.length,
+            todoLen: todos.items.length,
             hasUI,
           });
         } catch (_e) {
@@ -15131,7 +15163,7 @@ export default function workflowExtension(
           awaitingDecisionAtEntry: false,
           planPath,
           planTextLen: planTextForRender ? planTextForRender.length : 0,
-          todoLen: todoItems.length,
+          todoLen: todos.items.length,
           source:
             planTextForRender && fs.existsSync(planPath) ? "file" : "assistant",
         });
@@ -15228,7 +15260,7 @@ export default function workflowExtension(
             if (toolsBeforePlanMode === undefined)
               toolsBeforePlanMode = pi.getActiveTools();
             try {
-              pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+              pi.setActiveTools(planModeTools(toolsBeforePlanMode));
             } catch (_e) {
               void _e;
             }
@@ -15237,7 +15269,7 @@ export default function workflowExtension(
             syncLegacyFlags();
             try {
               pi.setActiveTools(
-                toolsBeforePlanMode ?? getBuildTools(pi.getActiveTools()),
+                toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
               );
             } catch (_e) {
               void _e;

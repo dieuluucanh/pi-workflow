@@ -163,28 +163,28 @@
         "planner": {
           "provider": "openai-codex",
           "id": "gpt-6.1-sol",
-          "thinking": "max"
+          "thinking": "xhigh"
         },
         "explorer": {
-          "provider": "openai-codex",
-          "id": "gpt-6-luna",
-          "thinking": "high"
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "low"
         },
         "builder": {
-          "provider": "openai-codex",
-          "id": "gpt-6-luna",
-          "thinking": "xhigh"
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "high"
         },
         "reviewer": {
           "provider": "openai-codex",
           "id": "gpt-6.1-sol",
-          "thinking": "max"
+          "thinking": "xhigh"
         }
       },
       "defaultModel": {
         "provider": "openai-codex",
-        "id": "gpt-6-luna",
-        "thinking": "xhigh"
+        "id": "gpt-6.1-sol",
+        "thinking": "high"
       }
     }
   ]

@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "capturedAt": "2026-11-21",
+  "note": "Behavioral baseline for ordinary Plan/Build. Update only with an intentional Workflow change; every difference is user-visible.",
+  "sdk": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "1.5.0"
+  },
+  "registeredTools": [
+    "explore",
+    "questionnaire",
+    "workflow_todo",
+    "workflow_worker_ready"
+  ],
+  "planActiveTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo"
+  ],
+  "buildActiveTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo"
+  ],
+  "commands": [
+    "btw",
+    "build",
+    "commit",
+    "commit-policy",
+    "default",
+    "folder-policy",
+    "handoff",
+    "permissions",
+    "plan",
+    "profile",
+    "read-policy",
+    "review",
+    "review-abort",
+    "review-mode",
+    "review-pause",
+    "review-prompt",
+    "review-resume",
+    "review-status",
+    "rewind",
+    "role",
+    "shell-guard",
+    "todos",
+    "write-policy"
+  ],
+  "roles": {
+    "builtIn": [
+      "builder",
+      "explorer",
+      "planner",
+      "reviewer"
+    ],
+    "configVersion": 2,
+    "profileRoles": [
+      "planner",
+      "explorer",
+      "builder",
+      "reviewer"
+    ]
+  },
+  "statusKeys": {
+    "mode": "workflow",
+    "profile": "workflow-profile",
+    "policy": "workflow-policy",
+    "review": "workflow-review",
+    "todos": "workflow-todos"
+  },
+  "widgetKeys": [
+    "workflow-review-status",
+    "workflow-todos"
+  ]
+}
