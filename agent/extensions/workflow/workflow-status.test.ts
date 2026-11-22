@@ -225,7 +225,7 @@ test("the orchestrator footer surfaces the destination before consent and the ru
     },
   });
   assert.match(segments.mode, /breakdown pending approval/);
-  assert.match(segments.orchestrator, /next approval → direct build/);
+  assert.match(segments.orchestrator, /recommended → direct build/);
   assert.match(segments.orchestrator, /run awaiting_approval/);
   assert.match(segments.orchestrator, /next task-2/);
   assert.match(segments.orchestrator, /blocked: no host/);
@@ -239,7 +239,7 @@ test("the orchestrator footer surfaces the destination before consent and the ru
     orchestration: { phase: "ready", approval: "approved" },
   });
   assert.match(approved.mode, /execution approved/);
-  assert.match(approved.orchestrator, /next approval → orchestrator/);
+  assert.match(approved.orchestrator, /recommended → orchestrator/);
 
   const idle = buildWorkflowStatusSegments({
     mode: "plan",
@@ -248,4 +248,50 @@ test("the orchestrator footer surfaces the destination before consent and the ru
     commitMode: "never",
   });
   assert.equal(idle.orchestrator, "");
+});
+
+test("handoff stages are named accurately and a recommendation never executes", () => {
+  const review = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "review-pending",
+    handoffDestination: "build",
+  });
+  assert.match(review.mode, /handoff pending/);
+  assert.match(review.orchestrator, /recommended → direct build/);
+
+  const approved = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "approved",
+    handoffDestination: "orchestrator",
+  });
+  assert.match(approved.mode, /execution choice pending/);
+  assert.doesNotMatch(approved.mode, /review/);
+  assert.match(approved.orchestrator, /recommended → orchestrator/);
+
+  const routing = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "routing",
+  });
+  assert.match(routing.mode, /applying execution/);
+
+  // A stale `handoffPending` flag must not override a later stage.
+  const both = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffPending: true,
+    handoffStage: "approved",
+  });
+  assert.match(both.mode, /execution choice pending/);
+  assert.doesNotMatch(both.mode, /handoff pending/);
 });

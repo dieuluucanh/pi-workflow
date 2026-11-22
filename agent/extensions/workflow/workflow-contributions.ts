@@ -29,6 +29,11 @@ export interface WorkflowContributionInput {
   reviewPhase?: "idle" | "running" | "paused" | "handoff" | "transition" | null;
   /** A pending handoff that is not review-owned. */
   handoffPending?: boolean;
+  /**
+   * Active handoff stage. `approved` is a real, resumable state: the plan is
+   * approved and only the execution choice is missing.
+   */
+  handoffStage?: "review-pending" | "approved" | "routing";
   /** Panel/commit hints, optional (display only). */
   commitMode?: string;
   writeMode?: string | null;
@@ -143,7 +148,14 @@ export function buildWorkflowContributions(
             ? "info"
             : "neutral",
     order: 0,
-    detail: input.handoffPending ? "handoff pending" : undefined,
+    detail:
+      input.handoffStage === "approved"
+        ? "plan approved — execution choice pending"
+        : input.handoffStage === "routing"
+          ? "applying the chosen execution"
+          : input.handoffPending || input.handoffStage === "review-pending"
+            ? "handoff pending"
+            : undefined,
     actions: [],
   });
 
@@ -156,6 +168,21 @@ export function buildWorkflowContributions(
     order: 5,
     reason: "Prompts go to the active workflow mode.",
   });
+
+  if (input.handoffStage === "approved") {
+    // The approval survives a cancelled execution choice; this is the explicit
+    // resume. It can never execute by itself.
+    out.push({
+      id: "handoff-continue",
+      kind: "action",
+      slot: "action",
+      label: "Choose execution",
+      tone: "warning",
+      order: 6,
+      command: { name: "handoff", args: "continue" },
+      enabled: true,
+    });
+  }
 
   if (total > 0) {
     out.push({

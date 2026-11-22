@@ -206,3 +206,35 @@ test("extension: a host hello makes Workflow publish its UI", async () => {
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
 });
+
+test("build: an approved wait is resumable and is not a Review state", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    handoffStage: "approved",
+  });
+  const badge = contributions.find((entry) => entry.id === "mode");
+  assert.ok(badge && badge.kind === "mode");
+  assert.equal(badge.detail, "plan approved — execution choice pending");
+  assert.doesNotMatch(badge.label, /review/);
+
+  const resume = contributions.find((entry) => entry.id === "handoff-continue");
+  assert.ok(resume && resume.kind === "action");
+  assert.deepEqual(resume.command, { name: "handoff", args: "continue" });
+  assert.equal(resume.enabled, true);
+  // The action opens the chooser; it never claims to execute by itself.
+  assert.doesNotMatch(String(resume.label), /execute/i);
+});
+
+test("build: no resume action without an approved wait", () => {
+  const reviewing = buildWorkflowContributions({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    handoffStage: "review-pending",
+  });
+  assert.equal(reviewing.some((entry) => entry.id === "handoff-continue"), false);
+  const idle = buildWorkflowContributions({ mode: "plan", done: 0, total: 0 });
+  assert.equal(idle.some((entry) => entry.id === "handoff-continue"), false);
+});

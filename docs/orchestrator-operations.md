@@ -17,6 +17,32 @@ exists today. It is not a claim that the live loop passed acceptance — see
   in-flight run's controls are `pauseRun`/`resumeRun`/`stopRun` in the engine.
   If a run is terminal, it cannot be resumed or cancelled again.
 
+## Plan handoff: approval and execution are two decisions
+
+The presenter (`Plannotator` or the native sheet) is always asked about the
+**plan** first. Approving it does not execute anything:
+
+```text
+Plan → optional independent Review → configured presenter
+     ├─ Feedback → Plan revision → (review) → presenter again
+     └─ Approve  → execution chooser
+                     ├─ Orchestrator → prepare breakdown → preview approval → children
+                     ├─ Direct Build → this session's Build → one execute turn
+                     └─ Decide later → Plan, approved, nothing started
+```
+
+- `workflow.handoff.executionMode` is a **recommendation** (first chooser row).
+  It never executes by itself, and the chooser's answer is not written back to
+  settings — it applies to that approved plan only.
+- Cancelling the chooser keeps the approval. Resume with
+  `/handoff continue <decision-id>`; a changed plan/branch/session invalidates
+  the approval instead.
+- Headless: `/handoff approve <id>` records the approval, then
+  `/handoff execute <id> orchestrator|build` records the destination. Neither
+  infers consent from the saved default.
+- Choosing Orchestrator authorizes **preparation only**. The digest-bound
+  `preview-<id>` approval below is still required before any child starts.
+
 ## Entry and work sources
 
 Both the automatic handoff and a direct request use ONE preparation service:

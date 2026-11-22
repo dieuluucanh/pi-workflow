@@ -367,10 +367,17 @@ import {
   type HandoffReason,
 } from "./handoff-view.ts";
 import {
+  buildExecutionQuestion,
+  executionChoiceFromResult,
+} from "./handoff-execution-view.ts";
+import {
   DEFAULT_HANDOFF_CONFIG,
   describeExecutionDestination,
   describeHandoffMode,
   EXECUTION_DESTINATIONS,
+  HANDOFF_APPROVE_TOKEN,
+  HANDOFF_CONTINUE_TOKEN,
+  HANDOFF_EXECUTE_TOKEN,
   HANDOFF_EXECUTION_TOKEN,
   HANDOFF_FALLBACK_TOKEN,
   HANDOFF_ONCE_TOKEN,
@@ -388,14 +395,17 @@ import {
 } from "./handoff-config.ts";
 import { createGrantHolder } from "./host-bridge-auth.ts";
 import {
-  consumeHandoffDecision,
+  approveHandoffPlan,
+  beginHandoffRoute,
+  consumeHandoffRoute,
   createHandoffDecision,
   dismissHandoffDecision,
   handoffDecisionMatches,
-  handoffRouteFor,
+  isAwaitingExecution,
   isHandoffDestination,
-  overrideHandoffDestination,
   parseHandoffDecision,
+  recommendHandoffDestination,
+  selectHandoffDestination,
   supersedeHandoffDecision,
   type HandoffDecision,
   type HandoffDestination,
@@ -1666,6 +1676,26 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * Which handoff stage owns the session, for the footer:
+   * a plan review awaiting a decision, an approved plan awaiting its execution
+   * choice, or a route being applied. `undefined` when no handoff is active.
+   */
+  function handoffStageForStatus():
+    | "review-pending"
+    | "approved"
+    | "routing"
+    | undefined {
+    const decision = pendingHandoffDecision;
+    if (decision) {
+      if (decision.state === "approved") return "approved";
+      if (decision.state === "routing") return "routing";
+      if (decision.state === "pending") return "review-pending";
+    }
+    if (planHandoffPhase === "pending" || awaitingDecision) return "review-pending";
+    return undefined;
+  }
+
   /** Bound-run phase/approval, for the footer; absent when no run exists. */
   function orchestrationStatus():
     | {
@@ -1736,6 +1766,9 @@ export default function workflowExtension(
       mode: workflowMode,
       reviewPhase: reviewTurn,
       handoffPending: planHandoffPhase === "pending",
+      ...(handoffStageForStatus() === undefined
+        ? {}
+        : { handoffStage: handoffStageForStatus()! }),
       done: todos.items.filter((t) => isDone(t)).length,
       total: todos.items.length,
       stale: todoStale && !isTodoListSettled(todos.items),
@@ -2326,54 +2359,6 @@ export default function workflowExtension(
       deps.plannotatorRequestTimeoutMs,
       handoffConfigNow().config.timeoutMs,
     );
-  }
-
-  /**
-   * First-run destination choice for the browser presenter.
-   *
-   * The native sheet already carries both destination rows, so it needs no
-   * extra prompt. Plannotator's protocol has no destination field and is not
-   * ours to patch, so Workflow asks ONCE — only while no scope has an explicit
-   * `executionMode` — and saves that answer as the user's default. Later
-   * handoffs are silent; `/handoff once` retargets a single pending one.
-   * Returns `undefined` when the user cancels, leaving the plan unapproved.
-   */
-  async function confirmBrowserHandoffDestination(
-    ctx: ExtensionContext,
-  ): Promise<HandoffDestination | undefined> {
-    const resolved = handoffConfigNow();
-    if (resolved.sources.execution !== "default") return resolved.config.executionMode;
-    if ((ctx as any).hasUI !== true) return resolved.config.executionMode;
-    overlayDepth += 1;
-    let choice: string | undefined;
-    try {
-      choice = await (ctx as any).ui.select(
-        "Where should an approved plan run? (saved as your default; /handoff once overrides one handoff)",
-        [
-          "Orchestrator — prepare a breakdown; nothing runs before you approve it",
-          "Direct Build — start executing in this session now",
-        ],
-      );
-    } catch (_e) {
-      void _e;
-      choice = undefined;
-    } finally {
-      overlayDepth = Math.max(0, overlayDepth - 1);
-    }
-    if (!choice) return undefined;
-    const destination: HandoffDestination = String(choice).startsWith("Orchestrator")
-      ? "orchestrator"
-      : "build";
-    const written = writeHandoffConfig("global", reviewCwd(), reviewAgentDir(), {
-      executionMode: destination,
-    });
-    if (!written.ok) {
-      ctx.ui.notify(
-        `Could not save the handoff destination (${written.error ?? "unknown error"}); this handoff still uses ${destination}.`,
-        "warning",
-      );
-    }
-    return destination;
   }
 
   /**
@@ -4062,15 +4047,19 @@ export default function workflowExtension(
         "  native      always the native questionnaire — never opens the browser",
         "  plannotator always try Plannotator; native fallback on timeout/error",
         "        /handoff execution orchestrator|build [global|project]",
-        "  execution   default destination for an APPROVED plan",
-        "  orchestrator  prepare an execution breakdown; a separate approval precedes Build children",
-        "  build       enter this session's Build mode and start directly (no orchestration)",
-        "        /handoff once orchestrator|build",
-        "  once        override ONLY the pending handoff; never writes settings",
+        "  execution   RECOMMENDATION for approved plans (never executes by itself)",
+        "  orchestrator  recommend preparing an execution breakdown before Build children",
+        "  build       recommend this session's Build mode and direct execution",
         "        /handoff approve <decision-id>",
-        "  approve     approve the pending handoff by its printed id (headless-safe)",
+        "  approve     approve the PLAN only; execution is always chosen separately",
+        "        /handoff continue <decision-id>",
+        "  continue    reopen the execution chooser for an approved plan",
+        "        /handoff execute <decision-id> orchestrator|build",
+        "  execute     choose execution explicitly (headless-safe)",
+        "        /handoff once orchestrator|build",
+        "  once        change this handoff's recommendation only; never executes",
         "        /handoff status | /handoff fallback",
-        "  fallback    present the pending handoff natively now (no setting change)",
+        "  fallback    present a pending PLAN review natively (no setting change)",
       ].join("\n");
 
       if (!sub || sub === "status") {
@@ -4088,6 +4077,7 @@ export default function workflowExtension(
             `  effective: ${effective}`,
             `  timeout  : ${resolved.config.timeoutMs} ms (${sourceLabel(resolved.sources.timeout)})`,
             `  execute  : ${resolved.config.executionMode} (${sourceLabel(resolved.sources.execution)}) — ${describeExecutionDestination(resolved.config.executionMode)}`,
+            "  A saved recommendation never executes anything: every approved plan gets its own execution chooser.",
             `Global settings: ${paths.global}`,
             `Project settings: ${paths.project}`,
             usage,
@@ -4111,8 +4101,9 @@ export default function workflowExtension(
           const resolved = readHandoffConfig(cwd, agentDir);
           ctx.ui.notify(
             [
-              `Execution destination: ${resolved.config.executionMode} (${sourceLabel(resolved.sources.execution)})`,
+              `Execution recommendation: ${resolved.config.executionMode} (${sourceLabel(resolved.sources.execution)})`,
               `  ${describeExecutionDestination(resolved.config.executionMode)}`,
+              "This never executes anything; an approved plan always gets its own chooser.",
               "Usage: /handoff execution orchestrator|build [global|project]",
             ].join("\n"),
             "info",
@@ -4143,42 +4134,58 @@ export default function workflowExtension(
         const after = readHandoffConfig(cwd, agentDir);
         ctx.ui.notify(
           [
-            `Approved plans → ${destination} (${scope} settings)`,
+            `Default execution recommendation → ${destination} (${scope} settings)`,
             `  ${describeExecutionDestination(destination)}`,
             after.config.executionMode === destination
               ? `  effective: ${destination}`
               : `  effective: ${after.config.executionMode} — another scope overrides this value`,
             `Settings: ${written.path}`,
-            "A pending handoff keeps the destination it was shown with; use /handoff once to change just that one.",
+            "A pending handoff keeps the recommendation it was shown with; use /handoff once to change just that one. Neither executes anything.",
           ].join("\n"),
           "info",
         );
         return;
       }
 
-      // ── /handoff approve <decision-id> ──────────────────────────────
-      if (sub === "approve") {
+      // ── /handoff approve <decision-id>  (stage 1) ───────────────────
+      if (sub === HANDOFF_APPROVE_TOKEN) {
         await approvePendingHandoffById(ctx as ExtensionContext, tokens[1]);
         return;
       }
 
-      // ── /handoff once <destination> ─────────────────────────────────
+      // ── /handoff continue <decision-id>  (stage 2 UI) ───────────────
+      if (sub === HANDOFF_CONTINUE_TOKEN) {
+        await continuePendingHandoffById(ctx as ExtensionContext, tokens[1]);
+        return;
+      }
+
+      // ── /handoff execute <decision-id> <destination>  (stage 2) ─────
+      if (sub === HANDOFF_EXECUTE_TOKEN) {
+        await executePendingHandoffById(
+          ctx as ExtensionContext,
+          tokens[1],
+          tokens[2],
+        );
+        return;
+      }
+
+      // ── /handoff once <destination>  (recommendation only) ──────────
       if (sub === HANDOFF_ONCE_TOKEN) {
         const requested = tokens[1]?.toLowerCase();
         if (!requested || !isHandoffDestination(requested)) {
           ctx.ui.notify(
-            `Usage: /handoff once ${EXECUTION_DESTINATIONS.join("|")} — changes only the pending handoff; settings are untouched.`,
+            `Usage: /handoff once ${EXECUTION_DESTINATIONS.join("|")} — changes only this handoff's recommendation; settings and execution are untouched.`,
             "info",
           );
           return;
         }
-        const changed = overridePendingHandoffDestination(
+        const changed = overridePendingHandoffRecommendation(
           ctx as ExtensionContext,
           requested as ExecutionDestination,
         );
         if (!changed) {
           ctx.ui.notify(
-            "No pending handoff to override — /handoff execution sets the default instead.",
+            "No handoff is pending — /handoff execution sets the saved recommendation instead.",
             "info",
           );
         }
@@ -4193,9 +4200,9 @@ export default function workflowExtension(
       // A pending decision owns the turn: switching the target mid-flight
       // would orphan the browser tab (or the open native sheet). The explicit
       // `fallback` above is the local conversion path, not a target change.
-      if (awaitingDecision || handoffModalOpen) {
+      if (awaitingDecision || handoffModalOpen || executionModalOpen) {
         ctx.ui.notify(
-          "A handoff decision is pending — approve/deny in the browser tab, run /handoff fallback for the native sheet, or /review-abort first.",
+          "A handoff prompt is open — finish it (or /handoff fallback) before changing the presenter.",
           "info",
         );
         return;
@@ -5913,6 +5920,9 @@ export default function workflowExtension(
           stale: todoStale,
           reviewPhase: reviewTurn,
           handoffPending: awaitingDecision && reviewTurn === "idle",
+          ...(handoffStageForStatus() === undefined
+            ? {}
+            : { handoffStage: handoffStageForStatus()! }),
           panelState: todoPanelState,
           ...(orchestrationStatus() === undefined
             ? {}
@@ -5959,7 +5969,9 @@ export default function workflowExtension(
         : false,
       // Versioned decision (destination, override, consume state). A reader that
       // does not understand it keeps the legacy fields above.
-      pendingHandoffDecision: awaitingDecision ? (pendingHandoffDecision ?? null) : null,
+      // Persisted in every active state: an approved plan awaiting an execution
+      // choice must survive reload even though no browser review is pending.
+      pendingHandoffDecision: pendingHandoffDecision ?? null,
       planHandoffPhase,
       manualReviewCycle,
       role: {
@@ -6627,8 +6639,10 @@ export default function workflowExtension(
       });
       return { ok: true, ...(response.reviewId ? { reviewId: response.reviewId } : {}) };
     }
-    const changed = clearPendingHandoffDecision();
-    if (changed) persistState();
+    // Keep the decision so the native fallback reuses its identity, plan hash
+    // and recommendation. Only the browser transport correlation retires.
+    retireBrowserCorrelation(`Plannotator unavailable — ${response.reason}`);
+    persistState();
     try {
       pi.appendEntry("workflow-handoff-plannotator-failed", {
         at: Date.now(),
@@ -6713,6 +6727,22 @@ export default function workflowExtension(
           void _e;
         }
       };
+      // An approved plan awaiting its execution choice restores PASSIVELY: no
+      // modal, no provider query, no execution. The user resumes explicitly.
+      const restored = pendingHandoffDecision;
+      if (restored && restored.state === "approved") {
+        manualReviewCycle = false;
+        awaitingDecision = false;
+        planHandoffPhase = "idle";
+        endReviewTurn();
+        record("awaiting-execution", { decisionId: restored.decisionId });
+        notifyReview(
+          `Plan approved (${restored.decisionId}) — execution was not selected. Nothing has run. Resume with /handoff continue ${restored.decisionId}.`,
+          "info",
+        );
+        updateStatus(ctx as any);
+        return;
+      }
       if (!awaitingDecision) {
         // A startup/new session cannot resume a manual cycle even when no
         // browser decision is pending: the persisted flag used to make the
@@ -6785,12 +6815,37 @@ export default function workflowExtension(
           approved: decision.approved,
         });
         if (decision.approved) {
-          await handlePlannotatorApprove(
-            pendingHandoffPlanPath ?? currentPlanFile ?? "",
-            currentFile ?? "",
-            decision.feedback,
-            ctx.cwd,
-          );
+          // Stage 1 only: recovery must never execute or pop a modal.
+          // A branch written before the lifecycle record existed has no
+          // decision; synthesize its legacy Build RECOMMENDATION (never a
+          // selection) so the approval has an identity to resume.
+          if (!pendingHandoffDecision && pendingHandoffPlanPath) {
+            beginHandoffDecision({
+              planPath: pendingHandoffPlanPath,
+              planText: currentFile ?? "",
+              presenter: "browser",
+              reviewOwned: pendingHandoffReviewOwned,
+              source: pendingHandoffSource ?? "auto",
+              cycleId: pendingHandoffCycleId || reviewCycleId,
+              ctx,
+              legacyDestination: "build",
+            });
+          }
+          const captured = pendingHandoffDecision;
+          if (captured) {
+            retireBrowserCorrelation("recovered browser approval");
+            endPlanHandoff();
+            endReviewTurn();
+            await approvePlanAndMaybeSelectExecution(ctx, {
+              decision: captured,
+              via: "recovery",
+              ...(currentFile ? { planText: currentFile } : {}),
+              ...(decision.feedback ? { feedback: decision.feedback } : {}),
+              autoSelect: false,
+            });
+            persistState();
+            updateStatus(ctx as any);
+          }
         } else {
           await handlePlannotatorDeny(
             decision.feedback || "Plan needs revision.",
@@ -6940,18 +6995,11 @@ export default function workflowExtension(
       // `native` mode (or `auto` with no detected host) skips the bus entirely:
       // no request, no timeout, no "unavailable" warning — straight to the
       // native questionnaire below.
-      const wantBrowser = usePlannotatorHandoff();
-      if (wantBrowser) {
-        // The browser has no destination field, so the choice is settled here
-        // (first run only) and shown in Workflow's status while it is pending.
-        const confirmed = await confirmBrowserHandoffDestination(ctx as any);
-        if (!confirmed) {
-          ctx.ui.notify(
-            "Handoff cancelled — the plan stays in Plan mode. Approve with /handoff or switch with /build.",
-            "info",
-          );
-          return "none";
-        }
+      //
+      // The configured presenter runs FIRST. There is deliberately no execution
+      // question before it: a plan approval and an execution choice are two
+      // separate decisions, and Plannotator's protocol has no destination field.
+      if (usePlannotatorHandoff()) {
         const handoff = await requestPlanReview({
           planText: input.planText,
           planPath: input.planPath,
@@ -6988,19 +7036,19 @@ export default function workflowExtension(
       lastHandoffAt = Date.now();
       beginPlanHandoff(input.reviewOwned ? "review" : "plain");
       const decision = pendingHandoffDecision;
-      const destination = decision?.destination ?? defaultHandoffDestination();
+      const recommended = decision?.recommendedDestination ?? defaultHandoffDestination();
       try {
         (pi as any).sendMessage?.(
           {
             customType: "workflow-handoff-fallback",
             content: [
               `**Plan ready** — ${input.planPath}`,
-              `Approving it would run: ${destination === "orchestrator" ? "Orchestrator (a breakdown is approved next; nothing runs before that)" : "direct Build in this session"}.`,
+              `Recommended execution: ${recommended === "orchestrator" ? "Orchestrator (a breakdown is approved next; nothing runs before that)" : "direct Build in this session"}.`,
+              "Approving the plan is a separate decision from executing it.",
               decision
                 ? `Approve with: /handoff approve ${decision.decisionId}`
                 : "Use /handoff to review the pending decision.",
-              `Change this one off with: /handoff once ${destination === "orchestrator" ? "build" : "orchestrator"}.`,
-              "Nothing executes until you approve.",
+              "Nothing executes until you approve the plan AND choose execution.",
             ].join("\n\n"),
             display: true,
           },
@@ -7044,9 +7092,6 @@ export default function workflowExtension(
       const question = buildHandoffQuestion({
         planPath: input.planPath,
         reason: input.reason,
-        ...(pendingHandoffDecision
-          ? { destination: pendingHandoffDecision.destination }
-          : {}),
         ...(input.verdict !== undefined ? { verdict: input.verdict } : {}),
         ...(input.findingCount !== undefined
           ? { findingCount: input.findingCount }
@@ -7103,94 +7148,22 @@ export default function workflowExtension(
       void _e;
     }
     try {
-      if (choice.choice === "execute") {
-        // A plain handoff does not enter Review; only a review-owned decision
-        // needs the short transition phase (and its input/mode lock).
+      if (choice.choice === "approve") {
+        // Stage 1 only. End the Review/handoff turn FIRST so the execution
+        // chooser is Workflow's Plan sub-state, not a continuing reviewer round.
         if (input.reviewOwned) setReviewTurn("transition");
-        // The destination row the user picked decides; the saved default only
-        // seeds a new handoff. A label can never retarget an approval silently:
-        // an explicit different row becomes a recorded one-off override.
-        const rawCaptured = takePendingHandoffDecision();
-        let captured = rawCaptured;
-        if (
-          rawCaptured &&
-          choice.destination &&
-          rawCaptured.destination !== choice.destination
-        ) {
-          const overridden = overrideHandoffDestination(
-            rawCaptured,
-            choice.destination,
-            Date.now(),
-          );
-          if (overridden.ok) captured = overridden.decision;
-        }
-        const destination: HandoffDestination =
-          choice.destination ?? captured?.destination ?? "build";
-        if (destination === "orchestrator") {
-          const prepared = await beginOrchestratorPreparation(ctx as any, {
-            ...(captured ? { decision: captured } : {}),
-            planPath: input.planPath,
-            planText: input.planText,
-            via: "native",
-          });
-          if (!prepared) {
-            printHandoffPlan(input.planText, input.planPath, "build-failed");
-            await closeReviewTurn({
-              reason: "handoff-orchestrator-failed",
-              planText: input.planText,
-            });
-            return "native";
-          }
+        const captured = pendingHandoffDecision;
+        if (!captured) {
+          ctx.ui.notify("This handoff is no longer pending — nothing was started.", "info");
           return "native";
         }
-        let entered = false;
-        try {
-          entered = await enterBuildModeFromPlan(ctx as any, input.planPath, {
-            fromReview: true,
-          });
-        } catch (e: any) {
-          ctx.ui.notify(
-            `Could not enter Build mode (${String(e?.message ?? e)}); the plan was not executed.`,
-            "warning",
-          );
-        }
-        if (!entered || workflowMode !== "build") {
-          ctx.ui.notify(
-            `Build was not entered — the plan stays at ${input.planPath || "(unknown)"}.`,
-            "warning",
-          );
-          printHandoffPlan(input.planText, input.planPath, "build-failed");
-          // Close the turn explicitly: the finally below only ends the phase,
-          // and the forensic entry must say why the handoff ended here.
-          await closeReviewTurn({
-            reason: "handoff-build-failed",
-            planText: input.planText,
-          });
-          recordHandoffRoute({
-            ...(captured ? { decision: captured } : {}),
-            destination: "build",
-            route: "direct-build",
-            planPath: input.planPath,
-            via: "native",
-            failure: "Build mode was not entered",
-          });
-          return "native";
-        }
-        sendExecuteMessages(ctx as any, input.planPath, undefined, "native");
-        recordHandoffRoute({
-          ...(captured ? { decision: captured } : {}),
-          destination: "build",
-          route: "direct-build",
-          planPath: input.planPath,
+        endPlanHandoff();
+        endReviewTurn();
+        await approvePlanAndMaybeSelectExecution(ctx, {
+          decision: captured,
           via: "native",
+          planText: input.planText,
         });
-        if (captured) {
-          consumeHandoffDecision(captured, {
-            now: Date.now(),
-            route: "direct-build",
-            planHash: planHash(input.planText),
-          });
-        }
         return "native";
       }
       if (choice.choice === "refine") {
@@ -7442,88 +7415,28 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
-    // Atomic decision exit: stop the reviewer and apply Build BEFORE any
-    // follow-up message. `transition` keeps input/mode gates closed while the
-    // async mode switch runs, so a queued prompt cannot race it. A plain
-    // handoff has no Review turn to hold: skip it rather than paint a false
-    // Review state for a few ticks.
+    // Stage 1 exit. Approval is recorded here; execution stays a SEPARATE
+    // decision. Retire the browser transport correlation but keep the decision
+    // record — the previous code cleared both and then routed immediately.
     const reviewOwned = pendingHandoffReviewOwned;
     if (reviewOwned) setReviewTurn("transition");
     if (pendingHandoffSource === "manual") manualReviewCycle = false;
-    // Capture the ONE decision before clearing correlation, so the destination
-    // the user was shown decides this approval (not the current settings).
-    const capturedDecision = takePendingHandoffDecision();
-    const destination: HandoffDestination = capturedDecision?.destination ?? "build";
-    clearPendingHandoffDecision();
-    if (destination === "orchestrator") {
-      const planTextForPrepare = (() => {
-        try {
-          return fs.readFileSync(resolvedPlan, "utf8");
-        } catch (_e) {
-          void _e;
-          return planContent ?? "";
-        }
-      })();
-      const prepared = await beginOrchestratorPreparation(ctx as any, {
-        ...(capturedDecision ? { decision: capturedDecision } : {}),
-        planPath: resolvedPlan,
-        planText: planTextForPrepare,
-        via: "plannotator",
-      });
-      setReviewTurn(prepared ? "idle" : "idle");
-      updateStatus(ctx as any);
+    const capturedDecision = pendingHandoffDecision ?? takePendingHandoffDecision();
+    retireBrowserCorrelation("browser approval received");
+    endPlanHandoff();
+    endReviewTurn();
+    if (!capturedDecision) {
+      ctx.ui.notify("This handoff is no longer pending — nothing was started.", "info");
+      persistState();
       return;
     }
-    let enteredBuild = false;
-    try {
-      enteredBuild = await enterBuildModeFromPlan(
-        ctx as any,
-        resolvedPlan,
-        { fromReview: true },
-      );
-    } catch (e: any) {
-      ctx.ui.notify(
-        `Could not enter Build mode (${String(e?.message ?? e)}); the plan was not executed.`,
-        "warning",
-      );
-    }
-    if (!enteredBuild) {
-      // Never leave a cleared decision owning the turn: print the plan so it
-      // stays reachable, then close the turn. Re-presenting a modal here would
-      // loop on a consistently failing Build.
-      const planTextForPrint = (() => {
-        try {
-          return fs.readFileSync(resolvedPlan, "utf8");
-        } catch (_e) {
-          void _e;
-          return planContent ?? "";
-        }
-      })();
-      printHandoffPlan(planTextForPrint, resolvedPlan, "build-failed");
-      await closeReviewTurn({ reason: "approve-build-failed" });
-      ctx.ui.notify(
-        `Build was not entered — the plan stays at ${resolvedPlan || "(unknown)"}.`,
-        "warning",
-      );
-      return;
-    }
-    setReviewTurn("idle");
-    updateStatus(ctx as any);
-    sendExecuteMessages(ctx as any, resolvedPlan, feedback, "plannotator");
-    recordHandoffRoute({
-      ...(capturedDecision ? { decision: capturedDecision } : {}),
-      destination: "build",
-      route: "direct-build",
-      planPath: resolvedPlan,
-      via: "plannotator",
+    await approvePlanAndMaybeSelectExecution(ctx as any, {
+      decision: capturedDecision,
+      via: "browser",
+      ...(planContent ? { planText: planContent } : {}),
+      ...(feedback ? { feedback } : {}),
     });
-    if (capturedDecision) {
-      consumeHandoffDecision(capturedDecision, {
-        now: Date.now(),
-        route: "direct-build",
-        ...(planContent ? { planHash: planHash(planContent) } : {}),
-      });
-    }
+    updateStatus(ctx as any);
   }
 
   async function handlePlannotatorDeny(feedback: string) {
@@ -7541,6 +7454,8 @@ export default function workflowExtension(
       return;
     }
     if (!awaitingDecision) return;
+    const decisionNow = pendingHandoffDecision;
+    if (decisionNow && decisionNow.state !== "pending") return;
     const manualSource = pendingHandoffSource === "manual";
     try {
       await applyHandoffRefine(ctx as any, feedback, {
@@ -7565,7 +7480,8 @@ export default function workflowExtension(
   ): Promise<void> {
     const source: ReviewHandoffSource = pendingHandoffSource ?? "manual";
     const reviewOwned = pendingHandoffReviewOwned;
-    clearPendingHandoffDecision();
+    // Convert the SAME decision to the native sheet; only transport retires.
+    retireBrowserCorrelation("browser review closed");
     if (!planText || !planPath) {
       await closeReviewTurn({ reason: "review-closed-no-plan" });
       ctx.ui.notify(
@@ -7641,7 +7557,11 @@ export default function workflowExtension(
       status: "error",
       reason: "switched to native handoff",
     });
-    await closeReviewTurn({ reason: "handoff-fallback", planText });
+    await closeReviewTurn({
+      reason: "handoff-fallback",
+      planText,
+      keepHandoff: true,
+    });
     await presentPlanHandoff(ctx, {
       planText,
       planPath,
@@ -7713,6 +7633,11 @@ export default function workflowExtension(
         // A leftover browser tab must not approve a plan after the user
         // switched the handoff target to native (or detection says no host).
         if (!usePlannotatorHandoff()) return;
+        // The plan-approved channel has no review id; claim the current
+        // handoff's request so it cannot double-act with review-result.
+        const claimKey = pendingHandoffRequestId ?? lastReviewId;
+        if (claimKey && claimedReviewResultId === claimKey) return;
+        if (claimKey) claimedReviewResultId = claimKey;
         void handlePlannotatorApprove(
           event?.planFilePath,
           event?.planContent,
@@ -7733,6 +7658,10 @@ export default function workflowExtension(
           // Strict correlation: a review result without the current handoff's
           // review id is stale (e.g. an old browser tab after a new prompt).
           if (!lastReviewId || event.reviewId !== lastReviewId) return;
+          // One claim per review: a duplicate/contradictory event cannot act
+          // after the first decision started (the handlers are async).
+          if (claimedReviewResultId === event.reviewId) return;
+          claimedReviewResultId = event.reviewId;
           if (event.approved) {
             // For review-result we need to resolve planPath from currentPlanFile or lastReviewId
             const planPath = currentPlanFile || lastReviewId || "";
@@ -12656,9 +12585,23 @@ ${rows}`,
             // The versioned destination decision. A branch that predates it
             // restores without a destination record; recovery synthesizes a
             // legacy Build decision so the meaning it was shown with survives.
-            pendingHandoffDecision = awaitingDecision
-              ? parseHandoffDecision((d as any).pendingHandoffDecision)
-              : undefined;
+            // Parse the lifecycle record even when no browser review is
+            // pending: `approved` is a real, restorable state. Terminal records
+            // are history, not live authority.
+            const restoredDecision = parseHandoffDecision(
+              (d as any).pendingHandoffDecision,
+            );
+            pendingHandoffDecision =
+              restoredDecision &&
+              (restoredDecision.state === "pending" ||
+                restoredDecision.state === "approved")
+                ? restoredDecision
+                : undefined;
+            if (pendingHandoffDecision && pendingHandoffDecision.state !== "pending") {
+              // A restored approval has no browser transport to point at; the
+              // legacy `awaitingDecision` boolean must not resurrect Review.
+              awaitingDecision = false;
+            }
           }
         }
         if (
@@ -12887,7 +12830,9 @@ ${rows}`,
     // The pending correlation is restored above. Recovery (step 15) decides
     // whether it survives; do not null it here, or a restored gate can only
     // suppress the next handoff.
-    if (!awaitingDecision) clearPendingHandoffDecision();
+    if (!awaitingDecision && !isAwaitingExecution(pendingHandoffDecision)) {
+      clearPendingHandoffDecision();
+    }
     // A reload cannot preserve a running/paused reviewer child. Only a
     // persisted pending decision survives, and only a review-owned one still
     // owns the Review turn; a plain handoff leaves modes/prompts free.
@@ -15653,6 +15598,8 @@ ${rows}`,
    * can never run twice or be retargeted after it was shown.
    */
   let pendingHandoffDecision: HandoffDecision | undefined;
+  /** True while the stage-2 execution chooser owns input. */
+  let executionModalOpen = false;
   /** The one in-flight `plannotator:request` waiter; settles exactly once. */
   let pendingPlanReviewRequest:
     | {
@@ -15663,6 +15610,15 @@ ${rows}`,
     | undefined;
   /** The review id already recorded in the transcript (one entry per review). */
   let recordedHandoffReviewId: string | null = null;
+  /**
+   * The review id whose decision was already CLAIMED.
+   *
+   * A provider may deliver two events for one review (a duplicate, or an
+   * approve followed immediately by a deny). The handlers are async, so without
+   * a synchronous claim the second event would observe the old state and act
+   * too. One review → at most one decision.
+   */
+  let claimedReviewResultId: string | null = null;
   /** A manual `/review` owns the following feedback cycle (even when auto is off). */
   let manualReviewCycle = false;
   /** One reload recovery at a time (session_start may re-enter). */
@@ -15727,37 +15683,36 @@ ${rows}`,
   }
 
   /**
-   * `/handoff once`: retarget ONLY the pending approval. Never writes settings,
-   * never touches a consumed/superseded decision.
+   * `/handoff once`: change the pending handoff's RECOMMENDATION only.
+   *
+   * Never writes settings and never grants execution: the recommended row is
+   * just the first option of the later, separate execution chooser.
    */
-  function overridePendingHandoffDestination(
+  function overridePendingHandoffRecommendation(
     ctx: ExtensionContext,
     destination: HandoffDestination,
   ): boolean {
-    if (!pendingHandoffDecision || !awaitingDecision || planHandoffPhase !== "pending") {
-      return false;
-    }
-    if (handoffModalOpen) {
+    const decision = pendingHandoffDecision;
+    if (!decision) return false;
+    if (handoffModalOpen || executionModalOpen) {
       ctx.ui.notify(
-        "The native handoff sheet is open — choose its destination-specific approval row instead.",
+        "A handoff prompt is open — choose its row instead.",
         "info",
       );
       return true;
     }
-    const result = overrideHandoffDestination(pendingHandoffDecision, destination, Date.now());
+    const result = recommendHandoffDestination(decision, destination, Date.now());
     if (!result.ok) {
       ctx.ui.notify(`Cannot change this handoff: ${result.error}.`, "warning");
       return true;
     }
-    pendingHandoffDecision = result.decision;
-    persistState();
-    updateStatus(ctx);
+    commitHandoffDecision(result.decision);
     ctx.ui.notify(
-      `This handoff will now approve → ${
+      `Recommended execution for this handoff: ${
         destination === "orchestrator"
           ? "Orchestrator (prepare breakdown)"
           : "direct Build (execute here)"
-      }. Saved default is unchanged (${handoffConfigNow().config.executionMode}).`,
+      }. This does not execute anything and the saved default is unchanged.`,
       "info",
     );
     return true;
@@ -15773,6 +15728,400 @@ ${rows}`,
     return decision;
   }
 
+  // ── Two-stage handoff coordinator ────────────────────────────────
+  //
+  // Stage 1 (plan) and stage 2 (execution) are separate decisions. Everything
+  // that can approve or route goes through this section, so browser events,
+  // native answers, recovery and commands cannot disagree about authority.
+
+  /** Persist + repaint after a decision transition (one call site per change). */
+  function commitHandoffDecision(decision: HandoffDecision | undefined): void {
+    pendingHandoffDecision = decision;
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      if (currentSessionCtx) updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Drop the BROWSER transport correlation but keep the handoff decision.
+   *
+   * Retiring a review (timeout, close, fallback, approval) must not discard the
+   * approval/identity it belongs to — the previous implementation cleared both
+   * and then tried to reuse a record it had already dropped.
+   */
+  function retireBrowserCorrelation(reason = "handoff converted"): void {
+    settlePlanReviewRequest({ status: "error", reason });
+    awaitingDecision = false;
+    lastReviewId = null;
+    pendingHandoffRequestId = null;
+    pendingHandoffReviewUrl = null;
+    recordedHandoffReviewId = null;
+    claimedReviewResultId = null;
+    planHandoffPhase = "idle";
+    pendingHandoffReviewOwned = false;
+    refreshHandoffStatus();
+  }
+
+  /** The approved decision is waiting for (or has received) its execution choice. */
+  function approvedWait(): HandoffDecision | undefined {
+    return pendingHandoffDecision && pendingHandoffDecision.state === "approved"
+      ? pendingHandoffDecision
+      : undefined;
+  }
+
+  /**
+   * Stage 1: record plan approval, then (by default) ask for execution.
+   *
+   * `autoSelect: false` is for reload recovery: record the approval, but never
+   * open a modal or run anything from a passive restore.
+   */
+  async function approvePlanAndMaybeSelectExecution(
+    ctx: ExtensionContext,
+    input: {
+      decision: HandoffDecision;
+      via: "native" | "browser" | "recovery" | "command";
+      planText?: string;
+      feedback?: string;
+      autoSelect?: boolean;
+    },
+  ): Promise<boolean> {
+    const approved = approveHandoffPlan(input.decision, {
+      now: Date.now(),
+      via: input.via,
+      ...(input.planText ? { planHash: planHash(input.planText) } : {}),
+      ...(input.feedback ? { feedback: input.feedback } : {}),
+    });
+    if (!approved.ok) {
+      ctx.ui.notify(`This handoff could not be approved: ${approved.error}.`, "warning");
+      return false;
+    }
+    // Defense in depth: once the PLAN is approved, no presenter owns it any
+    // more. Retiring the transport here (also for a native approval that
+    // replaced a browser prompt) is what stops a late browser deny from
+    // starting a revision for an already-approved plan.
+    if (awaitingDecision) retireBrowserCorrelation("plan approved");
+    endPlanHandoff();
+    endReviewTurn();
+    commitHandoffDecision(approved.decision);
+    try {
+      pi.appendEntry("workflow-handoff-approved", {
+        at: Date.now(),
+        decisionId: approved.decision.decisionId,
+        planPath: approved.decision.planPath,
+        via: input.via,
+      });
+    } catch (_e) {
+      void _e;
+    }
+    const id = approved.decision.decisionId;
+    if (input.autoSelect === false) {
+      ctx.ui.notify(
+        `Plan approved (${id}). Execution was not selected — nothing has run.\nChoose with /handoff continue ${id}.`,
+        "info",
+      );
+      return true;
+    }
+    await requestExecutionSelection(ctx);
+    return true;
+  }
+
+  /**
+   * Stage 2 UI: exactly one execution chooser for the approved decision.
+   *
+   * A cancellation/unknown answer keeps the approval and starts nothing; the
+   * plan stays resumable with `/handoff continue <id>`.
+   */
+  async function requestExecutionSelection(ctx: ExtensionContext): Promise<void> {
+    const decision = approvedWait();
+    if (!decision) {
+      const current = pendingHandoffDecision;
+      ctx.ui.notify(
+        current
+          ? `No execution choice is needed — this handoff is ${current.state}.`
+          : "No approved plan is waiting for an execution choice.",
+        "info",
+      );
+      return;
+    }
+    if (executionModalOpen) {
+      ctx.ui.notify("The execution chooser is already open.", "info");
+      return;
+    }
+    if ((ctx as any).hasUI !== true) {
+      ctx.ui.notify(
+        [
+          `Plan approved — ${decision.decisionId} (${decision.planPath})`,
+          "Choose execution explicitly; nothing runs until then:",
+          `  /handoff execute ${decision.decisionId} orchestrator`,
+          `  /handoff execute ${decision.decisionId} build`,
+        ].join("\n"),
+        "info",
+      );
+      return;
+    }
+    executionModalOpen = true;
+    overlayDepth += 1;
+    let result: QuestionnaireResult | null = null;
+    try {
+      result = await ctx.ui.custom<QuestionnaireResult | null>(
+        (tui, theme, _kb, done) =>
+          createQuestionnaireView(tui, theme, {
+            questions: [
+              buildExecutionQuestion({
+                planPath: decision.planPath,
+                decisionId: decision.decisionId,
+                recommended: decision.recommendedDestination,
+              }),
+            ],
+            done,
+          }),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: QUESTIONNAIRE_OVERLAY_MAX_HEIGHT,
+            margin: 0,
+          },
+        },
+      );
+    } catch (_e) {
+      void _e;
+      result = null;
+    } finally {
+      overlayDepth = Math.max(0, overlayDepth - 1);
+      executionModalOpen = false;
+    }
+    const current = pendingHandoffDecision;
+    if (
+      !current ||
+      current.decisionId !== decision.decisionId ||
+      current.state !== "approved"
+    ) {
+      ctx.ui.notify(
+        "That handoff changed while the chooser was open — nothing was started.",
+        "warning",
+      );
+      return;
+    }
+    const choice = executionChoiceFromResult(result);
+    if (choice.choice !== "execute") {
+      ctx.ui.notify(
+        `Plan stays approved; nothing has run. Resume with /handoff continue ${current.decisionId}.`,
+        "info",
+      );
+      return;
+    }
+    await applyExecutionSelection(ctx, choice.destination, "native");
+  }
+
+  /** Persist the explicit stage-2 selection, then route it once. */
+  async function applyExecutionSelection(
+    ctx: ExtensionContext,
+    destination: HandoffDestination,
+    via: "native" | "command",
+  ): Promise<void> {
+    const decision = pendingHandoffDecision;
+    if (!decision) {
+      ctx.ui.notify("No approved handoff is waiting — nothing was started.", "info");
+      return;
+    }
+    const selected = selectHandoffDestination(decision, destination, Date.now(), via);
+    if (!selected.ok) {
+      ctx.ui.notify(`Cannot select that destination: ${selected.error}.`, "warning");
+      return;
+    }
+    commitHandoffDecision(selected.decision);
+    await routeSelectedDestination(ctx);
+  }
+
+  /**
+   * The single routing owner. Requires an `approved` (or retryable
+   * `route-failed`) decision with an explicit destination.
+   *
+   * Order is intentional: re-validate the approved bytes → persist the routing
+   * intent → apply the effect → record consumed/failed. Nothing is retried
+   * automatically, and an uncertain failure stays blocked.
+   */
+  async function routeSelectedDestination(ctx: ExtensionContext): Promise<void> {
+    const decision = pendingHandoffDecision;
+    if (
+      !decision ||
+      (decision.state !== "approved" && decision.state !== "route-failed")
+    ) {
+      ctx.ui.notify("Nothing is ready to execute.", "info");
+      return;
+    }
+    const destination = decision.destination;
+    if (!destination) {
+      ctx.ui.notify(
+        "Choose Orchestrator or direct Build before executing — nothing was started.",
+        "info",
+      );
+      return;
+    }
+    let planText = "";
+    try {
+      planText = fs.readFileSync(decision.planPath, "utf8");
+    } catch (_e) {
+      void _e;
+    }
+    if (!planText || planHash(planText) !== decision.planHash) {
+      // Never execute content the user did not approve.
+      commitHandoffDecision(
+        supersedeHandoffDecision(decision, Date.now(), "the plan changed after approval"),
+      );
+      ctx.ui.notify(
+        `The plan at ${decision.planPath || "(unknown)"} changed or is unreadable — nothing was executed. Present the handoff again.`,
+        "warning",
+      );
+      return;
+    }
+    const began = beginHandoffRoute(decision, {
+      now: Date.now(),
+      destination,
+      planHash: planHash(planText),
+    });
+    if (!began.ok) {
+      ctx.ui.notify(`Cannot start this route: ${began.error}.`, "warning");
+      return;
+    }
+    commitHandoffDecision(began.decision);
+    if (began.route.kind === "orchestrator-prepare") {
+      await enterOrchestratorRoute(ctx, planText);
+      return;
+    }
+    await enterDirectBuildRoute(ctx, planText);
+  }
+
+  /**
+   * Record one route outcome. `consumed` drops the live decision (the journal
+   * entries are the durable receipt); a failure stays visible for an explicit
+   * retry, and an uncertain delivery stays blocked.
+   */
+  async function finishHandoffRoute(
+    ctx: ExtensionContext,
+    routing: HandoffDecision,
+    input: { route: HandoffRouteKind; failure?: string; uncertain?: boolean },
+  ): Promise<void> {
+    const settled = consumeHandoffRoute(routing, {
+      now: Date.now(),
+      route: input.route,
+      ...(input.failure === undefined ? {} : { failure: input.failure }),
+      ...(input.uncertain === true ? { uncertain: true } : {}),
+    });
+    if (!settled.ok) {
+      ctx.ui.notify(`Handoff receipt could not be recorded: ${settled.error}.`, "warning");
+      return;
+    }
+    recordHandoffRoute({
+      decision: settled.decision,
+      destination: settled.decision.destination ?? "build",
+      route: input.route,
+      planPath: settled.decision.planPath,
+      via: "handoff",
+      ...(input.failure === undefined ? {} : { failure: input.failure }),
+    });
+    if (settled.decision.state === "consumed") {
+      commitHandoffDecision(undefined);
+      endPlanHandoff();
+      endReviewTurn();
+      return;
+    }
+    commitHandoffDecision(settled.decision);
+    const id = settled.decision.decisionId;
+    if (input.uncertain === true) {
+      ctx.ui.notify(
+        `The ${input.route} delivery is uncertain — nothing will be retried automatically. Inspect the session, then re-present the plan or reconcile with /orchestrator status. Handoff ${id}.`,
+        "warning",
+      );
+      return;
+    }
+    ctx.ui.notify(
+      `The ${input.route} attempt did not start (${input.failure ?? "unknown reason"}). The plan stays approved — retry with /handoff execute ${id} ${settled.decision.destination}.`,
+      "warning",
+    );
+  }
+
+  /** Orchestrator effect for an explicitly selected approved plan. */
+  async function enterOrchestratorRoute(
+    ctx: ExtensionContext,
+    planText: string,
+  ): Promise<void> {
+    const routing = pendingHandoffDecision;
+    if (!routing || routing.state !== "routing") return;
+    let prepared = false;
+    try {
+      prepared = await beginOrchestratorPreparation(ctx, {
+        decision: routing,
+        planPath: routing.planPath,
+        planText,
+        via: "handoff",
+      });
+    } catch (error: unknown) {
+      await finishHandoffRoute(ctx, routing, {
+        route: "orchestrator-prepare",
+        failure: `Orchestrator preparation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        uncertain: true,
+      });
+      return;
+    }
+    await finishHandoffRoute(ctx, routing, {
+      route: "orchestrator-prepare",
+      ...(prepared ? {} : { failure: "Orchestrator preparation was not started" }),
+    });
+  }
+
+  /** Direct-Build effect for an explicitly selected approved plan. */
+  async function enterDirectBuildRoute(
+    ctx: ExtensionContext,
+    planText: string,
+  ): Promise<void> {
+    const routing = pendingHandoffDecision;
+    if (!routing || routing.state !== "routing") return;
+    let entered = false;
+    try {
+      entered = await enterBuildModeFromPlan(ctx, routing.planPath, {
+        fromReview: true,
+      });
+    } catch (error: unknown) {
+      ctx.ui.notify(
+        `Could not enter Build mode (${
+          error instanceof Error ? error.message : String(error)
+        }); the plan was not executed.`,
+        "warning",
+      );
+    }
+    if (!entered || workflowMode !== "build") {
+      printHandoffPlan(planText, routing.planPath, "build-failed");
+      // Release the turn and record why, but KEEP the decision so the failure
+      // receipt is attributed to it and an explicit retry stays possible.
+      await closeReviewTurn({
+        reason: "handoff-build-failed",
+        planText,
+        keepHandoff: true,
+      });
+      await finishHandoffRoute(ctx, routing, {
+        route: "direct-build",
+        failure: "Build mode was not entered",
+      });
+      return;
+    }
+    // `enterBuildModeFromPlan` clears the handoff; restore the routing record so
+    // the receipt is recorded against the decision that authorized it.
+    sendExecuteMessages(ctx, routing.planPath, routing.approval?.feedback, "native");
+    await finishHandoffRoute(ctx, routing, { route: "direct-build" });
+  }
+
   /** Durable, display-only record of which route an approval took. */
   function recordHandoffRoute(input: {
     decision?: HandoffDecision;
@@ -15786,7 +16135,7 @@ ${rows}`,
       pi.appendEntry("workflow-handoff-route", {
         at: Date.now(),
         decisionId: input.decision?.decisionId ?? null,
-        overrideRevision: input.decision?.overrideRevision ?? 0,
+        recommendationRevision: input.decision?.recommendationRevision ?? 0,
         destination: input.destination,
         route: input.route,
         planPath: input.planPath,
@@ -16940,32 +17289,34 @@ ${rows}`,
 
   async function beginOrchestratorPreparation(
     ctx: ExtensionContext,
-    input: { decision?: HandoffDecision; planPath: string; planText?: string; via: string },
+    input: {
+      decision?: HandoffDecision;
+      planPath: string;
+      planText?: string;
+      via: string;
+    },
   ): Promise<boolean> {
-    const expectedRoute = input.decision ? handoffRouteFor(input.decision) : undefined;
-    if (expectedRoute && expectedRoute.kind !== "orchestrator-prepare") {
-      ctx.ui.notify(
-        "This handoff was approved for direct Build — it cannot be routed to Orchestrator.",
-        "warning",
-      );
-      return false;
+    // The route owner (`routeSelectedDestination`) has already persisted the
+    // explicit selection and the routing intent. This function must not
+    // re-authorize or consume: it only applies the Orchestrator effect.
+    if (input.decision) {
+      if (input.decision.state !== "routing" && input.decision.state !== "approved") {
+        ctx.ui.notify(
+          `This handoff is ${input.decision.state} — it cannot be prepared again.`,
+          "warning",
+        );
+        return false;
+      }
+      if (input.decision.destination !== "orchestrator") {
+        ctx.ui.notify(
+          "This handoff was approved for direct Build — it cannot be routed to Orchestrator.",
+          "warning",
+        );
+        return false;
+      }
     }
     const destination: HandoffDestination = "orchestrator";
     const route: HandoffRouteKind = "orchestrator-prepare";
-    const consumed = input.decision
-      ? consumeHandoffDecision(input.decision, {
-          now: Date.now(),
-          route,
-          ...(input.planText ? { planHash: planHash(input.planText) } : {}),
-        })
-      : undefined;
-    if (consumed && !consumed.ok) {
-      ctx.ui.notify(
-        `This approval was already applied (${consumed.error}) — nothing was started again.`,
-        "warning",
-      );
-      return false;
-    }
     await switchWorkflowMode("orchestrator", ctx, { quiet: true, fromReview: true });
     if (workflowMode !== "orchestrator") {
       recordHandoffRoute({
@@ -17066,101 +17417,207 @@ ${rows}`,
    * `/review-status`; a mismatched or consumed decision is refused, so an old
    * message can never approve a newer plan.
    */
-  async function approvePendingHandoffById(
+  /**
+   * Resolve a decision by the id the user was shown, refusing a mismatched one.
+   * Shared by the approve/continue/execute commands.
+   */
+  function decisionForCommand(
     ctx: ExtensionContext,
     rawId: string | undefined,
-  ): Promise<void> {
+    usage: string,
+  ): HandoffDecision | undefined {
     const id = typeof rawId === "string" ? rawId.trim() : "";
     const decision = pendingHandoffDecision;
     if (!id) {
-      ctx.ui.notify(
-        "Usage: /handoff approve <decision-id> — the id is printed with the plan and in /review-status.",
-        "info",
-      );
-      return;
+      ctx.ui.notify(usage, "info");
+      return undefined;
     }
     if (!decision) {
       ctx.ui.notify(
-        "No pending handoff to approve — write or open a plan first, then approve it from the handoff.",
+        "No handoff is pending — write or open a plan first, then use the handoff.",
         "info",
       );
-      return;
+      return undefined;
     }
     if (decision.decisionId !== id) {
       ctx.ui.notify(
-        `That id does not match the pending handoff (${decision.decisionId}). Nothing was approved.`,
+        `That id does not match the current handoff (${decision.decisionId}). Nothing was changed.`,
         "warning",
       );
-      return;
+      return undefined;
     }
-    if (decision.state !== "pending") {
-      ctx.ui.notify(`This handoff is already ${decision.state}; nothing was started again.`, "info");
-      return;
-    }
-    if (workflowMode !== "plan" && pendingHandoffSource !== "manual") {
-      ctx.ui.notify(
-        "A plan handoff can only be approved in Plan mode. Nothing was executed.",
-        "warning",
-      );
-      return;
-    }
+    return decision;
+  }
+
+  /** Read + verify the approved plan bytes; refuses on any mismatch. */
+  function verifiedPlanText(
+    ctx: ExtensionContext,
+    decision: HandoffDecision,
+  ): string | undefined {
     let planText = "";
     try {
       planText = fs.readFileSync(decision.planPath, "utf8");
     } catch (_e) {
       void _e;
     }
-    if (decision.planHash !== planHash(planText)) {
+    if (!planText || planHash(planText) !== decision.planHash) {
       ctx.ui.notify(
-        "The plan changed after this handoff was shown — nothing was approved. Present the handoff again.",
+        `The plan at ${decision.planPath || "(unknown)"} changed or is unreadable — nothing was approved. Present the handoff again.`,
+        "warning",
+      );
+      return undefined;
+    }
+    return planText;
+  }
+
+  /**
+   * `/handoff approve <decision-id>`: STAGE 1 only (plan approval).
+   *
+   * The id is the identity printed with the plan and in `/review-status`; a
+   * mismatched or already-approved decision is refused. An interactive session
+   * then opens the execution chooser; a headless one prints the stage-2
+   * commands and executes nothing.
+   */
+  async function approvePendingHandoffById(
+    ctx: ExtensionContext,
+    rawId: string | undefined,
+  ): Promise<void> {
+    const decision = decisionForCommand(
+      ctx,
+      rawId,
+      "Usage: /handoff approve <decision-id> — the id is printed with the plan and in /review-status.",
+    );
+    if (!decision) return;
+    if (decision.state !== "pending") {
+      ctx.ui.notify(
+        decision.state === "approved"
+          ? `This plan is already approved — choose execution with /handoff continue ${decision.decisionId}.`
+          : `This handoff is ${decision.state}; nothing was started again.`,
+        "info",
+      );
+      return;
+    }
+    if (workflowMode !== "plan" && decision.source !== "manual") {
+      ctx.ui.notify(
+        "A plan handoff can only be approved in Plan mode. Nothing was executed.",
         "warning",
       );
       return;
     }
-    takePendingHandoffDecision();
-    if (decision.destination === "orchestrator") {
-      await beginOrchestratorPreparation(ctx, {
+    const planText = verifiedPlanText(ctx, decision);
+    if (planText === undefined) return;
+    retireBrowserCorrelation("approved by command");
+    endPlanHandoff();
+    endReviewTurn();
+    if ((ctx as any).hasUI === true) {
+      await approvePlanAndMaybeSelectExecution(ctx, {
         decision,
-        planPath: decision.planPath,
+        via: "command",
         planText,
-        via: "headless",
       });
-    } else {
-      const entered = await enterBuildModeFromPlan(ctx, decision.planPath, {
-        fromReview: true,
-      });
-      if (!entered || workflowMode !== "build") {
-        recordHandoffRoute({
-          decision,
-          destination: "build",
-          route: "direct-build",
-          planPath: decision.planPath,
-          via: "headless",
-          failure: "Build mode was not entered",
-        });
-        ctx.ui.notify(
-          `Build was not entered — the plan stays at ${decision.planPath}.`,
-          "warning",
-        );
-        return;
-      }
-      sendExecuteMessages(ctx, decision.planPath, undefined, "native");
-      recordHandoffRoute({
-        decision,
-        destination: "build",
-        route: "direct-build",
-        planPath: decision.planPath,
-        via: "headless",
-      });
-      consumeHandoffDecision(decision, {
-        now: Date.now(),
-        route: "direct-build",
-        planHash: planText ? planHash(planText) : undefined,
-      });
+      return;
     }
-    clearPendingHandoffDecision();
+    const approved = approveHandoffPlan(decision, {
+      now: Date.now(),
+      via: "command",
+      planHash: planHash(planText),
+    });
+    if (!approved.ok) {
+      ctx.ui.notify(`This handoff could not be approved: ${approved.error}.`, "warning");
+      return;
+    }
+    commitHandoffDecision(approved.decision);
+    pi.appendEntry("workflow-handoff-approved", {
+      at: Date.now(),
+      decisionId: approved.decision.decisionId,
+      planPath: approved.decision.planPath,
+      via: "command",
+    });
+    ctx.ui.notify(
+      `Plan approved (${approved.decision.decisionId}). Choose execution explicitly; nothing runs until then:
+  /handoff execute ${approved.decision.decisionId} orchestrator
+  /handoff execute ${approved.decision.decisionId} build`,
+      "info",
+    );
     persistState();
     updateStatus(ctx);
+  }
+
+  /** `/handoff continue <decision-id>`: reopen the stage-2 chooser. */
+  async function continuePendingHandoffById(
+    ctx: ExtensionContext,
+    rawId: string | undefined,
+  ): Promise<void> {
+    // The UI action sends bare `continue`: with exactly one approved handoff,
+    // that id is unambiguous. An explicit id must still match.
+    const bare = typeof rawId !== "string" || rawId.trim() === "";
+    const decision =
+      bare && pendingHandoffDecision?.state === "approved"
+        ? pendingHandoffDecision
+        : decisionForCommand(
+            ctx,
+            rawId,
+            "Usage: /handoff continue <decision-id> — the id is printed when the plan is approved.",
+          );
+    if (!decision) return;
+    if (decision.state !== "approved") {
+      ctx.ui.notify(
+        decision.state === "pending"
+          ? "The plan is not approved yet — approve it first."
+          : `This handoff is ${decision.state}; there is nothing to continue.`,
+        "info",
+      );
+      return;
+    }
+    await requestExecutionSelection(ctx);
+  }
+
+  /**
+   * `/handoff execute <decision-id> <orchestrator|build>`: STAGE 2 explicitly,
+   * for headless use or when the chooser was cancelled.
+   */
+  async function executePendingHandoffById(
+    ctx: ExtensionContext,
+    rawId: string | undefined,
+    rawDestination: string | undefined,
+  ): Promise<void> {
+    const decision = decisionForCommand(
+      ctx,
+      rawId,
+      `Usage: /handoff execute <decision-id> ${EXECUTION_DESTINATIONS.join("|")} — choose execution for an approved plan.`,
+    );
+    if (!decision) return;
+    const destinationToken = (rawDestination ?? "").trim().toLowerCase();
+    if (!isExecutionDestination(destinationToken)) {
+      ctx.ui.notify(
+        `Choose an execution destination: ${EXECUTION_DESTINATIONS.join(" or ")}. Nothing was executed.`,
+        "info",
+      );
+      return;
+    }
+    if (decision.state === "pending") {
+      ctx.ui.notify(
+        `The plan is not approved yet — approve it first with /handoff approve ${decision.decisionId}.`,
+        "warning",
+      );
+      return;
+    }
+    if (decision.state !== "approved" && decision.state !== "route-failed") {
+      ctx.ui.notify(
+        `This handoff is ${decision.state}; it cannot be executed again.`,
+        "info",
+      );
+      return;
+    }
+    if (decision.destination && decision.destination !== destinationToken) {
+      ctx.ui.notify(
+        `This handoff already selected ${decision.destination}. Retarget the recommendation with /handoff once ${destinationToken} before choosing, or present a new handoff.`,
+        "warning",
+      );
+      return;
+    }
+    // The explicit command IS the stage-2 decision.
+    await applyExecutionSelection(ctx, destinationToken, "command");
   }
 
   /** Clear per-run handoff provenance (fresh prompt / mode switch / run end). */
@@ -17252,6 +17709,7 @@ ${rows}`,
     pendingHandoffReviewUrl = null;
     pendingHandoffPlanTextLen = 0;
     recordedHandoffReviewId = null;
+    claimedReviewResultId = null;
     pendingHandoffDecision = undefined;
     endPlanHandoff();
     return changed;

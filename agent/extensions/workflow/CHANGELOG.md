@@ -4,6 +4,62 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — plan approval and execution selection are separate decisions (2026-11-22)
+
+**Fixes the reported ordering bug.** After Review completed, the configured
+presenter was not given the plan first: the browser path asked a native
+destination question *before* opening Plannotator (and could look like a native
+fallback), while the native sheet combined "approve" with a destination. Both
+now follow the required order everywhere.
+
+- **Presenter first.** `confirmBrowserHandoffDestination()` — the pre-review
+  picker that wrote a global `executionMode` — is gone. The configured
+  presenter (Plannotator or native) is asked about the PLAN only:
+  *Approve plan (choose execution next)* / *Give feedback* / *Skip*.
+- **Separate execution chooser.** A plan approval records the approval and then
+  opens one chooser: *Orchestrator — prepare an execution breakdown* /
+  *Direct Build — execute in this session now* / *Decide later*. No approval,
+  saved default or one-off recommendation can execute by itself.
+- **Per-plan, not persisted.** The chooser's answer applies to that approved
+  plan. `workflow.handoff.executionMode` remains the saved RECOMMENDATION
+  (edited only by `/handoff execution …`) and is no longer written as a side
+  effect.
+- **Cancel keeps the approval.** Cancelling/escaping the chooser, or a reload
+  mid-choice, leaves the plan approved and the session in Plan with nothing
+  started. `/handoff continue <decision-id>` reopens it; a changed plan,
+  branch or session invalidates it instead.
+- **New command stages.** `/handoff approve <id>` is stage 1 only;
+  `/handoff continue <id>` reopens stage 2; `/handoff execute <id>
+  orchestrator|build` is the explicit headless/CLI stage 2; `/handoff once`
+  now changes only the recommendation and never executes.
+- **`handoff-routing.ts` v2.** The record now models
+  `pending → approved → routing → consumed` (plus `route-failed`,
+  `superseded`, `dismissed`), with separate approval, selection and route
+  receipts. v1 records migrate conservatively: the old captured destination
+  becomes a recommendation, and a consumed v1 record stays terminal.
+- **One owner for effects.** Browser events, native answers, reload recovery and
+  commands all approve/route through the same coordinator. Approval is journaled
+  before any effect; routing intent is persisted before Build/Orchestrator work;
+  a duplicate event cannot open a second chooser, and an uncertain delivery is
+  never retried automatically.
+- **Fallback keeps the decision.** Plannotator timeout/error, a closed review and
+  `/handoff fallback` now retire only the browser transport correlation — the
+  claim/identity/recommendation survive into the native sheet (previously the
+  decision was cleared and then "reused").
+- **Late events are refused.** One claim per review id, plus a state guard in
+  the deny handler, prevent an approve-then-deny pair or a stale tab from
+  revising or executing an already-approved plan.
+- **Status.** The footer/contribution detail distinguishes a pending plan review
+  from `execution choice pending`, labels the destination as a *recommendation*,
+  and offers a `Choose execution` action for an approved wait.
+- Tests: `handoff-routing.test.ts` (v2 + migration), new
+  `handoff-execution-view.test.ts`, and `extension.test.ts` now cover the
+  ordering, cancellation/resume, changed-plan refusal, duplicate channels, the
+  presenter×recommendation matrix, and the headless two-command flow.
+
+The Orchestrator preview approval is unchanged and still separate: choosing
+Orchestrator authorizes preparation only.
+
 ### Added — Orchestrator mission and manual work entry (2026-11-22, third pass)
 
 - **Distinct Orchestrator identity.** `permissions.ts`/`policy-runtime.ts` now

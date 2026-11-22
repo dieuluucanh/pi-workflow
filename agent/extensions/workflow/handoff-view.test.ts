@@ -21,8 +21,6 @@ import {
   HANDOFF_QUESTION_HEADER,
   HANDOFF_SKIP_LABEL,
   buildHandoffQuestion,
-  describeHandoffDestination,
-  handoffApproveLabel,
   capHandoffPlanText,
   handoffChoiceFromResult,
   handoffReasonLabel,
@@ -73,16 +71,11 @@ test("buildHandoffQuestion carries a short context, never the plan body", () => 
     findingCount: 2,
   });
   assert.equal(question.header, HANDOFF_QUESTION_HEADER);
-  assert.equal(question.question, "Plan ready — how do you want to proceed?");
+  assert.equal(question.question, "Plan ready — approve it, or ask for changes?");
   assert.deepEqual(
     question.options.map((o) => o.label),
-    [
-      HANDOFF_APPROVE_ORCHESTRATOR_LABEL,
-      HANDOFF_APPROVE_BUILD_LABEL,
-      HANDOFF_FEEDBACK_LABEL,
-      HANDOFF_SKIP_LABEL,
-    ],
-    "the captured destination is the recommended approval row",
+    [HANDOFF_APPROVE_LABEL, HANDOFF_FEEDBACK_LABEL, HANDOFF_SKIP_LABEL],
+    "the plan question is destination-neutral",
   );
   const context = String(question.context ?? "");
   assert.ok(context.includes(".pi/plans/2026-11-15-hf.md"));
@@ -96,6 +89,10 @@ test("buildHandoffQuestion carries a short context, never the plan body", () => 
   assert.ok(
     !context.includes("Plan Steps"),
     "the plan body must not be pinned inside the modal",
+  );
+  assert.ok(
+    /not execution/.test(context),
+    "the question says approval is not execution",
   );
 });
 
@@ -130,14 +127,14 @@ test("handoffReasonLabel covers every reason", () => {
   assert.ok(handoffReasonLabel("handoff").includes("approve"));
 });
 
-test("handoffChoiceFromResult maps the approve row to execute", () => {
+test("handoffChoiceFromResult maps the approve row to a PLAN approval", () => {
   const result = {
     cancelled: false,
     answers: [
       { question: "q", answer: HANDOFF_APPROVE_LABEL, wasCustom: false },
     ],
   };
-  assert.deepEqual(handoffChoiceFromResult(result), { choice: "execute" });
+  assert.deepEqual(handoffChoiceFromResult(result), { choice: "approve" });
 });
 
 test("handoffChoiceFromResult maps the feedback row to refine", () => {
@@ -208,51 +205,31 @@ test("handoffChoiceFromResult tolerates a non-object host answer", () => {
   );
 });
 
-// ── Destination-specific approval rows (plan step 5) ─────────────────
+// ── Approval is stage 1 only ─────────────────────────────────────────
 
-test("destination rows: the captured destination is first and the other is a one-off", () => {
-  const orchestrator = buildHandoffQuestion({
-    planPath: "p",
-    reason: "reviewed",
-    destination: "orchestrator",
-  });
-  assert.equal(orchestrator.options[0]?.label, HANDOFF_APPROVE_ORCHESTRATOR_LABEL);
-  assert.equal(orchestrator.options[1]?.label, HANDOFF_APPROVE_BUILD_LABEL);
-  assert.match(String(orchestrator.options[1]?.description), /saved default is unchanged/);
-
-  const build = buildHandoffQuestion({
-    planPath: "p",
-    reason: "reviewed",
-    destination: "build",
-  });
-  assert.equal(build.options[0]?.label, HANDOFF_APPROVE_BUILD_LABEL);
-  assert.equal(build.options[1]?.label, HANDOFF_APPROVE_ORCHESTRATOR_LABEL);
-
-  assert.equal(
-    handoffApproveLabel("orchestrator"),
-    HANDOFF_APPROVE_ORCHESTRATOR_LABEL,
-  );
-  assert.equal(handoffApproveLabel("build"), HANDOFF_APPROVE_BUILD_LABEL);
-  assert.ok(describeHandoffDestination("orchestrator").includes("breakdown"));
-  assert.ok(describeHandoffDestination("build").includes("Build"));
+test("native plan rows never carry an execution destination", () => {
+  const question = buildHandoffQuestion({ planPath: "p", reason: "reviewed" });
+  assert.equal(question.options.length, 3);
+  assert.equal(question.options[0]?.label, HANDOFF_APPROVE_LABEL);
+  assert.match(String(question.options[0]?.description), /choose Orchestrator preparation or direct Build/);
+  for (const option of question.options) {
+    assert.doesNotMatch(
+      option.label,
+      /→ (Orchestrator|direct Build)/,
+      "no destination-specific approval row",
+    );
+  }
 });
 
-test("destination rows: each approval row maps to its explicit destination", () => {
+test("legacy destination labels approve the PLAN only", () => {
   const answer = (label: string) =>
     handoffChoiceFromResult({
       cancelled: false,
       answers: [{ question: "q", answer: label, wasCustom: false }],
     });
-  assert.deepEqual(answer(HANDOFF_APPROVE_ORCHESTRATOR_LABEL), {
-    choice: "execute",
-    destination: "orchestrator",
-  });
-  assert.deepEqual(answer(HANDOFF_APPROVE_BUILD_LABEL), {
-    choice: "execute",
-    destination: "build",
-  });
-  // The pre-destination label still executes, using the captured destination.
-  assert.deepEqual(answer(HANDOFF_APPROVE_LABEL), { choice: "execute" });
+  // Pre-split labels are still readable, but they must never imply a route.
+  assert.deepEqual(answer(HANDOFF_APPROVE_ORCHESTRATOR_LABEL), { choice: "approve" });
+  assert.deepEqual(answer(HANDOFF_APPROVE_BUILD_LABEL), { choice: "approve" });
   // A label that is only similar is never an approval.
   assert.deepEqual(answer("Approve plan → Build maybe"), { choice: "dismiss" });
 });

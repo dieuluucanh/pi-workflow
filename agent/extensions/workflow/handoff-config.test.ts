@@ -316,10 +316,21 @@ test("handoff: isHandoffMode and describeHandoffMode are total", () => {
 
 // ── /handoff argument completions ────────────────────────────────────
 
-test("handoff completions: mode position lists modes and fallback", () => {
+test("handoff completions: mode position lists modes and subcommands", () => {
   assert.deepEqual(
     handoffArgumentCompletions("")?.map((i) => i.value),
-    ["auto ", "native ", "plannotator ", "execution ", "once ", "status", "fallback"],
+    [
+      "auto ",
+      "native ",
+      "plannotator ",
+      "execution ",
+      "once ",
+      "approve ",
+      "continue ",
+      "execute ",
+      "status",
+      "fallback",
+    ],
   );
   assert.deepEqual(
     handoffArgumentCompletions("nat")?.map((i) => i.value),

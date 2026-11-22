@@ -88,6 +88,9 @@ Do not convert any row to PASSED without the real run described in it.
 | 19 | `/orchestrator start [path]` | Same preparation service as the tool; bare `/orchestrator` still only enters the mode | NOT RUN |
 | 20 | Preview approve/refine/cancel | Approval requires the displayed `preview-<id>`; refine voids it durably; cancel launches nothing; a stale id is refused | NOT RUN |
 | 21 | Same-length edit to an already-dirty file | Candidate revision changes; acceptance does not treat it as unchanged | NOT RUN |
+| 22 | Configured Plannotator handoff | The browser opens FIRST (no pre-review destination picker, no settings write); Approve then shows the execution chooser | NOT RUN |
+| 23 | Native handoff ordering | The sheet asks Approve/Feedback/Skip about the plan only; approval then opens the separate execution chooser | NOT RUN |
+| 24 | Cancel the execution chooser | Plan stays approved in Plan, no run/turn starts, settings unchanged; `/handoff continue <id>` resumes and an unchanged plan executes only after the choice | NOT RUN |
 
 ## Automated evidence (context, not live signoff)
 

@@ -500,6 +500,12 @@ export interface FakeCtxOptions {
   selectAnswers?: Array<string | undefined>;
   /** Value returned by `ui.custom` (native handoff questionnaire result). */
   customAnswer?: unknown;
+  /**
+   * Sequential `ui.custom` answers. The handoff now has TWO stages (plan
+   * approval, then execution), so a test that answers both supplies them in
+   * order. When exhausted, `customAnswer` is used.
+   */
+  customAnswers?: unknown[];
   /** Value returned by `ui.editor` (e.g. the inline Refine text). */
   editorAnswer?: string | null;
   /** Value returned by `ui.confirm` (default true). */
@@ -565,6 +571,9 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       },
       async custom(_factory?: unknown, options?: unknown) {
         customs.push({ options });
+        if (over.customAnswers && over.customAnswers.length > 0) {
+          return over.customAnswers.shift();
+        }
         return over.customAnswer ?? null;
       },
       async editor() {
@@ -645,13 +654,21 @@ export function renderReviewWidget(
   return Array.isArray(call.value) ? (call.value as string[]) : [];
 }
 
-/** Latest `ctx.ui.setStatus` value for one key (undefined when never set). */
+/**
+ * Latest `ctx.ui.setStatus` text for one key (undefined when never set).
+ *
+ * Statuses are strings by contract; a non-string value is mangled for display
+ * rather than leaking `unknown` into assertions.
+ */
 export function latestStatus(
   statusCalls: Array<{ key: string; value: unknown }>,
   key: string,
-): unknown {
+): string | undefined {
   const call = [...statusCalls].reverse().find((entry) => entry.key === key);
-  return call?.value;
+  const value = call?.value;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
 /**

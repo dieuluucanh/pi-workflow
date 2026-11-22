@@ -395,17 +395,23 @@ export const HANDOFF_FALLBACK_TOKEN = "fallback";
 export const HANDOFF_FALLBACK_DESCRIPTION =
   "present the pending plan handoff in the native questionnaire now";
 
-/** `/handoff execution <destination> [scope]`: the saved approval destination. */
+/** `/handoff execution <destination> [scope]`: the saved RECOMMENDATION. */
 export const HANDOFF_EXECUTION_TOKEN = "execution";
-/** `/handoff once <destination>`: this handoff only; never writes settings. */
+/** `/handoff once <destination>`: this handoff's recommendation; no settings. */
 export const HANDOFF_ONCE_TOKEN = "once";
 /** `/handoff status`: effective presenter, destination and scopes. */
 export const HANDOFF_STATUS_TOKEN = "status";
+/** `/handoff continue <decision-id>`: reopen the execution chooser. */
+export const HANDOFF_CONTINUE_TOKEN = "continue";
+/** `/handoff execute <decision-id> orchestrator|build`: the stage-2 decision. */
+export const HANDOFF_EXECUTE_TOKEN = "execute";
+/** `/handoff approve <decision-id>`: stage 1 (plan approval) only. */
+export const HANDOFF_APPROVE_TOKEN = "approve";
 
 export const HANDOFF_EXECUTION_DESCRIPTIONS: Record<ExecutionDestination, string> = {
   orchestrator:
-    "approved plans go to Orchestrator (separate breakdown approval before Build children)",
-  build: "approved plans start directly in this session's Build mode",
+    "recommend Orchestrator for approved plans (a separate breakdown approval precedes Build children)",
+  build: "recommend direct Build for approved plans (execute in this session)",
 };
 
 /**
@@ -415,6 +421,9 @@ export const HANDOFF_EXECUTION_DESCRIPTIONS: Record<ExecutionDestination, string
  *   /handoff [auto|native|plannotator] [global|project]
  *   /handoff execution <orchestrator|build> [global|project]
  *   /handoff once <orchestrator|build>
+ *   /handoff approve <decision-id>
+ *   /handoff continue <decision-id>
+ *   /handoff execute <decision-id> <orchestrator|build>
  *   /handoff status
  *   /handoff fallback
  *
@@ -474,7 +483,28 @@ export function handoffArgumentCompletions(
       items.push({
         value: `${HANDOFF_ONCE_TOKEN} `,
         label: HANDOFF_ONCE_TOKEN,
-        description: "override the destination of the pending handoff only",
+        description: "change this handoff's recommendation only (never executes)",
+      });
+    }
+    if (HANDOFF_APPROVE_TOKEN.startsWith(lower)) {
+      items.push({
+        value: `${HANDOFF_APPROVE_TOKEN} `,
+        label: HANDOFF_APPROVE_TOKEN,
+        description: "approve a pending plan by its printed decision id",
+      });
+    }
+    if (HANDOFF_CONTINUE_TOKEN.startsWith(lower)) {
+      items.push({
+        value: `${HANDOFF_CONTINUE_TOKEN} `,
+        label: HANDOFF_CONTINUE_TOKEN,
+        description: "reopen the execution chooser for an approved plan",
+      });
+    }
+    if (HANDOFF_EXECUTE_TOKEN.startsWith(lower)) {
+      items.push({
+        value: `${HANDOFF_EXECUTE_TOKEN} `,
+        label: HANDOFF_EXECUTE_TOKEN,
+        description: "choose execution for an approved plan by decision id",
       });
     }
     if (HANDOFF_STATUS_TOKEN.startsWith(lower)) {
@@ -519,6 +549,19 @@ export function handoffArgumentCompletions(
     }
     return null;
   }
+
+  // ── /handoff execute <decision-id> <destination> ────────────────────
+  if (sub === HANDOFF_EXECUTE_TOKEN) {
+    // The decision id is free-form; only the destination token completes.
+    if (tokens.length === 2 && endsWithWs) return null;
+    if (tokens.length === 3 && !endsWithWs) {
+      return filterScopes(destinationItems(partial), partial);
+    }
+    return null;
+  }
+
+  // ── /handoff continue <decision-id> / approve <decision-id> ─────────
+  if (sub === HANDOFF_CONTINUE_TOKEN || sub === HANDOFF_APPROVE_TOKEN) return null;
 
   // ── /handoff <presenter> [scope] ────────────────────────────────────
   if (!isHandoffMode(sub)) return null;

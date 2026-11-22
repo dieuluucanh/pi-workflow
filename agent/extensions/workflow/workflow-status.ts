@@ -45,10 +45,15 @@ export interface WorkflowStatusInput {
   /** Shared read/write/commit folder scope; null/undefined omits it. */
   folderMode?: string | null;
   /**
-   * The saved handoff execution destination. Visible so the user knows where
-   * the NEXT approval goes before consenting to it.
+   * The saved handoff execution RECOMMENDATION. Visible so the user knows what
+   * the next chooser will suggest; it never executes anything by itself.
    */
   handoffDestination?: "orchestrator" | "build";
+  /**
+   * Which handoff stage is active: a plan review awaiting a decision, an
+   * approved plan awaiting its execution choice, or a route being applied.
+   */
+  handoffStage?: "review-pending" | "approved" | "routing";
   /** Orchestrator run state, when one is bound to this session. */
   orchestration?: {
     phase: string;
@@ -116,11 +121,19 @@ export function buildWorkflowStatusSegments(
     } else {
       base = `◦ commits:${input.commitMode}${stale}`;
     }
-    mode = input.handoffPending ? `${base} — handoff pending` : base;
+    const stageSuffix =
+      input.handoffStage === "approved"
+        ? " — execution choice pending"
+        : input.handoffStage === "routing"
+          ? " — applying execution"
+          : input.handoffPending || input.handoffStage === "review-pending"
+            ? " — handoff pending"
+            : "";
+    mode = `${base}${stageSuffix}`;
   }
 
   const destination = input.handoffDestination
-    ? `next approval → ${input.handoffDestination === "orchestrator" ? "orchestrator" : "direct build"}`
+    ? `recommended → ${input.handoffDestination === "orchestrator" ? "orchestrator" : "direct build"}`
     : "";
   const run = input.orchestration
     ? `run ${input.orchestration.phase}` +

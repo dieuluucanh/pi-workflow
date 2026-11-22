@@ -1,26 +1,37 @@
 /**
- * Workflow Extension — plan handoff decision record and approval router.
+ * Workflow Extension — plan handoff lifecycle and approval routing.
  *
- * A plan approval is a decision with identity, not a boolean. This module owns
- * everything that can be decided without a Pi host:
+ * A handoff is a two-stage decision, not a boolean:
  *
- *   - the durable identity of one handoff (plan path + approved-content digest,
- *     session/branch, review cycle, review/request correlation);
- *   - the destination captured when the decision was SHOWN, plus a one-off
- *     override that never writes settings;
- *   - consume/supersede transitions, so browser, native and reload-recovery
- *     events can never execute the same approval twice;
- *   - the pure route choice (`build` = this session, `orchestrator` = prepare a
- *     breakdown) that the extension applies.
+ *   1. **Plan review** — the configured presenter (Plannotator or native)
+ *      asks Approve / Feedback / Skip about the PLAN.
+ *   2. **Execution** — only after an approval, Workflow asks where the
+ *      approved plan runs (Orchestrator preparation or direct Build).
  *
- * Legacy compatibility: a pending browser handoff persisted before destinations
- * existed was shown as "Approve → Build". Restoring it must keep that meaning;
- * it never becomes retroactive consent to orchestration.
+ * The stages are separate states so that:
+ *   - a saved/recommended destination can never execute without stage 2;
+ *   - cancelling stage 2 keeps the approval (it is not a dismissal);
+ *   - duplicate browser/native/recovery events cannot route twice.
+ *
+ * ```text
+ *   pending ──approve──▶ approved ──select──▶ routing ──ok──▶ consumed
+ *      │                   │   ▲                │
+ *      │                   │   └──fail(retryable)│
+ *      ├──feedback/dismiss │                    └──fail(uncertain)─▶ route-failed
+ *      └──superseded       └──superseded / new prompt✗
+ * ```
+ *
+ * Legacy compatibility: v1 records (and pre-destination browser gates) carried
+ * a destination captured when the handoff was SHOWN. That is a recommendation,
+ * never consent to execute. Migrating them keeps the recommendation and
+ * requires the new two-stage decisions. A v1 `consumed` record stays terminal.
  *
  * Type-only imports: this module stays testable without a host or filesystem.
  */
 
-export const HANDOFF_DECISION_VERSION = 1 as const;
+export const HANDOFF_DECISION_VERSION = 2 as const;
+/** Records written before the two-stage lifecycle. Readable, never writable. */
+export const HANDOFF_DECISION_VERSION_LEGACY = 1 as const;
 
 /** Where an approved plan executes. Mirrors `handoff-config.ts`. */
 export type HandoffDestination = "orchestrator" | "build";
@@ -30,13 +41,46 @@ export const HANDOFF_DESTINATIONS: readonly HandoffDestination[] = [
   "build",
 ];
 
+/**
+ * Lifecycle states.
+ *
+ * - `pending`   — the plan is presented; only approval/feedback/dismiss.
+ * - `approved`  — the plan is approved; the execution chooser has not routed.
+ * - `routing`   — a destination was selected and the effect is being applied.
+ * - `consumed`  — the route was applied (receipts hold the evidence).
+ * - `route-failed` — the route failed; terminal unless the failure was provably
+ *   pre-delivery, in which case an explicit retry is allowed.
+ * - `superseded` / `dismissed` — terminal, no execution authority.
+ */
 export type HandoffDecisionState =
   | "pending"
+  | "approved"
+  | "routing"
   | "consumed"
+  | "route-failed"
   | "superseded"
   | "dismissed";
 
 export type HandoffPresenter = "browser" | "native";
+
+/** Why the plan was approved. Recorded as evidence, not authority. */
+export type HandoffApprovalVia = "native" | "browser" | "recovery" | "command";
+
+/** Why the execution destination was selected. */
+export type HandoffSelectionVia = "native" | "command";
+
+export interface HandoffApprovalReceipt {
+  at: number;
+  via: HandoffApprovalVia;
+  /** Optional plan comment carried with an approval (never a denial). */
+  feedback?: string;
+}
+
+export interface HandoffSelectionReceipt {
+  at: number;
+  destination: HandoffDestination;
+  via: HandoffSelectionVia;
+}
 
 /** One applied routing effect. Exactly one per consumed decision. */
 export interface HandoffRouteReceipt {
@@ -44,8 +88,13 @@ export interface HandoffRouteReceipt {
   destination: HandoffDestination;
   /** `direct-build` or `orchestrator-prepare`. */
   route: HandoffRouteKind;
-  /** Set when the route was requested but could not be applied. */
+  /** Set when the route was attempted but could not be applied. */
   failure?: string;
+  /**
+   * True when delivery cannot be proved (a throw after an effect began). Such
+   * a failure is never retried automatically.
+   */
+  uncertain?: boolean;
 }
 
 export type HandoffRouteKind = "direct-build" | "orchestrator-prepare";
@@ -66,19 +115,30 @@ export interface HandoffDecision {
   source: "auto" | "manual";
   presenter: HandoffPresenter;
   reviewOwned: boolean;
-  /** Destination captured from settings when the decision was presented. */
-  defaultDestination: HandoffDestination;
-  /** Effective destination: the default, or the one-off override. */
-  destination: HandoffDestination;
-  /** 0 while the captured default applies; increments per explicit override. */
-  overrideRevision: number;
+  /**
+   * The destination recommended by settings (`executionMode`) or a one-off
+   * recommendation. It seeds the execution chooser's first row; it is NEVER
+   * authority to execute.
+   */
+  recommendedDestination: HandoffDestination;
+  /** Bumped by an explicit recommendation change. */
+  recommendationRevision: number;
+  /**
+   * The destination the user explicitly selected in stage 2. Absent until the
+   * execution chooser answers — this is the only execution authority.
+   */
+  destination?: HandoffDestination;
   state: HandoffDecisionState;
   createdAt: number;
   updatedAt: number;
-  /** Set when consumed; the bounded evidence that this decision ran. */
-  receipts: HandoffRouteReceipt[];
+  /** Set when the plan was approved (stage 1). */
+  approvedAt?: number;
+  approval?: HandoffApprovalReceipt;
+  selection?: HandoffSelectionReceipt;
   /** Present on a restored legacy decision (pre-destination). */
   legacy?: true;
+  /** Bounded evidence of applied/failed routes. */
+  receipts: HandoffRouteReceipt[];
 }
 
 export type HandoffDecisionResult<T = HandoffDecision> =
@@ -87,11 +147,14 @@ export type HandoffDecisionResult<T = HandoffDecision> =
       ok: false;
       code:
         | "invalid"
+        | "wrong-state"
         | "consumed"
         | "dismissed"
         | "superseded"
         | "stale"
-        | "unchanged";
+        | "unchanged"
+        | "not-approved"
+        | "no-selection";
       error: string;
     };
 
@@ -118,10 +181,33 @@ export function isHandoffDestination(value: unknown): value is HandoffDestinatio
 function isState(value: unknown): value is HandoffDecisionState {
   return (
     value === "pending" ||
+    value === "approved" ||
+    value === "routing" ||
     value === "consumed" ||
+    value === "route-failed" ||
     value === "superseded" ||
     value === "dismissed"
   );
+}
+
+/** True while a decision still describes work the user can act on. */
+export function isHandoffActive(
+  decision: HandoffDecision | undefined,
+): decision is HandoffDecision {
+  return (
+    decision !== undefined &&
+    (decision.state === "pending" ||
+      decision.state === "approved" ||
+      decision.state === "routing" ||
+      decision.state === "route-failed")
+  );
+}
+
+/** The plan was approved but no execution route has been applied. */
+export function isAwaitingExecution(
+  decision: HandoffDecision | undefined,
+): decision is HandoffDecision {
+  return decision !== undefined && decision.state === "approved";
 }
 
 /** Deterministic identity: stable across reloads for the same handoff. */
@@ -155,6 +241,7 @@ export interface CreateHandoffDecisionInput {
   source: "auto" | "manual";
   presenter: HandoffPresenter;
   reviewOwned: boolean;
+  /** Saved `executionMode` (or a legacy captured destination). */
   defaultDestination: HandoffDestination;
   now: number;
   /** A restored decision keeps its id through reload/recovery. */
@@ -163,8 +250,8 @@ export interface CreateHandoffDecisionInput {
 }
 
 /**
- * Creates the pending record. A legacy record keeps the destination it was
- * originally shown with (`build`), never the new default.
+ * Creates the `pending` record. A legacy record keeps the destination it was
+ * originally shown with (`build`) as the RECOMMENDATION, never as a selection.
  */
 export function createHandoffDecision(
   input: CreateHandoffDecisionInput,
@@ -182,7 +269,7 @@ export function createHandoffDecision(
     return { ok: false, code: "invalid", error: "unknown default destination" };
   }
   const legacy = input.legacy === true;
-  const defaultDestination: HandoffDestination = legacy ? "build" : input.defaultDestination;
+  const recommendedDestination: HandoffDestination = legacy ? "build" : input.defaultDestination;
   const decisionId =
     bounded(input.decisionId, MAX_DECISION_ID) ??
     handoffDecisionId({
@@ -203,9 +290,8 @@ export function createHandoffDecision(
       source: input.source,
       presenter: input.presenter,
       reviewOwned: input.reviewOwned,
-      defaultDestination,
-      destination: defaultDestination,
-      overrideRevision: 0,
+      recommendedDestination,
+      recommendationRevision: 0,
       state: "pending",
       createdAt: input.now,
       updatedAt: input.now,
@@ -216,10 +302,71 @@ export function createHandoffDecision(
 }
 
 /**
- * Applies a one-off destination. Only a pending decision can be overridden and
- * settings are never touched here; `handoff-config.ts` owns the saved default.
+ * Stage 1: record plan approval. Does NOT choose or apply a destination.
+ *
+ * Idempotence is by state: a second approval sees `approved` (or later) and is
+ * refused, so a duplicate browser event cannot open a second chooser.
  */
-export function overrideHandoffDestination(
+export function approveHandoffPlan(
+  decision: HandoffDecision,
+  input: {
+    now: number;
+    via: HandoffApprovalVia;
+    /** Re-validated approved content; must still match what was shown. */
+    planHash?: string;
+    /** Approval comment from the presenter (not a denial). */
+    feedback?: string;
+  },
+): HandoffDecisionResult {
+  if (decision.state === "consumed") {
+    return { ok: false, code: "consumed", error: "this handoff was already applied" };
+  }
+  if (decision.state === "dismissed") {
+    return { ok: false, code: "dismissed", error: "this handoff was dismissed" };
+  }
+  if (decision.state === "superseded") {
+    return { ok: false, code: "superseded", error: "this handoff was superseded" };
+  }
+  if (decision.state === "route-failed") {
+    return {
+      ok: false,
+      code: "wrong-state",
+      error: "this handoff already had an execution attempt",
+    };
+  }
+  if (decision.state === "approved" || decision.state === "routing") {
+    return {
+      ok: false,
+      code: "wrong-state",
+      error: "this plan is already approved — choose the execution destination",
+    };
+  }
+  if (input.planHash !== undefined && input.planHash !== decision.planHash) {
+    return { ok: false, code: "invalid", error: "the plan changed after it was shown" };
+  }
+  return {
+    ok: true,
+    decision: {
+      ...decision,
+      state: "approved",
+      updatedAt: input.now,
+      approvedAt: input.now,
+      approval: {
+        at: input.now,
+        via: input.via,
+        ...(input.feedback === undefined || input.feedback.trim() === ""
+          ? {}
+          : { feedback: input.feedback }),
+      },
+    },
+  };
+}
+
+/**
+ * Changes the RECOMMENDATION for this handoff only (settings are untouched).
+ * Works while `pending` or `approved`; never selects or routes.
+ */
+export function recommendHandoffDestination(
   decision: HandoffDecision,
   destination: HandoffDestination,
   now: number,
@@ -228,23 +375,33 @@ export function overrideHandoffDestination(
     return {
       ok: false,
       code: "consumed",
-      error: "this handoff was already approved — change the default for the next one",
+      error: "this handoff was already applied — change the default for the next one",
     };
   }
-  if (decision.state !== "pending") {
+  if (decision.state === "routing") {
     return {
       ok: false,
-      code: decision.state === "dismissed" ? "dismissed" : "superseded",
+      code: "wrong-state",
+      error: "this handoff is already applying a route",
+    };
+  }
+  if (decision.state !== "pending" && decision.state !== "approved") {
+    return {
+      ok: false,
+      code: "wrong-state",
       error: `this handoff is ${decision.state}`,
     };
   }
   if (!isHandoffDestination(destination)) {
     return { ok: false, code: "invalid", error: "unknown destination" };
   }
-  if (decision.destination === destination && decision.overrideRevision > 0) {
+  if (
+    decision.recommendedDestination === destination &&
+    decision.recommendationRevision > 0
+  ) {
     return { ok: false, code: "unchanged", error: `already set to ${destination}` };
   }
-  // Drop `legacy` entirely: an explicit one-off choice means the restored-Build
+  // Drop `legacy` entirely: an explicit recommendation means the restored-Build
   // rule no longer applies, and the record must round-trip byte-stably.
   const { legacy: _legacy, ...rest } = decision;
   void _legacy;
@@ -252,9 +409,52 @@ export function overrideHandoffDestination(
     ok: true,
     decision: {
       ...rest,
-      destination,
-      overrideRevision: decision.overrideRevision + 1,
+      recommendedDestination: destination,
+      recommendationRevision: decision.recommendationRevision + 1,
       updatedAt: now,
+    },
+  };
+}
+
+/**
+ * Stage 2: the user explicitly chose where the approved plan runs.
+ *
+ * Only an `approved` decision can be selected. A destination is required; a
+ * cancellation is the ABSENCE of this transition, never a default.
+ */
+export function selectHandoffDestination(
+  decision: HandoffDecision,
+  destination: HandoffDestination,
+  now: number,
+  via: HandoffSelectionVia = "native",
+): HandoffDecisionResult {
+  if (decision.state === "pending") {
+    return {
+      ok: false,
+      code: "not-approved",
+      error: "the plan is not approved yet",
+    };
+  }
+  if (decision.state === "consumed") {
+    return { ok: false, code: "consumed", error: "this handoff was already applied" };
+  }
+  if (decision.state !== "approved") {
+    return {
+      ok: false,
+      code: "wrong-state",
+      error: `this handoff is ${decision.state}`,
+    };
+  }
+  if (!isHandoffDestination(destination)) {
+    return { ok: false, code: "invalid", error: "unknown destination" };
+  }
+  return {
+    ok: true,
+    decision: {
+      ...decision,
+      destination,
+      updatedAt: now,
+      selection: { at: now, destination, via },
     },
   };
 }
@@ -273,16 +473,20 @@ export function handoffDecisionMatches(
 }
 
 /**
- * The pure route for an approval. Calling this does not consume: the caller
- * persists intent first, then applies the effect, then records the receipt.
+ * The pure route for a selected destination. Calling this does not consume:
+ * the caller persists intent first, then applies the effect, then records the
+ * receipt.
  */
 export function handoffRouteFor(decision: HandoffDecision): HandoffRoute | undefined {
-  if (decision.state !== "pending") return undefined;
-  if (decision.destination === "build") {
+  if (decision.state !== "routing" && decision.state !== "approved") return undefined;
+  const destination = decision.destination;
+  if (!destination) return undefined;
+  if (destination === "build") {
     return {
       kind: "direct-build",
       planPath: decision.planPath,
       decisionId: decision.decisionId,
+      ...(decision.approval?.feedback ? { feedback: decision.approval.feedback } : {}),
     };
   }
   return {
@@ -293,58 +497,121 @@ export function handoffRouteFor(decision: HandoffDecision): HandoffRoute | undef
   };
 }
 
-export type ConsumeResult =
+export type RouteBeginResult =
   | { ok: true; decision: HandoffDecision; route: HandoffRoute }
-  | { ok: false; code: "not_pending" | "invalid"; error: string };
+  | { ok: false; code: "not-approved" | "no-selection" | "wrong-state" | "invalid"; error: string };
 
 /**
- * Marks the decision consumed and returns the single route to apply.
+ * Persisted routing intent. Marks the decision `routing` and returns the single
+ * route to apply. Requires a selected destination that matches `destination`.
  *
- * Idempotence is by state: a second approval (browser duplicate, native answer
- * after fallback, reload recovery) sees `consumed` and is refused, so no second
- * parent turn, run or child can start from one decision.
+ * A `route-failed` decision is retryable only when the last receipt is not
+ * uncertain (a proven pre-delivery failure).
  */
-export function consumeHandoffDecision(
+export function beginHandoffRoute(
   decision: HandoffDecision,
   input: {
     now: number;
     /** Re-validated approved content; must still match what was shown. */
     planHash?: string;
-    route: HandoffRouteKind;
-    failure?: string;
+    /** The destination the caller is about to apply. */
+    destination: HandoffDestination;
   },
-): ConsumeResult {
-  if (decision.state !== "pending") {
+): RouteBeginResult {
+  const retry =
+    decision.state === "route-failed" &&
+    decision.receipts[decision.receipts.length - 1]?.uncertain !== true;
+  if (decision.state !== "approved" && !retry) {
+    if (decision.state === "route-failed") {
+      return {
+        ok: false,
+        code: "wrong-state",
+        error: "the previous attempt's delivery is uncertain — reconcile before retrying",
+      };
+    }
     return {
       ok: false,
-      code: "not_pending",
+      code: decision.state === "pending" ? "not-approved" : "wrong-state",
       error: `this handoff is ${decision.state}`,
     };
   }
   if (input.planHash !== undefined && input.planHash !== decision.planHash) {
     return { ok: false, code: "invalid", error: "the plan changed after it was shown" };
   }
-  const route = handoffRouteFor(decision);
-  if (!route) return { ok: false, code: "not_pending", error: "no route is available" };
-  if (route.kind !== input.route) {
+  if (!isHandoffDestination(input.destination)) {
+    return { ok: false, code: "invalid", error: "unknown destination" };
+  }
+  if (!decision.destination) {
+    return {
+      ok: false,
+      code: "no-selection",
+      error: "choose Orchestrator or direct Build before executing",
+    };
+  }
+  if (decision.destination !== input.destination) {
     return {
       ok: false,
       code: "invalid",
-      error: `the destination is ${decision.destination}, not ${input.route}`,
+      error: `the selected destination is ${decision.destination}, not ${input.destination}`,
+    };
+  }
+  const routing: HandoffDecision = {
+    ...decision,
+    state: "routing",
+    updatedAt: input.now,
+  };
+  const route = handoffRouteFor(routing);
+  if (!route) {
+    return { ok: false, code: "no-selection", error: "no route is available" };
+  }
+  return { ok: true, decision: routing, route };
+}
+
+/**
+ * Marks the route applied. Requires `routing` (or a retryable `route-failed`,
+ * which `beginHandoffRoute` normalizes first).
+ */
+export function consumeHandoffRoute(
+  decision: HandoffDecision,
+  input: {
+    now: number;
+    route: HandoffRouteKind;
+    failure?: string;
+    uncertain?: boolean;
+  },
+): HandoffDecisionResult {
+  if (decision.state !== "routing" && decision.state !== "route-failed") {
+    return {
+      ok: false,
+      code: decision.state === "consumed" ? "consumed" : "wrong-state",
+      error: `this handoff is ${decision.state}`,
+    };
+  }
+  const destination = decision.destination;
+  if (!destination) {
+    return { ok: false, code: "no-selection", error: "no destination was selected" };
+  }
+  const expected = destination === "build" ? "direct-build" : "orchestrator-prepare";
+  if (input.route !== expected) {
+    return {
+      ok: false,
+      code: "invalid",
+      error: `the destination is ${destination}, not ${input.route}`,
     };
   }
   const receipt: HandoffRouteReceipt = {
     at: input.now,
-    destination: decision.destination,
+    destination,
     route: input.route,
     ...(input.failure === undefined ? {} : { failure: input.failure }),
+    ...(input.uncertain === true ? { uncertain: true } : {}),
   };
+  const failed = input.failure !== undefined;
   return {
     ok: true,
-    route,
     decision: {
       ...decision,
-      state: "consumed",
+      state: failed ? "route-failed" : "consumed",
       updatedAt: input.now,
       receipts: [...decision.receipts, receipt].slice(-MAX_RECEIPTS),
     },
@@ -356,12 +623,17 @@ export function supersedeHandoffDecision(
   now: number,
   reason?: string,
 ): HandoffDecision {
-  if (decision.state === "consumed") return decision;
+  // A routing attempt is never silently superseded: its delivery outcome must
+  // be recorded by the route owner.
+  if (decision.state === "consumed" || decision.state === "routing") return decision;
   const receipt: HandoffRouteReceipt | undefined = reason
     ? {
         at: now,
-        destination: decision.destination,
-        route: decision.destination === "build" ? "direct-build" : "orchestrator-prepare",
+        destination: decision.destination ?? decision.recommendedDestination,
+        route:
+          (decision.destination ?? decision.recommendedDestination) === "build"
+            ? "direct-build"
+            : "orchestrator-prepare",
         failure: reason,
       }
     : undefined;
@@ -375,31 +647,60 @@ export function supersedeHandoffDecision(
   };
 }
 
+/** Dismisses an UNANSWERED plan review. An approval is not dismissible. */
 export function dismissHandoffDecision(decision: HandoffDecision, now: number): HandoffDecision {
-  if (decision.state === "consumed") return decision;
+  if (decision.state !== "pending") return decision;
   return { ...decision, state: "dismissed", updatedAt: now };
 }
 
-/** Bounded, validated codec for the persisted workflow entry. */
-export function parseHandoffDecision(raw: unknown): HandoffDecision | undefined {
-  if (!isRecord(raw)) return undefined;
-  if (raw.version !== HANDOFF_DECISION_VERSION) return undefined;
-  if (!isState(raw.state)) return undefined;
+function parseReceipts(raw: unknown): HandoffRouteReceipt[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(isRecord)
+    .flatMap((entry) => {
+      if (typeof entry.at !== "number") return [];
+      if (!isHandoffDestination(entry.destination)) return [];
+      if (entry.route !== "direct-build" && entry.route !== "orchestrator-prepare") {
+        return [];
+      }
+      const failure = bounded(entry.failure, 400);
+      return [
+        {
+          at: entry.at,
+          destination: entry.destination,
+          route: entry.route,
+          ...(failure ? { failure } : {}),
+          ...(entry.uncertain === true ? { uncertain: true as const } : {}),
+        } satisfies HandoffRouteReceipt,
+      ];
+    })
+    .slice(-MAX_RECEIPTS);
+}
+
+/** What every versioned record must carry to be considered at all. */
+interface DecisionIdentity {
+  decisionId: string;
+  planPath: string;
+  planHash: string;
+  sessionRef: string;
+  reviewCycleId: number;
+  source: "auto" | "manual";
+  presenter: HandoffPresenter;
+}
+
+/** Validate the identity/correlation fields shared by all versions. */
+function parseIdentity(raw: Record<string, unknown>): DecisionIdentity | undefined {
   const decisionId = bounded(raw.decisionId, MAX_DECISION_ID);
   const planPath = bounded(raw.planPath, MAX_PLAN_PATH);
   const planHash = bounded(raw.planHash, MAX_HASH);
   const sessionRef = bounded(raw.sessionRef, MAX_SESSION_REF);
   if (!decisionId || !planPath || !planHash || !sessionRef) return undefined;
-  if (!Number.isInteger(raw.reviewCycleId) || (raw.reviewCycleId as number) < 0) return undefined;
-  if (raw.source !== "auto" && raw.source !== "manual") return undefined;
-  if (raw.presenter !== "browser" && raw.presenter !== "native") return undefined;
-  if (!isHandoffDestination(raw.defaultDestination)) return undefined;
-  if (!isHandoffDestination(raw.destination)) return undefined;
-  if (!Number.isInteger(raw.overrideRevision) || (raw.overrideRevision as number) < 0) {
+  if (!Number.isInteger(raw.reviewCycleId) || (raw.reviewCycleId as number) < 0) {
     return undefined;
   }
+  if (raw.source !== "auto" && raw.source !== "manual") return undefined;
+  if (raw.presenter !== "browser" && raw.presenter !== "native") return undefined;
   return {
-    version: HANDOFF_DECISION_VERSION,
     decisionId,
     planPath,
     planHash,
@@ -407,33 +708,121 @@ export function parseHandoffDecision(raw: unknown): HandoffDecision | undefined 
     reviewCycleId: raw.reviewCycleId as number,
     source: raw.source,
     presenter: raw.presenter,
+  };
+}
+
+/**
+ * v1 → v2. A v1 destination captured at creation is only a RECOMMENDATION; a
+ * v1 `consumed` record stays terminal with its original route.
+ */
+function parseLegacyDecision(raw: Record<string, unknown>): HandoffDecision | undefined {
+  const identity = parseIdentity(raw);
+  if (!identity) return undefined;
+  const legacyDestination = isHandoffDestination(raw.defaultDestination)
+    ? raw.defaultDestination
+    : isHandoffDestination(raw.destination)
+      ? raw.destination
+      : undefined;
+  if (!legacyDestination) return undefined;
+  const legacyState: HandoffDecisionState =
+    raw.state === "consumed" || raw.state === "superseded" || raw.state === "dismissed"
+      ? raw.state
+      : "pending";
+  const receipts = parseReceipts(raw.receipts);
+  const base: HandoffDecision = {
+    version: HANDOFF_DECISION_VERSION,
+    ...identity,
     reviewOwned: raw.reviewOwned === true,
-    defaultDestination: raw.defaultDestination,
+    recommendedDestination: legacyDestination,
+    recommendationRevision:
+      Number.isInteger(raw.overrideRevision) && (raw.overrideRevision as number) >= 0
+        ? (raw.overrideRevision as number)
+        : 0,
+    state: legacyState,
+    createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+    updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : 0,
+    receipts,
+    ...(raw.legacy === true ? { legacy: true as const } : {}),
+  };
+  if (legacyState !== "consumed") return base;
+  return {
+    ...base,
+    destination: legacyDestination,
+    selection: {
+      at: receipts.at(-1)?.at ?? 0,
+      destination: legacyDestination,
+      via: "native",
+    },
+  };
+}
+
+function parseApproval(raw: unknown): HandoffApprovalReceipt | undefined {
+  if (!isRecord(raw) || typeof raw.at !== "number") return undefined;
+  const via: HandoffApprovalVia =
+    raw.via === "browser" || raw.via === "recovery" || raw.via === "command"
+      ? raw.via
+      : "native";
+  const feedback = bounded(raw.feedback, 4_000);
+  return { at: raw.at, via, ...(feedback ? { feedback } : {}) };
+}
+
+function parseSelection(raw: unknown): HandoffSelectionReceipt | undefined {
+  if (!isRecord(raw) || typeof raw.at !== "number") return undefined;
+  if (!isHandoffDestination(raw.destination)) return undefined;
+  return {
+    at: raw.at,
     destination: raw.destination,
-    overrideRevision: raw.overrideRevision as number,
+    via: raw.via === "command" ? "command" : "native",
+  };
+}
+
+/** Current v2 shape. */
+function parseCurrentDecision(raw: Record<string, unknown>): HandoffDecision | undefined {
+  if (!isState(raw.state)) return undefined;
+  const identity = parseIdentity(raw);
+  if (!identity) return undefined;
+  if (!isHandoffDestination(raw.recommendedDestination)) return undefined;
+  if (!Number.isInteger(raw.recommendationRevision) || (raw.recommendationRevision as number) < 0) {
+    return undefined;
+  }
+  if (raw.destination !== undefined && !isHandoffDestination(raw.destination)) return undefined;
+  const destination = isHandoffDestination(raw.destination) ? raw.destination : undefined;
+  // Approved/routed states must carry their explicit selection; treating a
+  // missing one as a default would execute without consent.
+  const needsSelection =
+    raw.state === "approved" || raw.state === "routing" || raw.state === "route-failed";
+  if (needsSelection && !destination) return undefined;
+
+  const approval = parseApproval(raw.approval);
+  const selection = parseSelection(raw.selection);
+  return {
+    version: HANDOFF_DECISION_VERSION,
+    ...identity,
+    reviewOwned: raw.reviewOwned === true,
+    recommendedDestination: raw.recommendedDestination,
+    recommendationRevision: raw.recommendationRevision as number,
+    ...(destination ? { destination } : {}),
     state: raw.state,
     createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
     updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : 0,
-    receipts: Array.isArray(raw.receipts)
-      ? (raw.receipts as unknown[])
-          .filter(isRecord)
-          .flatMap((entry) => {
-            if (typeof entry.at !== "number") return [];
-            if (!isHandoffDestination(entry.destination)) return [];
-            if (entry.route !== "direct-build" && entry.route !== "orchestrator-prepare") {
-              return [];
-            }
-            return [
-              {
-                at: entry.at,
-                destination: entry.destination,
-                route: entry.route,
-                ...(bounded(entry.failure, 400) ? { failure: bounded(entry.failure, 400)! } : {}),
-              } satisfies HandoffRouteReceipt,
-            ];
-          })
-          .slice(-MAX_RECEIPTS)
-      : [],
+    ...(typeof raw.approvedAt === "number" ? { approvedAt: raw.approvedAt } : {}),
+    ...(approval ? { approval } : {}),
+    ...(selection ? { selection } : {}),
+    receipts: parseReceipts(raw.receipts),
     ...(raw.legacy === true ? { legacy: true as const } : {}),
   };
+}
+
+/**
+ * Bounded, validated codec for the persisted workflow entry.
+ *
+ * Accepts the current v2 shape and migrates a v1 record conservatively:
+ * a v1 destination/recommendation is only ever a recommendation, and a v1
+ * `consumed` record stays terminal.
+ */
+export function parseHandoffDecision(raw: unknown): HandoffDecision | undefined {
+  if (!isRecord(raw)) return undefined;
+  if (raw.version === HANDOFF_DECISION_VERSION_LEGACY) return parseLegacyDecision(raw);
+  if (raw.version !== HANDOFF_DECISION_VERSION) return undefined;
+  return parseCurrentDecision(raw);
 }
