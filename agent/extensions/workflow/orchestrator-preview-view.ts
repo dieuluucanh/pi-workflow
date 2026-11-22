@@ -35,6 +35,12 @@ export interface FormatPreviewInput {
   fromDiscussion?: boolean;
   /** Dirty-baseline change count, when the caller knows it. */
   dirtyChanges?: number;
+  /**
+   * How the caller will ask for approval. A UI host asks in a dialog; a
+   * headless host prints the id-bound command. `none` omits the final lines
+   * when the caller appends the actual outcome (approved/dispatched/denied).
+   */
+  approvalHint?: "command" | "dialog" | "none";
 }
 
 /**
@@ -44,6 +50,13 @@ export interface FormatPreviewInput {
  */
 export function previewApprovalId(preview: Pick<ExecutionPreview, "approvalDigest">): string {
   return `preview-${preview.approvalDigest.slice(0, 16)}`;
+}
+
+/** The id-bound command for a headless/non-dialog host. */
+export function approvalCommandHint(
+  preview: Pick<ExecutionPreview, "approvalDigest">,
+): string {
+  return `Approve with: /orchestrator approve ${previewApprovalId(preview)}`;
 }
 
 /** True when a user-supplied value names this exact preview. */
@@ -78,6 +91,7 @@ export function formatExecutionPreview(input: FormatPreviewInput): string {
   );
   const mapped = new Set(preview.mapping.flatMap((entry) => entry.taskIds));
   const outstanding = preview.mapping.filter((entry) => entry.taskIds.length === 0);
+  const approvalHint = input.approvalHint ?? "command";
 
   const lines: string[] = [];
   const push = (line: string) => {
@@ -164,12 +178,16 @@ export function formatExecutionPreview(input: FormatPreviewInput): string {
   push(
     `Mapped tasks: ${mapped.size > 0 ? [...mapped].slice(0, 40).join(", ") : "none"}`,
   );
-  push(
-    preview.blockedReasons.length > 0
-      ? `This breakdown cannot be dispatched yet. Fix the blockers, then propose again; nothing is approved by this text.`
-      : `Approve with: /orchestrator approve ${id}`,
-  );
-  push(`Refine with: /orchestrator refine <what to change> · Cancel with: /orchestrator cancel`);
+  if (preview.blockedReasons.length > 0) {
+    push(
+      `This breakdown cannot be dispatched yet. Fix the blockers, then propose again; nothing is approved by this text.`,
+    );
+  } else if (approvalHint === "command") {
+    push(approvalCommandHint(preview));
+    push(`Refine with: /orchestrator refine <what to change> · Cancel with: /orchestrator cancel`);
+  } else if (approvalHint === "dialog") {
+    push("Approve or deny in the execution approval dialog; no command is needed.");
+  }
 
   return lines.join("\n").slice(0, MAX_PREVIEW_VIEW_CHARS);
 }

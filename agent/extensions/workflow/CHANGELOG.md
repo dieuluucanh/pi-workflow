@@ -4,6 +4,36 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — breakdown approval dialog and Builder bootstrap (2026-11-22)
+
+**The Orchestrator no longer asks the user to copy an approval command, and a
+valid approval can actually launch the Builder child.**
+
+- **Approval is a dialog.** After `orchestrator_propose_tasks` validates an
+  unblocked breakdown, the host opens the execution-approval questionnaire.
+  The fixed rows are *Approve execution — start the next ready task* and
+  *Deny — stay in Orchestrator*; the freeform row means “revise”. Esc/cancel
+  dismisses without approving or invalidating.
+- **Approve starts work.** Approval is journaled first, then the next
+  dependency-ready task is dispatched through the existing durable dispatch
+  path. A failed dispatch keeps the approval and reports the real blocker.
+- **Deny is durable.** The preview is invalidated through the runtime refine
+  path; typed feedback asks for a revised breakdown. The session stays in
+  Orchestrator mode.
+- **Headless fallback unchanged.** A host without UI still gets
+  `/orchestrator approve preview-<digest>`; the command now also starts the next
+  ready task after approval.
+- **Builder model bootstrap fixed.** `builderModelPlan()` no longer drops the
+  provider. `resolveBudget()` keeps a missing provider absent instead of writing
+  `""`, so a fallback is not defeated by a non-nullish empty string. Preview and
+  launch now share one resolver: effective Builder role/profile first, current
+  session model fallback, fail closed when neither has a provider/id.
+- **Truthful preview.** The preview shows the exact Builder model that will
+  launch, including a profile override and a conservative limit estimate when
+  the role model is not the live session model.
+- **Model-facing text.** The mission, preparation result and tool description
+  no longer instruct the model to print an approval command in a UI session.
+
 ### Changed — plan approval and execution selection are separate decisions (2026-11-22)
 
 **Fixes the reported ordering bug.** After Review completed, the configured

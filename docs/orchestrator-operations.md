@@ -70,14 +70,19 @@ Both the automatic handoff and a direct request use ONE preparation service:
 /orchestrator start [path]          # prepare discussion (default) or an explicit plan
 /orchestrator status                # phase, requirements, approval/next blocker
 /orchestrator preview               # the exact breakdown preview + approval id
-/orchestrator approve preview-<id>  # the ONE execution decision (id-bound)
+/orchestrator approve preview-<id>  # explicit approval; starts the next ready task
 /orchestrator refine <what>         # durably void the preview/approval
 /orchestrator cancel                # terminal; nothing launched
 /orchestrator pause|resume|stop|retry|inspect|say <text>
 ```
 
-The model has no approve tool. A stale, duplicate or wrong preview id is
-refused; an approval never carries over to a changed preview.
+The normal UI flow asks for this approval in a dialog right after the breakdown
+validates. **Approve** records the approval and dispatches the next
+dependency-ready task; **Deny** invalidates the preview durably and stays in
+Orchestrator; freeform text asks for a revision. `/orchestrator approve` is the
+headless/automation fallback and also starts the next ready task. The model has
+no approve tool. A stale, duplicate or wrong preview id is refused; an approval
+never carries over to a changed preview.
 
 ## Migration
 
@@ -104,11 +109,14 @@ refused; an approval never carries over to a changed preview.
 3. **Breakdown** — structured tasks must cover every outstanding requirement;
    dependencies must be a DAG. A material scope/criteria/dependency change needs
    a new approval revision.
-4. **Execution approval** — separate from mode entry and plan approval. `/orchestrator
-   preview` shows the task mapping, model/limit estimates, launcher readiness,
-   checks, dirty baseline, commit behavior and repair/rollover limits; approval
-   names that preview's `preview-<digest>` id. Ordinary handoff Approve → Build
-   is not repurposed.
+4. **Execution approval** — separate from mode entry and plan approval. In a UI
+   session the host presents the one approval dialog after the validated
+   breakdown: Approve starts the next ready task, Deny invalidates durably and
+   stays in Orchestrator, freeform text asks for a revision. A headless host
+   uses `/orchestrator preview` and `/orchestrator approve preview-<digest>`.
+   The preview shows the task mapping, exact Builder model/limit estimates,
+   launcher readiness, checks, dirty baseline, commit behavior and
+   repair/rollover limits. Ordinary handoff Approve → Build is not repurposed.
 5. **Dispatch** — returns a durable launch/status receipt immediately. The child
    is a normal visible session; assignment start is one correlated wake after
    readiness and lease grant. Resume alone stays idle.

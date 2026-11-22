@@ -283,6 +283,17 @@ import { createPumpRuntime } from "./orchestrator-pump-runtime.ts";
 import { createOperatorRuntime } from "./orchestrator-operator.ts";
 import { DEFAULT_EXECUTION_BUDGETS } from "./orchestrator-types.ts";
 import { resolveBudget } from "./orchestrator-budget.ts";
+import { resolveModelPlan } from "./orchestrator-model-plan.ts";
+import {
+  breakdownApprovalDecisionFromResult,
+  buildBreakdownApprovalQuestion,
+} from "./orchestrator-approval-view.ts";
+import {
+  applyBreakdownApprovalDecision,
+  startNextReadyTask,
+  type ApprovalFlowPorts,
+} from "./orchestrator-approval-flow.ts";
+import { approvalCommandHint } from "./orchestrator-preview-view.ts";
 import { createRunJournal } from "./orchestrator-store.ts";
 import {
   createFileWorkspaceLeases,
@@ -817,6 +828,8 @@ export default function workflowExtension(
   let orchestratorPump: ReturnType<typeof createPumpRuntime> | undefined;
   /** Operator command surface (step 20); never launches children. */
   let orchestratorOperator: ReturnType<typeof createOperatorRuntime> | undefined;
+  /** True while the breakdown approval dialog owns input. */
+  let orchestratorApprovalModalOpen = false;
   // ── Orchestrator production ports (integration steps 9–22) ──────
   // Created lazily so an ordinary session pays nothing and a host without the
   // SDK/local transport reports an honest blocker instead of a fake child.
@@ -833,6 +846,8 @@ export default function workflowExtension(
   let orchestratorWorkspaceRev: string | undefined;
   let orchestratorVerify: ReturnType<typeof createVerifyRuntime> | undefined;
   let orchestratorBudget: ReturnType<typeof createBudgetRuntime> | undefined;
+  /** Last concrete reason a proposal could not be prepared (e.g. no Builder model). */
+  let lastProposalUnavailable: string | undefined;
   let orchestratorFinal: ReturnType<typeof createFinalRuntime> | undefined;
   let orchestratorSdk: ReturnType<typeof createSdkWorkerPort> | undefined;
   let orchestratorDesktop: ReturnType<typeof createDesktopSessionHost> | undefined;
@@ -7846,6 +7861,15 @@ export default function workflowExtension(
           }
           const operator = ensureOrchestratorOperator(liveCtx);
           const result = await operator.run(text);
+          let resultText = result.text;
+          let resultOk = result.ok;
+          if (result.ok && result.verb === "approve") {
+            // Approval and “go ahead” are one user action. Persist first (the
+            // operator already did), then use the same durable dispatch path.
+            const started = await startNextReadyOrchestratorTask();
+            resultText = `${resultText}\n\n${started.text}`;
+            resultOk = resultOk && started.ok;
+          }
           if (result.say) {
             const delivered = await deliverOrchestratorSay(result.say);
             ctx.ui.notify(
@@ -7853,7 +7877,7 @@ export default function workflowExtension(
               delivered ? "info" : "warning",
             );
           } else {
-            ctx.ui.notify(result.text, result.ok ? "info" : "warning");
+            ctx.ui.notify(resultText, resultOk ? "info" : "warning");
           }
           updateStatus(ctx as any);
         } catch (error: unknown) {
@@ -11265,18 +11289,26 @@ ${rows}`,
   const parentTools = createParentToolRuntime({
     runtime: () => orchestratorRuntime,
     proposalContext: (): ProposalContext | undefined => {
+      const builder = resolveBuilderModelPlan();
+      if (!builder.ok) {
+        lastProposalUnavailable = builder.error;
+        return undefined;
+      }
       const model = lastKnownModel ?? {
         id: "unknown",
         contextWindow: null,
         maxOutputTokens: null,
       };
       const orchestratorBudget = resolveBudget({ role: "orchestrator", model });
-      const builderBudget = resolveBudget({ role: "builder", model });
-      if (!orchestratorBudget.ok || !builderBudget.ok) return undefined;
+      if (!orchestratorBudget.ok) {
+        lastProposalUnavailable = `Orchestrator budget is unavailable: ${orchestratorBudget.error}`;
+        return undefined;
+      }
+      lastProposalUnavailable = undefined;
       const capability = orchestratorHostCapability;
       return {
         orchestratorBudget: orchestratorBudget.plan,
-        builderBudget: builderBudget.plan,
+        builderBudget: builder.budget,
         launcher: {
           ready: capability?.available === true,
           label: capability?.label ?? "no child host bound",
@@ -11295,6 +11327,7 @@ ${rows}`,
         },
       };
     },
+    proposalUnavailable: () => lastProposalUnavailable,
     epoch: () => orchestrationEpoch,
     prepareEligible: () => {
       if (managedGate || workerBinding || managedQuarantine) {
@@ -11402,7 +11435,21 @@ ${rows}`,
           const result = await parentTools.call(
             definition.name as never,
             params,
+            definition.name === "orchestrator_propose_tasks" &&
+              (ctx as any)?.hasUI === true
+              ? { approvalHint: "none" as const }
+              : undefined,
           );
+          if (
+            definition.name === "orchestrator_propose_tasks" &&
+            result.ok
+          ) {
+            const presented = await requestBreakdownApproval(ctx, result);
+            return {
+              content: [{ type: "text" as const, text: presented.text }],
+              details: presented.details,
+            };
+          }
           return {
             content: [{ type: "text" as const, text: result.text }],
             details: result.ok ? result.details : { ok: false, code: result.code },
@@ -15395,6 +15442,7 @@ ${rows}`,
               runId: view.runId,
               sourceLabel: view.roadmap.path,
               taskCounts: { accepted, total },
+              hasBreakdown: view.preview !== null,
               ...(view.approval ? { breakdownApproved: true } : {}),
             }
           : {}),
@@ -16422,19 +16470,194 @@ ${rows}`,
   function builderModelPlan():
     | { provider: string; id: string; thinking?: string }
     | undefined {
-    const model = lastKnownModel ?? { id: "unknown", contextWindow: null, maxOutputTokens: null };
-    const resolved = resolveBudget({
+    const resolved = resolveBuilderModelPlan();
+    return resolved.ok ? resolved.launch : undefined;
+  }
+
+  /** Provider-catalogue limits for a model that is not the live session model. */
+  function registryLimitsFor(ref: {
+    provider: string;
+    id: string;
+  }): { contextWindow: number | null; maxOutputTokens: number | null } | undefined {
+    try {
+      const found = (currentSessionCtx as any)?.modelRegistry?.find?.(
+        ref.provider,
+        ref.id,
+      );
+      if (!found) return undefined;
+      return {
+        contextWindow:
+          typeof found.contextWindow === "number" ? found.contextWindow : null,
+        maxOutputTokens:
+          typeof found.maxOutputTokens === "number"
+            ? found.maxOutputTokens
+            : null,
+      };
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
+  /**
+   * ONE Builder resolution for the approval preview and the child launch.
+   * The effective Builder role (profile overlay applied) wins; the live session
+   * model is only a fallback. This is what prevents the preview from showing a
+   * model that `prepareWorker` will never launch.
+   */
+  function resolveBuilderModelPlan() {
+    return resolveModelPlan({
       role: "builder",
-      model: {
-        id: model.id,
-        contextWindow: model.contextWindow ?? null,
-        maxOutputTokens: model.maxOutputTokens ?? null,
-      },
+      roleName: "Builder",
+      roleModel: getEffectiveRole("builder")?.model,
+      fallbackModel: lastKnownModel,
+      lookupLimits: (ref) => registryLimitsFor(ref),
     });
-    if (!resolved.ok) return undefined;
+  }
+
+  /** Ports for the pure approval/start coordinator. */
+  function orchestratorApprovalPorts(): ApprovalFlowPorts {
     return {
-      provider: resolved.plan.model.provider ?? model.provider ?? "unknown",
-      id: resolved.plan.model.id,
+      view: () => {
+        const view = orchestratorRuntime?.view();
+        if (!view) return undefined;
+        return {
+          runId: view.runId,
+          preview: view.preview,
+          ...(view.nextTaskId ? { nextTaskId: view.nextTaskId } : {}),
+          state: {
+            ...(view.state.mutation ? { mutation: view.state.mutation } : {}),
+            tasks: view.state.tasks,
+          },
+        };
+      },
+      approve: async (input) => {
+        const runtime = orchestratorRuntime;
+        if (!runtime) return { ok: false, error: "no approved run is bound" };
+        const approved = await runtime.approve(input);
+        return approved.ok
+          ? { ok: true }
+          : { ok: false, error: approved.error };
+      },
+      refine: async (reason) => {
+        const runtime = orchestratorRuntime;
+        if (!runtime) return { ok: false, error: "no run is bound" };
+        const refined = await runtime.refine(reason);
+        return refined.ok
+          ? { ok: true }
+          : { ok: false, error: refined.error };
+      },
+      canDispatch: () => {
+        const dispatchable = orchestratorRuntime?.canDispatch() ?? {
+          ok: false,
+          reasons: ["no run is bound"],
+        };
+        return { ok: dispatchable.ok, reasons: dispatchable.reasons };
+      },
+      dispatch: async (input) => {
+        try {
+          const outcome = await parentTools.call(
+            "orchestrator_dispatch",
+            input,
+          );
+          return { ok: outcome.ok, text: outcome.text };
+        } catch (error: unknown) {
+          return {
+            ok: false,
+            text: `The dispatch call failed before a launch: ${
+              error instanceof Error ? error.message : String(error)
+            }.`,
+          };
+        }
+      },
+    };
+  }
+
+  /** Dispatch the next ready task after an explicit approval. */
+  function startNextReadyOrchestratorTask() {
+    return startNextReadyTask(orchestratorApprovalPorts());
+  }
+
+  /**
+   * Present the one execution-approval dialog for a valid, unblocked preview.
+   * The tool result already rendered the preview without a command; this adds
+   * the real outcome (approved/started, revised, denied or dismissed). A host
+   * without UI, or a dialog that cannot open, keeps the id-bound command path.
+   */
+  async function requestBreakdownApproval(
+    ctx: ExtensionContext,
+    result: { text: string; details: Record<string, unknown> },
+  ): Promise<{ text: string; details: Record<string, unknown> }> {
+    const view = orchestratorRuntime?.view();
+    if (!view?.preview) return result;
+    if (view.preview.blockedReasons.length > 0) return result;
+    if ((ctx as any).hasUI !== true) return result;
+    if (orchestratorApprovalModalOpen) {
+      return {
+        text: `${result.text}\n\nAn execution approval dialog is already open; finish it first.`,
+        details: result.details,
+      };
+    }
+    const preview = view.preview;
+    const expected = {
+      runId: view.runId,
+      approvalDigest: preview.approvalDigest,
+    };
+    let answer: QuestionnaireResult | null = null;
+    let uiFailed = false;
+    orchestratorApprovalModalOpen = true;
+    overlayDepth += 1;
+    try {
+      const question = buildBreakdownApprovalQuestion({
+        preview,
+        requirements: view.requirements,
+        fromDiscussion: /discussion-[0-9a-f]+\.md$/i.test(view.roadmap.path),
+        ...(orchestratorBaseline
+          ? { dirtyChanges: orchestratorBaseline.baseline.changes.length }
+          : {}),
+      });
+      answer = await ctx.ui.custom<QuestionnaireResult | null>(
+        (tui, theme, _kb, done) =>
+          createQuestionnaireView(tui, theme, {
+            questions: [question],
+            done,
+          }),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: QUESTIONNAIRE_OVERLAY_MAX_HEIGHT,
+            margin: 0,
+          },
+        },
+      );
+    } catch (_e) {
+      void _e;
+      uiFailed = true;
+      answer = null;
+    } finally {
+      overlayDepth = Math.max(0, overlayDepth - 1);
+      orchestratorApprovalModalOpen = false;
+    }
+    if (uiFailed) {
+      return {
+        text: `${result.text}\n\n${approvalCommandHint(preview)}\nRefine with: /orchestrator refine <what to change> · Cancel with: /orchestrator cancel`,
+        details: result.details,
+      };
+    }
+    const outcome = await applyBreakdownApprovalDecision({
+      decision: breakdownApprovalDecisionFromResult(answer),
+      expected,
+      ports: orchestratorApprovalPorts(),
+    });
+    return {
+      text: `${result.text}\n\n${outcome.text}`,
+      details: {
+        ...result.details,
+        approvalDecision: outcome.status,
+        ...(outcome.details ?? {}),
+      },
     };
   }
 
@@ -16454,6 +16677,7 @@ ${rows}`,
       parentSessionRef: () => sessionRefFor(),
       cwd: () => orchestratorRoot(),
       agentDir: () => getAgentDir(),
+      profile: () => activeProfileName ?? undefined,
       trust: () => "session",
       allocateGeneration: () => leases.nextGeneration?.(workspaceKey) ?? 1,
       now: () => Date.now(),
@@ -17014,6 +17238,7 @@ ${rows}`,
     orchestratorVerify = undefined;
     orchestratorBaseline = undefined;
     orchestratorWorkspaceRev = undefined;
+    orchestratorApprovalModalOpen = false;
     try {
       orchestratorDesktop?.dispose();
     } catch (_e) {
@@ -17149,7 +17374,7 @@ ${rows}`,
         requirementLines,
         "",
         `Next: call orchestrator_propose_tasks with a TaskPlan {schemaVersion:1, runId:"${view.runId}", roadmapRevision:${view.roadmapRevision}, tasks:[...]} that covers every requirement and declares dependencies, expected files and acceptance checks.`,
-        "Then show the breakdown and ask the user for the separate execution approval. Nothing has been launched.",
+        "The host presents the execution approval dialog when the breakdown validates; if approved it starts the first ready task. In a UI session never print an approval command; a headless host returns the id-bound command instead.",
         "Do not switch to /build; the parent delegates project changes to managed Build children.",
       ].join("\n"),
       details: {

@@ -39,6 +39,43 @@ test("mission: work entry and approval are explicit and idle-safe", () => {
   assert.match(text, /orchestrator_propose_tasks/);
   assert.match(text, /execution approval/i);
   assert.match(text, /never launch|never launched|Nothing has been launched|no child/i);
+  assert.doesNotMatch(text, /Approve with:/);
+});
+
+test("mission: a proposed breakdown waits for the host dialog, not a command", () => {
+  const proposed = buildOrchestratorMission({
+    phase: "awaiting_approval",
+    coordinator: true,
+    hasBreakdown: true,
+  });
+  assert.match(proposed, /wait for the user's execution approval/i);
+  assert.doesNotMatch(proposed, /present the proposed breakdown/i);
+  assert.doesNotMatch(proposed, /Approve with:/);
+
+  const revised = buildOrchestratorMission({
+    phase: "awaiting_approval",
+    coordinator: true,
+    hasBreakdown: false,
+  });
+  assert.match(revised, /propose a revised breakdown/i);
+  assert.doesNotMatch(revised, /wait for the user's execution approval/i);
+});
+
+test("mission: a running child is not told to dispatch a second task", () => {
+  const building = buildOrchestratorMission({
+    phase: "building",
+    coordinator: true,
+    breakdownApproved: true,
+  });
+  assert.match(building, /wait for the child's fenced report/i);
+  assert.doesNotMatch(building, /dispatch the next dependency-ready task/i);
+
+  const ready = buildOrchestratorMission({
+    phase: "ready",
+    coordinator: true,
+    breakdownApproved: true,
+  });
+  assert.match(ready, /dispatch the next dependency-ready task/i);
 });
 
 test("mission: unready host or non-coordinator cannot claim launch authority", () => {

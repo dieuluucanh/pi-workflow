@@ -42,6 +42,8 @@ export interface OrchestratorMissionState {
   host?: { ready: boolean; label: string; reason?: string };
   /** True only when this session owns the parent scheduler. */
   coordinator: boolean;
+  /** A preview exists for the current roadmap revision. */
+  hasBreakdown?: boolean;
   /** A worker must never reach this builder, but the guard is explicit. */
   managedWorker?: boolean;
   quarantined?: boolean;
@@ -83,9 +85,23 @@ function nextLine(state: OrchestratorMissionState): string {
     return "Next action: call orchestrator_prepare with the requested work (current discussion or an explicit plan) to bind a run.";
   }
   if (state.phase === "awaiting_approval") {
-    return "Next action: present the proposed breakdown and ask the user for the separate execution approval.";
+    return state.hasBreakdown
+      ? "Next action: wait for the user's execution approval in the host dialog; do not dispatch or print an approval command."
+      : "Next action: propose a revised breakdown with orchestrator_propose_tasks; nothing is approved yet.";
   }
-  if (state.breakdownApproved) {
+  if (state.phase === "draft") {
+    return "Next action: propose the breakdown with orchestrator_propose_tasks; preparation never launches a child.";
+  }
+  if (state.phase === "dispatching" || state.phase === "building") {
+    return "Next action: wait for the child's fenced report, then verify it; do not dispatch a second task.";
+  }
+  if (state.phase === "verifying") {
+    return "Next action: verify the candidate with orchestrator_verify and accept only evidence-backed results.";
+  }
+  if (state.phase === "waiting_user") {
+    return "Next action: wait for the user's answer; do not dispatch or claim completion.";
+  }
+  if (state.breakdownApproved && state.phase === "ready") {
     return "Next action: dispatch the next dependency-ready task to a managed Build child.";
   }
   return "Next action: inspect the run state with orchestrator_status.";
@@ -120,7 +136,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "1. Understand the work the user asked for — the current discussion/tasks or an explicitly referenced plan.",
     "2. Read and explore enough to make the work executable; ask only necessary clarifications.",
     "3. Group or split the work into bounded execution tasks with dependencies, expected files and acceptance checks.",
-    "4. Propose the breakdown, show it, and obtain the user's separate execution approval.",
+    "4. Propose the breakdown. The host presents the execution approval dialog; if approved it starts the first ready task.",
     "5. Delegate each approved task to a visible, ordinary managed Build child session.",
     "6. After the child settles and is fenced, independently verify its actual changes and the required checks.",
     "7. Accept only evidence-backed results; otherwise send a bounded scoped repair. Then continue with the next task.",
@@ -128,7 +144,8 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "Work entry (do this instead of changing mode):",
     "- When the user asks you to work, call orchestrator_prepare. Omit source to use the current discussion; pass source:\"plan\" with planPath to use a plan file.",
     "- Then call orchestrator_propose_tasks with the validated breakdown. Preparation and proposal never launch a child.",
-    "- Ask for the execution approval after the proposal. After it is granted, dispatch the ready task.",
+    "- The host presents the execution approval after the proposal. If approved, the next ready task starts automatically.",
+    "- In a UI session never print /orchestrator approve or ask the user to run it; only a headless host returns that command.",
     "",
     "Permissions and limits:",
     "- You may inspect, run read-only/verify commands, propose, dispatch and verify.",

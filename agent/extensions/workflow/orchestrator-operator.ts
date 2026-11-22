@@ -302,7 +302,7 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
             ? {
                 ok: true,
                 verb: parsed.verb,
-                text: `Execution approved (${approved.value.record.approvalId}); approvals are bound to the roadmap, plan and limits digests. Dispatch still needs a bound child host.`,
+                text: `Execution approved (${approved.value.record.approvalId}). The host starts the next dependency-ready task; approvals are bound to the roadmap, plan and limits digests.`,
               }
             : fail(`Approval refused: ${approved.error}`);
         }

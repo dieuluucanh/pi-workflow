@@ -85,6 +85,26 @@ test("preview renders the derived requirement text, grouping and models", () => 
   assert.match(text, /Approve with: \/orchestrator approve preview-aaaaaaaaaaaaaaaa/);
 });
 
+test("dialog approval hides the command and points at the host dialog", () => {
+  const text = formatExecutionPreview({
+    preview: preview(),
+    approvalHint: "dialog",
+  });
+  assert.doesNotMatch(text, /\/orchestrator approve/);
+  assert.doesNotMatch(text, /\/orchestrator refine/);
+  assert.match(text, /execution approval dialog/);
+});
+
+test("none approval hint leaves the outcome to the caller", () => {
+  const text = formatExecutionPreview({
+    preview: preview(),
+    approvalHint: "none",
+  });
+  assert.doesNotMatch(text, /\/orchestrator approve/);
+  assert.doesNotMatch(text, /\/orchestrator refine/);
+  assert.doesNotMatch(text, /execution approval dialog/);
+});
+
 test("a blocked breakdown shows the blocker and no approval command", () => {
   const text = formatExecutionPreview({
     preview: preview({

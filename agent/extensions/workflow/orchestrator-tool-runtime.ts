@@ -66,6 +66,12 @@ export interface ParentToolPorts {
   runtime: () => OrchestratorRuntime | undefined;
   /** Proposal inputs (budgets, launcher readiness, checks, limits, options). */
   proposalContext: () => ProposalContext | undefined;
+  /**
+   * Why proposal inputs are unavailable (for example an unconfigured Builder
+   * model). A generic "budgets unavailable" message hides an actionable
+   * configuration error, so the host supplies the concrete reason.
+   */
+  proposalUnavailable?: () => string | undefined;
   epoch: () => number;
   budgets?: ExecutionBudgets;
   workspaceRev?: () => string | undefined;
@@ -128,10 +134,23 @@ export interface ParentToolRegistrar {
   }): void;
 }
 
+export interface ParentToolCallOptions {
+  /**
+   * The host already owns the approval surface. A UI host asks for the dialog
+   * (so the tool text must not print a command), a headless host keeps the
+   * id-bound command, and `none` lets the host append the actual outcome.
+   */
+  approvalHint?: "command" | "dialog" | "none";
+}
+
 export interface ParentToolRuntime {
   /** Builds the current tool context, or a truthful reason it is unavailable. */
   context(): { ok: true; context: ToolContext } | { ok: false; error: string };
-  call(name: OrchestratorToolName, params: unknown): Promise<ParentToolOutcome>;
+  call(
+    name: OrchestratorToolName,
+    params: unknown,
+    options?: ParentToolCallOptions,
+  ): Promise<ParentToolOutcome>;
   register(registrar: ParentToolRegistrar): { registered: string[]; refused: string | null };
 }
 
@@ -429,7 +448,7 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
   const runtime: ParentToolRuntime = {
     context,
 
-    async call(name, params) {
+    async call(name, params, options) {
       const input = asParams(params);
 
       // Preparation is the one parent capability available BEFORE a run is
@@ -480,7 +499,9 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
             ok: false,
             tool: name,
             code: "unavailable",
-            text: "Execution budgets/launcher readiness are unavailable, so a breakdown cannot be validated yet.",
+            text:
+              ports.proposalUnavailable?.() ??
+              "Execution budgets/launcher readiness are unavailable, so a breakdown cannot be validated yet.",
           };
         }
         const proposed = await (ports.runtime() as OrchestratorRuntime).propose({
@@ -502,6 +523,7 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
               preview,
               requirements: proposed.value.view.requirements,
               fromDiscussion: /discussion-[0-9a-f]+\.md$/i.test(proposed.value.view.roadmap.path),
+              approvalHint: options?.approvalHint ?? "command",
             }),
             MAX_PREVIEW_VIEW_CHARS,
           ),

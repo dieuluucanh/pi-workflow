@@ -164,6 +164,10 @@ function approvalInput(
   };
 }
 
+function modelLabel(model: { provider?: string; id: string }): string {
+  return model.provider ? `${model.provider}/${model.id}` : model.id;
+}
+
 /**
  * Builds the preview the user approves. Invalid identity fails; everything else
  * is presented with explicit `blockedReasons` so approval can refuse cleanly.
@@ -240,12 +244,12 @@ export function buildExecutionPreview(input: ExecutionPreviewInput): PreviewResu
     tasks,
     models: {
       orchestrator: {
-        model: `${input.orchestratorBudget.model.provider}/${input.orchestratorBudget.model.id}`,
+        model: modelLabel(input.orchestratorBudget.model),
         usableInput: input.orchestratorBudget.usableInput,
         confidence: input.orchestratorBudget.confidence,
       },
       builder: {
-        model: `${input.builderBudget.model.provider}/${input.builderBudget.model.id}`,
+        model: modelLabel(input.builderBudget.model),
         usableInput: input.builderBudget.usableInput,
         confidence: input.builderBudget.confidence,
       },

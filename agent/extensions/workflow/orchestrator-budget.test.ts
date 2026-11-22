@@ -100,6 +100,37 @@ test("a model change produces a new plan; nothing is cached as capability", () =
   assert.doesNotMatch(JSON.stringify(large), /compet|capab/i);
 });
 
+test("provider is preserved when present and never invented when absent", () => {
+  const withProvider = resolveBudget({
+    role: "builder",
+    model: { provider: "p", id: "m", contextWindow: 131_072, maxOutputTokens: null },
+  });
+  assert.equal(withProvider.ok, true);
+  assert.equal(
+    (withProvider as { ok: true; plan: BudgetPlan }).plan.model.provider,
+    "p",
+  );
+
+  const withoutProvider = resolveBudget({
+    role: "builder",
+    model: { id: "m", contextWindow: 131_072, maxOutputTokens: null },
+  });
+  assert.equal(withoutProvider.ok, true);
+  const missing = (withoutProvider as { ok: true; plan: BudgetPlan }).plan;
+  assert.equal(missing.model.provider, undefined);
+  assert.notEqual(missing.model.provider, "");
+
+  const emptyProvider = resolveBudget({
+    role: "builder",
+    model: { provider: "   ", id: "m", contextWindow: 131_072, maxOutputTokens: null },
+  });
+  assert.equal(emptyProvider.ok, true);
+  assert.equal(
+    (emptyProvider as { ok: true; plan: BudgetPlan }).plan.model.provider,
+    undefined,
+  );
+});
+
 test("policy ratios are clamped into a safe order", () => {
   const policy = coerceBudgetPolicy({ targetRatio: 0.9, checkpointRatio: 0.2, stopRatio: 0.3 });
   assert.equal(policy.targetRatio, 0.2);

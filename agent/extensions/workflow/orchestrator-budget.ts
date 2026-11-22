@@ -72,7 +72,12 @@ export const FALLBACK_OUTPUT_TOKENS = 1_024;
 export interface BudgetPlan {
   schemaVersion: typeof BUDGET_SCHEMA_VERSION;
   role: BudgetRole;
-  model: { provider: string; id: string };
+  /**
+   * Provider is part of the launch identity, not a capacity input. It is kept
+   * optional here so "unknown" is never confused with an explicit empty value;
+   * launch validation decides whether a provider is required.
+   */
+  model: { provider?: string; id: string };
   /** Capacity used for this plan (after provider/user caps). */
   contextWindow: number;
   usableInput: number;
@@ -199,13 +204,16 @@ export function resolveBudget(input: {
     Math.min(targetWorkingSet, Math.floor(usableInput * policy.bootstrapRatio)),
   );
 
+  const provider =
+    typeof input.model.provider === "string" ? input.model.provider.trim() : "";
+
   return {
     ok: true,
     plan: {
       schemaVersion: BUDGET_SCHEMA_VERSION,
       role: input.role,
       model: {
-        provider: input.model.provider ?? "",
+        ...(provider.length > 0 ? { provider } : {}),
         id: input.model.id,
       },
       contextWindow: usableInputCandidate,

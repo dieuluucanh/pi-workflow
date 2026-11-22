@@ -90,9 +90,13 @@ short Plan → Review → Build work keeps its current behavior.
   mode” or “switch to `/build`”.
 - **One breakdown approval.** The preview shows the derived requirements,
   task grouping, models, checks, host readiness, dirty baseline, commit behavior
-  and limits. Approve by ID (`/orchestrator approve preview-<digest>`); refine
-  invalidates the preview durably; cancel launches nothing. The model has no
-  approve tool, and the literal `approve-execution` is not a preview ID.
+  and limits. In a UI session the host opens the execution approval dialog:
+  **Approve** journals the approval and starts the next ready task, **Deny**
+  invalidates the preview durably and stays in Orchestrator, and freeform text
+  asks for a revised breakdown. A headless host keeps the id-bound command
+  (`/orchestrator approve preview-<digest>`); refine invalidates the preview
+  durably; cancel launches nothing. The model has no approve tool, and the
+  literal `approve-execution` is not a preview ID.
 - **Identity is durable.** Run/task/attempt/session ids are stable; TODO numbers
   are display refs only. A child's local step 1 is never the parent's roadmap
   step 1, and child TODOs cannot complete a roadmap.

@@ -114,7 +114,7 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
     name: "orchestrator_propose_tasks",
     description:
-      "Propose a validated roadmap-to-task breakdown. This never dispatches work; it returns the coverage decision for explicit execution approval.",
+      "Propose a validated roadmap-to-task breakdown. The host presents the execution approval dialog; if approved it starts the next ready task. In a UI session never print an approval command. This never dispatches before approval.",
     parameters: {
       type: "object",
       properties: {

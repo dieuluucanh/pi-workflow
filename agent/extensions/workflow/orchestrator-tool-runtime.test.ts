@@ -338,24 +338,56 @@ test("read/propose tools answer from the bound run and keep approval separate", 
   if (!ingested.ok) return;
   const { tool } = harness({ io, runtime });
 
-  const proposed = await tool.call("orchestrator_propose_tasks", {
-    plan: planFor(ingested.value.runId),
-    requirements: [
-      {
-        roadmapStepId: requirementId(),
-        label: "1",
-        text: "Add the module",
-      },
-    ],
-  });
+  const proposed = await tool.call(
+    "orchestrator_propose_tasks",
+    {
+      plan: planFor(ingested.value.runId),
+      requirements: [
+        {
+          roadmapStepId: requirementId(),
+          label: "1",
+          text: "Add the module",
+        },
+      ],
+    },
+    { approvalHint: "none" },
+  );
   assert.equal(proposed.ok, true, proposed.text);
   if (!proposed.ok) return;
   assert.equal(proposed.details.requiresApproval, true);
+  assert.doesNotMatch(proposed.text, /\/orchestrator approve/);
 
   const status = await tool.call("orchestrator_status", {});
   assert.equal(status.ok, true);
   if (!status.ok) return;
   assert.match(status.text, /awaiting_approval/);
+});
+
+test("proposal unavailability reports the concrete Builder model reason", async () => {
+  const io = memoryIo();
+  const runtime = createOrchestratorRuntime({
+    createJournal: (runId) => createRunJournal({ dir: `C:/runs/${runId}`, runId, io }),
+    readRoadmap: async () => ROADMAP,
+    now: () => 1_000,
+  });
+  const ingested = await runtime.ingest({ planPath: PATH, planText: ROADMAP });
+  assert.equal(ingested.ok, true);
+  if (!ingested.ok) return;
+  const tool = createParentToolRuntime({
+    runtime: () => runtime,
+    proposalContext: () => undefined,
+    proposalUnavailable: () =>
+      "Builder model is required: neither the effective role nor the current session has a provider and id",
+    epoch: () => 7,
+    now: () => 2_000,
+  });
+  const result = await tool.call("orchestrator_propose_tasks", {
+    plan: planFor(ingested.value.runId),
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.code, "unavailable");
+  assert.match(result.text, /Builder model is required/);
 });
 
 test("registration exposes every parent tool name", () => {
