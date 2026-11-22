@@ -27,8 +27,8 @@
     "openai-codex/gpt-5.6-luna"
   ],
   "defaultThinkingLevel": "high",
-  "defaultProvider": "command-code",
-  "defaultModel": "deepseek/deepseek-v4.1-flash",
+  "defaultProvider": "synthetic",
+  "defaultModel": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -63,11 +63,11 @@
       "mutatingTools": []
     },
     "modelDefault": {
-      "provider": "command-code",
-      "id": "deepseek/deepseek-v4.1-flash",
+      "provider": "synthetic",
+      "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
       "thinking": "high"
     },
-    "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
+    "defaultProfile": "openAI",
     "commitPolicy": {
       "mode": "never",
       "allowedPaths": []

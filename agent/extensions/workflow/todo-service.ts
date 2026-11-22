@@ -44,6 +44,15 @@ import {
   type TodoUpdateEntry,
 } from "./utils.ts";
 
+import {
+  applyFrozenStatusUpdate,
+  frozenRowsToTodoItems,
+  validateFrozenSnapshot,
+  type FrozenStatusUpdate,
+  type FrozenTodoResult,
+  type FrozenTodoSnapshot,
+} from "./todo-snapshot.ts";
+
 /** Which list a store instance owns. */
 export const TODO_LIST_OWNERS = ["ordinary", "roadmap", "worker"] as const;
 export type TodoListOwner = (typeof TODO_LIST_OWNERS)[number];
@@ -63,6 +72,10 @@ export interface TodoStoreSnapshot {
   planDigest?: string;
   /** Idempotency key of the last applied reviewed recovery. */
   recoveryReceiptId?: string;
+  /** Versioned frozen execution. Its presence makes the list structural-immutable. */
+  frozen?: FrozenTodoSnapshot;
+  /** A present-but-corrupt frozen field is reported, never silently downgraded. */
+  frozenError?: string;
   panel: {
     preference: TodoPanelPreference;
     preferenceScope: string | null;
@@ -84,6 +97,10 @@ export interface TodoStore {
   excludedPlanSteps: Set<string>;
   /** Digest of the plan bytes last imported, when known. */
   planDigest: string | undefined;
+  /** The frozen execution, when this list is forward-only. */
+  frozen: FrozenTodoSnapshot | undefined;
+  /** Set when a persisted frozen field was present but invalid. */
+  frozenError: string | undefined;
   /** Last applied recovery receipt (idempotency). */
   recoveryReceiptId: string | undefined;
 
@@ -95,6 +112,8 @@ export interface TodoStore {
 
   /** Replace the whole list (already-extracted steps are normalized). */
   replace(items: TodoItem[]): void;
+  /** Install a frozen execution. Structural methods then refuse. */
+  freeze(snapshot: FrozenTodoSnapshot): FrozenTodoResult;
   /**
    * Industry-style wholesale update: omitted items are removed.
    *
@@ -171,6 +190,8 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     revision: 0,
     excludedPlanSteps: new Set<string>(),
     planDigest: undefined,
+    frozen: undefined,
+    frozenError: undefined,
     recoveryReceiptId: undefined,
     panelPreference: "auto",
     panelScope: null,
@@ -178,7 +199,23 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     completedSignature: null,
 
     replace(items) {
+      if (store.frozen) return;
       store.items = ensureTodoLabels(dedupeTodoItems(items));
+    },
+
+    freeze(snapshot) {
+      const checked = validateFrozenSnapshot(snapshot);
+      if (!checked.ok) {
+        store.frozenError = checked.error;
+        return checked;
+      }
+      store.frozen = checked.snapshot;
+      store.frozenError = undefined;
+      store.items = frozenRowsToTodoItems(checked.snapshot);
+      store.planPath = checked.snapshot.source.path;
+      store.planDigest = checked.snapshot.source.digest;
+      store.revision += 1;
+      return { ok: true, snapshot: checked.snapshot };
     },
 
     update(incoming, options) {
@@ -198,6 +235,46 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         };
       }
       const planRows = store.items.filter((item) => item.planStepId);
+      if (store.frozen) {
+        const rows = store.frozen.rows;
+        const entries = incoming ?? [];
+        if (entries.length !== rows.length) {
+          return frozenRefusal(store.items,
+            "A frozen list accepts only a complete status update with every row in order.",
+          );
+        }
+        const updates: FrozenStatusUpdate[] = [];
+        for (let index = 0; index < entries.length; index += 1) {
+          const entry = entries[index]!;
+          const row = rows[index]!;
+          const resolved =
+            (entry.id !== undefined ? rows.find((candidate) => candidate.id === entry.id) : undefined) ??
+            (entry.ref !== undefined ? rows.find((candidate) => candidate.ref === entry.ref) : undefined);
+          if (!resolved || resolved.id !== row.id) {
+            return frozenRefusal(store.items,
+              "A frozen list cannot reorder, add, or rename rows; send the same ids/refs in the same order.",
+            );
+          }
+          if (entry.text !== undefined && entry.text.trim() !== row.text) {
+            return frozenRefusal(store.items, "A frozen list cannot change row text; only status may change.");
+          }
+          if (entry.status !== undefined) updates.push({ id: row.id, status: entry.status });
+        }
+        const applied = applyFrozenStatusUpdate(store.frozen, updates);
+        if (!applied.ok) return frozenRefusal(store.items, applied.error);
+        store.frozen = applied.snapshot;
+        store.items = frozenRowsToTodoItems(applied.snapshot);
+        store.revision += 1;
+        return {
+          items: [...store.items],
+          added: 0,
+          removed: 0,
+          kept: store.items.length,
+          normalized: 0,
+          warnings: [],
+          revision: store.revision,
+        };
+      }
       const identifiable = (incoming ?? []).filter(
         (entry) =>
           (entry.id !== undefined && String(entry.id).trim().length > 0) ||
@@ -238,6 +315,27 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     markDoneTags(text) {
+      if (store.frozen) {
+        const copy = store.items.map((item) => ({ ...item }));
+        const result = markCompletedRefs(text, copy);
+        const updates: FrozenStatusUpdate[] = [];
+        for (const item of copy) {
+          const before = store.items.find((candidate) => candidate.id === item.id);
+          const after = itemStatus(item);
+          if (before && item.id && itemStatus(before) !== after) {
+            updates.push({ id: item.id, status: after });
+          }
+        }
+        if (updates.length > 0) {
+          const applied = applyFrozenStatusUpdate(store.frozen, updates);
+          if (applied.ok) {
+            store.frozen = applied.snapshot;
+            store.items = frozenRowsToTodoItems(applied.snapshot);
+            store.revision += 1;
+          }
+        }
+        return result;
+      }
       return markCompletedRefs(text, store.items);
     },
 
@@ -246,6 +344,14 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     setStatus(ref, status) {
+      if (store.frozen) {
+        const applied = applyFrozenStatusUpdate(store.frozen, [{ ref, status }]);
+        if (!applied.ok) return undefined;
+        store.frozen = applied.snapshot;
+        store.items = frozenRowsToTodoItems(applied.snapshot);
+        store.revision += 1;
+        return store.items.find((item) => item.ref === ref || item.id === ref);
+      }
       const resolved = resolveTodoRef(store.items, ref);
       if (!resolved.item) return undefined;
       setTodoStatus(resolved.item, status);
@@ -253,6 +359,17 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     toggle(ref) {
+      if (store.frozen) {
+        const resolved = resolveTodoRef(store.items, ref);
+        if (!resolved.item) return undefined;
+        const status = isDone(resolved.item) ? "pending" : "completed";
+        const applied = applyFrozenStatusUpdate(store.frozen, [{ ref, status }]);
+        if (!applied.ok) return undefined;
+        store.frozen = applied.snapshot;
+        store.items = frozenRowsToTodoItems(applied.snapshot);
+        store.revision += 1;
+        return store.items.find((item) => item.ref === ref || item.id === ref);
+      }
       const resolved = resolveTodoRef(store.items, ref);
       if (!resolved.item) return undefined;
       setTodoStatus(resolved.item, isDone(resolved.item) ? "pending" : "completed");
@@ -260,6 +377,9 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     add(input) {
+      if (store.frozen) {
+        return { item: store.items[0]!, duplicate: true };
+      }
       const text = input.text.trim();
       const key = todoKey({ text, group: input.group });
       const existing = store.items.find((item) => todoKey(item) === key);
@@ -280,6 +400,7 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     clear() {
+      if (store.frozen) return;
       // An explicit clear is a deliberate membership decision: remember the
       // plan bindings so passive reconciliation cannot resurrect them.
       for (const item of store.items) {
@@ -291,6 +412,16 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     loadFromPlanMarkdown({ markdown, planPath, cwd, restoreExcluded }) {
+      if (store.frozen) {
+        return {
+          replaced: false,
+          count: store.items.length,
+          preserved: store.items.length,
+          synthesized: false,
+          excluded: 0,
+          restored: 0,
+        };
+      }
       let extracted = extractPlanStepsFromMarkdown(markdown);
       let synthesized = false;
       if (extracted.length === 0) {
@@ -317,6 +448,15 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     mergeExtracted(extracted, planPath, cwd, options) {
+      if (store.frozen) {
+        return {
+          replaced: false,
+          count: store.items.length,
+          preserved: store.items.length,
+          excluded: 0,
+          restored: 0,
+        };
+      }
       const samePlan =
         store.planPath !== undefined && samePlanPath(store.planPath, planPath, cwd);
       if (samePlan) {
@@ -382,6 +522,8 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         revision: store.revision,
         excludedPlanSteps: [...store.excludedPlanSteps],
         ...(store.planDigest === undefined ? {} : { planDigest: store.planDigest }),
+        ...(store.frozen === undefined ? {} : { frozen: cloneFrozenSnapshot(store.frozen) }),
+        ...(store.frozenError === undefined ? {} : { frozenError: store.frozenError }),
         ...(store.recoveryReceiptId === undefined
           ? {}
           : { recoveryReceiptId: store.recoveryReceiptId }),
@@ -410,6 +552,22 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         );
       }
       if (typeof snapshot.planDigest === "string") store.planDigest = snapshot.planDigest;
+      if (snapshot.frozen !== undefined) {
+        const checked = validateFrozenSnapshot(snapshot.frozen);
+        if (checked.ok) {
+          store.frozen = checked.snapshot;
+          store.frozenError = undefined;
+          store.items = frozenRowsToTodoItems(checked.snapshot);
+          store.planPath = checked.snapshot.source.path;
+          store.planDigest = checked.snapshot.source.digest;
+        } else {
+          store.frozen = undefined;
+          store.frozenError = checked.error;
+          store.items = [];
+        }
+      } else if (typeof snapshot.frozenError === "string") {
+        store.frozenError = snapshot.frozenError;
+      }
       if (typeof snapshot.recoveryReceiptId === "string") {
         store.recoveryReceiptId = snapshot.recoveryReceiptId;
       }
@@ -431,6 +589,7 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     recover(items, receiptId) {
+      if (store.frozen) return { applied: false };
       if (store.recoveryReceiptId === receiptId) return { applied: false };
       // The reviewed list is authoritative; keep stable ids/bindings it carries.
       store.items = ensureTodoLabels(dedupeTodoItems(items));
@@ -440,6 +599,32 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
   };
   return store;
+}
+
+function frozenRefusal(items: TodoItem[], refused: string) {
+  return {
+    items: [...items],
+    added: 0,
+    removed: 0,
+    kept: 0,
+    normalized: 0,
+    warnings: [] as string[],
+    refused,
+    revision: 0,
+  };
+}
+
+function cloneFrozenSnapshot(snapshot: FrozenTodoSnapshot): FrozenTodoSnapshot {
+  return {
+    ...snapshot,
+    source: { ...snapshot.source },
+    rows: snapshot.rows.map((row) => ({
+      ...row,
+      acceptanceChecks: [...row.acceptanceChecks],
+      expectedFiles: [...row.expectedFiles],
+    })),
+    planChecks: [...snapshot.planChecks],
+  };
 }
 
 /**

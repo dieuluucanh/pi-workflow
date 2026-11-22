@@ -1,38 +1,27 @@
 /**
- * Workflow Extension — parent tool adapters and durable dispatch (step 16).
+ * Workflow Extension — parent tool adapters and durable dispatch.
  *
- * `orchestrator-tools.ts` decides; this module is where a decision becomes a
- * real, durable effect. It exists because the pure tool layer is not enough:
- * a dispatch must prepare the child, take the workspace lease, journal the
- * start INTENT, wake exactly once and record the actual acknowledgement.
+ * `orchestrator-tools.ts` decides; this module turns a decision into a real,
+ * durable effect. Dispatch order is the whole point:
  *
- * The order is the whole point, and it is enforced here rather than described:
+ *   1. authority/state checks (single running row, pending row, host bound)
+ *   2. prepared child session/host ownership (real session ref)
+ *   3. the `task.start` reducer event, journaled before any wake
+ *   4. the persisted `task.start.intent`
+ *   5. exactly one wake
  *
- *   1. readiness/authority checks (execution approval, task, dependencies)
- *   2. prepared session/host ownership (real session ref)
- *   3. workspace lease for this attempt/generation
- *   4. the `task.assign` reducer event (journaled before any wake)
- *   5. persisted `task.start.intent`
- *   6. one authenticated wake
- *   7. persisted `task.start.ack` + the `task.start` reducer event
- *
- * A failure at step 6 leaves the intent without an ack: that is `uncertain`,
- * and it must be reconciled, never retried blindly. Nothing here reports
- * "running" from an in-memory proposal.
+ * A failure before step 5 leaves the row pending with a real reason; nothing
+ * is reported as running from an in-memory guess.
  */
 
 import {
   ORCHESTRATOR_TOOLS,
   handleOrchestratorTool,
-  type ApprovalState,
   type OrchestratorToolName,
   type ToolContext,
-  type ToolResult,
 } from "./orchestrator-tools.ts";
-import type { OrchestratorRuntime, ProposalContext } from "./orchestrator-runtime.ts";
+import type { OrchestratorRuntime } from "./orchestrator-runtime.ts";
 import type { WorkspaceLeases, LeaseGrant } from "./orchestrator-workspace.ts";
-import type { ExecutionBudgets } from "./orchestrator-types.ts";
-import { formatExecutionPreview, previewApprovalId, MAX_PREVIEW_VIEW_CHARS } from "./orchestrator-preview-view.ts";
 
 export const TOOL_ADAPTER_SCHEMA_VERSION = 1 as const;
 export const MAX_TOOL_TEXT = 2_000;
@@ -50,30 +39,18 @@ export interface DispatchPort {
     attemptId: string;
     generation: number;
   }): Promise<{ ok: true; child: PreparedChild } | { ok: false; error: string }>;
-  /** The one correlated start message. Success means delivered, not accepted. */
+  /** The one correlated start message. */
   wake(input: {
     sessionRef: string;
     taskStartId: string;
     taskId: string;
     attemptId: string;
-  }): Promise<
-    | { ok: true; acknowledged: boolean }
-    | { ok: false; error: string; uncertain?: boolean }
-  >;
+  }): Promise<{ ok: true; acknowledged: boolean } | { ok: false; error: string }>;
 }
 
 export interface ParentToolPorts {
   runtime: () => OrchestratorRuntime | undefined;
-  /** Proposal inputs (budgets, launcher readiness, checks, limits, options). */
-  proposalContext: () => ProposalContext | undefined;
-  /**
-   * Why proposal inputs are unavailable (for example an unconfigured Builder
-   * model). A generic "budgets unavailable" message hides an actionable
-   * configuration error, so the host supplies the concrete reason.
-   */
-  proposalUnavailable?: () => string | undefined;
   epoch: () => number;
-  budgets?: ExecutionBudgets;
   workspaceRev?: () => string | undefined;
   dispatcher?: DispatchPort;
   leases?: {
@@ -81,46 +58,51 @@ export interface ParentToolPorts {
     release: WorkspaceLeases["release"];
   };
   workspaceKey?: () => string | undefined;
-  /** Durable workspace-wide fencing token; falls back to attempt-local. */
   allocateGeneration?: () => number | undefined;
   now?: () => number;
-  /**
-   * Why this session may not orchestrate right now (managed worker, wrong
-   * mode, no bound run). Checked before every tool call, so a tool name alone
-   * can never grant orchestration authority.
-   */
+  /** Why this session may not orchestrate right now. */
   eligible?: () => string | undefined;
-  /**
-   * Why preparation is unavailable (managed worker, wrong mode). Preparation
-   * must work BEFORE a run is bound, so it cannot use `eligible`.
-   */
-  prepareEligible?: () => string | undefined;
-  /**
-   * Resolve/snapshot the requested work and return bounded breakdown
-   * instructions. The extension owns file/run effects; this port only decides
-   * what the model is told.
-   */
-  prepare?: (input: {
-    source?: string;
+  /** Why preparation/start is unavailable (works before a run is bound). */
+  startEligible?: () => string | undefined;
+  /** Create/freeze the run and dispatch the first row. */
+  start?: (input: {
     planPath?: string;
-    objective?: string;
-    constraints?: string[];
+    title?: string;
+    steps?: string[];
   }) => Promise<
     | { ok: true; text: string; details: Record<string, unknown> }
     | { ok: false; code: string; text: string }
   >;
+  /** Retry the next pending row after a dispatch failure. */
+  retry?: () => Promise<
+    | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  >;
+  /** Run the real row verification (diff + checks). */
+  verify?: (taskId: string) => Promise<{
+    ok: boolean;
+    text: string;
+    code?: string;
+    details?: Record<string, unknown>;
+  }>;
+  /** Accept the verified row and dispatch the next one. */
+  accept?: (taskId: string) => Promise<{
+    ok: boolean;
+    text: string;
+    code?: string;
+    details?: Record<string, unknown>;
+  }>;
 }
 
 export type ParentToolOutcome =
   | {
       ok: true;
-      tool: OrchestratorToolName;
+      tool: OrchestratorToolName | "orchestrator_dispatch";
       text: string;
       details: Record<string, unknown>;
     }
   | { ok: false; tool: string; text: string; code: string };
 
-/** What `registerParentTools` needs; index.ts maps this to `pi.registerTool`. */
 export interface ParentToolRegistrar {
   registerTool(definition: {
     name: string;
@@ -134,27 +116,13 @@ export interface ParentToolRegistrar {
   }): void;
 }
 
-export interface ParentToolCallOptions {
-  /**
-   * The host already owns the approval surface. A UI host asks for the dialog
-   * (so the tool text must not print a command), a headless host keeps the
-   * id-bound command, and `none` lets the host append the actual outcome.
-   */
-  approvalHint?: "command" | "dialog" | "none";
-}
-
 export interface ParentToolRuntime {
-  /** Builds the current tool context, or a truthful reason it is unavailable. */
   context(): { ok: true; context: ToolContext } | { ok: false; error: string };
-  call(
-    name: OrchestratorToolName,
-    params: unknown,
-    options?: ParentToolCallOptions,
-  ): Promise<ParentToolOutcome>;
+  call(name: OrchestratorToolName, params: unknown): Promise<ParentToolOutcome>;
+  /** Internal scheduler entry: prepare/wake the requested frozen row. */
+  dispatch(taskId: string): Promise<ParentToolOutcome>;
   register(registrar: ParentToolRegistrar): { registered: string[]; refused: string | null };
 }
-
-const START_ACK_PREFIX = "start-ack";
 
 function bounded(value: string, max = MAX_TOOL_TEXT): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
@@ -170,26 +138,22 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
   const now = ports.now ?? (() => Date.now());
   let lease: LeaseGrant | undefined;
 
+  const releaseLease = () => {
+    if (!lease) return;
+    try {
+      ports.leases?.release(lease);
+    } catch {
+      /* a stale lease expires on its own */
+    }
+    lease = undefined;
+  };
+
   const context = (): { ok: true; context: ToolContext } | { ok: false; error: string } => {
     const rt = ports.runtime();
-    if (!rt) {
-      return { ok: false, error: "no approved orchestrator run is bound to this session" };
+    const view = rt?.view();
+    if (!rt || !view) {
+      return { ok: false, error: "no orchestrator run is bound to this session" };
     }
-    const view = rt.view();
-    if (!view) {
-      return { ok: false, error: "no approved orchestrator run is bound to this session" };
-    }
-    const dispatcherReady = rt.canDispatch();
-    const approval: ApprovalState | null = view.approval && view.preview
-      ? {
-          // A live approval is not the same as a dispatchable run: the runtime
-          // revalidates every material digest and the phase.
-          approved: dispatcherReady.ok,
-          approvalDigest: view.approval.approvalDigest,
-          planDigest: view.approval.planDigest,
-        }
-      : null;
-    const workspaceRevision = ports.workspaceRev?.();
     return {
       ok: true,
       context: {
@@ -197,28 +161,47 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         now: now(),
         epoch: ports.epoch(),
         currentEpoch: ports.epoch(),
-        activeTurn: false,
-        approval,
-        ...(workspaceRevision === undefined ? {} : { workspaceRevision }),
-        ...(ports.budgets === undefined ? {} : { budgets: ports.budgets }),
       },
     };
   };
 
-  const releaseLease = () => {
-    if (!lease) return;
-    try {
-      ports.leases?.release(lease);
-    } catch {
-      /* a stale lease expires on its own; never crash the run on release */
+  const dispatch = async (taskId: string): Promise<ParentToolOutcome> => {
+    const rt = ports.runtime();
+    const view = rt?.view();
+    if (!rt || !view) {
+      return { ok: false, tool: "orchestrator_dispatch", code: "unavailable", text: "No orchestrator run is bound." };
     }
-    lease = undefined;
-  };
-
-  const dispatch = async (
-    ctx: ToolContext,
-    params: Record<string, unknown>,
-  ): Promise<ParentToolOutcome> => {
+    if (view.phase === "paused" || view.phase === "cancelled" || view.phase === "completed") {
+      return {
+        ok: false,
+        tool: "orchestrator_dispatch",
+        code: "state",
+        text: `The run is ${view.phase}; no row is dispatched.`,
+      };
+    }
+    const running = view.state.order.find(
+      (id) => view.state.tasks[id]?.state === "running" || view.state.tasks[id]?.state === "candidate",
+    );
+    if (running) {
+      return {
+        ok: false,
+        tool: "orchestrator_dispatch",
+        code: "state",
+        text: `${running} is still in flight; the scheduler runs one child at a time.`,
+      };
+    }
+    const task = view.state.tasks[taskId];
+    if (!task) {
+      return { ok: false, tool: "orchestrator_dispatch", code: "state", text: "unknown task" };
+    }
+    if (task.state !== "pending") {
+      return {
+        ok: false,
+        tool: "orchestrator_dispatch",
+        code: "state",
+        text: `${taskId} is ${task.state}; only a pending row is dispatched.`,
+      };
+    }
     const dispatcher = ports.dispatcher;
     if (!dispatcher) {
       return {
@@ -228,44 +211,16 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         text: "No child host is bound (no Terminal/Desktop launcher port); nothing was dispatched.",
       };
     }
-    const taskId = typeof params.taskId === "string" ? params.taskId : "";
-    const attemptId = typeof params.attemptId === "string" ? params.attemptId : "";
-    const task = ctx.state.tasks[taskId];
-    if (!task) {
-      return { ok: false, tool: "orchestrator_dispatch", code: "state", text: "unknown task" };
-    }
-    // (1) authority first: a missing/stale execution approval must fail BEFORE
-    // any session, lease or wake effect. A prepared child is already an effect.
-    if (!ctx.approval?.approved) {
-      return {
-        ok: false,
-        tool: "orchestrator_dispatch",
-        code: "approval",
-        text: "Explicit execution approval is required before the first dispatch; nothing was prepared or woken.",
-      };
-    }
-    const rt = ports.runtime();
-    if (!rt) {
-      return { ok: false, tool: "orchestrator_dispatch", code: "unavailable", text: "No orchestrator run is bound; nothing was prepared or woken." };
-    }
-    const dispatchable = rt.canDispatch();
-    if (!dispatchable.ok) {
-      return {
-        ok: false,
-        tool: "orchestrator_dispatch",
-        code: "approval",
-        text: `This run is not dispatchable: ${dispatchable.reasons.join("; ")}. Nothing was prepared or woken.`,
-      };
-    }
     const allocated = ports.allocateGeneration?.();
     const generation =
       typeof allocated === "number" && Number.isInteger(allocated) && allocated > 0
         ? allocated
-        : task.attempts.length + 1;
+        : task.repairRounds + 1;
+    const attemptId = `${taskId}-attempt-${generation}`;
 
-    // (2) prepared session/host ownership — real identity, not a guess.
+    // (1) prepared session/host ownership — a real identity, not a guess.
     const prepared = await dispatcher.prepare({
-      runId: ctx.state.runId,
+      runId: view.runId,
       taskId,
       attemptId,
       generation,
@@ -279,12 +234,12 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       };
     }
 
-    // (3) the workspace lease, when one is configured.
+    // (2) the workspace lease, when one is configured.
     const workspaceKey = ports.workspaceKey?.();
     if (ports.leases && workspaceKey) {
       const acquired = ports.leases.acquire({
         workspaceKey,
-        runId: ctx.state.runId,
+        runId: view.runId,
         taskId,
         attemptId,
         sessionId: prepared.child.sessionRef,
@@ -301,42 +256,28 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       lease = acquired.grant;
     }
 
-    // (4) the decision, recomputed with the REAL session reference.
-    const decided = handleOrchestratorTool(
-      "orchestrator_dispatch",
-      { ...params, sessionRef: prepared.child.sessionRef },
-      ctx,
-    );
-    if (!decided.ok) {
-      releaseLease();
-      return { ok: false, tool: "orchestrator_dispatch", code: decided.code, text: decided.error };
-    }
-    if (!decided.event) {
-      releaseLease();
-      return {
-        ok: false,
-        tool: "orchestrator_dispatch",
-        code: "state",
-        text: "the dispatch produced no durable transition",
-      };
-    }
-    const assigned = await rt.applyEvent(decided.event);
-    if (!assigned.ok) {
+    // (3) the durable transition, journaled before any wake.
+    const started = await rt.applyEvent({
+      type: "task.start",
+      runId: view.runId,
+      now: now(),
+      taskId,
+      attemptId,
+      sessionId: prepared.child.sessionRef,
+    });
+    if (!started.ok) {
       releaseLease();
       return {
         ok: false,
         tool: "orchestrator_dispatch",
         code: "journal",
-        text: `The dispatch intent could not be journaled: ${assigned.error}. Nothing was woken.`,
+        text: `The dispatch intent could not be journaled: ${started.error}. Nothing was woken.`,
       };
     }
 
-    const taskStartId =
-      decided.receipt.taskStartId ??
-      prepared.child.taskStartId ??
-      `start-${ctx.state.runId}-${taskId}-${attemptId}`;
+    const taskStartId = prepared.child.taskStartId ?? `start-${view.runId}-${taskId}-${attemptId}`;
 
-    // (5) persisted start INTENT, before the wake.
+    // (4) persisted start INTENT, before the wake.
     const intent = await rt.appendJournal(
       "task.start.intent",
       {
@@ -346,7 +287,7 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         taskStartId,
         generation,
       },
-      `start-intent-${ctx.state.runId}-${taskId}-${attemptId}`,
+      `start-intent-${view.runId}-${taskId}-${attemptId}`,
     );
     if (!intent.ok) {
       releaseLease();
@@ -358,7 +299,7 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       };
     }
 
-    // (6) exactly one wake.
+    // (5) exactly one wake.
     const woken = await dispatcher.wake({
       sessionRef: prepared.child.sessionRef,
       taskStartId,
@@ -366,76 +307,21 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       attemptId,
     });
     if (!woken.ok) {
-      // A delivered-but-unacknowledged start is uncertain, not failed.
-      if (woken.uncertain) {
-        return {
-          ok: false,
-          tool: "orchestrator_dispatch",
-          code: "uncertain",
-          text: `The start was sealed but not acknowledged: ${woken.error}. The run must reconcile this attempt (never resend blindly).`,
-        };
-      }
-      await rt.applyEvent({
-        type: "attempt.launchFailed",
-        runId: ctx.state.runId,
-        now: now(),
-        taskId,
-        attemptId,
-      });
-      releaseLease();
+      // The visible window/session exists; the row is in flight and the report
+      // cannot arrive until the start turn runs. Leave the honest state.
       return {
         ok: false,
         tool: "orchestrator_dispatch",
         code: "launch",
-        text: `The child could not be started: ${woken.error}. The launch failure was recorded.`,
+        text: `The child was prepared but the start could not be delivered: ${woken.error}. The frozen row is intact; retry after fixing the host.`,
       };
     }
-
-    if (!woken.acknowledged) {
-      return {
-        ok: false,
-        tool: "orchestrator_dispatch",
-        code: "uncertain",
-        text: `The start message was delivered but the child did not acknowledge ${taskStartId}. Reconcile before retrying.`,
-      };
-    }
-
-    // (7) the actual acknowledgement.
-    await rt.appendJournal(
-      "task.start.ack",
-      {
-        taskId,
-        attemptId,
-        sessionId: prepared.child.sessionRef,
-        taskStartId,
-        generation,
-      },
-      `${START_ACK_PREFIX}-${ctx.state.runId}-${taskId}-${attemptId}`,
-    );
-    const started = await rt.applyEvent({
-      type: "task.start",
-      runId: ctx.state.runId,
-      now: now(),
-      taskId,
-      attemptId,
-      sessionId: prepared.child.sessionRef,
-      generation,
-    });
-    if (!started.ok) {
-      return {
-        ok: false,
-        tool: "orchestrator_dispatch",
-        code: "state",
-        text: `The child acknowledged, but the start transition failed: ${started.error}. Reconcile the run.`,
-      };
-    }
-
     return {
       ok: true,
       tool: "orchestrator_dispatch",
-      text: `Dispatched ${taskId}/${attemptId} to ${prepared.child.sessionRef}; the child acknowledged start ${taskStartId}. Parent verification follows the child's fenced report.`,
+      text: `Dispatched ${taskId} to ${prepared.child.sessionRef}; waiting for the child's report.`,
       details: {
-        runId: ctx.state.runId,
+        runId: view.runId,
         taskId,
         attemptId,
         sessionRef: prepared.child.sessionRef,
@@ -448,107 +334,65 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
   const runtime: ParentToolRuntime = {
     context,
 
-    async call(name, params, options) {
+    async call(name, params) {
       const input = asParams(params);
 
-      // Preparation is the one parent capability available BEFORE a run is
-      // bound. It is still refused for workers, quarantine and other modes.
-      if (name === "orchestrator_prepare") {
-        const blocked = ports.prepareEligible?.();
-        if (blocked) {
-          return { ok: false, tool: name, code: "unavailable", text: blocked };
+      if (name === "orchestrator_start") {
+        const blocked = ports.startEligible?.();
+        if (blocked) return { ok: false, tool: name, code: "unavailable", text: blocked };
+        if (!ports.start) {
+          return { ok: false, tool: name, code: "unavailable", text: "No Orchestrator start service is bound." };
         }
-        if (!ports.prepare) {
-          return {
-            ok: false,
-            tool: name,
-            code: "unavailable",
-            text: "This build has no work-source service bound; nothing was prepared.",
-          };
-        }
-        const prepared = await ports.prepare({
-          ...(typeof input.source === "string" ? { source: input.source } : {}),
+        const started = await ports.start({
           ...(typeof input.planPath === "string" ? { planPath: input.planPath } : {}),
-          ...(typeof input.objective === "string" ? { objective: input.objective } : {}),
-          ...(Array.isArray(input.constraints)
+          ...(typeof input.title === "string" ? { title: input.title } : {}),
+          ...(Array.isArray(input.steps)
             ? {
-                constraints: input.constraints.filter(
-                  (entry): entry is string => typeof entry === "string",
+                steps: input.steps.filter(
+                  (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
                 ),
               }
             : {}),
         });
-        return prepared.ok
-          ? { ok: true, tool: name, text: prepared.text, details: prepared.details }
-          : { ok: false, tool: name, code: prepared.code, text: prepared.text };
+        return started.ok
+          ? { ok: true, tool: name, text: started.text, details: started.details }
+          : { ok: false, tool: name, code: started.code, text: started.text };
       }
 
       const blocked = ports.eligible?.();
-      if (blocked) {
-        return { ok: false, tool: name, code: "unavailable", text: blocked };
-      }
+      if (blocked) return { ok: false, tool: name, code: "unavailable", text: blocked };
       const built = context();
-      if (!built.ok) {
-        return { ok: false, tool: name, code: "unavailable", text: built.error };
+      if (!built.ok) return { ok: false, tool: name, code: "unavailable", text: built.error };
+
+      // The real verification/acceptance paths are host-provided; the model
+      // supplies only a task id and can never mint evidence.
+      if (name === "orchestrator_verify") {
+        const taskId = typeof input.taskId === "string" ? input.taskId : "";
+        if (!ports.verify) {
+          return { ok: false, tool: name, code: "unavailable", text: "No verification service is bound." };
+        }
+        const verified = await ports.verify(taskId);
+        if (verified.ok) {
+          return { ok: true, tool: name, text: bounded(verified.text), details: verified.details ?? {} };
+        }
+        return { ok: false, tool: name, code: verified.code ?? "state", text: verified.text };
       }
 
-      if (name === "orchestrator_propose_tasks") {
-        const proposal = ports.proposalContext();
-        if (!proposal) {
-          return {
-            ok: false,
-            tool: name,
-            code: "unavailable",
-            text:
-              ports.proposalUnavailable?.() ??
-              "Execution budgets/launcher readiness are unavailable, so a breakdown cannot be validated yet.",
-          };
+      if (name === "orchestrator_accept") {
+        const taskId = typeof input.taskId === "string" ? input.taskId : "";
+        if (!ports.accept) {
+          return { ok: false, tool: name, code: "unavailable", text: "No acceptance service is bound." };
         }
-        const proposed = await (ports.runtime() as OrchestratorRuntime).propose({
-          plan: input.plan,
-          // Coverage is resolved by the runtime from the roadmap it snapshotted
-          // at ingest; a model-supplied requirement list is not authority.
-          context: proposal,
-        });
-        if (!proposed.ok) {
-          return { ok: false, tool: name, code: proposed.code, text: proposed.error };
-        }
-        const preview = proposed.value.preview;
-        const blockers = preview.blockedReasons.slice(0, 5);
-        return {
-          ok: true,
-          tool: name,
-          text: bounded(
-            formatExecutionPreview({
-              preview,
-              requirements: proposed.value.view.requirements,
-              fromDiscussion: /discussion-[0-9a-f]+\.md$/i.test(proposed.value.view.roadmap.path),
-              approvalHint: options?.approvalHint ?? "command",
-            }),
-            MAX_PREVIEW_VIEW_CHARS,
-          ),
-          details: {
-            runId: preview.runId,
-            previewId: previewApprovalId(preview),
-            planDigest: preview.planDigest,
-            approvalDigest: preview.approvalDigest,
-            taskCount: preview.tasks.length,
-            blockedReasons: blockers,
-            requiresApproval: true,
-          },
-        };
-      }
-
-      if (name === "orchestrator_dispatch") {
-        return dispatch(built.context, input);
+        const accepted = await ports.accept(taskId);
+        return accepted.ok
+          ? { ok: true, tool: name, text: bounded(accepted.text), details: accepted.details ?? {} }
+          : { ok: false, tool: name, code: accepted.code ?? "state", text: accepted.text };
       }
 
       const decided = handleOrchestratorTool(name, input, built.context);
-      if (!decided.ok) {
-        return { ok: false, tool: name, code: decided.code, text: decided.error };
-      }
+      if (!decided.ok) return { ok: false, tool: name, code: decided.code, text: decided.error };
       if (decided.event) {
-        const applied = await (ports.runtime() as OrchestratorRuntime).applyEvent(decided.event);
+        const applied = await ports.runtime()!.applyEvent(decided.event);
         if (!applied.ok) {
           return {
             ok: false,
@@ -558,14 +402,15 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
           };
         }
       }
-      const receipt = decided.receipt;
       return {
         ok: true,
         tool: name,
-        text: bounded(receipt.summary),
-        details: { ...receipt },
+        text: bounded(decided.receipt.summary),
+        details: { ...decided.receipt },
       };
     },
+
+    dispatch,
 
     register(registrar) {
       const registered: string[] = [];
@@ -606,5 +451,3 @@ export function parentToolRefusal(reason: string): ParentToolOutcome {
     text: bounded(`Orchestration tools are unavailable: ${reason}`),
   };
 }
-
-export type { ToolResult };

@@ -45,58 +45,34 @@ export interface JournalIo {
 
 export type JournalEventType =
   | "run.created"
-  | "run.preparation"
-  | "plan.proposed"
-  | "plan.approved"
-  | "execution.approved"
+  | "todos.frozen"
   | "run.transition"
-  | "task.dispatched"
+  | "task.started"
   | "task.start.intent"
-  | "task.start.ack"
   | "task.reported"
   | "task.verified"
   | "task.needs_fix"
   | "task.accepted"
   | "task.blocked"
-  | "task.superseded"
-  | "task.cancelled"
-  | "attempt.rollover"
-  | "attempt.launch_failed"
+  | "task.retried"
   | "run.control"
-  | "run.final_gate"
-  | "run.completed"
-  | "plan.revision"
-  | "wake.delivered"
-  | "wake.acked"
-  | "session.ref";
+  | "run.completed";
 
 /** Unknown event types are refused, so a future writer cannot be half-read. */
 export const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<JournalEventType>([
   "run.created",
-  "run.preparation",
-  "plan.proposed",
-  "plan.approved",
-  "execution.approved",
+  "todos.frozen",
   "run.transition",
-  "task.dispatched",
+  "task.started",
   "task.start.intent",
-  "task.start.ack",
   "task.reported",
   "task.verified",
   "task.needs_fix",
   "task.accepted",
   "task.blocked",
-  "task.superseded",
-  "task.cancelled",
-  "attempt.rollover",
-  "attempt.launch_failed",
+  "task.retried",
   "run.control",
-  "run.final_gate",
   "run.completed",
-  "plan.revision",
-  "wake.delivered",
-  "wake.acked",
-  "session.ref",
 ]);
 
 export interface JournalEvent {
@@ -158,8 +134,6 @@ export interface JournalState {
   accepted: AcceptanceRecord[];
   acceptedTaskIds: Set<string>;
   kickoff: Record<string, KickoffState>;
-  /** Session refs are branch-local. */
-  sessionsByBranch: Map<string, Array<{ sessionRef: string; taskId?: string; attemptId?: string }>>;
   /** Lines after the first invalid one (torn write / tamper). */
   truncated: number;
 }
@@ -221,46 +195,16 @@ function acceptedFrom(events: readonly JournalEvent[]): AcceptanceRecord[] {
 function kickoffFrom(events: readonly JournalEvent[]): Record<string, KickoffState> {
   const out: Record<string, KickoffState> = {};
   for (const event of events) {
-    if (event.type !== "task.start.intent" && event.type !== "task.start.ack") continue;
+    if (event.type !== "task.start.intent") continue;
     const payload = asRecord(event.payload);
     const taskId = typeof payload.taskId === "string" ? payload.taskId : "";
     const attemptId = typeof payload.attemptId === "string" ? payload.attemptId : "";
     const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : undefined;
     if (!taskId || !attemptId) continue;
-    const entry = out[taskId] ?? { status: "not_started" as const };
-    if (event.type === "task.start.intent") entry.intent = { attemptId, at: event.at, ...(sessionId ? { sessionId } : {}) };
-    else entry.ack = { attemptId, at: event.at, ...(sessionId ? { sessionId } : {}) };
-    out[taskId] = entry;
-  }
-  for (const entry of Object.values(out)) {
-    if (entry.intent && entry.ack) {
-      entry.status =
-        entry.intent.attemptId === entry.ack.attemptId ? "acknowledged" : "inconsistent";
-    } else if (entry.intent) {
-      // Intent without ack: a kickoff may or may not have happened. Reconcile.
-      entry.status = "uncertain";
-    } else {
-      entry.status = "inconsistent";
-    }
-  }
-  return out;
-}
-
-function sessionsFrom(events: readonly JournalEvent[]): Map<string, Array<{ sessionRef: string; taskId?: string; attemptId?: string }>> {
-  const out = new Map<string, Array<{ sessionRef: string; taskId?: string; attemptId?: string }>>();
-  for (const event of events) {
-    if (event.type !== "session.ref") continue;
-    const payload = asRecord(event.payload);
-    const branchId = typeof payload.branchId === "string" ? payload.branchId : "";
-    const sessionRef = typeof payload.sessionRef === "string" ? payload.sessionRef : "";
-    if (!branchId || !sessionRef) continue;
-    const list = out.get(branchId) ?? [];
-    list.push({
-      sessionRef,
-      ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}),
-      ...(typeof payload.attemptId === "string" ? { attemptId: payload.attemptId } : {}),
-    });
-    out.set(branchId, list);
+    out[taskId] = {
+      intent: { attemptId, at: event.at, ...(sessionId ? { sessionId } : {}) },
+      status: "uncertain",
+    };
   }
   return out;
 }
@@ -273,7 +217,6 @@ export interface RunJournal {
   recover(): Promise<JournalResult<JournalState>>;
   putArtifact(input: { name: string; content: string }): Promise<JournalResult<ArtifactRef>>;
   getArtifact(sha256: string): Promise<JournalResult<string>>;
-  sessionRefs(branchId: string): Promise<JournalResult<Array<{ sessionRef: string; taskId?: string; attemptId?: string }>>>;
 }
 
 /** Pure replay; shared by load and recover. */
@@ -289,10 +232,8 @@ export function replayJournal(
     accepted: [],
     acceptedTaskIds: new Set(),
     kickoff: {},
-    sessionsByBranch: new Map(),
     truncated: 0,
-  };
-  if (text === null || text.length === 0) {
+  };  if (text === null || text.length === 0) {
     return { ok: true, value: { state, validLines: [] } };
   }
   const lines = text.split("\n").filter((line) => line.length > 0);
@@ -342,7 +283,6 @@ export function replayJournal(
   state.accepted = acceptedFrom(state.events);
   state.acceptedTaskIds = new Set(state.accepted.map((entry) => entry.taskId));
   state.kickoff = kickoffFrom(state.events);
-  state.sessionsByBranch = sessionsFrom(state.events);
   return { ok: true, value: { state, validLines } };
 }
 
@@ -494,12 +434,6 @@ export function createRunJournal(options: {
       return content === null
         ? { ok: false, code: "invalid", error: "artifact not found" }
         : { ok: true, value: content };
-    },
-
-    async sessionRefs(branchId) {
-      const loaded = await readState();
-      if (!loaded.ok) return loaded;
-      return { ok: true, value: loaded.value.sessionsByBranch.get(branchId) ?? [] };
     },
   };
 

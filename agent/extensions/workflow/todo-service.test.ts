@@ -274,3 +274,65 @@ test("store: ownership is explicit and enforced", () => {
   // A worker list cannot be mistaken for the ordinary Plan/Build list.
   assert.throws(() => assertListOwner(worker, "ordinary"), /owner mismatch/);
 });
+
+test("store: a frozen list allows status-only updates and refuses structure", async () => {
+  const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
+  const frozen = createFrozenTodosFromPlan({
+    planPath: "C:/work/.pi/plans/frozen.md",
+    planText: "# Plan: Frozen\n\n## Plan Steps\n\n1. One\n2. Two\n",
+    mode: "build",
+    now: 1_000,
+  });
+  assert.equal(frozen.ok, true);
+  if (!frozen.ok) return;
+  const store = createTodoStore();
+  assert.equal(store.freeze(frozen.snapshot).ok, true);
+  const ids = store.items.map((entry) => entry.id);
+  assert.ok(ids[0] && ids[1]);
+
+  const partial = store.update([{ ref: "1", text: "One", status: "in_progress" }]);
+  assert.match(partial.refused ?? "", /complete status update/);
+  assert.equal(store.items[0]?.status, "pending");
+
+  const reorder = store.update([
+    { id: ids[1], text: "Two", status: "pending" },
+    { id: ids[0], text: "One", status: "pending" },
+  ]);
+  assert.match(reorder.refused ?? "", /cannot reorder/);
+
+  const rename = store.update([
+    { id: ids[0], text: "One renamed" },
+    { id: ids[1], text: "Two" },
+  ]);
+  assert.match(rename.refused ?? "", /cannot change row text/);
+
+  const ok = store.update([
+    { id: ids[0], text: "One", status: "in_progress" },
+    { id: ids[1], text: "Two" },
+  ]);
+  assert.equal(ok.refused, undefined);
+  assert.equal(store.items[0]?.status, "in_progress");
+  assert.equal(store.items[1]?.status, "pending");
+  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
+
+  const beforeAdd = store.items.length;
+  store.add({ text: "Injected" });
+  store.clear();
+  store.replace([{ step: 1, text: "Replaced", completed: false }]);
+  assert.equal(store.items.length, beforeAdd);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
+
+  const applied = store.loadFromPlanMarkdown({
+    markdown: "# Plan: Other\n\n## Plan Steps\n\n1. Other\n",
+    planPath: "C:/other.md",
+    cwd: "C:/",
+  });
+  assert.equal(applied.replaced, false);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
+
+  const restored = createTodoStore();
+  restored.restore(store.snapshot());
+  assert.ok(restored.frozen);
+  assert.equal(restored.items[0]?.status, "in_progress");
+  assert.deepEqual(restored.items.map((entry) => entry.id), ids);
+});

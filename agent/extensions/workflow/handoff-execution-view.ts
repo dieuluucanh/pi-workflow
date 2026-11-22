@@ -5,7 +5,7 @@
  * destination. It is asked after a plan has been APPROVED, never before and
  * never as part of the plan question, so:
  *
- *   - a saved `workflow.handoff.executionMode` is a recommendation, not consent;
+ *   - there is no saved destination: both options are equal and asked again;
  *   - cancelling the chooser keeps the approval and starts nothing;
  *   - an unknown/freeform answer can never fall back to direct Build.
  *
@@ -23,12 +23,12 @@ import type { HandoffDestination } from "./handoff-routing.ts";
 /** Header tab of the execution question. */
 export const EXECUTION_QUESTION_HEADER = "Execution";
 
-/** Approve into Orchestrator preparation (a second, separate approval follows). */
+/** Create a frozen TODO list and delegate each plan step to a Build child. */
 export const EXECUTION_ORCHESTRATOR_LABEL =
-  "Orchestrator — prepare an execution breakdown";
-/** Approve into this session's Build mode and start now. */
+  "Orchestrator — delegate each plan step";
+/** Implement the approved plan in this session. */
 export const EXECUTION_BUILD_LABEL =
-  "Direct Build — execute in this session now";
+  "Direct Build — implement in this session";
 /** Keep the approval; start nothing and stay in Plan. */
 export const EXECUTION_LATER_LABEL = "Decide later (stay in Plan)";
 
@@ -36,8 +36,6 @@ export interface ExecutionQuestionInput {
   planPath: string;
   /** The pending decision's printed id, so the user can resume it later. */
   decisionId: string;
-  /** Saved/one-off recommendation; earns the first row and "recommended". */
-  recommended?: HandoffDestination;
 }
 
 function normalize(value: string): string {
@@ -54,29 +52,26 @@ export function executionLabel(destination: HandoffDestination): string {
 /** One-line meaning of a destination, for the row description and notices. */
 export function describeExecutionChoice(destination: HandoffDestination): string {
   return destination === "orchestrator"
-    ? "Enter Orchestrator, prepare a validated breakdown, and approve that separately before any Build child starts"
-    : "Enter this session's Build mode and start implementing the approved plan now";
+    ? "Freeze the approved plan into one TODO row per step and delegate each row to a visible Build child"
+    : "Enter this session's Build mode and implement the approved plan here";
 }
 
 /**
- * Build the execution question. The recommended destination is first; the
- * other remains a first-class choice. Cancelling is always available through
- * the questionnaire's own cancel row.
+ * Build the execution question. Both destinations are first-class and neither
+ * is preselected; there is no saved execution default. Cancelling is always
+ * available through the questionnaire's own cancel row.
  */
 export function buildExecutionQuestion(
   input: ExecutionQuestionInput,
 ): QuestionnaireQuestion {
-  const recommended: HandoffDestination = input.recommended ?? "orchestrator";
-  const alternate: HandoffDestination =
-    recommended === "orchestrator" ? "build" : "orchestrator";
   const options: QuestionnaireOption[] = [
     {
-      label: executionLabel(recommended),
-      description: `${describeExecutionChoice(recommended)} (recommended)`,
+      label: executionLabel("build"),
+      description: describeExecutionChoice("build"),
     },
     {
-      label: executionLabel(alternate),
-      description: describeExecutionChoice(alternate),
+      label: executionLabel("orchestrator"),
+      description: describeExecutionChoice("orchestrator"),
     },
     {
       label: EXECUTION_LATER_LABEL,
@@ -90,7 +85,7 @@ export function buildExecutionQuestion(
     context: [
       `Plan: ${input.planPath || "(no plan file)"}`,
       `Handoff: ${input.decisionId || "(unknown)"}`,
-      "This choice applies to this approved plan only; your saved default is unchanged.",
+      "This choice applies to this approved plan only; no execution default is saved.",
       "Nothing has run yet.",
     ].join("\n"),
     options,

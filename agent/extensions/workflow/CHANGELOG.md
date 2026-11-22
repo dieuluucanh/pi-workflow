@@ -4,6 +4,46 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Orchestrator simplification: frozen plan TODOs and direct delegation (2026-11-22)
+
+**Breaking.** The Orchestrator no longer has a second planning/approval layer.
+
+- **Frozen TODO authority.** A new pure `todo-snapshot.ts` converts a plan (or an
+  explicitly agreed standalone list) into stable rows ONCE: one row per
+  top-level plan step, stable ids/refs, heading and 1-based source line, optional
+  `Acceptance:`/`Checks:`/`Files:` metadata, and plan-level `## Verification`
+  commands. Build and Orchestrator share it; only status changes afterwards.
+  The session `TodoStore` enforces the freeze (structural mutations refused as a
+  `{refused}` result rather than thrown) and persists it per branch.
+- **No execution breakdown approval.** `orchestrator_prepare`,
+  `orchestrator_propose_tasks`, `orchestrator_dispatch`, the execution preview,
+  the approval dialog/flow, budgets, rollover, drift, verifier, parity,
+  lifecycle/stages, the roadmap/final/commit runtimes, the event pump, the
+  packet/context/plan/source modules and `orchestrator-worker-todos` were
+  deleted. The model-facing tools are now `orchestrator_start|status|verify|
+  repair|accept|retry`.
+- **Start freezes and dispatches.** `orchestrator_start` (plan path or explicit
+  steps) freezes the list and dispatches row 1; acceptance of row N dispatches
+  row N+1; all rows accepted plus a passing plan check completes the run. A
+  dispatch failure leaves a retryable ready/blocked row, never a lost approval.
+- **Neutral destination.** `workflow.handoff.executionMode`,
+  `DEFAULT_EXECUTION_DESTINATION`, the recommendation fields,
+  `recommendHandoffDestination`, `/handoff execution` and `/handoff once` are
+  removed. Every approved plan asks Build/Orchestrator again; feedback stays in
+  Plan. Handoff decisions are codec version 3; version 2 is still read (its
+  recommendation fields are ignored) and approved records still require their
+  explicit `destination`.
+- **The child is a Build session.** Managed children switch to Build on session
+  start (mode/tools/model), create their own task-local TODO list, and edit
+  immediately: the readiness/fence edit interlock and the 45 s start wait are
+  gone. Report/checkpoint and parent-only tool refusal remain.
+- **Verification is row-scoped.** The parent captures the pre-work baseline,
+  runs the row checks, accepts with runtime-owned evidence, and runs the plan's
+  verification commands once after the last row. Repair is hard-capped at two
+  rounds.
+- **Status/footer.** The Orchestrator footer no longer renders approval or
+  recommendation prose; host contributions report phase/next/blocked only.
+
 ### Changed — the composer mode label is the cycle control (2026-11-22)
 
 - **One cycle, two entry points.** `Tab`, `Ctrl+Alt+P` and the registered

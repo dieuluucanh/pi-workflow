@@ -29,7 +29,9 @@
  * Type-only imports: this module stays testable without a host or filesystem.
  */
 
-export const HANDOFF_DECISION_VERSION = 2 as const;
+export const HANDOFF_DECISION_VERSION = 3 as const;
+/** The version that carried recommendation fields; still readable. */
+export const HANDOFF_DECISION_VERSION_V2 = 2 as const;
 /** Records written before the two-stage lifecycle. Readable, never writable. */
 export const HANDOFF_DECISION_VERSION_LEGACY = 1 as const;
 
@@ -97,10 +99,11 @@ export interface HandoffRouteReceipt {
   uncertain?: boolean;
 }
 
-export type HandoffRouteKind = "direct-build" | "orchestrator-prepare";
+export type HandoffRouteKind = "direct-build" | "orchestrator-start" | "orchestrator-prepare";
 
 export type HandoffRoute =
   | { kind: "direct-build"; planPath: string; decisionId: string; feedback?: string }
+  | { kind: "orchestrator-start"; planPath: string; decisionId: string; runHint: string }
   | { kind: "orchestrator-prepare"; planPath: string; decisionId: string; runHint: string };
 
 export interface HandoffDecision {
@@ -115,14 +118,6 @@ export interface HandoffDecision {
   source: "auto" | "manual";
   presenter: HandoffPresenter;
   reviewOwned: boolean;
-  /**
-   * The destination recommended by settings (`executionMode`) or a one-off
-   * recommendation. It seeds the execution chooser's first row; it is NEVER
-   * authority to execute.
-   */
-  recommendedDestination: HandoffDestination;
-  /** Bumped by an explicit recommendation change. */
-  recommendationRevision: number;
   /**
    * The destination the user explicitly selected in stage 2. Absent until the
    * execution chooser answers — this is the only execution authority.
@@ -241,8 +236,6 @@ export interface CreateHandoffDecisionInput {
   source: "auto" | "manual";
   presenter: HandoffPresenter;
   reviewOwned: boolean;
-  /** Saved `executionMode` (or a legacy captured destination). */
-  defaultDestination: HandoffDestination;
   now: number;
   /** A restored decision keeps its id through reload/recovery. */
   decisionId?: string;
@@ -265,11 +258,7 @@ export function createHandoffDecision(
   if (!Number.isInteger(input.reviewCycleId) || input.reviewCycleId < 0) {
     return { ok: false, code: "invalid", error: "reviewCycleId must be a non-negative integer" };
   }
-  if (!isHandoffDestination(input.defaultDestination)) {
-    return { ok: false, code: "invalid", error: "unknown default destination" };
-  }
   const legacy = input.legacy === true;
-  const recommendedDestination: HandoffDestination = legacy ? "build" : input.defaultDestination;
   const decisionId =
     bounded(input.decisionId, MAX_DECISION_ID) ??
     handoffDecisionId({
@@ -290,8 +279,6 @@ export function createHandoffDecision(
       source: input.source,
       presenter: input.presenter,
       reviewOwned: input.reviewOwned,
-      recommendedDestination,
-      recommendationRevision: 0,
       state: "pending",
       createdAt: input.now,
       updatedAt: input.now,
@@ -358,60 +345,6 @@ export function approveHandoffPlan(
           ? {}
           : { feedback: input.feedback }),
       },
-    },
-  };
-}
-
-/**
- * Changes the RECOMMENDATION for this handoff only (settings are untouched).
- * Works while `pending` or `approved`; never selects or routes.
- */
-export function recommendHandoffDestination(
-  decision: HandoffDecision,
-  destination: HandoffDestination,
-  now: number,
-): HandoffDecisionResult {
-  if (decision.state === "consumed") {
-    return {
-      ok: false,
-      code: "consumed",
-      error: "this handoff was already applied — change the default for the next one",
-    };
-  }
-  if (decision.state === "routing") {
-    return {
-      ok: false,
-      code: "wrong-state",
-      error: "this handoff is already applying a route",
-    };
-  }
-  if (decision.state !== "pending" && decision.state !== "approved") {
-    return {
-      ok: false,
-      code: "wrong-state",
-      error: `this handoff is ${decision.state}`,
-    };
-  }
-  if (!isHandoffDestination(destination)) {
-    return { ok: false, code: "invalid", error: "unknown destination" };
-  }
-  if (
-    decision.recommendedDestination === destination &&
-    decision.recommendationRevision > 0
-  ) {
-    return { ok: false, code: "unchanged", error: `already set to ${destination}` };
-  }
-  // Drop `legacy` entirely: an explicit recommendation means the restored-Build
-  // rule no longer applies, and the record must round-trip byte-stably.
-  const { legacy: _legacy, ...rest } = decision;
-  void _legacy;
-  return {
-    ok: true,
-    decision: {
-      ...rest,
-      recommendedDestination: destination,
-      recommendationRevision: decision.recommendationRevision + 1,
-      updatedAt: now,
     },
   };
 }
@@ -626,17 +559,16 @@ export function supersedeHandoffDecision(
   // A routing attempt is never silently superseded: its delivery outcome must
   // be recorded by the route owner.
   if (decision.state === "consumed" || decision.state === "routing") return decision;
-  const receipt: HandoffRouteReceipt | undefined = reason
-    ? {
-        at: now,
-        destination: decision.destination ?? decision.recommendedDestination,
-        route:
-          (decision.destination ?? decision.recommendedDestination) === "build"
-            ? "direct-build"
-            : "orchestrator-prepare",
-        failure: reason,
-      }
-    : undefined;
+  const receipt: HandoffRouteReceipt | undefined =
+    reason && decision.destination
+      ? {
+          at: now,
+          destination: decision.destination,
+          route:
+            decision.destination === "build" ? "direct-build" : "orchestrator-start",
+          failure: reason,
+        }
+      : undefined;
   return {
     ...decision,
     state: "superseded",
@@ -733,11 +665,6 @@ function parseLegacyDecision(raw: Record<string, unknown>): HandoffDecision | un
     version: HANDOFF_DECISION_VERSION,
     ...identity,
     reviewOwned: raw.reviewOwned === true,
-    recommendedDestination: legacyDestination,
-    recommendationRevision:
-      Number.isInteger(raw.overrideRevision) && (raw.overrideRevision as number) >= 0
-        ? (raw.overrideRevision as number)
-        : 0,
     state: legacyState,
     createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
     updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : 0,
@@ -776,15 +703,24 @@ function parseSelection(raw: unknown): HandoffSelectionReceipt | undefined {
   };
 }
 
-/** Current v2 shape. */
-function parseCurrentDecision(raw: Record<string, unknown>): HandoffDecision | undefined {
+/** Current v3 shape: no recommendation fields. */
+function parseV3Decision(raw: Record<string, unknown>): HandoffDecision | undefined {
+  return parseDecisionBody(raw);
+}
+
+/**
+ * Version 2 is still readable: its recommendation fields are dropped (they
+ * never were execution authority), and an approved/routing record still needs
+ * its explicit `destination`.
+ */
+function parseV2Decision(raw: Record<string, unknown>): HandoffDecision | undefined {
+  return parseDecisionBody(raw);
+}
+
+function parseDecisionBody(raw: Record<string, unknown>): HandoffDecision | undefined {
   if (!isState(raw.state)) return undefined;
   const identity = parseIdentity(raw);
   if (!identity) return undefined;
-  if (!isHandoffDestination(raw.recommendedDestination)) return undefined;
-  if (!Number.isInteger(raw.recommendationRevision) || (raw.recommendationRevision as number) < 0) {
-    return undefined;
-  }
   if (raw.destination !== undefined && !isHandoffDestination(raw.destination)) return undefined;
   const destination = isHandoffDestination(raw.destination) ? raw.destination : undefined;
   // Approved/routed states must carry their explicit selection; treating a
@@ -799,8 +735,6 @@ function parseCurrentDecision(raw: Record<string, unknown>): HandoffDecision | u
     version: HANDOFF_DECISION_VERSION,
     ...identity,
     reviewOwned: raw.reviewOwned === true,
-    recommendedDestination: raw.recommendedDestination,
-    recommendationRevision: raw.recommendationRevision as number,
     ...(destination ? { destination } : {}),
     state: raw.state,
     createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
@@ -816,13 +750,14 @@ function parseCurrentDecision(raw: Record<string, unknown>): HandoffDecision | u
 /**
  * Bounded, validated codec for the persisted workflow entry.
  *
- * Accepts the current v2 shape and migrates a v1 record conservatively:
- * a v1 destination/recommendation is only ever a recommendation, and a v1
+ * Accepts v3 (current), v2 (recommendation fields ignored) and migrates a v1
+ * record conservatively: a v1 destination is a recommendation, and a v1
  * `consumed` record stays terminal.
  */
 export function parseHandoffDecision(raw: unknown): HandoffDecision | undefined {
   if (!isRecord(raw)) return undefined;
   if (raw.version === HANDOFF_DECISION_VERSION_LEGACY) return parseLegacyDecision(raw);
+  if (raw.version === HANDOFF_DECISION_VERSION_V2) return parseV2Decision(raw);
   if (raw.version !== HANDOFF_DECISION_VERSION) return undefined;
-  return parseCurrentDecision(raw);
+  return parseV3Decision(raw);
 }

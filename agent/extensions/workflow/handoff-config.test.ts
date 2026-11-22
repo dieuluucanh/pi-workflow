@@ -52,17 +52,14 @@ test("handoff coerce: string shorthand, trimmed and case-insensitive", () => {
   assert.deepEqual(coerceHandoffConfig("native"), {
     mode: "native",
     timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
   });
   assert.deepEqual(coerceHandoffConfig("  NAtive "), {
     mode: "native",
     timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
   });
   assert.deepEqual(coerceHandoffConfig("plannotator"), {
     mode: "plannotator",
     timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
   });
   assert.equal(coerceHandoffConfig("bogus").mode, "auto");
 });
@@ -71,12 +68,10 @@ test("handoff coerce: object form accepts mode and timeoutMs", () => {
   assert.deepEqual(coerceHandoffConfig({ mode: "PLANNOTATOR" }), {
     mode: "plannotator",
     timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
   });
   assert.deepEqual(coerceHandoffConfig({ timeoutMs: 30_000 }), {
     mode: "auto",
     timeoutMs: 30_000,
-    executionMode: "orchestrator",
   });
 });
 
@@ -84,7 +79,6 @@ test("handoff coerce: invalid fields fall back to the base", () => {
   const base = {
     mode: "native" as const,
     timeoutMs: 7_000,
-    executionMode: "build" as const,
   };
   assert.deepEqual(coerceHandoffConfig({ mode: "bogus" }, base), base);
   assert.deepEqual(coerceHandoffConfig({ mode: 7 }, base), base);
@@ -130,11 +124,11 @@ test("handoff merge: project wins field by field over global", () => {
       { mode: "plannotator", timeoutMs: 20_000 },
       { mode: "native" },
     ),
-    { mode: "native", timeoutMs: 20_000, executionMode: "orchestrator" },
+    { mode: "native", timeoutMs: 20_000 },
   );
   assert.deepEqual(
     mergeHandoffConfig("plannotator", { timeoutMs: 45_000 }),
-    { mode: "plannotator", timeoutMs: 45_000, executionMode: "orchestrator" },
+    { mode: "plannotator", timeoutMs: 45_000 },
   );
   assert.deepEqual(mergeHandoffConfig(undefined, undefined), {
     ...DEFAULT_HANDOFF_CONFIG,
@@ -142,7 +136,6 @@ test("handoff merge: project wins field by field over global", () => {
   assert.deepEqual(mergeHandoffConfig(undefined, "native"), {
     mode: "native",
     timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
   });
 });
 
@@ -205,7 +198,6 @@ test("handoff read: global only, project only, both, corrupt and missing", () =>
   assert.deepEqual(r.config, {
     mode: "plannotator",
     timeoutMs: 30_000,
-    executionMode: "orchestrator",
   });
   assert.equal(r.sources.mode, "project");
   assert.equal(r.sources.timeout, "project");
@@ -369,105 +361,6 @@ test("handoff completions: scope position returns full-argument values", () => {
   );
   assert.equal(handoffArgumentCompletions("bogus "), null);
   assert.equal(handoffArgumentCompletions("native xyz"), null);
-});
-
-// ── Execution destination (plan step 3) ──────────────────────────────
-
-test("destination: the default is orchestrator and is independent of the presenter", () => {
-  assert.equal(DEFAULT_HANDOFF_CONFIG.executionMode, "orchestrator");
-  assert.deepEqual(coerceHandoffConfig(undefined), {
-    mode: "auto",
-    timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-    executionMode: "orchestrator",
-  });
-  // A presenter-only edit never changes the destination and vice versa.
-  assert.equal(coerceHandoffConfig({ mode: "native" }).executionMode, "orchestrator");
-  assert.equal(coerceHandoffConfig({ executionMode: "build" }).mode, "auto");
-});
-
-test("destination: coercion trims, lowercases and falls back on garbage", () => {
-  assert.equal(coerceHandoffConfig({ executionMode: " BUILD " }).executionMode, "build");
-  assert.equal(coerceHandoffConfig({ executionMode: "orchestrator" }).executionMode, "orchestrator");
-  for (const junk of [undefined, null, 7, "", "auto", "plan", {}, []]) {
-    assert.equal(
-      coerceHandoffConfig({ executionMode: junk }).executionMode,
-      "orchestrator",
-      JSON.stringify(junk),
-    );
-  }
-  assert.equal(isExecutionDestination("orchestrator"), true);
-  assert.equal(isExecutionDestination("build"), true);
-  assert.equal(isExecutionDestination("auto"), false);
-  assert.ok(describeExecutionDestination("build").includes("Build"));
-  assert.ok(describeExecutionDestination("orchestrator").includes("breakdown"));
-});
-
-test("destination: merge is field-by-field, so a project destination keeps a global presenter", () => {
-  assert.deepEqual(
-    mergeHandoffConfig({ mode: "plannotator", timeoutMs: 20_000 }, { executionMode: "build" }),
-    { mode: "plannotator", timeoutMs: 20_000, executionMode: "build" },
-  );
-  assert.deepEqual(
-    mergeHandoffConfig({ executionMode: "build" }, { mode: "native" }),
-    { mode: "native", timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS, executionMode: "build" },
-  );
-  assert.equal(
-    handoffFieldSourceOf(undefined, { executionMode: "build" }, "executionMode"),
-    "project",
-  );
-  assert.equal(
-    handoffFieldSourceOf({ executionMode: "build" }, { mode: "native" }, "executionMode"),
-    "global",
-  );
-  assert.equal(handoffFieldSourceOf(undefined, undefined, "executionMode"), "default");
-});
-
-test("destination: a sparse write stores only the destination and preserves unrelated keys", () => {
-  const { root, cwd, agentDir } = tmpProject();
-  try {
-    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
-    fs.writeFileSync(
-      path.join(cwd, ".pi", "settings.json"),
-      JSON.stringify({ theme: "x", workflow: { reviewMode: { enabled: true } } }, null, 2),
-    );
-    const res = writeHandoffConfig("project", cwd, agentDir, { executionMode: "build" });
-    assert.equal(res.ok, true);
-    const root = JSON.parse(fs.readFileSync(res.path, "utf8"));
-    assert.equal(root.theme, "x");
-    assert.deepEqual(root.workflow.reviewMode, { enabled: true });
-    assert.deepEqual(root.workflow.handoff, { executionMode: "build" });
-    const resolved = readHandoffConfig(cwd, agentDir);
-    assert.equal(resolved.config.executionMode, "build");
-    assert.equal(resolved.config.mode, "auto", "the presenter stays at its default");
-    assert.equal(resolved.sources.execution, "project");
-
-    // A later presenter write must not materialize the destination.
-    const second = writeHandoffConfig("project", cwd, agentDir, { mode: "native" });
-    assert.equal(second.ok, true);
-    const after = JSON.parse(fs.readFileSync(second.path, "utf8"));
-    assert.equal(after.workflow.handoff.executionMode, "build");
-    assert.equal(after.workflow.handoff.mode, "native");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("destination: retained string shorthand does not lose its presenter", () => {
-  const { root, cwd, agentDir } = tmpProject();
-  try {
-    fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(agentDir, "settings.json"),
-      JSON.stringify({ workflow: { handoff: "native" } }, null, 2),
-    );
-    const res = writeHandoffConfig("global", cwd, agentDir, { executionMode: "build" });
-    assert.equal(res.ok, true);
-    const root = JSON.parse(fs.readFileSync(res.path, "utf8"));
-    assert.equal(root.workflow.handoff.mode, "native");
-    assert.equal(root.workflow.handoff.executionMode, "build");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
 });
 
 test("destination completions: execution takes a destination then a scope; once takes a destination", () => {

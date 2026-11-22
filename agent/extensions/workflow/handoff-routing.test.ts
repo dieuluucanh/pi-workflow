@@ -31,7 +31,6 @@ import {
   isAwaitingExecution,
   isHandoffDestination,
   parseHandoffDecision,
-  recommendHandoffDestination,
   selectHandoffDestination,
   supersedeHandoffDecision,
   type HandoffDecision,
@@ -68,10 +67,8 @@ test("create: identity is stable for the same handoff and changes with content",
   const b = created();
   assert.equal(a.decisionId, b.decisionId);
   assert.equal(a.state, "pending");
-  assert.equal(a.recommendedDestination, "orchestrator", "the saved default is a recommendation");
-  assert.equal(a.destination, undefined, "a recommendation is never a selection");
-  assert.equal(a.recommendationRevision, 0);
-  assert.equal(HANDOFF_DECISION_VERSION, 2);
+  assert.equal(a.destination, undefined, "creation never selects an execution");
+  assert.equal(HANDOFF_DECISION_VERSION, 3);
 
   const otherHash = created({ planHash: "b".repeat(64) });
   assert.notEqual(otherHash.decisionId, a.decisionId);
@@ -96,21 +93,10 @@ test("create: invalid identity fails closed", () => {
     { sessionRef: "  " },
     { reviewCycleId: -1 },
     { reviewCycleId: 1.5 },
-    { defaultDestination: "auto" as never },
   ]) {
     const result = createHandoffDecision({ ...BASE, ...broken });
     assert.equal(result.ok, false, JSON.stringify(broken));
   }
-});
-
-test("create: a legacy record keeps Build as a recommendation, never a selection", () => {
-  const legacy = created({ legacy: true, defaultDestination: "orchestrator" });
-  assert.equal(legacy.state, "pending");
-  assert.equal(legacy.recommendedDestination, "build");
-  assert.equal(legacy.destination, undefined);
-  assert.equal(legacy.legacy, true);
-  assert.equal(handoffRouteFor(legacy), undefined, "no route before approval/selection");
-  assert.equal(isAwaitingExecution(legacy), false);
 });
 
 test("approve: stage 1 records approval and never routes", () => {
@@ -163,35 +149,6 @@ test("approve: an approval comment is kept and is not a denial", () => {
   if (!result.ok) return;
   assert.equal(result.decision.state, "approved");
   assert.equal(result.decision.approval?.feedback, "ship it, but note the migration");
-});
-
-test("recommendation: changes only the first chooser row, never the route", () => {
-  const decision = created();
-  const changed = recommendHandoffDestination(decision, "build", 1_050);
-  assert.equal(changed.ok, true);
-  if (!changed.ok) return;
-  assert.equal(changed.decision.recommendedDestination, "build");
-  assert.equal(changed.decision.recommendationRevision, 1);
-  assert.equal(changed.decision.destination, undefined);
-  assert.equal(changed.decision.state, "pending");
-  assert.equal(handoffRouteFor(changed.decision), undefined);
-
-  const same = recommendHandoffDestination(changed.decision, "build", 1_060);
-  assert.equal(same.ok, false);
-  assert.equal((same as any).code, "unchanged");
-
-  const back = recommendHandoffDestination(changed.decision, "orchestrator", 1_070);
-  assert.equal(back.ok, true);
-  if (back.ok) assert.equal(back.decision.recommendationRevision, 2);
-
-  // A recommendation is allowed while approved, still without routing.
-  const onApproved = recommendHandoffDestination(approved(), "build", 1_200);
-  assert.equal(onApproved.ok, true);
-  if (onApproved.ok) {
-    assert.equal(onApproved.decision.state, "approved");
-    assert.equal(onApproved.decision.destination, undefined);
-    assert.equal(handoffRouteFor(onApproved.decision), undefined);
-  }
 });
 
 test("select: requires an approval, then records the only execution authority", () => {
@@ -437,12 +394,40 @@ test("codec: a v1 pending record migrates to a RECOMMENDATION only", () => {
   };
   const migrated = parseHandoffDecision(v1);
   assert.ok(migrated);
-  assert.equal(migrated!.version, 2);
+  assert.equal(migrated!.version, 3);
   assert.equal(migrated!.state, "pending");
-  assert.equal(migrated!.recommendedDestination, "orchestrator");
-  assert.equal(migrated!.recommendationRevision, 1);
   assert.equal(migrated!.destination, undefined, "a v1 capture is not consent to execute");
   assert.equal(handoffRouteFor(migrated!), undefined);
+});
+
+test("codec: a v2 decision still reads; its recommendation fields are dropped", () => {
+  const v2 = {
+    version: 2,
+    decisionId: "handoff-cccccccc",
+    planPath: BASE.planPath,
+    planHash: BASE.planHash,
+    sessionRef: BASE.sessionRef,
+    reviewCycleId: 4,
+    source: "auto",
+    presenter: "native",
+    reviewOwned: false,
+    recommendedDestination: "build",
+    recommendationRevision: 3,
+    destination: "orchestrator",
+    state: "approved",
+    createdAt: 1,
+    updatedAt: 2,
+    receipts: [],
+  };
+  const migrated = parseHandoffDecision(v2);
+  assert.ok(migrated);
+  assert.equal(migrated!.version, 3);
+  assert.equal(migrated!.destination, "orchestrator", "the explicit selection survives");
+  assert.equal((migrated as any).recommendedDestination, undefined);
+  assert.equal((migrated as any).recommendationRevision, undefined);
+
+  const missingDestination = parseHandoffDecision({ ...v2, destination: undefined });
+  assert.equal(missingDestination, undefined, "an approved v2 record still needs consent");
 });
 
 test("codec: a v1 consumed record stays terminal and never re-routes", () => {
@@ -479,5 +464,5 @@ test("codec: destinations are a closed set", () => {
   assert.equal(isHandoffDestination("orchestrator"), true);
   assert.equal(isHandoffDestination("build"), true);
   assert.equal(isHandoffDestination("auto"), false);
-  assert.equal(HANDOFF_DECISION_VERSION, 2);
+  assert.equal(HANDOFF_DECISION_VERSION, 3);
 });

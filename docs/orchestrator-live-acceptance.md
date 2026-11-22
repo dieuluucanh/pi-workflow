@@ -1,5 +1,25 @@
 # Orchestrator live acceptance — manual signoff
 
+> **Superseded 2026-11-22 (Orchestrator simplification).** The
+> propose → preview → execution-approval pipeline described in the older body of
+> this document no longer exists. The current contract is:
+>
+> - plan approval (or an agreed standalone discussion) freezes ONE TODO list
+>   (one row per top-level plan step) via `orchestrator_start`;
+> - the scheduler dispatches row 1 to a visible Build child, and acceptance of
+>   row N dispatches row N+1;
+> - the child is a normal Build session with its own task-local TODO list and no
+>   edit interlock;
+> - per row the parent runs the row's checks and `orchestrator_verify` /
+>   `orchestrator_accept`; after the last row it runs the plan's
+>   `## Verification` commands once;
+> - there is no saved execution destination, no recommendation and no
+>   `/handoff execution|once`; every approved plan asks Build/Orchestrator;
+> - `workflow.handoff.executionMode` is ignored, never rewritten, and legacy
+>   runs are not resumed — restart from the approved plan.
+>
+> See the package README and CHANGELOG for the current operator contract.
+
 Status: **NOT RUN**. This file is a checklist, not evidence. The automated
 suites (workflow `npm test`, Desktop `npm test`) exercise the contract with
 fake ports, fake agents and in-memory sessions; they are **not** a substitute
@@ -125,3 +145,35 @@ Do not convert any row to PASSED without the real run described in it.
 | Host OS + terminal | |
 | Passed cases | |
 | Failed/blocked cases (with evidence) | |
+
+## 2026-11-22 simplification — evidence recorded
+
+The propose → preview → execution-approval pipeline was removed. The live
+matrix below was **not executed** in this change: it needs real Terminal/Desktop
+windows, real provider turns and packaged hosts, none of which are simulated by
+the test harness. Do not read the automated suite as a live pass.
+
+| Case | Status | Evidence / note |
+| --- | --- | --- |
+| Plan approve → neutral chooser → Orchestrator → frozen TODO → visible Build child → report → verify → accept → next row | **NOT RUN** | Needs a real Terminal/Desktop child and provider |
+| Plan approve → direct Build (frozen list, status-only) | **NOT RUN** | Needs a real UI session |
+| Plan approve → feedback stays in Plan | **NOT RUN** | Needs the real questionnaire |
+| Standalone `/orchestrator` → discussion → `orchestrator_start` | **NOT RUN** | Needs a real model turn |
+| Child report → verify → accept → automatic next dispatch | **NOT RUN** | Composed unit tests cover the reducer/tool path only |
+| Child failure → scoped repair (≤2) → block | **NOT RUN** | Reducer tests cover the cap |
+| Dispatch failure (SDK/host/`wt.exe` missing) leaves a retryable row | **NOT RUN** | Fake-host tests cover the refusal text |
+| Reload mid-run restores rows/states, no duplicate child | **NOT RUN** | Journal replay is unit-tested |
+| Build source edit does not renumber rows | **NOT RUN** | Snapshot immutability is unit-tested |
+| Neutral chooser: no recommendation, no saved default, asked every time | **NOT RUN** | Codec/view tests cover the neutrality |
+| Legacy pending decision still parses; legacy run not resumed | **NOT RUN** | v1/v2 codec tests cover the parse path |
+
+Automated gates that DID pass on 2026-11-22:
+
+- `agent/extensions/workflow`: `npm run typecheck` clean; `npm test`
+  **1247/1247**; `npm run check:read-policy` pass; `npm run check:policy`
+  **100/100** in a disposable HOME.
+- repo root: `npm test` **80/80**; `npm run verify -- --packages workflow`
+  **79 files ok**.
+- LSP diagnostics on the changed files were **inconclusive** (timeouts; `index.ts`
+  exceeds the 5000-line LSP limit). Typecheck is the authoritative compiler
+  evidence; LSP is reported separately.

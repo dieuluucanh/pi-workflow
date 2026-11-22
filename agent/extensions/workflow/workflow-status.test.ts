@@ -210,36 +210,23 @@ test("setWorkflowWidget is a no-op for a host without a widget API", () => {
   assert.doesNotThrow(() => setWorkflowWidget({}, "k", ["a"]));
 });
 
-test("the orchestrator footer surfaces the destination before consent and the run after it", () => {
+test("the orchestrator footer reports the run without approval or recommendation prose", () => {
   const segments = buildWorkflowStatusSegments({
     mode: "orchestrator",
     done: 1,
     total: 2,
     commitMode: "never",
-    handoffDestination: "build",
     orchestration: {
-      phase: "awaiting_approval",
-      approval: "pending",
+      phase: "blocked",
       blockedReason: "no host",
       nextTaskId: "task-2",
     },
   });
-  assert.match(segments.mode, /breakdown pending approval/);
-  assert.match(segments.orchestrator, /recommended → direct build/);
-  assert.match(segments.orchestrator, /run awaiting_approval/);
+  assert.match(segments.mode, /orchestrator 1\/2/);
+  assert.doesNotMatch(segments.mode, /approval/);
+  assert.match(segments.orchestrator, /run blocked/);
   assert.match(segments.orchestrator, /next task-2/);
   assert.match(segments.orchestrator, /blocked: no host/);
-
-  const approved = buildWorkflowStatusSegments({
-    mode: "orchestrator",
-    done: 2,
-    total: 2,
-    commitMode: "never",
-    handoffDestination: "orchestrator",
-    orchestration: { phase: "ready", approval: "approved" },
-  });
-  assert.match(approved.mode, /execution approved/);
-  assert.match(approved.orchestrator, /recommended → orchestrator/);
 
   const idle = buildWorkflowStatusSegments({
     mode: "plan",
@@ -257,10 +244,9 @@ test("handoff stages are named accurately and a recommendation never executes", 
     total: 0,
     commitMode: "never",
     handoffStage: "review-pending",
-    handoffDestination: "build",
   });
   assert.match(review.mode, /handoff pending/);
-  assert.match(review.orchestrator, /recommended → direct build/);
+  assert.equal(review.orchestrator, "", "no destination recommendation is rendered");
 
   const approved = buildWorkflowStatusSegments({
     mode: "plan",
@@ -268,11 +254,10 @@ test("handoff stages are named accurately and a recommendation never executes", 
     total: 0,
     commitMode: "never",
     handoffStage: "approved",
-    handoffDestination: "orchestrator",
   });
   assert.match(approved.mode, /execution choice pending/);
   assert.doesNotMatch(approved.mode, /review/);
-  assert.match(approved.orchestrator, /recommended → orchestrator/);
+  assert.equal(approved.orchestrator, "", "no destination recommendation is rendered");
 
   const routing = buildWorkflowStatusSegments({
     mode: "plan",

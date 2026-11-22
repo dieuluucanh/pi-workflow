@@ -56,8 +56,6 @@ export const EXECUTION_DESTINATIONS: readonly ExecutionDestination[] = [
   "build",
 ];
 
-export const DEFAULT_EXECUTION_DESTINATION: ExecutionDestination = "orchestrator";
-
 /** Canonical mode order (status output and completions). */
 export const HANDOFF_MODES: readonly HandoffMode[] = [
   "auto",
@@ -77,8 +75,6 @@ export interface HandoffConfig {
    * made; `native` mode never waits.
    */
   timeoutMs: number;
-  /** Default execution destination for a newly presented handoff. */
-  executionMode: ExecutionDestination;
 }
 
 export const DEFAULT_HANDOFF_TIMEOUT_MS = 15_000;
@@ -88,7 +84,6 @@ export const HANDOFF_TIMEOUT_MAX = 300_000;
 export const DEFAULT_HANDOFF_CONFIG: Readonly<HandoffConfig> = {
   mode: "auto",
   timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
-  executionMode: DEFAULT_EXECUTION_DESTINATION,
 };
 
 /** A JSON object parsed from an untrusted source. */
@@ -110,7 +105,6 @@ export interface ResolvedHandoffConfig {
     project: boolean;
     mode: HandoffConfigScopeSource;
     timeout: HandoffConfigScopeSource;
-    execution: HandoffConfigScopeSource;
   };
 }
 
@@ -183,7 +177,6 @@ export function coerceHandoffConfig(
       HANDOFF_TIMEOUT_MAX,
       base.timeoutMs,
     ),
-    executionMode: normalizeExecution(r.executionMode) ?? base.executionMode,
   };
 }
 
@@ -223,7 +216,7 @@ function hasField(
   return Object.prototype.hasOwnProperty.call(raw, key);
 }
 
-type HandoffConfigField = "mode" | "timeoutMs" | "executionMode";
+type HandoffConfigField = "mode" | "timeoutMs";
 
 /**
  * Which scope supplied a field's effective value. Pure and total.
@@ -276,7 +269,6 @@ export function readHandoffConfig(
       project: projectRaw !== undefined,
       mode: handoffFieldSourceOf(globalRaw, projectRaw, "mode"),
       timeout: handoffFieldSourceOf(globalRaw, projectRaw, "timeoutMs"),
-      execution: handoffFieldSourceOf(globalRaw, projectRaw, "executionMode"),
     },
   };
 }
@@ -321,8 +313,6 @@ export function writeHandoffConfig(
     }
     if (patch.mode !== undefined) next.mode = coerced.mode;
     if (patch.timeoutMs !== undefined) next.timeoutMs = coerced.timeoutMs;
-    if (patch.executionMode !== undefined)
-      next.executionMode = coerced.executionMode;
     wf[HANDOFF_SETTINGS_KEY] = next;
     root[WORKFLOW_SETTINGS_KEY] = wf;
     fs.mkdirSync(path.dirname(fp), { recursive: true });

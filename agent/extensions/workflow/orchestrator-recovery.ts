@@ -155,26 +155,12 @@ function probeSessions(input: RecoveryInput): {
   missingAcknowledged: string[];
   foreign: string[];
 } {
-  const refs = input.journal.sessionsByBranch.get(input.branch.id) ?? [];
-  const byRef = new Map(input.sessions.map((probe) => [probe.sessionRef, probe]));
   const staleMs = input.staleMs ?? DEFAULT_HEARTBEAT_STALE_MS;
   const reconciled: SessionReconciliation[] = [];
   const missingAcknowledged: string[] = [];
   const foreign: string[] = [];
 
-  for (const ref of refs) {
-    const probe = byRef.get(ref.sessionRef);
-    if (!probe) {
-      reconciled.push({
-        sessionRef: ref.sessionRef,
-        ...(ref.taskId ? { taskId: ref.taskId } : {}),
-        ...(ref.attemptId ? { attemptId: ref.attemptId } : {}),
-        state: "unprobed",
-        ownedByCurrent: false,
-      });
-      if (ref.taskId) missingAcknowledged.push(ref.taskId);
-      continue;
-    }
+  for (const probe of input.sessions) {
     const ownedByCurrent = probe.ownerInstance === input.current.instanceId;
     let state: SessionState;
     if (!probe.exists || !probe.sessionFile) state = "missing";
@@ -185,12 +171,8 @@ function probeSessions(input: RecoveryInput): {
     ) {
       state = "stale";
     } else state = "live";
-    if (state === "missing" && ref.taskId) missingAcknowledged.push(ref.taskId);
-    if (state === "foreign" && ref.taskId) foreign.push(ref.taskId);
     reconciled.push({
-      sessionRef: ref.sessionRef,
-      ...(ref.taskId ? { taskId: ref.taskId } : {}),
-      ...(ref.attemptId ? { attemptId: ref.attemptId } : {}),
+      sessionRef: probe.sessionRef,
       state,
       ownedByCurrent,
     });
@@ -254,11 +236,8 @@ export function planRecovery(input: RecoveryInput): RecoveryPlan {
   const kickoff: KickoffReconciliation[] = [];
   const pausedTasks = new Set<string>();
   for (const [taskId, state] of Object.entries(journal.kickoff)) {
-    const sessionRefEntry = (journal.sessionsByBranch.get(input.branch.id) ?? []).find(
-      (entry) => entry.taskId === taskId,
-    );
-    const probe = input.sessions.find((entry) => entry.sessionRef === sessionRefEntry?.sessionRef);
     const sessionId = state.ack?.sessionId ?? state.intent?.sessionId;
+    const probe = input.sessions.find((entry) => entry.sessionRef === sessionId);
     kickoff.push({
       taskId,
       status: state.status,

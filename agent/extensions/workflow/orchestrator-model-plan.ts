@@ -15,11 +15,12 @@
  * approval preview and the launched child cannot describe different models.
  */
 
-import {
-  resolveBudget,
-  type BudgetPlan,
-  type ModelLimits,
-} from "./orchestrator-budget.ts";
+export interface ModelLimits {
+  provider?: string;
+  id: string;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+}
 
 export interface ModelPlanRef {
   provider?: string;
@@ -51,9 +52,8 @@ export type ModelPlanResult =
   | {
       ok: true;
       launch: { provider: string; id: string; thinking?: string };
-      budget: BudgetPlan;
     }
-  | { ok: false; code: "no_model" | "budget"; error: string };
+  | { ok: false; code: "no_model"; error: string };
 
 function clean(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -134,23 +134,6 @@ export function resolveModelPlan(
         ? limits.maxOutputTokens
         : null,
   };
-  const resolved = resolveBudget({ role: input.role, model });
-  if (!resolved.ok) {
-    return { ok: false, code: "budget", error: resolved.error };
-  }
-  // Defense in depth: a resolver that loses the identity cannot be used to
-  // launch a child, even if a future refactor changes the budget layer again.
-  if (
-    clean(resolved.plan.model.provider) !== chosen.provider ||
-    resolved.plan.model.id !== chosen.id
-  ) {
-    return {
-      ok: false,
-      code: "budget",
-      error: "budget resolution lost the model provider/id",
-    };
-  }
-
   return {
     ok: true,
     launch: {
@@ -160,6 +143,5 @@ export function resolveModelPlan(
         ? { thinking: chosen.thinking }
         : {}),
     },
-    budget: resolved.plan,
   };
 }

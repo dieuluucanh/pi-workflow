@@ -421,20 +421,21 @@ export function createRunControl(options: {
       if (state.acknowledged) return { ok: true, acknowledged: true };
       const timeoutMs = input.timeoutMs ?? DEFAULT_START_TIMEOUT_MS;
       return new Promise<StartWait>((resolve) => {
-        state.waiter = {
-          resolve,
-          timer: setTimeout(() => {
-            state.waiter = undefined;
-            resolve({
-              ok: false,
-              error: state.delivered
-                ? "the start was delivered but the child did not acknowledge it"
-                : "the child never connected to the control endpoint",
-              delivered: state.delivered,
-              uncertain: state.delivered,
-            });
-          }, timeoutMs),
-        };
+        const timer = setTimeout(() => {
+          state.waiter = undefined;
+          resolve({
+            ok: false,
+            error: state.delivered
+              ? "the start was delivered but the child did not acknowledge it"
+              : "the child never connected to the control endpoint",
+            delivered: state.delivered,
+            uncertain: state.delivered,
+          });
+        }, timeoutMs);
+        // A non-awaited start wait must not keep the parent process alive.
+        // SAFETY: Node's Timeout has unref(); the shared timer type omits it.
+        (timer as unknown as { unref?: () => void }).unref?.();
+        state.waiter = { resolve, timer };
       });
     },
     async request(type, payload, input) {

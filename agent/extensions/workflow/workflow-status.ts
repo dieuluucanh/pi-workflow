@@ -57,7 +57,6 @@ export interface WorkflowStatusInput {
   /** Orchestrator run state, when one is bound to this session. */
   orchestration?: {
     phase: string;
-    approval: "none" | "pending" | "approved";
     blockedReason?: string;
     nextTaskId?: string;
   };
@@ -105,16 +104,10 @@ export function buildWorkflowStatusSegments(
     } else if (input.mode === "plan") {
       base = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
     } else if (input.mode === "orchestrator") {
-      const approval =
-        input.orchestration?.approval === "approved"
-          ? " · execution approved"
-          : input.orchestration?.approval === "pending"
-            ? " · breakdown pending approval"
-            : "";
       base =
         total > 0
-          ? `🧭 orchestrator ${done}/${total}${stale}${approval}`
-          : `🧭 orchestrator${stale}${approval}`;
+          ? `🧭 orchestrator ${done}/${total}${stale}`
+          : `🧭 orchestrator${stale}`;
     } else if (total > 0) {
       // The default mode must stay parseable by the Desktop badge decoder.
       base = `◦ ${done}/${total}${stale}`;
@@ -132,9 +125,7 @@ export function buildWorkflowStatusSegments(
     mode = `${base}${stageSuffix}`;
   }
 
-  const destination = input.handoffDestination
-    ? `recommended → ${input.handoffDestination === "orchestrator" ? "orchestrator" : "direct build"}`
-    : "";
+  const destination = "";
   const run = input.orchestration
     ? `run ${input.orchestration.phase}` +
       (input.orchestration.nextTaskId ? ` · next ${input.orchestration.nextTaskId}` : "") +

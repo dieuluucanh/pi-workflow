@@ -51,7 +51,6 @@ export interface WorkflowContributionInput {
    */
   orchestration?: {
     phase: string;
-    approval: "none" | "pending" | "approved";
     blockedReason?: string;
     nextTaskId?: string;
     /** Whether a visible child host can be reached right now. */
@@ -273,17 +272,11 @@ export function buildWorkflowContributions(
 
   if (input.mode === "orchestrator" && input.orchestration) {
     const run = input.orchestration;
-    const approval =
-      run.approval === "approved"
-        ? "execution approved"
-        : run.approval === "pending"
-          ? "breakdown pending approval"
-          : "no breakdown yet";
     out.push({
       id: "orchestrator-run",
       kind: "status",
       slot: "status",
-      text: `run ${run.phase} · ${approval}${run.nextTaskId ? ` · next ${run.nextTaskId}` : ""}`,
+      text: `run ${run.phase}${run.nextTaskId ? ` · next ${run.nextTaskId}` : ""}`,
       tone: "info",
       order: 41,
     });

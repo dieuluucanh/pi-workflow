@@ -52,7 +52,6 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/handoff approve <decision-id>` | Stage 1 only: approve the PLAN by the id printed with it. An interactive session then opens the execution chooser; a headless one prints the stage-2 commands |
 | `/handoff continue <decision-id>` | Reopen the execution chooser for an approved plan (e.g. after cancelling it, or after a reload) |
 | `/handoff execute <decision-id> orchestrator\|build` | Stage 2 explicitly, for headless use or after cancelling the chooser. Refused before approval, or for a changed/consumed/uncertain decision |
-| `/handoff once orchestrator\|build` | Change THIS handoff's recommendation only. Never writes settings and never executes |
 | `/handoff fallback` | Present a pending PLAN review in the native questionnaire now, without changing `workflow.handoff`. The escape when the in-app review tab is blank or unusable. An approved plan uses `/handoff continue` instead |
 | `/commit` | Commit staged changes with an AI-summarized message (`-a`: stage tracked changes first). Confirmation-gated; the confirmation arms the commit exemption for that run |
 | `/commit-policy [never\|ask\|allow] [global\|project]` | View or set the commit policy (default `never`: the agent cannot `git add`/`commit`/`push` — you commit, or use `/commit`) |
@@ -74,70 +73,47 @@ short Plan → Review → Build work keeps its current behavior.
 
 ### Core rules
 
-- **Mode entry is not execution.** `/orchestrator` (Tab or command) enters the
-  mode; the first dispatch requires an execution approval that is separate from
-  plan approval and from mode entry. A missing old role config falls back to the
-  planner model without rewriting files; the worker model remains Builder.
-- **Ask it to work — do not switch to `/build`.** When the user asks for work,
-  the parent calls `orchestrator_prepare` (or the user runs
-  `/orchestrator start [path]`). A bare `/orchestrator start` first restores a
-  bound plan's deterministic run/journal and, when it already has an execution
-  approval, starts the next ready task; `start <path>` snapshots an explicit
-  plan, and a session with no bound plan prepares the current discussion. Both
-  preparation routes are the same service the approved handoff uses. A
-  read-only question stays a question.
-- **Identity is separate from permissions.** Orchestrator is its own permission
-  role: it inspects and runs verify commands, but project edits, mutating shell
-  and child-only tools are refused with a delegation remedy, never with “Plan
-  mode” or “switch to `/build`”.
-- **One breakdown approval.** The preview shows the derived requirements,
-  task grouping, models, checks, host readiness, dirty baseline, commit behavior
-  and limits. In a UI session the host opens the execution approval dialog:
-  **Approve** journals the approval and starts the next ready task, **Deny**
-  invalidates the preview durably and stays in Orchestrator, and freeform text
-  asks for a revised breakdown. A headless host keeps the id-bound command
-  (`/orchestrator approve preview-<digest>`); refine invalidates the preview
-  durably; cancel launches nothing. The model has no approve tool, and the
-  literal `approve-execution` is not a preview ID.
-- **Identity is durable.** Run/task/attempt/session ids are stable; TODO numbers
-  are display refs only. A child's local step 1 is never the parent's roadmap
-  step 1, and child TODOs cannot complete a roadmap.
-- **One writer.** A cooperative workspace lease and the run state machine give
-  the workspace to exactly one attempt at a time. Fencing tokens are allocated
-  durably per workspace and reserved before acquisition, so task 2, a later run
-  and a restarted parent never reuse generation 1. A stale lease generation
-  cannot write, pause, repair or resume.
-- **Candidates are not acceptance.** A worker report only proposes completion.
-  The parent captures the real diff (content-addressed, including already-dirty,
-  untracked, deleted and non-Git files), runs the required checks through the
-  normal gated tool path, records exit status/evidence, recomputes the workspace
-  revision after the checks, and accepts atomically only against that exact
-  candidate, workspace and roadmap revision. Metadata-only coverage is a blocker,
-  not “unchanged”.
-- **Bounded retries.** Repair and no-progress counters persist across retries and
-  rollovers. A failed verification never advances; exhausted budgets pause with
-  explicit retry/unblock/cancel controls.
-- **Normal children.** Each worker is an ordinary visible Pi session with normal
-  tools, UI, questions and local TODOs — not a hidden headless fork of the
-  parent history. Persisted creation is distinct from an authorized start: a
-  resume stays idle until one correlated wake starts the assignment.
-- **Parent-only commits.** Managed children suppress TODO/`[DONE]`/checkbox and
-  report auto-commits and may not push. An accepted task is committed at most
-  once, by the parent, from parent-attributable paths, under the existing
-  `never`/`ask`/`allow` policy. Baseline overlap is an attribution conflict, not
-  an automatic stage.
-- **Bounded parent context.** The parent carries a small run pointer/projection
-  (accepted/remaining, active task, next decision) and pages history on demand;
-  compaction keeps the pending verify/repair/accept decision instead of losing
-  it in prose.
-- **Recovery is conservative.** Reload compares the journal, active branch,
-  parent process identity and real session files. An uncertain kickoff is
-  reconciled by inspection, never replayed blindly; parent loss stops children;
-  fork/tree/rewind cannot reuse an active run/lease without an explicit clone.
-- **Final gate.** Roadmap completion comes from accepted task coverage, not from
-  every child TODO being done. A roadmap-level integration/manual check failure
-  keeps the run non-complete and returns a scoped repair proposal; a scope change
-  needs a new approval.
+- **Mode entry is not execution.** Tab or `/orchestrator` enters the mode;
+  nothing runs until the user approves a plan (or explicitly agrees the
+  standalone steps) and picks an execution destination.
+- **One frozen TODO list per execution.** Plan approval or an agreed standalone
+  discussion produces rows ONCE: one row per top-level plan step, stable ids,
+  stable `1..N` refs, header/line evidence and optional per-row checks/files.
+  From then on only status changes. There is no re-proposal, rebaseline,
+  renumbering, split/combine, coverage map or DAG.
+- **Ask it to work — do not switch to `/build`.** After the discussion is
+  agreed the model calls `orchestrator_start` with the explicit steps (or an
+  approved plan path). The tool freezes the list and the scheduler dispatches
+  row 1. `/orchestrator start [path]` is the same service from the command
+  line. No second approval dialog exists.
+- **Neutral destination every time.** An approved plan always asks: direct
+  Build, or Orchestrator, plus *Decide later*. Both options are equal: there is
+  no saved default, no `workflow.handoff.executionMode`, no recommendation and
+  no `/handoff execution|once`. Feedback keeps the session in Plan.
+- **Direct Build stays in-session.** It uses the same frozen list and the same
+  status-only contract; it does not start an Orchestrator child.
+- **The child is a normal Build session.** A managed child switches to Build
+  immediately (no edit interlock, no `workflow_worker_ready` prerequisite),
+  creates its own task-local TODO list, edits normally and reports with
+  `orchestrator_report`. It never enters Orchestrator or edits the parent run.
+- **One panel list authority.** The active execution's frozen snapshot is
+  installed in the session `TodoStore`; the pinned panel renders that store.
+  In Orchestrator mode `workflow_todo` is read-only for the run rows.
+- **Verification is the parent's.** Per row, the parent captures the baseline
+  diff and runs the row's `acceptanceChecks`; `orchestrator_accept` journals
+  the acceptance and dispatches the next row. A failing check records a bounded
+  repair round (max 2) against the same child. After the last row the plan's
+  `## Verification` commands run once as the final gate.
+- **No execution budgets or parent commits.** Usage/cost caps, rollover,
+  drift, parity, a second-opinion verifier and the parent commit ledger are
+  gone. The child follows the normal Build commit policy.
+- **Failure leaves a retryable row.** A dispatch failure never loses the frozen
+  list: the run stays ready/blocked with a concrete reason, and
+  `orchestrator_retry` / `/orchestrator retry` resumes it.
+- **Legacy records survive.** Handoff decisions are version 3; version 2 is
+  still readable (its recommendation fields are ignored), and an approved record
+  still requires its explicit `destination`. Old runs are not resumed: restart
+  from the approved plan with the new flow.
 
 ### Host contract
 
@@ -151,13 +127,12 @@ both repos (`fixtures/two-extension-contract.json`).
 ### What is wired, and what still needs a live run
 
 - **Wired in the entrypoint:** the four-mode ring, a fresh authoritative
-  mission injection, manual-and-handoff work preparation (discussion snapshot or
-  exact plan bytes), the parent tools (`orchestrator_prepare|propose_tasks|
-  dispatch|status|verify|repair|accept`), dispatch journaling (assign → start
-  intent → one wake → ack), the durable wake pump, evidence-backed verification,
-  usage/rollover, operator commands (`/orchestrator status|preview|start|pause|
-  resume|stop|inspect|say|retry|refine|approve <preview-id>|cancel`), parent-only
-  TODO projection, accepted-task commits and the fail-closed final gate.
+  mission injection, `orchestrator_start` (plan path or explicit steps), the
+  frozen TODO snapshot and its persistence, the scheduler auto-dispatch, row
+  verification (diff + `acceptanceChecks`), acceptance and the final plan
+  check, the parent tools (`orchestrator_start|status|verify|repair|accept|
+  retry`), operator commands (`/orchestrator status|start|pause|resume|stop|
+  inspect|say|retry|cancel`), and the neutral execution chooser.
 - **Child host binding:** dispatch composes a real child host — a source-bound
   Desktop tab when that host announces the capability, otherwise a visible
   Terminal window running `pi --session <file>` (never a headless print worker).
@@ -260,7 +235,7 @@ Plan Mode (main session) ──plan file──▶ Review Mode (child session, ga
 - **Approve** in Plannotator → Build mode; review activity suspends but the reviewer session stays warm for the next round.
 - **Feedback** → Plan revises, Review re-reviews the revision, Plannotator reopens.
 - **A broken Plannotator is never a dead end.** Every handoff path (automatic, `/review`, `/review-resume`, a closed browser tab) falls back to the workflow's own questionnaire: the plan is appended to the transcript (scroll up to read it), and `Approve plan (choose execution next)` / `Give feedback (stay in Plan)` / `Skip for now (stay in Plan)` are pinned at the bottom. The fallback keeps the SAME handoff record, so its identity and recommendation survive; a late browser event cannot act on the native decision.
-- **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with Orchestrator and direct Build, plus *Decide later*. The answer applies to this approved plan only and never rewrites `workflow.handoff.executionMode`. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build still verifies the Build transition before sending one execute turn; Orchestrator still prepares a breakdown that needs its own approval, and no child starts before that.
+- **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with direct Build and Orchestrator as equal options, plus *Decide later*. No destination is saved or recommended. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build sends one execute turn in this session; Orchestrator freezes the plan into one TODO row per step and starts the first visible Build child immediately.
 - **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit_plan` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the round. `timeoutMs` defaults to **5 minutes**; set `0` to opt out into unlimited, and a pass that outlives the cap is aborted — though a plan submitted before the deadline is always kept.
 
 ### Enabling

@@ -1,5 +1,25 @@
 # Orchestrator operation, migration and compatibility
 
+> **Superseded 2026-11-22 (Orchestrator simplification).** The
+> propose → preview → execution-approval pipeline described in the older body of
+> this document no longer exists. The current contract is:
+>
+> - plan approval (or an agreed standalone discussion) freezes ONE TODO list
+>   (one row per top-level plan step) via `orchestrator_start`;
+> - the scheduler dispatches row 1 to a visible Build child, and acceptance of
+>   row N dispatches row N+1;
+> - the child is a normal Build session with its own task-local TODO list and no
+>   edit interlock;
+> - per row the parent runs the row's checks and `orchestrator_verify` /
+>   `orchestrator_accept`; after the last row it runs the plan's
+>   `## Verification` commands once;
+> - there is no saved execution destination, no recommendation and no
+>   `/handoff execution|once`; every approved plan asks Build/Orchestrator;
+> - `workflow.handoff.executionMode` is ignored, never rewritten, and legacy
+>   runs are not resumed — restart from the approved plan.
+>
+> See the package README and CHANGELOG for the current operator contract.
+
 Status: **experimental**. The engine, its contracts and the live composition are
 implemented and covered by automated tests; real provider turns and visible-host
 signoff remain manual. This document is the operator-facing contract for what

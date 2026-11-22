@@ -259,40 +259,41 @@ async function gateResult(
   return undefined;
 }
 
-test("extension: a managed worker cannot edit or run a shell before acknowledgement", async () => {
+test("extension: a managed Build child edits immediately; no readiness interlock", async () => {
   const b = await boot(managedBranch());
   try {
-    const edit = await gateResult(b.pi, b.made.ctx, "edit", { path: `${b.made.ctx.cwd}/a.ts` });
-    assert.equal(edit?.block, true);
-    assert.match(edit?.reason ?? "", /not ready yet/);
+    // The child is an ordinary Build session: it creates its own TODO first,
+    // then edits immediately. No acknowledgement gates either step.
+    await b.pi.tools.workflow_todo.execute("w1", {
+      action: "add",
+      text: "implement the assigned row",
+    });
+    const edit = await gateResult(b.pi, b.made.ctx, "edit", {
+      path: `${b.made.ctx.cwd}/a.ts`,
+    });
+    assert.equal(edit, undefined, "a Build child may edit immediately");
 
     const shell = await gateResult(b.pi, b.made.ctx, "bash", { command: "echo hi" });
-    assert.equal(shell?.block, true);
-    assert.match(shell?.reason ?? "", /not ready yet/);
+    assert.equal(shell, undefined, "a Build child may run a shell immediately");
 
     // Read-only inspection and its own TODO list stay open.
-    assert.equal(await gateResult(b.pi, b.made.ctx, "read", { path: `${b.made.ctx.cwd}/a.ts` }), undefined);
+    assert.equal(
+      await gateResult(b.pi, b.made.ctx, "read", { path: `${b.made.ctx.cwd}/a.ts` }),
+      undefined,
+    );
     assert.equal(
       await gateResult(b.pi, b.made.ctx, "workflow_todo", { action: "list" }),
       undefined,
     );
 
+    // Readiness is optional instrumentation now, never an edit prerequisite.
     const ready = (await b.pi.tools.workflow_worker_ready.execute()) as {
       content?: Array<{ text?: string }>;
     };
-    assert.match(JSON.stringify(ready), /acknowledged/);
-    assert.match(
-      String(ready.content?.[0]?.text ?? ""),
-      /blocked until the parent grants/,
-      "the acknowledgement explains that mutation is still closed",
+    assert.ok(
+      /acknowledged|already|not_managed|closed/i.test(JSON.stringify(ready)),
+      "the readiness tool still answers without gating edits",
     );
-
-    // Readiness is not authority: only a parent grant over IPC opens mutation.
-    const after = await gateResult(b.pi, b.made.ctx, "edit", {
-      path: `${b.made.ctx.cwd}/a.ts`,
-    });
-    assert.equal((after as any)?.block, true, "a ready worker still waits for its grant");
-    assert.match((after as any)?.reason ?? "", /not authorized yet/);
   } finally {
     await b.cleanup();
   }

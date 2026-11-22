@@ -427,8 +427,8 @@ function executionAnswer(
   destination: "orchestrator" | "build" | "later",
 ): unknown {
   const labels = {
-    orchestrator: "Orchestrator — prepare an execution breakdown",
-    build: "Direct Build — execute in this session now",
+    orchestrator: "Orchestrator — delegate each plan step",
+    build: "Direct Build — implement in this session",
     later: "Decide later (stay in Plan)",
   };
   return {
@@ -437,11 +437,6 @@ function executionAnswer(
       { question: "Plan approved — where should it run?", answer: labels[destination], wasCustom: false },
     ],
   };
-}
-
-/** Stage 1 + stage 2 answers for a native approval. */
-function approveAndExecute(destination: "orchestrator" | "build"): unknown[] {
-  return [handoffAnswer("approve"), executionAnswer(destination)];
 }
 
 /** The reviewer writes the rewrite plus a "Review changes" appendix. */
@@ -3712,120 +3707,6 @@ test("Z13: a collapsed panel stays collapsed when a step is added", async () => 
 
 // ── Approval destination routing (plan steps 4–6) ─────────────────────
 
-test("RD1: the PRODUCT default sends an approved plan to Orchestrator, not Build", async () => {
-  const b = await boot({
-    hasUI: true,
-    executionMode: "unset",
-    customAnswer: handoffAnswer("approve"),
-  });
-  try {
-    await freshPrompt(b.pi, b.ctx);
-    await switchToPlan(b.pi, b.ctx);
-    const plan = placePlan(b.cwd, "rd1-default.md");
-    await writeResult(b.pi, b.ctx, plan.rel);
-    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
-
-    const persisted = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
-    assert.equal(
-      persisted?.data?.mode,
-      "orchestrator",
-      "the approved plan enters Orchestrator mode",
-    );
-    const route = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow-handoff-route") as any;
-    assert.equal(route?.data?.destination, "orchestrator");
-    assert.equal(route?.data?.route, "orchestrator-prepare");
-    assert.equal(
-      sentIncludes(b, "Execute the plan"),
-      false,
-      "the direct-Build execution prompt is never sent",
-    );
-    assert.ok(
-      b.pi.entries.some((e: any) => e.type === "workflow-orchestrator-preparation"),
-      "a durable preparation request is recorded",
-    );
-  } finally {
-    await b.cleanup();
-  }
-});
-
-test("RD2: /handoff once changes only the recommendation and never executes", async () => {
-  const b = await boot({
-    executionMode: "orchestrator",
-    plannotator: true,
-    hasUI: true,
-    customAnswers: [executionAnswer("build")],
-  });
-  const settingsPath = path.join(b.cwd, ".pi", "settings.json");
-  try {
-    await freshPrompt(b.pi, b.ctx);
-    await switchToPlan(b.pi, b.ctx);
-    const plan = placePlan(b.cwd, "rd2-once.md");
-    await writeResult(b.pi, b.ctx, plan.rel);
-    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
-    assert.equal(b.plannotatorRequests.length, 1, "the browser owns the gate");
-
-    const before = fs.readFileSync(settingsPath, "utf8");
-    await b.pi.commands.handoff.handler("once build", b.ctx);
-    assert.equal(
-      fs.readFileSync(settingsPath, "utf8"),
-      before,
-      "a one-off recommendation never writes settings",
-    );
-    assert.ok(notified(b.notifies, "Recommended execution for this handoff"));
-    assert.equal(
-      sentIncludes(b, "Execute the plan"),
-      false,
-      "changing the recommendation executes nothing",
-    );
-
-    // The plan approval is still a separate decision; the chooser then answers.
-    b.pi.events.emit("plannotator:review-result", {
-      reviewId: "review-1",
-      approved: true,
-    });
-    await waitFor(() =>
-      sentIncludes(b, "Execute the plan"),
-    );
-    const persisted = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
-    assert.equal(persisted?.data?.mode, "build", "the chosen destination ran");
-    const route = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow-handoff-route") as any;
-    assert.equal(route?.data?.destination, "build");
-    assert.equal(route?.data?.recommendationRevision, 1);
-  } finally {
-    await b.cleanup();
-  }
-});
-
-test("RD3: /handoff execution persists the recommendation and status reports its scope", async () => {
-  const b = await boot({ executionMode: "unset" });
-  try {
-    await b.pi.commands.handoff.handler("execution build project", b.ctx);
-    const settings = JSON.parse(
-      fs.readFileSync(path.join(b.cwd, ".pi", "settings.json"), "utf8"),
-    );
-    assert.equal(settings.workflow.handoff.executionMode, "build");
-    assert.ok(notified(b.notifies, "Default execution recommendation → build (project settings)"));
-
-    b.notifies.length = 0;
-    await b.pi.commands.handoff.handler("", b.ctx);
-    assert.ok(notified(b.notifies, "execute  : build (project settings)"));
-    assert.ok(notified(b.notifies, "never executes anything"));
-
-    await b.pi.commands.handoff.handler("execution nope", b.ctx);
-    assert.ok(notified(b.notifies, 'Unknown execution destination "nope"'));
-  } finally {
-    await b.cleanup();
-  }
-});
-
 test("RD4: a configured browser handoff opens FIRST, with no picker and no write", async () => {
   const b = await boot({
     executionMode: "unset",
@@ -3934,158 +3815,6 @@ test("RD5: a headless handoff approves by id, then executes by explicit id", asy
   }
 });
 
-test("RD6: a one-off recommendation survives a browser failure into the native handoff", async () => {
-  const b = await boot({
-    executionMode: "orchestrator",
-    plannotator: true,
-    plannotatorError: true,
-    hasUI: true,
-    customAnswers: approveAndExecute("build"),
-  });
-  const settingsPath = path.join(b.cwd, ".pi", "settings.json");
-  try {
-    await freshPrompt(b.pi, b.ctx);
-    await switchToPlan(b.pi, b.ctx);
-    const plan = placePlan(b.cwd, "rd6-fallback.md");
-    await writeResult(b.pi, b.ctx, plan.rel);
-    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
-
-    // The browser failed; the SAME decision converts to native.
-    assert.ok(b.customs.length >= 1, "the native sheet opened after the failure");
-    const pending = [...b.pi.entries]
-      .filter((e: any) => e.type === "workflow" && e.data?.pendingHandoffDecision)
-      .at(-1) as any;
-    const decisionId = pending?.data?.pendingHandoffDecision?.decisionId;
-    assert.ok(decisionId, "the decision identity survived the fallback");
-    assert.equal(
-      pending?.data?.pendingHandoffDecision?.recommendedDestination,
-      "orchestrator",
-      "the saved recommendation is preserved",
-    );
-
-    // No execution happened, and the choice is what decides, not the default.
-    const route = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow-handoff-route") as any;
-    assert.equal(route?.data?.destination, "build", "the user's choice ran");
-    const persisted = [...b.pi.entries]
-      .reverse()
-      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
-    assert.equal(persisted?.data?.mode, "build");
-    const dbg = { notifies: b.notifies.map(n=>n.message), entries: b.pi.entries.filter((e:any)=>String(e.type).startsWith("workflow")).map((e:any)=>e.type) };
-    assert.equal(
-      sentIncludes(b, "Execute the plan"),
-      true,
-      JSON.stringify(dbg),
-    );
-    // The per-handoff choice never rewrote the saved default.
-    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    assert.equal(settings.workflow.handoff.executionMode, "orchestrator");
-  } finally {
-    await b.cleanup();
-  }
-});
-
-// ── Presenter × recommendation matrix (plan step 12) ────────────────
-
-test("MX: every presenter/recommendation asks the plan FIRST, then execution", async () => {
-  const combos: Array<{
-    presenter: "native" | "plannotator";
-    recommendation: "build" | "orchestrator";
-  }> = [
-    { presenter: "native", recommendation: "build" },
-    { presenter: "native", recommendation: "orchestrator" },
-    { presenter: "plannotator", recommendation: "build" },
-    { presenter: "plannotator", recommendation: "orchestrator" },
-  ];
-  for (const combo of combos) {
-    // The browser owns stage 1 in the Plannotator combo, so only its stage-2
-    // answer is queued; the native combo answers both stages in order.
-    const answers: unknown[] =
-      combo.presenter === "native"
-        ? [handoffAnswer("approve"), executionAnswer(combo.recommendation)]
-        : [executionAnswer(combo.recommendation)];
-    const b = await boot({
-      hasUI: true,
-      plannotator: combo.presenter === "plannotator",
-      executionMode: combo.recommendation,
-      customAnswers: answers,
-    });
-    try {
-      await freshPrompt(b.pi, b.ctx);
-      await switchToPlan(b.pi, b.ctx);
-      const plan = placePlan(b.cwd, `mx-${combo.presenter}-${combo.recommendation}.md`);
-      await writeResult(b.pi, b.ctx, plan.rel);
-      await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
-
-      // Stage 1 uses the configured presenter and nothing executes from it.
-      if (combo.presenter === "plannotator") {
-        assert.equal(
-          b.plannotatorRequests.length,
-          1,
-          `${combo.presenter}: the browser owns stage 1`,
-        );
-        assert.equal(b.customs.length, 0, "no native modal before the browser");
-        b.pi.events.emit("plannotator:review-result", {
-          reviewId: "review-1",
-          approved: true,
-        });
-      }
-      await waitFor(() => approvedDecisionId(b) !== undefined);
-      const approved = b.pi.entries.find(
-        (e: any) => e.type === "workflow-handoff-approved",
-      ) as any;
-      assert.ok(approved, `${combo.presenter}: stage 1 recorded an approval`);
-      // Chronology, which a synchronous fake cannot fake away: the approval is
-      // journaled BEFORE any route/preparation entry, and it never moves after.
-      const orderNow = b.pi.entries.map((e: any) => e.type);
-      assert.ok(orderNow.includes("workflow-handoff-approved"));
-      const routedNow = orderNow.findIndex((t: string) =>
-        t === "workflow-handoff-route" || t === "workflow-orchestrator-preparation",
-      );
-      if (routedNow >= 0) {
-        assert.ok(
-          orderNow.indexOf("workflow-handoff-approved") < routedNow,
-          "approval is recorded before the execution route",
-        );
-      }
-
-      // Stage 2 is the recommendation's destination, chosen explicitly.
-      await waitFor(() => sentIncludes(b, "Execute the plan") || b.pi.entries.some(
-        (e: any) => e.type === "workflow-orchestrator-preparation",
-      ));
-      if (combo.recommendation === "build") {
-        assert.equal(sentIncludes(b, "Execute the plan"), true, "direct Build ran");
-        assert.equal(
-          b.pi.entries.some((e: any) => e.type === "workflow-orchestrator-preparation"),
-          false,
-          "no orchestration run on the Build route",
-        );
-      } else {
-        assert.equal(sentIncludes(b, "Execute the plan"), false, "no Build turn");
-        assert.ok(
-          b.pi.entries.some((e: any) => e.type === "workflow-orchestrator-preparation"),
-          "Orchestrator preparation started",
-        );
-      }
-      // The saved recommendation is never rewritten by the chooser.
-      const settings = JSON.parse(
-        fs.readFileSync(path.join(b.cwd, ".pi", "settings.json"), "utf8"),
-      );
-      assert.equal(
-        settings.workflow.handoff.executionMode,
-        combo.recommendation,
-        "settings untouched by the per-plan choice",
-      );
-    } finally {
-      await b.cleanup();
-    }
-  }
-});
-
-// ── Two-stage handoff: approval, then a SEPARATE execution choice ────
-
-/** The decision id recorded by the most recent stage-1 approval. */
 function approvedDecisionId(b: { pi: { entries: any[] } }): string | undefined {
   const approved = [...b.pi.entries]
     .reverse()
@@ -4093,6 +3822,55 @@ function approvedDecisionId(b: { pi: { entries: any[] } }): string | undefined {
   return approved?.data?.decisionId;
 }
 
+test("MX: every presenter asks the plan first, then asks execution", async () => {
+  for (const presenter of ["native", "plannotator"] as const) {
+    const answers: unknown[] =
+      presenter === "native"
+        ? [handoffAnswer("approve"), executionAnswer("build")]
+        : [executionAnswer("build")];
+    const b = await boot({
+      hasUI: true,
+      plannotator: presenter === "plannotator",
+      customAnswers: answers,
+    });
+    try {
+      await freshPrompt(b.pi, b.ctx);
+      await switchToPlan(b.pi, b.ctx);
+      const plan = placePlan(b.cwd, `mx-${presenter}.md`);
+      await writeResult(b.pi, b.ctx, plan.rel);
+      await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+      if (presenter === "plannotator") {
+        assert.equal(b.plannotatorRequests.length, 1, "the browser owns stage 1");
+        assert.equal(b.customs.length, 0, "no native modal before the browser");
+        b.pi.events.emit("plannotator:review-result", {
+          reviewId: "review-1",
+          approved: true,
+        });
+      }
+      await waitFor(() => approvedDecisionId(b) !== undefined);
+      const orderNow = b.pi.entries.map((e: any) => e.type);
+      const routedNow = orderNow.findIndex(
+        (t: string) => t === "workflow-handoff-route",
+      );
+      if (routedNow >= 0) {
+        assert.ok(
+          orderNow.indexOf("workflow-handoff-approved") < routedNow,
+          "approval is recorded before the execution route",
+        );
+      }
+      await waitFor(() => sentIncludes(b, "Execute the plan"));
+      assert.equal(sentIncludes(b, "Execute the plan"), true, "direct Build ran");
+      assert.equal(
+        b.pi.entries.some((e: any) => e.type === "workflow-orchestrator-preparation"),
+        false,
+        "no preparation entry exists",
+      );
+    } finally {
+      await b.cleanup();
+    }
+  }
+});
 test("TS1: an approved plan waits in Plan until execution is chosen", async () => {
   const answers: unknown[] = [handoffAnswer("approve"), executionAnswer("later")];
   const b = await boot({ hasUI: true, customAnswers: answers });
@@ -4286,11 +4064,10 @@ test("TS4: a plan changed after approval is refused at execution time", async ()
 
 // ── Real-entrypoint orchestration integration (plan step 24) ─────────
 
-test("RE1: a real approved plan binds a durable run and prepares once, without a child", async () => {
+test("RE1: a real approved plan freezes the run and starts without a preparation turn", async () => {
   const b = await boot({
     hasUI: true,
-    executionMode: "unset",
-    customAnswer: handoffAnswer("approve"),
+    customAnswers: [handoffAnswer("approve"), executionAnswer("orchestrator")],
   });
   try {
     await freshPrompt(b.pi, b.ctx);
@@ -4299,7 +4076,6 @@ test("RE1: a real approved plan binds a durable run and prepares once, without a
     await writeResult(b.pi, b.ctx, plan.rel);
     await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
 
-    // A real journal is on disk (real Node adapters, not a fake).
     const runsRoot = path.join(b.agentDir, "orchestrator", "runs");
     assert.ok(fs.existsSync(runsRoot), "the run directory exists");
     const runDirs = fs.readdirSync(runsRoot).filter((entry) => entry.startsWith("run-"));
@@ -4309,9 +4085,9 @@ test("RE1: a real approved plan binds a durable run and prepares once, without a
       "utf8",
     );
     assert.match(journal, /"type":"run.created"/);
-    assert.match(journal, /"type":"run.preparation"/);
+    assert.match(journal, /"type":"todos.frozen"/);
+    assert.doesNotMatch(journal, /"type":"plan.proposed"/);
 
-    // Exactly one bounded preparation turn, and no direct-Build prompt.
     const sentText = (entry: any) =>
       String(
         (entry.content && typeof entry.content === "object"
@@ -4321,38 +4097,24 @@ test("RE1: a real approved plan binds a durable run and prepares once, without a
     const preparationTurns = b.pi.sent.filter((entry: any) =>
       sentText(entry).includes("Orchestrator preparation"),
     );
-    assert.equal(preparationTurns.length, 1, "one preparation turn");
+    assert.equal(preparationTurns.length, 0, "no separate preparation turn");
     assert.equal(
       b.pi.sent.some((entry: any) => sentText(entry).includes("Execute the plan")),
       false,
       "the direct-Build prompt is never sent",
     );
 
-    // The registered parent tools observe the bound run and refuse dispatch
-    // honestly, because this build has no child host bound.
     const status = await b.pi.tools.orchestrator_status.execute("re1-status", {});
     assert.match(JSON.stringify(status), /"runId":"run-/);
-    assert.match(JSON.stringify(status), /draft · 0\/0 accepted/);
-    const dispatch = await b.pi.tools.orchestrator_dispatch.execute("re1-dispatch", {
-      taskId: "task-1",
-      attemptId: "attempt-1",
-    });
-    assert.match(JSON.stringify(dispatch), /no child host|no approved roadmap|not dispatchable|unknown task/);
-    assert.equal(
-      b.pi.sent.some((entry: any) => sentText(entry).includes("Dispatched ")),
-      false,
-      "no dispatch receipt was fabricated",
-    );
+    assert.match(JSON.stringify(status), /accepted/);
   } finally {
     await b.cleanup();
   }
 });
-
 test("RE2: the explicit direct-Build destination sends exactly one execution prompt and creates no run", async () => {
   const b = await boot({
     hasUI: true,
-    executionMode: "build",
-    customAnswer: handoffAnswer("approve"),
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
   });
   try {
     await freshPrompt(b.pi, b.ctx);

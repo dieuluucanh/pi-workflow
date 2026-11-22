@@ -44,22 +44,31 @@ import {
   type ReportContext,
 } from "./orchestrator-candidate.ts";
 import type { WorkerRuntime } from "./orchestrator-worker-runtime.ts";
-import {
-  applyWorkerDoneTags,
-  buildWorkerTodos,
-  completeWorkerTodo,
-  detectOutOfScopeChanges,
-  syncWorkerTodos,
-  type OutOfScopeResult,
-  type RoadmapReference,
-  type WorkerAssignmentScope,
-  type WorkerInteraction,
-  type WorkerTodoEffects,
-  type WorkerTodoList,
-  type WorkerTodoResult,
-} from "./orchestrator-worker-todos.ts";
-import { childPushPolicy, suppressChildCommit } from "./orchestrator-commits.ts";
 import type { BranchEntryLike } from "./managed-session.ts";
+
+/** The read-only roadmap reference a child may cite, never edit. */
+export interface RoadmapReference {
+  path: string;
+  digest: string;
+  revision: number;
+}
+
+/** The task-local contract the parent writes before launch. */
+export interface WorkerAssignmentScope {
+  taskId: string;
+  covers: string[];
+  objective: string;
+  acceptanceChecks: string[];
+  expectedFiles: string[];
+  mutationScope?: string[];
+  roadmap: RoadmapReference;
+}
+
+export interface WorkerInteraction {
+  kind: string;
+  note?: string;
+  at: number;
+}
 
 /**
  * Conservative read-only classification. Anything not named here — including a
@@ -142,14 +151,6 @@ export interface WorkerSessionBinding {
   readonly assignment: WorkerAssignmentScope;
   /** Current candidate/fence state. */
   fence(): CandidateState;
-  /** The child's own list; undefined until initialized. */
-  todos(): WorkerTodoList | undefined;
-
-  initializeTodos(planText?: string | null): WorkerTodoResult<WorkerTodoList>;
-  syncTodos(planText?: string | null): WorkerTodoResult<WorkerTodoList>;
-  completeTodo(input: { ref?: number; text?: string; origin: "todo" | "done-tag" }): WorkerTodoResult<WorkerTodoList>;
-  applyDoneTags(message: string): WorkerTodoResult<{ list: WorkerTodoList; effects: WorkerTodoEffects }>;
-
   /** Tool admission: unknown tools are mutations. */
   admitTool(tool: string): FenceResult<CandidateState>;
   noteToolEnded(now?: number): void;
@@ -169,8 +170,7 @@ export interface WorkerSessionBinding {
   mutationBlockReason(tool: string): string | undefined;
   canMutate(tool: string): boolean;
 
-  scope(paths: readonly string[]): OutOfScopeResult;
-  interaction(kind: WorkerInteraction["kind"], note?: string): { recorded: WorkerInteraction; revalidate: true };
+  interaction(kind: string, note?: string): { recorded: WorkerInteraction; revalidate: true };
   /** A child may never become the parent scheduler. */
   refuseOrchestratorEntry(): string;
   /** Child commits/pushes stay suppressed regardless of mode. */
@@ -192,8 +192,6 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
   const now = input.now ?? (() => Date.now());
   const { runtime, assignment } = input;
   let fenceState = openCandidateFence();
-  let list: WorkerTodoList | undefined;
-  let initialPlanText: string | null | undefined = input.planText;
   let closed = false;
   const interactions: WorkerInteraction[] = [];
 
@@ -204,6 +202,16 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
     sessionId: runtime.gate.sessionKey(),
   });
 
+  /** Fence admission for a mutating tool; read-only tools always pass. */
+  const combinedBlockReason = (tool: string): string | undefined => {
+    if (closed) return "This worker session is closed; the parent must reopen the task.";
+    if (!isMutatingWorkerTool(tool)) return undefined;
+    if (!fenceAllowsMutation(fenceState)) {
+      return "The child is quiescent/fenced: mutation authority is revoked until the parent authorizes a repair.";
+    }
+    return undefined;
+  };
+
   const fenceBlocked = (): string | undefined => {
     if (closed) return "This worker session is closed; the parent must reopen the task.";
     if (!fenceAllowsMutation(fenceState)) {
@@ -212,74 +220,11 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
     return undefined;
   };
 
-  /** Combined managed-gate + fence admission. */
-  const combinedBlockReason = (tool: string): string | undefined => {
-    if (closed) return "This worker session is closed; the parent must reopen the task.";
-    // Read-only inspection stays available before readiness and while fenced:
-    // that is how a child reads its assignment and how a repair is diagnosed.
-    if (!isMutatingWorkerTool(tool)) return undefined;
-    const gateReason = runtime.gate.mutationBlockReason(tool);
-    if (gateReason) return gateReason;
-    return fenceBlocked();
-  };
-
   const binding: WorkerSessionBinding = {
     runtime,
     assignment,
 
     fence: () => fenceState,
-    todos: () => list,
-
-    initializeTodos(planText) {
-      if (planText !== undefined) initialPlanText = planText;
-      const built = buildWorkerTodos({
-        assignment,
-        planText: initialPlanText ?? null,
-        now: now(),
-      });
-      if (!built.ok) return built;
-      list = built.value;
-      return { ok: true, value: list };
-    },
-
-    syncTodos(planText) {
-      if (!list) return binding.initializeTodos(planText);
-      const synced = syncWorkerTodos({
-        list,
-        assignment,
-        ...(planText === undefined ? {} : { planText }),
-        now: now(),
-      });
-      if (!synced.ok) return synced;
-      list = synced.value.list;
-      return { ok: true, value: list };
-    },
-
-    completeTodo(entry) {
-      if (!list) {
-        return { ok: false, code: "invalid", error: "the task-local list is not initialized" };
-      }
-      const done = completeWorkerTodo({
-        list,
-        ...(entry.ref === undefined ? {} : { ref: entry.ref }),
-        ...(entry.text === undefined ? {} : { text: entry.text }),
-        origin: entry.origin,
-        now: now(),
-      });
-      if (!done.ok) return done;
-      list = done.value.list;
-      return { ok: true, value: list };
-    },
-
-    applyDoneTags(message) {
-      if (!list) {
-        return { ok: false, code: "invalid", error: "the task-local list is not initialized" };
-      }
-      const tagged = applyWorkerDoneTags({ list, message, now: now() });
-      if (!tagged.ok) return tagged;
-      list = tagged.value.list;
-      return { ok: true, value: { list: tagged.value.list, effects: tagged.value.effects } };
-    },
 
     admitTool(tool) {
       const blocked = combinedBlockReason(tool);
@@ -371,15 +316,12 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
     mutationBlockReason: combinedBlockReason,
     canMutate: (tool) => combinedBlockReason(tool) === undefined,
 
-    scope(paths) {
-      return detectOutOfScopeChanges({ assignment, changedPaths: paths });
-    },
-
     interaction(kind, note) {
       const bounded = note === undefined ? undefined : maxReportText(note, 500);
       const interaction: WorkerInteraction = {
         kind,
         ...(bounded ? { note: bounded } : {}),
+        at: now(),
       };
       interactions.push(interaction);
       return { recorded: interaction, revalidate: true };
@@ -391,11 +333,10 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
 
     commitSurface(tool) {
       const normalized = tool.toLowerCase();
-      if (normalized.includes("commit") || normalized.includes("push") || normalized === "bash") {
-        const policy = childPushPolicy();
+      if (normalized.includes("commit") || normalized.includes("push")) {
         return {
           allowed: false,
-          reason: `Managed children never commit or push (${policy.reason}). The parent commits accepted work.`,
+          reason: "Managed children never commit or push; the parent owns git history.",
         };
       }
       return { allowed: true };
@@ -409,13 +350,11 @@ export function createWorkerSessionBinding(input: WorkerSessionInput): WorkerSes
       const result = binding.report(record.report);
       if (!result.ok) return { ok: false, text: result.error };
       const candidate = result.value.candidate;
-      const suppressed = suppressChildCommit({ source: "report", managed: true });
-      const suppressionNote = suppressed.suppressed ? ` (${suppressed.reason})` : "";
       return {
         ok: true,
         candidateStored: !!candidate,
         text: candidate
-          ? `Report ${candidate.reportId} stored for parent verification. Phase: ${result.value.phase}. This is not acceptance, and no commit was triggered${suppressionNote}.`
+          ? `Report ${candidate.reportId} stored for parent verification. Phase: ${result.value.phase}. This is not acceptance, and no commit was triggered.`
           : `Report stored, waiting for the tool batch to drain. Phase: ${result.value.phase}.`,
       };
     },

@@ -88,7 +88,7 @@ test("a duplicate event id is idempotent; a stale sequence is refused", async ()
   const again = await h.value.append({ ...event("e1", "run.created"), expectedSeq: 0 });
   assert.equal(again.ok, true);
   assert.equal((again as { ok: true; value: { duplicate: boolean } }).value.duplicate, true);
-  const stale = await h.value.append({ ...event("e2", "plan.approved"), expectedSeq: 0 });
+  const stale = await h.value.append({ ...event("e2", "run.transition"), expectedSeq: 0 });
   assert.equal(stale.ok, false);
   assert.equal((stale as { code: string }).code, "stale");
   assert.equal(((await h.value.load()) as { ok: true; value: any }).value.seq, 1);
@@ -147,26 +147,6 @@ test("unknown versions fail closed; a corrupt snapshot is recoverable", async ()
   assert.equal((await h.value.load()).ok, true);
 });
 
-test("start intent and acknowledgement are separate; ack alone is inconsistent", async () => {
-  const h = journal();
-  await h.value.append(event("e1", "task.start.intent", { taskId: "task-1", attemptId: "a-1" }));
-  let state = (await h.value.load()) as { ok: true; value: any };
-  assert.equal(state.value.kickoff["task-1"].status, "uncertain");
-
-  await h.value.append(event("e2", "task.start.ack", { taskId: "task-1", attemptId: "a-1" }));
-  state = (await h.value.load()) as { ok: true; value: any };
-  assert.equal(state.value.kickoff["task-1"].status, "acknowledged");
-
-  await h.value.append(event("e3", "task.start.ack", { taskId: "task-2", attemptId: "a-2" }));
-  state = (await h.value.load()) as { ok: true; value: any };
-  assert.equal(state.value.kickoff["task-2"].status, "inconsistent");
-
-  // An accepted event without evidence does not grant acceptance.
-  await h.value.append(event("e4", "task.accepted", { taskId: "task-3" }));
-  state = (await h.value.load()) as { ok: true; value: any };
-  assert.equal(state.value.acceptedTaskIds.has("task-3"), false);
-});
-
 test("artifacts are content-addressed and bounded; refs are branch-local", async () => {
   const h = journal();
   const one = await h.value.putArtifact({ name: "packet", content: "hello" });
@@ -181,8 +161,4 @@ test("artifacts are content-addressed and bounded; refs are branch-local", async
   const huge = await h.value.putArtifact({ name: "big", content: "x".repeat(MAX_ARTIFACT_BYTES + 1) });
   assert.equal((huge as { code: string }).code, "too_large");
 
-  await h.value.append(event("e1", "session.ref", { branchId: "b1", sessionRef: "s-1" }));
-  await h.value.append(event("e2", "session.ref", { branchId: "b2", sessionRef: "s-2" }));
-  const b1 = (await h.value.sessionRefs("b1")) as { ok: true; value: any[] };
-  assert.deepEqual(b1.value.map((entry) => entry.sessionRef), ["s-1"]);
 });

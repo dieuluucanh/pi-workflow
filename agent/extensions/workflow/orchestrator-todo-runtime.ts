@@ -1,19 +1,16 @@
 /**
- * Workflow Extension — TODO ownership (integration step 21).
+ * Workflow Extension — TODO ownership for orchestration.
  *
- * Three lists must never overwrite each other:
+ * The session `TodoStore` is the single list authority. An Orchestrator run
+ * installs its frozen snapshot there, so this module is only the read-only
+ * projection and mutation guard used by `workflow_todo`:
  *
- *   - an ordinary session's Plan/Build todos (unchanged behaviour);
- *   - the PARENT roadmap projection (derived from accepted task coverage);
- *   - a managed child's task-local todos (`orchestrator-worker-todos.ts`).
- *
- * The parent projection is read-only with respect to the roadmap: a checkbox,
- * `[DONE:n]` tag or child completion can display progress but cannot accept a
- * task or schedule the next one. That is what makes "completion is derived from
- * acceptance" true instead of aspirational.
+ *   - a parent/Orchestrator list is a projection of frozen rows + task state;
+ *   - a checkbox or `[DONE:n]` tag is a claim, never acceptance;
+ *   - only `orchestrator_verify` + `orchestrator_accept` move a row.
  */
 
-import { projectTodos, type RunState } from "./orchestrator-state.ts";
+import { rowForTask, taskCounts, type RunState } from "./orchestrator-state.ts";
 
 export const TODO_OWNER_SCHEMA_VERSION = 1 as const;
 
@@ -25,7 +22,7 @@ export interface OwnedTodo {
   text: string;
   status: "pending" | "in_progress" | "completed" | "cancelled";
   taskId?: string;
-  /** Only an accepted task's coverage is `completed` in the parent list. */
+  /** True only for an accepted frozen row. */
   acceptedCoverage: boolean;
 }
 
@@ -33,37 +30,45 @@ export interface ParentTodoProjection {
   owner: "parent";
   runId: string;
   items: OwnedTodo[];
-  /** True only when every requirement is covered by an accepted task. */
+  /** True only when every frozen row is accepted. */
   complete: boolean;
   counts: { accepted: number; pending: number; blocked: number; cancelled: number };
 }
 
-/** The parent roadmap projection. Display-only; never a scheduler input. */
+/** The parent projection. Display-only; never a scheduler input. */
 export function parentRoadmapTodos(state: RunState): ParentTodoProjection {
-  const projected = projectTodos(state);
-  const items: OwnedTodo[] = projected.map((entry) => {
-    const task = state.tasks[entry.taskId];
+  const items: OwnedTodo[] = state.order.map((taskId, index) => {
+    const task = state.tasks[taskId];
+    const row = rowForTask(state, taskId);
+    const status: OwnedTodo["status"] =
+      task?.state === "accepted"
+        ? "completed"
+        : task?.state === "blocked"
+          ? "pending"
+          : task?.state === "pending"
+            ? "pending"
+            : "in_progress";
     return {
-      ref: entry.ref,
-      text: entry.text,
-      status: entry.status,
-      taskId: entry.taskId,
+      ref: index + 1,
+      text: row?.text ?? "",
+      status,
+      taskId,
       acceptedCoverage: task?.state === "accepted",
     };
   });
-  const counts = { accepted: 0, pending: 0, blocked: 0, cancelled: 0 };
-  for (const taskId of state.order) {
-    const task = state.tasks[taskId];
-    if (!task) continue;
-    if (task.state === "accepted") counts.accepted += 1;
-    else if (task.state === "blocked") counts.blocked += 1;
-    else if (task.state === "cancelled" || task.state === "superseded") counts.cancelled += 1;
-    else counts.pending += 1;
-  }
-  const complete =
-    state.order.length > 0 &&
-    state.order.every((taskId) => state.tasks[taskId]?.state === "accepted");
-  return { owner: "parent", runId: state.runId, items, complete, counts };
+  const counts = taskCounts(state);
+  return {
+    owner: "parent",
+    runId: state.runId,
+    items,
+    complete: state.order.length > 0 && counts.accepted === state.order.length,
+    counts: {
+      accepted: counts.accepted,
+      pending: counts.pending + counts.running,
+      blocked: counts.blocked,
+      cancelled: 0,
+    },
+  };
 }
 
 export interface TodoMutationDecision {
@@ -73,51 +78,22 @@ export interface TodoMutationDecision {
 }
 
 /**
- * Who may mutate which list. A worker/ordinary list update can never move the
- * parent roadmap, and a parent checkbox change is display-only.
+ * Who may mutate which list. A parent/Orchestrator list is read-only: the run
+ * owns acceptance, and status edits would silently diverge from the journal.
  */
 export function todoMutationDecision(
   owner: TodoOwner,
   action: "list" | "update" | "done" | "pending" | "add" | "toggle" | "sync" | "clear",
 ): TodoMutationDecision {
-  if (owner === "parent" && action !== "list") {
-    return {
-      allowed: false,
-      owner,
-      reason:
-        "The parent roadmap list is a projection of accepted coverage; use acceptance/repair decisions instead of editing it.",
-    };
+  if (owner === "parent") {
+    return action === "list"
+      ? { allowed: true, owner }
+      : {
+          allowed: false,
+          owner,
+          reason:
+            "The Orchestrator list is frozen; use orchestrator_verify and orchestrator_accept to move a row.",
+        };
   }
   return { allowed: true, owner };
-}
-
-/** A child or ordinary completion can never be routed into parent acceptance. */
-export function todoEffectsTarget(owner: TodoOwner): {
-  parentRoadmap: false;
-  commit: false;
-  parentTodos: false;
-} {
-  void owner;
-  return { parentRoadmap: false, commit: false, parentTodos: false };
-}
-
-/**
- * Reconciles `- [x]` checkboxes from a plan file into the PARENT view without
- * accepting anything: it returns the claimed-complete refs for display, and an
- * empty acceptance list. (Roadmap ingestion already records claimed state.)
- */
-export function reconcileCheckboxClaims(input: {
-  state: RunState;
-  completedRefs: readonly number[];
-}): { displayOnly: true; acceptedTaskIds: string[]; claimedRefs: number[] } {
-  const ids = new Set(input.state.order);
-  const claimedRefs = [...new Set(input.completedRefs)].filter(
-    (ref) => Number.isInteger(ref) && ref >= 1 && ref <= input.state.order.length,
-  );
-  for (const ref of claimedRefs) {
-    const taskId = input.state.order[ref - 1];
-    if (taskId) ids.add(taskId);
-  }
-  // A checkbox is a claim: it never becomes acceptance.
-  return { displayOnly: true, acceptedTaskIds: [], claimedRefs };
 }

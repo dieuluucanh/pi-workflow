@@ -58,17 +58,10 @@ export function makeId(kind: string, suffix: string): string {
 // ── Run phases ───────────────────────────────────────────────────────
 
 export const RUN_PHASES = [
-  "draft",
-  "awaiting_approval",
   "ready",
-  "dispatching",
-  "building",
-  "verifying",
-  "waiting_user",
+  "running",
   "paused",
   "blocked",
-  "interrupted",
-  "final_verification",
   "completed",
   "failed",
   "cancelled",
@@ -82,19 +75,10 @@ export type RunPhase = (typeof RUN_PHASES)[number];
  * only from `final_verification`.
  */
 export const RUN_TRANSITIONS: Readonly<Record<RunPhase, readonly RunPhase[]>> = {
-  draft: ["awaiting_approval", "cancelled"],
-  awaiting_approval: ["ready", "cancelled"],
-  ready: ["dispatching", "final_verification", "paused", "blocked", "cancelled", "failed"],
-  dispatching: ["building", "ready", "interrupted", "paused", "failed"],
-  building: ["verifying", "interrupted", "paused", "blocked", "failed"],
-  verifying: ["ready", "building", "waiting_user", "blocked", "failed", "paused"],
-  waiting_user: ["building", "verifying", "ready", "paused", "cancelled"],
-  paused: ["ready", "building", "cancelled", "failed"],
-  blocked: ["ready", "paused", "cancelled", "failed"],
-  interrupted: ["ready", "paused", "cancelled", "failed"],
-  // A final integration failure returns to repair (`ready` re-proposes a
-  // scoped task), never straight to `completed`.
-  final_verification: ["completed", "ready", "failed"],
+  ready: ["running", "paused", "blocked", "completed", "cancelled", "failed"],
+  running: ["ready", "paused", "blocked", "completed", "cancelled", "failed"],
+  paused: ["ready", "running", "cancelled", "failed"],
+  blocked: ["ready", "running", "paused", "cancelled", "failed"],
   completed: [],
   failed: [],
   cancelled: [],
@@ -118,15 +102,11 @@ export function canTransitionRun(from: RunPhase, to: RunPhase): boolean {
 
 export const TASK_STATES = [
   "pending",
-  "assigned",
   "running",
   "candidate",
-  "verifying",
   "needs_fix",
   "accepted",
   "blocked",
-  "cancelled",
-  "superseded",
 ] as const;
 
 export type TaskState = (typeof TASK_STATES)[number];
@@ -143,33 +123,20 @@ export type TaskState = (typeof TASK_STATES)[number];
  *    pretending the worker ran.
  */
 export const TASK_TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
-  pending: ["assigned", "cancelled", "superseded"],
-  assigned: ["running", "pending", "cancelled", "superseded"],
-  running: ["candidate", "blocked", "cancelled", "superseded"],
-  candidate: ["verifying", "cancelled", "superseded"],
-  verifying: ["accepted", "needs_fix", "blocked", "cancelled"],
-  needs_fix: ["running", "assigned", "blocked", "cancelled", "superseded"],
-  accepted: ["superseded"],
-  blocked: ["assigned", "cancelled", "superseded"],
-  cancelled: [],
-  superseded: [],
+  pending: ["running", "blocked"],
+  running: ["candidate", "needs_fix", "blocked"],
+  candidate: ["accepted", "needs_fix", "blocked"],
+  needs_fix: ["running", "blocked"],
+  accepted: [],
+  blocked: ["pending", "running"],
 };
 
-export const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set([
-  "cancelled",
-  "superseded",
-]);
+export const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set(["accepted"]);
 
 /**
- * States in which a task needs no further default action. `accepted` is settled
- * but not terminal: an APPROVED scope revision may supersede it, and that is
- * the only transition out of it.
+ * States in which a row needs no further default action.
  */
-export const SETTLED_TASK_STATES: ReadonlySet<TaskState> = new Set([
-  "accepted",
-  "cancelled",
-  "superseded",
-]);
+export const SETTLED_TASK_STATES: ReadonlySet<TaskState> = new Set(["accepted"]);
 
 export function isTaskState(value: unknown): value is TaskState {
   return typeof value === "string" && (TASK_STATES as readonly string[]).includes(value);

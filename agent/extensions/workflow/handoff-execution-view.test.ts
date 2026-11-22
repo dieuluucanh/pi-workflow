@@ -32,7 +32,6 @@ test("the question names the plan, the decision id and that nothing ran", () => 
   const question = buildExecutionQuestion({
     planPath: ".pi/plans/2026-11-22-x.md",
     decisionId: "handoff-1234abcd",
-    recommended: "orchestrator",
   });
   assert.equal(question.header, EXECUTION_QUESTION_HEADER);
   assert.match(question.question, /Plan approved/);
@@ -43,19 +42,12 @@ test("the question names the plan, the decision id and that nothing ran", () => 
   assert.ok(context.includes("Nothing has run yet"));
 });
 
-test("the recommendation is the first row and is marked recommended", () => {
-  const recommended = buildExecutionQuestion({
-    planPath: "p",
-    decisionId: "d",
-    recommended: "build",
-  });
-  assert.equal(recommended.options[0]?.label, EXECUTION_BUILD_LABEL);
-  assert.match(String(recommended.options[0]?.description), /recommended/);
-  assert.equal(recommended.options[1]?.label, EXECUTION_ORCHESTRATOR_LABEL);
-  assert.equal(recommended.options[2]?.label, EXECUTION_LATER_LABEL);
-
-  const fallback = buildExecutionQuestion({ planPath: "p", decisionId: "d" });
-  assert.equal(fallback.options[0]?.label, EXECUTION_ORCHESTRATOR_LABEL);
+test("both destinations are first-class and neither is marked recommended", () => {
+  const question = buildExecutionQuestion({ planPath: "p", decisionId: "d" });
+  assert.equal(question.options[0]?.label, EXECUTION_BUILD_LABEL);
+  assert.equal(question.options[1]?.label, EXECUTION_ORCHESTRATOR_LABEL);
+  assert.equal(question.options[2]?.label, EXECUTION_LATER_LABEL);
+  assert.doesNotMatch(JSON.stringify(question.options), /recommended/i);
   assert.equal(executionLabel("orchestrator"), EXECUTION_ORCHESTRATOR_LABEL);
   assert.equal(executionLabel("build"), EXECUTION_BUILD_LABEL);
 });
@@ -86,18 +78,18 @@ test("cancel, later, freeform, unknown and malformed DEFER (never Build)", () =>
   assert.deepEqual(executionChoiceFromResult({} as never), defer);
 });
 
-test("the recommendation never influences parsing", () => {
-  // The same answer resolves the same destination regardless of context; the
-  // recommendation is a UI hint seeded by the caller.
+test("the chooser never preselects a destination", () => {
+  // The same answer resolves the same destination regardless of context; there
+  // is no saved recommendation to seed it.
   assert.deepEqual(executionChoiceFromResult(answer(EXECUTION_ORCHESTRATOR_LABEL)), {
     choice: "execute",
     destination: "orchestrator",
   });
 });
 
-test("descriptions distinguish preparation from immediate execution", () => {
-  assert.match(describeExecutionChoice("orchestrator"), /breakdown/);
-  assert.match(describeExecutionChoice("orchestrator"), /before any Build child/);
+test("descriptions distinguish in-session Build from delegated Orchestrator", () => {
+  assert.match(describeExecutionChoice("orchestrator"), /TODO row per step/);
+  assert.match(describeExecutionChoice("orchestrator"), /delegate/);
   assert.match(describeExecutionChoice("build"), /Build mode/);
-  assert.match(describeExecutionChoice("build"), /now/);
+  assert.match(describeExecutionChoice("build"), /implement/);
 });

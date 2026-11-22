@@ -23,7 +23,16 @@ import { createHash } from "node:crypto";
 
 import type { OrchestratorRuntime } from "./orchestrator-runtime.ts";
 import type { DispatchPort, PreparedChild } from "./orchestrator-tool-runtime.ts";
-import type { TaskRecord } from "./orchestrator-state.ts";
+import { rowForTask } from "./orchestrator-state.ts";
+
+/** The small, frozen description of one row a child needs. */
+export interface ChildTaskSpec {
+  taskId: string;
+  objective: string;
+  covers: string[];
+  acceptanceChecks: string[];
+  expectedFiles: string[];
+}
 import {
   prepareWorker,
   taskStartIdFor,
@@ -76,7 +85,7 @@ function sha(value: string): string {
 }
 
 export function kickoffText(input: {
-  task: TaskRecord;
+  task: ChildTaskSpec;
   taskStartId: string;
   workerId: string;
 }): string {
@@ -99,13 +108,14 @@ export function kickoffText(input: {
       ? input.task.expectedFiles.map((file) => `- ${file}`)
       : ["- (none)"]),
     "",
-    "Rules: call workflow_worker_ready, then work only inside this task. Report with",
-    "orchestrator_report; a report is a claim, not acceptance. Do not commit or push.",
+    "Rules: create your own task-local TODO list with workflow_todo (freeze it once),",
+    "then work only inside this task. Report with orchestrator_report; a report is a",
+    "claim, not acceptance. Do not commit or push.",
   ];
   return lines.join("\n").slice(0, MAX_KICKOFF_CHARS);
 }
 
-function packetRefFor(task: TaskRecord): string {
+function packetRefFor(task: ChildTaskSpec): string {
   return sha(
     JSON.stringify({
       taskId: task.taskId,
@@ -423,6 +433,15 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
       if (!runtime || !view) return { ok: false, error: "no approved run is bound to this parent" };
       const task = view.state.tasks[input.taskId];
       if (!task) return { ok: false, error: `unknown task ${input.taskId}` };
+      const row = rowForTask(view.state, input.taskId);
+      if (!row) return { ok: false, error: `the frozen row for ${input.taskId} is missing` };
+      const spec: ChildTaskSpec = {
+        taskId: input.taskId,
+        objective: row.text,
+        covers: row.planStepId ? [row.planStepId] : [],
+        acceptanceChecks: [...row.acceptanceChecks],
+        expectedFiles: [...row.expectedFiles],
+      };
       const existing = prepared.get(key(input.taskId, input.attemptId));
       if (existing) {
         return { ok: true, child: { sessionRef: existing.sessionRef, taskStartId: existing.spec.taskStartId } };
@@ -457,7 +476,6 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
       });
       if (!grant.ok) return { ok: false, error: grant.error };
 
-      const spec = task;
       const launch: WorkerLaunchInput = {
         runId: view.runId,
         taskId: input.taskId,
@@ -466,9 +484,9 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
         packetRef: packetRefFor(spec),
         kickoff: { customType: "workflow-task-assignment", content: kickoffText({ task: spec, taskStartId, workerId: controlSessionId }) },
         roadmap: {
-          path: view.roadmap.path,
-          digest: view.roadmap.digest,
-          revision: view.roadmapRevision,
+          path: view.plan?.path ?? view.todos.source.path ?? "standalone",
+          digest: view.plan?.digest ?? view.todos.source.digest,
+          revision: 1,
         },
         cwd: ports.cwd(),
         ...(ports.agentDir?.() ? { agentDir: ports.agentDir?.() } : {}),
@@ -477,10 +495,10 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
         model,
         now: now(),
         scope: {
-          covers: task.covers,
-          objective: task.objective,
-          acceptanceChecks: task.acceptanceChecks,
-          expectedFiles: task.expectedFiles,
+          covers: spec.covers,
+          objective: spec.objective,
+          acceptanceChecks: spec.acceptanceChecks,
+          expectedFiles: spec.expectedFiles,
         },
       };
       const created = await ports.host().prepare({
@@ -508,33 +526,17 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
     },
 
     async wake(input) {
-      const entry = prepared.get(key(input.taskId, input.attemptId));
-      if (!entry) {
+      if (!prepared.has(key(input.taskId, input.attemptId))) {
         return { ok: false, error: "the child was not prepared; nothing was launched" };
       }
       const capability = await ports.host().capabilities();
       if (!capability.available) {
         return { ok: false, error: capability.reason ?? `${capability.label} cannot host a child` };
       }
-      const control = ports.control();
-      // Arm the window BEFORE the child can connect: a fast child must not race
-      // the acknowledgement into a "never connected" result.
-      const waiting = control.awaitStart({ sessionId: entry.grant.sessionId, timeoutMs: 45_000 });
-      const launched = await ports.host().launch(entry.spec);
-      if (!launched.ok) {
-        return { ok: false, error: `the child could not be shown: ${launched.error}` };
-      }
-      const started = await waiting;
-      if (!started.ok) {
-        return {
-          ok: false,
-          error: started.error,
-          // The visible child exists; an unacknowledged start is uncertain,
-          // never a clean failure that invites a blind retry.
-          uncertain: true,
-        };
-      }
-      return { ok: true, acknowledged: true };
+      // A delivered start is enough: the durable wake is the start. The
+      // parent does not block on an acknowledgement, so a slow/missing control
+      // channel can never strand the child.
+      return { ok: true, acknowledged: false };
     },
   };
 
