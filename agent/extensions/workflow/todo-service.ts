@@ -56,6 +56,13 @@ export interface TodoStoreSnapshot {
   owner: TodoListOwner;
   items: TodoItem[];
   planPath?: string;
+  /** Monotonic list revision; a stale expected revision is refused. */
+  revision?: number;
+  /** Plan bindings deliberately removed; passive reconciliation must not restore them. */
+  excludedPlanSteps?: string[];
+  planDigest?: string;
+  /** Idempotency key of the last applied reviewed recovery. */
+  recoveryReceiptId?: string;
   panel: {
     preference: TodoPanelPreference;
     preferenceScope: string | null;
@@ -71,6 +78,14 @@ export interface TodoStore {
   items: TodoItem[];
   /** Plan file the current list was derived from (drives merge vs replace). */
   planPath: string | undefined;
+  /** Monotonic list revision; bumped by every authoritative mutation. */
+  revision: number;
+  /** Plan bindings the user deliberately removed (durable exclusions). */
+  excludedPlanSteps: Set<string>;
+  /** Digest of the plan bytes last imported, when known. */
+  planDigest: string | undefined;
+  /** Last applied recovery receipt (idempotency). */
+  recoveryReceiptId: string | undefined;
 
   // Panel presentation. Kept beside the list because it is scoped to it.
   panelPreference: TodoPanelPreference;
@@ -80,8 +95,17 @@ export interface TodoStore {
 
   /** Replace the whole list (already-extracted steps are normalized). */
   replace(items: TodoItem[]): void;
-  /** Industry-style wholesale update: omitted items are removed. */
-  update(incoming: TodoUpdateEntry[]): ReturnType<typeof applyTodoUpdate>;
+  /**
+   * Industry-style wholesale update: omitted items are removed.
+   *
+   * A plan-linked list refuses a text-only bulk rewrite that would replace
+   * most plan rows with new agent rows (that is how the 23→46 duplication
+   * happened). `allowBulkReplace` is the explicit replacement intent.
+   */
+  update(
+    incoming: TodoUpdateEntry[],
+    options?: { allowBulkReplace?: boolean; expectedRevision?: number },
+  ): ReturnType<typeof applyTodoUpdate>;
   /** Mark `[DONE:ref]` tags from assistant text. */
   markDoneTags(text: string): ReturnType<typeof markCompletedRefs>;
   resolve(ref: string): TodoRefResolution;
@@ -99,13 +123,29 @@ export interface TodoStore {
     markdown: string;
     planPath: string;
     cwd: string;
-  }): { replaced: boolean; count: number; preserved: number; synthesized: boolean };
-
-  /** Merge freshly extracted steps from the SAME plan file. */
-  mergeExtracted(extracted: TodoItem[], planPath: string, cwd: string): {
+    /** Explicit sync may restore deliberately removed steps. */
+    restoreExcluded?: boolean;
+  }): {
     replaced: boolean;
     count: number;
     preserved: number;
+    synthesized: boolean;
+    excluded: number;
+    restored: number;
+  };
+
+  /** Merge freshly extracted steps from the SAME plan file. */
+  mergeExtracted(
+    extracted: TodoItem[],
+    planPath: string,
+    cwd: string,
+    options?: { restoreExcluded?: boolean },
+  ): {
+    replaced: boolean;
+    count: number;
+    preserved: number;
+    excluded: number;
+    restored: number;
   };
 
   doneCount(): number;
@@ -116,6 +156,11 @@ export interface TodoStore {
 
   snapshot(): TodoStoreSnapshot;
   restore(snapshot: Partial<TodoStoreSnapshot>): void;
+  /**
+   * Apply a reviewed recovery of a damaged list. Idempotent per receipt id;
+   * it is bookkeeping only and never proves completion or triggers commits.
+   */
+  recover(items: TodoItem[], receiptId: string): { applied: boolean };
 }
 
 export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
@@ -123,6 +168,10 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     owner,
     items: [],
     planPath: undefined,
+    revision: 0,
+    excludedPlanSteps: new Set<string>(),
+    planDigest: undefined,
+    recoveryReceiptId: undefined,
     panelPreference: "auto",
     panelScope: null,
     promptAfterSettle: false,
@@ -132,10 +181,60 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
       store.items = ensureTodoLabels(dedupeTodoItems(items));
     },
 
-    update(incoming) {
+    update(incoming, options) {
+      if (
+        options?.expectedRevision !== undefined &&
+        options.expectedRevision !== store.revision
+      ) {
+        return {
+          items: [...store.items],
+          added: 0,
+          removed: 0,
+          kept: 0,
+          normalized: 0,
+          warnings: [],
+          refused: `The list changed (revision ${store.revision}, expected ${options.expectedRevision}); re-read it and retry.`,
+          revision: store.revision,
+        };
+      }
+      const planRows = store.items.filter((item) => item.planStepId);
+      const identifiable = (incoming ?? []).filter(
+        (entry) =>
+          (entry.id !== undefined && String(entry.id).trim().length > 0) ||
+          (entry.ref !== undefined && String(entry.ref).trim().length > 0),
+      ).length;
+      // Ref-less wholesale rewording of a plan-linked list is the exact shape
+      // that created a second copy of every task. Refuse before mutating.
+      if (
+        options?.allowBulkReplace !== true &&
+        planRows.length >= 3 &&
+        identifiable < Math.ceil(planRows.length / 2)
+      ) {
+        return {
+          items: [...store.items],
+          added: 0,
+          removed: 0,
+          kept: 0,
+          normalized: 0,
+          warnings: [],
+          refused:
+            "This list is linked to a plan. Update existing items with their id/ref; a text-only wholesale rewrite could duplicate tasks. Pass intent:\"replace\" to replace the list deliberately.",
+          revision: store.revision,
+        };
+      }
+      const before = new Map(store.items.map((item) => [item.id, item]));
       const result = applyTodoUpdate(store.items, incoming);
+      const keptIds = new Set(result.items.map((item) => item.id));
+      let excludedAdded = 0;
+      for (const item of before.values()) {
+        if (!item?.planStepId || !item.id) continue;
+        if (keptIds.has(item.id)) continue;
+        store.excludedPlanSteps.add(item.planStepId);
+        excludedAdded += 1;
+      }
       store.items = result.items;
-      return result;
+      store.revision += 1;
+      return { ...result, revision: store.revision, excludedAdded };
     },
 
     markDoneTags(text) {
@@ -181,11 +280,17 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     clear() {
+      // An explicit clear is a deliberate membership decision: remember the
+      // plan bindings so passive reconciliation cannot resurrect them.
+      for (const item of store.items) {
+        if (item.planStepId) store.excludedPlanSteps.add(item.planStepId);
+      }
       store.items = [];
       store.planPath = undefined;
+      store.revision += 1;
     },
 
-    loadFromPlanMarkdown({ markdown, planPath, cwd }) {
+    loadFromPlanMarkdown({ markdown, planPath, cwd, restoreExcluded }) {
       let extracted = extractPlanStepsFromMarkdown(markdown);
       let synthesized = false;
       if (extracted.length === 0) {
@@ -196,24 +301,56 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         }
       }
       if (extracted.length === 0) {
-        return { replaced: false, count: store.items.length, preserved: 0, synthesized: false };
+        return {
+          replaced: false,
+          count: store.items.length,
+          preserved: 0,
+          synthesized: false,
+          excluded: 0,
+          restored: 0,
+        };
       }
-      const merged = store.mergeExtracted(extracted, planPath, cwd);
+      const merged = store.mergeExtracted(extracted, planPath, cwd, {
+        ...(restoreExcluded === undefined ? {} : { restoreExcluded }),
+      });
       return { ...merged, synthesized };
     },
 
-    mergeExtracted(extracted, planPath, cwd) {
+    mergeExtracted(extracted, planPath, cwd, options) {
       const samePlan =
         store.planPath !== undefined && samePlanPath(store.planPath, planPath, cwd);
       if (samePlan) {
-        const merged = mergeTodoItems(store.items, extracted);
+        const restoreExcluded = options?.restoreExcluded === true;
+        const merged = mergeTodoItems(store.items, extracted, {
+          excludedPlanStepIds: store.excludedPlanSteps,
+          ...(restoreExcluded ? { restoreExcluded: true } : {}),
+        });
+        // An explicit sync is the only operation that clears membership
+        // exclusions; passive reconciliation never does.
+        if (restoreExcluded) store.excludedPlanSteps.clear();
         store.items = merged.items;
         store.planPath = planPath;
-        return { replaced: false, count: store.items.length, preserved: merged.preserved };
+        store.revision += 1;
+        return {
+          replaced: false,
+          count: store.items.length,
+          preserved: merged.preserved,
+          excluded: merged.excluded,
+          restored: merged.restored,
+        };
       }
+      // A new plan lineage: exclusions belong to the previous plan.
+      store.excludedPlanSteps.clear();
       store.items = ensureTodoLabels(extracted);
       store.planPath = planPath;
-      return { replaced: true, count: store.items.length, preserved: 0 };
+      store.revision += 1;
+      return {
+        replaced: true,
+        count: store.items.length,
+        preserved: 0,
+        excluded: 0,
+        restored: 0,
+      };
     },
 
     doneCount() {
@@ -242,6 +379,12 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         owner: store.owner,
         items: store.items.map((item) => ({ ...item })),
         ...(store.planPath === undefined ? {} : { planPath: store.planPath }),
+        revision: store.revision,
+        excludedPlanSteps: [...store.excludedPlanSteps],
+        ...(store.planDigest === undefined ? {} : { planDigest: store.planDigest }),
+        ...(store.recoveryReceiptId === undefined
+          ? {}
+          : { recoveryReceiptId: store.recoveryReceiptId }),
         panel: {
           preference: store.panelPreference,
           preferenceScope: store.panelScope,
@@ -256,6 +399,20 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         store.items = ensureTodoLabels(snapshot.items);
       }
       if (snapshot.planPath !== undefined) store.planPath = snapshot.planPath;
+      if (typeof snapshot.revision === "number" && Number.isFinite(snapshot.revision)) {
+        store.revision = Math.max(store.revision, Math.floor(snapshot.revision));
+      }
+      if (Array.isArray(snapshot.excludedPlanSteps)) {
+        store.excludedPlanSteps = new Set(
+          snapshot.excludedPlanSteps.filter(
+            (entry): entry is string => typeof entry === "string" && entry.length > 0,
+          ),
+        );
+      }
+      if (typeof snapshot.planDigest === "string") store.planDigest = snapshot.planDigest;
+      if (typeof snapshot.recoveryReceiptId === "string") {
+        store.recoveryReceiptId = snapshot.recoveryReceiptId;
+      }
       const panel = snapshot.panel;
       if (panel) {
         // An entry written before a field existed must not erase the current
@@ -271,6 +428,15 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
           store.completedSignature = panel.completedSignature;
         }
       }
+    },
+
+    recover(items, receiptId) {
+      if (store.recoveryReceiptId === receiptId) return { applied: false };
+      // The reviewed list is authoritative; keep stable ids/bindings it carries.
+      store.items = ensureTodoLabels(dedupeTodoItems(items));
+      store.recoveryReceiptId = receiptId;
+      store.revision += 1;
+      return { applied: true };
     },
   };
   return store;

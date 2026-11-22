@@ -191,7 +191,19 @@ export interface TodoItem {
   completed: boolean;
   /** Industry-style status. Legacy items derive it from `completed`. */
   status?: TodoStatus;
-  /** Stable, globally-unique identity ref assigned at creation and never renumbered. */
+  /**
+   * Stable item identity, assigned once and preserved by updates/merges.
+   * Display `ref` is a canonical position and may change when rows reorder;
+   * `id` is what identifies the work item across rewording and reindexing.
+   */
+  id?: string;
+  /**
+   * Stable plan-step binding for plan-derived rows. Absent on genuine
+   * agent-added rows. Never derived from the current position or from a
+   * shortened rewrite of the text.
+   */
+  planStepId?: string;
+  /** Canonical position, recomputed as 1..N for display. Not durable identity. */
   ref?: string;
   /** Plan-faithful label, e.g. "1", "2.3". Legacy items derive it from step. */
   label?: string;
@@ -199,6 +211,41 @@ export interface TodoItem {
   group?: string;
   /** Where the item came from. */
   source?: "plan" | "agent" | "synthesized";
+}
+
+/** FNV-1a over normalized text: deterministic ids without persistence. */
+function stableHash(value: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function identityKey(parts: Array<string | undefined>): string {
+  return parts
+    .map((part) =>
+      String(part ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim(),
+    )
+    .join("|");
+}
+
+/** Stable identity for a row that predates ids (content-based, not positional). */
+export function todoItemId(item: Pick<TodoItem, "text" | "group" | "label">): string {
+  return `todo-${stableHash(identityKey([item.text, item.group, item.label]))}`;
+}
+
+/** Stable plan binding: label + group, falling back to the plan text. */
+export function planStepIdFor(
+  item: Pick<TodoItem, "text" | "group" | "label" | "planStepId">,
+): string {
+  if (item.planStepId) return item.planStepId;
+  const key = identityKey([item.group, item.label]);
+  return `plan-${stableHash(key || item.text)}`;
 }
 
 const TODO_STATUS_RANK: Record<TodoStatus, number> = {
@@ -300,14 +347,20 @@ export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
     // Preserve the original positional label for legacy rows without a label.
     const originalStep = Number.isFinite(it?.step) ? Number(it.step) : step;
     const status = itemStatus(it);
+    const label = it?.label || String(originalStep);
+    const source = it?.source ?? "plan";
+    const seeded = { ...it, label, group: it?.group };
     return {
-      ...it,
+      ...seeded,
       step,
-      label: it?.label || String(originalStep),
       ref: String(step),
       status,
       completed: status === "completed",
-      source: it?.source ?? "plan",
+      source,
+      id: it?.id || todoItemId(seeded),
+      ...(source === "plan"
+        ? { planStepId: it?.planStepId || planStepIdFor({ ...seeded, label }) }
+        : {}),
     };
   });
 }
@@ -325,6 +378,13 @@ export function dedupeTodoItems(items: TodoItem[]): TodoItem[] {
   return out;
 }
 
+export interface TodoMergeOptions {
+  /** Plan bindings deliberately removed; passive reconciliation must not restore them. */
+  excludedPlanStepIds?: ReadonlySet<string>;
+  /** Explicit sync may restore excluded plan steps. */
+  restoreExcluded?: boolean;
+}
+
 export interface TodoMergeResult {
   items: TodoItem[];
   added: number;
@@ -332,28 +392,36 @@ export interface TodoMergeResult {
   kept: number;
   /** Number of unmatched `source:"agent"` items preserved from the previous list. */
   preserved: number;
+  /** Plan bindings skipped because the user deliberately removed them. */
+  excluded: number;
+  /** Excluded bindings restored by an explicit sync. */
+  restored: number;
 }
 
 /**
  * Merge freshly extracted plan steps into the existing list while preserving
  * completion state for steps that are still present. Extracted order wins.
  *
- * Match order: exact `todoKey` (text+group) first, then — for existing
- * `source:"plan"` rows — the plan label (group-aware, collision-safe), so a
- * step whose wording the model rewrote in `workflow_todo update` still
- * reunites with its plan row instead of being duplicated. On a label match the
- * extracted text is authoritative and status merges by rank (a plan-file
+ * Match order: stable `planStepId` first, exact `todoKey` (text+group) next,
+ * then — for existing `source:"plan"` rows — the plan label (group-aware), so
+ * a legacy row still reunites instead of being duplicated. Excluded bindings
+ * stay removed unless the caller explicitly restores them. On a label match
+ * the extracted text is authoritative and status merges by rank (a plan-file
  * `- [x]` can mark an item done, nothing un-completes it). Unmatched
  * `source:"agent"` items are preserved.
  *
  * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
  * the returned list order, so displayed numbers always equal `todoRef`.
+ * `id`/`planStepId` are stable and never recomputed from position.
  */
 export function mergeTodoItems(
   existing: TodoItem[],
   extracted: TodoItem[],
+  options: TodoMergeOptions = {},
 ): TodoMergeResult {
   const prev = ensureTodoLabels(existing ?? []);
+  const excluded = new Set(options.excludedPlanStepIds ?? []);
+  const restoreExcluded = options.restoreExcluded === true;
   const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
   const normLabel = (s: string | undefined) =>
     String(s ?? "")
@@ -362,6 +430,7 @@ export function mergeTodoItems(
       .trim();
   const byLabel = new Map<string, TodoItem[]>();
   const byKey = new Map<string, TodoItem>();
+  const byPlanStep = new Map<string, TodoItem>();
   for (const p of prev) {
     const l = normLabel(p.label || String(p.step));
     if (l) {
@@ -371,10 +440,15 @@ export function mergeTodoItems(
     }
     const k = todoKey(p);
     if (k && !byKey.has(k)) byKey.set(k, p);
+    if (p.planStepId && !byPlanStep.has(p.planStepId)) {
+      byPlanStep.set(p.planStepId, p);
+    }
   }
   const used = new Set<TodoItem>();
   let added = 0;
   let kept = 0;
+  let excludedCount = 0;
+  let restored = 0;
   /**
    * Collision-safe plan-label match for a re-extracted step. Only existing
    * `source:"plan"` rows are eligible; when duplicate labels exist across
@@ -392,29 +466,56 @@ export function mergeTodoItems(
     const grouped = cands.filter((p) => normLabel(p.group) === ng);
     return grouped.length === 1 ? grouped[0] : undefined;
   };
-  const items = next.map((n) => {
+  const items: TodoItem[] = [];
+  for (const n of next) {
+    const planId =
+      n.planStepId || (n.source === "plan" ? planStepIdFor(n) : undefined);
+    // A deliberately removed plan step must stay removed unless this call is
+    // an explicit restore. Passive reconciliation must never resurrect it.
+    if (planId && excluded.has(planId)) {
+      if (!restoreExcluded) {
+        excludedCount++;
+        continue;
+      }
+      excluded.delete(planId);
+      restored++;
+    }
     const nKey = todoKey(n);
-    let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
+    let match: TodoItem | undefined = planId ? byPlanStep.get(planId) : undefined;
+    if ((!match || used.has(match)) && nKey) {
+      const byText = byKey.get(nKey);
+      if (byText && !used.has(byText)) match = byText;
+    }
+    if (!match || used.has(match)) match = matchByPlanLabel(n);
     if (match && used.has(match)) match = undefined;
-    if (!match) match = matchByPlanLabel(n);
-    if (match && !used.has(match)) {
+    if (match) {
       used.add(match);
       kept++;
       const item: TodoItem = {
         ...n,
+        id: match.id || n.id || todoItemId(n),
+        ...(planId || match.planStepId
+          ? { planStepId: planId || match.planStepId }
+          : {}),
         group: n.group ?? match.group,
+        label: n.label ?? match.label,
         source: n.source ?? match.source,
       };
       const status = mergeStatusByRank(itemStatus(match), itemStatus(item));
       setTodoStatus(item, status);
-      return item;
+      items.push(item);
+    } else {
+      added++;
+      const item: TodoItem = {
+        ...n,
+        id: n.id || todoItemId(n),
+        ...(planId ? { planStepId: planId } : {}),
+      };
+      if (item.status) item.completed = item.status === "completed";
+      else setTodoStatus(item, item.completed ? "completed" : "pending");
+      items.push(item);
     }
-    added++;
-    const item: TodoItem = { ...n };
-    if (item.status) item.completed = item.status === "completed";
-    else setTodoStatus(item, item.completed ? "completed" : "pending");
-    return item;
-  });
+  }
   // Preserve unmatched agent-added items (progress + ad-hoc steps survive sync).
   const preserved: TodoItem[] = [];
   for (const p of prev) {
@@ -426,11 +527,20 @@ export function mergeTodoItems(
     it.step = i + 1;
     it.ref = String(i + 1);
     if (!it.label) it.label = String(i + 1);
+    if (!it.id) it.id = todoItemId(it);
   });
   const removed = prev.filter(
     (p) => !used.has(p) && p.source !== "agent",
   ).length;
-  return { items: all, added, removed, kept, preserved: preserved.length };
+  return {
+    items: all,
+    added,
+    removed,
+    kept,
+    preserved: preserved.length,
+    excluded: excludedCount,
+    restored,
+  };
 }
 
 export interface TodoRefResolution {
@@ -602,9 +712,11 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 // ── Wholesale update (industry-style replace) ────────────────────────
 
 export interface TodoUpdateEntry {
+  /** Stable item identity. Preferred over `ref` when supplied. */
+  id?: string;
   /** Canonical ref to an existing item (optional for new items). */
   ref?: string;
-  /** Step text. Exact/normalized match is used when no `ref` is given. */
+  /** Step text. Exact/normalized match is used when no id/ref is given. */
   text?: string;
   status?: TodoStatus;
 }
@@ -618,6 +730,12 @@ export interface TodoUpdateResult {
   normalized: number;
   /** Non-fatal resolution notes (refs matched by label/text or added as new). */
   warnings: string[];
+  /** Set when the store refused an ambiguous destructive replacement. */
+  refused?: string;
+  /** Store revision after the mutation (absent on a refused/removed-API call). */
+  revision?: number;
+  /** Plan bindings newly recorded as deliberately removed. */
+  excludedAdded?: number;
 }
 
 /**
@@ -640,10 +758,12 @@ export function applyTodoUpdate(
 ): TodoUpdateResult {
   const prev = ensureTodoLabels(existing ?? []);
   const byRef = new Map<string, TodoItem>();
+  const byId = new Map<string, TodoItem>();
   const byTextKey = new Map<string, TodoItem>();
   for (const p of prev) {
     const r = todoRef(p);
     if (r) byRef.set(r.toLowerCase(), p);
+    if (p.id) byId.set(p.id, p);
     const k = todoKey({ text: p.text });
     if (k && !byTextKey.has(k)) byTextKey.set(k, p);
   }
@@ -655,13 +775,28 @@ export function applyTodoUpdate(
   let kept = 0;
   for (const raw of incoming ?? []) {
     const text = normalizeStepText(raw?.text ?? "");
+    const rawId =
+      raw?.id !== undefined && String(raw.id).trim()
+        ? String(raw.id).trim()
+        : undefined;
     const rawRef =
       raw?.ref !== undefined && String(raw.ref).trim()
         ? String(raw.ref).trim()
         : undefined;
     let match: TodoItem | undefined;
-    let matchedBy: "ref" | "label" | "text" | undefined;
-    if (rawRef) {
+    let matchedBy: "id" | "ref" | "label" | "text" | undefined;
+    if (rawId) {
+      // A supplied stable id is authoritative; an unknown id is an error, not
+      // permission to fall back to text and mint a duplicate task.
+      const byStableId = byId.get(rawId);
+      if (!byStableId) {
+        warnings.push(`id "${short(rawId)}" not found; the entry was not applied`);
+        continue;
+      }
+      match = byStableId;
+      matchedBy = "id";
+    }
+    if (!match && rawRef) {
       match = byRef.get(rawRef.toLowerCase());
       if (match) matchedBy = "ref";
     }
@@ -692,6 +827,8 @@ export function applyTodoUpdate(
         status,
         completed: status === "completed",
         source: match.source ?? "agent",
+        id: match.id || todoItemId(match),
+        ...(match.planStepId ? { planStepId: match.planStepId } : {}),
       };
       items.push(item);
     } else {
@@ -708,6 +845,7 @@ export function applyTodoUpdate(
         completed: status === "completed",
         status,
         source: "agent",
+        id: todoItemId({ text, label: undefined, group: undefined }),
       };
       items.push(item);
     }
@@ -983,14 +1121,24 @@ function parseStepsFromLines(lines: string[]): TodoItem[] {
       if (cb) raw.push({ text: cb.text, completed: cb.completed });
     }
   }
-  const items: TodoItem[] = raw.map((r, i) => ({
-    step: i + 1,
-    text: r.text,
-    completed: !!r.completed,
-    label: r.label,
-    group: r.group,
-    source: "plan" as const,
-  }));
+  const items: TodoItem[] = raw.map((r, i) => {
+    const label = r.label || String(i + 1);
+    const base = {
+      step: i + 1,
+      text: r.text,
+      completed: !!r.completed,
+      label,
+      group: r.group,
+      source: "plan" as const,
+    };
+    return {
+      ...base,
+      // Plan identity is label+group, so rewording or a plan edit does not
+      // invent a second task and a repeated phase label still disambiguates.
+      planStepId: planStepIdFor(base),
+      id: todoItemId(base),
+    };
+  });
   const deduped = dedupeTodoItems(items);
   deduped.forEach((it, i) => {
     it.step = i + 1;

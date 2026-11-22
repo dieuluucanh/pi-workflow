@@ -307,7 +307,6 @@ import {
   discussionSourceFileName,
   resolveWorkSource,
   summarizeWorkSource,
-  type DiscussionSource,
 } from "./orchestrator-source.ts";
 import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
 import { createCommitLedger } from "./orchestrator-commits.ts";
@@ -5978,6 +5977,11 @@ export default function workflowExtension(
         promptAfterSettle: todos.promptAfterSettle,
         completedSignature: todos.completedSignature,
       },
+      // Durable list identity/removal authority. Older readers ignore these.
+      todoRevision: todos.revision,
+      todoExclusions: [...todos.excludedPlanSteps],
+      todoPlanDigest: todos.planDigest ?? null,
+      todoRecoveryReceipt: todos.recoveryReceiptId ?? null,
     } as any);
     lastPersistedPlanFile = currentPlanFile;
     publishContributions();
@@ -6266,7 +6270,8 @@ export default function workflowExtension(
   function loadTodosFromPlan(
     planPath: string,
     cwd: string,
-  ): { count: number; replaced: boolean; preserved: number } {
+    options?: { restoreExcluded?: boolean },
+  ): { count: number; replaced: boolean; preserved: number; excluded: number; restored: number } {
     let extracted: TodoItem[] = [];
     try {
       const abs = path.isAbsolute(planPath)
@@ -6282,11 +6287,17 @@ export default function workflowExtension(
       void _e;
     }
     if (extracted.length === 0)
-      return { count: todos.items.length, replaced: false, preserved: 0 };
+      return {
+        count: todos.items.length,
+        replaced: false,
+        preserved: 0,
+        excluded: 0,
+        restored: 0,
+      };
     // Same plan file → status-preserving merge; a different plan replaces the
     // list. The store owns that rule so plan reconciliation and the tool cannot
     // drift apart (step 3).
-    return todos.mergeExtracted(extracted, planPath, cwd);
+    return todos.mergeExtracted(extracted, planPath, cwd, options);
   }
 
   async function enterBuildModeFromPlan(
@@ -8147,6 +8158,7 @@ export default function workflowExtension(
     todos: TodoItem[];
     nextStep: number;
     warnings?: string[];
+    revision?: number;
     error?: string;
   }
 
@@ -8156,7 +8168,8 @@ export default function workflowExtension(
     description:
       "Manage the plan todo list. Steps are numbered GLOBALLY 1..N — use these numbers as refs. Actions: list, update (send the COMPLETE list; items you omit are removed), done/pending (set one item's status by ref), add (new ad-hoc item), toggle, sync (re-read the plan file), clear.",
     promptGuidelines: [
-      "workflow_todo: send the COMPLETE todo list to `update`; a step you omit is removed.",
+      "workflow_todo: update existing tasks with their returned `id` (or current `ref`); never rewrite the whole plan with shortened text-only entries — that creates duplicate tasks.",
+      "workflow_todo: send the COMPLETE todo list to `update`; a step you omit is removed and stays removed (explicit `sync` may restore it).",
       "workflow_todo: mark a step `completed` IMMEDIATELY after finishing it (never batch completions at the end).",
       "workflow_todo: keep exactly one step `in_progress`; set it before starting a step and clear it when that step is done.",
       "workflow_todo: never mark a step `completed` unless the work is fully done (Claude Code rule: never based on intent).",
@@ -8176,6 +8189,12 @@ export default function workflowExtension(
       todos: Type.Optional(
         Type.Array(
           Type.Object({
+            id: Type.Optional(
+              Type.String({
+                description:
+                  "Stable item id from a previous result. Preferred over ref for updates.",
+              }),
+            ),
             ref: Type.Optional(
               Type.String({
                 description:
@@ -8197,6 +8216,15 @@ export default function workflowExtension(
         ),
       ),
       text: Type.Optional(Type.String({ description: "Todo text (for add)" })),
+      intent: Type.Optional(
+        StringEnum(["update", "replace"] as const),
+      ),
+      expectedRevision: Type.Optional(
+        Type.Number({
+          description:
+            "List revision from the last result; a stale revision is refused instead of applied to different rows.",
+        }),
+      ),
       step: Type.Optional(
         Type.Number({
           description: "GLOBAL step ref (for done/pending/toggle)",
@@ -8313,11 +8341,17 @@ ${rows}`,
           };
         case "update": {
           const incoming: TodoUpdateEntry[] = (params.todos ?? []).map((t) => ({
+            id: t.id,
             ref: t.ref,
             text: t.text,
             status: t.status as TodoStatus,
           }));
-          const res = todos.update(incoming);
+          const res = todos.update(incoming, {
+            allowBulkReplace: params.intent === "replace",
+            ...(typeof params.expectedRevision === "number"
+              ? { expectedRevision: params.expectedRevision }
+              : {}),
+          });
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -8326,8 +8360,20 @@ ${rows}`,
           } catch (_e) {
             void _e;
           }
+          if (res.refused) {
+            return {
+              content: [{ type: "text", text: `Update refused: ${res.refused}` }],
+              details: {
+                action: "update",
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
+                revision: res.revision,
+                error: "refused",
+              } as TodoDetails,
+            };
+          }
           onTodoWrite();
-          const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}.`;
+          const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}${res.excludedAdded ? `, ${res.excludedAdded} plan step(s) recorded as removed` : ""}. Revision ${res.revision}.`;
           const warningText = res.warnings.length
             ? `\nWarnings:\n${res.warnings.map((w) => `- ${w}`).join("\n")}`
             : "";
@@ -8343,6 +8389,7 @@ ${rows}`,
               todos: [...todos.items],
               nextStep: todos.items.length + 1,
               warnings: res.warnings,
+              revision: res.revision,
             } as TodoDetails,
           };
         }
@@ -8542,6 +8589,7 @@ ${rows}`,
           const loaded = loadTodosFromPlan(
             currentPlanFile,
             (currentSessionCtx as any)?.cwd ?? process.cwd(),
+            { restoreExcluded: true },
           );
           try {
             if (currentSessionCtx) {
@@ -8556,11 +8604,17 @@ ${rows}`,
             loaded.preserved > 0
               ? ` (kept ${loaded.preserved} agent-added)`
               : "";
+          const excludedNote =
+            loaded.excluded > 0
+              ? ` (${loaded.excluded} previously removed step(s) stay excluded until an explicit sync)`
+              : "";
+          const restoredNote =
+            loaded.restored > 0 ? ` (restored ${loaded.restored} removed step(s))` : "";
           return {
             content: [
               {
                 type: "text",
-                text: `Synced ${loaded.count} todos from plan${preservedNote}`,
+                text: `Synced ${loaded.count} todos from plan${preservedNote}${restoredNote}${excludedNote}`,
               },
             ],
             details: {
@@ -12456,6 +12510,20 @@ ${rows}`,
             if (decoded) workflowMode = decoded.mode;
             syncLegacyFlags();
             if (Array.isArray(d.todos)) todos.items = ensureTodoLabels(d.todos);
+            // Restore durable list identity/removal authority before any
+            // reconciliation can run, so a removed step stays removed.
+            todos.restore({
+              ...(typeof d.todoRevision === "number" ? { revision: d.todoRevision } : {}),
+              ...(Array.isArray(d.todoExclusions)
+                ? { excludedPlanSteps: d.todoExclusions }
+                : {}),
+              ...(typeof d.todoPlanDigest === "string"
+                ? { planDigest: d.todoPlanDigest }
+                : {}),
+              ...(typeof d.todoRecoveryReceipt === "string"
+                ? { recoveryReceiptId: d.todoRecoveryReceipt }
+                : {}),
+            });
             // Entries written before this feature have no `todoPanel`; they
             // must not erase a value restored from an earlier entry.
             if (d.todoPanel && typeof d.todoPanel === "object") {
@@ -12950,6 +13018,20 @@ ${rows}`,
         if (e.type === "custom" && e.customType === "workflow") {
           if (Array.isArray(e.data?.todos)) {
             todos.items = ensureTodoLabels(e.data.todos);
+            todos.restore({
+              ...(typeof e.data.todoRevision === "number"
+                ? { revision: e.data.todoRevision }
+                : {}),
+              ...(Array.isArray(e.data.todoExclusions)
+                ? { excludedPlanSteps: e.data.todoExclusions }
+                : {}),
+              ...(typeof e.data.todoPlanDigest === "string"
+                ? { planDigest: e.data.todoPlanDigest }
+                : {}),
+              ...(typeof e.data.todoRecoveryReceipt === "string"
+                ? { recoveryReceiptId: e.data.todoRecoveryReceipt }
+                : {}),
+            });
             if (e.data.planFile) todos.planPath = e.data.planFile;
           }
           if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
@@ -14741,12 +14823,17 @@ ${rows}`,
   // ── Deterministic per-step commit executor (allow mode) ──────────
 
   /** Mark pre-existing done steps (session resume, re-executed plan) as already accounted for. Called once per session. */
+  /** Stable id when present, else the display ref (legacy sessions). */
+  function stepCommitKey(t: TodoItem): string {
+    return t.id || todoRef(t);
+  }
+
   function seedCommittedStepRefs(): void {
     if (stepCommitsSeeded) return;
     stepCommitsSeeded = true;
     for (const t of todos.items) {
       if (!isDone(t) || itemStatus(t) === "cancelled") continue;
-      committedStepRefs.add(todoRef(t));
+      committedStepRefs.add(stepCommitKey(t));
     }
   }
 
@@ -14756,8 +14843,14 @@ ${rows}`,
     for (const t of todos.items) {
       if (!isDone(t) || itemStatus(t) === "cancelled") continue;
       const ref = todoRef(t);
-      if (committedStepRefs.has(ref)) continue;
-      out.push({ ref, step: t.step, label: t.label, text: t.text });
+      if (committedStepRefs.has(stepCommitKey(t))) continue;
+      out.push({
+        ref,
+        ...(t.id ? { id: t.id } : {}),
+        step: t.step,
+        label: t.label,
+        text: t.text,
+      });
     }
     return out;
   }
@@ -14900,7 +14993,10 @@ ${rows}`,
         }
         return;
       }
-      for (const ref of decision.refs) committedStepRefs.add(ref);
+      for (const ref of decision.refs) {
+        const item = todos.items.find((entry) => todoRef(entry) === ref);
+        committedStepRefs.add(item ? stepCommitKey(item) : ref);
+      }
       try {
         ctx?.ui?.notify?.(
           `Committed ${decision.refs.join(", ")} — ${decision.message}`,
@@ -17463,8 +17559,11 @@ ${rows}`,
               const planExtracted = extractPlanStepsFromMarkdown(planText);
               if (planExtracted.length > 0) {
                 const before = todos.items.filter((t) => isDone(t)).length;
-                const merged = mergeTodoItems(todos.items, planExtracted);
+                const merged = mergeTodoItems(todos.items, planExtracted, {
+                  excludedPlanStepIds: todos.excludedPlanSteps,
+                });
                 todos.items = merged.items;
+                todos.revision += 1;
                 const after = todos.items.filter((t) => isDone(t)).length;
                 if (after > before || merged.preserved > 0) {
                   updateStatus(ctx as any);
@@ -17599,7 +17698,9 @@ ${rows}`,
           // exact plan content; a `- [x]` tick changes the key and re-merges.
           if (!(planKey && planKey === lastReconcileKey)) {
             if (planKey) lastReconcileKey = planKey;
-            todos.items = mergeTodoItems(todos.items, planExtracted).items;
+            todos.items = mergeTodoItems(todos.items, planExtracted, {
+              excludedPlanStepIds: todos.excludedPlanSteps,
+            }).items;
           }
         } else {
           todos.items = ensureTodoLabels(planExtracted);
@@ -17745,7 +17846,9 @@ ${rows}`,
           if (steps.length > 0) {
             todos.items =
               todos.items.length > 0
-                ? mergeTodoItems(todos.items, steps).items
+                ? mergeTodoItems(todos.items, steps, {
+                    excludedPlanStepIds: todos.excludedPlanSteps,
+                  }).items
                 : ensureTodoLabels(steps);
             updateStatus(ctx as any);
             persistState();

@@ -270,8 +270,10 @@ export function describeCommitPolicyMode(mode: CommitPolicyMode): string {
 
 /** A completed plan step that may be due for its automatic commit. */
 export interface StepCommitCandidate {
-  /** Canonical global ref ("1", "2", …). */
+  /** Canonical global ref ("1", "2", …). Display/dispatch only. */
   ref: string;
+  /** Stable item identity; the idempotency key when present. */
+  id?: string;
   /** Global step number when known (preferred for the message). */
   step?: number;
   /** Plan label fallback (e.g. "2.1"). */

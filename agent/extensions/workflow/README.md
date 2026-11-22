@@ -885,6 +885,25 @@ Invalid numbers fall back to the base value and the pair is repaired so `default
 
 See `index.ts`, `checkpoint.ts` (shadow bare-repo), `commit-policy.ts` (commit policy config, coercion, the `/commit` prompt and write — no runtime imports, unit-testable), `questionnaire-layout.ts` (pure questionnaire viewport/scroll geometry), `questionnaire-view.ts` (the bounded bottom-sheet questionnaire view), `edit-policy.ts` (write-policy config, coercion, path/command matching, the decision table, and the guided-denial helpers — no runtime imports, unit-testable), `permissions.ts` (shell-command mutation classification), `shell-paths.ts` (path extraction for the shared floor), `folder-policy.ts` (the shared containment floor and sensitive-file rules), `read-policy.ts` / `read-policy-tools.ts` / `read-policy-redact.ts` (the read gate, tool classification and output redaction), `utils.ts` (safe-command gating, todo/plan extraction, plan hashing), `todo-panel.ts` (pure todo-panel state matrix, list identity, summary and row rendering), `roles.ts` (role registry, one model per role), `shell-guard.ts` (pure deadlines, the empty-probe recognizer and the request budget), `shell-guard-config.ts` (settings/provenance/inheritance and `/shell-guard` parsing), `shell-guard-runtime.ts` (the tool-lifecycle adapter), `profiles.ts` (profile registry, the model overlay and the `workflow.defaultProfile` setting — no Pi runtime needed, unit-testable), `provider-retarget.ts` (guarded, backed-up `provider` ref migration for profiles/roles — pure document rewrite plus a two-phase file apply), `picker.ts` (the fuzzy-filterable picker primitives), and the Review Mode modules: `review.ts` (config, prompt, state, transcript, child session — no runtime imports, so it is unit-testable), `review-providers.ts` (parent→reviewer provider seeding and the provider-agnostic auth preflight), `review-tools.ts` (the reviewer's tool set), `review-runtime.ts` (round orchestration), `review-ui.ts` (the main-transcript entries: line buffer, formatters, renderers), `review-handoff.ts` (pure pending-gate correlation, supersede and reload-recovery decisions), `handoff-config.ts` (the `workflow.handoff` target config, coercion/merge/read-write, presenter decision and `/handoff` completions — no runtime imports, unit-testable), `handoff-view.ts` (pure native-handoff question/choice decisions: the plan-text cap, the bottom-sheet question and the Approve/Feedback/Skip mapping — no runtime imports, unit-testable). Hot-reload via `/reload` when placed in `~/.pi/agent/extensions/workflow/` or loaded via `pi.extensions` manifest.
 
+### Todo identity and plan reconciliation
+
+Each todo carries a stable `id` (returned by the tool) plus a plan binding for
+plan-derived rows. `ref` is the global display position and may change when
+rows reorder; use `id` (or the current `ref`) to update an existing task.
+Rewording a task by id/ref preserves its identity and plan origin.
+
+- `workflow_todo update` replaces the list; omitted tasks are removed and stay
+  removed. A text-only wholesale rewrite of a plan-linked list is refused
+  unless `intent:"replace"` is supplied, because shortened rewrites used to
+  create a second copy of every plan task.
+- Automatic plan reconciliation never resurrects a deliberately removed step.
+  `workflow_todo sync` is the explicit restore path and reports what it
+  restored.
+- Removals, list revision and the plan digest persist in the `workflow` entry,
+  so reload/resume keeps the same membership.
+- Recovering a damaged list is a reviewed, idempotent operation; it is
+  bookkeeping only and never proves completion or triggers commits.
+
 ### Todo protocol (industry-aligned)
 
 - **Canonical refs**: every todo row is numbered **globally** `1..N`; those numbers are the only refs the model ever needs. Refs are canonical positions — they are recomputed as `1..N` after every mutation (plan merge, `update`, session restore), so the pinned widget, handoff messages, tool output and `workflow_todo` refs always show the same numbers (no 11–20 drift). The plan's per-phase labels (e.g. `Phase B: 1..3`) are preserved only as display metadata (`(plan label B2)`). Integer refs resolve by canonical `ref` → positional `step` → unique `label`; the resolver also accepts `Group/Label`, `Label@Group`, `#N` and unique text (≥8 chars).

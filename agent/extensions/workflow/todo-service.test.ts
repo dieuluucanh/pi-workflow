@@ -136,6 +136,82 @@ test("store: wholesale update removes omitted items, like the public tool", () =
   assert.equal(store.remainingCount(), 1);
 });
 
+test("store: a ref-less wholesale rewrite of a plan-linked list is refused", () => {
+  const store = createTodoStore();
+  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
+  const before = store.items.map((entry) => entry.text);
+  const revision = store.revision;
+
+  const refused = store.update([
+    { text: "scaffold" },
+    { text: "api" },
+    { text: "ui" },
+  ]);
+  assert.ok(refused.refused, "the ambiguous replacement is refused");
+  assert.deepEqual(store.items.map((entry) => entry.text), before);
+  assert.equal(store.revision, revision, "a refusal is not a mutation");
+  assert.equal(refused.added, 0);
+});
+
+test("store: an explicit replacement records excluded plan steps", () => {
+  const store = createTodoStore();
+  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
+  const third = store.items[2]?.planStepId;
+  assert.ok(third);
+
+  const replaced = store.update(
+    [
+      { ref: "1", status: "completed" },
+      { ref: "2", text: "Add the API layer", status: "pending" },
+    ],
+    { allowBulkReplace: true },
+  );
+  assert.equal(replaced.refused, undefined);
+  assert.equal(store.items.length, 2);
+  assert.equal(store.excludedPlanSteps.has(third!), true);
+  // Rewording by ref preserves the plan binding (no second task).
+  assert.ok(store.items[1]?.planStepId);
+  assert.equal(store.items[1]?.source, "plan");
+});
+
+test("store: passive reconciliation never restores a removed plan step; explicit sync does", () => {
+  const store = createTodoStore();
+  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
+  store.update([{ ref: "1" }, { ref: "2" }], { allowBulkReplace: true });
+  assert.equal(store.items.length, 2);
+
+  const passive = store.loadFromPlanMarkdown({
+    markdown: PLAN,
+    planPath: "/p/plan.md",
+    cwd: "/p",
+  });
+  assert.equal(passive.excluded, 1, "the removed step stays excluded");
+  assert.equal(store.items.length, 2, "no silent restoration");
+
+  const restored = store.loadFromPlanMarkdown({
+    markdown: PLAN,
+    planPath: "/p/plan.md",
+    cwd: "/p",
+    restoreExcluded: true,
+  });
+  assert.equal(restored.restored, 1, "explicit sync restores it once");
+  assert.equal(store.items.length, 3);
+  assert.equal(store.excludedPlanSteps.size, 0);
+});
+
+test("store: a reviewed recovery is idempotent per receipt", () => {
+  const store = createTodoStore();
+  const canonical = [
+    item(1, "Full plan step one", { source: "plan", status: "completed", completed: true }),
+    item(2, "Full plan step two", { source: "plan" }),
+  ];
+  const first = store.recover(canonical, "recovery-1");
+  assert.equal(first.applied, true);
+  assert.equal(store.items.length, 2);
+  const second = store.recover(canonical, "recovery-1");
+  assert.equal(second.applied, false, "a retry does not apply twice");
+});
+
 test("store: done tags mark refs and settle the list", () => {
   const store = createTodoStore();
   store.replace([item(1, "one"), item(2, "two")]);
