@@ -8,8 +8,9 @@
  *   say <text> | retry | refine <what> | approve <preview-id> | cancel | help
  *
  * Two rules are structural here:
- *   - `start` never launches: it reports whether a breakdown + explicit
- *     execution approval exist, and refuses otherwise;
+ *   - `start` never dispatches by itself: it reports whether a breakdown and
+ *     explicit execution approval exist, and refuses otherwise. The command
+ *     host performs the one dispatch through the shared auto-start path;
  *   - `approve` names the exact preview ID. The literal `approve-execution` is
  *     not enough: a model or stale command cannot approve a breakdown it did
  *     not show, and a changed preview invalidates the ID.
@@ -174,7 +175,7 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
           return {
             ok: true,
             verb: parsed.verb,
-            text: `Ready to dispatch${view.nextTaskId ? ` ${view.nextTaskId}` : ""}. Dispatch still requires the registered dispatch tool and a bound child host; this command never launches a child itself.`,
+            text: `Approval is valid${view.nextTaskId ? ` for ${view.nextTaskId}` : ""}. The host is starting the next dependency-ready task through the shared durable dispatch path.`,
           };
         }
 

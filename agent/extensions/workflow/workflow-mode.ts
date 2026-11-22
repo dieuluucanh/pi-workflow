@@ -23,7 +23,7 @@
 import type { TodoItem } from "./utils.ts";
 import { ORCHESTRATOR_TOOL_NAMES } from "./orchestrator-tools.ts";
 
-/** `null` is Default (workflow off). Orchestrator is opt-in, never in Tab. */
+/** `null` is Default (workflow off). Orchestrator is in the ordinary cycle. */
 export type WorkflowMode = "plan" | "build" | "orchestrator" | null;
 
 export const WORKFLOW_MODES: readonly WorkflowMode[] = ["plan", "build", "orchestrator", null];

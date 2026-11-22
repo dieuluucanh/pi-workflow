@@ -4,6 +4,49 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — the composer mode label is the cycle control (2026-11-22)
+
+- **One cycle, two entry points.** `Tab`, `Ctrl+Alt+P` and the registered
+  `/workflow-cycle` command now call one serialized operation; the next mode is
+  computed inside it from the live mode, and the overlay/Review checks are
+  re-evaluated when the queued request runs. The ordinary ring is
+  Default → Plan → Orchestrator → Build (a managed worker omits Orchestrator;
+  quarantined workers use the worker ring instead of getting stuck on a refused
+  target). A transition queued before a rebind/shutdown is abandoned instead of
+  publishing into the replacement session.
+- **The generic mode contribution references its action.** `ModeContribution`
+  gained an optional `actionRef` naming a same-owner, top-level action. The
+  publisher emits one `mode-cycle` action for all four base modes (Default
+  included) and no longer sends the fixed-target `mode-plan` /
+  `mode-orchestrator` / `mode-build` buttons, so a host can make the mode label
+  itself the control. The retired ids are withdrawn explicitly; a Review turn
+  publishes the cycle action disabled with its reason. Task, progress, review,
+  handoff and recovery contributions are unchanged.
+- **Publication failures are visible.** `set()` results are inspected and a
+  rejected set keeps the last valid state and reports one bounded, deduplicated
+  diagnostic (never the payload).
+
+### Fixed — SDK SessionManager loader and host readiness (2026-11-22)
+
+**The Orchestrator can now create the durable Builder session on a host whose
+SDK exports `SessionManager` as a class.**
+
+- **The loader validates the contract, not the JavaScript type.** A class is a
+  function, not an object. `loadPiSdkModule()` accepts a class/function or an
+  object whose static `create` and `open` are functions, including a
+  `default.SessionManager` ESM/CJS interop shape. Invalid exports and import
+  failures name the package and report a bounded export shape.
+- **Terminal readiness includes the SDK.** `createTerminalChildHost` probes the
+  SDK worker storage in `capabilities()` and again before `prepare()`. A
+  terminal that exists but cannot load the SDK is advertised unavailable, so the
+  approval preview blocks before the user spends an approval.
+- **`/orchestrator start` resumes an approved run.** It restores the bound
+  plan's deterministic journal first, then uses the same one-dispatch auto-start
+  path as approval. A repeated start is still refused by the approval, phase and
+  mutation guards; passive reload never auto-dispatches.
+- **Non-creating probe.** `createSdkWorkerPort.probe()` loads and validates the
+  SDK without creating a session file or metadata.
+
 ### Fixed — breakdown approval dialog and Builder bootstrap (2026-11-22)
 
 **The Orchestrator no longer asks the user to copy an approval command, and a

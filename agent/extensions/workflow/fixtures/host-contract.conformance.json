@@ -42,6 +42,62 @@
       }
     },
     {
+      "name": "mode references a same-owner cycle action",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode",
+            "id": "mode",
+            "label": "Plan",
+            "tone": "warning",
+            "actionRef": "mode-cycle",
+            "actions": []
+          },
+          {
+            "kind": "action",
+            "id": "mode-cycle",
+            "label": "Cycle mode",
+            "tone": "warning",
+            "command": { "name": "workflow-cycle" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "mode actionRef must not carry a command or path",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "mode", "id": "mode", "label": "Plan", "actionRef": "../../bin/sh" }
+        ]
+      }
+    },
+    {
+      "name": "mode actionRef must be a string id",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "mode", "id": "mode", "label": "Plan", "actionRef": 7 }
+        ]
+      }
+    },
+    {
       "name": "progress and related session",
       "expect": "ok",
       "input": {

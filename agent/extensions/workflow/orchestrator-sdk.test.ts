@@ -17,6 +17,8 @@ import {
   MANAGED_KEY_INDEX,
   SESSION_BOOTSTRAP_MARKER,
   createSdkWorkerPort,
+  loadPiSdkModule,
+  resolveSessionManagerExport,
   type SdkLike,
   type SdkSessionManagerLike,
 } from "./orchestrator-sdk.ts";
@@ -101,6 +103,96 @@ function tempDir(): { dir: string; cleanup: () => void } {
   return { dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
+test("sdk loader: a class constructor is accepted (the reported bootstrap bug)", async () => {
+  class ClassSessionManager {
+    static create(): SdkSessionManagerLike {
+      return {} as SdkSessionManagerLike;
+    }
+    static open(): SdkSessionManagerLike {
+      return {} as SdkSessionManagerLike;
+    }
+  }
+  assert.equal(typeof ClassSessionManager, "function");
+  assert.equal(
+    resolveSessionManagerExport({ SessionManager: ClassSessionManager }),
+    ClassSessionManager,
+  );
+  const loaded = await loadPiSdkModule(async () => ({
+    SessionManager: ClassSessionManager,
+  }));
+  assert.equal(loaded.SessionManager, ClassSessionManager);
+});
+
+test("sdk loader: object and default-namespace exports are accepted", async () => {
+  const objectManager = {
+    create: () => ({} as SdkSessionManagerLike),
+    open: () => ({} as SdkSessionManagerLike),
+  };
+  assert.equal(
+    resolveSessionManagerExport({ SessionManager: objectManager }),
+    objectManager,
+  );
+  assert.equal(
+    resolveSessionManagerExport({ default: { SessionManager: objectManager } }),
+    objectManager,
+  );
+  assert.equal(resolveSessionManagerExport({ default: objectManager }), objectManager);
+});
+
+test("sdk loader: an export without create/open is rejected with a bounded reason", async () => {
+  assert.equal(resolveSessionManagerExport({ SessionManager: class {} }), undefined);
+  await assert.rejects(
+    loadPiSdkModule(async () => ({ SessionManager: class {} }), "test-sdk"),
+    (error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error);
+      assert.match(text, /SessionManager is unavailable or invalid/);
+      assert.match(text, /test-sdk/);
+      assert.match(text, /SessionManager=function/);
+      return true;
+    },
+  );
+});
+
+test("sdk loader: import failures name the package", async () => {
+  await assert.rejects(
+    loadPiSdkModule(async () => {
+      throw new Error("module not found");
+    }, "missing-sdk"),
+    (error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error);
+      assert.match(text, /missing-sdk/);
+      assert.match(text, /module not found/);
+      return true;
+    },
+  );
+});
+
+test("sdk port: probe validates the SDK without creating a session", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { sdk } = fakeSdk(dir);
+    let loads = 0;
+    const port = createSdkWorkerPort({
+      loadSdk: async () => {
+        loads += 1;
+        return sdk;
+      },
+    });
+    await port.probe?.();
+    assert.equal(loads, 1);
+    assert.deepEqual(fs.readdirSync(dir), [], "probe must not create a session file");
+
+    const failing = createSdkWorkerPort({
+      loadSdk: async () => {
+        throw new Error("sdk missing");
+      },
+    });
+    await assert.rejects(failing.probe?.() ?? Promise.resolve(), /sdk missing/);
+  } finally {
+    cleanup();
+  }
+});
+
 test("sdk port: creation materializes the file before it is reported durable", async () => {
   const { dir, cleanup } = tempDir();
   try {
@@ -129,10 +221,11 @@ test("sdk port: the REAL SDK materializes a durable idle session", async () => {
   try {
     // Built at runtime so the dependency stays a peer (not a bundled import).
     const sdkPackage = ["@earendil-works", "pi-coding-agent"].join("/");
-    const real = await import(sdkPackage);
-    const port = createSdkWorkerPort({
-      loadSdk: async () => ({ SessionManager: real.SessionManager }),
-    });
+    const loaded = await loadPiSdkModule(
+      async () => await import(sdkPackage),
+      sdkPackage,
+    );
+    const port = createSdkWorkerPort({ loadSdk: async () => loaded });
     const created = await port.createSession({ cwd: dir, name: "real worker" });
     assert.ok(created.sessionId.length > 0);
     assert.ok(

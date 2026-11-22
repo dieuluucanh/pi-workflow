@@ -4,7 +4,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 
 ## Features
 
-- **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; **Tab** completes the highlighted suggestion while a list is open and otherwise cycles Plan → Build → Default (`Ctrl+Alt+P` always cycles), `--workflow-plan` flag
+- **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; **Tab** completes the highlighted suggestion while a list is open and otherwise cycles Default → Plan → Orchestrator → Build (`Ctrl+Alt+P` always cycles; a managed worker omits Orchestrator), `--workflow-plan` flag. Hosts that render generic contributions (Pi Desktop) get one current-mode control bound to the same cycle through `/workflow-cycle`.
 - **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, rewrites it, streams its work into the main transcript, and hands the result to the configured presenter (`/handoff`: Plannotator, or the workflow's native questionnaire). If Plannotator is unavailable or answers with an error, the handoff falls back to the native questionnaire (the plan is printed into the transcript, the choices are pinned at the bottom). Off by default; see [Review Mode](#review-mode) below.
 - **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, and an inline `↳ Your answer:` editor. Rendered as a bounded bottom-sheet overlay: a short question and the choices stay pinned, while a long question or the optional `context` body (e.g. a proposed commit message) scrolls with the wheel, `PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The freeform editor takes the pane while typing.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
@@ -80,10 +80,12 @@ short Plan → Review → Build work keeps its current behavior.
   planner model without rewriting files; the worker model remains Builder.
 - **Ask it to work — do not switch to `/build`.** When the user asks for work,
   the parent calls `orchestrator_prepare` (or the user runs
-  `/orchestrator start [path]`). With no plan path it snapshots the current
-  discussion into a deterministic roadmap; with a path it snapshots those exact
-  bytes. Both routes are the same preparation service the approved handoff uses.
-  A read-only question stays a question.
+  `/orchestrator start [path]`). A bare `/orchestrator start` first restores a
+  bound plan's deterministic run/journal and, when it already has an execution
+  approval, starts the next ready task; `start <path>` snapshots an explicit
+  plan, and a session with no bound plan prepares the current discussion. Both
+  preparation routes are the same service the approved handoff uses. A
+  read-only question stays a question.
 - **Identity is separate from permissions.** Orchestrator is its own permission
   role: it inspects and runs verify commands, but project edits, mutating shell
   and child-only tools are refused with a delegation remedy, never with “Plan
@@ -160,9 +162,12 @@ both repos (`fixtures/two-extension-contract.json`).
   Desktop tab when that host announces the capability, otherwise a visible
   Terminal window running `pi --session <file>` (never a headless print worker).
   The parent creates the durable session and private grant, arms the control
-  window, launches, then waits for the child's authenticated `start` ack. A host
-  that is neither announced nor resolvable fails closed with an actionable
-  reason; there is no silent direct-Build fallback.
+  window, launches, then waits for the child's authenticated `start` ack. The
+  terminal host's readiness includes an SDK probe: the SDK peer dependency must
+  resolve to a `SessionManager` class/object with static `create` and `open`, or
+  the host is reported unavailable before approval. A host that is neither
+  announced nor resolvable fails closed with an actionable reason; there is no
+  silent direct-Build fallback.
 - **Two-step authorization:** the signed start grant is held after delivery.
   `workflow_worker_ready` applies it; only then does the worker's mutation gate
   open. The control secret lives in a private 0600 grant file, and only its path
@@ -385,9 +390,9 @@ reviewer `opencode-go/muse-spark-1.3-contributor` · verdict **revise**
 
 Because the two agents run sequentially — Plan Mode finishes before the reviewer starts — their transcripts can never interleave, and there is no overlay or second pane to navigate. Everything shows up in Pi's normal transcript.
 
-Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress): switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line.
+Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, plus todo progress) and, on a generic-contribution host, by one published `mode` contribution: switching with **Tab** or `Ctrl+Alt+P` is silent and adds nothing to the transcript, while `/plan`, `/build` and `/default` print a single confirmation line.
 
-**Tab precedence.** While the input's suggestion list is open (commands, `@files`, `#documents`), **Tab** applies the highlighted item and leaves the mode alone. With no list open, the workflow's `tab` shortcut cycles Plan → Build → Default. `Ctrl+Alt+P` always cycles. This matches Pi Desktop; it requires `tui.input.tab` to stay bound (the default is `tab`), because a disabled binding leaves nothing for the editor to accept. The one exception is a live review: mode switching is refused with a notice (see [Controlling a running review](#controlling-a-running-review)). Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
+**Tab precedence.** While the input's suggestion list is open (commands, `@files`, `#documents`), **Tab** applies the highlighted item and leaves the mode alone. With no list open, the workflow's `tab` shortcut cycles Default → Plan → Orchestrator → Build (a managed worker omits Orchestrator). `Ctrl+Alt+P` and the registered `/workflow-cycle` command run the same guarded cycle; Pi Desktop's composer mode button invokes that command, so a click and Tab cannot drift. Mode switches are refused during a live review and while an overlay owns input. This matches Pi Desktop; it requires `tui.input.tab` to stay bound (the default is `tab`), because a disabled binding leaves nothing for the editor to accept. The one exception is a live review: mode switching is refused with a notice (see [Controlling a running review](#controlling-a-running-review)). Only the review phase adds bands, and the reviewer's stream is rendered in the review color:
 
 | Entry | Color | Meaning |
 | --- | --- | --- |

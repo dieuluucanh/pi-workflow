@@ -126,12 +126,35 @@ export function createTerminalChildHost(options: {
   return {
     async capabilities() {
       const caps = await options.terminal.port.capabilities();
+      const label = options.label ?? caps.label;
+      if (!caps.available) {
+        return {
+          available: false,
+          label,
+          separateWindow: caps.separateWindow,
+          focus: caps.focus,
+          ...(caps.reason ? { reason: caps.reason } : {}),
+        };
+      }
+      try {
+        const sdk = await options.sdk();
+        await sdk.probe?.();
+      } catch (error: unknown) {
+        return {
+          available: false,
+          label,
+          separateWindow: caps.separateWindow,
+          focus: caps.focus,
+          reason: `SDK worker storage unavailable: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
       return {
-        available: caps.available,
-        label: options.label ?? caps.label,
+        available: true,
+        label,
         separateWindow: caps.separateWindow,
         focus: caps.focus,
-        ...(caps.reason ? { reason: caps.reason } : {}),
       };
     },
 
@@ -139,6 +162,7 @@ export function createTerminalChildHost(options: {
       let sdk: WorkerSdkPort;
       try {
         sdk = await options.sdk();
+        await sdk.probe?.();
       } catch (error: unknown) {
         return {
           ok: false,

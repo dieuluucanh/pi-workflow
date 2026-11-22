@@ -179,7 +179,8 @@ test("approve requires the exact preview id and then start reports readiness onl
 
   const start = await operator.run("start");
   assert.equal(start.ok, true, start.text);
-  assert.match(start.text, /never launches a child/);
+  assert.match(start.text, /Approval is valid/);
+  assert.match(start.text, /host is starting/);
 });
 
 test("preview renders scope, host, limits and the approval id; refine invalidates durably", async () => {

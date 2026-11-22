@@ -23,6 +23,14 @@ export interface WorkflowContributionInput {
   done: number;
   total: number;
   stale?: boolean;
+  /**
+   * Whether the registered `/workflow-cycle` command exists in this session.
+   * The composer's mode label references that action, so an unavailable
+   * command must publish a disabled target rather than a dead button.
+   */
+  cycleAvailable?: boolean;
+  /** Why cycling is refused right now (e.g. a Review owns the turn). */
+  cycleDisabledReason?: string;
   /** Effective todo-panel state; display-only, never inferred by the host. */
   panelState?: WorkflowPanelState | null;
   /** Live review phase; `idle` means no review row. */
@@ -71,6 +79,31 @@ export function buildWorkflowContributions(
   const done = Math.max(0, Math.trunc(input.done));
   const total = Math.max(0, Math.trunc(input.total));
 
+  /**
+   * One generic cycle action per snapshot. The current-mode label references it
+   * by id, so a host can render the mode itself as the control instead of a row
+   * of Plan/Build buttons. The command walks the same guarded, serialized ring
+   * as Tab; this mapper never computes the next mode and never grants an
+   * execution effect.
+   */
+  const pushCycleAction = (disabledReason?: string): string => {
+    const reason =
+      disabledReason ??
+      (input.cycleAvailable === false ? "mode cycle is unavailable in this session" : undefined);
+    out.push({
+      id: "mode-cycle",
+      kind: "action",
+      slot: "action",
+      label: "Cycle mode",
+      tone: "neutral",
+      order: 20,
+      command: { name: "workflow-cycle" },
+      enabled: reason === undefined,
+      ...(reason === undefined ? {} : { disabledReason: reason }),
+    });
+    return "mode-cycle";
+  };
+
   if (reviewing) {
     const base =
       phase === "paused"
@@ -89,6 +122,7 @@ export function buildWorkflowContributions(
         phase === "handoff"
           ? "The plan is waiting for your decision in the review tab."
           : "An independent reviewer owns this turn.",
+      actionRef: pushCycleAction(input.cycleDisabledReason ?? "a review owns this turn"),
       actions: [],
     });
     out.push({
@@ -156,6 +190,7 @@ export function buildWorkflowContributions(
           : input.handoffPending || input.handoffStage === "review-pending"
             ? "handoff pending"
             : undefined,
+    actionRef: pushCycleAction(input.cycleDisabledReason),
     actions: [],
   });
 
@@ -235,42 +270,6 @@ export function buildWorkflowContributions(
       enabled: true,
     });
   }
-
-  out.push({
-    id: "mode-plan",
-    kind: "action",
-    slot: "action",
-    label: "Plan",
-    tone: "warning",
-    order: 20,
-    command: { name: "plan" },
-    enabled: input.mode !== "plan",
-    ...(input.mode === "plan" ? { disabledReason: "already in Plan" } : {}),
-  });
-  out.push({
-    id: "mode-orchestrator",
-    kind: "action",
-    slot: "action",
-    label: "Orchestrator",
-    tone: "info",
-    order: 21,
-    command: { name: "orchestrator" },
-    enabled: input.mode !== "orchestrator",
-    ...(input.mode === "orchestrator"
-      ? { disabledReason: "already in Orchestrator" }
-      : {}),
-  });
-  out.push({
-    id: "mode-build",
-    kind: "action",
-    slot: "action",
-    label: "Build",
-    tone: "accent",
-    order: 22,
-    command: { name: "build" },
-    enabled: input.mode !== "build",
-    ...(input.mode === "build" ? { disabledReason: "already in Build" } : {}),
-  });
 
   if (input.mode === "orchestrator" && input.orchestration) {
     const run = input.orchestration;

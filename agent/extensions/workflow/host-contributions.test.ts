@@ -198,6 +198,49 @@ test("limits: an oversized string is rejected rather than truncated", () => {
   assert.equal(result.ok, false);
 });
 
+test("mode actionRef is preserved and cannot carry executable content", () => {
+  const parsed = parseContributionEnvelope({
+    version: 1,
+    owner: { id: "o" },
+    sessionId: "s",
+    epoch: 0,
+    revision: 1,
+    contributions: [
+      { kind: "mode", id: "mode", label: "Plan", actionRef: "mode-cycle" },
+      { kind: "action", id: "mode-cycle", label: "Cycle mode", command: { name: "cycle" } },
+    ],
+  });
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
+  if (parsed.ok) {
+    const [mode, action] = parsed.value.envelope.contributions;
+    assert.equal(mode?.kind === "mode" ? mode.actionRef : undefined, "mode-cycle");
+    assert.equal(action?.kind === "action" ? action.command.name : undefined, "cycle");
+  }
+
+  // A dangling reference is valid: resolution/refusal happens on the host.
+  const dangling = parseContributionEnvelope({
+    version: 1,
+    owner: { id: "o" },
+    sessionId: "s",
+    epoch: 0,
+    revision: 2,
+    contributions: [{ kind: "mode", id: "mode", label: "Plan", actionRef: "missing-action" }],
+  });
+  assert.equal(dangling.ok, true, dangling.ok ? "" : dangling.error);
+
+  for (const badRef of ["../../bin/sh", "has space", 7, null, "x".repeat(97)]) {
+    const rejected = parseContributionEnvelope({
+      version: 1,
+      owner: { id: "o" },
+      sessionId: "s",
+      epoch: 0,
+      revision: 1,
+      contributions: [{ kind: "mode", id: "mode", label: "Plan", actionRef: badRef }],
+    });
+    assert.equal(rejected.ok, false, `actionRef ${JSON.stringify(badRef)} must be rejected`);
+  }
+});
+
 test("compatibility: an unknown kind is reported, valid siblings survive", () => {
   const result = parseContributionEnvelope({
     version: 1,

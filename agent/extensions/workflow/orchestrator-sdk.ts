@@ -41,11 +41,98 @@ export interface SdkSessionManagerLike {
   }): string;
 }
 
+export interface SdkSessionManagerCtor {
+  create(
+    cwd: string,
+    sessionDir?: string,
+    options?: { id?: string; parentSession?: string },
+  ): SdkSessionManagerLike;
+  open(
+    path: string,
+    sessionDir?: string,
+    cwdOverride?: string,
+  ): SdkSessionManagerLike;
+}
+
 export interface SdkLike {
-  SessionManager: {
-    create(cwd: string, sessionDir?: string, options?: { id?: string; parentSession?: string }): SdkSessionManagerLike;
-    open(path: string, sessionDir?: string, cwdOverride?: string): SdkSessionManagerLike;
-  };
+  SessionManager: SdkSessionManagerCtor;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null &&
+    (typeof value === "object" || typeof value === "function")
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function isSessionManagerCtor(value: unknown): value is SdkSessionManagerCtor {
+  const record = asRecord(value);
+  return (
+    record !== undefined &&
+    typeof record.create === "function" &&
+    typeof record.open === "function"
+  );
+}
+
+/**
+ * Resolve the SDK's SessionManager from the shapes a real host can produce.
+ *
+ * A class constructor is a FUNCTION, not an object. The previous loader checked
+ * `typeof ... !== "object"` and rejected the real SDK before `create()` ran.
+ * The contract that matters is the static `create`/`open` pair.
+ */
+export function resolveSessionManagerExport(
+  loaded: unknown,
+): SdkSessionManagerCtor | undefined {
+  const root = asRecord(loaded);
+  if (!root) return undefined;
+  if (isSessionManagerCtor(root.SessionManager)) return root.SessionManager;
+
+  const defaultExport = asRecord(root.default);
+  if (!defaultExport) return undefined;
+  if (isSessionManagerCtor(defaultExport.SessionManager)) {
+    return defaultExport.SessionManager;
+  }
+  if (isSessionManagerCtor(defaultExport)) return defaultExport;
+  return undefined;
+}
+
+/** Bounded module-shape diagnostics; never prints function bodies or secrets. */
+function describeSdkExports(loaded: unknown): string {
+  const root = asRecord(loaded);
+  if (!root) return `module value is ${loaded === null ? "null" : typeof loaded}`;
+  const keys = Object.keys(root).slice(0, 12);
+  const sessionManagerType =
+    "SessionManager" in root ? typeof root.SessionManager : "missing";
+  const defaultType = "default" in root ? typeof root.default : "missing";
+  return `keys=[${keys.join(", ")}]; SessionManager=${sessionManagerType}; default=${defaultType}`;
+}
+
+/**
+ * Load the Pi SDK through an injected importer (keeps the peer dependency out
+ * of this module's static imports) and validate its SessionManager contract.
+ */
+export async function loadPiSdkModule(
+  importModule: () => Promise<unknown>,
+  moduleName = "@earendil-works/pi-coding-agent",
+): Promise<SdkLike> {
+  let loaded: unknown;
+  try {
+    loaded = await importModule();
+  } catch (error: unknown) {
+    throw new Error(
+      `the Pi SDK package ${moduleName} could not be loaded: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  const manager = resolveSessionManagerExport(loaded);
+  if (!manager) {
+    throw new Error(
+      `the Pi SDK SessionManager is unavailable or invalid in ${moduleName} (${describeSdkExports(loaded)})`,
+    );
+  }
+  return { SessionManager: manager };
 }
 
 /** Custom entry that forces a lazy session file to exist. Never LLM-visible. */
@@ -95,6 +182,11 @@ function hasIndex(
 
 export function createSdkWorkerPort(options: SdkWorkerPortOptions): SdkWorkerPort {
   return {
+    async probe() {
+      // Validation only: no session file, no metadata, no wake.
+      await options.loadSdk();
+    },
+
     async createSession({ cwd, name }) {
       const sdk = await options.loadSdk();
       const manager = sdk.SessionManager.create(

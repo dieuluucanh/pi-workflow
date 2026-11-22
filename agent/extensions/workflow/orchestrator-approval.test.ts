@@ -143,6 +143,23 @@ test("a blocked preview cannot be approved", () => {
   assert.equal(result.ok, false);
   assert.equal((result as { code: string }).code, "blocked");
 
+  // A terminal that exists but cannot load the SDK is not a usable child host.
+  const sdkBlocked = preview({
+    launcher: {
+      ready: false,
+      label: "Pi Terminal",
+      reason: "SDK worker storage unavailable: SessionManager export invalid",
+    },
+  });
+  assert.match(sdkBlocked.blockedReasons.join(" "), /SessionManager/);
+  const sdkResult = approveExecution(sdkBlocked, {
+    confirmation: APPROVAL_CONFIRMATION,
+    approvalId: "approval-2",
+    now: 3,
+  });
+  assert.equal(sdkResult.ok, false);
+  assert.equal((sdkResult as { code: string }).code, "blocked");
+
   const uncovered = preview({ plan: plan([task("1", ["rm-1"])]) });
   assert.match(uncovered.blockedReasons.join(" "), /rm-2/);
 });

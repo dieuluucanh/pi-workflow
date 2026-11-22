@@ -113,6 +113,16 @@ export interface ModeContribution extends ContributionBase {
   slot: "mode";
   label: string;
   detail?: string;
+  /**
+   * Optional id of a same-owner, top-level `kind:"action"` contribution that
+   * activates this mode label. The reference carries no command: a host still
+   * resolves and validates the named action before running it. Readers that do
+   * not know the field keep rendering the label without an action (v1 is
+   * additive). A dangling reference is allowed because envelopes can replace
+   * or withdraw contributions between publications; the host then renders a
+   * non-actionable label instead of inventing a command.
+   */
+  actionRef?: string;
   actions: ContributionAction[];
 }
 
@@ -324,9 +334,21 @@ function parseContribution(raw: unknown, ownerId: string): ContributionResult<Co
       if (raw.detail !== undefined && detail === undefined) return fail(`mode ${contributionId} detail is invalid`);
       const actions = parseActions(raw.actions, ownerId);
       if (!actions.ok) return actions;
+      const actionRef = raw.actionRef === undefined ? undefined : id(raw.actionRef);
+      if (raw.actionRef !== undefined && actionRef === undefined) {
+        return fail(`mode ${contributionId} actionRef is invalid`);
+      }
       return {
         ok: true,
-        value: { ...base, kind: "mode", slot: "mode", label, ...(detail === undefined ? {} : { detail }), actions: actions.value },
+        value: {
+          ...base,
+          kind: "mode",
+          slot: "mode",
+          label,
+          ...(detail === undefined ? {} : { detail }),
+          ...(actionRef === undefined ? {} : { actionRef }),
+          actions: actions.value,
+        },
       };
     }
     case "progress": {

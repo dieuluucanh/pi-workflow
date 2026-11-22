@@ -48,8 +48,11 @@ Plan → optional independent Review → configured presenter
 Both the automatic handoff and a direct request use ONE preparation service:
 
 - **Direct request.** In Orchestrator, ask for the work. The parent calls
-  `orchestrator_prepare`; `/orchestrator start` (or `start <path>`) is the same
-  route when typed as a command. A bare `/orchestrator` remains mode entry.
+  `orchestrator_prepare`; `/orchestrator start` is also the explicit RESUME
+  command: a bare start restores a bound plan's deterministic run/journal and,
+  if it already has an execution approval, starts the next ready task;
+  `start <path>` prepares an explicit plan. A bare `/orchestrator` remains mode
+  entry.
 - **Current discussion.** With no path, the parent snapshots the objective and
   the constraints the user stated, plus bullet/numbered lines as requirements.
   A formal Markdown plan and a separate Plan-mode approval are not required; the
@@ -119,7 +122,10 @@ never carries over to a changed preview.
    repair/rollover limits. Ordinary handoff Approve → Build is not repurposed.
 5. **Dispatch** — returns a durable launch/status receipt immediately. The child
    is a normal visible session; assignment start is one correlated wake after
-   readiness and lease grant. Resume alone stays idle.
+   readiness and lease grant. The terminal host's readiness includes an SDK
+   probe: a missing/invalid `SessionManager` blocks the approval preview instead
+   of failing after approval. A bare `/orchestrator start` resumes an approved
+   run through the same one-dispatch path; passive reload alone stays idle.
 6. **Candidate** — a report only proposes completion. Mutation is fenced after a
    real settle with tools/follow-ups drained.
 7. **Verification / acceptance** — the parent captures the actual baseline →

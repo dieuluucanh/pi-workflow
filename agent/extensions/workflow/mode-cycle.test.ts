@@ -72,6 +72,13 @@ async function tap(pi: ReturnType<typeof makeFakePi>, ctx: unknown, key = "tab")
   await shortcut.handler(ctx);
 }
 
+/** The composer's mode button runs this command; it must be the Tab cycle. */
+async function invokeCycle(pi: ReturnType<typeof makeFakePi>, ctx: unknown, args = "") {
+  const command = pi.commands["workflow-cycle"];
+  assert.ok(command, "the mode-cycle command must be registered");
+  await command.handler(args, ctx);
+}
+
 test("mode cycle: Tab and Ctrl+Alt+P walk Default → Plan → Orchestrator → Build", async () => {
   const b = await boot();
   try {
@@ -106,6 +113,85 @@ test("mode cycle: a double press advances twice, never losing a step", async () 
 
     await tap(b.pi, b.ctx);
     assert.equal(persistedMode(b.pi), "build");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("mode cycle: the composer command walks the same ring as Tab", async () => {
+  const b = await boot();
+  try {
+    // Alternate the two entry points: a click must not need Tab, and the pair
+    // must produce exactly one ring, including Default.
+    const seen: Array<string | null> = [];
+    await invokeCycle(b.pi, b.ctx);
+    seen.push(persistedMode(b.pi));
+    await tap(b.pi, b.ctx);
+    seen.push(persistedMode(b.pi));
+    await invokeCycle(b.pi, b.ctx);
+    seen.push(persistedMode(b.pi));
+    await tap(b.pi, b.ctx);
+    seen.push(persistedMode(b.pi));
+    assert.deepEqual(seen, ["plan", "orchestrator", "build", null]);
+
+    // A command that targeted a fixed mode (e.g. /build) would not return here.
+    await invokeCycle(b.pi, b.ctx, "ignored-argument");
+    assert.equal(persistedMode(b.pi), "plan");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("mode cycle: a double command activation advances twice, never losing a step", async () => {
+  const b = await boot();
+  try {
+    const first = invokeCycle(b.pi, b.ctx);
+    const second = invokeCycle(b.pi, b.ctx);
+    await Promise.all([first, second]);
+    assert.equal(persistedMode(b.pi), "orchestrator");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("mode cycle: the command shares the overlay-open guard with Tab", async () => {
+  const branch = [
+    { type: "message", message: { role: "user", content: "first prompt" } },
+    { type: "message", message: { role: "user", content: "second prompt" } },
+  ];
+  const b = await boot({ hasUI: true, branch });
+  try {
+    const before = persistedMode(b.pi);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    (b.ctx as any).ui.custom = async () => {
+      await gate;
+      return null;
+    };
+    const rewinding = b.pi.commands.rewind.handler("", b.ctx);
+    await invokeCycle(b.pi, b.ctx);
+    assert.equal(persistedMode(b.pi), before, "a click is ignored while a dialog owns input");
+    release?.();
+    await rewinding;
+    await invokeCycle(b.pi, b.ctx);
+    assert.notEqual(persistedMode(b.pi), before);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("mode cycle: a queued cycle never crosses a session rebind", async () => {
+  const b = await boot();
+  try {
+    // The request is queued for the current session lifetime, then the session
+    // is shut down before the queued task observes it. The transition must be
+    // abandoned instead of publishing into a replacement session.
+    const pending = invokeCycle(b.pi, b.ctx);
+    await b.pi.emit("session_shutdown", { reason: "reload" }, b.ctx);
+    await pending;
+    assert.equal(persistedMode(b.pi), null);
   } finally {
     await b.cleanup();
   }

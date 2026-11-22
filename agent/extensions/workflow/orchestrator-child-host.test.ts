@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   controlGrantRefFrom,
   createChildDispatcher,
+  createTerminalChildHost,
   kickoffText,
   type ChildHost,
   type HostCapability,
@@ -263,6 +264,77 @@ test("dispatcher: a missing Builder model or unavailable host prepares nothing",
   assert.equal(prepared.ok, false);
   if (prepared.ok) return;
   assert.match(prepared.error, /Builder model/);
+});
+
+test("terminal host: readiness includes the SDK probe", async () => {
+  const terminal = {
+    port: {
+      capabilities: async () => ({
+        available: true,
+        label: "Test Terminal",
+        separateWindow: true,
+        focus: false,
+      }),
+    },
+  } as never;
+  const healthy = createTerminalChildHost({
+    sdk: async () => ({ probe: async () => undefined }) as never,
+    terminal,
+    label: "Test Terminal",
+  });
+  const ready = await healthy.capabilities();
+  assert.equal(ready.available, true);
+  assert.equal(ready.label, "Test Terminal");
+
+  const broken = createTerminalChildHost({
+    sdk: async () =>
+      ({
+        probe: async () => {
+          throw new Error("SessionManager export invalid");
+        },
+      }) as never,
+    terminal,
+    label: "Test Terminal",
+  });
+  const unavailable = await broken.capabilities();
+  assert.equal(unavailable.available, false);
+  assert.match(unavailable.reason ?? "", /SDK worker storage unavailable/);
+  assert.match(unavailable.reason ?? "", /SessionManager export invalid/);
+});
+
+test("terminal host: a failed SDK probe prepares nothing", async () => {
+  let creates = 0;
+  const host = createTerminalChildHost({
+    sdk: async () =>
+      ({
+        probe: async () => {
+          throw new Error("SessionManager unavailable");
+        },
+        createSession: async () => {
+          creates += 1;
+          return { sessionId: "s", sessionFile: "C:/sessions/s.jsonl" };
+        },
+      }) as never,
+    terminal: {
+      port: {
+        capabilities: async () => ({
+          available: true,
+          label: "Test Terminal",
+          separateWindow: true,
+          focus: false,
+        }),
+      },
+    } as never,
+  });
+  const prepared = await host.prepare({
+    launch: {} as never,
+    grantRef: "g",
+    controlSessionId: "control-1",
+  });
+  assert.equal(prepared.ok, false);
+  if (prepared.ok) return;
+  assert.match(prepared.error, /SDK worker storage is unavailable/);
+  assert.equal(creates, 0);
 });
 
 test("kickoff text carries the assignment contract, not the roadmap", () => {

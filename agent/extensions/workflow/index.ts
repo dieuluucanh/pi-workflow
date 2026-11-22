@@ -305,7 +305,7 @@ import { createChildDispatcher, createDesktopChildHost, createTerminalChildHost,
 import { createRunControl, createChildControl, readWorkerGrant, type ChildControl, type RunControl } from "./orchestrator-run-control.ts";
 import { createTerminalHost } from "./orchestrator-launcher-node.ts";
 import { createDesktopSessionHost } from "./orchestrator-desktop-host.ts";
-import { createSdkWorkerPort } from "./orchestrator-sdk.ts";
+import { createSdkWorkerPort, loadPiSdkModule, type SdkLike } from "./orchestrator-sdk.ts";
 import { createVerifyRuntime } from "./orchestrator-verify-runtime.ts";
 import { createBudgetRuntime } from "./orchestrator-budget-runtime.ts";
 import { createFinalRuntime } from "./orchestrator-final-runtime.ts";
@@ -5919,20 +5919,29 @@ export default function workflowExtension(
     }
   }
 
+  let lastContributionFailure: string | undefined;
+
   /**
    * Publish Workflow's UI through the generic contract (step 10). The existing
    * statuses/widgets stay authoritative for terminal Pi; this is additive and
    * silently falls back when the host does not speak the contract.
+   *
+   * The publisher's verdict is inspected instead of assumed: a refused set
+   * keeps the last valid state and reports one bounded, deduplicated diagnostic
+   * (the payload itself is never logged).
    */
   function publishContributions(): void {
     if (!contributionsPublisher) return;
     try {
-      contributionsPublisher.set(
+      const result = contributionsPublisher.set(
         buildWorkflowContributions({
           mode: workflowMode,
           done: todos.items.filter((item) => isDone(item)).length,
           total: todos.items.length,
           stale: todoStale,
+          // The composer's mode label references this action; never advertise
+          // it when the command could not be registered.
+          cycleAvailable: modeCycleCommandRegistered,
           reviewPhase: reviewTurn,
           handoffPending: awaitingDecision && reviewTurn === "idle",
           ...(handoffStageForStatus() === undefined
@@ -5955,6 +5964,15 @@ export default function workflowExtension(
               }),
         }),
       );
+      if (!result.ok) {
+        const reason = (result.reason ?? "publisher refused the set").slice(0, 300);
+        if (reason !== lastContributionFailure) {
+          lastContributionFailure = reason;
+          console.warn(`[workflow] contribution set rejected: ${reason}`);
+        }
+      } else {
+        lastContributionFailure = undefined;
+      }
     } catch (_e) {
       void _e;
     }
@@ -6121,9 +6139,10 @@ export default function workflowExtension(
   }
 
   /**
-   * Orchestrator is opt-in: it is deliberately absent from the Tab cycle. The
-   * setter only changes mode/role/tools and status; it never creates a child
-   * session, dispatch intent or prompt. Entering the mode must not launch work.
+   * Orchestrator is opt-in in the sense that nothing runs on entry: the setter
+   * only changes mode/role/tools and status; it never creates a child session,
+   * dispatch intent or prompt. It IS part of the ordinary cycle
+   * (Default → Plan → Orchestrator → Build).
    */
   async function setOrchestratorMode(
     ctx: ExtensionContext,
@@ -6131,7 +6150,7 @@ export default function workflowExtension(
   ) {
     if (workflowMode === "orchestrator") {
       ctx.ui.notify(
-        "Already in Orchestrator mode — no work is running until you approve an execution breakdown. Tab continues to Build; /plan or /build switch directly.",
+        "Already in Orchestrator mode — no work is running until you approve an execution breakdown. Tab/cycle continues to Build; /plan, /build or /default switch directly.",
         "info",
       );
       return;
@@ -6163,7 +6182,7 @@ export default function workflowExtension(
     pi.setActiveTools(orchestratorModeTools(toolsBeforePlanMode));
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Orchestrator mode — roadmap and verification only. Nothing runs until you review and approve an execution breakdown. Tab continues to Build; /plan or /build switch directly.",
+        "Orchestrator mode — roadmap and verification only. Nothing runs until you review and approve an execution breakdown. Tab/cycle continues to Build; /plan, /build or /default switch directly.",
         "info",
       );
     }
@@ -6227,6 +6246,15 @@ export default function workflowExtension(
    * stale snapshot. A rejected transition never poisons the queue.
    */
   let modeTransitionTail: Promise<unknown> = Promise.resolve();
+  /**
+   * Session lifetime for queued transitions. A task queued before a rebind
+   * (reload/switch/shutdown) must not persist or publish a mode into the
+   * replacement session with the old context.
+   */
+  let modeSessionGeneration = 0;
+  /** False when `/workflow-cycle` could not be registered (name taken). */
+  let modeCycleCommandRegistered = false;
+
   function enqueueModeTransition<T>(task: () => Promise<T>): Promise<T> {
     const run = modeTransitionTail.then(task, task);
     modeTransitionTail = run.then(
@@ -6236,38 +6264,71 @@ export default function workflowExtension(
     return run;
   }
 
+  /**
+   * Applies one target against the mode that is live *now*. The caller owns the
+   * queue, so this never enqueues again (that would deadlock the serial tail).
+   */
+  async function applyModeTarget(
+    next: WorkflowMode | ((current: WorkflowMode) => WorkflowMode),
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ): Promise<void> {
+    const target = typeof next === "function" ? next(workflowMode) : next;
+    if (target === "plan") await setPlanMode(ctx, opts);
+    else if (target === "orchestrator") await setOrchestratorMode(ctx, opts);
+    else if (target === "build") await setBuildMode(ctx, opts);
+    else await setDefaultMode(ctx, opts);
+  }
+
   /** One serialized entry point for every mode selection. */
   function switchWorkflowMode(
     next: WorkflowMode | ((current: WorkflowMode) => WorkflowMode),
     ctx: ExtensionContext,
     opts?: ModeSwitchOptions,
   ): Promise<void> {
-    return enqueueModeTransition(async () => {
-      const target = typeof next === "function" ? next(workflowMode) : next;
-      if (target === "plan") await setPlanMode(ctx, opts);
-      else if (target === "orchestrator") await setOrchestratorMode(ctx, opts);
-      else if (target === "build") await setBuildMode(ctx, opts);
-      else await setDefaultMode(ctx, opts);
-    });
+    return enqueueModeTransition(() => applyModeTarget(next, ctx, opts));
   }
 
   /** The cycle ring this session may use (a managed worker omits Orchestrator). */
   function sessionModeCycleOrder(): readonly WorkflowMode[] {
-    return modeCycleOrder({ managedWorker: managedGate !== undefined });
+    // A quarantined managed session is still a worker: offering Orchestrator
+    // would make every Tab press land on a refused target (stuck cycle).
+    return modeCycleOrder({
+      managedWorker: managedGate !== undefined || managedQuarantine !== undefined,
+    });
   }
 
-  async function cycleWorkflowMode(ctx: ExtensionContext) {
-    // Keyboard cycling is silent: no chat line, no band. The footer status is
-    // the confirmation (see plan 2026-09-19). A live review is the one
-    // exception: Tab / Ctrl+Alt+P are refused with one notice instead of
-    // silently changing mode and suspending the reviewer.
-    if (blockModeSwitchDuringReview(ctx)) return;
-    const opts: ModeSwitchOptions = { quiet: true };
-    await switchWorkflowMode(
-      (current) => cycleMode(current, 1, sessionModeCycleOrder()),
-      ctx,
-      opts,
-    );
+  /**
+   * The single cycle operation behind Tab, Ctrl+Alt+P and the composer's mode
+   * button. It observes the same serialized controller as every other switch:
+   * the next mode is computed inside the queued task from the live mode, so a
+   * double activation advances twice instead of racing on a stale snapshot.
+   *
+   * Overlay, Review and session-lifetime guards are re-checked *inside* the
+   * task: a dialog/review that opened while the request waited still wins, and
+   * an obsolete context never publishes into a replacement session.
+   */
+  function cycleWorkflowMode(ctx: ExtensionContext): Promise<void> {
+    const generation = modeSessionGeneration;
+    return enqueueModeTransition(async () => {
+      if (generation !== modeSessionGeneration) return;
+      if (overlayDepth > 0) return;
+      // Keyboard cycling is silent: no chat line, no band. The footer status and
+      // the published mode are the confirmation (see plan 2026-09-19). A live
+      // review is the one exception: Tab / Ctrl+Alt+P / the button are refused
+      // with one notice instead of silently changing mode and suspending the
+      // reviewer.
+      if (blockModeSwitchDuringReview(ctx)) return;
+      await applyModeTarget(
+        (current) => cycleMode(current, 1, sessionModeCycleOrder()),
+        ctx,
+        { quiet: true },
+      );
+      // A no-op/refused setter publishes nothing itself; republishing the live
+      // mode keeps an external control (the composer button) convergent
+      // without claiming a transition. The publisher drops unchanged sets.
+      publishContributions();
+    });
   }
 
   // legacy alias for backward compat
@@ -7847,23 +7908,50 @@ export default function workflowExtension(
           // `/orchestrator start [path]` is the manual work-entry route: it is
           // identical to calling orchestrator_prepare, so a user does not need
           // a plan handoff (or /build) to compile the work.
-          if (/^start(?:\s|$)/i.test(text) && !orchestratorRuntime) {
+          const isStart = /^start(?:\s|$)/i.test(text);
+          const startRest = isStart ? text.replace(/^start\s*/i, "").trim() : "";
+          if (isStart && !orchestratorRuntime) {
             if (workflowMode !== "orchestrator") {
               await switchWorkflowMode("orchestrator", ctx as any);
             }
-            const started = await startOrchestratorWork(
-              liveCtx,
-              text.replace(/^start\s*/i, "").trim(),
-            );
-            ctx.ui.notify(started.text, started.ok ? "info" : "warning");
-            updateStatus(ctx as any);
-            return;
+            if (startRest.length === 0 && currentPlanFile) {
+              // A bare start may be resuming an approved run after a reload.
+              // Restore the deterministic journal first; only prepare when no
+              // existing run was found.
+              const runtime = ensureOrchestratorRuntime(liveCtx);
+              let restored = false;
+              try {
+                const ingested = await runtime.ingest({
+                  planPath: currentPlanFile,
+                });
+                restored = ingested.ok && !ingested.value.created;
+              } catch (_e) {
+                void _e;
+              }
+              if (!restored) {
+                const prepared = await prepareOrchestratorStartCommand(
+                  liveCtx,
+                  "",
+                );
+                ctx.ui.notify(
+                  prepared.text,
+                  prepared.ok ? "info" : "warning",
+                );
+                updateStatus(ctx as any);
+                return;
+              }
+            } else {
+              const started = await startOrchestratorWork(liveCtx, startRest);
+              ctx.ui.notify(started.text, started.ok ? "info" : "warning");
+              updateStatus(ctx as any);
+              return;
+            }
           }
-          const operator = ensureOrchestratorOperator(liveCtx);
+          const operator = await ensureOrchestratorOperator(liveCtx);
           const result = await operator.run(text);
           let resultText = result.text;
           let resultOk = result.ok;
-          if (result.ok && result.verb === "approve") {
+          if (result.ok && (result.verb === "approve" || result.verb === "start")) {
             // Approval and “go ahead” are one user action. Persist first (the
             // operator already did), then use the same durable dispatch path.
             const started = await startNextReadyOrchestratorTask();
@@ -8043,11 +8131,8 @@ export default function workflowExtension(
 
   try {
     pi.registerShortcut(Key.ctrlAlt("p"), {
-      description: "Toggle plan/build mode",
-      handler: async (ctx: any) => {
-        if (overlayDepth > 0) return;
-        return await cycleWorkflowMode(ctx as any);
-      },
+      description: "Cycle workflow mode (Default → Plan → Orchestrator → Build)",
+      handler: async (ctx: any) => cycleWorkflowMode(ctx as any),
     });
   } catch (_e) {
     void _e;
@@ -8087,19 +8172,31 @@ export default function workflowExtension(
   // Tab cycles workflow modes (context-aware: not when an overlay is active).
   // WorkflowTabEditor gives Tab back to autocomplete while a suggestion list is
   // visible; this registration remains the no-list path. Single registration to
-  // avoid a duplicate-conflict warning.
+  // avoid a duplicate-conflict warning. The composer's mode button invokes the
+  // same cycle through `/workflow-cycle`, so both user paths cannot drift.
   try {
     pi.registerShortcut(
       "tab" as any,
       {
         description:
           "Cycle workflow mode (Tab; completes when a suggestion list is open)",
-        handler: async (ctx: any) => {
-          if (overlayDepth > 0) return;
-          return await cycleWorkflowMode(ctx as any);
-        },
+        handler: async (ctx: any) => cycleWorkflowMode(ctx as any),
       } as any,
     );
+  } catch (_e) {
+    void _e;
+  }
+
+  // One registered command for hosts that render the mode label as a button
+  // (Pi Desktop), and for users who prefer a slash command. It is the same
+  // guarded, serialized cycle as Tab; registration failure is recorded so the
+  // publisher never advertises an action that cannot run.
+  try {
+    pi.registerCommand("workflow-cycle", {
+      description: "Cycle workflow mode (Default → Plan → Orchestrator → Build)",
+      handler: async (_args, ctx) => cycleWorkflowMode(ctx as any),
+    });
+    modeCycleCommandRegistered = true;
   } catch (_e) {
     void _e;
   }
@@ -12258,6 +12355,9 @@ ${rows}`,
   // ── Session & Agent lifecycle ────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
+    // A rebind starts a new lifetime for queued mode transitions: anything
+    // still waiting from the previous session must not publish into this one.
+    modeSessionGeneration += 1;
     // Managed worker identity first: every later handler (prompt context, the
     // readiness gate, handoff suppression) reads it.
     resetOrchestratorComposition();
@@ -12901,6 +13001,9 @@ ${rows}`,
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    // The session is going away: queued transitions must observe a stale
+    // lifetime and stop before persisting/publishing with this context.
+    modeSessionGeneration += 1;
     try {
       orchestratorPump?.dispose();
       orchestratorPump = undefined;
@@ -16224,20 +16327,12 @@ ${rows}`,
     return process.platform === "win32" ? root.toLowerCase() : root;
   }
 
-  async function loadPiSdk(): Promise<{
-    SessionManager: {
-      create(cwd: string, sessionDir?: string, options?: { id?: string; parentSession?: string }): never;
-      open(path: string, sessionDir?: string, cwdOverride?: string): never;
-    };
-  }> {
+  async function loadPiSdk(): Promise<SdkLike> {
     // A supported peer dependency, resolved at runtime. Never a bundled copy
-    // and never a node_modules patch.
+    // and never a node_modules patch. The importer is injected so the loader's
+    // contract tests cover the same path a host uses.
     const moduleName = ["@earendil-works", "pi-coding-agent"].join("/");
-    const loaded: any = await import(moduleName);
-    if (!loaded || typeof loaded.SessionManager !== "object") {
-      throw new Error("the Pi SDK SessionManager is unavailable in this host");
-    }
-    return { SessionManager: loaded.SessionManager };
+    return loadPiSdkModule(async () => await import(moduleName), moduleName);
   }
 
   function ensureOrchestratorSdk(): ReturnType<typeof createSdkWorkerPort> {
@@ -17392,18 +17487,15 @@ ${rows}`,
    * preparation service. No path (or `discussion`) captures the current
    * discussion; a path snapshots the explicit plan. It never dispatches.
    */
-  async function startOrchestratorWork(
+  async function prepareOrchestratorStartCommand(
     ctx: ExtensionContext,
     rest: string,
   ): Promise<{ ok: boolean; text: string }> {
-    if (orchestratorRuntime) {
-      return {
-        ok: false,
-        text: "A run is already bound; use /orchestrator status, or /orchestrator retry after a block. Nothing was prepared twice.",
-      };
-    }
     const asked = rest.toLowerCase();
-    const fromDiscussion = asked.length === 0 || asked === "discussion" || asked === "current discussion";
+    const fromDiscussion =
+      asked.length === 0 ||
+      asked === "discussion" ||
+      asked === "current discussion";
     const objective = lastUserPrompt.trim();
     const prepared = await prepareOrchestratorWork(ctx, {
       source: fromDiscussion ? "discussion" : "plan",
@@ -17418,6 +17510,19 @@ ${rows}`,
       ok: true,
       text: `${prepared.text}\n\n(Started by /orchestrator start — the same preparation service as orchestrator_prepare. The execution breakdown still needs your approval.)`,
     };
+  }
+
+  async function startOrchestratorWork(
+    ctx: ExtensionContext,
+    rest: string,
+  ): Promise<{ ok: boolean; text: string }> {
+    if (orchestratorRuntime) {
+      return {
+        ok: false,
+        text: "A run is already bound; use /orchestrator status, or /orchestrator retry after a block. Nothing was prepared twice.",
+      };
+    }
+    return prepareOrchestratorStartCommand(ctx, rest);
   }
 
   function ensureOrchestratorRuntime(ctx: ExtensionContext): OrchestratorRuntime {
@@ -17437,21 +17542,36 @@ ${rows}`,
     return orchestratorRuntime;
   }
 
-  function ensureOrchestratorOperator(
+  async function ensureOrchestratorOperator(
     ctx: ExtensionContext,
-  ): ReturnType<typeof createOperatorRuntime> {
+  ): Promise<ReturnType<typeof createOperatorRuntime>> {
     if (orchestratorOperator) return orchestratorOperator;
     orchestratorOperator = createOperatorRuntime({
       runtime: () => orchestratorRuntime,
       now: () => Date.now(),
     });
-    // Bind a run on demand from the session's approved plan, so /orchestrator
-    // status works after a reload without re-approving anything.
+    // Bind a run on demand from the session's approved plan, so an approved
+    // run survives a reload. Await the deterministic restore BEFORE the operator
+    // reads the runtime; otherwise `start` sees an unbound run and only reports
+    // a refusal.
     if (!orchestratorRuntime && currentPlanFile) {
       const runtime = ensureOrchestratorRuntime(ctx);
-      void runtime
-        .ingest({ planPath: currentPlanFile })
-        .catch(() => undefined);
+      try {
+        const ingested = await runtime.ingest({ planPath: currentPlanFile });
+        if (!ingested.ok) {
+          ctx.ui.notify(
+            `The bound orchestrator plan could not be restored: ${ingested.error}. Nothing was launched.`,
+            "warning",
+          );
+        }
+      } catch (error: unknown) {
+        ctx.ui.notify(
+          `The bound orchestrator plan could not be restored: ${
+            error instanceof Error ? error.message : String(error)
+          }. Nothing was launched.`,
+          "warning",
+        );
+      }
     }
     return orchestratorOperator;
   }

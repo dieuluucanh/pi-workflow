@@ -28,6 +28,11 @@ export const MAX_METADATA_CHARS = 8_000;
 export const MAX_RESOURCES = 64;
 
 export interface WorkerSdkPort {
+  /**
+   * Load and validate the SDK without creating a session. Hosts use this to
+   * advertise readiness before an approval, not only when a dispatch fails.
+   */
+  probe?(): Promise<void>;
   createSession(input: {
     cwd: string;
     agentDir?: string;
