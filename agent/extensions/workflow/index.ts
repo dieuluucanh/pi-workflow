@@ -298,6 +298,17 @@ import { createSdkWorkerPort } from "./orchestrator-sdk.ts";
 import { createVerifyRuntime } from "./orchestrator-verify-runtime.ts";
 import { createBudgetRuntime } from "./orchestrator-budget-runtime.ts";
 import { createFinalRuntime } from "./orchestrator-final-runtime.ts";
+import {
+  buildOrchestratorMission,
+  ORCHESTRATOR_CONTEXT_ENTRY,
+  type OrchestratorPhase,
+} from "./orchestrator-mission.ts";
+import {
+  discussionSourceFileName,
+  resolveWorkSource,
+  summarizeWorkSource,
+  type DiscussionSource,
+} from "./orchestrator-source.ts";
 import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
 import { createCommitLedger } from "./orchestrator-commits.ts";
 import {
@@ -1002,6 +1013,11 @@ export default function workflowExtension(
   const checkpoints = new Map<string, string>();
   let currentEntryId: string | undefined;
   let lastPromptHeader: string | undefined;
+  /**
+   * The current user prompt (bounded). Discussion work is captured from this,
+   * so a work request does not need a plan file or a second prompt.
+   */
+  let lastUserPrompt = "";
   const recentRestores = new Set<string>();
 
   // ── Model roles state ──────────────────────────────────────────
@@ -7860,7 +7876,7 @@ export default function workflowExtension(
   try {
     pi.registerCommand("orchestrator", {
       description:
-        "Enter Orchestrator mode, or run an operator command: status|start|pause|resume|stop|inspect|say|retry|approve|cancel.",
+        "Enter Orchestrator mode, or run an operator command: status|preview|start|pause|resume|stop|inspect|say|retry|refine|approve|cancel.",
       handler: async (args, ctx) => {
         const text = typeof args === "string" ? args.trim() : "";
         if (text.length === 0) {
@@ -7871,6 +7887,21 @@ export default function workflowExtension(
           const liveCtx = ctx as ExtensionContext;
           if (/^finalize/i.test(text)) {
             await runOrchestratorFinalize(liveCtx);
+            return;
+          }
+          // `/orchestrator start [path]` is the manual work-entry route: it is
+          // identical to calling orchestrator_prepare, so a user does not need
+          // a plan handoff (or /build) to compile the work.
+          if (/^start(?:\s|$)/i.test(text) && !orchestratorRuntime) {
+            if (workflowMode !== "orchestrator") {
+              await switchWorkflowMode("orchestrator", ctx as any);
+            }
+            const started = await startOrchestratorWork(
+              liveCtx,
+              text.replace(/^start\s*/i, "").trim(),
+            );
+            ctx.ui.notify(started.text, started.ok ? "info" : "warning");
+            updateStatus(ctx as any);
             return;
           }
           const operator = ensureOrchestratorOperator(liveCtx);
@@ -11282,6 +11313,26 @@ ${rows}`,
       };
     },
     epoch: () => orchestrationEpoch,
+    prepareEligible: () => {
+      if (managedGate || workerBinding || managedQuarantine) {
+        return "A managed worker cannot prepare parent orchestration. Finish the assignment and report.";
+      }
+      if (workflowMode !== "orchestrator") {
+        return "Orchestration preparation is available in Orchestrator mode only. Enter it with /orchestrator; no /build switch is needed.";
+      }
+      return undefined;
+    },
+    prepare: async (input) => {
+      const owner = currentSessionCtx;
+      if (!owner) {
+        return {
+          ok: false,
+          code: "unavailable",
+          text: "No live session context is bound to this parent; nothing was prepared.",
+        };
+      }
+      return prepareOrchestratorWork(owner, input);
+    },
     eligible: () => {
       if (managedGate || workerBinding || managedQuarantine) {
         return "A managed worker cannot orchestrate: the parent owns dispatch. Finish the assignment and report.";
@@ -11290,7 +11341,7 @@ ${rows}`,
         return "Orchestration tools are available in Orchestrator mode only. Enter it with /orchestrator.";
       }
       if (!orchestratorRuntime) {
-        return "No approved roadmap is bound to this session yet. Approve a plan through the handoff first.";
+        return "No run is bound to this session yet. Call orchestrator_prepare with the work (current discussion by default, or an explicit plan path); a plan handoff or /build is not required.";
       }
       return undefined;
     },
@@ -14440,7 +14491,7 @@ ${rows}`,
         return {
           block: true,
           reason:
-            `Plan mode: \`${target}\` is excluded by \`workflow.folderPolicy.excludePaths\` (${hit.pattern}). ` +
+            `Workflow policy: \`${target}\` is excluded by \`workflow.folderPolicy.excludePaths\` (${hit.pattern}). ` +
             "An exclusion applies in every mode and cannot be granted; ask the user to revoke it with `/folder-policy exclude revoke`.",
         };
       }
@@ -14449,7 +14500,7 @@ ${rows}`,
         return {
           block: true,
           reason:
-            `Plan mode: \`${target}\` is a sensitive file (${hit.pattern}). ` +
+            `Workflow policy: \`${target}\` is a sensitive file (${hit.pattern}). ` +
             "Sensitive files are blocked in every mode.",
         };
       }
@@ -14490,9 +14541,9 @@ ${rows}`,
       }
     }
     // Resolve the role per call: an env-carried role (spawned subagent) wins,
-    // then the workflow mode (plan → planner, build → builder). Read lazily —
-    // `workflowMode` is null while the extension body is evaluated and changes
-    // on every Tab/mode switch.
+    // then the workflow mode (plan → planner, orchestrator → orchestrator,
+    // build → builder). Read lazily — `workflowMode` is null while the
+    // extension body is evaluated and changes on every Tab/mode switch.
     // Role resolution is centralized in policy-runtime.ts (step 5): env role
     // wins, then the live mode. The gate keeps every policy decision it had.
     const gate = resolveRolePolicy({
@@ -14507,7 +14558,10 @@ ${rows}`,
     if (restricted && event.toolName === "powershell") {
       return {
         block: true,
-        reason: `${gateRole} role: the powershell tool is blocked (use bash with allowlisted read-only/verify commands, or /build for unrestricted access).`,
+        reason:
+          gateRole === "orchestrator"
+            ? "orchestrator role: the powershell tool is blocked. The Orchestrator parent inspects and verifies only; project changes are delegated to a managed Build child."
+            : `${gateRole} role: the powershell tool is blocked (use bash with allowlisted read-only/verify commands, or /build for unrestricted access).`,
       } as any;
     }
 
@@ -14543,9 +14597,15 @@ ${rows}`,
           gateRole === "planner" && refusal.kind === "forbidden-syntax"
             ? ' Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.'
             : "";
-        const hint = refusal.suggestion
-          ? ` ${refusal.suggestion}`
-          : " Use /build or Tab for unrestricted access.";
+        let hint: string;
+        if (gateRole === "orchestrator") {
+          hint =
+            " The Orchestrator parent must not mutate the workspace itself: prepare the work, propose a breakdown, and dispatch a managed Build child.";
+        } else {
+          hint = refusal.suggestion
+            ? ` ${refusal.suggestion}`
+            : " Use /build or Tab for unrestricted access.";
+        }
         return {
           block: true,
           reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}) — ${refusal.detail}.${hint}${planHint}\nCommand: ${cmd}`,
@@ -14571,6 +14631,12 @@ ${rows}`,
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
       if (!isPlanWritePath(p, cwd)) {
+        if (workflowMode === "orchestrator") {
+          return {
+            block: true,
+            reason: `Orchestrator parent: ${event.toolName} is blocked. The parent inspects and verifies; it does not edit project sources. Prepare the work and dispatch a managed Build child (orchestrator_prepare → orchestrator_propose_tasks → approval → orchestrator_dispatch). Do not switch to /build for orchestration work.`,
+          } as any;
+        }
         return {
           block: true,
           reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /build or Tab to switch to Build mode.`,
@@ -15234,12 +15300,17 @@ ${rows}`,
     const feedbackTurn = reviewFeedbackTurn;
     reviewFeedbackTurn = false;
     try {
-      if (!feedbackTurn) endReviewTurn();
-      await beginReviewCycle({
-        reason: feedbackTurn ? "refine" : "prompt",
-        keepFindings: true,
-        planPath: currentPlanFile,
-      });
+      // Orchestrator has no automatic Plan->Review lifecycle: its own mission
+      // owns the turn. Starting a review cycle here reset the reviewer budget
+      // on every orchestration prompt.
+      if (workflowMode !== "orchestrator") {
+        if (!feedbackTurn) endReviewTurn();
+        await beginReviewCycle({
+          reason: feedbackTurn ? "refine" : "prompt",
+          keepFindings: true,
+          planPath: currentPlanFile,
+        });
+      }
     } catch (_e) {
       void _e;
     }
@@ -15247,6 +15318,7 @@ ${rows}`,
     try {
       const raw = String((event as any).prompt ?? (event as any).text ?? "");
       if (raw.trim()) {
+        lastUserPrompt = raw.trim().slice(0, 20_000);
         const first =
           raw
             .split(/\r?\n/)
@@ -15256,6 +15328,55 @@ ${rows}`,
       }
     } catch (_e) {
       void _e;
+    }
+    // ── Authoritative Orchestrator mission (plan step 4) ─────────────
+    // Mode selection used to change the badge/model/tools but inject nothing,
+    // so the model inferred a Plan identity from the read-only policy. This
+    // message names the mission, the work-entry tool and the delegation rule.
+    if (workflowMode === "orchestrator") {
+      const view = orchestratorRuntime?.view();
+      const accepted = view
+        ? view.state.order.filter((id) => view.state.tasks[id]?.state === "accepted")
+            .length
+        : 0;
+      const total = view?.state.order.length ?? 0;
+      const notes = btwNotes.length
+        ? `\n\n[BTW notes from user (address these)]:\n${btwNotes
+            .map((note) => `- ${note}`)
+            .join("\n")}`
+        : "";
+      btwNotes = [];
+      const host = orchestratorHostCapability;
+      const mission = buildOrchestratorMission({
+        phase: (view?.phase ?? "unbound") as OrchestratorPhase,
+        ...(view
+          ? {
+              runId: view.runId,
+              sourceLabel: view.roadmap.path,
+              taskCounts: { accepted, total },
+              ...(view.approval ? { breakdownApproved: true } : {}),
+            }
+          : {}),
+        coordinator: !managedGate && !workerBinding && !managedQuarantine,
+        ...(managedGate || workerBinding ? { managedWorker: true } : {}),
+        ...(managedQuarantine ? { quarantined: true } : {}),
+        ...(host
+          ? {
+              host: {
+                ready: host.available,
+                label: host.label,
+                ...(host.reason ? { reason: host.reason } : {}),
+              },
+            }
+          : {}),
+      });
+      return {
+        message: {
+          customType: ORCHESTRATOR_CONTEXT_ENTRY,
+          content: `${mission}${notes}`,
+          display: false,
+        },
+      } as any;
     }
     if (workflowMode === "plan") {
       const btwBlock = btwNotes.length
@@ -15295,11 +15416,13 @@ ${rows}`,
   // Context filter when not in plan
   pi.on("context", async (event) => {
     const isPlan = workflowMode === "plan";
+    const isOrchestrator = workflowMode === "orchestrator";
     // Drop stale workflow context injections; a fresh one is appended below.
     const filtered = (event.messages as any[]).filter((m: any) => {
       if (m.customType === "workflow-build-context") return false;
       if (m.customType === "workflow-todo-context") return false;
       if (m.customType === "workflow-plan-context") return isPlan;
+      if (m.customType === ORCHESTRATOR_CONTEXT_ENTRY) return isOrchestrator;
       if (isPlan) return true;
       if (m.role !== "user") return true;
       const c = m.content;
@@ -15964,6 +16087,10 @@ ${rows}`,
           now: Date.now(),
         });
         if (!captured.ok) throw new Error(captured.error);
+        // The candidate's own content digest is the workspace revision that
+        // acceptance evidence describes. Keeping the pre-dispatch value here
+        // made every post-check comparison compare a stale number to itself.
+        orchestratorWorkspaceRev = captured.value.digest;
         return captured.value;
       },
       executor: {
@@ -16000,6 +16127,21 @@ ${rows}`,
         },
       },
       workspaceRevision: () => orchestratorWorkspaceRev ?? "unbaselined",
+      revalidate: async () => {
+        const captured = await captureBaseline({
+          workspace: {
+            key: `git:${orchestratorWorkspaceKey()}`,
+            root: path.resolve(orchestratorRoot()),
+            kind: "git",
+            displayPath: orchestratorWorkspaceKey(),
+          },
+          port: baselinePort,
+          now: Date.now(),
+        });
+        if (!captured.ok) throw new Error(captured.error);
+        orchestratorWorkspaceRev = captured.value.digest;
+        return captured.value.digest;
+      },
       now: () => Date.now(),
     });
     return orchestratorVerify;
@@ -16434,6 +16576,178 @@ ${rows}`,
     }
     orchestratorDesktop = undefined;
     orchestratorEvidence.clear();
+  }
+
+  /**
+   * Resolve and snapshot the requested work, then return bounded breakdown
+   * instructions for THIS turn. Used by the `orchestrator_prepare` tool so a
+   * manual "work on this discussion" request never needs a plan handoff or a
+   * mode switch. Nothing is dispatched here.
+   */
+  async function prepareOrchestratorWork(
+    ctx: ExtensionContext,
+    input: {
+      source?: string;
+      planPath?: string;
+      objective?: string;
+      constraints?: string[];
+    },
+  ): Promise<
+    | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  > {
+    if (managedGate || workerBinding || managedQuarantine) {
+      return {
+        ok: false,
+        code: "unavailable",
+        text: "A managed worker cannot prepare parent orchestration; the parent owns dispatch.",
+      };
+    }
+    if (workflowMode !== "orchestrator") {
+      return {
+        ok: false,
+        code: "unavailable",
+        text: "Orchestration preparation is available in Orchestrator mode only. Enter it with /orchestrator; no /build switch is needed.",
+      };
+    }
+    const requested =
+      input.source === "plan" || input.source === "discussion" || input.source === "auto"
+        ? input.source
+        : "auto";
+    const resolved = resolveWorkSource({
+      request: {
+        source: requested,
+        ...(input.planPath ? { planPath: input.planPath } : {}),
+        ...(input.objective ? { objective: input.objective } : {}),
+        ...(input.constraints ? { constraints: input.constraints } : {}),
+        now: Date.now(),
+      },
+      ...(currentPlanFile ? { boundPlanPath: currentPlanFile } : {}),
+      ...(lastUserPrompt ? { lastUserPrompt } : {}),
+    });
+    if (!resolved.ok) {
+      return { ok: false, code: resolved.code, text: resolved.error };
+    }
+    const source = resolved.source;
+    const runtime = ensureOrchestratorRuntime(ctx);
+    try {
+      await refreshOrchestratorHostCapability();
+    } catch (_e) {
+      void _e;
+    }
+
+    let planPath: string;
+    let planText: string;
+    if (source.kind === "plan") {
+      planPath = source.path;
+      try {
+        planText = await fs.promises.readFile(planPath, "utf8");
+      } catch (error: unknown) {
+        return {
+          ok: false,
+          code: "missing",
+          text: `The plan could not be read: ${error instanceof Error ? error.message : String(error)}. Nothing was prepared.`,
+        };
+      }
+      if (!planText.trim()) {
+        return { ok: false, code: "missing", text: "The plan file is empty. Nothing was prepared." };
+      }
+    } else {
+      planText = source.markdown;
+      const dir = path.join(getAgentDir(), "orchestrator", "sources");
+      try {
+        await fs.promises.mkdir(dir, { recursive: true });
+        planPath = path.join(dir, discussionSourceFileName(source.digest));
+        await fs.promises.writeFile(planPath, planText, "utf8");
+      } catch (error: unknown) {
+        return {
+          ok: false,
+          code: "journal",
+          text: `The discussion snapshot could not be stored: ${error instanceof Error ? error.message : String(error)}. Nothing was prepared.`,
+        };
+      }
+    }
+
+    const ingested = await runtime.ingest({ planPath, planText });
+    if (!ingested.ok) {
+      return {
+        ok: false,
+        code: ingested.code,
+        text: `The work could not be captured for run ingestion: ${ingested.error}. Nothing was dispatched.`,
+      };
+    }
+    const view = ingested.value.view;
+    if (source.kind === "plan") {
+      currentPlanFile = planPath;
+    }
+    const requirements =
+      source.kind === "discussion"
+        ? source.requirements
+        : (runtime.preparationMessage()?.split("\n").filter((line) => line.startsWith("- ")) ?? []);
+    const requirementLines =
+      requirements.length > 0
+        ? requirements.slice(0, 60).map((entry) => `- ${entry}`).join("\n")
+        : `- ${view.roadmap.requirementCount} requirement(s) captured; call orchestrator_status for the run projection.`;
+    try {
+      await runtime.markPreparationStarted();
+    } catch (_e) {
+      void _e;
+    }
+    updateStatus(ctx);
+    return {
+      ok: true,
+      text: [
+        `Work source bound: ${summarizeWorkSource(source)}.`,
+        `Run ${view.runId} (phase ${view.phase}); ${view.roadmap.requirementCount} requirement(s).`,
+        "",
+        "Requirements:",
+        requirementLines,
+        "",
+        `Next: call orchestrator_propose_tasks with a TaskPlan {schemaVersion:1, runId:"${view.runId}", roadmapRevision:${view.roadmapRevision}, tasks:[...]} that covers every requirement and declares dependencies, expected files and acceptance checks.`,
+        "Then show the breakdown and ask the user for the separate execution approval. Nothing has been launched.",
+        "Do not switch to /build; the parent delegates project changes to managed Build children.",
+      ].join("\n"),
+      details: {
+        runId: view.runId,
+        phase: view.phase,
+        source: source.kind,
+        requirementCount: view.roadmap.requirementCount,
+        requiresApproval: true,
+      },
+    };
+  }
+
+  /**
+   * `/orchestrator start [path]` — the thin manual route into the same work
+   * preparation service. No path (or `discussion`) captures the current
+   * discussion; a path snapshots the explicit plan. It never dispatches.
+   */
+  async function startOrchestratorWork(
+    ctx: ExtensionContext,
+    rest: string,
+  ): Promise<{ ok: boolean; text: string }> {
+    if (orchestratorRuntime) {
+      return {
+        ok: false,
+        text: "A run is already bound; use /orchestrator status, or /orchestrator retry after a block. Nothing was prepared twice.",
+      };
+    }
+    const asked = rest.toLowerCase();
+    const fromDiscussion = asked.length === 0 || asked === "discussion" || asked === "current discussion";
+    const objective = lastUserPrompt.trim();
+    const prepared = await prepareOrchestratorWork(ctx, {
+      source: fromDiscussion ? "discussion" : "plan",
+      ...(fromDiscussion
+        ? objective.length > 0
+          ? { objective }
+          : {}
+        : { planPath: path.resolve(orchestratorRoot(), rest) }),
+    });
+    if (!prepared.ok) return { ok: false, text: prepared.text };
+    return {
+      ok: true,
+      text: `${prepared.text}\n\n(Started by /orchestrator start — the same preparation service as orchestrator_prepare. The execution breakdown still needs your approval.)`,
+    };
   }
 
   function ensureOrchestratorRuntime(ctx: ExtensionContext): OrchestratorRuntime {

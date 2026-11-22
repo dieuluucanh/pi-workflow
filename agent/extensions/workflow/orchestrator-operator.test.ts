@@ -15,6 +15,7 @@ import { createRunJournal, type JournalIo } from "./orchestrator-store.ts";
 import { snapshotRoadmap } from "./orchestrator-plan.ts";
 import { resolveBudget } from "./orchestrator-budget.ts";
 import { APPROVAL_CONFIRMATION } from "./orchestrator-approval.ts";
+import { previewApprovalId } from "./orchestrator-preview-view.ts";
 
 const ROADMAP = [
   "# Plan: one thing",
@@ -160,19 +161,53 @@ test("start refuses before a breakdown and before its approval", async () => {
   assert.match(pending.text, /not approved/);
 });
 
-test("approve requires the explicit confirmation and then start reports readiness only", async () => {
-  const { operator } = await setup();
+test("approve requires the exact preview id and then start reports readiness only", async () => {
+  const { runtime, operator } = await setup();
+  const preview = runtime.view()?.preview;
+  assert.ok(preview, "the breakdown preview exists");
+  const previewId = previewApprovalId(preview!);
+
   const wrong = await operator.run("approve yes");
   assert.equal(wrong.ok, false);
-  assert.match(wrong.text, /Approval refused/);
+  assert.match(wrong.text, /must name this preview/);
+  const literal = await operator.run(`approve ${APPROVAL_CONFIRMATION}`);
+  assert.equal(literal.ok, false, "the old literal confirmation is not a preview id");
 
-  const approved = await operator.run(`approve ${APPROVAL_CONFIRMATION}`);
+  const approved = await operator.run(`approve ${previewId}`);
   assert.equal(approved.ok, true, approved.text);
   assert.match(approved.text, /Execution approved/);
 
   const start = await operator.run("start");
   assert.equal(start.ok, true, start.text);
   assert.match(start.text, /never launches a child/);
+});
+
+test("preview renders scope, host, limits and the approval id; refine invalidates durably", async () => {
+  const { runtime, operator } = await setup();
+  const preview = await operator.run("preview");
+  assert.equal(preview.ok, true, preview.text);
+  assert.match(preview.text, /Execution preview preview-[0-9a-f]{16}/);
+  assert.match(preview.text, /Approve with: \/orchestrator approve preview-/);
+  assert.match(preview.text, /Checks:/);
+  assert.match(preview.text, /Limits:/);
+
+  await operator.run("approve " + previewApprovalId(runtime.view()!.preview!));
+  assert.equal(runtime.canDispatch().ok, true);
+
+  const missing = await operator.run("refine");
+  assert.equal(missing.ok, false);
+
+  const refined = await operator.run("refine split task one");
+  assert.equal(refined.ok, true, refined.text);
+  assert.equal(runtime.view()?.approval, null);
+  assert.equal(runtime.view()?.preview, null);
+  assert.equal(runtime.view()?.phase, "awaiting_approval");
+
+  // The invalidation is journaled: a reload must not resurrect the approval.
+  const restored = await runtime.restore();
+  assert.equal(restored.ok, true, restored.ok ? "" : restored.error);
+  assert.equal(runtime.view()?.approval, null);
+  assert.equal(runtime.view()?.preview, null);
 });
 
 test("pause/resume/stop are real transitions and never claim a fenced child", async () => {

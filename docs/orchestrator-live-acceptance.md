@@ -28,6 +28,15 @@ check, and a real-entrypoint managed-child test that authorizes only from the
 parent's signed grant and applies it at `workflow_worker_ready`. Full workflow
 suite, typecheck, write-policy 100/100 and read-policy checks are green.
 
+**Automated (third pass, green):** real-entrypoint `/orchestrator start` captures
+the current discussion with no plan file and launches nothing; the mission text is
+tested for identity/work-entry and absence of a `/build` remedy; the preview is
+rendered with its derived scope and approval is refused without the exact
+`preview-<digest>` id; refine is journaled and survives restore; content digests
+detect same-length edits and post-check drift; the lease high-water mark survives
+release, a second task and a restarted adapter. Typecheck and the focused suites
+are green. The full package run is recorded below when executed.
+
 **Manual (NOT RUN):** every row below. In particular:
 
 - No real provider/model turn has been executed for Orchestrator preparation,
@@ -75,6 +84,10 @@ Do not convert any row to PASSED without the real run described in it.
 | 15 | macOS Terminal launcher | Real window, spaces/Unicode path, resume without assignment text, authorized wake starts once | NOT RUN (no macOS host available) |
 | 16 | Linux/tmux launcher | Same as 15 on a real Linux desktop/server | NOT RUN (no Linux host available) |
 | 17 | Unsupported host/SDK | Native child tabs are reported unavailable; ordinary Build still works | NOT RUN |
+| 18 | Tab → “work on our current discussion” | No `/build` request; preparation binds a discussion snapshot; preview shows the derived requirements; zero children before approval | NOT RUN |
+| 19 | `/orchestrator start [path]` | Same preparation service as the tool; bare `/orchestrator` still only enters the mode | NOT RUN |
+| 20 | Preview approve/refine/cancel | Approval requires the displayed `preview-<id>`; refine voids it durably; cancel launches nothing; a stale id is refused | NOT RUN |
+| 21 | Same-length edit to an already-dirty file | Candidate revision changes; acceptance does not treat it as unchanged | NOT RUN |
 
 ## Automated evidence (context, not live signoff)
 

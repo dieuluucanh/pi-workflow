@@ -1,22 +1,57 @@
 # Orchestrator operation, migration and compatibility
 
-Status: **experimental**. The engine and its contracts are implemented and
-covered by automated tests; the live orchestration loop is not wired into the
-extension entrypoint yet. This document is the operator-facing contract for what
-exists today and what a later release will enable. It is not a claim that the
-live loop passed acceptance — see
+Status: **experimental**. The engine, its contracts and the live composition are
+implemented and covered by automated tests; real provider turns and visible-host
+signoff remain manual. This document is the operator-facing contract for what
+exists today. It is not a claim that the live loop passed acceptance — see
 [`orchestrator-live-acceptance.md`](orchestrator-live-acceptance.md).
 
 ## Enable / disable
 
 - Orchestrator is **opt-in**. `/orchestrator` enters the mode; entering the mode
-  launches nothing.
+  launches nothing. Tab does not advertise it as an execution mode.
 - Ordinary Plan → Review → Build, Default mode, Review Mode and all existing
   policies keep their behavior. There is no global switch that enables automatic
   orchestration.
 - To go back, leave the mode as usual (`/plan`, `/build`, `/default`); an
   in-flight run's controls are `pauseRun`/`resumeRun`/`stopRun` in the engine.
   If a run is terminal, it cannot be resumed or cancelled again.
+
+## Entry and work sources
+
+Both the automatic handoff and a direct request use ONE preparation service:
+
+- **Direct request.** In Orchestrator, ask for the work. The parent calls
+  `orchestrator_prepare`; `/orchestrator start` (or `start <path>`) is the same
+  route when typed as a command. A bare `/orchestrator` remains mode entry.
+- **Current discussion.** With no path, the parent snapshots the objective and
+  the constraints the user stated, plus bullet/numbered lines as requirements.
+  A formal Markdown plan and a separate Plan-mode approval are not required; the
+  execution preview shows the derived requirements before approval.
+- **Explicit plan.** `source:"plan"` / a path captures the exact bytes and
+  digest. An explicitly requested discussion wins over a stale
+  `currentPlanFile`.
+- **Ambiguity.** With no objective, no path and no bound plan, preparation asks
+  for the work instead of silently choosing an old plan or TODO list.
+- **No `/build` detour.** Orchestrator is a distinct role. Its edit/shell
+  refusals name delegation as the remedy; `/build` is a deliberate user choice,
+  not the response to an ordinary work request.
+
+## Operator commands
+
+```text
+/orchestrator                       # enter the mode only
+/orchestrator start [path]          # prepare discussion (default) or an explicit plan
+/orchestrator status                # phase, requirements, approval/next blocker
+/orchestrator preview               # the exact breakdown preview + approval id
+/orchestrator approve preview-<id>  # the ONE execution decision (id-bound)
+/orchestrator refine <what>         # durably void the preview/approval
+/orchestrator cancel                # terminal; nothing launched
+/orchestrator pause|resume|stop|retry|inspect|say <text>
+```
+
+The model has no approve tool. A stale, duplicate or wrong preview id is
+refused; an approval never carries over to a changed preview.
 
 ## Migration
 
@@ -37,25 +72,30 @@ live loop passed acceptance — see
 ## Run lifecycle
 
 1. **Mode** — opt-in, no launch.
-2. **Roadmap** — an explicit readable path is ingested verbatim; `- [x]` is a
-   claim, not proof, and ambiguous/empty parses are refused.
+2. **Source** — discussion snapshot or explicit readable path, captured verbatim
+   with a digest; `- [x]` is a claim, not proof, and ambiguous/empty parses are
+   refused. The source kind is shown in status and the preview.
 3. **Breakdown** — structured tasks must cover every outstanding requirement;
    dependencies must be a DAG. A material scope/criteria/dependency change needs
    a new approval revision.
-4. **Execution approval** — separate from mode entry and plan approval. It shows
-   the task mapping, model/limit estimates, launcher readiness, checks and
-   repair/rollover/commit behavior. Ordinary handoff Approve → Build is not
-   repurposed.
+4. **Execution approval** — separate from mode entry and plan approval. `/orchestrator
+   preview` shows the task mapping, model/limit estimates, launcher readiness,
+   checks, dirty baseline, commit behavior and repair/rollover limits; approval
+   names that preview's `preview-<digest>` id. Ordinary handoff Approve → Build
+   is not repurposed.
 5. **Dispatch** — returns a durable launch/status receipt immediately. The child
    is a normal visible session; assignment start is one correlated wake after
    readiness and lease grant. Resume alone stays idle.
 6. **Candidate** — a report only proposes completion. Mutation is fenced after a
    real settle with tools/follow-ups drained.
 7. **Verification / acceptance** — the parent captures the actual baseline →
-   candidate diff, runs required checks through normal gated execution, records
-   real evidence, and accepts atomically against the exact candidate, workspace
-   and roadmap revision. Missing evidence, a pre-existing red gate, an
-   unavailable tool, a manual-only check or a changed workspace blocks it.
+   candidate diff (content-addressed, including already-dirty, untracked,
+   deleted and non-Git files), runs required checks through normal gated
+   execution, recomputes the workspace revision after the checks, records real
+   evidence, and accepts atomically against the exact candidate, workspace and
+   roadmap revision. Missing content identity, missing evidence, a pre-existing
+   red gate, an unavailable tool, a manual-only check or a changed workspace
+   blocks it.
 8. **Repair / rollover** — failed criteria go back in a bounded scoped directive;
    the same warm child is preferred, a fresh continuation is used only when the
    child is gone. Counters survive. At the budget the run pauses; rollover uses a
@@ -82,8 +122,8 @@ live loop passed acceptance — see
 - **Fork/tree/rewind.** Those branches are historical for an active run; reuse
   requires an explicit clone/reconcile decision.
 - **Lease reclaim.** An expired lease is reclaimed only with the explicit
-  `reclaim-stale` confirmation and a higher generation. Never reuse a stale
-  generation.
+  `reclaim-stale` confirmation and a reserved higher generation. Fencing tokens
+  are workspace-wide and survive release/restart; never reuse a consumed token.
 - **Pause/stop.** Quiesce first; release the lease only after a real settle and
   drain. Stop retains edits and does **not** roll back automatically.
 - **Close/archive.** A child window/tab close is `interrupted`, not accepted

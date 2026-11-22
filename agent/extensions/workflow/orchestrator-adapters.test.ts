@@ -190,6 +190,75 @@ test("leases: expiry needs an explicit reclaim and generations never go backward
   }
 });
 
+test("leases: the generation high-water mark survives release, a new task and a restart", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const leases = createFileWorkspaceLeases({ root: dir, ttlMs: 10_000 });
+
+    const firstGen = leases.nextGeneration!(GRANT.workspaceKey);
+    assert.equal(firstGen, 1);
+    const first = leases.acquire({ ...GRANT, generation: firstGen });
+    assert.equal(first.ok, true);
+    assert.equal(leases.release((first as any).grant).ok, true);
+
+    // Task two must NOT propose generation 1 again; the high-water mark is
+    // workspace-wide, not task/attempt-local.
+    const secondGen = leases.nextGeneration!(GRANT.workspaceKey);
+    assert.equal(secondGen, 2);
+    const second = leases.acquire({
+      ...GRANT,
+      taskId: "task-2",
+      attemptId: "attempt-2",
+      sessionId: "session-2",
+      generation: secondGen,
+    });
+    assert.equal(second.ok, true, second.ok ? "" : second.error);
+    const staleTaskOne = leases.acquire({
+      ...GRANT,
+      attemptId: "attempt-1b",
+      sessionId: "session-1b",
+      generation: 1,
+    });
+    assert.equal((staleTaskOne as any).code, "held", "the live lease refuses an old generation");
+    assert.equal(leases.release((second as any).grant).ok, true);
+
+    // A new adapter instance (a restarted parent) reads the same high-water
+    // mark from disk instead of resetting to 0.
+    const restarted = createFileWorkspaceLeases({ root: dir, ttlMs: 10_000 });
+    assert.equal(restarted.nextGeneration!(GRANT.workspaceKey), 3);
+    const newRun = restarted.acquire({
+      ...GRANT,
+      runId: "run-2",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      sessionId: "session-3",
+      generation: 3,
+    });
+    assert.equal(newRun.ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("baseline: content digests are real file bytes and bound to the workspace root", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    fs.writeFileSync(path.join(dir, "same-length.txt"), "aaaa");
+    const port = createGitBaselinePort({
+      runGit: () => ({ ok: false, stdout: "", error: "not a repository" }),
+    });
+    const first = await port.contentDigest!(dir, "same-length.txt");
+    assert.match(first ?? "", /^[0-9a-f]{64}$/);
+    fs.writeFileSync(path.join(dir, "same-length.txt"), "bbbb");
+    const second = await port.contentDigest!(dir, "same-length.txt");
+    assert.notEqual(first, second, "same size, different bytes");
+    assert.equal(await port.contentDigest!(dir, "../outside.txt"), null);
+    assert.equal(await port.contentDigest!(dir, "missing.txt"), null);
+  } finally {
+    cleanup();
+  }
+});
+
 test("leases: release is holder-only, so a stale generation cannot free a live lease", () => {
   const { dir, cleanup } = tempDir();
   try {

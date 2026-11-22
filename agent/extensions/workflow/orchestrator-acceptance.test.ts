@@ -364,3 +364,49 @@ test("an advanced task state cannot accept stale evidence; ids are deterministic
   assert.equal(mismatched.ok, false);
   assert.equal((mismatched as any).code, "evidence");
 });
+
+test("content digests detect a same-length edit to an already-dirty file", () => {
+  const before = baseline(
+    [{ path: "src/api.ts", status: "modified", staged: false, size: 10, contentDigest: "old" }],
+    { contentComplete: true },
+  );
+  const after = baseline(
+    [{ path: "src/api.ts", status: "modified", staged: false, size: 10, contentDigest: "new" }],
+    { contentComplete: true },
+  );
+  const diff = diffCandidateChanges(before, after);
+  assert.deepEqual(diff.modified, ["src/api.ts"]);
+  assert.equal(diff.filesChanged, 1);
+});
+
+test("staged and unstaged observations of one path are not collapsed", () => {
+  const before = baseline([
+    { path: "src/api.ts", status: "modified", staged: false },
+  ]);
+  const after = baseline([
+    { path: "src/api.ts", status: "modified", staged: false },
+    { path: "src/api.ts", status: "modified", staged: true },
+  ]);
+  const diff = diffCandidateChanges(before, after);
+  assert.deepEqual(diff.modified, ["src/api.ts"]);
+
+  const reversed = diffCandidateChanges(after, before);
+  assert.ok(reversed.modified.includes("src/api.ts"));
+});
+
+test("metadata-only content coverage blocks acceptance instead of becoming a pass", async () => {
+  const built = ok<{ outcome: any }>(
+    await runAcceptance(
+      input({
+        baseline: baseline([], { contentComplete: false }),
+        candidate: baseline(
+          [{ path: "src/api.ts", status: "modified", staged: false }],
+          { contentComplete: false },
+        ),
+      }),
+      executor({ tests: { status: "passed", exitCode: 0 } }),
+    ),
+  );
+  assert.equal(built.outcome.phase, "blocked");
+  assert.match(built.outcome.blockers.join(" "), /no content identity/);
+});

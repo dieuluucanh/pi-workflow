@@ -98,6 +98,8 @@ export interface RuntimeView {
     title: string;
     requirementCount: number;
   };
+  /** Bounded requirement projection, so a preview can show real scope. */
+  requirements: ReadonlyArray<{ roadmapStepId: string; label: string; text: string }>;
   plan: TaskPlan | null;
   preview: ExecutionPreview | null;
   approval: ExecutionApprovalRecord | null;
@@ -122,7 +124,7 @@ export interface OrchestratorRuntime {
     RuntimeResult<{ record: ExecutionApprovalRecord; view: RuntimeView }>
   >;
   /** Refine invalidates the shown breakdown; no child is launched. */
-  refine(reason: string): RuntimeResult<{ view: RuntimeView }>;
+  refine(reason: string): Promise<RuntimeResult<{ view: RuntimeView }>>;
   cancel(reason: string): Promise<RuntimeResult<{ view: RuntimeView }>>;
   /** A bounded preparation prompt, exactly once per roadmap revision. */
   preparationMessage(): string | undefined;
@@ -227,6 +229,11 @@ export function createOrchestratorRuntime(
         title: snapshot.title,
         requirementCount: snapshot.requirements.length,
       },
+      requirements: snapshot.requirements.slice(0, 200).map((entry) => ({
+        roadmapStepId: entry.roadmapStepId,
+        label: entry.label,
+        text: entry.text,
+      })),
       plan,
       preview,
       approval,
@@ -325,9 +332,26 @@ export function createOrchestratorRuntime(
 
       runId = candidateRunId;
       journal = ports.createJournal(runId);
+      // A journal that already has events is authoritative. Never replace a
+      // stored run with a fresh one because restore failed or the bytes moved:
+      // that would silently void the breakdown, approvals and acceptance.
+      const existing = await journal.load();
+      const hadEvents = existing.ok && existing.value.events.length > 0;
       const restored = await runtime.restore();
-      if (restored.ok && restored.value.roadmap.digest === digest) {
-        return { ok: true, value: { runId, created: false, view: restored.value } };
+      if (restored.ok) {
+        if (restored.value.roadmap.digest === digest) {
+          return { ok: true, value: { runId, created: false, view: restored.value } };
+        }
+        return fail(
+          "invalid",
+          "the approved roadmap changed since this run was created; approve the new bytes explicitly (a silent re-ingest would void the stored breakdown and acceptance)",
+        );
+      }
+      if (hadEvents) {
+        return fail(
+          "journal",
+          `the existing run could not be restored (${restored.error}); inspect or recover its journal instead of starting a new run`,
+        );
       }
 
       // Changed bytes: everything downstream (plan, preview, approval) is void.
@@ -484,17 +508,33 @@ export function createOrchestratorRuntime(
       return { ok: true, value: { record: approved.record, view: buildView()! } };
     },
 
-    refine(reason) {
+    async refine(reason) {
       if (!runId || !state) return fail("state", "no run state");
+      if (cancelled) return fail("cancelled", "this run was cancelled");
       const text = clampText(reason, 500) || "the user asked to refine the breakdown";
-      // Refinement is not a run transition: the phase stays whatever it was, but
-      // the shown approval is dead until a new breakdown is approved.
+      if (!plan && !preview && !approval) {
+        return { ok: true, value: { view: buildView()! } };
+      }
+      // Journal the invalidation BEFORE touching memory. A refinement must
+      // survive reload: the old approval stays dead until a new breakdown is
+      // approved again.
+      const appended = await append(
+        "run.control",
+        { action: "refine", reason: text },
+        `breakdown-refined-${runId}-${state.revision + 1}`,
+      );
+      if (!appended.ok) return appended;
       approval = null;
       plan = null;
       preview = null;
       notify(`Breakdown needs refinement: ${text}. Nothing was dispatched.`, "warning");
       if (state.phase === "ready") {
-        state = { ...state, revision: state.revision + 1, phase: "awaiting_approval", updatedAt: now() };
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          phase: "awaiting_approval",
+          updatedAt: now(),
+        };
       }
       return { ok: true, value: { view: buildView()! } };
     },
@@ -633,17 +673,23 @@ export function createOrchestratorRuntime(
 
       for (const event of events) {
         if (event.type === "plan.proposed" && isRecord(event.payload)) {
+          // A newly proposed breakdown voids any approval restored earlier in
+          // this loop; approvals bind to one exact plan digest.
+          approval = null;
           const planArtifact = event.payload.planArtifact;
           const previewArtifact = event.payload.previewArtifact;
           if (typeof planArtifact === "string") {
             const read = await readArtifact(planArtifact);
-            // SAFETY: the artifact is written by `propose` from a validated
-            // TaskPlan; a non-object value is ignored rather than trusted.
+            // SAFETY: written by `propose` from a validated TaskPlan; the
+            // object check above keeps a non-object value out.
+            // SAFETY: artifact schema is owned by this runtime.
             if (read.ok && isRecord(read.value)) plan = read.value as unknown as TaskPlan;
           }
           if (typeof previewArtifact === "string") {
             const read = await readArtifact(previewArtifact);
-            // SAFETY: the artifact is written by buildExecutionPreview.
+            // SAFETY: written by buildExecutionPreview; the object check above
+            // keeps a non-object value out.
+            // SAFETY: artifact schema is owned by this runtime.
             if (read.ok && isRecord(read.value)) preview = read.value as unknown as ExecutionPreview;
           }
         }
@@ -655,10 +701,52 @@ export function createOrchestratorRuntime(
         if (event.type === "run.control" && isRecord(event.payload) && event.payload.action === "cancel") {
           cancelled = true;
         }
+        if (event.type === "run.control" && isRecord(event.payload) && event.payload.action === "refine") {
+          approval = null;
+          plan = null;
+          preview = null;
+          if (state.phase === "ready") {
+            state = {
+              ...state,
+              revision: state.revision + 1,
+              phase: "awaiting_approval",
+              updatedAt: now(),
+            };
+          }
+        }
       }
 
-      // Rebuild the reducer state from the durable plan, if one was applied.
-      if (plan) {
+      // Replay the complete ordered reducer history. Rebuilding only the
+      // plan/approval left tasks, starts, fences and acceptance in memory that
+      // a reload lost, so a resumed parent could not know a child was running.
+      const reducerTypes = new Set<string>(Object.keys(EVENT_JOURNAL_TYPE));
+      for (const event of events) {
+        const payload = event.payload;
+        if (
+          isRecord(payload) &&
+          typeof payload.type === "string" &&
+          reducerTypes.has(payload.type) &&
+          payload.runId === runId
+        ) {
+          // SAFETY: the payload is the exact RunEvent this runtime journaled in
+          // `applyEvent`; the type/runId checks above keep foreign records out.
+          const applied = applyRunEvent(state, {
+            ...(payload as unknown as RunEvent),
+            expectedRevision: state.revision,
+          });
+          if (!applied.ok) {
+            return fail(
+              "state",
+              `journal replay failed at ${event.type}: ${applied.error}`,
+            );
+          }
+          state = applied.state;
+        }
+      }
+
+      // Legacy journal written before every transition was journaled: rebuild
+      // the plan/approval phase without overwriting a newer reducer phase.
+      if (plan && state.planRevision === 0) {
         const applied = applyRunEvent(state, {
           type: "plan.apply",
           runId,
@@ -669,12 +757,17 @@ export function createOrchestratorRuntime(
         });
         if (applied.ok) state = applied.state;
       }
-      const phase: RunState["phase"] = approval
-        ? "ready"
-        : plan
-          ? "awaiting_approval"
-          : "draft";
-      state = { ...state, phase, updatedAt: now() };
+      if (approval && state.phase === "awaiting_approval") {
+        const ready = applyRunEvent(state, {
+          type: "run.transition",
+          runId,
+          now: now(),
+          expectedRevision: state.revision,
+          to: "ready",
+        });
+        if (ready.ok) state = ready.state;
+      }
+      state = { ...state, updatedAt: now() };
       return { ok: true, value: buildView()! };
     },
   };

@@ -32,6 +32,7 @@ import {
 import type { OrchestratorRuntime, ProposalContext } from "./orchestrator-runtime.ts";
 import type { WorkspaceLeases, LeaseGrant } from "./orchestrator-workspace.ts";
 import type { ExecutionBudgets } from "./orchestrator-types.ts";
+import { formatExecutionPreview, previewApprovalId, MAX_PREVIEW_VIEW_CHARS } from "./orchestrator-preview-view.ts";
 
 export const TOOL_ADAPTER_SCHEMA_VERSION = 1 as const;
 export const MAX_TOOL_TEXT = 2_000;
@@ -83,6 +84,25 @@ export interface ParentToolPorts {
    * can never grant orchestration authority.
    */
   eligible?: () => string | undefined;
+  /**
+   * Why preparation is unavailable (managed worker, wrong mode). Preparation
+   * must work BEFORE a run is bound, so it cannot use `eligible`.
+   */
+  prepareEligible?: () => string | undefined;
+  /**
+   * Resolve/snapshot the requested work and return bounded breakdown
+   * instructions. The extension owns file/run effects; this port only decides
+   * what the model is told.
+   */
+  prepare?: (input: {
+    source?: string;
+    planPath?: string;
+    objective?: string;
+    constraints?: string[];
+  }) => Promise<
+    | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  >;
 }
 
 export type ParentToolOutcome =
@@ -410,6 +430,40 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
     context,
 
     async call(name, params) {
+      const input = asParams(params);
+
+      // Preparation is the one parent capability available BEFORE a run is
+      // bound. It is still refused for workers, quarantine and other modes.
+      if (name === "orchestrator_prepare") {
+        const blocked = ports.prepareEligible?.();
+        if (blocked) {
+          return { ok: false, tool: name, code: "unavailable", text: blocked };
+        }
+        if (!ports.prepare) {
+          return {
+            ok: false,
+            tool: name,
+            code: "unavailable",
+            text: "This build has no work-source service bound; nothing was prepared.",
+          };
+        }
+        const prepared = await ports.prepare({
+          ...(typeof input.source === "string" ? { source: input.source } : {}),
+          ...(typeof input.planPath === "string" ? { planPath: input.planPath } : {}),
+          ...(typeof input.objective === "string" ? { objective: input.objective } : {}),
+          ...(Array.isArray(input.constraints)
+            ? {
+                constraints: input.constraints.filter(
+                  (entry): entry is string => typeof entry === "string",
+                ),
+              }
+            : {}),
+        });
+        return prepared.ok
+          ? { ok: true, tool: name, text: prepared.text, details: prepared.details }
+          : { ok: false, tool: name, code: prepared.code, text: prepared.text };
+      }
+
       const blocked = ports.eligible?.();
       if (blocked) {
         return { ok: false, tool: name, code: "unavailable", text: blocked };
@@ -418,7 +472,6 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       if (!built.ok) {
         return { ok: false, tool: name, code: "unavailable", text: built.error };
       }
-      const input = asParams(params);
 
       if (name === "orchestrator_propose_tasks") {
         const proposal = ports.proposalContext();
@@ -432,9 +485,8 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         }
         const proposed = await (ports.runtime() as OrchestratorRuntime).propose({
           plan: input.plan,
-          requirements: Array.isArray(input.requirements)
-            ? (input.requirements as never)
-            : undefined,
+          // Coverage is resolved by the runtime from the roadmap it snapshotted
+          // at ingest; a model-supplied requirement list is not authority.
           context: proposal,
         });
         if (!proposed.ok) {
@@ -446,13 +498,16 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
           ok: true,
           tool: name,
           text: bounded(
-            `Breakdown proposed: ${preview.tasks.length} task(s), ${preview.warnings.length} warning(s), ${blockers.length} blocker(s). ` +
-              (blockers.length > 0
-                ? `Blocked: ${blockers.join("; ")}. Fix these and propose again.`
-                : "An explicit execution approval is still required before any child starts."),
+            formatExecutionPreview({
+              preview,
+              requirements: proposed.value.view.requirements,
+              fromDiscussion: /discussion-[0-9a-f]+\.md$/i.test(proposed.value.view.roadmap.path),
+            }),
+            MAX_PREVIEW_VIEW_CHARS,
           ),
           details: {
             runId: preview.runId,
+            previewId: previewApprovalId(preview),
             planDigest: preview.planDigest,
             approvalDigest: preview.approvalDigest,
             taskCount: preview.tasks.length,

@@ -236,7 +236,7 @@ test("refine and cancel leave no approval and launch nothing", async () => {
   await runtime.approve({ confirmation: APPROVAL_CONFIRMATION });
   assert.equal(runtime.canDispatch().ok, true);
 
-  const refined = runtime.refine("grouping is wrong");
+  const refined = await runtime.refine("grouping is wrong");
   assert.equal(refined.ok, true);
   assert.equal(runtime.canDispatch().ok, false);
   assert.equal(runtime.view()?.approval, null);

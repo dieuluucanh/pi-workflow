@@ -376,5 +376,5 @@ test("registration exposes every parent tool name", () => {
   });
   assert.deepEqual(names, [...PARENT_TOOL_NAMES]);
   assert.equal(result.refused, null);
-  assert.equal(result.registered.length, 6);
+  assert.equal(result.registered.length, PARENT_TOOL_NAMES.length);
 });

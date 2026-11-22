@@ -231,22 +231,43 @@ function readLease(dir: string): LeaseFile | undefined {
   }
 }
 
-function generationOf(dir: string): number {
+function generationState(dir: string): { generation: number; reserved: number } {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(dir, "generation.json"), "utf8"));
-    return typeof raw.generation === "number" ? raw.generation : 0;
+    return {
+      generation: typeof raw.generation === "number" ? raw.generation : 0,
+      reserved: typeof raw.reserved === "number" ? raw.reserved : 0,
+    };
   } catch {
-    return 0;
+    return { generation: 0, reserved: 0 };
   }
 }
 
-function writeGeneration(dir: string, generation: number): void {
+function generationOf(dir: string): number {
+  const state = generationState(dir);
+  return Math.max(state.generation, state.reserved);
+}
+
+function writeGeneration(dir: string, generation: number, reserved = 0): void {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, "generation.json"),
-    JSON.stringify({ generation }),
+    JSON.stringify({ generation, reserved }),
     "utf8",
   );
+}
+
+/**
+ * A token is valid when it is above the high-water mark, or when it is the
+ * token this process reserved with `nextGeneration` and nobody consumed it.
+ * Once consumed (or released), `reserved` resets, so replaying the same token
+ * is stale rather than a second writer.
+ */
+function tokenAllowed(dir: string, token: number): boolean {
+  const state = generationState(dir);
+  const last = Math.max(state.generation, state.reserved);
+  if (token > last) return true;
+  return token === state.reserved && token > state.generation;
 }
 
 const sameHolder = (
@@ -327,7 +348,7 @@ export function createFileWorkspaceLeases(options: {
         };
       }
       const last = generationOf(dir);
-      if (input.generation <= last) {
+      if (!tokenAllowed(dir, input.generation)) {
         return {
           ok: false,
           code: "stale_generation",
@@ -398,8 +419,11 @@ export function createFileWorkspaceLeases(options: {
     nextGeneration(workspaceKey) {
       const dir = leaseDirFor(options.root, workspaceKey);
       fs.mkdirSync(dir, { recursive: true });
-      const next = generationOf(dir) + 1;
-      writeGeneration(dir, next);
+      const state = generationState(dir);
+      const next = Math.max(state.generation, state.reserved) + 1;
+      // Reserve the token durably; `acquire` accepts it once, then resets the
+      // reservation. A restarted parent therefore never reuses a number.
+      writeGeneration(dir, state.generation, next);
       return next;
     },
 
@@ -418,7 +442,7 @@ export function createFileWorkspaceLeases(options: {
         return { ok: false, code: "held", error: "the lease is still live", holder: { ...current } };
       }
       const last = generationOf(dir);
-      if (input.grant.generation <= last) {
+      if (!tokenAllowed(dir, input.grant.generation)) {
         return { ok: false, code: "stale_generation", error: `generation must exceed ${last}` };
       }
       const grant: LeaseGrant = {
@@ -491,7 +515,11 @@ export function parsePorcelainZ(output: string): BaselineChange[] {
  * Real `BaselinePort`. It never stages, checks out or cleans: only `status`,
  * `diff --numstat` (for binary detection) and `rev-parse HEAD` are read.
  */
-export function createGitBaselinePort(options: { runGit: GitRunner }): BaselinePort {
+export function createGitBaselinePort(options: {
+  runGit: GitRunner;
+  maxHashBytes?: number;
+}): BaselinePort {
+  const maxHashBytes = options.maxHashBytes ?? 4 * 1024 * 1024;
   const trackedStatus = (cwd: string): BaselineChange[] | undefined => {
     const result = options.runGit(
       ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -570,6 +598,22 @@ export function createGitBaselinePort(options: { runGit: GitRunner }): BaselineP
       walk(root);
       out.sort((left, right) => left.path.localeCompare(right.path));
       return { files: out, truncated };
+    },
+
+    async contentDigest(root, relative) {
+      // Content identity for a changed path. Status/size cannot distinguish a
+      // same-length edit; a missing/oversized/unreadable file is reported as
+      // `null` so acceptance blocks instead of treating it as unchanged.
+      const base = path.resolve(root);
+      const target = path.resolve(base, relative);
+      if (target !== base && !target.startsWith(base + path.sep)) return null;
+      try {
+        const stat = fs.statSync(target);
+        if (!stat.isFile() || stat.size > maxHashBytes) return null;
+        return createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+      } catch {
+        return null;
+      }
     },
   };
 }

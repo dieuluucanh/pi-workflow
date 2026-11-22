@@ -470,6 +470,32 @@ function stringList(value: unknown, max: number): string[] | undefined {
   return out;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Text of a custom message entry; the Desktop host writes bootstrap as one. */
+function messageText(message: unknown): string | undefined {
+  if (!isRecord(message)) return undefined;
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/**
+ * Reads the newest record for a custom type in EITHER host shape:
+ *   - a custom ENTRY whose `data` is the record (Workflow's own SDK writer);
+ *   - a custom MESSAGE whose text content is the JSON record (Desktop's
+ *     related-session bootstrap, appended before `session_start`).
+ * Reading only the first shape would make every Desktop child look unassigned.
+ */
 function newestRecord(
   entries: readonly BranchEntryLike[],
   customType: string,
@@ -477,11 +503,24 @@ function newestRecord(
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
     if (!entry) continue;
-    if (entry.type !== "custom" || entry.customType !== customType) continue;
-    const data = entry.data;
-    return data && typeof data === "object" && !Array.isArray(data)
-      ? (data as Record<string, unknown>)
-      : undefined;
+    if (entry.type === "custom" && entry.customType === customType) {
+      const data = entry.data;
+      return isRecord(data) ? data : undefined;
+    }
+    if (
+      entry.type === "message" &&
+      isRecord(entry.message) &&
+      entry.message.customType === customType
+    ) {
+      const text = messageText(entry.message);
+      if (text === undefined) return undefined;
+      try {
+        const parsed: unknown = JSON.parse(text);
+        return isRecord(parsed) ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    }
   }
   return undefined;
 }

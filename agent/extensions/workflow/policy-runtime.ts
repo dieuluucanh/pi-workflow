@@ -52,6 +52,9 @@ const ROLE_AUTHORITY: Record<WorkflowRole, number> = {
   explorer: 0,
   planner: 1,
   reviewer: 1,
+  // The Orchestrator parent inspects and verifies but never edits project
+  // sources, so it narrows like the other read-only roles.
+  orchestrator: 1,
   builder: 2,
 };
 

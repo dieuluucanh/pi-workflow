@@ -21,6 +21,7 @@
  */
 
 import type { TodoItem } from "./utils.ts";
+import { ORCHESTRATOR_TOOL_NAMES } from "./orchestrator-tools.ts";
 
 /** `null` is Default (workflow off). Orchestrator is opt-in, never in Tab. */
 export type WorkflowMode = "plan" | "build" | "orchestrator" | null;
@@ -54,10 +55,14 @@ export const PLAN_MODE_TOOLS = [
 
 /**
  * Tools Orchestrator keeps active. It is a parent/verification mode: the same
- * read-only exploration set as Plan, with project edits gated. Dispatch tools
- * arrive in later phases; entering the mode must not launch anything.
+ * read-only exploration set as Plan, with project edits gated, PLUS the parent
+ * orchestration tools. Preparation must be exposed before a run is bound, so
+ * these are part of the mode's tool policy rather than merely registered.
  */
-export const ORCHESTRATOR_MODE_TOOLS = [...PLAN_MODE_TOOLS] as const;
+export const ORCHESTRATOR_MODE_TOOLS = [
+  ...PLAN_MODE_TOOLS,
+  ...ORCHESTRATOR_TOOL_NAMES,
+] as const;
 
 /** Tools Build (the normal state) ensures are present. */
 export const NORMAL_MODE_TOOLS = [...PLAN_MODE_TOOLS] as const;
@@ -68,6 +73,7 @@ export const PLAN_DISABLED_TOOLS: ReadonlySet<string> = new Set(["edit", "write"
 const MANAGED_TOOLS: ReadonlySet<string> = new Set([
   ...PLAN_MODE_TOOLS,
   ...NORMAL_MODE_TOOLS,
+  ...ORCHESTRATOR_TOOL_NAMES,
 ]);
 
 function unique(names: readonly string[]): string[] {
@@ -86,9 +92,12 @@ export function planModeTools(active: readonly string[]): string[] {
   ]);
 }
 
-/** Active tools for Orchestrator: read-only plus the gated plan-write path. */
+/** Active tools for Orchestrator: inspect/verify plus parent orchestration. */
 export function orchestratorModeTools(active: readonly string[]): string[] {
-  return planModeTools(active);
+  return unique([
+    ...active.filter((name) => !PLAN_DISABLED_TOOLS.has(name)),
+    ...ORCHESTRATOR_MODE_TOOLS,
+  ]);
 }
 
 /**

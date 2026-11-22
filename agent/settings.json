@@ -85,7 +85,8 @@
       ]
     },
     "handoff": {
-      "mode": "plannotator"
+      "mode": "plannotator",
+      "executionMode": "build"
     }
   },
   "extensionChangelogVersions": {

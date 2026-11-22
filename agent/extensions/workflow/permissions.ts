@@ -28,7 +28,12 @@ import type { ArgumentCompletion } from "./utils.ts";
 
 export type CommandClass = "read-only" | "verify" | "full";
 
-export type WorkflowRole = "planner" | "reviewer" | "explorer" | "builder";
+export type WorkflowRole =
+  | "planner"
+  | "reviewer"
+  | "explorer"
+  | "orchestrator"
+  | "builder";
 
 export interface RolePolicy {
   role: WorkflowRole;
@@ -47,6 +52,7 @@ const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   "planner",
   "reviewer",
   "explorer",
+  "orchestrator",
   "builder",
 ];
 
@@ -68,6 +74,20 @@ export const ROLE_POLICIES: Record<WorkflowRole, RolePolicy> = {
     commandClass: "read-only",
     canWrite: false,
     description: "read-only commands only",
+  },
+  /**
+   * The Orchestrator parent inspects and verifies; it never edits project
+   * sources. This is a DISTINCT identity from `planner`: sharing the planner
+   * role made every refusal say "Plan mode" and recommend `/build`, which is
+   * how the parent lost its mission. The command class is the same read-only
+   * plus verify limit; the difference is the identity and the remedy text.
+   */
+  orchestrator: {
+    role: "orchestrator",
+    commandClass: "verify",
+    canWrite: false,
+    description:
+      "inspection plus test/lint/typecheck; project changes are delegated to managed Build children",
   },
   builder: {
     role: "builder",
@@ -113,9 +133,10 @@ export function resolveSessionRole(input?: {
   const fromEnv = normalizeRole(input?.envRole);
   if (fromEnv) return fromEnv;
   if (input?.workflowMode === "plan") return "planner";
-  // Orchestrator is a parent/verification mode: reuse the planner policy so it
-  // is read-only, not a second unrestricted Builder.
-  if (input?.workflowMode === "orchestrator") return "planner";
+  // Orchestrator is its own parent/verification identity. It has the same
+  // read-only command class as Plan, but it must never be described as Plan:
+  // its remedy is delegation, not `/build`.
+  if (input?.workflowMode === "orchestrator") return "orchestrator";
   if (input?.workflowMode === "build") return "builder";
   return undefined;
 }
@@ -1316,14 +1337,25 @@ export function explainCommandRefusal(
 
   const analysis = analyzeCommand(raw);
 
-  if (analysis.forbiddenSyntax)
+  const orchestratorParent = role === "orchestrator";
+
+  if (analysis.forbiddenSyntax) {
+    let suggestion: string;
+    if (analysis.forbiddenSyntax.includes("redirect")) {
+      suggestion =
+        "drop the redirect — `cmd` already captures stdout and `cmd 2>&1` also captures stderr; only `2>/dev/null` and `2>&1` are exempt";
+    } else if (orchestratorParent) {
+      suggestion =
+        "use an allowlisted read-only/verify command; project changes are delegated to a managed Build child";
+    } else {
+      suggestion = "use an allowlisted read-only/verify command, or /build for full shell access";
+    }
     return {
       kind: "forbidden-syntax",
       detail: `forbidden shell syntax: ${analysis.forbiddenSyntax}`,
-      suggestion: analysis.forbiddenSyntax.includes("redirect")
-        ? "drop the redirect — `cmd` already captures stdout and `cmd 2>&1` also captures stderr; only `2>/dev/null` and `2>&1` are exempt"
-        : "use an allowlisted read-only/verify command, or /build for full shell access",
+      suggestion,
     };
+  }
 
   if (analysis.destructive) {
     const { kind, label } = analysis.destructive;
@@ -1333,8 +1365,9 @@ export function explainCommandRefusal(
         kind === "blocked-flag"
           ? `${label} can rewrite files`
           : `${label} matched the destructive denylist`,
-      suggestion:
-        "remove or rename the argument, or use /build for unrestricted access",
+      suggestion: orchestratorParent
+        ? "remove or rename the argument; the Orchestrator parent must not mutate the workspace itself"
+        : "remove or rename the argument, or use /build for unrestricted access",
     };
   }
 
@@ -1348,7 +1381,9 @@ export function explainCommandRefusal(
       kind: "segment-class",
       detail: `\`${head}\` needs ${needed === "full" ? "unrestricted" : needed} access, above the ${policy.commandClass} limit`,
       segment: segment.raw,
-      suggestion: `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives, or use /build`,
+      suggestion: orchestratorParent
+        ? `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives. Orchestrator delegates project changes to a Build child instead of switching mode.`
+        : `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives, or use /build`,
     };
   }
   return null;

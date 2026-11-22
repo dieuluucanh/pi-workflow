@@ -62,27 +62,47 @@ Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` short
 ## Orchestrator (experimental)
 
 Orchestrator mode is an opt-in engine for a long, phased roadmap. It is
-**experimental**: the contracts and reducers are implemented and tested, but the
-live orchestration loop (real provider/turn wiring) is not released yet. Entering
-the mode changes nothing by itself and ordinary short Plan → Review → Build work
-keeps its current behavior.
+**experimental**: the contracts, reducers and live composition are implemented
+and tested, but real provider turns and visible-host acceptance still require a
+human run (see below). Entering the mode changes nothing by itself and ordinary
+short Plan → Review → Build work keeps its current behavior.
 
 ### Core rules
 
-- **Mode entry is not execution.** `/orchestrator` enters the mode; the first
-dispatch requires an execution approval that is separate from plan approval and
-from mode entry. A missing old role config falls back to the planner model
-without rewriting files; the worker model remains Builder.
+- **Mode entry is not execution.** `/orchestrator` (Tab or command) enters the
+  mode; the first dispatch requires an execution approval that is separate from
+  plan approval and from mode entry. A missing old role config falls back to the
+  planner model without rewriting files; the worker model remains Builder.
+- **Ask it to work — do not switch to `/build`.** When the user asks for work,
+  the parent calls `orchestrator_prepare` (or the user runs
+  `/orchestrator start [path]`). With no plan path it snapshots the current
+  discussion into a deterministic roadmap; with a path it snapshots those exact
+  bytes. Both routes are the same preparation service the approved handoff uses.
+  A read-only question stays a question.
+- **Identity is separate from permissions.** Orchestrator is its own permission
+  role: it inspects and runs verify commands, but project edits, mutating shell
+  and child-only tools are refused with a delegation remedy, never with “Plan
+  mode” or “switch to `/build`”.
+- **One breakdown approval.** The preview shows the derived requirements,
+  task grouping, models, checks, host readiness, dirty baseline, commit behavior
+  and limits. Approve by ID (`/orchestrator approve preview-<digest>`); refine
+  invalidates the preview durably; cancel launches nothing. The model has no
+  approve tool, and the literal `approve-execution` is not a preview ID.
 - **Identity is durable.** Run/task/attempt/session ids are stable; TODO numbers
   are display refs only. A child's local step 1 is never the parent's roadmap
   step 1, and child TODOs cannot complete a roadmap.
 - **One writer.** A cooperative workspace lease and the run state machine give
-  the workspace to exactly one attempt at a time. A stale lease generation
+  the workspace to exactly one attempt at a time. Fencing tokens are allocated
+  durably per workspace and reserved before acquisition, so task 2, a later run
+  and a restarted parent never reuse generation 1. A stale lease generation
   cannot write, pause, repair or resume.
 - **Candidates are not acceptance.** A worker report only proposes completion.
-  The parent captures the real diff, runs the required checks through the normal
-  gated tool path, records exit status/evidence, and accepts atomically only
-  against the exact candidate, workspace and roadmap revision.
+  The parent captures the real diff (content-addressed, including already-dirty,
+  untracked, deleted and non-Git files), runs the required checks through the
+  normal gated tool path, records exit status/evidence, recomputes the workspace
+  revision after the checks, and accepts atomically only against that exact
+  candidate, workspace and roadmap revision. Metadata-only coverage is a blocker,
+  not “unchanged”.
 - **Bounded retries.** Repair and no-progress counters persist across retries and
   rollovers. A failed verification never advances; exhausted budgets pause with
   explicit retry/unblock/cancel controls.
@@ -119,13 +139,14 @@ both repos (`fixtures/two-extension-contract.json`).
 
 ### What is wired, and what still needs a live run
 
-- **Wired in the entrypoint:** the four-mode ring, approved-plan ingestion into a
-  durable run journal, the parent tools (`orchestrator_propose_tasks|dispatch|
-  status|verify|repair|accept`), dispatch journaling (assign → start intent → one
-  wake → ack), the durable wake pump, evidence-backed verification, usage/rollover,
-  operator commands (`/orchestrator status|start|pause|resume|stop|inspect|say|
-  retry|approve|cancel`), parent-only TODO projection, accepted-task commits and
-  the fail-closed final gate.
+- **Wired in the entrypoint:** the four-mode ring, a fresh authoritative
+  mission injection, manual-and-handoff work preparation (discussion snapshot or
+  exact plan bytes), the parent tools (`orchestrator_prepare|propose_tasks|
+  dispatch|status|verify|repair|accept`), dispatch journaling (assign → start
+  intent → one wake → ack), the durable wake pump, evidence-backed verification,
+  usage/rollover, operator commands (`/orchestrator status|preview|start|pause|
+  resume|stop|inspect|say|retry|refine|approve <preview-id>|cancel`), parent-only
+  TODO projection, accepted-task commits and the fail-closed final gate.
 - **Child host binding:** dispatch composes a real child host — a source-bound
   Desktop tab when that host announces the capability, otherwise a visible
   Terminal window running `pi --session <file>` (never a headless print worker).

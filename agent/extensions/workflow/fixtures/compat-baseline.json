@@ -11,6 +11,7 @@
     "orchestrator_accept",
     "orchestrator_checkpoint",
     "orchestrator_dispatch",
+    "orchestrator_prepare",
     "orchestrator_propose_tasks",
     "orchestrator_repair",
     "orchestrator_report",

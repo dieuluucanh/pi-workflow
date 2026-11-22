@@ -62,6 +62,12 @@ test("live: parent orchestration tools are registered but refuse without approva
     const schema = JSON.stringify(accept?.parameters ?? {});
     assert.match(schema, /taskId/);
     assert.doesNotMatch(schema, /AcceptanceEvidence/);
+    // The model cannot narrow the requirement set or name the session it will
+    // own; both are resolved by the runtime from immutable state.
+    const proposeSchema = JSON.stringify((b.pi.tools["orchestrator_propose_tasks"] as any)?.parameters ?? {});
+    assert.doesNotMatch(proposeSchema, /"requirements":/);
+    const dispatchSchema = JSON.stringify((b.pi.tools["orchestrator_dispatch"] as any)?.parameters ?? {});
+    assert.doesNotMatch(dispatchSchema, /"sessionRef":/);
 
     await b.pi.emit("session_start", { reason: "startup" }, b.ctx as never);
     await b.pi.commands["orchestrator"]!.handler("", b.ctx as never);
@@ -72,6 +78,35 @@ test("live: parent orchestration tools are registered but refuse without approva
     assert.match(text, /No approved roadmap|No child host|not dispatchable|Orchestrator/i);
     // Registration and mode entry never start a child or a run.
     assert.equal(b.pi.sent.length, 0);
+  } finally {
+    b.cleanup();
+  }
+});
+
+test("live: /orchestrator start compiles the current discussion without a plan file or /build", async () => {
+  const b = await boot([]);
+  try {
+    await waitFor(() => !!b.pi.tools["orchestrator_prepare"]);
+    await b.pi.emit("session_start", { reason: "startup" }, b.ctx as never);
+    // The discussion is the current user prompt; no Markdown plan exists.
+    await b.pi.emit(
+      "before_agent_start",
+      { prompt: "Implement the export command\n- add the CLI command\n- add tests" },
+      b.ctx as never,
+    );
+
+    await b.pi.commands["orchestrator"]!.handler("start", b.ctx as never);
+    const text = b.notifies.map((entry) => entry.message).join("\n");
+    assert.match(text, /Work source bound: current discussion/);
+    assert.match(text, /distinct|execution approval|approval/i);
+    assert.doesNotMatch(text, /\/build switch is needed|Plan mode/i);
+    // Preparation binds a run but launches nothing.
+    assert.equal(
+      b.pi.sent.filter(
+        (entry) => (entry.content as { type?: string } | undefined)?.type === "workflow-task-start",
+      ).length,
+      0,
+    );
   } finally {
     b.cleanup();
   }

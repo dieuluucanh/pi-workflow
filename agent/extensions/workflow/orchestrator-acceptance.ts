@@ -56,15 +56,34 @@ export interface CandidateDiff {
 }
 
 function fingerprint(change: BaselineChange): string {
-  return [change.status, change.staged ? "s" : "u", change.mode ?? "", change.size ?? ""].join(
-    "\u0000",
-  );
+  return [
+    change.status,
+    change.staged ? "s" : "u",
+    change.mode ?? "",
+    change.size ?? "",
+    change.contentDigest ?? "",
+  ].join("\u0000");
 }
 
-function byPath(baseline: WorkspaceBaseline): Map<string, BaselineChange> {
-  const map = new Map<string, BaselineChange>();
-  for (const change of baseline.changes) map.set(change.path, change);
+/**
+ * Observations per path, never collapsed. A file changed in both the index and
+ * the worktree is two entries; using a single value would hide one side.
+ */
+function byPath(baseline: WorkspaceBaseline): Map<string, BaselineChange[]> {
+  const map = new Map<string, BaselineChange[]>();
+  for (const change of baseline.changes) {
+    const list = map.get(change.path);
+    if (list) list.push(change);
+    else map.set(change.path, [change]);
+  }
   return map;
+}
+
+function signature(changes: readonly BaselineChange[]): string {
+  return changes
+    .map(fingerprint)
+    .sort((left, right) => left.localeCompare(right))
+    .join("\u0001");
 }
 
 /**
@@ -77,31 +96,35 @@ export function diffCandidateChanges(
   current: WorkspaceBaseline,
 ): CandidateDiff {
   const before = byPath(previous);
+  const after = byPath(current);
   const added: string[] = [];
   const modified: string[] = [];
   const deleted: string[] = [];
   const renamed: string[] = [];
   const binary: string[] = [];
-  const seen = new Set<string>();
 
-  for (const change of current.changes) {
-    seen.add(change.path);
-    const earlier = before.get(change.path);
-    if (change.status === "binary") binary.push(change.path);
-    if (!earlier) {
-      if (change.status === "deleted") deleted.push(change.path);
-      else if (change.status === "renamed") renamed.push(change.path);
-      else added.push(change.path);
+  const paths = new Set([...before.keys(), ...after.keys()]);
+  for (const path of paths) {
+    const earlier = before.get(path) ?? [];
+    const later = after.get(path) ?? [];
+    for (const change of later) {
+      if (change.status === "binary") binary.push(change.path);
+    }
+    if (later.length === 0) {
+      deleted.push(path);
       continue;
     }
-    if (change.status === "deleted") deleted.push(change.path);
-    else if (change.status === "renamed") renamed.push(change.path);
-    else if (fingerprint(earlier) !== fingerprint(change)) modified.push(change.path);
-  }
-  for (const change of previous.changes) {
-    if (seen.has(change.path)) continue;
-    deleted.push(change.path);
-    if (change.status === "binary") binary.push(change.path);
+    if (earlier.length === 0) {
+      if (later.some((change) => change.status === "deleted")) deleted.push(path);
+      else if (later.some((change) => change.status === "renamed")) renamed.push(path);
+      else added.push(path);
+      continue;
+    }
+    if (signature(earlier) !== signature(later)) {
+      if (later.every((change) => change.status === "deleted")) deleted.push(path);
+      else if (later.some((change) => change.status === "renamed")) renamed.push(path);
+      else modified.push(path);
+    }
   }
 
   const sort = (list: string[]) => [...new Set(list)].sort((left, right) => left.localeCompare(right));
@@ -300,6 +323,14 @@ export async function runAcceptance(
   if (diff.truncated) {
     blockers.push("the change set was truncated; acceptance needs a bounded, complete diff");
   }
+  // Metadata-only capture cannot prove a same-length/already-dirty edit did or
+  // did not happen. Content must be addressable for the exact candidate.
+  if (input.baseline.contentComplete === false) {
+    blockers.push("the pre-work baseline has no content identity for every change");
+  }
+  if (input.candidate.contentComplete === false) {
+    blockers.push("the candidate workspace has no content identity for every change");
+  }
 
   const expected = new Set((input.expectedPaths ?? []).map((path) => path.replace(/\\/g, "/")));
   for (const path of expected) {
@@ -399,7 +430,7 @@ export async function runAcceptance(
   }
 
   const blocked = blockers.some((blocker) =>
-    /not quiescent|unavailable|manual-only|pre-existing|no verification checks|truncated|has no parent-observed/.test(
+    /not quiescent|unavailable|manual-only|pre-existing|no verification checks|truncated|has no parent-observed|no content identity/.test(
       blocker,
     ),
   );

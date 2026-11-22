@@ -225,3 +225,58 @@ test("comparison reports external changes, revalidation and attribution conflict
   const conflict = compareBaseline(base, base, { expectedPaths: ["src/user.ts"] });
   assert.deepEqual(conflict.attributionConflicts, ["src/user.ts"]);
 });
+
+test("content identity detects a same-length edit the metadata fingerprint misses", async () => {
+  let content = "aaaa";
+  const port: BaselinePort = {
+    async gitStatus() {
+      return {
+        changes: [{ path: "src/user.ts", status: "modified", staged: false, size: 4 }],
+      };
+    },
+    async listFiles() {
+      return null;
+    },
+    async contentDigest() {
+      return content;
+    },
+  };
+  const workspace = { key: "git:c:/app", root: "c:/app", kind: "git" as const, displayPath: "C:/app" };
+  const before = (await captureBaseline({ workspace, port, now: 1 }) as any).value;
+  assert.equal(before.contentComplete, true);
+  assert.equal(before.changes[0].contentDigest, "aaaa");
+
+  content = "bbbb";
+  const after = (await captureBaseline({ workspace, port, now: 2 }) as any).value;
+  assert.notEqual(before.digest, after.digest, "same status/size but different content");
+  const compared = compareBaseline(before, after);
+  assert.equal(compared.requiresRevalidation, true);
+  assert.deepEqual(compared.externalChanges, ["src/user.ts"]);
+});
+
+test("unreadable or oversized content is reported as incomplete, not unchanged", async () => {
+  const port: BaselinePort = {
+    async gitStatus() {
+      return {
+        changes: [
+          { path: "src/user.ts", status: "modified", staged: false, size: 4 },
+          { path: "gone.ts", status: "deleted", staged: false },
+        ],
+      };
+    },
+    async listFiles() {
+      return null;
+    },
+    async contentDigest() {
+      return null;
+    },
+  };
+  const captured = await captureBaseline({
+    workspace: { key: "git:c:/app", root: "c:/app", kind: "git", displayPath: "C:/app" },
+    port,
+    now: 1,
+  });
+  const value = (captured as any).value;
+  assert.equal(value.contentComplete, false);
+  assert.equal(value.changes.find((change: any) => change.path === "gone.ts").contentDigest, undefined);
+});

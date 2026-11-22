@@ -351,6 +351,33 @@ test("a workspace that changed during verification is refused", async () => {
   assert.equal(runtime.view()?.state.tasks["task-one"]?.acceptance, undefined);
 });
 
+test("a check that changes the workspace invalidates its own evidence", async () => {
+  const { runtime } = await running(false);
+  await candidate(runtime);
+  const verify = createVerifyRuntime({
+    runtime: () => runtime,
+    baseline: () => CLEAN,
+    candidate: async () => CHANGED,
+    executor: executor("passed"),
+    workspaceRevision: () => "rev-1",
+    revalidate: async () => "rev-2",
+    now: () => 2_000,
+  });
+  const outcome = await verify.verify({
+    taskId: "task-one",
+    attemptId: "attempt-1",
+    candidateId: "candidate-c1",
+    requiredCriteria: [requirementIds()[0]!],
+    criteria: [{ roadmapStepId: requirementIds()[0]!, status: "met" }],
+    cwd: "C:/work",
+  });
+  assert.equal(outcome.ok, false);
+  if (outcome.ok) return;
+  assert.equal(outcome.code, "workspace");
+  assert.match(outcome.error, /changed while acceptance was running/);
+  assert.equal(runtime.view()?.state.tasks["task-one"]?.acceptance, undefined);
+});
+
 test("verification without a baseline is refused before any transition", async () => {
   const { runtime } = await running(false);
   await candidate(runtime);

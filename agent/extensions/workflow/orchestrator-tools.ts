@@ -27,11 +27,8 @@ import type { RunEvent, RunState, TaskRecord } from "./orchestrator-state.ts";
 import { taskStartIdFor, workerIdFor } from "./orchestrator-worker.ts";
 import {
   ORCHESTRATOR_SCHEMA_VERSION,
-  acceptanceBlocker,
   canTransitionTask,
-  validateAcceptanceEvidence,
   validatePlanCoverage,
-  type AcceptanceEvidence,
   type PlannedTask,
   type RoadmapRequirement,
   type TaskPlan,
@@ -51,6 +48,7 @@ export const MAX_TASKS = 500;
 // ── Tool descriptors ─────────────────────────────────────────────────
 
 export const ORCHESTRATOR_TOOL_NAMES = [
+  "orchestrator_prepare",
   "orchestrator_propose_tasks",
   "orchestrator_dispatch",
   "orchestrator_status",
@@ -84,16 +82,49 @@ const EMPTY_PARAMS = {
 
 export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
+    name: "orchestrator_prepare",
+    description:
+      "Resolve and snapshot the work to orchestrate, then return bounded breakdown instructions. Call this when the user asks you to work; it works from the current discussion (default) or an explicit plan path and never launches a child.",
+    parameters: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: 'Where the work comes from: "discussion" (default), "plan", or "auto".',
+        },
+        planPath: {
+          type: "string",
+          description: "Absolute plan path when source is \"plan\" or the user named a plan file.",
+        },
+        objective: {
+          type: "string",
+          description:
+            "The work to execute when it comes from the discussion. Omit to use the current user prompt.",
+        },
+        constraints: {
+          type: "array",
+          description: "Constraints the user stated; each becomes a roadmap requirement.",
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    bounded: true,
+  },
+  {
     name: "orchestrator_propose_tasks",
     description:
       "Propose a validated roadmap-to-task breakdown. This never dispatches work; it returns the coverage decision for explicit execution approval.",
     parameters: {
       type: "object",
       properties: {
-        plan: { type: "object", description: "TaskPlan (schemaVersion, runId, roadmapRevision, tasks[])" },
-        requirements: { type: "array", description: "Roadmap requirements the plan must cover" },
+        plan: {
+          type: "object",
+          description:
+            "TaskPlan (schemaVersion, runId, roadmapRevision, tasks[]). Coverage is validated against the runtime's own immutable roadmap requirements; the model cannot supply a smaller requirement set.",
+        },
       },
-      required: ["plan", "requirements"],
+      required: ["plan"],
       additionalProperties: false,
     },
     bounded: true,
@@ -107,7 +138,6 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
       properties: {
         taskId: { type: "string" },
         attemptId: { type: "string" },
-        sessionRef: { type: "string" },
       },
       required: ["taskId", "attemptId"],
       additionalProperties: false,
@@ -228,11 +258,19 @@ function fail(code: ToolErrorCode, error: string): ToolResult {
   return { ok: false, code, error };
 }
 
+function hasControlCharacters(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
 function text(value: unknown, max = MAX_RECEIPT_TEXT): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (trimmed.length === 0 || trimmed.length > max) return undefined;
-  if (/[\u0000-\u001f\u007f]/.test(trimmed.replace(/[\n\r\t]/g, " "))) return undefined;
+  if (hasControlCharacters(trimmed.replace(/[\n\r\t]/g, " "))) return undefined;
   return trimmed;
 }
 

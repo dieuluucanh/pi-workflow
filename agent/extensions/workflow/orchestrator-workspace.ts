@@ -161,8 +161,15 @@ export function createWorkspaceLeases(options: {
   const now = options.now ?? (() => Date.now());
   const holders = new Map<string, LeaseGrant>();
   const generations = new Map<string, number>();
+  const reserved = new Map<string, number>();
 
   const expired = (grant: LeaseGrant): boolean => grant.expiresAt <= now();
+  const tokenAllowed = (workspaceKey: string, token: number): boolean => {
+    const last = generations.get(workspaceKey) ?? 0;
+    const pending = reserved.get(workspaceKey) ?? 0;
+    if (token > Math.max(last, pending)) return true;
+    return token === pending && token > last;
+  };
 
   const leases: WorkspaceLeases = {
     acquire(input) {
@@ -198,7 +205,7 @@ export function createWorkspaceLeases(options: {
         };
       }
       const last = generations.get(input.workspaceKey) ?? 0;
-      if (input.generation <= last) {
+      if (!tokenAllowed(input.workspaceKey, input.generation)) {
         return { ok: false, code: "stale_generation", error: `generation must exceed ${last}` };
       }
       const grant: LeaseGrant = {
@@ -208,6 +215,7 @@ export function createWorkspaceLeases(options: {
       };
       holders.set(input.workspaceKey, grant);
       generations.set(input.workspaceKey, input.generation);
+      reserved.delete(input.workspaceKey);
       return { ok: true, grant: { ...grant } };
     },
 
@@ -256,7 +264,7 @@ export function createWorkspaceLeases(options: {
         return { ok: false, code: "held", error: "the lease is still live", holder: { ...current } };
       }
       const last = generations.get(input.workspaceKey) ?? 0;
-      if (input.grant.generation <= last) {
+      if (!tokenAllowed(input.workspaceKey, input.grant.generation)) {
         return { ok: false, code: "stale_generation", error: `generation must exceed ${last}` };
       }
       const grant: LeaseGrant = {
@@ -266,7 +274,16 @@ export function createWorkspaceLeases(options: {
       };
       holders.set(input.workspaceKey, grant);
       generations.set(input.workspaceKey, input.grant.generation);
+      reserved.delete(input.workspaceKey);
       return { ok: true, grant: { ...grant } };
+    },
+
+    nextGeneration(workspaceKey) {
+      const last = generations.get(workspaceKey) ?? 0;
+      const pending = reserved.get(workspaceKey) ?? 0;
+      const next = Math.max(last, pending) + 1;
+      reserved.set(workspaceKey, next);
+      return next;
     },
   };
   return leases;
@@ -289,6 +306,12 @@ export interface BaselineChange {
   staged: boolean;
   mode?: string;
   size?: number;
+  /**
+   * Content identity of this observation, when the port could read it.
+   * Status/size alone cannot detect a same-length edit to an already-dirty
+   * file; acceptance requires this to be present for every non-deleted change.
+   */
+  contentDigest?: string;
 }
 
 export interface GitStatusSnapshot {
@@ -302,6 +325,12 @@ export interface BaselinePort {
   gitStatus(root: string): Promise<GitStatusSnapshot | null>;
   /** Bounded non-Git listing; null when unsupported. */
   listFiles(root: string, limit: number): Promise<{ files: Array<{ path: string; size: number | null }>; truncated: boolean } | null>;
+  /**
+   * Bounded content digest for one changed path. Returning null means the
+   * content could not be observed (too large, unreadable, excluded); that is
+   * reported as incomplete coverage instead of "unchanged".
+   */
+  contentDigest?(root: string, path: string): Promise<string | null>;
 }
 
 export interface WorkspaceBaseline {
@@ -317,6 +346,11 @@ export interface WorkspaceBaseline {
   truncated: boolean;
   /** Digest of the bounded content, not of the clock. */
   digest: string;
+  /**
+   * True when every non-deleted observation carries a content digest. Absent
+   * when the port cannot hash content at all (metadata-only capture).
+   */
+  contentComplete?: boolean;
 }
 
 function canonical(value: unknown): string {
@@ -397,6 +431,30 @@ export async function captureBaseline(input: {
     truncated = listing.truncated;
   }
 
+  // Content identity, not just status/size. One observation per (path, staged,
+  // status) pair; a path changed in both index and worktree is two entries.
+  let contentComplete: boolean | undefined;
+  if (input.port.contentDigest) {
+    const hasher = input.port.contentDigest.bind(input.port);
+    const digests = new Map<string, string | null>();
+    contentComplete = true;
+    for (const change of changes) {
+      if (change.status === "deleted") continue;
+      let observed: string | null;
+      if (digests.has(change.path)) observed = digests.get(change.path) ?? null;
+      else {
+        try {
+          observed = await hasher(input.workspace.root, change.path);
+        } catch {
+          observed = null;
+        }
+        digests.set(change.path, observed);
+      }
+      if (observed) change.contentDigest = observed;
+      else contentComplete = false;
+    }
+  }
+
   const counts = {
     staged: changes.filter((change) => change.staged).length,
     unstaged: changes.filter((change) => !change.staged).length,
@@ -425,6 +483,7 @@ export async function captureBaseline(input: {
       changes,
       counts,
       truncated,
+      ...(contentComplete === undefined ? {} : { contentComplete }),
       digest: sha256(content),
     },
   };
@@ -447,7 +506,7 @@ export function compareBaseline(
   const key = (change: BaselineChange) =>
     `${change.staged ? "s" : "u"}\u0000${change.status}\u0000${change.path}\u0000${
       change.mode ?? ""
-    }\u0000${change.size ?? ""}`;
+    }\u0000${change.size ?? ""}\u0000${change.contentDigest ?? ""}`;
   const before = new Map(previous.changes.map((change) => [key(change), change]));
   const after = new Set(current.changes.map(key));
   const external: string[] = [];

@@ -4,6 +4,50 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — Orchestrator mission and manual work entry (2026-11-22, third pass)
+
+- **Distinct Orchestrator identity.** `permissions.ts`/`policy-runtime.ts` now
+  resolve an `orchestrator` role (inspect + verify, no project writes). Refusals
+  name the delegation remedy instead of calling the session Plan or telling the
+  user to switch to `/build`. The role still cannot widen inherited authority.
+- **Authoritative mission injection.** `orchestrator-mission.ts` is the single
+  mission text: identity (not Plan/Builder), the work-entry tool, the breakdown
+  approval, delegation, evidence-backed acceptance, host readiness and the
+  current phase/next action. It replaces nothing else and never accumulates.
+- **Plan-or-discussion work source.** `orchestrator-source.ts` captures the
+  current discussion (objective, constraints, bullet/numbered requirements,
+  deterministic snapshot bytes + digest) or an explicit plan path. Explicit
+  discussion beats a stale `currentPlanFile`; ambiguity asks instead of guessing.
+- **Manual preparation entrypoint.** `orchestrator_prepare` is available before
+  a run is bound, and `/orchestrator start [path]` routes into the same service.
+  Bare `/orchestrator` still only selects the mode and launches nothing.
+- **Human-bound execution preview.** `orchestrator-preview-view.ts` renders the
+  derived scope, grouping, models, checks, host, dirty baseline, commit behavior
+  and limits. `/orchestrator preview` shows it; approval requires the exact
+  `preview-<digest>` id, so the old literal confirmation cannot approve and a
+  changed preview cannot be approved by a stale command.
+- **Durable refine.** `/orchestrator refine <what>` journals the invalidation,
+  clears plan/preview/approval, returns the run to awaiting approval and survives
+  reload; a restored journal can no longer resurrect a superseded approval.
+- **Content-addressed evidence.** Workspace capture now records a SHA-256 for
+  every non-deleted changed path. Same-length edits to already-dirty, untracked
+  and non-Git files change the revision; staged + unstaged observations are no
+  longer collapsed; unreadable/oversized content is incomplete coverage and
+  blocks acceptance instead of reading as unchanged. Verification recomputes the
+  revision after checks and refuses evidence when it moved.
+- **Durable fencing reservation.** `nextGeneration` reserves a workspace-wide
+  token on disk and `acquire` consumes it once; a restarted parent or a second
+  task cannot reuse a token, and replaying a consumed token is stale.
+- **Model input narrowed.** `orchestrator_propose_tasks` no longer exposes a
+  model-supplied requirement list (coverage uses the runtime's immutable roadmap)
+  and `orchestrator_dispatch` no longer exposes `sessionRef` (the runtime owns the
+  prepared identity).
+- **Packaging/docs:** the three new modules and their tests are in the package
+  files and test command; README/CHANGELOG describe both work-entry paths.
+- **Still NOT RUN:** real provider turns, visible Terminal/Desktop launches,
+  packaged Desktop E2E and macOS/Linux signoff. These remain explicit manual
+  acceptance items, not claims of passing.
+
 ### Added — Live child composition (2026-11-22, second pass)
 
 - **Real child host composition.** `orchestrator-child-host.ts` builds a

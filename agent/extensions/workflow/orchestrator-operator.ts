@@ -4,21 +4,29 @@
  * `/orchestrator` without arguments stays MODE ENTRY (index.ts). This module is
  * the argument surface:
  *
- *   status | start [path] | pause | resume | stop | inspect [taskId] |
- *   say <text> | retry | approve | cancel | help
+ *   status | preview | start [path] | pause | resume | stop | inspect [taskId] |
+ *   say <text> | retry | refine <what> | approve <preview-id> | cancel | help
  *
  * Two rules are structural here:
  *   - `start` never launches: it reports whether a breakdown + explicit
  *     execution approval exist, and refuses otherwise;
- *   - pause/stop never claim a live child is fenced. With an active mutation
- *     grant they return "wait for the fence" instead of pretending.
+ *   - `approve` names the exact preview ID. The literal `approve-execution` is
+ *     not enough: a model or stale command cannot approve a breakdown it did
+ *     not show, and a changed preview invalidates the ID.
  */
 
 export const OPERATOR_SCHEMA_VERSION = 1 as const;
 export const MAX_SAY_CHARS = 2_000;
 
+import {
+  formatExecutionPreview,
+  matchesPreviewId,
+  previewApprovalId,
+} from "./orchestrator-preview-view.ts";
+
 export const OPERATOR_VERBS = [
   "status",
+  "preview",
   "start",
   "pause",
   "resume",
@@ -27,6 +35,7 @@ export const OPERATOR_VERBS = [
   "say",
   "retry",
   "approve",
+  "refine",
   "cancel",
   "help",
 ] as const;
@@ -92,7 +101,7 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         ok: true,
         verb: parsed.verb,
         text: [
-          "Usage: /orchestrator [status|start [path]|pause|resume|stop|inspect [taskId]|say <text>|retry|approve|cancel]",
+          "Usage: /orchestrator [status|preview|start [path]|pause|resume|stop|inspect [taskId]|say <text>|retry|refine <what>|approve <preview-id>|cancel]",
           "Bare /orchestrator enters the mode. A breakdown and its execution approval are separate decisions; nothing is dispatched by these commands.",
         ].join("\n"),
       });
@@ -101,11 +110,19 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
       if (parsed.verb === "help") return help();
       if (!owner) {
         return fail(
-          "No orchestrator run is bound. Approve a plan through the handoff (destination: Orchestrator) first.",
+          "No orchestrator run is bound yet. Ask Orchestrator to work (or run /orchestrator start [path]) — preparation binds the current discussion or an explicit plan and launches nothing. A plan handoff is not required.",
         );
       }
       const view = owner.view();
       if (!view) return fail("No orchestrator run is bound.");
+      const previewBlock = () => {
+        if (!view.preview) return undefined;
+        return formatExecutionPreview({
+          preview: view.preview,
+          requirements: view.requirements,
+          fromDiscussion: /discussion-[0-9a-f]+\.md$/i.test(view.roadmap.path),
+        });
+      };
 
       switch (parsed.verb) {
         case "status": {
@@ -123,11 +140,20 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
               `roadmap ${view.roadmap.path} (digest ${view.roadmap.digest.slice(0, 12)}, revision ${view.roadmapRevision})`,
               `${view.roadmap.requirementCount} requirement(s) · ${countStates(view.state)}`,
               `execution: ${approval}`,
+              ...(view.preview
+                ? [`preview ${previewApprovalId(view.preview)} — /orchestrator preview to read it`]
+                : []),
               dispatch.ok
                 ? `dispatchable${view.nextTaskId ? `; next ${view.nextTaskId}` : ""}`
                 : `not dispatchable: ${dispatch.reasons.join("; ")}`,
             ].join("\n"),
           };
+        }
+
+        case "preview": {
+          const block = previewBlock();
+          if (!block) return fail("There is no breakdown to preview yet.");
+          return { ok: true, verb: parsed.verb, text: block };
         }
 
         case "start": {
@@ -150,6 +176,22 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
             verb: parsed.verb,
             text: `Ready to dispatch${view.nextTaskId ? ` ${view.nextTaskId}` : ""}. Dispatch still requires the registered dispatch tool and a bound child host; this command never launches a child itself.`,
           };
+        }
+
+        case "refine": {
+          if (!view.preview && !view.approval) return fail("There is no breakdown to refine.");
+          const what = parsed.rest;
+          if (!what) {
+            return fail("Say what should change: /orchestrator refine <what to change>.");
+          }
+          const refined = await owner.refine(what);
+          return refined.ok
+            ? {
+                ok: true,
+                verb: parsed.verb,
+                text: "Breakdown invalidated (durably). Nothing is approved and nothing was dispatched; propose a revised breakdown, then approve its new preview id.",
+              }
+            : fail(`Cannot refine: ${refined.error}`);
         }
 
         case "pause": {
@@ -247,8 +289,14 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         case "approve": {
           if (!view.preview) return fail("There is no breakdown to approve.");
           if (view.approval) return fail("This breakdown is already approved.");
+          if (!matchesPreviewId(view.preview, parsed.rest)) {
+            return fail(
+              `Approval must name this preview: /orchestrator approve ${previewApprovalId(view.preview)}. Nothing was approved.`,
+            );
+          }
           const approved = await owner.approve({
-            confirmation: parsed.rest || "approve-execution",
+            confirmation: "approve-execution",
+            approvalId: `approval-${view.runId}-${view.preview.planDigest.slice(0, 12)}`,
           });
           return approved.ok
             ? {

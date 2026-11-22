@@ -48,6 +48,12 @@ export interface VerifyPorts {
   executor: CheckExecutor;
   /** Fingerprint of the workspace at decision time. */
   workspaceRevision: () => string;
+  /**
+   * Recompute the fingerprint AFTER checks ran. Checks can have effects, and
+   * an external writer can change the workspace while a suite runs; evidence
+   * for the earlier revision must not be accepted then.
+   */
+  revalidate?: () => Promise<string>;
   now?: () => number;
 }
 
@@ -196,7 +202,25 @@ export function createVerifyRuntime(ports: VerifyPorts): VerifyRuntime {
       }
       const outcome = built.outcome;
       // The evidence is only valid for the workspace revision it observed.
-      if (ports.workspaceRevision() !== workspaceRevision) {
+      // Recompute AFTER checks ran: a check script or an external writer can
+      // change content while the suite is running.
+      let currentRevision = workspaceRevision;
+      if (ports.revalidate) {
+        try {
+          currentRevision = await ports.revalidate();
+        } catch (error: unknown) {
+          return {
+            ok: false,
+            code: "workspace",
+            error: `the workspace could not be revalidated after checks: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          };
+        }
+      } else if (ports.workspaceRevision() !== workspaceRevision) {
+        currentRevision = ports.workspaceRevision();
+      }
+      if (currentRevision !== workspaceRevision) {
         return {
           ok: false,
           code: "workspace",
