@@ -297,7 +297,7 @@ test("a persisted resume stays idle until an authorized wake starts exactly once
     const ack = await agent.waitFor("start-ack");
     assert.equal(ack.taskStartId, "start-1");
 
-    const acknowledged = recordStartAck((delivered as any).value, { taskStartId: "start-1", now: 6 });
+    const acknowledged = recordStartAck({ taskStartId: "start-1" }, (delivered as any).value, { taskStartId: "start-1", now: 6 });
     assert.equal(acknowledged.ok, true);
     assert.equal((acknowledged as any).value.phase, "running");
 

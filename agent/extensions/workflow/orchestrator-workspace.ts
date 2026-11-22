@@ -145,6 +145,12 @@ export interface WorkspaceLeases {
     grant: Omit<LeaseGrant, "acquiredAt" | "expiresAt">;
     confirmation: string;
   }): LeaseResult;
+  /**
+   * Durably reserves the next workspace-wide fencing token. Task/attempt
+   * counters must never be used as this number: a second task would otherwise
+   * propose generation 1 again.
+   */
+  nextGeneration?(workspaceKey: string): number;
 }
 
 export function createWorkspaceLeases(options: {

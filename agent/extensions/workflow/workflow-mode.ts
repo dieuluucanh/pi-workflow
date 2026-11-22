@@ -109,15 +109,48 @@ export function isManagedTool(name: string): boolean {
 
 // ── Cycle and role mapping ───────────────────────────────────────────
 
-/** Tab / Ctrl+Alt+P order: Default → Plan → Build → Default. */
-export function cycleMode(current: WorkflowMode, direction: 1 | -1 = 1): WorkflowMode {
-  // Orchestrator is opt-in and not in this cycle. Tab (either direction) leaves
-  // it for Default; /plan and /build switch directly.
-  if (current === "orchestrator") return null;
-  const order: WorkflowMode[] = [null, "plan", "build"];
-  const index = order.indexOf(current);
-  const next = (index + direction + order.length) % order.length;
-  return order[next] ?? null;
+/**
+ * Tab / Ctrl+Alt+P order for ordinary sessions:
+ * Default → Plan → Orchestrator → Build → Default.
+ *
+ * `null` is Default (workflow off). Orchestrator sits before Build because
+ * approving a plan hands execution to the orchestrator by default; Tab still
+ * reaches Build in one more press for reproducible manual transitions.
+ */
+export const MODE_CYCLE_ORDER: readonly WorkflowMode[] = [
+  null,
+  "plan",
+  "orchestrator",
+  "build",
+];
+
+/**
+ * Managed workers may use Plan/Build but can never promote themselves into the
+ * parent scheduler. Their eligible ring therefore omits Orchestrator; explicit
+ * `/orchestrator` is refused by the mode controller.
+ */
+export const WORKER_MODE_CYCLE_ORDER: readonly WorkflowMode[] = [null, "plan", "build"];
+
+/** Tab / Ctrl+Alt+P order: Default → Plan → Orchestrator → Build → Default. */
+export function cycleMode(
+  current: WorkflowMode,
+  direction: 1 | -1 = 1,
+  order: readonly WorkflowMode[] = MODE_CYCLE_ORDER,
+): WorkflowMode {
+  const ring = order.length > 0 ? order : MODE_CYCLE_ORDER;
+  const index = ring.indexOf(current);
+  if (index < 0) {
+    // A mode this build does not understand (or an empty ring) resolves to
+    // the first entry rather than guessing an index.
+    return ring[0] ?? null;
+  }
+  const next = (index + direction + ring.length) % ring.length;
+  return ring[next] ?? null;
+}
+
+/** The cycle ring for this session; a managed worker excludes Orchestrator. */
+export function modeCycleOrder(options: { managedWorker: boolean }): readonly WorkflowMode[] {
+  return options.managedWorker ? WORKER_MODE_CYCLE_ORDER : MODE_CYCLE_ORDER;
 }
 
 export type ModeRole = "planner" | "builder" | "orchestrator" | null;

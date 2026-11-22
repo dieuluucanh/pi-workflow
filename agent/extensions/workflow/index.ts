@@ -70,7 +70,6 @@ import {
   isDone,
   setTodoStatus,
   todoRef,
-  applyTodoUpdate,
   formatTodoLine,
   formatTodoNumberedList,
   buildTodoContextBlock,
@@ -92,7 +91,6 @@ import {
   explainCommandRefusal,
   gitCommitPolicyHit,
   permissionsArgumentCompletions,
-  policyForRole,
   resolveSessionRole,
   subagentEnv,
   type WorkflowRole,
@@ -254,7 +252,6 @@ import {
   todoStatusText,
   type PersistedTodoPanel,
   type TodoPanelPreference,
-  type TodoPanelState,
 } from "./todo-panel.ts";
 import { createTodoStore } from "./todo-service.ts";
 import { classifyToolMutation, resolveRolePolicy } from "./policy-runtime.ts";
@@ -266,15 +263,50 @@ import {
 } from "./workflow-contributions.ts";
 import {
   createManagedSessionGate,
-  readManagedSessionContext,
+  quarantineBlockReason,
+  resolveManagedSessionState,
   type ManagedSessionGate,
 } from "./managed-session.ts";
+import {
+  createWorkerSessionBinding,
+  isMutatingWorkerTool,
+  readWorkerAssignment,
+  WORKER_TOOL_SPECS,
+  type WorkerSessionBinding,
+} from "./orchestrator-worker-session.ts";
+import { createWorkerRuntime } from "./orchestrator-worker-runtime.ts";
+import { createOrchestratorRuntime, type OrchestratorRuntime, type ProposalContext } from "./orchestrator-runtime.ts";
+import { workerIdFor } from "./orchestrator-worker.ts";
+import { snapshotRoadmap } from "./orchestrator-plan.ts";
+import { createParentToolRuntime } from "./orchestrator-tool-runtime.ts";
+import { createPumpRuntime } from "./orchestrator-pump-runtime.ts";
+import { createOperatorRuntime } from "./orchestrator-operator.ts";
+import { DEFAULT_EXECUTION_BUDGETS } from "./orchestrator-types.ts";
+import { resolveBudget } from "./orchestrator-budget.ts";
+import { createRunJournal } from "./orchestrator-store.ts";
+import {
+  createFileWorkspaceLeases,
+  createGitBaselinePort,
+  createNodeJournalIo,
+} from "./orchestrator-adapters.ts";
+import { captureBaseline, type WorkspaceBaseline } from "./orchestrator-workspace.ts";
+import { createChildDispatcher, createDesktopChildHost, createTerminalChildHost, controlGrantRefFrom, type ChildHost } from "./orchestrator-child-host.ts";
+import { createRunControl, createChildControl, readWorkerGrant, type ChildControl, type RunControl } from "./orchestrator-run-control.ts";
+import { createTerminalHost } from "./orchestrator-launcher-node.ts";
+import { createDesktopSessionHost } from "./orchestrator-desktop-host.ts";
+import { createSdkWorkerPort } from "./orchestrator-sdk.ts";
+import { createVerifyRuntime } from "./orchestrator-verify-runtime.ts";
+import { createBudgetRuntime } from "./orchestrator-budget-runtime.ts";
+import { createFinalRuntime } from "./orchestrator-final-runtime.ts";
+import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
+import { createCommitLedger } from "./orchestrator-commits.ts";
 import {
   buildModeTools,
   orchestratorModeTools,
   cycleMode,
   decodeWorkflowEntry,
   encodeWorkflowMode,
+  modeCycleOrder,
   planModeTools,
   roleForMode,
   type WorkflowMode,
@@ -326,18 +358,40 @@ import {
 } from "./handoff-view.ts";
 import {
   DEFAULT_HANDOFF_CONFIG,
+  describeExecutionDestination,
   describeHandoffMode,
+  EXECUTION_DESTINATIONS,
+  HANDOFF_EXECUTION_TOKEN,
   HANDOFF_FALLBACK_TOKEN,
+  HANDOFF_ONCE_TOKEN,
   handoffArgumentCompletions,
   handoffConfigPaths,
+  isExecutionDestination,
   isHandoffMode,
   readHandoffConfig,
   resolveHandoffTimeout,
   shouldUsePlannotator,
   writeHandoffConfig,
+  type ExecutionDestination,
   type HandoffMode,
   type ResolvedHandoffConfig,
 } from "./handoff-config.ts";
+import { createGrantHolder } from "./host-bridge-auth.ts";
+import {
+  consumeHandoffDecision,
+  createHandoffDecision,
+  dismissHandoffDecision,
+  handoffDecisionMatches,
+  handoffRouteFor,
+  isHandoffDestination,
+  overrideHandoffDestination,
+  parseHandoffDecision,
+  supersedeHandoffDecision,
+  type HandoffDecision,
+  type HandoffDestination,
+  type HandoffPresenter,
+  type HandoffRouteKind,
+} from "./handoff-routing.ts";
 import {
   coerceModelDefault,
   describeModelDefaultApply,
@@ -383,7 +437,6 @@ import {
   reviewEscapeAction,
   reviewElapsedMs,
   reviewHandoffParks,
-  reviewLiveLine,
   reviewResumeSettles,
   reviewStateSummary,
   reviewStatusText,
@@ -729,6 +782,65 @@ export default function workflowExtension(
   // Read from THIS session's branch only: a process-global marker would leak
   // between sessions. `undefined` means an ordinary session.
   let managedGate: ManagedSessionGate | undefined;
+  /**
+   * Present-but-unreadable managed metadata is quarantined, never promoted to
+   * an ordinary session: losing the record must not restore write authority.
+   */
+  let managedQuarantine: string | undefined;
+  /** Worker-side report/TODO/fence binding (step 14); absent for parents. */
+  let workerBinding: WorkerSessionBinding | undefined;
+  /** Parent orchestration runtime (step 15); created per approved run. */
+  let orchestratorRuntime: OrchestratorRuntime | undefined;
+  /** Incremented on every session/run rebind so stale tool calls are refused. */
+  let orchestrationEpoch = 1;
+  /** Parent event pump (step 17); one durable wake per safe settle boundary. */
+  let orchestratorPump: ReturnType<typeof createPumpRuntime> | undefined;
+  /** Operator command surface (step 20); never launches children. */
+  let orchestratorOperator: ReturnType<typeof createOperatorRuntime> | undefined;
+  // ── Orchestrator production ports (integration steps 9–22) ──────
+  // Created lazily so an ordinary session pays nothing and a host without the
+  // SDK/local transport reports an honest blocker instead of a fake child.
+  let orchestratorControl: RunControl | undefined;
+  let orchestratorChildHost: ChildHost | undefined;
+  let orchestratorDispatcher: ReturnType<typeof createChildDispatcher> | undefined;
+  let orchestratorLeases: ReturnType<typeof createFileWorkspaceLeases> | undefined;
+  let orchestratorHostCapability:
+    | { available: boolean; label: string; reason?: string }
+    | undefined;
+  let orchestratorBaseline:
+    | { attemptId: string; baseline: WorkspaceBaseline }
+    | undefined;
+  let orchestratorWorkspaceRev: string | undefined;
+  let orchestratorVerify: ReturnType<typeof createVerifyRuntime> | undefined;
+  let orchestratorBudget: ReturnType<typeof createBudgetRuntime> | undefined;
+  let orchestratorFinal: ReturnType<typeof createFinalRuntime> | undefined;
+  let orchestratorSdk: ReturnType<typeof createSdkWorkerPort> | undefined;
+  let orchestratorDesktop: ReturnType<typeof createDesktopSessionHost> | undefined;
+  /** Child-side authenticated control channel (a managed worker only). */
+  let workerControl: ChildControl | undefined;
+  /**
+   * A verified parent start grant held until the model acknowledges the
+   * assignment (`workflow_worker_ready`). Delivery alone never opens mutation:
+   * the plan's rule is that readiness is not authorization, and authorization
+   * is not acknowledgment.
+   */
+  let pendingWorkerGrant:
+    | { leaseGeneration: number; taskStartId: string }
+    | undefined;
+  let commitLedger = createCommitLedger();
+  /** Runtime-owned evidence: a model cannot mint an acceptance object. */
+  const orchestratorEvidence = new Map<string, unknown>();
+  /** Last observed session model, used to resolve real budget limits. */
+  let lastKnownModel:
+    | { provider?: string; id: string; contextWindow: number | null; maxOutputTokens: number | null }
+    | undefined;
+  /** Tool calls admitted as MUTATIONS, so only those decrement the fence. */
+  const workerAdmittedCalls = new Set<string>();
+  /**
+   * Host-issued related-session capability (integration step 12). Delivered by
+   * the Desktop host through `workflow-bridge`; memory only, never persisted.
+   */
+  const bridgeGrantHolder = createGrantHolder();
   /** Generic host-contract publisher (step 10); absent when the host has no bus. */
   let contributionsPublisher: ReturnType<typeof createContributionPublisher> | undefined;
   // ── /commit flow authorization ──
@@ -1530,6 +1642,40 @@ export default function workflowExtension(
     if (note) ctx.ui.notify(note, "info");
   }
 
+  /** Saved handoff destination, for the footer (never a settings write). */
+  function handoffDestinationForStatus(): "orchestrator" | "build" | undefined {
+    try {
+      return handoffConfigNow().config.executionMode === "build" ? "build" : "orchestrator";
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Bound-run phase/approval, for the footer; absent when no run exists. */
+  function orchestrationStatus():
+    | {
+        phase: string;
+        approval: "none" | "pending" | "approved";
+        blockedReason?: string;
+        nextTaskId?: string;
+      }
+    | undefined {
+    const view = orchestratorRuntime?.view?.();
+    if (!view) return undefined;
+    const approval: "none" | "pending" | "approved" = view.approval
+      ? "approved"
+      : view.preview
+        ? "pending"
+        : "none";
+    const blocked = view.state?.blockedReason;
+    return {
+      phase: view.phase,
+      approval,
+      ...(blocked ? { blockedReason: blocked } : {}),
+      ...(view.nextTaskId ? { nextTaskId: view.nextTaskId } : {}),
+    };
+  }
+
   function updateStatus(ctx: ExtensionContext) {
     // Profile prefix (⚡ name) when one is active, then the role label.
     const profileLabel = activeProfileLabel();
@@ -1583,6 +1729,12 @@ export default function workflowExtension(
       commitMode,
       writeMode: workflowMode === null ? writeMode : null,
       folderMode,
+      ...(handoffDestinationForStatus() === undefined
+        ? {}
+        : { handoffDestination: handoffDestinationForStatus() }),
+      ...(orchestrationStatus() === undefined
+        ? {}
+        : { orchestration: orchestrationStatus() }),
     });
     const modeTone =
       reviewTurn !== "idle"
@@ -1608,6 +1760,13 @@ export default function workflowExtension(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.policy,
       ctx.ui.theme.fg("dim", segments.policy),
+    );
+    // Orchestrator destination/run state: visible BEFORE a decision (where the
+    // next approval goes) and after one (phase/next/blocked). Empty otherwise.
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.orchestrator,
+      segments.orchestrator ? ctx.ui.theme.fg("muted", segments.orchestrator) : "",
     );
     let todoPanelView: ReturnType<typeof refreshTodoPanel> | null = null;
     if (todos.items.length > 0) {
@@ -2129,6 +2288,7 @@ export default function workflowExtension(
           project: false,
           mode: "default",
           timeout: "default",
+          execution: "default",
         },
       };
     }
@@ -2151,6 +2311,54 @@ export default function workflowExtension(
       deps.plannotatorRequestTimeoutMs,
       handoffConfigNow().config.timeoutMs,
     );
+  }
+
+  /**
+   * First-run destination choice for the browser presenter.
+   *
+   * The native sheet already carries both destination rows, so it needs no
+   * extra prompt. Plannotator's protocol has no destination field and is not
+   * ours to patch, so Workflow asks ONCE — only while no scope has an explicit
+   * `executionMode` — and saves that answer as the user's default. Later
+   * handoffs are silent; `/handoff once` retargets a single pending one.
+   * Returns `undefined` when the user cancels, leaving the plan unapproved.
+   */
+  async function confirmBrowserHandoffDestination(
+    ctx: ExtensionContext,
+  ): Promise<HandoffDestination | undefined> {
+    const resolved = handoffConfigNow();
+    if (resolved.sources.execution !== "default") return resolved.config.executionMode;
+    if ((ctx as any).hasUI !== true) return resolved.config.executionMode;
+    overlayDepth += 1;
+    let choice: string | undefined;
+    try {
+      choice = await (ctx as any).ui.select(
+        "Where should an approved plan run? (saved as your default; /handoff once overrides one handoff)",
+        [
+          "Orchestrator — prepare a breakdown; nothing runs before you approve it",
+          "Direct Build — start executing in this session now",
+        ],
+      );
+    } catch (_e) {
+      void _e;
+      choice = undefined;
+    } finally {
+      overlayDepth = Math.max(0, overlayDepth - 1);
+    }
+    if (!choice) return undefined;
+    const destination: HandoffDestination = String(choice).startsWith("Orchestrator")
+      ? "orchestrator"
+      : "build";
+    const written = writeHandoffConfig("global", reviewCwd(), reviewAgentDir(), {
+      executionMode: destination,
+    });
+    if (!written.ok) {
+      ctx.ui.notify(
+        `Could not save the handoff destination (${written.error ?? "unknown error"}); this handoff still uses ${destination}.`,
+        "warning",
+      );
+    }
+    return destination;
   }
 
   /**
@@ -2858,6 +3066,12 @@ export default function workflowExtension(
     reason: string;
     planText?: string;
     clearAbortMarkers?: boolean;
+    /**
+     * Keep the pending handoff decision. The headless presenter owns a pending
+     * approval that must survive the turn ending, or `/handoff approve` could
+     * never consume it.
+     */
+    keepHandoff?: boolean;
   }): Promise<void> {
     try {
       settleReviewGate({ outcome: "unreviewed", planText: opts.planText });
@@ -2869,7 +3083,7 @@ export default function workflowExtension(
       abortedReviewHash = undefined;
       quietAbortHash = undefined;
     }
-    clearPendingHandoffDecision();
+    if (opts.keepHandoff !== true) clearPendingHandoffDecision();
     try {
       await suspendReview();
     } catch (_e) {
@@ -3832,6 +4046,15 @@ export default function workflowExtension(
         "  auto        Plannotator when a host is detected, native otherwise",
         "  native      always the native questionnaire — never opens the browser",
         "  plannotator always try Plannotator; native fallback on timeout/error",
+        "        /handoff execution orchestrator|build [global|project]",
+        "  execution   default destination for an APPROVED plan",
+        "  orchestrator  prepare an execution breakdown; a separate approval precedes Build children",
+        "  build       enter this session's Build mode and start directly (no orchestration)",
+        "        /handoff once orchestrator|build",
+        "  once        override ONLY the pending handoff; never writes settings",
+        "        /handoff approve <decision-id>",
+        "  approve     approve the pending handoff by its printed id (headless-safe)",
+        "        /handoff status | /handoff fallback",
         "  fallback    present the pending handoff natively now (no setting change)",
       ].join("\n");
 
@@ -3849,6 +4072,7 @@ export default function workflowExtension(
             `  detected : ${detectionLabel()}`,
             `  effective: ${effective}`,
             `  timeout  : ${resolved.config.timeoutMs} ms (${sourceLabel(resolved.sources.timeout)})`,
+            `  execute  : ${resolved.config.executionMode} (${sourceLabel(resolved.sources.execution)}) — ${describeExecutionDestination(resolved.config.executionMode)}`,
             `Global settings: ${paths.global}`,
             `Project settings: ${paths.project}`,
             usage,
@@ -3860,6 +4084,89 @@ export default function workflowExtension(
 
       if (sub === HANDOFF_FALLBACK_TOKEN) {
         await fallbackPendingHandoff(ctx as ExtensionContext);
+        return;
+      }
+
+      // ── /handoff execution <destination> [scope] ────────────────────
+      if (sub === HANDOFF_EXECUTION_TOKEN) {
+        const requested = tokens
+          .slice(1)
+          .find((token) => token !== "global" && token !== "project");
+        if (requested === undefined) {
+          const resolved = readHandoffConfig(cwd, agentDir);
+          ctx.ui.notify(
+            [
+              `Execution destination: ${resolved.config.executionMode} (${sourceLabel(resolved.sources.execution)})`,
+              `  ${describeExecutionDestination(resolved.config.executionMode)}`,
+              "Usage: /handoff execution orchestrator|build [global|project]",
+            ].join("\n"),
+            "info",
+          );
+          return;
+        }
+        if (!isExecutionDestination(requested.toLowerCase())) {
+          ctx.ui.notify(
+            `Unknown execution destination "${requested}". Choose ${EXECUTION_DESTINATIONS.join(" or ")}.`,
+            "warning",
+          );
+          return;
+        }
+        const destination = requested.toLowerCase() as ExecutionDestination;
+        const scope: "global" | "project" = tokens.includes("project")
+          ? "project"
+          : "global";
+        const written = writeHandoffConfig(scope, cwd, agentDir, {
+          executionMode: destination,
+        });
+        if (!written.ok) {
+          ctx.ui.notify(
+            `Could not write handoff settings: ${written.error ?? "unknown error"}`,
+            "error",
+          );
+          return;
+        }
+        const after = readHandoffConfig(cwd, agentDir);
+        ctx.ui.notify(
+          [
+            `Approved plans → ${destination} (${scope} settings)`,
+            `  ${describeExecutionDestination(destination)}`,
+            after.config.executionMode === destination
+              ? `  effective: ${destination}`
+              : `  effective: ${after.config.executionMode} — another scope overrides this value`,
+            `Settings: ${written.path}`,
+            "A pending handoff keeps the destination it was shown with; use /handoff once to change just that one.",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      // ── /handoff approve <decision-id> ──────────────────────────────
+      if (sub === "approve") {
+        await approvePendingHandoffById(ctx as ExtensionContext, tokens[1]);
+        return;
+      }
+
+      // ── /handoff once <destination> ─────────────────────────────────
+      if (sub === HANDOFF_ONCE_TOKEN) {
+        const requested = tokens[1]?.toLowerCase();
+        if (!requested || !isHandoffDestination(requested)) {
+          ctx.ui.notify(
+            `Usage: /handoff once ${EXECUTION_DESTINATIONS.join("|")} — changes only the pending handoff; settings are untouched.`,
+            "info",
+          );
+          return;
+        }
+        const changed = overridePendingHandoffDestination(
+          ctx as ExtensionContext,
+          requested as ExecutionDestination,
+        );
+        if (!changed) {
+          ctx.ui.notify(
+            "No pending handoff to override — /handoff execution sets the default instead.",
+            "info",
+          );
+        }
         return;
       }
 
@@ -5592,6 +5899,20 @@ export default function workflowExtension(
           reviewPhase: reviewTurn,
           handoffPending: awaitingDecision && reviewTurn === "idle",
           panelState: todoPanelState,
+          ...(orchestrationStatus() === undefined
+            ? {}
+            : {
+                orchestration: {
+                  ...orchestrationStatus()!,
+                  hostReady: orchestratorHostCapability?.available === true,
+                  ...(orchestratorHostCapability?.label
+                    ? { hostLabel: orchestratorHostCapability.label }
+                    : {}),
+                  ...(orchestratorHostCapability?.reason
+                    ? { hostReason: orchestratorHostCapability.reason }
+                    : {}),
+                },
+              }),
         }),
       );
     } catch (_e) {
@@ -5621,6 +5942,9 @@ export default function workflowExtension(
       pendingHandoffReviewOwned: awaitingDecision
         ? pendingHandoffReviewOwned
         : false,
+      // Versioned decision (destination, override, consume state). A reader that
+      // does not understand it keeps the legacy fields above.
+      pendingHandoffDecision: awaitingDecision ? (pendingHandoffDecision ?? null) : null,
       planHandoffPhase,
       manualReviewCycle,
       role: {
@@ -5649,7 +5973,7 @@ export default function workflowExtension(
   ) {
     if (workflowMode === "plan") {
       ctx.ui.notify(
-        "Already in Plan mode — read-only. Press Tab (when no suggestion list is open) to cycle: Plan → Build → Default. Or /build to switch to Build.",
+        "Already in Plan mode — read-only. Press Tab (when no suggestion list is open) to cycle: Plan → Orchestrator → Build → Default. Or /build to switch to Build.",
         "info",
       );
       return;
@@ -5674,7 +5998,7 @@ export default function workflowExtension(
     pi.setActiveTools(planModeTools(toolsBeforePlanMode));
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab (when no suggestion list is open) to cycle: Plan → Build → Default. Or /build to switch to Build.",
+        "Plan mode enabled — read-only. Explore + questionnaire loop, then write plan to .pi/plans/. Press Tab (when no suggestion list is open) to cycle: Plan → Orchestrator → Build → Default. Or /build to switch to Build.",
         "info",
       );
     }
@@ -5702,7 +6026,7 @@ export default function workflowExtension(
   ) {
     if (workflowMode === "build") {
       ctx.ui.notify(
-        "Already in Build mode — full access. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
+        "Already in Build mode — full access. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan → Orchestrator. Or /plan to switch to Plan.",
         "info",
       );
       return;
@@ -5727,7 +6051,7 @@ export default function workflowExtension(
     }
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Build mode — full access restored. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan. Or /plan to switch to Plan.",
+        "Build mode — full access restored. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan → Orchestrator. Or /plan to switch to Plan.",
         "info",
       );
     }
@@ -5760,12 +6084,29 @@ export default function workflowExtension(
   ) {
     if (workflowMode === "orchestrator") {
       ctx.ui.notify(
-        "Already in Orchestrator mode — no work is running until you approve an execution breakdown. Tab leaves it; /plan or /build switch directly.",
+        "Already in Orchestrator mode — no work is running until you approve an execution breakdown. Tab continues to Build; /plan or /build switch directly.",
         "info",
       );
       return;
     }
-    if (blockModeSwitchDuringReview(ctx)) return;
+    if (managedGate) {
+      ctx.ui.notify(
+        "This is a managed Build worker — it cannot enter Orchestrator mode. Finish the assignment and report; the parent verifies and schedules the next task.",
+        "warning",
+      );
+      return;
+    }
+    if (managedQuarantine) {
+      ctx.ui.notify(
+        `This managed session is quarantined (${managedQuarantine}); orchestration is refused until the assignment is reconciled.`,
+        "warning",
+      );
+      return;
+    }
+    // A validated plan approval is the exit from a review-owned handoff, not a
+    // competing mode switch: the caller owns the `transition` state exactly as
+    // it does for `enterBuildModeFromPlan`.
+    if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
     if (workflowMode === null) captureDefaultModel(ctx);
     workflowMode = "orchestrator";
     syncLegacyFlags();
@@ -5775,7 +6116,7 @@ export default function workflowExtension(
     pi.setActiveTools(orchestratorModeTools(toolsBeforePlanMode));
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Orchestrator mode — roadmap and verification only. Nothing runs until you review and approve an execution breakdown. Tab leaves it; /plan or /build switch directly.",
+        "Orchestrator mode — roadmap and verification only. Nothing runs until you review and approve an execution breakdown. Tab continues to Build; /plan or /build switch directly.",
         "info",
       );
     }
@@ -5826,10 +6167,46 @@ export default function workflowExtension(
     persistState();
     if (!opts?.quiet) {
       ctx.ui.notify(
-        "Default mode — workflow off, full access. Press Tab (when no suggestion list is open) to cycle: Default → Plan → Build. Or /plan to switch to Plan.",
+        "Default mode — workflow off, full access. Press Tab (when no suggestion list is open) to cycle: Default → Plan → Orchestrator → Build. Or /plan to switch to Plan.",
         "info",
       );
     }
+  }
+
+  /**
+   * Serializes mode transitions across keyboard, commands and host-driven
+   * switches. `workflowMode` is read INSIDE the queued task, so a double Tab
+   * advances twice from the mode that is actually live rather than from a
+   * stale snapshot. A rejected transition never poisons the queue.
+   */
+  let modeTransitionTail: Promise<unknown> = Promise.resolve();
+  function enqueueModeTransition<T>(task: () => Promise<T>): Promise<T> {
+    const run = modeTransitionTail.then(task, task);
+    modeTransitionTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** One serialized entry point for every mode selection. */
+  function switchWorkflowMode(
+    next: WorkflowMode | ((current: WorkflowMode) => WorkflowMode),
+    ctx: ExtensionContext,
+    opts?: ModeSwitchOptions,
+  ): Promise<void> {
+    return enqueueModeTransition(async () => {
+      const target = typeof next === "function" ? next(workflowMode) : next;
+      if (target === "plan") await setPlanMode(ctx, opts);
+      else if (target === "orchestrator") await setOrchestratorMode(ctx, opts);
+      else if (target === "build") await setBuildMode(ctx, opts);
+      else await setDefaultMode(ctx, opts);
+    });
+  }
+
+  /** The cycle ring this session may use (a managed worker omits Orchestrator). */
+  function sessionModeCycleOrder(): readonly WorkflowMode[] {
+    return modeCycleOrder({ managedWorker: managedGate !== undefined });
   }
 
   async function cycleWorkflowMode(ctx: ExtensionContext) {
@@ -5839,10 +6216,11 @@ export default function workflowExtension(
     // silently changing mode and suspending the reviewer.
     if (blockModeSwitchDuringReview(ctx)) return;
     const opts: ModeSwitchOptions = { quiet: true };
-    const next = cycleMode(workflowMode, 1);
-    if (next === "plan") await setPlanMode(ctx, opts);
-    else if (next === "build") await setBuildMode(ctx, opts);
-    else await setDefaultMode(ctx, opts);
+    await switchWorkflowMode(
+      (current) => cycleMode(current, 1, sessionModeCycleOrder()),
+      ctx,
+      opts,
+    );
   }
 
   // legacy alias for backward compat
@@ -6135,6 +6513,16 @@ export default function workflowExtension(
     pendingHandoffReviewUrl = null;
     lastReviewId = null;
     recordedHandoffReviewId = null;
+    // The decision record is the single authority for destination + consume.
+    beginHandoffDecision({
+      planPath: input.planPath,
+      planText: input.planText,
+      presenter: "browser",
+      reviewOwned: input.reviewOwned,
+      source: input.source,
+      cycleId: input.cycleId ?? reviewCycleId,
+      ctx: input.ctx,
+    });
     // A review-owned handoff keeps the Review turn visible while the browser
     // owns the decision. A plain handoff (Review Mode off) does not: modes and
     // prompts stay free and a mode switch/prompt supersedes it.
@@ -6335,6 +6723,21 @@ export default function workflowExtension(
       });
       if (decision.action === "keep") {
         if (pendingHandoffSource === "manual") manualReviewCycle = true;
+        // A browser gate persisted before destinations existed was shown as
+        // Approve → Build. Restoring it synthesizes a LEGACY decision so that
+        // meaning survives; it never becomes consent to orchestration.
+        if (!pendingHandoffDecision && pendingHandoffPlanPath) {
+          beginHandoffDecision({
+            planPath: pendingHandoffPlanPath,
+            planText: currentFile ?? "",
+            presenter: "browser",
+            reviewOwned: pendingHandoffReviewOwned,
+            source: pendingHandoffSource ?? "auto",
+            cycleId: pendingHandoffCycleId || reviewCycleId,
+            ctx,
+            legacyDestination: "build",
+          });
+        }
         beginPlanHandoff(pendingHandoffReviewOwned ? "review" : "plain");
         record("keep", {
           reviewId: lastReviewId,
@@ -6512,6 +6915,16 @@ export default function workflowExtension(
       // native questionnaire below.
       const wantBrowser = usePlannotatorHandoff();
       if (wantBrowser) {
+        // The browser has no destination field, so the choice is settled here
+        // (first run only) and shown in Workflow's status while it is pending.
+        const confirmed = await confirmBrowserHandoffDestination(ctx as any);
+        if (!confirmed) {
+          ctx.ui.notify(
+            "Handoff cancelled — the plan stays in Plan mode. Approve with /handoff or switch with /build.",
+            "info",
+          );
+          return "none";
+        }
         const handoff = await requestPlanReview({
           planText: input.planText,
           planPath: input.planPath,
@@ -6528,11 +6941,40 @@ export default function workflowExtension(
       }
     }
     if ((ctx as any).hasUI !== true) {
+      // Headless: persist a real pending decision (never auto-approve) and name
+      // the exact command that can approve it, so the plan cannot be executed
+      // from ambiguous prose.
+      if (!pendingHandoffDecision) {
+        beginHandoffDecision({
+          planPath: input.planPath,
+          planText: input.planText,
+          presenter: "native",
+          reviewOwned: input.reviewOwned,
+          source: input.source,
+          cycleId: reviewCycleId,
+          ctx,
+        });
+      }
+      // A headless handoff IS a pending decision: it survives reload and is
+      // listed by /review-status. It never becomes an execution by itself.
+      awaitingDecision = true;
+      lastHandoffAt = Date.now();
+      beginPlanHandoff(input.reviewOwned ? "review" : "plain");
+      const decision = pendingHandoffDecision;
+      const destination = decision?.destination ?? defaultHandoffDestination();
       try {
         (pi as any).sendMessage?.(
           {
             customType: "workflow-handoff-fallback",
-            content: `**Plan ready**\n\nThe plan is at ${input.planPath}.\n\nType "Execute the plan" to build, or tell me what to refine.`,
+            content: [
+              `**Plan ready** — ${input.planPath}`,
+              `Approving it would run: ${destination === "orchestrator" ? "Orchestrator (a breakdown is approved next; nothing runs before that)" : "direct Build in this session"}.`,
+              decision
+                ? `Approve with: /handoff approve ${decision.decisionId}`
+                : "Use /handoff to review the pending decision.",
+              `Change this one off with: /handoff once ${destination === "orchestrator" ? "build" : "orchestrator"}.`,
+              "Nothing executes until you approve.",
+            ].join("\n\n"),
             display: true,
           },
           { triggerTurn: false },
@@ -6540,10 +6982,34 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
+      persistState();
       return "none";
     }
     const cycle = reviewCycleId;
     beginPlanHandoff(input.reviewOwned ? "review" : "plain");
+    // The native sheet and the browser path share ONE decision record shape.
+    // When the browser handoff falls back to native (timeout/error/close), the
+    // SAME record must be reused so a one-off destination survives the fallback.
+    const existingDecision = pendingHandoffDecision;
+    const sameHandoff =
+      existingDecision !== undefined &&
+      existingDecision.state === "pending" &&
+      existingDecision.planPath === input.planPath &&
+      existingDecision.planHash === planHash(input.planText) &&
+      existingDecision.reviewCycleId === cycle;
+    if (sameHandoff) {
+      pendingHandoffDecision = { ...existingDecision, presenter: "native" };
+    } else {
+      beginHandoffDecision({
+        planPath: input.planPath,
+        planText: input.planText,
+        presenter: "native",
+        reviewOwned: input.reviewOwned,
+        source: input.source,
+        cycleId: cycle,
+        ctx,
+      });
+    }
     overlayDepth += 1;
     handoffModalOpen = true;
     let result: QuestionnaireResult | null = null;
@@ -6551,6 +7017,9 @@ export default function workflowExtension(
       const question = buildHandoffQuestion({
         planPath: input.planPath,
         reason: input.reason,
+        ...(pendingHandoffDecision
+          ? { destination: pendingHandoffDecision.destination }
+          : {}),
         ...(input.verdict !== undefined ? { verdict: input.verdict } : {}),
         ...(input.findingCount !== undefined
           ? { findingCount: input.findingCount }
@@ -6611,6 +7080,42 @@ export default function workflowExtension(
         // A plain handoff does not enter Review; only a review-owned decision
         // needs the short transition phase (and its input/mode lock).
         if (input.reviewOwned) setReviewTurn("transition");
+        // The destination row the user picked decides; the saved default only
+        // seeds a new handoff. A label can never retarget an approval silently:
+        // an explicit different row becomes a recorded one-off override.
+        const rawCaptured = takePendingHandoffDecision();
+        let captured = rawCaptured;
+        if (
+          rawCaptured &&
+          choice.destination &&
+          rawCaptured.destination !== choice.destination
+        ) {
+          const overridden = overrideHandoffDestination(
+            rawCaptured,
+            choice.destination,
+            Date.now(),
+          );
+          if (overridden.ok) captured = overridden.decision;
+        }
+        const destination: HandoffDestination =
+          choice.destination ?? captured?.destination ?? "build";
+        if (destination === "orchestrator") {
+          const prepared = await beginOrchestratorPreparation(ctx as any, {
+            ...(captured ? { decision: captured } : {}),
+            planPath: input.planPath,
+            planText: input.planText,
+            via: "native",
+          });
+          if (!prepared) {
+            printHandoffPlan(input.planText, input.planPath, "build-failed");
+            await closeReviewTurn({
+              reason: "handoff-orchestrator-failed",
+              planText: input.planText,
+            });
+            return "native";
+          }
+          return "native";
+        }
         let entered = false;
         try {
           entered = await enterBuildModeFromPlan(ctx as any, input.planPath, {
@@ -6634,9 +7139,31 @@ export default function workflowExtension(
             reason: "handoff-build-failed",
             planText: input.planText,
           });
+          recordHandoffRoute({
+            ...(captured ? { decision: captured } : {}),
+            destination: "build",
+            route: "direct-build",
+            planPath: input.planPath,
+            via: "native",
+            failure: "Build mode was not entered",
+          });
           return "native";
         }
         sendExecuteMessages(ctx as any, input.planPath, undefined, "native");
+        recordHandoffRoute({
+          ...(captured ? { decision: captured } : {}),
+          destination: "build",
+          route: "direct-build",
+          planPath: input.planPath,
+          via: "native",
+        });
+        if (captured) {
+          consumeHandoffDecision(captured, {
+            now: Date.now(),
+            route: "direct-build",
+            planHash: planHash(input.planText),
+          });
+        }
         return "native";
       }
       if (choice.choice === "refine") {
@@ -6670,6 +7197,9 @@ export default function workflowExtension(
         return "native";
       }
       ctx.ui.notify("Dismissed. Type your follow-up.", "info");
+      if (pendingHandoffDecision) {
+        pendingHandoffDecision = dismissHandoffDecision(pendingHandoffDecision, Date.now());
+      }
       return "native";
     } finally {
       endPlanHandoff();
@@ -6861,6 +7391,21 @@ export default function workflowExtension(
       );
       return;
     }
+    // The versioned decision must still describe the plan this approval names:
+    // a stale browser tab cannot approve a handoff that was superseded or
+    // replaced by a newer revision.
+    if (
+      pendingHandoffDecision &&
+      (!handoffDecisionMatches(pendingHandoffDecision, { planPath: resolvedPlan }) ||
+        (planContent &&
+          pendingHandoffDecision.planHash !== planHash(planContent)))
+    ) {
+      ctx.ui.notify(
+        "Ignoring a stale approval — this handoff no longer describes the plan it showed.",
+        "info",
+      );
+      return;
+    }
     // Ensure file exists (fallback write if agent only gave content)
     try {
       if (!fs.existsSync(resolvedPlan) && planContent) {
@@ -6878,7 +7423,30 @@ export default function workflowExtension(
     const reviewOwned = pendingHandoffReviewOwned;
     if (reviewOwned) setReviewTurn("transition");
     if (pendingHandoffSource === "manual") manualReviewCycle = false;
+    // Capture the ONE decision before clearing correlation, so the destination
+    // the user was shown decides this approval (not the current settings).
+    const capturedDecision = takePendingHandoffDecision();
+    const destination: HandoffDestination = capturedDecision?.destination ?? "build";
     clearPendingHandoffDecision();
+    if (destination === "orchestrator") {
+      const planTextForPrepare = (() => {
+        try {
+          return fs.readFileSync(resolvedPlan, "utf8");
+        } catch (_e) {
+          void _e;
+          return planContent ?? "";
+        }
+      })();
+      const prepared = await beginOrchestratorPreparation(ctx as any, {
+        ...(capturedDecision ? { decision: capturedDecision } : {}),
+        planPath: resolvedPlan,
+        planText: planTextForPrepare,
+        via: "plannotator",
+      });
+      setReviewTurn(prepared ? "idle" : "idle");
+      updateStatus(ctx as any);
+      return;
+    }
     let enteredBuild = false;
     try {
       enteredBuild = await enterBuildModeFromPlan(
@@ -6914,7 +7482,21 @@ export default function workflowExtension(
     }
     setReviewTurn("idle");
     updateStatus(ctx as any);
-    sendExecuteMessages(ctx as any, resolvedPlan, feedback);
+    sendExecuteMessages(ctx as any, resolvedPlan, feedback, "plannotator");
+    recordHandoffRoute({
+      ...(capturedDecision ? { decision: capturedDecision } : {}),
+      destination: "build",
+      route: "direct-build",
+      planPath: resolvedPlan,
+      via: "plannotator",
+    });
+    if (capturedDecision) {
+      consumeHandoffDecision(capturedDecision, {
+        now: Date.now(),
+        route: "direct-build",
+        ...(planContent ? { planHash: planHash(planContent) } : {}),
+      });
+    }
   }
 
   async function handlePlannotatorDeny(feedback: string) {
@@ -7247,20 +7829,20 @@ export default function workflowExtension(
   try {
     pi.registerCommand("plan", {
       description: "Enable Plan mode (read-only, idempotent)",
-      handler: async (_args, ctx) => setPlanMode(ctx as any),
+      handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
     });
   } catch {
     // pi-code already owns /plan — add /workflow as our alias
     pi.registerCommand("workflow", {
       description: "Enable Plan mode (alias for /plan)",
-      handler: async (_args, ctx) => setPlanMode(ctx as any),
+      handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
     });
   }
 
   try {
     pi.registerCommand("build", {
       description: "Enable Build mode (full access, idempotent)",
-      handler: async (_args, ctx) => setBuildMode(ctx as any),
+      handler: async (_args, ctx) => switchWorkflowMode("build", ctx as any),
     });
   } catch (_e) {
     void _e;
@@ -7269,7 +7851,7 @@ export default function workflowExtension(
   try {
     pi.registerCommand("default", {
       description: "Switch to default mode (no workflow, full access)",
-      handler: async (_args, ctx) => setDefaultMode(ctx as any),
+      handler: async (_args, ctx) => switchWorkflowMode(null, ctx as any),
     });
   } catch (_e) {
     void _e;
@@ -7278,8 +7860,61 @@ export default function workflowExtension(
   try {
     pi.registerCommand("orchestrator", {
       description:
-        "Enter Orchestrator mode (opt-in; nothing launches until an approved breakdown)",
-      handler: async (_args, ctx) => setOrchestratorMode(ctx as any),
+        "Enter Orchestrator mode, or run an operator command: status|start|pause|resume|stop|inspect|say|retry|approve|cancel.",
+      handler: async (args, ctx) => {
+        const text = typeof args === "string" ? args.trim() : "";
+        if (text.length === 0) {
+          await switchWorkflowMode("orchestrator", ctx as any);
+          return;
+        }
+        try {
+          const liveCtx = ctx as ExtensionContext;
+          if (/^finalize/i.test(text)) {
+            await runOrchestratorFinalize(liveCtx);
+            return;
+          }
+          const operator = ensureOrchestratorOperator(liveCtx);
+          const result = await operator.run(text);
+          if (result.say) {
+            const delivered = await deliverOrchestratorSay(result.say);
+            ctx.ui.notify(
+              delivered ? `Message delivered to the child: ${result.say}` : result.text,
+              delivered ? "info" : "warning",
+            );
+          } else {
+            ctx.ui.notify(result.text, result.ok ? "info" : "warning");
+          }
+          updateStatus(ctx as any);
+        } catch (error: unknown) {
+          ctx.ui.notify(
+            `Orchestrator command failed: ${error instanceof Error ? error.message : String(error)}`,
+            "warning",
+          );
+        }
+      },
+    });
+  } catch (_e) {
+    void _e;
+  }
+
+  // â”€â”€ Host capability bridge (Desktop step 12) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // The Desktop host invokes this companion command with a bounded JSON grant.
+  // Only code reachable from this registration sees the token; requests then
+  // attach it, so a self-declared owner never authorizes an operation.
+  try {
+    pi.registerCommand("workflow-bridge", {
+      description:
+        "Internal: accept a host-issued capability grant (Desktop related sessions)",
+      handler: async (args: string) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(String(args || "{}"));
+        } catch {
+          bridgeGrantHolder.clear();
+          return;
+        }
+        bridgeGrantHolder.accept(parsed);
+      },
     });
   } catch (_e) {
     void _e;
@@ -7416,7 +8051,7 @@ export default function workflowExtension(
       description: "Toggle plan/build mode",
       handler: async (ctx: any) => {
         if (overlayDepth > 0) return;
-        cycleWorkflowMode(ctx as any);
+        return await cycleWorkflowMode(ctx as any);
       },
     });
   } catch (_e) {
@@ -7466,7 +8101,7 @@ export default function workflowExtension(
           "Cycle workflow mode (Tab; completes when a suggestion list is open)",
         handler: async (ctx: any) => {
           if (overlayDepth > 0) return;
-          cycleWorkflowMode(ctx as any);
+          return await cycleWorkflowMode(ctx as any);
         },
       } as any,
     );
@@ -7547,6 +8182,74 @@ export default function workflowExtension(
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
+      // Step 21: while a coordinated run owns this session, the list IS the
+      // parent projection of accepted coverage. A checkbox, `[DONE]`, or a
+      // child completion can never move it.
+      const projectParentTodoDetails = (
+        projection: ReturnType<typeof parentRoadmapTodos>,
+      ): TodoItem[] =>
+        projection.items.map((item) => ({
+          step: item.ref,
+          text: item.text,
+          completed: item.status === "completed",
+          status: item.status,
+          ref: String(item.ref),
+          label: String(item.ref),
+        }));
+      const parentView =
+        workflowMode === "orchestrator" && orchestratorRuntime
+          ? orchestratorRuntime.view()
+          : undefined;
+      if (parentView) {
+        const projection = parentRoadmapTodos(parentView.state);
+        const decision = todoMutationDecision("parent", params.action as never);
+        const rows = projection.items.length
+          ? projection.items
+              .map(
+                (item) =>
+                  `${item.ref}. [${item.status}] ${item.text}${
+                    item.acceptedCoverage ? " (accepted)" : ""
+                  }`,
+              )
+              .join("\n")
+          : "(no tasks proposed yet)";
+        const counts = `${projection.counts.accepted} accepted · ${projection.counts.pending} pending · ${projection.counts.blocked} blocked · ${projection.counts.cancelled} cancelled`;
+        if (!decision.allowed) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${decision.reason ?? "The parent roadmap is display-only."}
+
+${counts}
+${rows}`,
+              },
+            ],
+            details: {
+              action: params.action,
+              owner: "parent",
+              todos: projectParentTodoDetails(projection),
+              nextStep: projection.items.length + 1,
+            } as TodoDetails,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Parent roadmap projection (accepted coverage only) — run ${projection.runId}
+${counts}${projection.complete ? " · COMPLETE" : ""}
+${rows}`,
+            },
+          ],
+          details: {
+            action: "list",
+            owner: "parent",
+            todos: projectParentTodoDetails(projection),
+            nextStep: projection.items.length + 1,
+          } as TodoDetails,
+        };
+      }
       const renderList = (items: TodoItem[]) =>
         items.length
           ? `Steps are numbered GLOBALLY 1..${items.length}:
@@ -10436,26 +11139,242 @@ export default function workflowExtension(
           details,
         };
       }
-      const first = managedGate.phase() !== "ready";
-      const ok = managedGate.acknowledgeStart();
+      const first = workerBinding
+        ? workerBinding.runtime.gate.phase() !== "ready"
+        : managedGate.phase() !== "ready";
+      // A managed worker acknowledges through its runtime when one is bound, so
+      // preflight (model/tools/assignment) is enforced rather than assumed.
+      const ack = workerBinding ? workerBinding.runtime.acknowledge() : undefined;
+      const ok = ack ? ack.ok : managedGate.acknowledgeStart();
       const task = managedGate.context;
+      // The assignment is now acknowledged; apply the parent grant that was
+      // held at delivery. This is the ONLY place it opens mutation.
+      let grantError = "";
+      if (ok && pendingWorkerGrant && workerBinding) {
+        const applied = workerBinding.runtime.authorize(pendingWorkerGrant);
+        if (applied.ok) {
+          const noted = workerBinding.runtime.noteStartAck(pendingWorkerGrant.taskStartId);
+          if (noted.ok) {
+            pendingWorkerGrant = undefined;
+          } else {
+            grantError = noted.error;
+          }
+        } else {
+          grantError = applied.error;
+        }
+        if (grantError) {
+          try {
+            currentSessionCtx?.ui?.notify(
+              `The parent grant could not be applied: ${grantError}. Edits stay blocked.`,
+              "warning",
+            );
+          } catch (_e) {
+            void _e;
+          }
+        }
+      }
+      const authorized = managedGate.authorization() !== undefined;
       const details: ReadyDetails = {
         acknowledged: ok,
         runId: task.runId,
         taskId: task.taskId,
         attemptId: task.attemptId,
+        ...(ack && !ack.ok ? { reason: ack.error } : {}),
       };
       return {
         content: [
           {
             type: "text",
             text: ok
-              ? `${first ? "Assignment acknowledged" : "Already acknowledged"} — task ${task.taskId} (run ${task.runId}). You may now edit files and run shell commands within the assigned scope.`
-              : "This worker session is closed; the parent decides whether to reopen the task.",
+              ? `${first ? "Assignment acknowledged" : "Already acknowledged"} — task ${task.taskId} (run ${task.runId}). ${
+                  authorized
+                    ? "Mutation is authorized for this attempt; stay inside the assigned scope."
+                    : "Reading is allowed; edits and shell remain blocked until the parent grants this attempt's lease and start."
+                }`
+              : ack && !ack.ok
+                ? `Cannot acknowledge: ${ack.error}`
+                : "This worker session is closed; the parent decides whether to reopen the task.",
           },
         ],
         details,
       };
+    },
+  });
+
+  // ── Worker report/checkpoint tools (orchestrator step 14) ────────
+  // Registered in every session so an ordinary session gets a truthful refusal
+  // instead of "unknown tool". A stored report is a CLAIM; the parent verifies.
+  for (const spec of WORKER_TOOL_SPECS) {
+    pi.registerTool({
+      name: spec.name,
+      label: spec.name === "orchestrator_report" ? "Worker Report" : "Worker Checkpoint",
+      description: spec.description,
+      parameters: Type.Object({
+        report: Type.Optional(Type.Any()),
+        summary: Type.Optional(Type.String()),
+      }),
+      async execute(_id, params): Promise<{ content: Array<{ type: "text"; text: string }>; details: { ok: boolean; reason?: string; candidateStored?: boolean } }> {
+        if (!workerBinding) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: managedQuarantine
+                  ? `This managed session is quarantined (${managedQuarantine}); no report can be stored.`
+                  : "This is not a managed worker session; there is no parent to report to.",
+              },
+            ],
+            details: { ok: false, reason: "not_managed" },
+          };
+        }
+        const result =
+          spec.name === "orchestrator_report"
+            ? workerBinding.callReportTool(params)
+            : workerBinding.callCheckpointTool(params);
+        if (result.candidateStored && workerControl) {
+          // A report is a CLAIM. It reaches the parent as a candidate event
+          // only through the authenticated channel; the parent verifies it.
+          void workerControl.send("candidate", { report: params.report }).catch(() => false);
+        }
+        return {
+          content: [{ type: "text", text: result.text }],
+          details: { ok: result.ok, ...(result.candidateStored ? { candidateStored: true } : {}) },
+        };
+      },
+    });
+  }
+
+  // ── Parent orchestration tools (orchestrator step 16) ────────────
+  // Registered in every session so the refusal is truthful, but they are
+  // eligible ONLY in Orchestrator mode on a bound run. A managed worker can
+  // never use them to gain orchestration authority.
+  const parentTools = createParentToolRuntime({
+    runtime: () => orchestratorRuntime,
+    proposalContext: (): ProposalContext | undefined => {
+      const model = lastKnownModel ?? {
+        id: "unknown",
+        contextWindow: null,
+        maxOutputTokens: null,
+      };
+      const orchestratorBudget = resolveBudget({ role: "orchestrator", model });
+      const builderBudget = resolveBudget({ role: "builder", model });
+      if (!orchestratorBudget.ok || !builderBudget.ok) return undefined;
+      const capability = orchestratorHostCapability;
+      return {
+        orchestratorBudget: orchestratorBudget.plan,
+        builderBudget: builderBudget.plan,
+        launcher: {
+          ready: capability?.available === true,
+          label: capability?.label ?? "no child host bound",
+          reason:
+            capability?.available === true
+              ? capability.reason
+              : capability?.reason ??
+                "No Terminal launcher or Desktop tab service is available, so a child cannot be shown.",
+        },
+        checks: [],
+        limits: DEFAULT_EXECUTION_BUDGETS,
+        options: {
+          commitMode: "never",
+          mutationScope: [],
+          baselineDirty: (orchestratorBaseline?.baseline.changes.length ?? 0) > 0,
+        },
+      };
+    },
+    epoch: () => orchestrationEpoch,
+    eligible: () => {
+      if (managedGate || workerBinding || managedQuarantine) {
+        return "A managed worker cannot orchestrate: the parent owns dispatch. Finish the assignment and report.";
+      }
+      if (workflowMode !== "orchestrator") {
+        return "Orchestration tools are available in Orchestrator mode only. Enter it with /orchestrator.";
+      }
+      if (!orchestratorRuntime) {
+        return "No approved roadmap is bound to this session yet. Approve a plan through the handoff first.";
+      }
+      return undefined;
+    },
+    dispatcher: {
+      async prepare(input) {
+        const owner = currentSessionCtx;
+        if (!owner) {
+          return { ok: false, error: "no live session context is bound to this parent" };
+        }
+        const dispatcher = ensureOrchestratorDispatcher(owner);
+        const prepared = await dispatcher.prepare(input);
+        if (!prepared.ok) return prepared;
+        // The pre-work baseline must exist before the child can touch anything.
+        await captureOrchestratorBaseline(input.attemptId);
+        return prepared;
+      },
+      async wake(input) {
+        const owner = currentSessionCtx;
+        if (!owner) {
+          return { ok: false, error: "no live session context is bound to this parent" };
+        }
+        return ensureOrchestratorDispatcher(owner).wake(input);
+      },
+    },
+    leases: {
+      acquire: (input) => ensureOrchestratorLeases().acquire(input),
+      release: (input) => ensureOrchestratorLeases().release(input),
+    },
+    workspaceKey: () => orchestratorWorkspaceKey(),
+    workspaceRev: () => orchestratorWorkspaceRev,
+    allocateGeneration: () => {
+      const leases = ensureOrchestratorLeases();
+      return leases.nextGeneration?.(orchestratorWorkspaceKey());
+    },
+  });
+  parentTools.register({
+    registerTool: (definition) => {
+      pi.registerTool({
+        name: definition.name,
+        label: definition.label,
+        description: definition.description,
+        parameters: Type.Unsafe(definition.parameters) as never,
+        async execute(
+          _id: string,
+          params: Record<string, unknown>,
+          _signal: unknown,
+          _onUpdate: unknown,
+          ctx: any,
+        ) {
+          // Verification and acceptance are runtime-owned. Route them here so a
+          // model-supplied evidence object never becomes authority.
+          if (definition.name === "orchestrator_verify") {
+            const routed = await verifyTaskWithRuntime(
+              ctx,
+              typeof params.taskId === "string" ? params.taskId : "",
+            );
+            return {
+              content: [{ type: "text" as const, text: routed.text }],
+              details: routed.ok
+                ? { ok: true, ...routed.details }
+                : { ok: false, ...routed.details },
+            };
+          }
+          if (definition.name === "orchestrator_accept") {
+            const routed = await acceptTaskWithRuntime(
+              typeof params.taskId === "string" ? params.taskId : "",
+            );
+            return {
+              content: [{ type: "text" as const, text: routed.text }],
+              details: routed.ok
+                ? { ok: true, ...routed.details }
+                : { ok: false, ...routed.details },
+            };
+          }
+          const result = await parentTools.call(
+            definition.name as never,
+            params,
+          );
+          return {
+            content: [{ type: "text" as const, text: result.text }],
+            details: result.ok ? result.details : { ok: false, code: result.code },
+          };
+        },
+      });
     },
   });
 
@@ -11157,6 +12076,15 @@ export default function workflowExtension(
         void _e;
       }
     }
+    // A steered/queued message into a managed child is pending input; the
+    // quiescence fence must wait for it, so a report cannot race user input.
+    if (workerBinding && event.streamingBehavior !== undefined) {
+      const admitted = workerBinding.admitFollowUp();
+      if (!admitted.ok) {
+        notifyReview(admitted.error, "info");
+        return { action: "handled" } as any;
+      }
+    }
     if (typeof event.text === "string" && event.text.startsWith("/btw ")) {
       const note = event.text.slice(5).trim();
       if (note) {
@@ -11251,26 +12179,97 @@ export default function workflowExtension(
   pi.on("session_start", async (event, ctx) => {
     // Managed worker identity first: every later handler (prompt context, the
     // readiness gate, handoff suppression) reads it.
+    resetOrchestratorComposition();
     managedGate = undefined;
+    managedQuarantine = undefined;
+    workerControl?.close();
+    workerControl = undefined;
+    workerBinding = undefined;
+    workerAdmittedCalls.clear();
+    orchestrationEpoch += 1;
+    const sessionModel: any = (ctx as any)?.model;
+    if (sessionModel && typeof sessionModel.id === "string") {
+      lastKnownModel = {
+        ...(typeof sessionModel.provider === "string" ? { provider: sessionModel.provider } : {}),
+        id: sessionModel.id,
+        contextWindow:
+          typeof sessionModel.contextWindow === "number" ? sessionModel.contextWindow : null,
+        maxOutputTokens:
+          typeof sessionModel.maxOutputTokens === "number" ? sessionModel.maxOutputTokens : null,
+      };
+    }
+    let managedState: ReturnType<typeof resolveManagedSessionState> = { kind: "ordinary" };
+    let managedReadError: unknown;
+    let branch: unknown[] = [];
     try {
-      const managed = readManagedSessionContext(
-        ctx.sessionManager.getBranch() as never,
-      );
-      if (managed.ok) {
-        managedGate = createManagedSessionGate(
-          managed.context,
-          typeof (ctx.sessionManager as any).getSessionId === "function"
-            ? (ctx.sessionManager as any).getSessionId()
-            : undefined,
-        );
-      } else if (managed.reason !== "absent") {
+      branch = (ctx.sessionManager.getBranch() as unknown[]) ?? [];
+    } catch (error: unknown) {
+      managedReadError = error;
+    }
+    try {
+      managedState = resolveManagedSessionState(branch as never, managedReadError);
+      const sessionId =
+        typeof (ctx.sessionManager as any).getSessionId === "function"
+          ? (ctx.sessionManager as any).getSessionId()
+          : undefined;
+      if (managedState.kind === "worker") {
+        managedGate = createManagedSessionGate(managedState.context, sessionId);
+        const assignment = readWorkerAssignment(branch as never);
+        if (!assignment.ok) {
+          // A worker with no readable task contract must not mutate: the scope
+          // is what bounds it. Inspect/reconcile stays available.
+          managedQuarantine = assignment.reason;
+          ctx.ui.notify(
+            `Managed worker quarantined: ${assignment.reason}. Inspect and reconcile before any edit, shell or orchestration.`,
+            "warning",
+          );
+        } else {
+          const context = managedState.context;
+          const recordedModel = assignment.model ?? null;
+          const runtime = createWorkerRuntime({
+            context,
+            ...(sessionId ? { sessionId } : {}),
+            preflightInput: () => ({
+              model: (() => {
+                if (recordedModel) return recordedModel;
+                const model = (ctx as any)?.model;
+                return model && typeof model.provider === "string" && typeof model.id === "string"
+                  ? { provider: model.provider, id: model.id }
+                  : null;
+              })(),
+              activeTools: pi.getActiveTools(),
+              requiredTools: ["read", "edit", "bash"],
+              assignmentPresent: true,
+            }),
+          });
+          workerBinding = createWorkerSessionBinding({
+            runtime,
+            assignment: assignment.scope,
+          });
+          // One gate, not two: the runtime's gate is the authority every tool
+          // surface consults, so an acknowledgement cannot land on a copy.
+          managedGate = runtime.gate;
+          workerBinding.initializeTodos();
+          void bindWorkerControlChannel(ctx, branch as unknown[]);
+        }
+      } else if (managedState.kind === "quarantined") {
+        managedQuarantine = managedState.reason;
         ctx.ui.notify(
-          `Managed session bootstrap ignored: ${managed.reason}. Starting as an ordinary session.`,
+          `Managed session quarantined: ${managedState.reason}. This session may inspect only; edits, shell, orchestration and commits are refused until it is reconciled.`,
           "warning",
         );
       }
-    } catch (_e) {
-      void _e;
+    } catch (error: unknown) {
+      managedGate = undefined;
+      workerBinding = undefined;
+      managedState = resolveManagedSessionState([], error);
+      if (managedState.kind === "quarantined") {
+        managedQuarantine = managedState.reason;
+        ctx.ui.notify(
+          `Managed session quarantined: ${managedState.reason}. Inspection only until reconciled.`,
+          "warning",
+        );
+      }
     }
     // Generic host contract: negotiate/announce once per session. A host that
     // never answers keeps the statuses/widgets path only.
@@ -11302,6 +12301,17 @@ export default function workflowExtension(
     }
     // A session boundary owns the session-scoped plan fallback; the restore
     // loop below re-seeds it from the persisted `planFile`.
+    // Authenticated child events arrive as a bus payload whose envelope was
+    // opened by the transport (step 10). The pump re-checks identity, epoch and
+    // sequence before anything can wake the parent.
+    try {
+      const eventBus: any = (pi as any).events;
+      eventBus?.on?.("workflow-orchestrator-event", (payload: unknown) => {
+        void ingestOrchestratorEvent(payload);
+      });
+    } catch (_e) {
+      void _e;
+    }
     resetSessionPlanProvenance();
     // Recovery is request-scoped; a new/resumed/reloaded session starts clean.
     try {
@@ -11524,6 +12534,12 @@ export default function workflowExtension(
               ((d as any).pendingHandoffReviewOwned === true ||
                 ((d as any).pendingHandoffReviewOwned === undefined &&
                   legacyReviewOwned));
+            // The versioned destination decision. A branch that predates it
+            // restores without a destination record; recovery synthesizes a
+            // legacy Build decision so the meaning it was shown with survives.
+            pendingHandoffDecision = awaitingDecision
+              ? parseHandoffDecision((d as any).pendingHandoffDecision)
+              : undefined;
           }
         }
         if (
@@ -11774,6 +12790,12 @@ export default function workflowExtension(
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    try {
+      orchestratorPump?.dispose();
+      orchestratorPump = undefined;
+    } catch (_e) {
+      void _e;
+    }
     // A write denial is run-scoped; the session is going away, so drop it.
     writeGateRunDenials.clear();
     writeGateTurnAnswer = null;
@@ -11821,6 +12843,7 @@ export default function workflowExtension(
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.policy, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.todos, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.orchestrator, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
     // The Terminal review line is a live surface; a quit/reload must not wait
     // for teardown to clear it (teardown later drops currentSessionCtx).
@@ -13441,11 +14464,29 @@ export default function workflowExtension(
     // ── Managed worker readiness ── A worker reads its assignment first; a
     // mutation or shell call before acknowledgement is refused with a reason,
     // not silently allowed. Read-only inspection and its own TODOs stay open.
-    if (managedGate) {
-      const mutation = classifyToolMutation(event.toolName, event.input);
-      if (mutation.mutating || mutation.shell) {
-        const reason = managedGate.mutationBlockReason(event.toolName);
-        if (reason) return { block: true, reason } as any;
+    const managedMutation = classifyToolMutation(event.toolName, event.input);
+    const managedMutating = managedMutation.mutating || managedMutation.shell;
+    // Quarantine outranks everything: present-but-unreadable managed metadata
+    // must never restore ordinary write authority.
+    if (managedQuarantine) {
+      const reason = quarantineBlockReason({
+        reason: managedQuarantine,
+        tool: event.toolName,
+        mutating: managedMutating,
+      });
+      if (reason) return { block: true, reason } as any;
+    }
+    if (managedGate && managedMutating) {
+      const reason = managedGate.mutationBlockReason(event.toolName);
+      if (reason) return { block: true, reason } as any;
+    }
+    // Step 14: the candidate fence is a second, independent authority. A
+    // quiescent child stops mutating even while its managed grant is live.
+    if (workerBinding) {
+      const admitted = workerBinding.admitTool(event.toolName);
+      if (!admitted.ok) return { block: true, reason: admitted.error } as any;
+      if (isMutatingWorkerTool(event.toolName)) {
+        workerAdmittedCalls.add(String(event.toolCallId ?? `${event.toolName}:${Date.now()}`));
       }
     }
     // Resolve the role per call: an env-carried role (spawned subagent) wins,
@@ -13888,6 +14929,22 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
+    // Step 14: only calls admitted as mutations decrement the fence counter.
+    if (workerBinding) {
+      const callId = String((event as any).toolCallId ?? "");
+      const toolName = String((event as any).toolName ?? "");
+      if (callId && workerAdmittedCalls.delete(callId)) {
+        workerBinding.noteToolEnded();
+      } else if (!callId && toolName && workerAdmittedCalls.size > 0) {
+        for (const key of workerAdmittedCalls) {
+          if (key.startsWith(`${toolName}:`)) {
+            workerAdmittedCalls.delete(key);
+            workerBinding.noteToolEnded();
+            break;
+          }
+        }
+      }
+    }
   });
 
   // Per-step commit trigger: the runner AWAITS tool_result handlers, so the
@@ -13935,6 +14992,22 @@ export default function workflowExtension(
       readGateBatchCallIds = callIds;
       readGateTurnAnswer = null;
       readGateTurnSteered = false;
+      // Step 19: real provider usage, journaled idempotently per message.
+      if (orchestratorRuntime && message.usage && typeof message.usage === "object") {
+        const usage: any = message.usage;
+        const cost = usage.cost && typeof usage.cost.total === "number" ? usage.cost.total : null;
+        void recordOrchestratorUsage({
+          sessionId: sessionRefFor(),
+          messageId: String(
+            message.id ?? `${sessionRefFor()}-${(event as any)?.timestamp ?? Date.now()}`,
+          ),
+          model: String(message.model ?? lastKnownModel?.id ?? "unknown"),
+          inputTokens: Number(usage.input ?? 0),
+          outputTokens: Number(usage.output ?? 0),
+          cachedInputTokens: Number(usage.cacheRead ?? 0),
+          costUsd: cost,
+        }).catch(() => undefined);
+      }
     } catch (_e) {
       void _e;
     }
@@ -13942,6 +15015,13 @@ export default function workflowExtension(
 
   pi.on("turn_start", async (_event, ctx) => {
     footerInjectedThisTurn = false;
+    // A queued follow-up that starts its turn is no longer pending input; the
+    // fence may now close once tools drain and the child settles.
+    try {
+      workerBinding?.noteFollowUpEnded();
+    } catch (_e) {
+      void _e;
+    }
     // A new turn = a new answer for the write gate (the batch's own
     // message_end already resets it; this is the defensive second guard).
     writeGateTurnAnswer = null;
@@ -13991,6 +15071,26 @@ export default function workflowExtension(
   });
 
   pi.on("agent_settled", async () => {
+    // Step 14: only a real settle can close the fence — `agent_end` cannot.
+    try {
+      workerBinding?.noteSettled();
+    } catch (_e) {
+      void _e;
+    }
+    // Step 17: the parent is idle now. Drain at most one durable wake.
+    try {
+      if (
+        orchestratorPump &&
+        workflowMode === "orchestrator" &&
+        !managedGate &&
+        !workerBinding
+      ) {
+        orchestratorPump.endTurn();
+        await orchestratorPump.drainAndDeliver();
+      }
+    } catch (_e) {
+      void _e;
+    }
     // The run is over (completed, aborted or errored). The /commit flow lives
     // within one run, so both the armed exemption and any unconfirmed flow are
     // dropped here — nothing that runs next inherits them.
@@ -14328,6 +15428,12 @@ export default function workflowExtension(
   let pendingHandoffCycleId = 0;
   let pendingHandoffReviewUrl: string | null = null;
   let pendingHandoffPlanTextLen = 0;
+  /**
+   * The durable identity/destination of the ONE pending approval. Browser,
+   * native and reload-recovery paths all consume this record, so an approval
+   * can never run twice or be retargeted after it was shown.
+   */
+  let pendingHandoffDecision: HandoffDecision | undefined;
   /** The one in-flight `plannotator:request` waiter; settles exactly once. */
   let pendingPlanReviewRequest:
     | {
@@ -14344,6 +15450,1308 @@ export default function workflowExtension(
   let recoveryInFlight: Promise<void> | null = null;
   /** Last path announced by the suppressed-handoff notice (per run). */
   let lastPlanReadyNoticeKey: string | null = null;
+
+  /** Stable session identity for a handoff decision (never a filesystem path). */
+  function handoffDecisionSessionRef(ctx?: unknown): string {
+    try {
+      const manager: any = (ctx as any)?.sessionManager ?? (currentSessionCtx as any)?.sessionManager;
+      const id = manager?.getSessionId?.();
+      if (typeof id === "string" && id.trim()) return id.trim();
+      const file = manager?.getSessionFile?.();
+      if (typeof file === "string" && file.trim()) return file.trim();
+    } catch (_e) {
+      void _e;
+    }
+    return "session";
+  }
+
+  /** The saved destination for a NEW handoff (presenter settings are separate). */
+  function defaultHandoffDestination(): HandoffDestination {
+    return handoffConfigNow().config.executionMode;
+  }
+
+  /**
+   * Creates the pending decision for the plan about to be presented. A legacy
+   * browser gate being restored keeps its original Build meaning.
+   */
+  function beginHandoffDecision(input: {
+    planPath: string;
+    planText: string;
+    presenter: HandoffPresenter;
+    reviewOwned: boolean;
+    source: "auto" | "manual";
+    cycleId: number;
+    ctx?: unknown;
+    legacyDestination?: HandoffDestination;
+  }): HandoffDecision | undefined {
+    const created = createHandoffDecision({
+      planPath: input.planPath,
+      planHash: planHash(input.planText),
+      sessionRef: handoffDecisionSessionRef(input.ctx),
+      reviewCycleId: input.cycleId,
+      source: input.source,
+      presenter: input.presenter,
+      reviewOwned: input.reviewOwned,
+      defaultDestination: defaultHandoffDestination(),
+      now: Date.now(),
+      ...(input.legacyDestination === undefined
+        ? {}
+        : { legacy: true as const, defaultDestination: input.legacyDestination }),
+    });
+    if (!created.ok) {
+      notifyReview(`Handoff routing unavailable: ${created.error}`, "warning");
+      pendingHandoffDecision = undefined;
+      return undefined;
+    }
+    pendingHandoffDecision = created.decision;
+    return created.decision;
+  }
+
+  /**
+   * `/handoff once`: retarget ONLY the pending approval. Never writes settings,
+   * never touches a consumed/superseded decision.
+   */
+  function overridePendingHandoffDestination(
+    ctx: ExtensionContext,
+    destination: HandoffDestination,
+  ): boolean {
+    if (!pendingHandoffDecision || !awaitingDecision || planHandoffPhase !== "pending") {
+      return false;
+    }
+    if (handoffModalOpen) {
+      ctx.ui.notify(
+        "The native handoff sheet is open — choose its destination-specific approval row instead.",
+        "info",
+      );
+      return true;
+    }
+    const result = overrideHandoffDestination(pendingHandoffDecision, destination, Date.now());
+    if (!result.ok) {
+      ctx.ui.notify(`Cannot change this handoff: ${result.error}.`, "warning");
+      return true;
+    }
+    pendingHandoffDecision = result.decision;
+    persistState();
+    updateStatus(ctx);
+    ctx.ui.notify(
+      `This handoff will now approve → ${
+        destination === "orchestrator"
+          ? "Orchestrator (prepare breakdown)"
+          : "direct Build (execute here)"
+      }. Saved default is unchanged (${handoffConfigNow().config.executionMode}).`,
+      "info",
+    );
+    return true;
+  }
+
+  /**
+   * Take the pending decision exactly once. The consume step then validates the
+   * approved content and returns the single route to apply.
+   */
+  function takePendingHandoffDecision(): HandoffDecision | undefined {
+    const decision = pendingHandoffDecision;
+    pendingHandoffDecision = undefined;
+    return decision;
+  }
+
+  /** Durable, display-only record of which route an approval took. */
+  function recordHandoffRoute(input: {
+    decision?: HandoffDecision;
+    destination: HandoffDestination;
+    route: HandoffRouteKind;
+    planPath: string;
+    via: string;
+    failure?: string;
+  }): void {
+    try {
+      pi.appendEntry("workflow-handoff-route", {
+        at: Date.now(),
+        decisionId: input.decision?.decisionId ?? null,
+        overrideRevision: input.decision?.overrideRevision ?? 0,
+        destination: input.destination,
+        route: input.route,
+        planPath: input.planPath,
+        via: input.via,
+        ...(input.failure === undefined ? {} : { failure: input.failure }),
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Orchestrator route for an approved plan.
+   *
+   * Approval hands the roadmap to the Orchestrator PARENT: it prepares a
+   * validated execution breakdown for a second, explicit approval. This never
+   * sends the direct-Build execution prompt and never launches a child.
+   * Step 15 replaces the `awaiting_runtime` marker with run ingestion and a
+   * bounded preparation turn.
+   */
+  /**
+   * The parent runtime's ports. One runtime per session: an approved plan binds
+   * its run, and a reload re-ingests the same bytes into the same journal.
+   */
+  // ── Orchestrator production composition (steps 9/11/16–22) ──────
+  //
+  // Everything below turns the injected-port runtimes into live effects. The
+  // order is deliberate: a child host must exist before a dispatcher, the
+  // dispatcher before a dispatch, and verification before acceptance.
+
+  function orchestratorRoot(): string {
+    const cwd = (currentSessionCtx as any)?.cwd;
+    return typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
+  }
+
+  function orchestratorWorkspaceKey(): string {
+    const root = path.resolve(orchestratorRoot()).replace(/\\/g, "/");
+    return process.platform === "win32" ? root.toLowerCase() : root;
+  }
+
+  async function loadPiSdk(): Promise<{
+    SessionManager: {
+      create(cwd: string, sessionDir?: string, options?: { id?: string; parentSession?: string }): never;
+      open(path: string, sessionDir?: string, cwdOverride?: string): never;
+    };
+  }> {
+    // A supported peer dependency, resolved at runtime. Never a bundled copy
+    // and never a node_modules patch.
+    const moduleName = ["@earendil-works", "pi-coding-agent"].join("/");
+    const loaded: any = await import(moduleName);
+    if (!loaded || typeof loaded.SessionManager !== "object") {
+      throw new Error("the Pi SDK SessionManager is unavailable in this host");
+    }
+    return { SessionManager: loaded.SessionManager };
+  }
+
+  function ensureOrchestratorSdk(): ReturnType<typeof createSdkWorkerPort> {
+    if (orchestratorSdk) return orchestratorSdk;
+    orchestratorSdk = createSdkWorkerPort({
+      loadSdk: async () => (await loadPiSdk()) as never,
+    });
+    return orchestratorSdk;
+  }
+
+  function resolvePiCli(): Promise<{
+    command: string;
+    baseArgs?: string[];
+    resourceArgs?: (resources: unknown) => readonly string[];
+  } | null> {
+    const explicit = (process.env.PI_CLI ?? "").trim();
+    if (explicit) {
+      return Promise.resolve(fs.existsSync(explicit) ? { command: explicit } : null);
+    }
+    try {
+      const finder = process.platform === "win32" ? "where" : "which";
+      const found = spawnSync(finder, ["pi"], { encoding: "utf8" });
+      const first = String(found.stdout ?? "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)[0];
+      return Promise.resolve(first ? { command: first } : null);
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+
+  function ensureDesktopSessionHost(): ReturnType<typeof createDesktopSessionHost> | undefined {
+    if (orchestratorDesktop) return orchestratorDesktop;
+    const bus: any = (pi as any).events;
+    if (!bus || typeof bus.on !== "function" || typeof bus.emit !== "function") return undefined;
+    try {
+      orchestratorDesktop = createDesktopSessionHost({
+        bus: {
+          on: (channel, handler) => bus.on(channel, handler),
+          emit: (channel, payload) => bus.emit(channel, payload),
+        },
+        ownerCommand: "workflow-bridge",
+        clock: {
+          now: () => Date.now(),
+          setTimeout: (callback, ms) => setTimeout(callback, ms) as unknown as object,
+          clearTimeout: (handle) => clearTimeout(handle as never),
+        },
+        grant: () => {
+          const held = bridgeGrantHolder.current();
+          return held
+            ? {
+                token: held.token,
+                ownerCommand: held.ownerCommand,
+                sessionId: held.sessionId,
+                epoch: held.epoch,
+              }
+            : undefined;
+        },
+        onError: () => undefined,
+      });
+      orchestratorDesktop.probe();
+    } catch {
+      orchestratorDesktop = undefined;
+    }
+    return orchestratorDesktop;
+  }
+
+  /** Prefer a source-bound Desktop tab, else a real Terminal window. */
+  function createPreferringChildHost(
+    desktop: ChildHost | undefined,
+    terminal: ChildHost,
+  ): ChildHost {
+    const used = new Map<string, ChildHost>();
+    const candidates = desktop ? [desktop, terminal] : [terminal];
+    const pick = async (): Promise<
+      | { host: ChildHost; capability: Awaited<ReturnType<ChildHost["capabilities"]>> }
+      | undefined
+    > => {
+      for (const host of candidates) {
+        const capability = await host.capabilities();
+        if (capability.available) return { host, capability };
+      }
+      return undefined;
+    };
+    return {
+      async capabilities() {
+        const chosen = await pick();
+        if (chosen) return chosen.capability;
+        const all = await Promise.all(candidates.map((host) => host.capabilities()));
+        return {
+          available: false,
+          label: all[0]?.label ?? "child host",
+          separateWindow: false,
+          focus: false,
+          reason: all.map((cap) => `${cap.label}: ${cap.reason ?? "unavailable"}`).join("; "),
+        };
+      },
+      async prepare(input) {
+        const chosen = await pick();
+        if (!chosen) {
+          return {
+            ok: false,
+            error:
+              "no child host is available (the Terminal launcher and the Desktop tab service both refused)",
+          };
+        }
+        const prepared = await chosen.host.prepare(input);
+        if (prepared.ok) used.set(prepared.spec.workerId, chosen.host);
+        return prepared;
+      },
+      async launch(spec) {
+        const host = used.get(spec.workerId);
+        if (!host) return { ok: false, error: "the child was created by no bound host" };
+        return host.launch(spec);
+      },
+    };
+  }
+
+  function ensureOrchestratorChildHost(): ChildHost {
+    if (orchestratorChildHost) return orchestratorChildHost;
+    const terminal = createTerminalChildHost({
+      sdk: async () => ensureOrchestratorSdk(),
+      terminal: createTerminalHost({
+        platform: process.platform,
+        resolvePi: resolvePiCli,
+        label: "Pi Terminal",
+      }),
+    });
+    const desktop = ensureDesktopSessionHost();
+    orchestratorChildHost = createPreferringChildHost(
+      desktop
+        ? createDesktopChildHost({
+            host: desktop,
+            parentSessionRef: () => sessionRefFor(),
+            label: "Pi Desktop",
+          })
+        : undefined,
+      terminal,
+    );
+    void refreshOrchestratorHostCapability();
+    return orchestratorChildHost;
+  }
+
+  function sessionRefFor(): string {
+    try {
+      const id = (currentSessionCtx?.sessionManager as any)?.getSessionId?.();
+      if (typeof id === "string" && id.length > 0) return id;
+    } catch (_e) {
+      void _e;
+    }
+    return `${process.pid}`;
+  }
+
+  async function refreshOrchestratorHostCapability(): Promise<void> {
+    if (!orchestratorChildHost) return;
+    try {
+      orchestratorHostCapability = await orchestratorChildHost.capabilities();
+    } catch (error: unknown) {
+      orchestratorHostCapability = {
+        available: false,
+        label: "child host",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    updateStatusIfBound();
+  }
+
+  function updateStatusIfBound(): void {
+    if (!currentSessionCtx) return;
+    try {
+      updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function ensureOrchestratorLeases(): ReturnType<typeof createFileWorkspaceLeases> {
+    if (orchestratorLeases) return orchestratorLeases;
+    orchestratorLeases = createFileWorkspaceLeases({
+      root: path.join(getAgentDir(), "workflow"),
+    });
+    return orchestratorLeases;
+  }
+
+  function ensureOrchestratorControl(ctx: ExtensionContext): RunControl {
+    if (orchestratorControl) return orchestratorControl;
+    const view = orchestratorRuntime?.view();
+    if (!view) throw new Error("no orchestrator run is bound");
+    orchestratorControl = createRunControl({
+      profileDir: getAgentDir(),
+      runId: view.runId,
+      onEvent: async (event) => {
+        await ingestOrchestratorEvent({
+          messageId: event.messageId,
+          seq: event.seq,
+          kind: event.type,
+          runId: event.runId,
+          taskId: event.taskId,
+          attemptId: event.attemptId,
+          sessionId: event.sessionId,
+          generation: event.generation,
+          leaseGeneration: event.leaseGeneration,
+          epoch: orchestrationEpoch,
+          at: event.sentAt,
+          ...(event.payload && typeof event.payload === "object"
+            ? (event.payload as Record<string, unknown>)
+            : {}),
+        });
+        if (event.type === "candidate" || event.type === "waiting-user") {
+          await ensureOrchestratorPump().drainAndDeliver();
+        }
+        updateStatusIfBound();
+      },
+      onError: (error) => {
+        try {
+          pi.appendEntry("workflow-orchestrator-control-error", {
+            at: Date.now(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      },
+    });
+    void ctx;
+    return orchestratorControl;
+  }
+
+  function builderModelPlan():
+    | { provider: string; id: string; thinking?: string }
+    | undefined {
+    const model = lastKnownModel ?? { id: "unknown", contextWindow: null, maxOutputTokens: null };
+    const resolved = resolveBudget({
+      role: "builder",
+      model: {
+        id: model.id,
+        contextWindow: model.contextWindow ?? null,
+        maxOutputTokens: model.maxOutputTokens ?? null,
+      },
+    });
+    if (!resolved.ok) return undefined;
+    return {
+      provider: resolved.plan.model.provider ?? model.provider ?? "unknown",
+      id: resolved.plan.model.id,
+    };
+  }
+
+  function ensureOrchestratorDispatcher(
+    ctx: ExtensionContext,
+  ): ReturnType<typeof createChildDispatcher> {
+    if (orchestratorDispatcher) return orchestratorDispatcher;
+    ensureOrchestratorChildHost();
+    const leases = ensureOrchestratorLeases();
+    const workspaceKey = orchestratorWorkspaceKey();
+    const control = ensureOrchestratorControl(ctx);
+    orchestratorDispatcher = createChildDispatcher({
+      runtime: () => orchestratorRuntime,
+      control: () => control,
+      host: () => ensureOrchestratorChildHost(),
+      builderModel: () => builderModelPlan(),
+      parentSessionRef: () => sessionRefFor(),
+      cwd: () => orchestratorRoot(),
+      agentDir: () => getAgentDir(),
+      trust: () => "session",
+      allocateGeneration: () => leases.nextGeneration?.(workspaceKey) ?? 1,
+      now: () => Date.now(),
+    });
+    return orchestratorDispatcher;
+  }
+
+  /** Minimal git runner used by the baseline/commit ports. */
+  function runGitSync(
+    args: string[],
+    cwd: string,
+  ): { ok: boolean; stdout: string; stderr: string } {
+    try {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+      return {
+        ok: result.status === 0,
+        stdout: String(result.stdout ?? ""),
+        stderr: String(result.stderr ?? ""),
+      };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  function createLiveBaselinePort(): ReturnType<typeof createGitBaselinePort> {
+    return createGitBaselinePort({ runGit: runGitSync });
+  }
+
+  async function captureOrchestratorBaseline(attemptId: string): Promise<void> {
+    if (orchestratorBaseline?.attemptId === attemptId) return;
+    const captured = await captureBaseline({
+      workspace: {
+        key: `git:${orchestratorWorkspaceKey()}`,
+        root: path.resolve(orchestratorRoot()),
+        kind: "git",
+        displayPath: orchestratorWorkspaceKey(),
+      },
+      port: createLiveBaselinePort(),
+      now: Date.now(),
+    });
+    if (captured.ok) {
+      orchestratorBaseline = { attemptId, baseline: captured.value };
+      orchestratorWorkspaceRev = captured.value.digest;
+    } else {
+      orchestratorBaseline = undefined;
+    }
+  }
+
+  function ensureOrchestratorVerify(
+    ctx: ExtensionContext,
+  ): ReturnType<typeof createVerifyRuntime> {
+    if (orchestratorVerify) return orchestratorVerify;
+    const baselinePort = createLiveBaselinePort();
+    orchestratorVerify = createVerifyRuntime({
+      runtime: () => orchestratorRuntime,
+      baseline: () => {
+        const mutation = orchestratorRuntime?.view()?.state.mutation;
+        if (!mutation) return orchestratorBaseline?.baseline;
+        return orchestratorBaseline?.attemptId === mutation.attemptId
+          ? orchestratorBaseline.baseline
+          : undefined;
+      },
+      candidate: async () => {
+        const captured = await captureBaseline({
+          workspace: {
+            key: `git:${orchestratorWorkspaceKey()}`,
+            root: path.resolve(orchestratorRoot()),
+            kind: "git",
+            displayPath: orchestratorWorkspaceKey(),
+          },
+          port: baselinePort,
+          now: Date.now(),
+        });
+        if (!captured.ok) throw new Error(captured.error);
+        return captured.value;
+      },
+      executor: {
+        async run(request) {
+          // The parent's only execution path is the supported gated tool, not
+          // a raw shell: policy, deadlines and cancellation still apply.
+          const command = request.command ?? request.name;
+          const execute = (ctx as any)?.executeTool;
+          if (typeof execute !== "function") {
+            return {
+              name: request.name,
+              status: "unavailable",
+              evidence: "this host cannot execute a check tool from a tool call",
+            } as never;
+          }
+          const started = Date.now();
+          const result: any = await execute.call(ctx, "bash", { command, cwd: request.cwd });
+          const text = JSON.stringify(result ?? {}).slice(0, 4_000);
+          const exit =
+            typeof result?.exitCode === "number"
+              ? result.exitCode
+              : typeof result?.details?.exitCode === "number"
+                ? result.details.exitCode
+                : /"exitCode":\s*[1-9]/.test(text)
+                  ? 1
+                  : 0;
+          return {
+            name: request.name,
+            status: exit === 0 ? "passed" : "failed",
+            exitCode: exit,
+            evidence: text,
+            durationMs: Date.now() - started,
+          } as never;
+        },
+      },
+      workspaceRevision: () => orchestratorWorkspaceRev ?? "unbaselined",
+      now: () => Date.now(),
+    });
+    return orchestratorVerify;
+  }
+
+  function ensureOrchestratorBudget(): ReturnType<typeof createBudgetRuntime> {
+    if (orchestratorBudget) return orchestratorBudget;
+    orchestratorBudget = createBudgetRuntime({
+      runtime: () => orchestratorRuntime,
+      budgets: DEFAULT_EXECUTION_BUDGETS,
+      now: () => Date.now(),
+    });
+    void orchestratorBudget.restore();
+    return orchestratorBudget;
+  }
+
+  function ensureOrchestratorFinal(): ReturnType<typeof createFinalRuntime> {
+    if (orchestratorFinal) return orchestratorFinal;
+    orchestratorFinal = createFinalRuntime({
+      runtime: () => orchestratorRuntime,
+      ledger: commitLedger,
+      git: {
+        async stage(paths) {
+          for (const target of paths) {
+            spawnSync("git", ["add", "--", target], {
+              cwd: orchestratorRoot(),
+              windowsHide: true,
+            });
+          }
+        },
+        async commit(input) {
+          const message = `${input.message}\n\n${input.trailer}`;
+          const result = spawnSync("git", ["commit", "-m", message, "--", ...input.paths], {
+            cwd: orchestratorRoot(),
+            encoding: "utf8",
+            windowsHide: true,
+          });
+          if (result.status !== 0) throw new Error(String(result.stderr ?? "git commit failed"));
+          const sha = runGitSync(["rev-parse", "HEAD"], orchestratorRoot());
+          return { sha: sha.stdout.trim() };
+        },
+        async findCommit(trailer) {
+          const found = runGitSync(["log", "--format=%H%x00%B%x00", "-n", "50"], orchestratorRoot());
+          if (!found.ok) return null;
+          const parts = found.stdout.split("\u0000");
+          for (let index = 0; index + 1 < parts.length; index += 2) {
+            if (parts[index + 1]?.includes(trailer)) return { sha: parts[index]!.trim() };
+          }
+          return null;
+        },
+      },
+      commitMode: () => "never",
+      now: () => Date.now(),
+    });
+    return orchestratorFinal;
+  }
+
+  /** Deliver `/orchestrator say` to the live child over the control channel. */
+  async function deliverOrchestratorSay(text: string): Promise<boolean> {
+    const view = orchestratorRuntime?.view();
+    const mutation = view?.state.mutation;
+    if (!orchestratorControl || !view || !mutation) return false;
+    // The control identity is the deterministic worker id; the workspace
+    // session id is the child's real SDK/host identity.
+    const controlSessionId = workerIdFor({
+      runId: view.runId,
+      taskId: mutation.taskId,
+      attemptId: mutation.attemptId,
+    });
+    return orchestratorControl.request("say", { text }, { sessionId: controlSessionId });
+  }
+
+
+  /**
+   * `/orchestrator finalize`: the roadmap-level integration gate. Required
+   * final checks are not guessed: this run has no parsed final-check list, so
+   * the gate fails closed with an actionable reason instead of reporting
+   * completion. A failed gate records a scoped revision proposal.
+   */
+  async function runOrchestratorFinalize(ctx: ExtensionContext): Promise<void> {
+    const view = orchestratorRuntime?.view();
+    if (!view) {
+      ctx.ui.notify(
+        "No orchestrator run is bound. Approve a plan (destination: Orchestrator) first.",
+        "info",
+      );
+      return;
+    }
+    if (view.state.mutation) {
+      ctx.ui.notify(
+        "A child still holds the mutation grant. Finalize after its fence; nothing was evaluated.",
+        "warning",
+      );
+      return;
+    }
+    let markdown: string;
+    try {
+      markdown = fs.readFileSync(view.roadmap.path, "utf8");
+    } catch (error: unknown) {
+      ctx.ui.notify(
+        `The approved roadmap could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }. Nothing was evaluated.`,
+        "warning",
+      );
+      return;
+    }
+    const snapshot = snapshotRoadmap({
+      sourcePath: view.roadmap.path,
+      markdown,
+      now: Date.now(),
+    });
+    if (!snapshot.ok) {
+      ctx.ui.notify(`The roadmap could not be re-parsed: ${snapshot.error}.`, "warning");
+      return;
+    }
+    const runtime = ensureOrchestratorFinal();
+    const decision = await runtime.finalGate({
+      snapshot: snapshot.snapshot,
+      state: view.state,
+      workspace: {
+        revision: orchestratorWorkspaceRev ?? "unbaselined",
+        quiescent: view.state.mutation === null,
+      },
+      verifiedWorkspaceRevision: orchestratorWorkspaceRev ?? "unbaselined",
+      // Final integration checks are not manufactured here. An empty list is
+      // an honest "not run", and the gate must refuse rather than pass.
+      checks: [],
+      requiredChecks: [],
+      manualAcceptance: [],
+      approval: {
+        roadmapDigest: view.roadmap.digest,
+        roadmapRevision: view.roadmapRevision,
+      },
+      now: Date.now(),
+    });
+    if (!decision.ok) {
+      ctx.ui.notify(`Final gate refused: ${decision.error}.`, "warning");
+      return;
+    }
+    const gate = decision.value.decision;
+    if (!gate.ok) {
+      ctx.ui.notify(`Final gate refused: ${gate.error}.`, "warning");
+      return;
+    }
+    if (gate.decision === "complete") {
+      ctx.ui.notify("Final gate: complete. All required coverage was accepted.", "info");
+      updateStatus(ctx);
+      return;
+    }
+    const proposed = await runtime.proposeRevision(
+      gate.blockers.join("; ").slice(0, 400) || "final gate failed",
+    );
+    const revisionNote = proposed.ok
+      ? " A scoped revision was journaled; it needs a new execution approval before any child starts."
+      : "";
+    ctx.ui.notify(
+      `Final gate did not pass: ${gate.blockers.join("; ").slice(0, 600)}.${revisionNote}`,
+      "warning",
+    );
+    updateStatus(ctx);
+  }
+
+  /** Journal a usage receipt for the current assistant message (idempotent). */
+  async function recordOrchestratorUsage(input: {
+    sessionId: string;
+    messageId: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens?: number;
+    costUsd?: number | null;
+  }): Promise<void> {
+    if (!orchestratorRuntime) return;
+    const budget = ensureOrchestratorBudget();
+    await budget.recordUsage({ ...input, at: Date.now() });
+    updateStatusIfBound();
+  }
+
+  /** Runtime-owned verification; the model supplies a task id, not evidence. */
+  async function verifyTaskWithRuntime(
+    ctx: any,
+    taskId: string,
+  ): Promise<{ ok: boolean; text: string; details: Record<string, unknown> }> {
+    const view = orchestratorRuntime?.view();
+    if (!view) {
+      return {
+        ok: false,
+        text: "No orchestrator run is bound to this session. Approve a plan (destination: Orchestrator) first.",
+        details: { code: "unavailable" },
+      };
+    }
+    if (!taskId) {
+      return { ok: false, text: "taskId is required.", details: { code: "invalid" } };
+    }
+    const task = view.state.tasks[taskId];
+    if (!task) {
+      return { ok: false, text: `Unknown task ${taskId}.`, details: { code: "state" } };
+    }
+    if (task.state === "accepted" && task.acceptance) {
+      return {
+        ok: true,
+        text: `${taskId} is already accepted with evidence ${task.acceptance.evidenceId}; nothing was re-run.`,
+        details: { phase: "accepted", evidenceId: task.acceptance.evidenceId, duplicate: true },
+      };
+    }
+    const attemptId = task.currentAttemptId;
+    if (!attemptId) {
+      return {
+        ok: false,
+        text: `${taskId} has no live attempt; there is nothing to verify.`,
+        details: { code: "state" },
+      };
+    }
+    if (view.state.mutation) {
+      return {
+        ok: false,
+        text: "The workspace is not quiescent: a child still holds the mutation grant. Verify after its fence.",
+        details: { code: "state" },
+      };
+    }
+    await captureOrchestratorBaseline(attemptId);
+    if (!orchestratorBaseline || orchestratorBaseline.attemptId !== attemptId) {
+      return {
+        ok: false,
+        text: "No pre-work baseline was captured for this attempt, so acceptance evidence cannot be attributed. Re-dispatch to capture one.",
+        details: { code: "invalid" },
+      };
+    }
+    const runtime = ensureOrchestratorVerify(ctx);
+    const outcome = await runtime.verify({
+      taskId,
+      attemptId,
+      candidateId: orchestratorWorkspaceRev ?? `candidate-${attemptId}`,
+      requiredCriteria: task.covers,
+      // Scope mapping only. The pass/fail decision comes from the runtime's
+      // required checks and the captured diff, never from this list.
+      criteria: task.covers.map((id) => ({ roadmapStepId: id, status: "met" as const })),
+      cwd: orchestratorRoot(),
+    });
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        text: `Verification was refused: ${outcome.error}. Nothing was accepted.`,
+        details: { code: outcome.code },
+      };
+    }
+    if (outcome.phase === "accepted") {
+      if (outcome.outcome) {
+        orchestratorEvidence.set(taskId, outcome.outcome.evidence);
+      }
+      // Step 22: the accepted task may be committed once, from its own
+      // evidence and attributable paths. Commit policy still decides; this
+      // never becomes an automatic child completion.
+      let commitNote = "";
+      const acceptedTask = orchestratorRuntime?.view()?.state.tasks[taskId];
+      if (acceptedTask?.state === "accepted" && acceptedTask.acceptance) {
+        try {
+          const commit = await ensureOrchestratorFinal().commitAccepted({
+            taskId,
+            evidenceId: acceptedTask.acceptance.evidenceId,
+            candidateId: acceptedTask.acceptance.candidateId,
+            acceptedPaths: acceptedTask.expectedFiles,
+          });
+          if (commit.ok && commit.value.apply.ok && commit.value.apply.status === "committed") {
+            commitNote = ` Committed ${commit.value.apply.sha.slice(0, 12)}.`;
+          }
+        } catch (_e) {
+          void _e;
+        }
+      }
+      return {
+        ok: true,
+        text: `Verified ${taskId}: evidence ${outcome.evidenceId}${outcome.duplicate ? " (already recorded)" : ""}.${
+          outcome.nextTaskId ? ` Next dependency-ready task is ${outcome.nextTaskId}; dispatch it explicitly.` : " No task is dispatchable yet."
+        }${commitNote}`,
+        details: {
+          phase: "accepted",
+          evidenceId: outcome.evidenceId,
+          ...(outcome.nextTaskId === undefined ? {} : { nextTaskId: outcome.nextTaskId }),
+        },
+      };
+    }
+    return {
+      ok: false,
+      text: `Verification did not accept ${taskId} (${outcome.phase}): ${outcome.reasons.join("; ").slice(0, 1_200)}`,
+      details: { phase: outcome.phase, reasons: outcome.reasons.slice(0, 12) },
+    };
+  }
+
+  /** A model cannot mint acceptance: this only re-reads runtime evidence. */
+  async function acceptTaskWithRuntime(
+    taskId: string,
+  ): Promise<{ ok: boolean; text: string; details: Record<string, unknown> }> {
+    const view = orchestratorRuntime?.view();
+    if (!view) {
+      return { ok: false, text: "No orchestrator run is bound to this session.", details: { code: "unavailable" } };
+    }
+    if (!taskId) return { ok: false, text: "taskId is required.", details: { code: "invalid" } };
+    const task = view.state.tasks[taskId];
+    if (!task) return { ok: false, text: `Unknown task ${taskId}.`, details: { code: "state" } };
+    if (task.state === "accepted" && task.acceptance) {
+      return {
+        ok: true,
+        text: `${taskId} was accepted by the parent with evidence ${task.acceptance.evidenceId}.`,
+        details: { phase: "accepted", evidenceId: task.acceptance.evidenceId },
+      };
+    }
+    if (!orchestratorEvidence.has(taskId)) {
+      return {
+        ok: false,
+        text: "Acceptance evidence is runtime-owned. Run orchestrator_verify; a model-supplied evidence object cannot mint a pass.",
+        details: { code: "unavailable" },
+      };
+    }
+    return {
+      ok: false,
+      text: "The runtime captured evidence but the task is not accepted; inspect the verification blockers instead of re-accepting.",
+      details: { code: "state" },
+    };
+  }
+
+  /** The durable assignment text the parent wrote before launch. */
+  function readWorkerKickoff(branch: unknown[]): string | undefined {
+    for (let index = branch.length - 1; index >= 0; index -= 1) {
+      const entry: any = branch[index];
+      if (entry?.type !== "custom" || entry?.customType !== "workflow-task-assignment") continue;
+      const kickoff = entry.data?.kickoff;
+      if (typeof kickoff === "string" && kickoff.trim().length > 0) {
+        return kickoff.slice(0, 8_000);
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Child side of the run control channel. The worker reads only the grant
+   * REFERENCE from its own metadata; the secret stays in a private file. The
+   * parent grant is the only thing that opens mutation.
+   */
+  async function bindWorkerControlChannel(
+    ctx: ExtensionContext,
+    branch: unknown[],
+  ): Promise<void> {
+    workerControl?.close();
+    workerControl = undefined;
+    if (!workerBinding || managedQuarantine) return;
+    const grantRef = controlGrantRefFrom(branch as never);
+    if (!grantRef) return;
+    const grant = readWorkerGrant(grantRef);
+    if (!grant.ok) {
+      ctx.ui.notify(
+        `Worker control grant is unusable: ${grant.error}. Edits and shell stay blocked until the parent reconciles this attempt.`,
+        "warning",
+      );
+      return;
+    }
+    const kickoff = readWorkerKickoff(branch);
+    const control = createChildControl({
+      grant: grant.value,
+      onStart: async (started) => {
+        // Hold the verified grant; the model's first action is
+        // `workflow_worker_ready`, which applies it. Delivery is not mutation.
+        pendingWorkerGrant = {
+          leaseGeneration: started.leaseGeneration,
+          taskStartId: started.taskStartId,
+        };
+        try {
+          await (pi as any).sendMessage?.(
+            {
+              customType: "workflow-task-start",
+              content:
+                kickoff ??
+                `Start ${started.taskStartId}. Read this session's workflow assignment metadata, call workflow_worker_ready, then work only inside the task scope.`,
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+        } catch (error: unknown) {
+          ctx.ui.notify(
+            `The authorized start could not be delivered: ${
+              error instanceof Error ? error.message : String(error)
+            }.`,
+            "warning",
+          );
+          return false;
+        }
+        updateStatus(currentSessionCtx ?? ctx);
+        return true;
+      },
+      onSay: async (text) => {
+        // `/orchestrator say` is an explicit operator message, not an approval.
+        await (pi as any).sendMessage?.(
+          { customType: "workflow-orchestrator-say", content: text, display: true },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      },
+    });
+    workerControl = control;
+    const connected = await control.start();
+    if (!connected.ok) {
+      ctx.ui.notify(
+        `Worker control channel failed: ${connected.error}. Edits stay blocked until the parent grants this attempt.`,
+        "warning",
+      );
+    }
+  }
+
+  /**
+   * A rebind invalidates every live control/host reference. Nothing from the
+   * previous binding may steer the new one; a stale callback is inert.
+   */
+  function resetOrchestratorComposition(): void {
+    try {
+      workerControl?.close();
+    } catch (_e) {
+      void _e;
+    }
+    workerControl = undefined;
+    void orchestratorControl?.stop().catch(() => undefined);
+    orchestratorControl = undefined;
+    orchestratorDispatcher = undefined;
+    orchestratorChildHost = undefined;
+    orchestratorHostCapability = undefined;
+    orchestratorVerify = undefined;
+    orchestratorBaseline = undefined;
+    orchestratorWorkspaceRev = undefined;
+    try {
+      orchestratorDesktop?.dispose();
+    } catch (_e) {
+      void _e;
+    }
+    orchestratorDesktop = undefined;
+    orchestratorEvidence.clear();
+  }
+
+  function ensureOrchestratorRuntime(ctx: ExtensionContext): OrchestratorRuntime {
+    if (orchestratorRuntime) return orchestratorRuntime;
+    const io = createNodeJournalIo();
+    const runsRoot = path.join(getAgentDir(), "orchestrator", "runs");
+    orchestratorRuntime = createOrchestratorRuntime({
+      createJournal: (runId) =>
+        createRunJournal({ dir: path.join(runsRoot, runId), runId, io }),
+      readRoadmap: async (planPath) => await fs.promises.readFile(planPath, "utf8"),
+      notify: (message, level) => ctx.ui.notify(message, level),
+      appendEntry: (type, data) => pi.appendEntry(type, data),
+    });
+    // Resolve host readiness now so the footer can show an actionable blocker
+    // before the first dispatch attempt.
+    void ensureOrchestratorChildHost();
+    return orchestratorRuntime;
+  }
+
+  function ensureOrchestratorOperator(
+    ctx: ExtensionContext,
+  ): ReturnType<typeof createOperatorRuntime> {
+    if (orchestratorOperator) return orchestratorOperator;
+    orchestratorOperator = createOperatorRuntime({
+      runtime: () => orchestratorRuntime,
+      now: () => Date.now(),
+    });
+    // Bind a run on demand from the session's approved plan, so /orchestrator
+    // status works after a reload without re-approving anything.
+    if (!orchestratorRuntime && currentPlanFile) {
+      const runtime = ensureOrchestratorRuntime(ctx);
+      void runtime
+        .ingest({ planPath: currentPlanFile })
+        .catch(() => undefined);
+    }
+    return orchestratorOperator;
+  }
+
+  function ensureOrchestratorPump(): ReturnType<typeof createPumpRuntime> {
+    if (orchestratorPump) return orchestratorPump;
+    orchestratorPump = createPumpRuntime({
+      runtime: () => orchestratorRuntime,
+      identity: () => {
+        const view = orchestratorRuntime?.view();
+        const grant = view?.state.mutation;
+        if (!view || !grant) return undefined;
+        return {
+          runId: grant.runId,
+          taskId: grant.taskId,
+          attemptId: grant.attemptId,
+          sessionId: grant.sessionId,
+          generation: grant.generation,
+          leaseGeneration: Math.max(1, grant.generation),
+          epoch: orchestrationEpoch,
+        };
+      },
+      deliver: async (wake) => {
+        try {
+          await (pi as any).sendMessage?.(
+            {
+              customType: "workflow-orchestrator-wake",
+              content: `Orchestrator: ${wake.text}`,
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+          return { ok: true as const };
+        } catch (error: unknown) {
+          return {
+            ok: false as const,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    });
+    return orchestratorPump;
+  }
+
+  /**
+   * One entry point for authenticated child events (IPC/host adapters call it).
+   * The pump decides whether the event may wake the parent; this function never
+   * starts a turn on its own.
+   */
+  async function ingestOrchestratorEvent(raw: unknown): Promise<void> {
+    if (workflowMode !== "orchestrator" || managedGate || workerBinding) return;
+    const pump = ensureOrchestratorPump();
+    const result = pump.ingest(raw);
+    if (result.ok) orchestratorRuntime?.appendJournal(
+      "task.reported",
+      { messageId: (raw as any)?.messageId ?? null, kind: (raw as any)?.kind ?? null },
+      `pump-event-${String((raw as any)?.messageId ?? Date.now())}`,
+    );
+  }
+
+  async function beginOrchestratorPreparation(
+    ctx: ExtensionContext,
+    input: { decision?: HandoffDecision; planPath: string; planText?: string; via: string },
+  ): Promise<boolean> {
+    const expectedRoute = input.decision ? handoffRouteFor(input.decision) : undefined;
+    if (expectedRoute && expectedRoute.kind !== "orchestrator-prepare") {
+      ctx.ui.notify(
+        "This handoff was approved for direct Build — it cannot be routed to Orchestrator.",
+        "warning",
+      );
+      return false;
+    }
+    const destination: HandoffDestination = "orchestrator";
+    const route: HandoffRouteKind = "orchestrator-prepare";
+    const consumed = input.decision
+      ? consumeHandoffDecision(input.decision, {
+          now: Date.now(),
+          route,
+          ...(input.planText ? { planHash: planHash(input.planText) } : {}),
+        })
+      : undefined;
+    if (consumed && !consumed.ok) {
+      ctx.ui.notify(
+        `This approval was already applied (${consumed.error}) — nothing was started again.`,
+        "warning",
+      );
+      return false;
+    }
+    await switchWorkflowMode("orchestrator", ctx, { quiet: true, fromReview: true });
+    if (workflowMode !== "orchestrator") {
+      recordHandoffRoute({
+        ...(input.decision ? { decision: input.decision } : {}),
+        destination,
+        route,
+        planPath: input.planPath,
+        via: input.via,
+        failure: "could not enter Orchestrator mode",
+      });
+      ctx.ui.notify(
+        `The plan stays at ${input.planPath || "(unknown)"} — Orchestrator mode could not be entered. Nothing was executed.`,
+        "warning",
+      );
+      return false;
+    }
+    currentPlanFile = input.planPath;
+    try {
+      pi.appendEntry("workflow-orchestrator-preparation", {
+        at: Date.now(),
+        decisionId: input.decision?.decisionId ?? null,
+        planPath: input.planPath,
+        planHash: input.planText ? planHash(input.planText) : (input.decision?.planHash ?? null),
+        stage: "awaiting_runtime",
+      });
+    } catch (_e) {
+      void _e;
+    }
+    recordHandoffRoute({
+      ...(input.decision ? { decision: input.decision } : {}),
+      destination,
+      route,
+      planPath: input.planPath,
+      via: input.via,
+    });
+
+    // ── Step 15: bind the run and start ONE bounded preparation turn ──
+    const runtime = ensureOrchestratorRuntime(ctx);
+    const ingested = await runtime.ingest({
+      planPath: input.planPath,
+      ...(input.planText ? { planText: input.planText } : {}),
+    });
+    if (!ingested.ok) {
+      recordHandoffRoute({
+        ...(input.decision ? { decision: input.decision } : {}),
+        destination,
+        route,
+        planPath: input.planPath,
+        via: input.via,
+        failure: `roadmap ingestion failed: ${ingested.error}`,
+      });
+      ctx.ui.notify(
+        `Orchestrator mode — but the approved roadmap could not be bound: ${ingested.error}. Nothing was dispatched and no breakdown turn was started.`,
+        "warning",
+      );
+      updateStatus(ctx);
+      return false;
+    }
+    updateStatus(ctx);
+    ctx.ui.notify(
+      `Orchestrator mode — run ${ingested.value.runId}: ${ingested.value.view.roadmap.requirementCount} roadmap requirement(s) captured from ${input.planPath || "(unknown)"}.\nAn execution breakdown must be approved separately; nothing is dispatched before that.`,
+      "info",
+    );
+    const preparation = runtime.preparationMessage();
+    if (!preparation) return true;
+    const started = await runtime.markPreparationStarted();
+    if (!started.ok) {
+      ctx.ui.notify(
+        `The preparation turn could not be recorded (${started.error}); the run stays idle.`,
+        "warning",
+      );
+      return true;
+    }
+    try {
+      await (pi as any).sendMessage?.(
+        {
+          customType: "workflow-orchestrator-preparation",
+          content: preparation,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (error: unknown) {
+      ctx.ui.notify(
+        `The preparation turn failed to start: ${
+          error instanceof Error ? error.message : String(error)
+        }. Use /orchestrator status and retry; no child was launched.`,
+        "warning",
+      );
+    }
+    return true;
+  }
+
+  /**
+   * `/handoff approve <decision-id>`: the headless-safe approval.
+   *
+   * The id is the identity printed in the fallback message and in
+   * `/review-status`; a mismatched or consumed decision is refused, so an old
+   * message can never approve a newer plan.
+   */
+  async function approvePendingHandoffById(
+    ctx: ExtensionContext,
+    rawId: string | undefined,
+  ): Promise<void> {
+    const id = typeof rawId === "string" ? rawId.trim() : "";
+    const decision = pendingHandoffDecision;
+    if (!id) {
+      ctx.ui.notify(
+        "Usage: /handoff approve <decision-id> — the id is printed with the plan and in /review-status.",
+        "info",
+      );
+      return;
+    }
+    if (!decision) {
+      ctx.ui.notify(
+        "No pending handoff to approve — write or open a plan first, then approve it from the handoff.",
+        "info",
+      );
+      return;
+    }
+    if (decision.decisionId !== id) {
+      ctx.ui.notify(
+        `That id does not match the pending handoff (${decision.decisionId}). Nothing was approved.`,
+        "warning",
+      );
+      return;
+    }
+    if (decision.state !== "pending") {
+      ctx.ui.notify(`This handoff is already ${decision.state}; nothing was started again.`, "info");
+      return;
+    }
+    if (workflowMode !== "plan" && pendingHandoffSource !== "manual") {
+      ctx.ui.notify(
+        "A plan handoff can only be approved in Plan mode. Nothing was executed.",
+        "warning",
+      );
+      return;
+    }
+    let planText = "";
+    try {
+      planText = fs.readFileSync(decision.planPath, "utf8");
+    } catch (_e) {
+      void _e;
+    }
+    if (decision.planHash !== planHash(planText)) {
+      ctx.ui.notify(
+        "The plan changed after this handoff was shown — nothing was approved. Present the handoff again.",
+        "warning",
+      );
+      return;
+    }
+    takePendingHandoffDecision();
+    if (decision.destination === "orchestrator") {
+      await beginOrchestratorPreparation(ctx, {
+        decision,
+        planPath: decision.planPath,
+        planText,
+        via: "headless",
+      });
+    } else {
+      const entered = await enterBuildModeFromPlan(ctx, decision.planPath, {
+        fromReview: true,
+      });
+      if (!entered || workflowMode !== "build") {
+        recordHandoffRoute({
+          decision,
+          destination: "build",
+          route: "direct-build",
+          planPath: decision.planPath,
+          via: "headless",
+          failure: "Build mode was not entered",
+        });
+        ctx.ui.notify(
+          `Build was not entered — the plan stays at ${decision.planPath}.`,
+          "warning",
+        );
+        return;
+      }
+      sendExecuteMessages(ctx, decision.planPath, undefined, "native");
+      recordHandoffRoute({
+        decision,
+        destination: "build",
+        route: "direct-build",
+        planPath: decision.planPath,
+        via: "headless",
+      });
+      consumeHandoffDecision(decision, {
+        now: Date.now(),
+        route: "direct-build",
+        planHash: planText ? planHash(planText) : undefined,
+      });
+    }
+    clearPendingHandoffDecision();
+    persistState();
+    updateStatus(ctx);
+  }
 
   /** Clear per-run handoff provenance (fresh prompt / mode switch / run end). */
   function resetPlanRunProvenance(): void {
@@ -14374,7 +16782,9 @@ export default function workflowExtension(
       : 0;
     return `  handoff : browser pending — ${lastReviewId ?? "review id unknown"}${
       pendingHandoffReviewUrl ? ` @ ${pendingHandoffReviewUrl}` : ""
-    } (${pendingHandoffSource ?? "auto"}, ${age}s)`;
+    } (${pendingHandoffSource ?? "auto"}, ${age}s); approve → ${
+      pendingHandoffDecision?.destination ?? defaultHandoffDestination()
+    }${pendingHandoffDecision ? ` · ${pendingHandoffDecision.decisionId}` : ""}`;
   }
 
   /**
@@ -14419,7 +16829,8 @@ export default function workflowExtension(
       pendingHandoffCycleId !== 0 ||
       pendingHandoffReviewUrl !== null ||
       planHandoffPhase !== "idle" ||
-      pendingHandoffReviewOwned === true;
+      pendingHandoffReviewOwned === true ||
+      pendingHandoffDecision !== undefined;
     awaitingDecision = false;
     lastHandoffAt = undefined;
     lastReviewId = null;
@@ -14431,6 +16842,7 @@ export default function workflowExtension(
     pendingHandoffReviewUrl = null;
     pendingHandoffPlanTextLen = 0;
     recordedHandoffReviewId = null;
+    pendingHandoffDecision = undefined;
     endPlanHandoff();
     return changed;
   }
@@ -14464,8 +16876,14 @@ export default function workflowExtension(
     ) {
       return false;
     }
+    // Capture the decision before clearing: the superseded record is evidence
+    // of the route the user was shown, and it must not be resurrected.
+    const abandonedDecision = pendingHandoffDecision;
     const changed = clearPendingHandoffDecision();
     if (changed) {
+      if (abandonedDecision) {
+        supersedeHandoffDecision(abandonedDecision, Date.now(), reason);
+      }
       notifyReview(`Plan handoff superseded — ${reason}.`, "info");
       try {
         pi.appendEntry("workflow-handoff-superseded", {
@@ -15132,40 +17550,22 @@ export default function workflowExtension(
           return;
         }
       }
-      // Fallback when hasUI is false: still show handoff via followUp message (Claude Code parity for headless)
+      // Headless: one presenter, one durable pending decision. Nothing executes
+      // and nothing is auto-approved; the message names the decision id and the
+      // exact command that would approve it.
       if (!hasUI && planTextForRender && !awaitingDecision) {
-        try {
-          const preview = planTextForRender.slice(0, 4000);
-          const list = formatTodoNumberedList(todos.items);
-          const content = usePlannotatorHandoff()
-            ? `**Plan ready** (${todos.items.length} steps)\\n\\nTo review in browser, ensure SSH port forwarding is active:\\n\`\`\`\\nLocalForward 9999 localhost:9999\\n\`\`\`\\nThen set \`PLANNOTATOR_REMOTE=1\` and \`PLANNOTATOR_PORT=9999\`.\\n\\nOr type "Execute the plan" to build directly.\\n\\nRemaining:\\n${list}`
-            : `**Plan ready** (${todos.items.length} steps)\\n\\n${preview.slice(0, 500)}...\\n\\nRemaining:\\n${list}\\n\\nType "Execute the plan" to build, or tell me what to refine.${commitDirectiveLine(ctx)}`;
-          (pi as any).sendMessage?.(
-            {
-              customType: "workflow-handoff-fallback",
-              content,
-              display: true,
-            },
-            { triggerTurn: false },
-          );
-        } catch (_e) {
-          void _e;
-        }
-        // Also notify
-        try {
-          ctx.ui.notify(
-            usePlannotatorHandoff()
-              ? "Plan ready — awaiting browser review (or type Execute to build directly)"
-              : "Plan ready — type Execute to build or tell me what to refine.",
-            "info",
-          );
-        } catch (_e) {
-          void _e;
-        }
-        // Headless has no modal: the turn must not outlive the message.
+        await presentPlanHandoff(ctx as ExtensionContext, {
+          planText: planTextForRender,
+          planPath,
+          source: manualReviewCycle ? "manual" : "auto",
+          presentation: "native-only",
+          reason: "handoff",
+          reviewOwned: false,
+        });
         await closeReviewTurn({
           reason: "headless-handoff",
           planText: planTextForRender,
+          keepHandoff: true,
         });
         return;
       }
@@ -15318,6 +17718,16 @@ export default function workflowExtension(
   // all land here). Internal switches are suppressed by `persistSuppressed`.
   pi.on("model_select", async (event, ctx) => {
     updateStatus(ctx as any);
+    const selected: any = (event as any).model;
+    if (selected && typeof selected.id === "string") {
+      lastKnownModel = {
+        ...(typeof selected.provider === "string" ? { provider: selected.provider } : {}),
+        id: selected.id,
+        contextWindow: typeof selected.contextWindow === "number" ? selected.contextWindow : null,
+        maxOutputTokens:
+          typeof selected.maxOutputTokens === "number" ? selected.maxOutputTokens : null,
+      };
+    }
     // `restore` is Pi re-applying a recorded model (session resume / reload):
     // never a user gesture. Extension-initiated switches are suppressed.
     if (!shouldPersistModelSelect({ source: event.source, suppressed: persistSuppressed }))

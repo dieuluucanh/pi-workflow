@@ -26,6 +26,7 @@ test("build mode keeps the mode/progress in `workflow` and splits the rest", () 
       mode: "▶ build 3/8",
       profile: "⚡ cheap | 🔨 builder",
       policy: "commits:ask",
+      orchestrator: "",
     },
   );
 });
@@ -42,6 +43,7 @@ test("plan no longer claims a browser review without a Review turn", () => {
       mode: "⏸ plan 1/4",
       profile: "",
       policy: "commits:never",
+      orchestrator: "",
     },
   );
 });
@@ -124,7 +126,12 @@ test("default mode stays parseable and carries the write policy", () => {
       commitMode: "ask",
       writeMode: "allow",
     }),
-    { mode: "◦ 2/3 ⚠", profile: "", policy: "commits:ask · writes:allow" },
+    {
+      mode: "◦ 2/3 ⚠",
+      profile: "",
+      policy: "commits:ask · writes:allow",
+      orchestrator: "",
+    },
   );
   assert.deepEqual(
     buildWorkflowStatusSegments({
@@ -134,7 +141,12 @@ test("default mode stays parseable and carries the write policy", () => {
       commitMode: "never",
       writeMode: "ask",
     }),
-    { mode: "◦ commits:never", profile: "", policy: "commits:never · writes:ask" },
+    {
+      mode: "◦ commits:never",
+      profile: "",
+      policy: "commits:never · writes:ask",
+      orchestrator: "",
+    },
   );
 });
 
@@ -145,6 +157,7 @@ test("the status keys are stable", () => {
     policy: "workflow-policy",
     review: "workflow-review",
     todos: "workflow-todos",
+    orchestrator: "workflow-orchestrator",
   });
 });
 
@@ -195,4 +208,44 @@ test("setWorkflowWidget sets lines, clears with [], and passes placement", () =>
 test("setWorkflowWidget is a no-op for a host without a widget API", () => {
   assert.doesNotThrow(() => setWorkflowWidget(undefined, "k", ["a"]));
   assert.doesNotThrow(() => setWorkflowWidget({}, "k", ["a"]));
+});
+
+test("the orchestrator footer surfaces the destination before consent and the run after it", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 2,
+    commitMode: "never",
+    handoffDestination: "build",
+    orchestration: {
+      phase: "awaiting_approval",
+      approval: "pending",
+      blockedReason: "no host",
+      nextTaskId: "task-2",
+    },
+  });
+  assert.match(segments.mode, /breakdown pending approval/);
+  assert.match(segments.orchestrator, /next approval → direct build/);
+  assert.match(segments.orchestrator, /run awaiting_approval/);
+  assert.match(segments.orchestrator, /next task-2/);
+  assert.match(segments.orchestrator, /blocked: no host/);
+
+  const approved = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 2,
+    total: 2,
+    commitMode: "never",
+    handoffDestination: "orchestrator",
+    orchestration: { phase: "ready", approval: "approved" },
+  });
+  assert.match(approved.mode, /execution approved/);
+  assert.match(approved.orchestrator, /next approval → orchestrator/);
+
+  const idle = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+  });
+  assert.equal(idle.orchestrator, "");
 });

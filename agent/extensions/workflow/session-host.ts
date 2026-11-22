@@ -69,6 +69,8 @@ export const SESSION_BOOTSTRAP_TYPES = [
   "workflow-managed-session",
   "workflow-task-assignment",
   "workflow-roadmap-reference",
+  "workflow-task-scope",
+  "workflow-control-grant",
 ] as const;
 
 export type SessionBootstrapType = (typeof SESSION_BOOTSTRAP_TYPES)[number];
@@ -95,7 +97,15 @@ export interface RelatedSessionSpec {
 export type SessionHostErrorCode = "unsupported" | "rejected" | "failed" | "cancelled";
 
 export type SessionHostResult =
-  | { ok: true; sessionRef: string; focused: boolean; reused: boolean }
+  | {
+      ok: true;
+      sessionRef: string;
+      focused: boolean;
+      reused: boolean;
+      /** The real durable identity, when the host owns creation. */
+      sessionId?: string;
+      sessionFile?: string;
+    }
   | { ok: false; code: SessionHostErrorCode; reason: string };
 
 export interface SessionHostPort {

@@ -18,6 +18,7 @@ export const WORKFLOW_STATUS_KEYS = {
   policy: "workflow-policy",
   review: "workflow-review",
   todos: "workflow-todos",
+  orchestrator: "workflow-orchestrator",
 } as const;
 
 export interface WorkflowStatusInput {
@@ -43,12 +44,26 @@ export interface WorkflowStatusInput {
   writeMode?: string | null;
   /** Shared read/write/commit folder scope; null/undefined omits it. */
   folderMode?: string | null;
+  /**
+   * The saved handoff execution destination. Visible so the user knows where
+   * the NEXT approval goes before consenting to it.
+   */
+  handoffDestination?: "orchestrator" | "build";
+  /** Orchestrator run state, when one is bound to this session. */
+  orchestration?: {
+    phase: string;
+    approval: "none" | "pending" | "approved";
+    blockedReason?: string;
+    nextTaskId?: string;
+  };
 }
 
 export interface WorkflowStatusSegments {
   mode: string;
   profile: string;
   policy: string;
+  /** Empty unless an orchestrator run/decision is worth surfacing. */
+  orchestrator: string;
 }
 
 export function buildWorkflowStatusSegments(
@@ -85,10 +100,16 @@ export function buildWorkflowStatusSegments(
     } else if (input.mode === "plan") {
       base = total > 0 ? `⏸ plan ${done}/${total}${stale}` : `⏸ plan${stale}`;
     } else if (input.mode === "orchestrator") {
+      const approval =
+        input.orchestration?.approval === "approved"
+          ? " · execution approved"
+          : input.orchestration?.approval === "pending"
+            ? " · breakdown pending approval"
+            : "";
       base =
         total > 0
-          ? `🧭 orchestrator ${done}/${total}${stale}`
-          : `🧭 orchestrator${stale}`;
+          ? `🧭 orchestrator ${done}/${total}${stale}${approval}`
+          : `🧭 orchestrator${stale}${approval}`;
     } else if (total > 0) {
       // The default mode must stay parseable by the Desktop badge decoder.
       base = `◦ ${done}/${total}${stale}`;
@@ -98,7 +119,19 @@ export function buildWorkflowStatusSegments(
     mode = input.handoffPending ? `${base} — handoff pending` : base;
   }
 
-  return { mode, profile, policy };
+  const destination = input.handoffDestination
+    ? `next approval → ${input.handoffDestination === "orchestrator" ? "orchestrator" : "direct build"}`
+    : "";
+  const run = input.orchestration
+    ? `run ${input.orchestration.phase}` +
+      (input.orchestration.nextTaskId ? ` · next ${input.orchestration.nextTaskId}` : "") +
+      (input.orchestration.blockedReason
+        ? ` · blocked: ${input.orchestration.blockedReason.slice(0, 120)}`
+        : "")
+    : "";
+  const orchestrator = [destination, run].filter(Boolean).join(" · ");
+
+  return { mode, profile, policy, orchestrator };
 }
 
 /** Sets a status only while it has text; `undefined` removes a stale key. */

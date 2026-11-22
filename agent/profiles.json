@@ -148,6 +148,11 @@
           "provider": "command-code",
           "id": "deepseek/deepseek-v4.1-flash",
           "thinking": "max"
+        },
+        "orchestrator": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
         }
       },
       "defaultModel": {
@@ -176,6 +181,11 @@
           "thinking": "high"
         },
         "reviewer": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "xhigh"
+        },
+        "orchestrator": {
           "provider": "openai-codex",
           "id": "gpt-6.1-sol",
           "thinking": "xhigh"

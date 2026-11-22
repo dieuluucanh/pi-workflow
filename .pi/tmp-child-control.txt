@@ -1,0 +1,100 @@
+  /** The durable assignment text the parent wrote before launch. */
+  function readWorkerKickoff(branch: unknown[]): string | undefined {
+    for (let index = branch.length - 1; index >= 0; index -= 1) {
+      const entry: any = branch[index];
+      if (entry?.type !== "custom" || entry?.customType !== "workflow-task-assignment") continue;
+      const kickoff = entry.data?.kickoff;
+      if (typeof kickoff === "string" && kickoff.trim().length > 0) {
+        return kickoff.slice(0, 8_000);
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Child side of the run control channel. The worker reads only the grant
+   * REFERENCE from its own metadata; the secret stays in a private file. The
+   * parent grant is the only thing that opens mutation.
+   */
+  async function bindWorkerControlChannel(
+    ctx: ExtensionContext,
+    branch: unknown[],
+  ): Promise<void> {
+    workerControl?.close();
+    workerControl = undefined;
+    if (!workerBinding || managedQuarantine) return;
+    const grantRef = controlGrantRefFrom(branch as never);
+    if (!grantRef) return;
+    const grant = readWorkerGrant(grantRef);
+    if (!grant.ok) {
+      ctx.ui.notify(
+        `Worker control grant is unusable: ${grant.error}. Edits and shell stay blocked until the parent reconciles this attempt.`,
+        "warning",
+      );
+      return;
+    }
+    const kickoff = readWorkerKickoff(branch);
+    const binding = workerBinding;
+    const control = createChildControl({
+      grant: grant.value,
+      onStart: async (started) => {
+        const authorized = binding.runtime.authorize({
+          leaseGeneration: started.leaseGeneration,
+          taskStartId: started.taskStartId,
+        });
+        if (!authorized.ok) {
+          ctx.ui.notify(
+            `The parent grant was refused: ${authorized.error}. Nothing was mutated.`,
+            "warning",
+          );
+          return false;
+        }
+        const acknowledged = binding.runtime.noteStartAck(started.taskStartId);
+        if (!acknowledged.ok) {
+          ctx.ui.notify(
+            `Start ${started.taskStartId} was not recorded: ${acknowledged.error}.`,
+            "warning",
+          );
+          return false;
+        }
+        try {
+          await (pi as any).sendMessage?.(
+            {
+              customType: "workflow-task-start",
+              content:
+                kickoff ??
+                `Start ${started.taskStartId}. Read this session's workflow assignment metadata, call workflow_worker_ready, then work only inside the task scope.`,
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+        } catch (error: unknown) {
+          ctx.ui.notify(
+            `The authorized start could not be delivered: ${
+              error instanceof Error ? error.message : String(error)
+            }.`,
+            "warning",
+          );
+          return false;
+        }
+        updateStatus(currentSessionCtx ?? ctx);
+        return true;
+      },
+      onSay: async (text) => {
+        // `/orchestrator say` is an explicit operator message, not an approval.
+        await (pi as any).sendMessage?.(
+          { customType: "workflow-orchestrator-say", content: text, display: true },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      },
+    });
+    workerControl = control;
+    const connected = await control.start();
+    if (!connected.ok) {
+      ctx.ui.notify(
+        `Worker control channel failed: ${connected.error}. Edits stay blocked until the parent grants this attempt.`,
+        "warning",
+      );
+    }
+  }
+

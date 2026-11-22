@@ -127,7 +127,7 @@ test("bootstrap: an ordinary branch is absent, and isManagedWorker is false", ()
 
 // ── Readiness gate ───────────────────────────────────────────────────
 
-test("gate: mutation is refused until the worker acknowledges", () => {
+test("gate: acknowledgement opens reading but not mutation", () => {
   const gate = createManagedSessionGate(parsed, "session-1");
   assert.equal(gate.phase(), "pending_ready");
   assert.equal(gate.canMutate(), false);
@@ -136,8 +136,18 @@ test("gate: mutation is refused until the worker acknowledges", () => {
 
   assert.equal(gate.acknowledgeStart(1_700_000_000_000), true);
   assert.equal(gate.phase(), "ready");
-  assert.equal(gate.canMutate(), true);
+  assert.equal(gate.canMutate(), false, "readiness alone never authorizes edits");
   assert.equal(gate.acknowledgedAt(), 1_700_000_000_000);
+  assert.match(gate.mutationBlockReason("edit") ?? "", /not authorized yet/);
+
+  const granted = gate.authorizeMutation({
+    leaseGeneration: 1,
+    taskStartId: "start-worker-1-attempt-1-1",
+    at: 1_700_000_001_000,
+  });
+  assert.equal(granted.ok, true);
+  assert.equal(gate.authorization()?.leaseGeneration, 1);
+  assert.equal(gate.canMutate(), true);
   assert.equal(gate.mutationBlockReason("edit"), undefined);
   // Idempotent.
   assert.equal(gate.acknowledgeStart(), true);
@@ -169,6 +179,35 @@ function managedBranch() {
       type: "custom",
       customType: MANAGED_SESSION_ENTRY,
       data: CONTEXT,
+    },
+    {
+      type: "custom",
+      customType: "workflow-task-assignment",
+      data: {
+        assignmentId: "assignment-worker-run-1-task-1-attempt-1",
+        taskStartId: "start-1",
+        packetRef: "artifact-packet",
+        kickoff: "objective: implement the task",
+        model: { provider: "synthetic", id: "builder-test" },
+        trust: "session",
+        profile: null,
+      },
+    },
+    {
+      type: "custom",
+      customType: "workflow-task-scope",
+      data: {
+        covers: ["step-1"],
+        objective: "implement the task",
+        acceptanceChecks: ["the test suite passes"],
+        expectedFiles: ["a.ts"],
+        mutationScope: [],
+      },
+    },
+    {
+      type: "custom",
+      customType: "workflow-roadmap-reference",
+      data: { path: ".pi/plans/r.md", digest: "digest-1", revision: 1 },
     },
   ];
 }
@@ -238,11 +277,22 @@ test("extension: a managed worker cannot edit or run a shell before acknowledgem
       undefined,
     );
 
-    const ready = await b.pi.tools.workflow_worker_ready.execute();
+    const ready = (await b.pi.tools.workflow_worker_ready.execute()) as {
+      content?: Array<{ text?: string }>;
+    };
     assert.match(JSON.stringify(ready), /acknowledged/);
+    assert.match(
+      String(ready.content?.[0]?.text ?? ""),
+      /blocked until the parent grants/,
+      "the acknowledgement explains that mutation is still closed",
+    );
 
-    const after = await gateResult(b.pi, b.made.ctx, "edit", { path: `${b.made.ctx.cwd}/a.ts` });
-    assert.equal(after, undefined, "an acknowledged worker may mutate");
+    // Readiness is not authority: only a parent grant over IPC opens mutation.
+    const after = await gateResult(b.pi, b.made.ctx, "edit", {
+      path: `${b.made.ctx.cwd}/a.ts`,
+    });
+    assert.equal((after as any)?.block, true, "a ready worker still waits for its grant");
+    assert.match((after as any)?.reason ?? "", /not authorized yet/);
   } finally {
     await b.cleanup();
   }
@@ -261,17 +311,54 @@ test("extension: an ordinary session is completely unaffected", async () => {
   }
 });
 
-test("extension: a corrupt bootstrap starts an ordinary session with a warning", async () => {
+test("extension: a corrupt bootstrap is quarantined instead of restored as an ordinary session", async () => {
   const b = await boot([
     { type: "custom", customType: MANAGED_SESSION_ENTRY, data: { version: 99 } },
   ]);
   try {
     assert.ok(
-      b.made.notifies.some((note) => /bootstrap ignored/.test(note.message)),
-      "the user must be told the record was ignored",
+      b.made.notifies.some((note) => /quarantined/.test(note.message)),
+      "the user must be told the record was quarantined",
     );
     const edit = await gateResult(b.pi, b.made.ctx, "edit", { path: `${b.made.ctx.cwd}/a.ts` });
-    assert.equal(edit, undefined);
+    assert.equal((edit as any)?.block, true, "a lost managed record never restores write authority");
+    assert.match((edit as any)?.reason ?? "", /quarantined/);
+
+    // Read-only inspection is how it is reconciled.
+    assert.equal(await gateResult(b.pi, b.made.ctx, "read", { path: `${b.made.ctx.cwd}/a.ts` }), undefined);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("extension: a managed branch that lost its bootstrap is quarantined", async () => {
+  const b = await boot([
+    {
+      type: "custom",
+      customType: "workflow-task-scope",
+      data: { covers: ["step-1"], objective: "x", acceptanceChecks: ["y"], expectedFiles: ["a.ts"] },
+    },
+  ]);
+  try {
+    assert.ok(b.made.notifies.some((note) => /quarantined/.test(note.message)));
+    const shell = await gateResult(b.pi, b.made.ctx, "bash", { command: "echo hi" });
+    assert.equal((shell as any)?.block, true);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("extension: worker report and checkpoint tools refuse outside a managed worker", async () => {
+  const b = await boot([]);
+  try {
+    const report = (await b.pi.tools.orchestrator_report.execute("t1", {})) as {
+      content?: Array<{ text?: string }>;
+    };
+    assert.match(String(report.content?.[0]?.text ?? ""), /not a managed worker/);
+    const checkpoint = (await b.pi.tools.orchestrator_checkpoint.execute("t2", { summary: "x" })) as {
+      content?: Array<{ text?: string }>;
+    };
+    assert.match(String(checkpoint.content?.[0]?.text ?? ""), /not a managed worker/);
   } finally {
     await b.cleanup();
   }

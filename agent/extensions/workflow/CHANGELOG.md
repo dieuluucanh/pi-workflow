@@ -4,6 +4,76 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — Live child composition (2026-11-22, second pass)
+
+- **Real child host composition.** `orchestrator-child-host.ts` builds a
+  dispatcher over a Terminal launcher or a source-bound Desktop tab. Prepare
+  creates the durable child and its metadata, writes a private grant, and only
+  then does the visible launch happen. A launcher success is not readiness.
+- **Authenticated run control.** `orchestrator-run-control.ts` connects the
+  existing envelope/HMAC decisions to real named-pipe/unix-socket transports:
+  `ready → one sealed start → start-ack`, plus post-start `say`/control pushes.
+  Forged, stale, reordered and duplicate frames are refused; a delivered but
+  unacknowledged start is `uncertain`, never a clean failure.
+- **Two-step mutation authority.** The child holds the verified grant until
+  `workflow_worker_ready` acknowledges the assignment; only that call applies
+  the grant and records the start ack. Delivery never opens the workspace.
+- **SDK persistence fix.** A lazy session file is materialized with a supported
+  user conversation entry (the real SDK does not persist setup entries alone),
+  verified against the installed SDK rather than only the fake.
+- **Workspace-wide fencing.** `acquire` now takes a durable per-workspace
+  generation, so a second task or a later run cannot reuse generation 1; the
+  high-water mark survives release and restart.
+- **Runtime-owned verification and acceptance.** `orchestrator_verify` captures
+  the baseline and candidate, runs the task checks through `ctx.executeTool`,
+  and applies acceptance atomically. `orchestrator_accept` no longer accepts a
+  model-supplied evidence object at all.
+- **Live runtimes wired:** usage is recorded from real assistant usage and
+  journaled idempotently; the parent TODO list is the accepted-coverage
+  projection (mutations refused); `/orchestrator finalize` runs the fail-closed
+  final gate and journals a scoped revision proposal when it fails;
+  `/orchestrator say` is delivered to the live child.
+- **UI/diagnostics:** the contribution contract now carries run phase/approval,
+  blocked reasons, host readiness and an explicit "Use direct Build" action when
+  no child host is reachable. A session rebind clears every control/host
+  reference so stale callbacks are inert.
+- **Still NOT RUN:** real provider turns, real Windows/macOS/Linux terminal
+  launches, packaged Desktop E2E and cross-platform signoff.
+
+### Added — Orchestrator integration (2026-11-22)
+
+- **Parent runtime is wired:** an approved Orchestrator handoff now snapshots the
+  exact roadmap bytes into a durable run journal and starts exactly one bounded
+  preparation turn. Breakdown approval is still a separate, digest-bound decision.
+- **Parent tools are registered** (`orchestrator_propose_tasks|dispatch|status|
+  verify|repair|accept`). Dispatch journals assign → start intent → one wake →
+  ack, and reports uncertain/lost starts instead of retrying blindly. They refuse
+  outside Orchestrator mode, on a managed worker, or without a bound run.
+- **Durable wake pump:** child events wake the parent at most once per settle
+  boundary; heartbeats/progress never do; `agent_end` is not a boundary; delivered
+  wakes are journaled so a reload cannot repeat them.
+- **Evidence-backed verification:** baseline→candidate capture, gated checks,
+  acceptance bound to the current workspace revision, no second acceptance, and a
+  bounded scoped repair on failure.
+- **Usage/rollover:** usage is durable and idempotent, unknown cost pauses under a
+  configured cap, and rollover preserves repair/no-progress/rollover counters.
+- **Operator commands:** `/orchestrator status|start|pause|resume|stop|inspect|
+  say|retry|approve|cancel`; bare `/orchestrator` remains mode entry.
+- **TODO ownership:** the parent roadmap projection derives from acceptance only;
+  checkboxes, child TODOs and child reports cannot move it.
+- **Commits and final gate:** an accepted task is committed at most once by the
+  parent; a required final check that was skipped/cancelled/timed-out is **not** a
+  pass (fail-closed), and a failed final gate records a revision proposal without
+  reopening accepted work.
+- **Quarantine:** present-but-unreadable managed metadata now quarantines the
+  session (inspection only) instead of restoring it as an ordinary writable one.
+- **Footer:** a `workflow-orchestrator` segment shows the saved destination before
+  consent and the run phase/approval/next/blocked state after it; native
+  mode-action order is Plan → Orchestrator → Build.
+- **Still NOT RUN:** real provider/model turns, real terminal launches, packaged
+  Desktop E2E and macOS/Linux signoff. This build binds no child host, so dispatch
+  and execution approval fail closed with an actionable reason.
+
 ### Added — Orchestrator (experimental)
 
 An opt-in engine for long, phased roadmaps. It is **not** a release of the

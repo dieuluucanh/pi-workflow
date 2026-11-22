@@ -10,14 +10,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  MODE_CYCLE_ORDER,
   PLAN_MODE_TOOLS,
   NORMAL_MODE_TOOLS,
+  WORKER_MODE_CYCLE_ORDER,
   buildModeTools,
   cycleMode,
   decodeWorkflowEntry,
   encodeWorkflowMode,
   isManagedTool,
   isWorkflowMode,
+  modeCycleOrder,
   modeLabel,
   planModeTools,
   roleForMode,
@@ -61,21 +64,53 @@ test("tools: the managed set is explicit", () => {
   assert.equal(isManagedTool("third_party_tool"), false);
 });
 
-test("cycle: Tab is Default → Plan → Build → Default, and reverses", () => {
+test("cycle: Tab is Default → Plan → Orchestrator → Build → Default, and reverses", () => {
   assert.equal(cycleMode(null, 1), "plan");
-  assert.equal(cycleMode("plan", 1), "build");
+  assert.equal(cycleMode("plan", 1), "orchestrator");
+  assert.equal(cycleMode("orchestrator", 1), "build");
   assert.equal(cycleMode("build", 1), null);
+
   const forward: WorkflowMode[] = [];
   let mode: WorkflowMode = null;
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 8; i += 1) {
     mode = cycleMode(mode, 1);
     forward.push(mode);
   }
-  assert.deepEqual(forward, ["plan", "build", null, "plan", "build", null]);
+  assert.deepEqual(forward, [
+    "plan",
+    "orchestrator",
+    "build",
+    null,
+    "plan",
+    "orchestrator",
+    "build",
+    null,
+  ]);
 
-  assert.equal(cycleMode("build", -1), "plan");
+  assert.equal(cycleMode("build", -1), "orchestrator");
+  assert.equal(cycleMode("orchestrator", -1), "plan");
   assert.equal(cycleMode("plan", -1), null);
   assert.equal(cycleMode(null, -1), "build");
+});
+
+test("cycle: one ring is exported and the worker ring omits Orchestrator", () => {
+  assert.deepEqual(MODE_CYCLE_ORDER, [null, "plan", "orchestrator", "build"]);
+  assert.deepEqual(modeCycleOrder({ managedWorker: false }), MODE_CYCLE_ORDER);
+  assert.deepEqual(modeCycleOrder({ managedWorker: true }), WORKER_MODE_CYCLE_ORDER);
+  // A worker never reaches Orchestrator in either direction.
+  for (let i = 0; i < 6; i += 1) {
+    let workerMode: WorkflowMode = null;
+    for (let step = 0; step < 7; step += 1) {
+      workerMode = cycleMode(workerMode, 1, WORKER_MODE_CYCLE_ORDER);
+      assert.notEqual(workerMode, "orchestrator");
+    }
+    assert.equal(cycleMode("build", -1, WORKER_MODE_CYCLE_ORDER), "plan");
+  }
+});
+
+test("cycle: a mode outside the supplied ring resolves to its first entry", () => {
+  assert.equal(cycleMode("orchestrator", 1, WORKER_MODE_CYCLE_ORDER), null);
+  assert.equal(cycleMode("someday" as WorkflowMode, 1), null);
 });
 
 test("role and label: each mode names one semantic role", () => {
@@ -91,10 +126,11 @@ test("role and label: each mode names one semantic role", () => {
   assert.equal(modeLabel("orchestrator"), "orchestrator");
 });
 
-test("cycle: Orchestrator is opt-in and Tab leaves it for Default", () => {
-  // Not in the Tab order, so the default Plan→Build→Default cycle is unchanged.
-  assert.equal(cycleMode("orchestrator", 1), null);
-  assert.equal(cycleMode("orchestrator", -1), null);
+test("cycle: Orchestrator is a full member of the ordinary ring", () => {
+  assert.equal(cycleMode("orchestrator", 1), "build");
+  assert.equal(cycleMode("orchestrator", -1), "plan");
+  assert.equal(cycleMode("plan", 1), "orchestrator");
+  assert.equal(cycleMode("build", -1), "orchestrator");
 });
 
 test("codec: orchestrator round-trips and older readers see Default flags", () => {

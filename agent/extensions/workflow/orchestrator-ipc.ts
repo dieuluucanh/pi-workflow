@@ -40,6 +40,7 @@ export const MESSAGE_TYPES = [
   "pause",
   "heartbeat",
   "close",
+  "say",
 ] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];
 

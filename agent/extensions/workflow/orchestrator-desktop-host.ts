@@ -56,6 +56,12 @@ export interface DesktopSessionHostOptions {
   clock: DesktopClock;
   timeoutMs?: number;
   onError?(error: unknown): void;
+  /**
+   * Host-issued capability grant (see `host-bridge-auth.ts`). A request without
+   * one is not sent at all: a self-declared owner name proves nothing about the
+   * publisher, so native operations must fail closed.
+   */
+  grant?(): { token: string; ownerCommand: string; sessionId: string; epoch: number } | undefined;
 }
 
 export interface DesktopSessionHost extends SessionHostPort {
@@ -118,11 +124,15 @@ function resultFrom(raw: unknown): SessionHostResult | null {
   if (record.ok === true) {
     const sessionRef = bounded(record.sessionRef, 400);
     if (!sessionRef) return null;
+    const sessionId = bounded(record.sessionId, 200);
+    const sessionFile = bounded(record.sessionFile, 4_000);
     return {
       ok: true,
       sessionRef,
       focused: record.focused === true,
       reused: record.reused === true,
+      ...(sessionId ? { sessionId } : {}),
+      ...(sessionFile ? { sessionFile } : {}),
     };
   }
   if (record.ok === false) {
@@ -216,11 +226,37 @@ export function createDesktopSessionHost(options: DesktopSessionHostOptions): De
         });
       }, timeoutMs);
       pending.set(input.requestId, { finish: resolve, handle });
+      if (!options.grant) {
+        finish(input.requestId, {
+          ok: false,
+          code: "unsupported",
+          reason: "this session holds no host-issued capability grant",
+        });
+        return;
+      }
+      let grant:
+        | { token: string; ownerCommand: string; sessionId: string; epoch: number }
+        | undefined;
+      try {
+        grant = options.grant();
+      } catch (error) {
+        report(error);
+        grant = undefined;
+      }
+      if (!grant) {
+        finish(input.requestId, {
+          ok: false,
+          code: "unsupported",
+          reason: "this session holds no live host-issued capability grant",
+        });
+        return;
+      }
       try {
         options.bus.emit(DESKTOP_SESSION_CHANNELS.request, {
           requestId: input.requestId,
           operation: input.operation,
           ownerCommand: options.ownerCommand,
+          grant,
           ...(input.spec ? { spec: input.spec } : {}),
           ...(input.sessionRef ? { sessionRef: input.sessionRef } : {}),
         });

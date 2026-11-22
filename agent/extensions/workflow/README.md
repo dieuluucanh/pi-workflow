@@ -117,16 +117,38 @@ ownership is derived from a registered command's source info, not from an owner
 string in the payload. Two unrelated fixture extensions cover this contract in
 both repos (`fixtures/two-extension-contract.json`).
 
-### What is not released yet
+### What is wired, and what still needs a live run
 
-- No live provider/turn loop is wired into the extension entrypoint; the modules
-  and their tests are present, the runtime integration is the remaining work.
-- Real Windows Terminal / macOS Terminal / Linux tmux launches, real model runs,
-  packaged Desktop E2E and cross-platform signoff have not been run.
-- The installed SDK's anonymous event bus is not publisher authentication;
-  extensions remain trusted executable code. See
+- **Wired in the entrypoint:** the four-mode ring, approved-plan ingestion into a
+  durable run journal, the parent tools (`orchestrator_propose_tasks|dispatch|
+  status|verify|repair|accept`), dispatch journaling (assign → start intent → one
+  wake → ack), the durable wake pump, evidence-backed verification, usage/rollover,
+  operator commands (`/orchestrator status|start|pause|resume|stop|inspect|say|
+  retry|approve|cancel`), parent-only TODO projection, accepted-task commits and
+  the fail-closed final gate.
+- **Child host binding:** dispatch composes a real child host — a source-bound
+  Desktop tab when that host announces the capability, otherwise a visible
+  Terminal window running `pi --session <file>` (never a headless print worker).
+  The parent creates the durable session and private grant, arms the control
+  window, launches, then waits for the child's authenticated `start` ack. A host
+  that is neither announced nor resolvable fails closed with an actionable
+  reason; there is no silent direct-Build fallback.
+- **Two-step authorization:** the signed start grant is held after delivery.
+  `workflow_worker_ready` applies it; only then does the worker's mutation gate
+  open. The control secret lives in a private 0600 grant file, and only its path
+  is written into the child's session metadata.
+- **Runtime-owned evidence:** `orchestrator_verify` captures the baseline,
+  runs the task's checks through the gated tool executor and applies acceptance
+  itself. `orchestrator_accept` only re-reads that decision; a model-supplied
+  evidence object is refused.
+- **NOT RUN:** real provider/model turns, real Windows Terminal / macOS Terminal /
+  Linux tmux launches, packaged Desktop E2E and cross-platform signoff. See
   [`../../../docs/orchestrator-live-acceptance.md`](../../../docs/orchestrator-live-acceptance.md)
-  for the exact checklist (currently **NOT RUN**).
+  for the exact human matrix (currently **NOT RUN**).
+- The installed SDK's anonymous event bus is not publisher authentication;
+  extensions remain trusted executable code. Privileged host operations require
+  the host-issued, registration-bound grant, and a host without that seam is
+  advertised unsupported.
 
 ## Shell guard
 

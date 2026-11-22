@@ -24,6 +24,7 @@
  */
 
 import type { RunEvent, RunState, TaskRecord } from "./orchestrator-state.ts";
+import { taskStartIdFor, workerIdFor } from "./orchestrator-worker.ts";
 import {
   ORCHESTRATOR_SCHEMA_VERSION,
   acceptanceBlocker,
@@ -150,11 +151,11 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
     name: "orchestrator_accept",
     description:
-      "Accept the current candidate only with validated evidence that matches the workspace and roadmap revision. Candidate reports alone cannot satisfy this.",
+      "Re-read the runtime-owned acceptance for one task. Evidence is captured by the parent during verification; a model-supplied evidence object can never mint a pass.",
     parameters: {
       type: "object",
-      properties: { evidence: { type: "object", description: "AcceptanceEvidence" } },
-      required: ["evidence"],
+      properties: { taskId: { type: "string" } },
+      required: ["taskId"],
       additionalProperties: false,
     },
     bounded: true,
@@ -360,10 +361,6 @@ export function parseTaskPlan(
   };
 }
 
-function taskStartId(runId: string, taskId: string, attemptId: string): string {
-  return `start-${runId}-${taskId}-${attemptId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 160);
-}
-
 function findTask(state: RunState, taskId: unknown): TaskRecord | undefined {
   if (typeof taskId !== "string") return undefined;
   return state.tasks[taskId];
@@ -407,9 +404,6 @@ export function handleOrchestratorTool(
       if (!parsed.ok) return fail("invalid", parsed.error);
       const coverage = validatePlanCoverage({ requirements, tasks: parsed.plan.tasks });
       if (!coverage.ok) return fail("state", coverage.error);
-      if (ctx.state.planRevision !== 0) {
-        return fail("state", "a breakdown is already applied; scope changes need a new approval revision");
-      }
       if (ctx.state.phase !== "draft" && ctx.state.phase !== "awaiting_approval") {
         return fail("state", `cannot propose tasks in phase ${ctx.state.phase}`);
       }
@@ -460,7 +454,22 @@ export function handleOrchestratorTool(
       }
       const blocked = budgetBlocked(task, budgets);
       if (blocked) return fail("budget", blocked);
-      const startId = taskStartId(ctx.state.runId, task.taskId, params.attemptId);
+      const sessionRef =
+        typeof params.sessionRef === "string" ? params.sessionRef.trim() : "";
+      if (!sessionRef || sessionRef.length > 400) {
+        return fail(
+          "invalid",
+          "a concrete sessionRef from the host is required before dispatch",
+        );
+      }
+      const startId = taskStartIdFor(
+        workerIdFor({
+          runId: ctx.state.runId,
+          taskId: task.taskId,
+          attemptId: params.attemptId,
+        }),
+        params.attemptId,
+      );
       return {
         ok: true,
         tool: name,
@@ -470,9 +479,7 @@ export function handleOrchestratorTool(
           revision: ctx.state.revision,
           taskId: task.taskId,
           attemptId: params.attemptId,
-          ...(typeof params.sessionRef === "string" && params.sessionRef.length <= 400
-            ? { sessionRef: params.sessionRef }
-            : {}),
+          sessionRef,
           taskStartId: startId,
           summary: `Assignment ${task.taskId}/${params.attemptId} is ready to launch; the receipt is durable, the child runs in its own session.`,
         },
@@ -483,7 +490,7 @@ export function handleOrchestratorTool(
           now: ctx.now,
           taskId: task.taskId,
           attemptId: params.attemptId,
-          sessionId: `session-${params.attemptId}`,
+          sessionId: sessionRef,
           generation: task.attempts.length + 1,
         },
       };
@@ -603,56 +610,31 @@ export function handleOrchestratorTool(
     }
 
     case "orchestrator_accept": {
-      if (ctx.state.mutation) {
-        return fail("state", "acceptance requires a quiescent workspace");
+      // Acceptance evidence is runtime-owned: a model-supplied object is not
+      // provenance. The live adapter re-reads the evidence it captured during
+      // `orchestrator_verify`; the pure decision layer refuses to manufacture it.
+      const taskId = typeof params.taskId === "string" ? params.taskId : "";
+      if (!taskId) return fail("invalid", "taskId is required");
+      const task = ctx.state.tasks[taskId];
+      if (!task) return fail("state", "unknown task");
+      if (task.state === "accepted" && task.acceptance) {
+        return {
+          ok: true,
+          tool: name,
+          receipt: {
+            kind: "acceptance",
+            runId: ctx.state.runId,
+            revision: ctx.state.revision,
+            taskId: task.taskId,
+            attemptId: task.acceptance.attemptId,
+            summary: `${task.taskId} is already accepted with evidence ${task.acceptance.evidenceId}.`,
+          },
+        };
       }
-      if (!ctx.workspaceRevision) {
-        return fail("state", "the parent must supply the current workspace revision");
-      }
-      const validated = validateAcceptanceEvidence(params.evidence);
-      if (!validated.ok) return fail("invalid", validated.error);
-      const evidence: AcceptanceEvidence = validated.value;
-      const task = ctx.state.tasks[evidence.taskId];
-      if (!task) return fail("state", "evidence names an unknown task");
-      if (task.state !== "verifying") {
-        return fail("state", `cannot accept a ${task.state} task`);
-      }
-      const blocker = acceptanceBlocker({
-        evidence,
-        workspaceRevision: ctx.workspaceRevision,
-        roadmapRevision: ctx.state.roadmapRevision,
-        unmetCriteria: [],
-      });
-      if (blocker) return fail("state", blocker);
-      if (
-        evidence.runId !== ctx.state.runId ||
-        evidence.attemptId !== task.currentAttemptId ||
-        evidence.candidateId !==
-          task.attempts.find((entry) => entry.attemptId === task.currentAttemptId)?.candidateId
-      ) {
-        return fail("state", "evidence does not describe this task's current candidate");
-      }
-      return {
-        ok: true,
-        tool: name,
-        receipt: {
-          kind: "acceptance",
-          runId: ctx.state.runId,
-          revision: ctx.state.revision,
-          taskId: task.taskId,
-          attemptId: evidence.attemptId,
-          summary: `Accepted evidence ${evidence.evidenceId} for ${task.taskId}.`,
-        },
-        event: {
-          type: "task.accept",
-          runId: ctx.state.runId,
-          expectedRevision: ctx.state.revision,
-          now: ctx.now,
-          taskId: task.taskId,
-          evidence,
-          workspaceRevision: ctx.workspaceRevision,
-        },
-      };
+      return fail(
+        "unavailable",
+        "Acceptance is applied by the parent during verification. Run orchestrator_verify; a model-supplied evidence object cannot mint a pass.",
+      );
     }
 
     default:

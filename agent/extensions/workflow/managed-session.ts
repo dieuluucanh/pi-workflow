@@ -160,7 +160,21 @@ export interface ManagedSessionGate {
   phase(): WorkerPhase;
   /** The worker acknowledged its assignment. Idempotent. */
   acknowledgeStart(at?: number): boolean;
-  /** True only after an acknowledgement; mutation is refused before it. */
+  /**
+   * The PARENT granted mutation authority for this attempt/lease/start id.
+   * Readiness alone never authorizes edits: a worker can be ready yet still
+   * waiting for its grant, which is the state a resumed or fenced worker is in.
+   */
+  authorizeMutation(input: {
+    leaseGeneration: number;
+    taskStartId: string;
+    at?: number;
+  }): { ok: true } | { ok: false; code: "not_ready" | "closed" | "invalid"; error: string };
+  /** Drop the live grant (fence/repair); readiness is unchanged. */
+  revokeAuthorization(): void;
+  /** The live grant, when one was accepted. */
+  authorization(): { leaseGeneration: number; taskStartId: string; at: number } | undefined;
+  /** True only after acknowledgement AND a matching parent grant. */
   canMutate(): boolean;
   /** The run/acceptance side closed this worker; further mutation is refused. */
   close(): void;
@@ -184,6 +198,9 @@ export function createManagedSessionGate(
 ): ManagedSessionGate {
   let phase: WorkerPhase = "pending_ready";
   let acknowledgedAt: number | undefined;
+  let authority:
+    | { leaseGeneration: number; taskStartId: string; at: number }
+    | undefined;
   const key =
     sessionId && sessionId.trim().length > 0
       ? sessionId.trim()
@@ -199,20 +216,120 @@ export function createManagedSessionGate(
       acknowledgedAt = at;
       return true;
     },
-    canMutate: () => phase === "ready",
+    authorizeMutation(input) {
+      if (phase === "closed") {
+        return { ok: false, code: "closed", error: "this worker session is closed" };
+      }
+      if (phase !== "ready") {
+        return {
+          ok: false,
+          code: "not_ready",
+          error: "the worker has not acknowledged its assignment yet",
+        };
+      }
+      if (
+        !Number.isInteger(input.leaseGeneration) ||
+        input.leaseGeneration < 1 ||
+        typeof input.taskStartId !== "string" ||
+        input.taskStartId.length === 0
+      ) {
+        return { ok: false, code: "invalid", error: "the grant is incomplete" };
+      }
+      authority = {
+        leaseGeneration: input.leaseGeneration,
+        taskStartId: input.taskStartId,
+        at: input.at ?? Date.now(),
+      };
+      return { ok: true };
+    },
+    revokeAuthorization() {
+      authority = undefined;
+    },
+    authorization: () => authority,
+    canMutate: () => phase === "ready" && authority !== undefined,
     close() {
       phase = "closed";
+      authority = undefined;
     },
     mutationBlockReason(tool) {
-      if (phase === "ready") return undefined;
       if (phase === "closed") {
         return `This worker session is closed; ${tool} is refused. The parent verifies and decides whether to reopen the task.`;
       }
-      return `Worker not ready yet: call workflow_worker_ready after reading the assignment before using ${tool}.`;
+      if (phase !== "ready") {
+        return `Worker not ready yet: call workflow_worker_ready after reading the assignment before using ${tool}.`;
+      }
+      if (authority) return undefined;
+      return `Worker is ready but not authorized yet: the parent must grant this attempt's lease/start before ${tool}. Nothing is running.`;
     },
     acknowledgedAt: () => acknowledgedAt,
     sessionKey: () => key,
   };
+}
+
+/**
+ * True when this session's branch carries evidence that it WAS a managed
+ * worker, even if its bootstrap can no longer be read. A branch that lost its
+ * record must be reconciled, never silently promoted to ordinary authority.
+ */
+export function hasManagedHistory(entries: readonly BranchEntryLike[]): boolean {
+  return entries.some(
+    (entry) =>
+      (entry.type === "custom" || entry.type === "message") &&
+      (entry.customType === MANAGED_SESSION_ENTRY ||
+        entry.customType === "workflow-task-assignment" ||
+        entry.customType === "workflow-task-scope" ||
+        entry.customType === "workflow-roadmap-reference"),
+  );
+}
+
+/**
+ * The three session identities. The middle one is the reason this exists: a
+ * present-but-unreadable managed record is neither ordinary nor a usable
+ * worker, so it is quarantined instead of falling open.
+ */
+export type ManagedSessionState =
+  | { kind: "ordinary" }
+  | { kind: "worker"; context: ManagedSessionContext }
+  | { kind: "quarantined"; reason: string };
+
+export function resolveManagedSessionState(
+  entries: readonly BranchEntryLike[],
+  readError?: unknown,
+): ManagedSessionState {
+  if (readError !== undefined) {
+    return {
+      kind: "quarantined",
+      reason: `the managed bootstrap could not be read: ${
+        readError instanceof Error ? readError.message : String(readError)
+      }`,
+    };
+  }
+  const read = readManagedSessionContext(entries);
+  if (read.ok) return { kind: "worker", context: read.context };
+  if (read.reason === "absent") {
+    return hasManagedHistory(entries)
+      ? {
+          kind: "quarantined",
+          reason:
+            "this branch was a managed worker but its bootstrap is no longer readable; reconcile the assignment before mutating",
+        }
+      : { kind: "ordinary" };
+  }
+  return { kind: "quarantined", reason: read.reason };
+}
+
+/**
+ * The reason a quarantined session must refuse a tool. Read-only inspection is
+ * allowed (that is how the user reconciles it); mutation, shell and
+ * orchestration are not.
+ */
+export function quarantineBlockReason(input: {
+  reason: string;
+  tool: string;
+  mutating: boolean;
+}): string | undefined {
+  if (!input.mutating) return undefined;
+  return `This managed worker session is quarantined (${input.reason}). ${input.tool} is refused: inspect the assignment and reconcile it before any workspace change, orchestration or commit.`;
 }
 
 /**

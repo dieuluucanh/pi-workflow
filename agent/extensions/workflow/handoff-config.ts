@@ -38,6 +38,26 @@ export const HANDOFF_SETTINGS_KEY = "handoff";
 /** Handoff presenter policy. */
 export type HandoffMode = "auto" | "native" | "plannotator";
 
+/**
+ * Where an APPROVED plan executes. Deliberately independent of the presenter:
+ * Plannotator/native only decide where the plan is reviewed, never what runs
+ * after approval.
+ *
+ *  - `orchestrator` (default): the approved roadmap is handed to Orchestrator
+ *    mode, which prepares an execution breakdown for a SECOND, separate
+ *    approval before any Build child starts.
+ *  - `build`: the historical path — the parent session enters Build and one
+ *    execution prompt starts implementing in this conversation.
+ */
+export type ExecutionDestination = "orchestrator" | "build";
+
+export const EXECUTION_DESTINATIONS: readonly ExecutionDestination[] = [
+  "orchestrator",
+  "build",
+];
+
+export const DEFAULT_EXECUTION_DESTINATION: ExecutionDestination = "orchestrator";
+
 /** Canonical mode order (status output and completions). */
 export const HANDOFF_MODES: readonly HandoffMode[] = [
   "auto",
@@ -57,6 +77,8 @@ export interface HandoffConfig {
    * made; `native` mode never waits.
    */
   timeoutMs: number;
+  /** Default execution destination for a newly presented handoff. */
+  executionMode: ExecutionDestination;
 }
 
 export const DEFAULT_HANDOFF_TIMEOUT_MS = 15_000;
@@ -66,6 +88,7 @@ export const HANDOFF_TIMEOUT_MAX = 300_000;
 export const DEFAULT_HANDOFF_CONFIG: Readonly<HandoffConfig> = {
   mode: "auto",
   timeoutMs: DEFAULT_HANDOFF_TIMEOUT_MS,
+  executionMode: DEFAULT_EXECUTION_DESTINATION,
 };
 
 /** A JSON object parsed from an untrusted source. */
@@ -87,6 +110,7 @@ export interface ResolvedHandoffConfig {
     project: boolean;
     mode: HandoffConfigScopeSource;
     timeout: HandoffConfigScopeSource;
+    execution: HandoffConfigScopeSource;
   };
 }
 
@@ -112,6 +136,24 @@ function normalizeMode(value: unknown): HandoffMode | undefined {
   if (typeof value !== "string") return undefined;
   const lower = value.trim().toLowerCase();
   return isHandoffMode(lower) ? lower : undefined;
+}
+
+/** True when `value` is a supported execution destination. */
+export function isExecutionDestination(value: unknown): value is ExecutionDestination {
+  return value === "orchestrator" || value === "build";
+}
+
+function normalizeExecution(value: unknown): ExecutionDestination | undefined {
+  if (typeof value !== "string") return undefined;
+  const lower = value.trim().toLowerCase();
+  return isExecutionDestination(lower) ? lower : undefined;
+}
+
+/** One-line meaning of a destination, for status output and notices. */
+export function describeExecutionDestination(destination: ExecutionDestination): string {
+  return destination === "orchestrator"
+    ? "approved plans go to Orchestrator; a separate execution breakdown is approved before any Build child starts"
+    : "approved plans start directly in this session's Build mode (no orchestration)";
 }
 
 /**
@@ -141,6 +183,7 @@ export function coerceHandoffConfig(
       HANDOFF_TIMEOUT_MAX,
       base.timeoutMs,
     ),
+    executionMode: normalizeExecution(r.executionMode) ?? base.executionMode,
   };
 }
 
@@ -171,11 +214,16 @@ export function mergeHandoffConfig(
   return coerceHandoffConfig(projectRaw, fromGlobal);
 }
 
-function hasField(raw: RawHandoffSetting, key: "mode" | "timeoutMs"): boolean {
+function hasField(
+  raw: RawHandoffSetting,
+  key: HandoffConfigField,
+): boolean {
   if (typeof raw === "string") return key === "mode";
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
   return Object.prototype.hasOwnProperty.call(raw, key);
 }
+
+type HandoffConfigField = "mode" | "timeoutMs" | "executionMode";
 
 /**
  * Which scope supplied a field's effective value. Pure and total.
@@ -183,7 +231,7 @@ function hasField(raw: RawHandoffSetting, key: "mode" | "timeoutMs"): boolean {
 export function handoffFieldSourceOf(
   globalRaw: RawHandoffSetting,
   projectRaw: RawHandoffSetting,
-  key: "mode" | "timeoutMs",
+  key: HandoffConfigField,
 ): HandoffConfigScopeSource {
   if (hasField(projectRaw, key)) return "project";
   if (hasField(globalRaw, key)) return "global";
@@ -228,6 +276,7 @@ export function readHandoffConfig(
       project: projectRaw !== undefined,
       mode: handoffFieldSourceOf(globalRaw, projectRaw, "mode"),
       timeout: handoffFieldSourceOf(globalRaw, projectRaw, "timeoutMs"),
+      execution: handoffFieldSourceOf(globalRaw, projectRaw, "executionMode"),
     },
   };
 }
@@ -272,6 +321,8 @@ export function writeHandoffConfig(
     }
     if (patch.mode !== undefined) next.mode = coerced.mode;
     if (patch.timeoutMs !== undefined) next.timeoutMs = coerced.timeoutMs;
+    if (patch.executionMode !== undefined)
+      next.executionMode = coerced.executionMode;
     wf[HANDOFF_SETTINGS_KEY] = next;
     root[WORKFLOW_SETTINGS_KEY] = wf;
     fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -344,29 +395,95 @@ export const HANDOFF_FALLBACK_TOKEN = "fallback";
 export const HANDOFF_FALLBACK_DESCRIPTION =
   "present the pending plan handoff in the native questionnaire now";
 
+/** `/handoff execution <destination> [scope]`: the saved approval destination. */
+export const HANDOFF_EXECUTION_TOKEN = "execution";
+/** `/handoff once <destination>`: this handoff only; never writes settings. */
+export const HANDOFF_ONCE_TOKEN = "once";
+/** `/handoff status`: effective presenter, destination and scopes. */
+export const HANDOFF_STATUS_TOKEN = "status";
+
+export const HANDOFF_EXECUTION_DESCRIPTIONS: Record<ExecutionDestination, string> = {
+  orchestrator:
+    "approved plans go to Orchestrator (separate breakdown approval before Build children)",
+  build: "approved plans start directly in this session's Build mode",
+};
+
 /**
  * Argument completions for `/handoff` (pure; unit-tested).
  *
+ * Grammar:
+ *   /handoff [auto|native|plannotator] [global|project]
+ *   /handoff execution <orchestrator|build> [global|project]
+ *   /handoff once <orchestrator|build>
+ *   /handoff status
+ *   /handoff fallback
+ *
  * Follows the pi-tui full-argument contract (see `joinArgumentValue`): the
- * first token completes a mode, the second completes the write scope, and
- * every `value` is the complete replacement for the typed argument text.
- * Exact-match suppression closes the dropdown on an unambiguous token.
+ * first token completes a subcommand, the second a value, and every `value`
+ * is the complete replacement for the typed argument text.
  */
 export function handoffArgumentCompletions(
   argumentPrefix: string,
 ): ArgumentCompletion[] | null {
   const raw = String(argumentPrefix ?? "");
   const join = (token: string) => joinArgumentValue(raw, token);
+  const scopeItems = (partial: string): ArgumentCompletion[] =>
+    HANDOFF_SCOPES.flatMap((scope) =>
+      scope.token.startsWith(partial.toLowerCase())
+        ? [
+            {
+              value: join(scope.token),
+              label: scope.token,
+              description: scope.description,
+            },
+          ]
+        : [],
+    );
+  const destinationItems = (partial: string): ArgumentCompletion[] =>
+    EXECUTION_DESTINATIONS.filter((destination) =>
+      destination.startsWith(partial.toLowerCase()),
+    ).map((destination) => ({
+      value: join(destination),
+      label: destination,
+      description: HANDOFF_EXECUTION_DESCRIPTIONS[destination],
+    }));
+  const filterScopes = (items: ArgumentCompletion[], partial: string) => {
+    if (items.length === 0) return null;
+    if (suppressExactArgumentMatch(items.map((i) => i.label), partial)) return null;
+    return items;
+  };
 
-  // ── Mode position: no whitespace typed yet ──────────────────────────
+  // ── Subcommand position: no whitespace typed yet ────────────────────
   if (!raw.trim() || !/\s/.test(raw)) {
     const lower = raw.trim().toLowerCase();
-    const modes = HANDOFF_MODES.filter((mode) => mode.startsWith(lower));
-    const items: ArgumentCompletion[] = modes.map((mode) => ({
+    const items: ArgumentCompletion[] = HANDOFF_MODES.filter((mode) =>
+      mode.startsWith(lower),
+    ).map((mode) => ({
       value: `${mode} `,
       label: mode,
       description: describeHandoffMode(mode),
     }));
+    if (HANDOFF_EXECUTION_TOKEN.startsWith(lower)) {
+      items.push({
+        value: `${HANDOFF_EXECUTION_TOKEN} `,
+        label: HANDOFF_EXECUTION_TOKEN,
+        description: "default execution destination for approved plans",
+      });
+    }
+    if (HANDOFF_ONCE_TOKEN.startsWith(lower)) {
+      items.push({
+        value: `${HANDOFF_ONCE_TOKEN} `,
+        label: HANDOFF_ONCE_TOKEN,
+        description: "override the destination of the pending handoff only",
+      });
+    }
+    if (HANDOFF_STATUS_TOKEN.startsWith(lower)) {
+      items.push({
+        value: HANDOFF_STATUS_TOKEN,
+        label: HANDOFF_STATUS_TOKEN,
+        description: "show the effective presenter, destination and scopes",
+      });
+    }
     if (HANDOFF_FALLBACK_TOKEN.startsWith(lower)) {
       items.push({
         value: HANDOFF_FALLBACK_TOKEN,
@@ -374,31 +491,38 @@ export function handoffArgumentCompletions(
         description: HANDOFF_FALLBACK_DESCRIPTION,
       });
     }
-    return items.length > 0 ? items : null;
+    if (items.length === 0) return null;
+    // Close the dropdown once the typed token IS a candidate.
+    if (suppressExactArgumentMatch(items.map((i) => i.label), raw.trim())) return null;
+    return items;
   }
 
-  // ── Scope position: a mode is already committed ─────────────────────
   const tokens = raw.trim().split(/\s+/).filter(Boolean);
-  const mode = (tokens[0] ?? "").toLowerCase();
-  if (!isHandoffMode(mode)) return null;
-  if (tokens.length > 2) return null;
+  const sub = (tokens[0] ?? "").toLowerCase();
   const endsWithWs = /\s$/.test(raw);
-  if (tokens.length === 2 && endsWithWs) return null;
   const partial = endsWithWs ? "" : (tokens[tokens.length - 1] ?? "");
-  const items: ArgumentCompletion[] = HANDOFF_SCOPES.flatMap((scope) =>
-    scope.token.startsWith(partial.toLowerCase())
-      ? [
-          {
-            value: join(scope.token),
-            label: scope.token,
-            description: scope.description,
-          },
-        ]
-      : [],
-  );
-  if (items.length === 0) return null;
-  if (suppressExactArgumentMatch(items.map((i) => i.label), partial)) {
+
+  // ── /handoff execution <destination> [scope] ────────────────────────
+  if (sub === HANDOFF_EXECUTION_TOKEN) {
+    if (tokens.length === 1 || (tokens.length === 2 && !endsWithWs)) {
+      return filterScopes(destinationItems(tokens.length === 1 ? "" : partial), partial);
+    }
+    if (tokens.length === 2 && endsWithWs) return filterScopes(scopeItems(""), "");
+    if (tokens.length === 3 && !endsWithWs) return filterScopes(scopeItems(partial), partial);
     return null;
   }
-  return items;
+
+  // ── /handoff once <destination> (no scope, no write) ────────────────
+  if (sub === HANDOFF_ONCE_TOKEN) {
+    if (tokens.length === 1 || (tokens.length === 2 && !endsWithWs)) {
+      return filterScopes(destinationItems(tokens.length === 1 ? "" : partial), partial);
+    }
+    return null;
+  }
+
+  // ── /handoff <presenter> [scope] ────────────────────────────────────
+  if (!isHandoffMode(sub)) return null;
+  if (tokens.length > 2) return null;
+  if (tokens.length === 2 && endsWithWs) return null;
+  return filterScopes(scopeItems(partial), partial);
 }

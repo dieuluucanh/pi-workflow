@@ -144,7 +144,7 @@ test("readiness, lease and persisted intent gate the single wake", async () => {
   });
   assert.equal((duplicate as any).code, "duplicate");
 
-  const acked = recordStartAck((delivered as any).value, {
+  const acked = recordStartAck(value.spec, (delivered as any).value, {
     taskStartId: value.spec.taskStartId,
     now: 14,
   });
@@ -178,7 +178,12 @@ test("reconciliation never replays an uncertain start", async () => {
     "recreate",
   );
 
-  const running = (recordStartAck(delivered, { taskStartId: value.spec.taskStartId, now: 5 }) as any).value;
+  const running = (
+    recordStartAck(value.spec, delivered, {
+      taskStartId: value.spec.taskStartId,
+      now: 5,
+    }) as any
+  ).value;
   assert.equal((await reconcileWorker({ state: running, exists: async () => true })).action, "running");
   assert.equal(
     (await reconcileWorker({ state: markWorkerClosed(running, 6), exists: async () => true })).action,
@@ -193,4 +198,37 @@ test("invalid or oversized launch inputs are refused before any SDK effect", asy
   const noModel = await prepareWorker(input({ model: { provider: "", id: "" } }), sdk.sdk);
   assert.equal(noModel.ok, false);
   assert.equal(sdk.calls.length, 0);
+});
+
+test("an acknowledgement must name this worker's exact task-start id", async () => {
+  const value = await prepared();
+  const ready = (markWorkerReady(value.state, {
+    sessionId: "session-1",
+    generation: 1,
+    now: 11,
+  }) as any).value;
+  const starting = (beginWorkerStart(value.spec, ready, {
+    leaseGeneration: 1,
+    currentLeaseGeneration: 1,
+    now: 12,
+  }) as any).value;
+  const delivered = (await deliverWake(value.spec, starting.state, value.sdk, {
+    intentPersisted: true,
+    now: 13,
+  })) as any;
+
+  const wrong = recordStartAck(value.spec, delivered.value, {
+    taskStartId: "start-somewhere-else",
+    now: 14,
+  });
+  assert.equal(wrong.ok, false);
+  assert.equal((wrong as any).code, "mismatch");
+  assert.equal(wrong.ok ? undefined : wrong.error.includes("does not name"), true);
+
+  const right = recordStartAck(value.spec, delivered.value, {
+    taskStartId: value.spec.taskStartId,
+    now: 15,
+  });
+  assert.equal(right.ok, true);
+  assert.equal(right.ok ? right.value.phase : undefined, "running");
 });

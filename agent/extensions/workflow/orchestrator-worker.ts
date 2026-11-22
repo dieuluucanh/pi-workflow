@@ -70,6 +70,18 @@ export interface WorkerLaunchInput {
   trust: "trust" | "session" | "never";
   model: { provider: string; id: string; thinking?: string };
   resources?: WorkerResources;
+  /**
+   * The task-local work contract, written into the child's own session so the
+   * child can build its LOCAL todo list without reading the parent roadmap.
+   * Bounded and optional: an older caller keeps working unchanged.
+   */
+  scope?: {
+    covers: readonly string[];
+    objective: string;
+    acceptanceChecks: readonly string[];
+    expectedFiles: readonly string[];
+    mutationScope?: readonly string[];
+  };
   now: number;
 }
 
@@ -246,6 +258,19 @@ export async function prepareWorker(
       data: input.roadmap,
     },
   ];
+  if (input.scope) {
+    entries.push({
+      type: "workflow-task-scope",
+      key: `${assignmentId}:scope`,
+      data: {
+        covers: stringList(input.scope.covers),
+        objective: input.scope.objective.slice(0, 600),
+        acceptanceChecks: stringList(input.scope.acceptanceChecks).slice(0, 64),
+        expectedFiles: stringList(input.scope.expectedFiles).slice(0, 512),
+        mutationScope: stringList(input.scope.mutationScope).slice(0, 64),
+      },
+    });
+  }
   for (const entry of entries) {
     if (JSON.stringify(entry.data).length > MAX_METADATA_CHARS) {
       return { ok: false, code: "invalid", error: `${entry.type} metadata is too large` };
@@ -389,7 +414,14 @@ export async function deliverWake(
 }
 
 /** The child acknowledges the actual turn start (not just the wake send). */
+/**
+ * The child acknowledges the actual turn start (not just the wake send).
+ *
+ * The acknowledgement must name the EXACT start id this worker's wake carried:
+ * a stale or foreign ack must not promote a different attempt to `running`.
+ */
 export function recordStartAck(
+  spec: Pick<WorkerLaunchSpec, "taskStartId">,
   state: WorkerState,
   input: { taskStartId: string; now: number },
 ): WorkerResult<WorkerState> {
@@ -398,6 +430,13 @@ export function recordStartAck(
   }
   if (state.wakeSentAt === undefined) {
     return { ok: false, code: "invalid", error: "no wake was sent for this start" };
+  }
+  if (input.taskStartId !== spec.taskStartId) {
+    return {
+      ok: false,
+      code: "mismatch",
+      error: "the acknowledgement does not name this worker's task-start id",
+    };
   }
   return {
     ok: true,

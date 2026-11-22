@@ -32,6 +32,20 @@ export interface WorkflowContributionInput {
   /** Panel/commit hints, optional (display only). */
   commitMode?: string;
   writeMode?: string | null;
+  /**
+   * Bound orchestration state. Display/diagnostics only: a contribution can
+   * never approve, dispatch or bypass the runtime's eligibility checks.
+   */
+  orchestration?: {
+    phase: string;
+    approval: "none" | "pending" | "approved";
+    blockedReason?: string;
+    nextTaskId?: string;
+    /** Whether a visible child host can be reached right now. */
+    hostReady?: boolean;
+    hostLabel?: string;
+    hostReason?: string;
+  };
 }
 
 /** Human-readable panel state for the generic progress detail (display only). */
@@ -212,7 +226,7 @@ export function buildWorkflowContributions(
     slot: "action",
     label: "Orchestrator",
     tone: "info",
-    order: 22,
+    order: 21,
     command: { name: "orchestrator" },
     enabled: input.mode !== "orchestrator",
     ...(input.mode === "orchestrator"
@@ -225,11 +239,61 @@ export function buildWorkflowContributions(
     slot: "action",
     label: "Build",
     tone: "accent",
-    order: 21,
+    order: 22,
     command: { name: "build" },
     enabled: input.mode !== "build",
     ...(input.mode === "build" ? { disabledReason: "already in Build" } : {}),
   });
+
+  if (input.mode === "orchestrator" && input.orchestration) {
+    const run = input.orchestration;
+    const approval =
+      run.approval === "approved"
+        ? "execution approved"
+        : run.approval === "pending"
+          ? "breakdown pending approval"
+          : "no breakdown yet";
+    out.push({
+      id: "orchestrator-run",
+      kind: "status",
+      slot: "status",
+      text: `run ${run.phase} · ${approval}${run.nextTaskId ? ` · next ${run.nextTaskId}` : ""}`,
+      tone: "info",
+      order: 41,
+    });
+    if (run.blockedReason) {
+      out.push({
+        id: "orchestrator-blocked",
+        kind: "status",
+        slot: "status",
+        text: `blocked: ${run.blockedReason.slice(0, 160)}`,
+        tone: "warning",
+        order: 42,
+      });
+    }
+    if (run.hostReady === false) {
+      out.push({
+        id: "orchestrator-host",
+        kind: "status",
+        slot: "status",
+        text: `${run.hostLabel ?? "child host"} unavailable: ${(run.hostReason ?? "no visible child host").slice(0, 160)}`,
+        tone: "warning",
+        order: 43,
+      });
+      // An explicit escape, never an automatic fallback: the user chooses.
+      out.push({
+        id: "orchestrator-direct-build",
+        kind: "action",
+        slot: "action",
+        label: "Use direct Build",
+        description: "Leave coordination and continue in this session as Build. Nothing is dispatched.",
+        tone: "warning",
+        command: { name: "build" },
+        enabled: true,
+        order: 44,
+      });
+    }
+  }
 
   if (input.commitMode || input.writeMode) {
     const parts = [

@@ -93,7 +93,13 @@ const spec = (over: Partial<RelatedSessionSpec> = {}): RelatedSessionSpec => ({
   ...over,
 });
 
-function harness(over: { reply?: boolean; autoCaps?: boolean } = {}) {
+function harness(over: { reply?: boolean; autoCaps?: boolean; noGrant?: boolean } = {}) {
+  const grant = {
+    token: "grant-abc",
+    ownerCommand: "workflow",
+    sessionId: "session-1",
+    epoch: 3,
+  };
   const b = bus();
   const c = clock();
   const requests: Array<Record<string, unknown>> = [];
@@ -112,6 +118,7 @@ function harness(over: { reply?: boolean; autoCaps?: boolean } = {}) {
     bus: b.value,
     ownerCommand: "workflow",
     clock: c.value,
+    ...(over.noGrant ? {} : { grant: () => grant }),
   });
   // Announce AFTER the adapter subscribes (the real host does this on bind).
   if (over.autoCaps !== false) b.value.emit(DESKTOP_SESSION_CHANNELS.hello, caps);
@@ -239,4 +246,26 @@ test("dispose cancels pending requests and stops listening", async () => {
   const after = await h.host.createRelated(spec({ requestId: "req-after" }));
   assert.equal((after as any).code, "cancelled");
   assert.equal(h.requests.length, 1);
+});
+
+// ── Host-issued grant (plan step 12) ─────────────────────────────────
+
+test("grant: a session without a host grant sends nothing and fails closed", async () => {
+  const h = harness({ noGrant: true });
+  const result = await h.host.createRelated(spec());
+  assert.equal(result.ok, false);
+  assert.equal((result as any).code, "unsupported");
+  assert.match((result as any).reason, /capability grant/);
+  assert.equal(h.requests.length, 0, "the wire was never touched");
+});
+
+test("grant: the request carries the host-issued grant and nothing else proves it", async () => {
+  const h = harness();
+  const result = await h.host.createRelated(spec());
+  assert.equal(result.ok, true);
+  const sent = h.requests[0] as { grant?: { token?: string; ownerCommand?: string } };
+  assert.equal(sent.grant?.token, "grant-abc");
+  assert.equal(sent.grant?.ownerCommand, "workflow");
+  // The owner name alone is still present, but the host now gates on the grant.
+  assert.equal((h.requests[0] as { ownerCommand?: string }).ownerCommand, "workflow");
 });

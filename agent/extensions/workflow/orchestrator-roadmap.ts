@@ -361,6 +361,9 @@ export function evaluateFinalGate(input: FinalGateInput): FinalGateDecision {
         failed.push({ ...result, status: "skipped" });
         continue;
       }
+      // Explicit human acceptance satisfies a manual criterion; the automated
+      // "skipped is not a pass" rule below must not override it.
+      continue;
     }
     if (result.unavailableTool) {
       blockers.push(`final check tool is unavailable: ${result.unavailableTool} (${name})`);
@@ -370,6 +373,14 @@ export function evaluateFinalGate(input: FinalGateInput): FinalGateDecision {
     if (baseline.get(name) === "failed") {
       blockers.push(`pre-existing red final gate cannot be proof: ${name}`);
       failed.push({ ...result, preExistingFailure: true });
+      continue;
+    }
+    if (result.status === "skipped") {
+      // Fail closed: a required check that did not run is not a pass, even
+      // without a "manual" marker in its evidence. Only the explicit manual
+      // acceptance branch above can satisfy a human criterion.
+      blockers.push(`required final check did not run: ${name}`);
+      failed.push(result);
       continue;
     }
     if (result.status === "failed") {

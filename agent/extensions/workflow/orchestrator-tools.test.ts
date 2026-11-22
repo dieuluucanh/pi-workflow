@@ -31,6 +31,7 @@ import {
   type PlannedTask,
   type RoadmapRequirement,
 } from "./orchestrator-types.ts";
+import { taskStartIdFor, workerIdFor } from "./orchestrator-worker.ts";
 
 const REQS: RoadmapRequirement[] = [
   { roadmapStepId: "step-r1", label: "1", text: "Read the API" },
@@ -307,7 +308,7 @@ test("status reports bounded counts and the next runnable task", () => {
   assert.equal(candidate.nextTaskId, undefined);
 });
 
-test("verify requires a quiescent candidate; accept requires matching evidence", () => {
+test("verify requires a quiescent candidate; acceptance evidence is runtime-owned", () => {
   let state = runningCandidate();
   const verified = ok<{ event: any }>(
     handleOrchestratorTool("orchestrator_verify", { taskId: "task-t1" }, context(state)),
@@ -315,19 +316,23 @@ test("verify requires a quiescent candidate; accept requires matching evidence",
   state = ok<{ state: RunState }>(applyRunEvent(state, verified.event)).state;
   assert.equal(state.tasks["task-t1"]!.state, "verifying");
 
-  const noEvidence = handleOrchestratorTool(
+  // A model-supplied evidence object is no longer an acceptance input at all.
+  const forged = handleOrchestratorTool(
     "orchestrator_accept",
-    { evidence: { ...evidence(), verdict: "needs_fix" } },
+    { evidence: evidence() },
     context(state),
   );
-  assert.equal((noEvidence as any).code, "state");
+  assert.equal((forged as any).ok, false);
+  assert.equal((forged as any).code, "invalid");
 
-  const accepted = ok<{ event: any; receipt: any }>(
-    handleOrchestratorTool("orchestrator_accept", { evidence: evidence() }, context(state)),
+  const pending = handleOrchestratorTool(
+    "orchestrator_accept",
+    { taskId: "task-t1" },
+    context(state),
   );
-  assert.equal(accepted.receipt.kind, "acceptance");
-  const next = ok<{ state: RunState }>(applyRunEvent(state, accepted.event)).state;
-  assert.equal(next.tasks["task-t1"]!.state, "accepted");
+  assert.equal((pending as any).ok, false);
+  assert.equal((pending as any).code, "unavailable");
+  assert.match((pending as any).error, /orchestrator_verify/);
 });
 
 test("repair is bounded and refuses a stale epoch", () => {
@@ -451,4 +456,47 @@ test("the pump deduplicates, refuses reorders/stale epochs and coalesces bursts"
   assert.equal(wake?.kind, "waiting-user");
   assert.match(wake!.text, /Waiting|waiting/);
   assert.equal(pump.pending(), 0);
+});
+
+// ── Contract alignment (plan step 7) ─────────────────────────────────
+
+test("dispatch requires a real host session and uses the worker's start id", () => {
+  const state = stateWithPlan();
+  const context = (over: Partial<ToolContext> = {}): ToolContext => ({
+    state,
+    now: 10,
+    epoch: 1,
+    currentEpoch: 1,
+    activeTurn: false,
+    approval: { approved: true, approvalDigest: "a", planDigest: "b" },
+    ...over,
+  });
+
+  const missing = handleOrchestratorTool(
+    "orchestrator_dispatch",
+    { taskId: "task-t1", attemptId: "attempt-a1" },
+    context(),
+  );
+  assert.equal(missing.ok, false);
+  assert.equal((missing as any).code, "invalid");
+  assert.match((missing as any).error, /sessionRef/);
+
+  const dispatched = ok<{ event: any; receipt: any }>(
+    handleOrchestratorTool(
+      "orchestrator_dispatch",
+      {
+        taskId: "task-t1",
+        attemptId: "attempt-a1",
+        sessionRef: "sdk-session-42",
+      },
+      context(),
+    ),
+  );
+  assert.equal(dispatched.event.sessionId, "sdk-session-42", "no placeholder id");
+  assert.equal(dispatched.receipt.sessionRef, "sdk-session-42");
+  // The receipt and the worker module must agree on the start id.
+  assert.equal(
+    dispatched.receipt.taskStartId,
+    taskStartIdFor(workerIdFor({ runId: "run-1", taskId: "task-t1", attemptId: "attempt-a1" }), "attempt-a1"),
+  );
 });

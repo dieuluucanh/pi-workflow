@@ -386,11 +386,17 @@ function applyPlan(
 ): StateResult {
   const base = taskEventError(state, event);
   if (base) return base;
-  if (state.planRevision !== 0) {
-    return fail("invalid_state", "a task breakdown is already applied");
-  }
   if (state.phase !== "draft" && state.phase !== "awaiting_approval") {
-    return fail("illegal_transition", `cannot apply a breakdown in phase ${state.phase}`);
+    // Once dispatch starts, the breakdown is the approved contract; a scope
+    // change needs a new approval revision, not a silent replacement.
+    return fail(
+      "illegal_transition",
+      `cannot apply a breakdown in phase ${state.phase}`,
+    );
+  }
+  const replacing = state.planRevision > 0;
+  if (replacing && state.mutation) {
+    return fail("invalid_state", "cannot replace a breakdown while a task holds the workspace");
   }
   if (event.plan.runId !== state.runId) {
     return fail("invalid_state", "breakdown belongs to a different run");
@@ -426,7 +432,7 @@ function applyPlan(
       ...state,
       ...nextRevision(state, event.now),
       phase: "awaiting_approval",
-      planRevision: 1,
+      planRevision: replacing ? state.planRevision + 1 : 1,
       requirements: event.requirements.map((requirement) => ({ ...requirement })),
       tasks,
       order: event.plan.tasks.map((task) => task.taskId),

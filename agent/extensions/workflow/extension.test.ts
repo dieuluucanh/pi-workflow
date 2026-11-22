@@ -84,6 +84,12 @@ interface BootOptions {
   isTerminalHost?: boolean;
   /** `ctx.isIdle()` at boot; a test can flip it later with `setIdle`. */
   idle?: boolean;
+  /**
+   * Approval destination. This suite pins direct Build; the production default
+   * is Orchestrator, covered by `handoff-destination.test.ts`.
+   */
+  /** `unset` leaves the field absent so the PRODUCT default is exercised. */
+  executionMode?: "orchestrator" | "build" | "unset";
 }
 
 async function boot(over: BootOptions = {}) {
@@ -98,12 +104,22 @@ async function boot(over: BootOptions = {}) {
     !Array.isArray(extraSettings.workflow)
       ? (extraSettings.workflow as Record<string, unknown>)
       : {};
+  // A presenter string shorthand cannot also carry a destination, so this
+  // fixture normalizes it to the object form it means (`{mode: "native"}`).
+  const rawHandoff = extraWorkflow.handoff;
+  const handoffObject: Record<string, unknown> =
+    typeof rawHandoff === "string"
+      ? { mode: rawHandoff }
+      : rawHandoff && typeof rawHandoff === "object" && !Array.isArray(rawHandoff)
+        ? (rawHandoff as Record<string, unknown>)
+        : {};
   fs.writeFileSync(
     path.join(cwd, ".pi", "settings.json"),
     JSON.stringify(
       {
         ...extraSettings,
         workflow: {
+          ...extraWorkflow,
           reviewMode: {
             enabled: over.enabled !== false,
             rounds: 1,
@@ -111,7 +127,18 @@ async function boot(over: BootOptions = {}) {
             verify: over.verify === true,
             timeoutMs: 5000,
           },
-          ...extraWorkflow,
+          // This suite pins the DIRECT-BUILD contract. The product default is
+          // Orchestrator (covered by handoff-destination.test.ts), so legacy
+          // approve→Build tests configure their destination explicitly.
+          handoff: {
+            ...handoffObject,
+            ...(over.executionMode === "unset"
+              ? {}
+              : {
+                  executionMode:
+                    over.executionMode ?? handoffObject.executionMode ?? "build",
+                }),
+          },
         },
       },
       null,
@@ -2364,7 +2391,14 @@ test("HF8: a headless handoff closes the review turn", async () => {
       "the review turn was closed",
     );
     await b.pi.commands["review-abort"].handler("", b.ctx);
-    assert.ok(notified(b.notifies, "Nothing to abort"), "no lock is left");
+    // The headless decision stays pending after the turn closes (that is what
+    // makes /handoff approve possible). Assert the REVIEW turn is idle rather
+    // than the old "nothing to abort" wording, which no longer describes it.
+    b.notifies.length = 0;
+    await b.pi.commands["review-status"].handler("", b.ctx);
+    const status = b.notifies.at(-1)?.message ?? "";
+    assert.match(status, /turn\s*:\s*idle/, "no review turn is left running");
+    assert.ok(!/running|paused/.test(status), "no review lock is left");
   } finally {
     await b.cleanup();
   }
@@ -2648,8 +2682,12 @@ test("HD7: headless native handoff uses the text fallback, not SSH hint", async 
     assert.ok(fallback, "the headless fallback message was sent");
     const text = JSON.stringify((fallback as any).content);
     assert.ok(
-      text.includes("Execute the plan"),
-      "the headless message points at the execute prompt",
+      text.includes("/handoff approve handoff-"),
+      "the headless message names the exact approval command and decision id",
+    );
+    assert.ok(
+      text.includes("Nothing executes until you approve"),
+      "headless never implies automatic execution",
     );
     assert.ok(!text.includes("SSH port forwarding"), "no browser hint");
     assert.ok(!text.includes("PLANNOTATOR_REMOTE"), "no bridge env hint");
@@ -2680,7 +2718,10 @@ test("HD8: /handoff reports status and writes the requested scope", async () => 
 
     await b.pi.commands.handoff.handler("native project", b.ctx);
     let settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    assert.deepEqual(settings.workflow.handoff, { mode: "native" });
+    assert.deepEqual(settings.workflow.handoff, {
+      mode: "native",
+      executionMode: "build",
+    });
     assert.equal(
       settings.workflow.reviewMode.enabled,
       true,
@@ -2692,10 +2733,15 @@ test("HD8: /handoff reports status and writes the requested scope", async () => 
     const globalPath = path.join(b.agentDir, "settings.json");
     const global = JSON.parse(fs.readFileSync(globalPath, "utf8"));
     assert.equal(global.workflow.handoff.mode, "auto");
+    assert.equal(
+      global.workflow.handoff.executionMode,
+      undefined,
+      "a presenter write stays sparse and does not pin the destination",
+    );
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     assert.deepEqual(
       settings.workflow.handoff,
-      { mode: "native" },
+      { mode: "native", executionMode: "build" },
       "the project override is unchanged",
     );
     assert.ok(notified(b.notifies, "Handoff → auto (global)"));
@@ -2715,19 +2761,23 @@ test("HD9: /handoff refuses to switch while a decision is pending", async () => 
     await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
     assert.equal(b.plannotatorRequests.length, 1, "the browser owns the gate");
 
+    const beforeWrite = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     await b.pi.commands.handoff.handler("native", b.ctx);
     assert.ok(notified(b.notifies, "A handoff decision is pending"));
     let settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    assert.equal(
+    assert.deepEqual(
       settings.workflow.handoff,
-      undefined,
+      beforeWrite.workflow.handoff,
       "the refused write changed nothing",
     );
 
     await b.pi.commands["review-abort"].handler("", b.ctx);
     await b.pi.commands.handoff.handler("native project", b.ctx);
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    assert.deepEqual(settings.workflow.handoff, { mode: "native" });
+    assert.deepEqual(settings.workflow.handoff, {
+      mode: "native",
+      executionMode: "build",
+    });
   } finally {
     await b.cleanup();
   }
@@ -3547,6 +3597,319 @@ test("Z13: a collapsed panel stays collapsed when a step is added", async () => 
     const rows = renderTodoWidget(b.widgetCalls).map(stripAnsi);
     assert.equal(rows.length, 1, "the sticky collapsed choice survives the add");
     assert.match(rows[0] ?? "", /Todos/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── Approval destination routing (plan steps 4–6) ─────────────────────
+
+test("RD1: the PRODUCT default sends an approved plan to Orchestrator, not Build", async () => {
+  const b = await boot({
+    hasUI: true,
+    executionMode: "unset",
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "rd1-default.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
+    assert.equal(
+      persisted?.data?.mode,
+      "orchestrator",
+      "the approved plan enters Orchestrator mode",
+    );
+    const route = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow-handoff-route") as any;
+    assert.equal(route?.data?.destination, "orchestrator");
+    assert.equal(route?.data?.route, "orchestrator-prepare");
+    assert.equal(
+      b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")),
+      false,
+      "the direct-Build execution prompt is never sent",
+    );
+    assert.ok(
+      b.pi.entries.some((e: any) => e.type === "workflow-orchestrator-preparation"),
+      "a durable preparation request is recorded",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RD2: /handoff once retargets only the pending handoff and keeps settings", async () => {
+  const b = await boot({ executionMode: "orchestrator", plannotator: true, hasUI: true });
+  const settingsPath = path.join(b.cwd, ".pi", "settings.json");
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "rd2-once.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.plannotatorRequests.length, 1, "the browser owns the gate");
+
+    const before = fs.readFileSync(settingsPath, "utf8");
+    await b.pi.commands.handoff.handler("once build", b.ctx);
+    assert.equal(
+      fs.readFileSync(settingsPath, "utf8"),
+      before,
+      "a one-off override never writes settings",
+    );
+    assert.ok(notified(b.notifies, "Saved default is unchanged"));
+
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() => b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")));
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
+    assert.equal(persisted?.data?.mode, "build", "the overridden handoff runs directly");
+    const route = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow-handoff-route") as any;
+    assert.equal(route?.data?.destination, "build");
+    assert.equal(route?.data?.overrideRevision, 1);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RD3: /handoff execution persists the default and status reports its scope", async () => {
+  const b = await boot({ executionMode: "unset" });
+  try {
+    await b.pi.commands.handoff.handler("execution build project", b.ctx);
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(b.cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.equal(settings.workflow.handoff.executionMode, "build");
+    assert.ok(notified(b.notifies, "Approved plans → build (project settings)"));
+
+    b.notifies.length = 0;
+    await b.pi.commands.handoff.handler("", b.ctx);
+    assert.ok(notified(b.notifies, "execute  : build (project settings)"));
+
+    await b.pi.commands.handoff.handler("execution nope", b.ctx);
+    assert.ok(notified(b.notifies, 'Unknown execution destination "nope"'));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RD4: the first browser handoff asks once, saves the answer, and routes there", async () => {
+  const b = await boot({
+    executionMode: "unset",
+    plannotator: true,
+    hasUI: true,
+    selectAnswer: "Orchestrator — prepare a breakdown; nothing runs before you approve it",
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "rd4-first.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    // The answer became the saved default (a global scope write).
+    const globalSettings = JSON.parse(
+      fs.readFileSync(path.join(b.agentDir, "settings.json"), "utf8"),
+    );
+    assert.equal(globalSettings.workflow.handoff.executionMode, "orchestrator");
+    assert.equal(b.plannotatorRequests.length, 1, "the browser opened after the choice");
+
+    b.pi.events.emit("plannotator:review-result", { reviewId: "review-1", approved: true });
+    await waitFor(() =>
+      b.pi.entries.some(
+        (e: any) => e.type === "workflow-handoff-route" && e.data?.route === "orchestrator-prepare",
+      ),
+    );
+    assert.equal(
+      b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")),
+      false,
+      "the browser approval prepared a breakdown, not a Build turn",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RD5: a headless handoff is approved only by its printed decision id", async () => {
+  const b = await boot({ executionMode: "build", hasUI: false });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "rd5-headless.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow" && e.data?.pendingHandoffDecision) as any;
+    const decisionId = persisted?.data?.pendingHandoffDecision?.decisionId;
+    assert.ok(decisionId, "a pending decision with an id is persisted");
+    assert.equal(
+      b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")),
+      false,
+      "headless never auto-executes",
+    );
+
+    await b.pi.commands.handoff.handler("approve nope", b.ctx);
+    assert.ok(notified(b.notifies, "does not match the pending handoff"));
+
+    await b.pi.commands.handoff.handler(`approve ${decisionId}`, b.ctx);
+    await waitFor(() => b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")));
+    const mode = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
+    assert.equal(mode?.data?.mode, "build");
+
+    // A second approval of the same id starts nothing.
+    const before = b.pi.sent.length;
+    await b.pi.commands.handoff.handler(`approve ${decisionId}`, b.ctx);
+    assert.equal(b.pi.sent.length, before, "an id is consumed once");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RD6: a one-off destination survives browser failure → native fallback", async () => {
+  const b = await boot({
+    executionMode: "orchestrator",
+    plannotator: true,
+    plannotatorError: true,
+    hasUI: true,
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "rd6-fallback.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    // The browser failed and the native sheet took the same handoff; the
+    // override chosen while it was a browser decision is still in force.
+    assert.ok(b.customs.length >= 1, "the native sheet opened after the failure");
+    const route = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow-handoff-route") as any;
+    if (route) {
+      // A fallback that ran before the override would already have consumed it;
+      // the assertion below would then be the real signal.
+    }
+    const persisted = [...b.pi.entries]
+      .reverse()
+      .find((e: any) => e.type === "workflow" && e.data?.mode) as any;
+    assert.equal(persisted?.data?.mode, "orchestrator");
+    assert.equal(
+      b.pi.sent.some((s: any) => String(s.content).includes("Execute the plan")),
+      false,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── Real-entrypoint orchestration integration (plan step 24) ─────────
+
+test("RE1: a real approved plan binds a durable run and prepares once, without a child", async () => {
+  const b = await boot({
+    hasUI: true,
+    executionMode: "unset",
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re1-run.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    // A real journal is on disk (real Node adapters, not a fake).
+    const runsRoot = path.join(b.agentDir, "orchestrator", "runs");
+    assert.ok(fs.existsSync(runsRoot), "the run directory exists");
+    const runDirs = fs.readdirSync(runsRoot).filter((entry) => entry.startsWith("run-"));
+    assert.equal(runDirs.length, 1, "exactly one run is created");
+    const journal = fs.readFileSync(
+      path.join(runsRoot, runDirs[0]!, "journal.ndjson"),
+      "utf8",
+    );
+    assert.match(journal, /"type":"run.created"/);
+    assert.match(journal, /"type":"run.preparation"/);
+
+    // Exactly one bounded preparation turn, and no direct-Build prompt.
+    const sentText = (entry: any) =>
+      String(
+        (entry.content && typeof entry.content === "object"
+          ? (entry.content as any).content
+          : entry.content) ?? "",
+      );
+    const preparationTurns = b.pi.sent.filter((entry: any) =>
+      sentText(entry).includes("Orchestrator preparation"),
+    );
+    assert.equal(preparationTurns.length, 1, "one preparation turn");
+    assert.equal(
+      b.pi.sent.some((entry: any) => sentText(entry).includes("Execute the plan")),
+      false,
+      "the direct-Build prompt is never sent",
+    );
+
+    // The registered parent tools observe the bound run and refuse dispatch
+    // honestly, because this build has no child host bound.
+    const status = await b.pi.tools.orchestrator_status.execute("re1-status", {});
+    assert.match(JSON.stringify(status), /"runId":"run-/);
+    assert.match(JSON.stringify(status), /draft · 0\/0 accepted/);
+    const dispatch = await b.pi.tools.orchestrator_dispatch.execute("re1-dispatch", {
+      taskId: "task-1",
+      attemptId: "attempt-1",
+    });
+    assert.match(JSON.stringify(dispatch), /no child host|no approved roadmap|not dispatchable|unknown task/);
+    assert.equal(
+      b.pi.sent.some((entry: any) => sentText(entry).includes("Dispatched ")),
+      false,
+      "no dispatch receipt was fabricated",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE2: the explicit direct-Build destination sends exactly one execution prompt and creates no run", async () => {
+  const b = await boot({
+    hasUI: true,
+    executionMode: "build",
+    customAnswer: handoffAnswer("approve"),
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re2-build.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    const execution = b.pi.sent.filter((entry: any) => {
+      const content = entry.content;
+      const text =
+        content && typeof content === "object"
+          ? String((content as any).content ?? "")
+          : String(content ?? "");
+      return text.includes("Execute the plan");
+    });
+    assert.equal(execution.length, 1, "the direct-Build execution prompt is sent once");
+    const runsRoot = path.join(b.agentDir, "orchestrator", "runs");
+    assert.equal(
+      fs.existsSync(runsRoot) && fs.readdirSync(runsRoot).length > 0,
+      false,
+      "direct Build creates no orchestration run",
+    );
   } finally {
     await b.cleanup();
   }

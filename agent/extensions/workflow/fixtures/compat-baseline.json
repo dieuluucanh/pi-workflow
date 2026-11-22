@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "capturedAt": "2026-11-21",
+  "capturedAt": "2026-11-22",
   "note": "Behavioral baseline for ordinary Plan/Build. Update only with an intentional Workflow change; every difference is user-visible.",
   "sdk": {
     "package": "@earendil-works/pi-coding-agent",
@@ -8,6 +8,14 @@
   },
   "registeredTools": [
     "explore",
+    "orchestrator_accept",
+    "orchestrator_checkpoint",
+    "orchestrator_dispatch",
+    "orchestrator_propose_tasks",
+    "orchestrator_repair",
+    "orchestrator_report",
+    "orchestrator_status",
+    "orchestrator_verify",
     "questionnaire",
     "workflow_todo",
     "workflow_worker_ready"
@@ -60,6 +68,7 @@
     "role",
     "shell-guard",
     "todos",
+    "workflow-bridge",
     "write-policy"
   ],
   "roles": {
@@ -84,7 +93,8 @@
     "profile": "workflow-profile",
     "policy": "workflow-policy",
     "review": "workflow-review",
-    "todos": "workflow-todos"
+    "todos": "workflow-todos",
+    "orchestrator": "workflow-orchestrator"
   },
   "widgetKeys": [
     "workflow-review-status",

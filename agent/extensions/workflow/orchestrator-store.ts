@@ -45,14 +45,59 @@ export interface JournalIo {
 
 export type JournalEventType =
   | "run.created"
+  | "run.preparation"
+  | "plan.proposed"
   | "plan.approved"
+  | "execution.approved"
+  | "run.transition"
   | "task.dispatched"
   | "task.start.intent"
   | "task.start.ack"
   | "task.reported"
+  | "task.verified"
+  | "task.needs_fix"
   | "task.accepted"
+  | "task.blocked"
+  | "task.superseded"
   | "task.cancelled"
+  | "attempt.rollover"
+  | "attempt.launch_failed"
+  | "run.control"
+  | "run.final_gate"
+  | "run.completed"
+  | "plan.revision"
+  | "wake.delivered"
+  | "wake.acked"
   | "session.ref";
+
+/** Unknown event types are refused, so a future writer cannot be half-read. */
+export const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<JournalEventType>([
+  "run.created",
+  "run.preparation",
+  "plan.proposed",
+  "plan.approved",
+  "execution.approved",
+  "run.transition",
+  "task.dispatched",
+  "task.start.intent",
+  "task.start.ack",
+  "task.reported",
+  "task.verified",
+  "task.needs_fix",
+  "task.accepted",
+  "task.blocked",
+  "task.superseded",
+  "task.cancelled",
+  "attempt.rollover",
+  "attempt.launch_failed",
+  "run.control",
+  "run.final_gate",
+  "run.completed",
+  "plan.revision",
+  "wake.delivered",
+  "wake.acked",
+  "session.ref",
+]);
 
 export interface JournalEvent {
   version: typeof JOURNAL_VERSION;
@@ -358,6 +403,9 @@ export function createRunJournal(options: {
     async append(input) {
       if (!input.eventId || input.eventId.length > 200 || !input.type) {
         return { ok: false, code: "invalid", error: "event id/type is required" };
+      }
+      if (!KNOWN_EVENT_TYPES.has(input.type)) {
+        return { ok: false, code: "invalid", error: `unknown journal event type ${input.type}` };
       }
       await io.mkdir(dir);
       const locked = await io.acquireLock(lockPath, options.lockStaleMs ?? LOCK_STALE_MS);

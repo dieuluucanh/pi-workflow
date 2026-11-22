@@ -20,8 +20,18 @@ import type {
   QuestionnaireQuestion,
   QuestionnaireResult,
 } from "./questionnaire-view.ts";
+import type { HandoffDestination } from "./handoff-routing.ts";
 
-/** Recommended option: stop reviewing, switch to Build, execute the plan. */
+/**
+ * Recommended option for an Orchestrator approval: stop reviewing, hand the
+ * approved roadmap to Orchestrator, which prepares a SECOND approval.
+ */
+export const HANDOFF_APPROVE_ORCHESTRATOR_LABEL =
+  "Approve plan → Orchestrator (prepare breakdown)";
+/** Approve straight into this session's Build mode (no orchestration). */
+export const HANDOFF_APPROVE_BUILD_LABEL =
+  "Approve plan → direct Build (execute here)";
+/** Pre-destination label; still accepted so an old persisted answer works. */
 export const HANDOFF_APPROVE_LABEL = "Approve plan and go ahead (Build)";
 /** Stay in Plan mode and revise from user feedback. */
 export const HANDOFF_FEEDBACK_LABEL = "Give feedback (stay in Plan)";
@@ -62,7 +72,14 @@ export interface HandoffPlanEntryData {
 
 /** What the user chose in the handoff questionnaire. */
 export type HandoffChoice =
-  | { choice: "execute" }
+  | {
+      choice: "execute";
+      /**
+       * The destination row the user picked. Absent for the legacy label, in
+       * which case the decision's captured destination stands.
+       */
+      destination?: HandoffDestination;
+    }
   | { choice: "refine"; feedback?: string }
   | { choice: "dismiss" };
 
@@ -71,6 +88,24 @@ export interface HandoffQuestionInput {
   reason: HandoffReason;
   verdict?: string;
   findingCount?: number;
+  /**
+   * Effective destination for THIS handoff (captured default or one-off
+   * override). It gets the first, recommended approval row.
+   */
+  destination?: HandoffDestination;
+}
+
+/** Label for an approval row of a given destination. */
+export function handoffApproveLabel(destination: HandoffDestination): string {
+  return destination === "orchestrator"
+    ? HANDOFF_APPROVE_ORCHESTRATOR_LABEL
+    : HANDOFF_APPROVE_BUILD_LABEL;
+}
+
+export function describeHandoffDestination(destination: HandoffDestination): string {
+  return destination === "orchestrator"
+    ? "Hand over the approved roadmap; a separate execution breakdown is approved before Build children start"
+    : "Enter Build in this session and start executing now (no orchestration)";
 }
 
 function normalize(value: string): string {
@@ -140,10 +175,18 @@ export function buildHandoffQuestion(
     lines.push(`Review: ${input.verdict.trim()}${count}`);
   }
   lines.push("The plan is printed above in the transcript — scroll up to read it.");
+  const effective: HandoffDestination = input.destination ?? "orchestrator";
+  const alternate: HandoffDestination = effective === "orchestrator" ? "build" : "orchestrator";
+  // The effective destination is the recommendation; the other row is an
+  // explicit one-off override that never changes the saved default.
   const options: QuestionnaireOption[] = [
     {
-      label: HANDOFF_APPROVE_LABEL,
-      description: "Switch to Build mode and start executing the plan",
+      label: handoffApproveLabel(effective),
+      description: describeHandoffDestination(effective),
+    },
+    {
+      label: handoffApproveLabel(alternate),
+      description: `${describeHandoffDestination(alternate)} — this handoff only; the saved default is unchanged`,
     },
     {
       label: HANDOFF_FEEDBACK_LABEL,
@@ -189,7 +232,14 @@ export function handoffChoiceFromResult(
   }
   const normalized = normalize(answer);
   if (normalized === normalize(HANDOFF_APPROVE_LABEL)) {
+    // Pre-destination label: the decision's captured destination stands.
     return { choice: "execute" };
+  }
+  if (normalized === normalize(HANDOFF_APPROVE_ORCHESTRATOR_LABEL)) {
+    return { choice: "execute", destination: "orchestrator" };
+  }
+  if (normalized === normalize(HANDOFF_APPROVE_BUILD_LABEL)) {
+    return { choice: "execute", destination: "build" };
   }
   if (normalized === normalize(HANDOFF_FEEDBACK_LABEL)) {
     return { choice: "refine" };

@@ -9,6 +9,40 @@ named platform/provider.
 The implementation is opt-in and experimental. Orchestrator mode is off by
 default; ordinary Plan → Review → Build is unchanged.
 
+## Status update (2026-11-22)
+
+**Automated (run and green):** workflow `npm run typecheck`, the full workflow
+package test suite, and the new real-entrypoint integration tests (RE1/RE2). RE1
+approves a plan through the real extension, checks the on-disk run journal
+(`run.created`, `run.preparation`), exactly one preparation turn, the registered
+status tool reporting the bound run, and an honest refusal for dispatch with no
+bound child host. RE2 confirms the explicit direct-Build destination sends one
+execution prompt and creates no run. All of this uses fake hosts/providers, so it
+is integration evidence, **not** live acceptance.
+
+**Automated (second pass, green):** the child chain is now composed. New
+coverage: real local control transport (`ready → start → start-ack`, forged and
+duplicate frames refused, uncertain-after-delivery), the child-host dispatcher
+ordering (grant → metadata → launch → ack), a real-SDK session-materialization
+check, and a real-entrypoint managed-child test that authorizes only from the
+parent's signed grant and applies it at `workflow_worker_ready`. Full workflow
+suite, typecheck, write-policy 100/100 and read-policy checks are green.
+
+**Manual (NOT RUN):** every row below. In particular:
+
+- No real provider/model turn has been executed for Orchestrator preparation,
+  breakdown, dispatch or repair.
+- No visible Windows Terminal child, macOS Terminal or Linux tmux child has been
+  launched by this build. The entrypoint can now bind a Terminal host (or a
+  source-bound Desktop tab) and fails closed only when neither is available;
+  the launch itself has still not been exercised against a real window.
+- No packaged Pi Desktop E2E was run; Desktop related-session behavior is covered
+  only by its own fake-host conformance suites.
+- Crash/reload recovery is covered by module and entrypoint tests with fake
+  processes, not by killing a real parent while a real child runs.
+
+Do not convert any row to PASSED without the real run described in it.
+
 ## Required environment
 
 | Axis | Required |
