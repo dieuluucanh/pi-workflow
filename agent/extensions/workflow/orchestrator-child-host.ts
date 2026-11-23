@@ -132,6 +132,8 @@ export function createTerminalChildHost(options: {
   sdk: () => Promise<WorkerSdkPort>;
   terminal: TerminalHost;
   label?: string;
+  /** Narrow, allowlisted environment for the child (limits/quarantine). */
+  env?: () => Record<string, string>;
 }): ChildHost {
   return {
     async capabilities() {
@@ -217,6 +219,7 @@ export function createTerminalChildHost(options: {
         cwd: spec.cwd,
         ...(spec.agentDir === undefined ? {} : { agentDir: spec.agentDir }),
         resources: spec.resources,
+        ...(options.env ? { env: options.env() } : {}),
       });
       return outcome.ok
         ? { ok: true, handle: outcome.windowRef }

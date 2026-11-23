@@ -255,6 +255,17 @@ export function createReviewBashTool(
             }
 
             const shellGuard = deps.shellGuard?.();
+            if (shellGuard?.state.isStopped()) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_bash: shell is quarantined for this execution. Do not spawn another shell; continue with read-only inspection or end the review with the evidence you have.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
             if (shellGuard) {
                 const probe = detectEmptyInterpreterProbe(command);
                 if (probe.kind === "empty-probe") {
@@ -330,17 +341,32 @@ export function createReviewBashTool(
                     guard.config,
                 );
             } catch (e: unknown) {
-                return {
+                const failure = {
                     content: [
                         {
-                            type: "text",
+                            type: "text" as const,
                             text: `review_bash: execution failed — ${
                                 e instanceof Error ? e.message : String(e)
                             }`,
                         },
                     ],
-                    isError: true,
+                    isError: true as const,
                 };
+                // The real SDK throws on a native timeout; observe the thrown
+                // message before wrapping it, otherwise the reviewer budget
+                // never sees the timeout.
+                const guarded = guardReviewShellResult(
+                    failure,
+                    command,
+                    shellGuard,
+                );
+                return redactReviewResult(
+                    guarded,
+                    "bash",
+                    rawParams,
+                    deps.cwd,
+                    guard.config,
+                );
             }
         },
     };
@@ -1249,12 +1275,12 @@ function guardReviewerTarget(
     cwd: string,
 ): ReviewToolTextResult | undefined {
     const raw = input.path;
-    const value =
-        typeof raw === "string" && raw.trim()
-            ? raw
-            : tool === "read"
-              ? ""
-              : cwd;
+    let value = "";
+    if (typeof raw === "string" && raw.trim()) {
+        value = raw;
+    } else if (tool !== "read") {
+        value = cwd;
+    }
     if (!value) {
         return {
             content: [{ type: "text", text: `review ${tool}: missing path` }],

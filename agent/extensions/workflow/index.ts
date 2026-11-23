@@ -254,7 +254,11 @@ import {
   type TodoPanelPreference,
 } from "./todo-panel.ts";
 import { createTodoStore } from "./todo-service.ts";
-import { createFrozenTodosFromPlan } from "./todo-snapshot.ts";
+import {
+  createFrozenTodosFromPlan,
+  createFrozenTodosFromSteps,
+} from "./todo-snapshot.ts";
+import { rebindLegacyTodosToPlan } from "./legacy-recovery.ts";
 import { classifyToolMutation, resolveRolePolicy } from "./policy-runtime.ts";
 import { createContributionPublisher } from "./host-contributions-publisher.ts";
 import {
@@ -299,6 +303,17 @@ import {
   type OrchestratorPhase,
 } from "./orchestrator-mission.ts";
 import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
+import {
+  applyExecutionEvent,
+  armExecution,
+  evaluateExecutionOutcome,
+  markExecutionKickoff,
+  selectNextRow,
+  shellCommandHash,
+  type ExecutionBlocker,
+  type ExecutionRow,
+  type ExecutionState,
+} from "./execution-state.ts";
 import {
   buildModeTools,
   orchestratorModeTools,
@@ -375,7 +390,6 @@ import {
   resolveHandoffTimeout,
   shouldUsePlannotator,
   writeHandoffConfig,
-  type ExecutionDestination,
   type HandoffMode,
   type ResolvedHandoffConfig,
 } from "./handoff-config.ts";
@@ -388,7 +402,6 @@ import {
   dismissHandoffDecision,
   handoffDecisionMatches,
   isAwaitingExecution,
-  isHandoffDestination,
   parseHandoffDecision,
   selectHandoffDestination,
   supersedeHandoffDecision,
@@ -493,6 +506,7 @@ import {
   effectiveShellLimits,
   encodeShellLimitsEnv,
   parseShellGuardArgs,
+  SHELL_GUARD_QUARANTINE_ENV,
   shellGuardArgumentCompletions,
   writeShellGuardConfig,
   SHELL_GUARD_LIMITS_ENV,
@@ -611,6 +625,7 @@ async function runSingleAgent(
   signal?: AbortSignal,
   folderEnv?: Record<string, string>,
   shellLimits?: ShellLimits,
+  shellQuarantined = false,
 ): Promise<{ messages: any[]; stderr: string; exitCode: number; usage: any }> {
   const tmpDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "pi-subagent-"),
@@ -665,6 +680,9 @@ async function runSingleAgent(
           ...subagentEnv(process.env, agent.role),
           ...(inheritedShellLimits
             ? { [SHELL_GUARD_LIMITS_ENV]: inheritedShellLimits }
+            : {}),
+          ...(shellQuarantined
+            ? { [SHELL_GUARD_QUARANTINE_ENV]: "1" }
             : {}),
           ...(folderEnv ?? {
             PI_FOLDER_POLICY_LOCKED: "1",
@@ -775,6 +793,12 @@ export default function workflowExtension(
   // display-only entries. Registering once here keeps /reload idempotent.
   registerReviewEntryRenderers(pi);
   let workflowMode: WorkflowMode = null;
+  /** Durable control metadata for the current direct-Build execution. */
+  let executionState: ExecutionState | undefined;
+  /** Runtime-owned row evidence; cleared by any source mutation. */
+  const executionEvidence = new Map<string, { signature: string; at: number }>();
+  let lastToolFailureKey: string | undefined;
+  let repeatedToolFailureCount = 0;
   // overlay guard: depth of the ctx.ui.custom overlay stack (questionnaire/role
   // pickers/rewind/decision gate/refine editor). A counter — not a boolean —
   // so nested modals cannot clobber each other: each opener pushes, each
@@ -794,6 +818,10 @@ export default function workflowExtension(
   let managedQuarantine: string | undefined;
   /** Worker-side report/TODO/fence binding (step 14); absent for parents. */
   let workerBinding: WorkerSessionBinding | undefined;
+  /** Last candidate already delivered over the child channel. */
+  let lastWorkerCandidateSent: string | undefined;
+  /** Serialized parent pump: a candidate event never starts two verifiers. */
+  let orchestratorPump: Promise<void> | undefined;
   /** Parent orchestration runtime (step 15); created per approved run. */
   let orchestratorRuntime: OrchestratorRuntime | undefined;
   /** Incremented on every session/run rebind so stale tool calls are refused. */
@@ -993,6 +1021,11 @@ export default function workflowExtension(
           }
         },
       });
+      if (process.env[SHELL_GUARD_QUARANTINE_ENV] === "1") {
+        shellGuardRuntime.adoptQuarantine({
+          reason: "inherited from the parent execution's shell quarantine",
+        });
+      }
     }
     return shellGuardRuntime;
   }
@@ -1509,6 +1542,7 @@ export default function workflowExtension(
     turnsSinceLastTodoWrite = 0;
     mutatedSinceLastTodoWrite = false;
     todoStale = false;
+    noteExecutionProgress(`todo-${todos.revision}`);
   }
 
   /**
@@ -1684,6 +1718,17 @@ export default function workflowExtension(
     };
   }
 
+  function executionFooterStatus(): string | undefined {
+    const state = executionState;
+    if (!state) return undefined;
+    if (state.shellQuarantine) return "⛔ shell quarantined — non-shell only";
+    if (state.phase === "paused") return "⏸ execution paused";
+    if (state.phase === "blocked") return "⛔ execution blocked";
+    if (state.phase === "completed") return "✓ execution complete";
+    if (state.phase === "recovering-shell") return "◇ execution recovering";
+    return undefined;
+  }
+
   function updateStatus(ctx: ExtensionContext) {
     // Profile prefix (⚡ name) when one is active, then the role label.
     const profileLabel = activeProfileLabel();
@@ -1743,6 +1788,9 @@ export default function workflowExtension(
       ...(orchestrationStatus() === undefined
         ? {}
         : { orchestration: orchestrationStatus() }),
+      ...(executionFooterStatus() === undefined
+        ? {}
+        : { execution: executionFooterStatus() }),
     });
     const modeTone =
       reviewTurn !== "idle"
@@ -1758,6 +1806,11 @@ export default function workflowExtension(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.mode,
       ctx.ui.theme.fg(modeTone, segments.mode),
+    );
+    setWorkflowStatus(
+      ctx.ui,
+      WORKFLOW_STATUS_KEYS.execution,
+      executionFooterStatus() ? ctx.ui.theme.fg("warning", executionFooterStatus()!) : "",
     );
     setWorkflowStatus(
       ctx.ui,
@@ -2670,6 +2723,8 @@ export default function workflowExtension(
         signal,
         subagentFolderEnv(cwd),
         shellGuardLimitsFor(currentSessionCtx).config,
+        executionState?.shellQuarantine !== undefined ||
+          shellGuardRuntime?.isStopped() === true,
       );
       const out = getFinalOutput(res.messages);
       if (!out && res.exitCode !== 0) {
@@ -4619,6 +4674,16 @@ export default function workflowExtension(
         return;
       }
       if (parsed.action === "limits") {
+        if (
+          parsed.scope === "project" &&
+          (ctx as any).isProjectTrusted?.() !== true
+        ) {
+          ctx.ui.notify(
+            "Shell guard: project settings are ignored until this project is trusted; write global limits or trust the project first.",
+            "warning",
+          );
+          return;
+        }
         const written = writeShellGuardConfig(
           parsed.scope,
           cwd,
@@ -4634,7 +4699,8 @@ export default function workflowExtension(
         return;
       }
       if (parsed.action === "reset") {
-        if ((ctx as any).isIdle?.() === false) {
+        const quarantined = executionState?.shellQuarantine !== undefined;
+        if ((ctx as any).isIdle?.() === false && !quarantined) {
           ctx.ui.notify(
             "Shell guard: cannot reset while a run is active. Wait for it to settle or press Esc.",
             "warning",
@@ -4642,7 +4708,13 @@ export default function workflowExtension(
           return;
         }
         ensureShellGuard(ctx as ExtensionContext).reset("command-reset");
-        ctx.ui.notify("Shell guard: request budget cleared.", "info");
+        if (quarantined) clearExecutionShellQuarantine("command-reset");
+        ctx.ui.notify(
+          quarantined
+            ? "Shell guard: quarantine cleared; a new bounded shell budget is active."
+            : "Shell guard: request budget cleared.",
+          "info",
+        );
         return;
       }
       const resolved = shellGuardLimitsFor(ctx as any);
@@ -4655,10 +4727,10 @@ export default function workflowExtension(
           resolved.sources.projectIgnored
             ? "  project settings ignored: project not trusted"
             : "  project settings: " + (resolved.sources.project ? "applied" : "none"),
-          `  this request: ${snapshot.failures} qualifying failure(s)${snapshot.stopped ? " · STOPPED" : ""}`,
+          `  this execution: ${snapshot.failures} qualifying failure(s)${snapshot.stopped ? " · QUARANTINED" : ""}`,
           snapshot.stopped
-            ? `  stopped: ${snapshot.stoppedReason ?? "a repeated shell failure"} — start a new prompt or run /shell-guard reset`
-            : "  recovery: one changed approach, then stop",
+            ? `  quarantined: ${snapshot.stoppedReason ?? "a repeated shell failure"} — continue with non-shell tools; /shell-guard reset starts a new budget`
+            : "  recovery: one changed approach, then quarantine",
           `  covers: bash, powershell, explorer shells, review_bash`,
         ].join("\n"),
         snapshot.stopped ? "warning" : "info",
@@ -5840,6 +5912,598 @@ export default function workflowExtension(
     }
   }
 
+  function isExecutionTerminalState(state: ExecutionState): boolean {
+    return state.phase === "completed" || state.phase === "stopped";
+  }
+
+  function frozenRowForRef(ref: string) {
+    return todos.frozen?.rows.find((row) => row.ref === ref);
+  }
+
+  function executionEvidenceRequired(ref: string): boolean {
+    return (frozenRowForRef(ref)?.acceptanceChecks.length ?? 0) > 0;
+  }
+
+  function hasExecutionEvidence(ref: string): boolean {
+    return executionEvidence.has(ref);
+  }
+
+  function clearExecutionEvidence(): void {
+    executionEvidence.clear();
+  }
+
+  function executionRows(): ExecutionRow[] {
+    const frozenRows = new Map(
+      (todos.frozen?.rows ?? []).map((row) => [row.ref, row]),
+    );
+    return todos.items.map((item) => {
+      const ref = todoRef(item);
+      const frozen = frozenRows.get(ref);
+      return {
+        id: item.id ?? frozen?.id ?? todoKey(item),
+        ref,
+        status: itemStatus(item) as ExecutionRow["status"],
+        ...(frozen && frozen.acceptanceChecks.length > 0
+          ? { requiredChecks: frozen.acceptanceChecks.length }
+          : {}),
+      };
+    });
+  }
+
+  function executionConflictReason(
+    planPath: string,
+    digest: string,
+  ): string | undefined {
+    const existing = executionState;
+    if (!existing) return undefined;
+    if (isExecutionTerminalState(existing)) return undefined;
+    if (existing.source.digest === digest) return undefined;
+    return `a different frozen execution (${existing.executionId}) is still active; finish or stop it before replacing it with ${planPath}`;
+  }
+
+  function armBuildExecution(
+    planPath: string,
+    planText?: string,
+  ): { ok: boolean; error?: string } {
+    if (!todos.frozen || todos.frozen.rows.length === 0) {
+      return { ok: false, error: "the approved plan produced no frozen rows" };
+    }
+    const digest =
+      todos.frozen?.source.digest ??
+      (planText ? planHash(planText) : todos.planDigest);
+    if (!digest) {
+      return { ok: false, error: "the approved plan has no stable digest" };
+    }
+    const conflict = executionConflictReason(planPath, digest);
+    if (conflict) return { ok: false, error: conflict };
+    if (
+      executionState &&
+      executionState.source.digest === digest &&
+      !isExecutionTerminalState(executionState)
+    ) {
+      return { ok: true };
+    }
+    executionState = armExecution({
+      executionId: `build-${digest.slice(0, 16)}`,
+      owner: "build",
+      source: { kind: "plan", path: planPath, digest },
+    });
+    executionEvidence.clear();
+    return { ok: true };
+  }
+
+  function armStandaloneBuildExecution(
+    ctx: ExtensionContext,
+    title = "Build work",
+  ): void {
+    if (
+      workflowMode !== "build" ||
+      executionState ||
+      todos.frozen ||
+      (currentPlanFile && !workerBinding) ||
+      todos.items.length === 0
+    ) {
+      return;
+    }
+    const scopedTitle =
+      workerBinding?.assignment.objective?.trim().slice(0, 120) || title;
+    const frozen = createFrozenTodosFromSteps({
+      title: scopedTitle,
+      steps: todos.items.map((item) => item.text),
+      mode: "build",
+    });
+    if (!frozen.ok) {
+      pauseBuildExecution(`the standalone list could not be frozen: ${frozen.error}`);
+      return;
+    }
+    const placed = todos.freeze(frozen.snapshot);
+    if (!placed.ok) {
+      pauseBuildExecution(`the standalone list could not be frozen: ${placed.error}`);
+      return;
+    }
+    executionState = armExecution({
+      executionId: `build-${frozen.snapshot.source.digest.slice(0, 16)}`,
+      owner: workerBinding ? "managed-child" : "build",
+      source: {
+        kind: "steps",
+        digest: frozen.snapshot.source.digest,
+      },
+    });
+    if (workerBinding) {
+      executionState = markExecutionKickoff(
+        executionState,
+        "acknowledged",
+        Date.now(),
+      );
+    }
+    updateStatus(ctx);
+    persistState();
+  }
+
+  function migrateLegacyBuildOnRestore(ctx: ExtensionContext): void {
+    if (
+      workflowMode !== "build" ||
+      todos.frozen ||
+      todos.items.length === 0 ||
+      (!currentPlanFile && !todos.planPath)
+    ) {
+      return;
+    }
+    const planPath = currentPlanFile ?? todos.planPath!;
+    try {
+      const abs = path.isAbsolute(planPath)
+        ? planPath
+        : path.join((ctx as any)?.cwd ?? process.cwd(), planPath);
+      const planText = fs.readFileSync(abs, "utf8");
+      const digest = planHash(planText);
+      if (todos.planDigest && todos.planDigest !== digest) {
+        ctx.ui.notify(
+          `Build recovery: the plan at ${abs} changed since this list was written; keeping the legacy list paused for an explicit recovery choice.`,
+          "warning",
+        );
+        return;
+      }
+      const rebound = rebindLegacyTodosToPlan({
+        planPath: abs,
+        planText,
+        priorItems: todos.items,
+        now: Date.now(),
+      });
+      if (!rebound.ok) {
+        ctx.ui.notify(
+          `Build recovery: the legacy list could not be rebound (${rebound.error}); it was left paused.`,
+          "warning",
+        );
+        return;
+      }
+      const placed = todos.freeze(rebound.snapshot);
+      if (!placed.ok) {
+        ctx.ui.notify(
+          `Build recovery: the rebind could not be installed (${placed.error}); it was left paused.`,
+          "warning",
+        );
+        return;
+      }
+      updateStatus(ctx);
+      persistState();
+    } catch (error: unknown) {
+      ctx.ui.notify(
+        `Build recovery: the plan could not be read (${error instanceof Error ? error.message : String(error)}); the legacy list was left paused.`,
+        "warning",
+      );
+    }
+  }
+
+  function noteExecutionShellQuarantine(command?: string): void {
+    if (!executionState || executionState.shellQuarantine) return;
+    const info = ensureShellGuard().quarantineInfo?.();
+    if (!info) return;
+    const next = selectNextRow(executionRows(), executionState);
+    const applied = applyExecutionEvent(executionState, {
+      type: "shell-timeout",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      ...(next ? { rowRef: next.ref } : {}),
+      reason: info.reason,
+      commandHash:
+        info.commandHash ??
+        shellCommandHash(command ?? "shell guard quarantine"),
+      at: info.at,
+    });
+    if (applied.ok) {
+      executionState = applied.state;
+      // Shell quarantine invalidates evidence gathered by running checks.
+      executionEvidence.clear();
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
+  function noteToolFailureForExecution(event: any): void {
+    if (!executionState) return;
+    if (event?.isError !== true) {
+      lastToolFailureKey = undefined;
+      repeatedToolFailureCount = 0;
+      return;
+    }
+    if (executionState.shellQuarantine) return;
+    const text = (event.content ?? [])
+      .map((part: any) => (part?.type === "text" ? String(part.text ?? "") : ""))
+      .join("\n")
+      .trim();
+    const key = `${String(event.toolName ?? "tool")}:${text.slice(0, 240)}`;
+    if (key === lastToolFailureKey) repeatedToolFailureCount += 1;
+    else {
+      lastToolFailureKey = key;
+      repeatedToolFailureCount = 1;
+    }
+    if (repeatedToolFailureCount < 3) return;
+    if (executionState.phase === "paused" || executionState.phase === "blocked") return;
+    const reason = `repeated identical ${String(event.toolName ?? "tool")} failure (${repeatedToolFailureCount}x)`;
+    const paused = applyExecutionEvent(executionState, {
+      type: "pause",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      reason,
+      blocker: {
+        category: "no-permitted-action",
+        reason,
+        at: Date.now(),
+      },
+      at: Date.now(),
+    });
+    if (paused.ok) {
+      executionState = paused.state;
+      repeatedToolFailureCount = 0;
+      lastToolFailureKey = undefined;
+      persistState();
+      try {
+        (currentSessionCtx as any)?.ui?.notify?.(
+          `Build execution paused: ${reason}. Resume with /build resume after changing the approach.`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
+  function noteExecutionProgress(signature: string): void {
+    if (!executionState) return;
+    const applied = applyExecutionEvent(executionState, {
+      type: "progress",
+      at: Date.now(),
+      signature,
+    });
+    if (!applied.ok) return;
+    executionState = applied.state;
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function noteExecutionBoundary(): { pause: boolean; reason?: string } {
+    const state = executionState;
+    if (!state) return { pause: false };
+    const now = Date.now();
+    const lastProgress = state.progress.lastProgressAt ?? 0;
+    const lastBoundary = state.progress.lastBoundaryAt ?? 0;
+    // Timestamps can collide on a fast machine; an equal progress stamp is
+    // still progress, not a barren boundary.
+    const progressed = lastProgress > 0 && lastProgress >= lastBoundary;
+    const recovery = state.shellQuarantine !== undefined;
+    const count = progressed
+      ? 0
+      : recovery
+        ? state.progress.recoveryBoundariesWithoutProgress + 1
+        : state.progress.boundariesWithoutProgress + 1;
+    executionState = {
+      ...state,
+      progress: {
+        ...state.progress,
+        lastBoundaryAt: now,
+        ...(recovery
+          ? { recoveryBoundariesWithoutProgress: count }
+          : { boundariesWithoutProgress: count }),
+      },
+      updatedAt: now,
+    };
+    try {
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    if (count >= 3) {
+      return {
+        pause: true,
+        reason: `${count} autonomous boundaries without meaningful progress`,
+      };
+    }
+    return { pause: false };
+  }
+
+  function nextExecutionLine(): string {
+    if (!executionState) return "";
+    const next = selectNextRow(executionRows(), executionState);
+    if (!next) return "";
+    const item = todos.items.find((entry) => todoRef(entry) === next.ref);
+    return `\nNext execution row: ${next.ref}${item ? ` — ${item.text}` : ""}`;
+  }
+
+  function executionContextBlock(): string {
+    const state = executionState;
+    if (!state) return "";
+    const outcome = evaluateExecutionOutcome(state, executionRows());
+    const next = selectNextRow(executionRows(), state);
+    const remaining = todos.items.filter(
+      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
+    ).length;
+    const nextItem = next
+      ? todos.items.find((item) => todoRef(item) === next.ref)
+      : undefined;
+    const lines = [
+      "[EXECUTION STATE]",
+      `id: ${state.executionId} · epoch: ${state.epoch} · phase: ${state.phase}`,
+      `remaining: ${remaining} · next: ${next ? `${next.ref}. ${nextItem?.text ?? "pending row"}` : "none"}`,
+      "Update the TODO status immediately after each verified step. Never mark a row complete without its required evidence.",
+      "Do not stop for a routine checkpoint or a self-assessed context limit; continue until the execution is complete or a genuine blocker remains.",
+    ];
+    if (state.shellQuarantine) {
+      lines.push(
+        "shell: QUARANTINED after the two-attempt cap. Do not call bash, powershell, review_bash, or any verification adapter. Continue with read/grep/find/ls/edit/write and LSP diagnostics; required shell checks remain blocked/unverified.",
+      );
+    }
+    if (state.blocker) {
+      lines.push(
+        `blocker: ${state.blocker.category}${state.blocker.rowRef ? ` at row ${state.blocker.rowRef}` : ""} — ${state.blocker.reason}`,
+      );
+    }
+    if (outcome.kind === "blocked-unverified") {
+      lines.push(`unverified rows: ${outcome.blockedRefs.join(", ")} — do not report green completion.`);
+    }
+    return lines.join("\n");
+  }
+
+  function auditExecution(
+    event: string,
+    data: Record<string, unknown> = {},
+  ): void {
+    try {
+      pi.appendEntry("workflow-execution-audit", {
+        at: Date.now(),
+        event,
+        ...(executionState
+          ? {
+              executionId: executionState.executionId,
+              epoch: executionState.epoch,
+              phase: executionState.phase,
+            }
+          : {}),
+        ...data,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function executionStatusLines(): string[] {
+    const state = executionState;
+    if (!state) return ["Build execution: none."];
+    const outcome = evaluateExecutionOutcome(state, executionRows());
+    const next = selectNextRow(executionRows(), state);
+    const remaining = todos.items.filter(
+      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
+    ).length;
+    const lines = [
+      `Build execution ${state.executionId} · epoch ${state.epoch}`,
+      `  phase: ${state.phase}`,
+      `  remaining: ${remaining} · next: ${next ? next.ref : "none"}`,
+      `  outcome: ${outcome.kind}`,
+    ];
+    if (state.kickoff) lines.push(`  kickoff: ${state.kickoff.status}`);
+    if (state.shellQuarantine) {
+      lines.push(
+        `  shell: QUARANTINED — ${state.shellQuarantine.reason}`,
+        "  work available: read/grep/find/ls/edit/write/LSP; required shell checks are blocked/unverified",
+      );
+    }
+    if (state.blocker) {
+      lines.push(
+        `  blocker: ${state.blocker.category}${state.blocker.rowRef ? ` @ ${state.blocker.rowRef}` : ""} — ${state.blocker.reason}`,
+      );
+    }
+    return lines;
+  }
+
+  function applyUserExecutionEvent(
+    ctx: ExtensionContext,
+    event: Parameters<typeof applyExecutionEvent>[1],
+  ): boolean {
+    if (!executionState) {
+      ctx.ui.notify("No active Build execution.", "info");
+      return false;
+    }
+    const applied = applyExecutionEvent(executionState, event);
+    if (!applied.ok) {
+      ctx.ui.notify(`Build execution: ${applied.error}.`, "warning");
+      return false;
+    }
+    executionState = applied.state;
+    auditExecution(event.type, {
+      ...(event.type === "pause" ? { reason: event.reason } : {}),
+    });
+    updateStatus(ctx);
+    persistState();
+    return true;
+  }
+
+  function pauseExecutionByUser(ctx: ExtensionContext, reason = "paused by user"): void {
+    if (!executionState) {
+      ctx.ui.notify("No active Build execution.", "info");
+      return;
+    }
+    applyUserExecutionEvent(ctx, {
+      type: "pause",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      reason,
+      at: Date.now(),
+    });
+    ctx.ui.notify(`Build execution paused: ${reason}. Resume with /build resume.`, "info");
+  }
+
+  function resumeExecutionByUser(ctx: ExtensionContext): void {
+    if (!executionState) {
+      ctx.ui.notify("No active Build execution.", "info");
+      return;
+    }
+    if (executionState.phase !== "paused" && executionState.phase !== "blocked") {
+      ctx.ui.notify(`Build execution is ${executionState.phase}; nothing to resume.`, "info");
+      return;
+    }
+    if (
+      applyUserExecutionEvent(ctx, {
+        type: "resume",
+        executionId: executionState.executionId,
+        epoch: executionState.epoch,
+        at: Date.now(),
+      })
+    ) {
+      ctx.ui.notify(
+        executionState?.shellQuarantine
+          ? "Build execution resumed without shell. Shell remains quarantined; use /shell-guard reset only when you intend a new shell budget."
+          : "Build execution resumed.",
+        "info",
+      );
+    }
+  }
+
+  function stopExecutionByUser(ctx: ExtensionContext): void {
+    if (!executionState) {
+      ctx.ui.notify("No active Build execution.", "info");
+      return;
+    }
+    applyUserExecutionEvent(ctx, {
+      type: "stop",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      reason: "stopped by user",
+      at: Date.now(),
+    });
+    ctx.ui.notify("Build execution stopped.", "info");
+  }
+
+  function clearExecutionShellQuarantine(reason: string): void {
+    if (!executionState?.shellQuarantine) return;
+    const cleared = applyExecutionEvent(executionState, {
+      type: "shell-reset",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      at: Date.now(),
+    });
+    if (cleared.ok) {
+      executionState = cleared.state;
+      try {
+        pi.appendEntry("workflow-execution-shell-reset", {
+          at: Date.now(),
+          executionId: executionState.executionId,
+          reason,
+        });
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
+  function pauseRestoredExecution(ctx: ExtensionContext): void {
+    const state = executionState;
+    if (!state) return;
+    if (
+      state.phase === "completed" ||
+      state.phase === "stopped" ||
+      state.phase === "paused"
+    ) {
+      return;
+    }
+    const paused = applyExecutionEvent(state, {
+      type: "pause",
+      executionId: state.executionId,
+      epoch: state.epoch,
+      reason: "restored paused after a session boundary; use /build resume",
+      at: Date.now(),
+    });
+    if (paused.ok) {
+      executionState = paused.state;
+      auditExecution("restored-paused", { reason: "session boundary" });
+      try {
+        persistState();
+        updateStatus(ctx);
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
+  function reapplyInheritedShellQuarantine(ctx: ExtensionContext): void {
+    if (process.env[SHELL_GUARD_QUARANTINE_ENV] !== "1") return;
+    try {
+      ensureShellGuard(ctx).adoptQuarantine({
+        reason: "inherited from the parent execution's shell quarantine",
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function reapplyPersistedShellQuarantine(ctx: ExtensionContext): void {
+    const quarantine = executionState?.shellQuarantine;
+    if (!quarantine) return;
+    try {
+      ensureShellGuard(ctx).adoptQuarantine({
+        reason: quarantine.reason,
+        commandHash: quarantine.commandHash,
+        at: quarantine.at,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function pauseBuildExecution(reason: string, planPath?: string): void {
+    const digest = todos.frozen?.source.digest ?? todos.planDigest ?? "unavailable";
+    if (!executionState) {
+      executionState = armExecution({
+        executionId: `build-${digest.slice(0, 16)}`,
+        owner: "build",
+        source: { kind: "plan", ...(planPath ? { path: planPath } : {}), digest },
+      });
+    }
+    const now = Date.now();
+    const paused = applyExecutionEvent(executionState, {
+      type: "pause",
+      executionId: executionState.executionId,
+      epoch: executionState.epoch,
+      reason,
+      blocker: {
+        category: "verification",
+        reason,
+        at: now,
+      },
+      at: now,
+    });
+    if (paused.ok) executionState = paused.state;
+  }
+
   function persistState() {
     syncLegacyFlags();
     pi.appendEntry("workflow", {
@@ -5891,6 +6555,7 @@ export default function workflowExtension(
       todoRecoveryReceipt: todos.recoveryReceiptId ?? null,
       todoFrozen: todos.frozen ?? null,
       todoFrozenError: todos.frozenError ?? null,
+      execution: executionState ?? null,
     } as any);
     lastPersistedPlanFile = currentPlanFile;
     publishContributions();
@@ -6289,12 +6954,20 @@ export default function workflowExtension(
     if (!text || text.trim().length === 0) {
       return { ok: false, count: todos.items.length, replaced: false, error: "the plan is empty" };
     }
-    const frozen = createFrozenTodosFromPlan({
-      planPath: abs,
-      planText: text,
-      mode: "build",
-      now: Date.now(),
-    });
+    const frozen =
+      todos.items.length > 0
+        ? rebindLegacyTodosToPlan({
+            planPath: abs,
+            planText: text,
+            priorItems: todos.items,
+            now: Date.now(),
+          })
+        : createFrozenTodosFromPlan({
+            planPath: abs,
+            planText: text,
+            mode: "build",
+            now: Date.now(),
+          });
     if (!frozen.ok) {
       return { ok: false, count: todos.items.length, replaced: false, error: frozen.error };
     }
@@ -6352,11 +7025,22 @@ export default function workflowExtension(
       toolsBeforePlanMode = undefined;
       // Populate/refresh todos from the plan file (merge preserves progress).
       const loaded = seedFrozenBuildFromPlan(planPath, ctx.cwd, opts?.planText);
-      if (!loaded.ok) {
+      if (loaded.ok) {
+        const armed = armBuildExecution(planPath, opts?.planText);
+        if (!armed.ok) {
+          ctx.ui.notify(`Build mode: ${armed.error}`, "warning");
+          pauseBuildExecution(
+            armed.error ?? "the execution could not be armed",
+            planPath,
+          );
+        }
+      } else {
+        const reason = `the plan could not be frozen (${loaded.error ?? "unknown error"})`;
         ctx.ui.notify(
-          `Build mode: the plan could not be frozen (${loaded.error ?? "unknown error"}); create the TODO list manually.`,
+          `Build mode: ${reason}; create the TODO list manually.`,
           "warning",
         );
+        pauseBuildExecution(reason, planPath);
       }
       try {
         await applyModeModel(ctx);
@@ -7273,9 +7957,17 @@ export default function workflowExtension(
     ctx: ExtensionContext,
     kickoff: ExecutionKickoff,
   ): { planTodoListMessage: Record<string, unknown>; execMessage: string } {
-    const remainingList = formatTodoNumberedList(todos.items);
+    const remainingItems = todos.items.filter(
+      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
+    );
+    const remainingList = formatTodoNumberedList(remainingItems);
     const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
-    const firstTodo = todos.items[0];
+    const next = executionState
+      ? selectNextRow(executionRows(), executionState)
+      : undefined;
+    const nextItem = next
+      ? todos.items.find((item) => todoRef(item) === next.ref)
+      : remainingItems[0];
     const feedbackBlock = kickoff.feedback ? `\n\nFeedback: ${kickoff.feedback}` : "";
     return {
       planTodoListMessage: {
@@ -7283,19 +7975,46 @@ export default function workflowExtension(
         content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
         display: true,
       },
-      execMessage: `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todos.items[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`,
+      execMessage: `Execute the plan.\n\nRemaining steps:\n${remainingList || "(no pending steps)"}\n\nStart with: ${nextItem?.text ?? "the first pending step"}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).\nDo not stop for a routine checkpoint or a self-assessed context limit; continue until the approved execution is complete or a genuine blocker remains.`,
     };
   }
 
   function deliverExecutionKickoff(
     ctx: ExtensionContext,
     kickoff: ExecutionKickoff,
-  ): void {
+  ): boolean {
     pendingExecutionKickoff = null;
+    const state = executionState;
+    if (!state) {
+      ctx.ui.notify(
+        "Execution was not armed; the plan was not started. Re-approve the plan or restore the execution.",
+        "warning",
+      );
+      return false;
+    }
+    if (
+      isExecutionTerminalState(state) ||
+      state.phase === "paused" ||
+      state.phase === "blocked"
+    ) {
+      ctx.ui.notify(
+        `Execution ${state.executionId} is ${state.phase}; the kickoff was not delivered.`,
+        "warning",
+      );
+      return false;
+    }
+    // Idempotent: a settled callback or a duplicate decision cannot send a
+    // second kickoff for this execution.
+    if (state.kickoff?.status === "sent" || state.kickoff?.status === "acknowledged") {
+      return true;
+    }
     try {
+      if (typeof (pi as any).sendMessage !== "function") {
+        throw new Error("the host has no sendMessage");
+      }
       const { planTodoListMessage, execMessage } = executionKickoffMessages(ctx, kickoff);
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
-      (pi as any).sendMessage?.(
+      (pi as any).sendMessage(planTodoListMessage, { deliverAs: "followUp" });
+      (pi as any).sendMessage(
         {
           customType: "workflow-plan-execute",
           content: execMessage,
@@ -7303,31 +8022,84 @@ export default function workflowExtension(
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-    } catch (_e) {
-      void _e;
-    }
-    try {
-      pi.appendEntry("workflow-handoff-result", {
-        at: Date.now(),
-        choice: "execute",
-        source: kickoff.source,
-        planPath: kickoff.planPath,
-      });
-    } catch (_e) {
-      void _e;
+      executionState = markExecutionKickoff(state, "sent", Date.now());
+      try {
+        pi.appendEntry("workflow-execution-kickoff", {
+          at: Date.now(),
+          executionId: state.executionId,
+          epoch: state.epoch,
+          status: "sent",
+          planPath: kickoff.planPath,
+        });
+        pi.appendEntry("workflow-handoff-result", {
+          at: Date.now(),
+          choice: "execute",
+          source: kickoff.source,
+          planPath: kickoff.planPath,
+          executionId: state.executionId,
+        });
+      } catch (_e) {
+        void _e;
+      }
+      persistState();
+      return true;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      executionState = markExecutionKickoff(state, "failed", Date.now(), message);
+      try {
+        pi.appendEntry("workflow-execution-kickoff", {
+          at: Date.now(),
+          executionId: state.executionId,
+          epoch: state.epoch,
+          status: "failed",
+          planPath: kickoff.planPath,
+          error: message.slice(0, 500),
+        });
+      } catch (_e) {
+        void _e;
+      }
+      pauseBuildExecution(
+        `the execution kickoff could not be delivered: ${message}`,
+        kickoff.planPath,
+      );
+      persistState();
+      ctx.ui.notify(
+        `The Build kickoff could not be delivered (${message}); the execution is paused, not running.`,
+        "warning",
+      );
+      return false;
     }
   }
 
   function requestExecutionKickoff(
     ctx: ExtensionContext,
     kickoff: ExecutionKickoff,
-  ): void {
+  ): boolean {
+    if (!executionState) {
+      const armed = armBuildExecution(kickoff.planPath);
+      if (!armed.ok) {
+        ctx.ui.notify(`Build execution: ${armed.error}`, "warning");
+        return false;
+      }
+    }
+    const state = executionState!;
+    if (
+      isExecutionTerminalState(state) ||
+      state.phase === "paused" ||
+      state.phase === "blocked"
+    ) {
+      ctx.ui.notify(
+        `Build execution is ${state.phase}; the kickoff was not queued.`,
+        "warning",
+      );
+      return false;
+    }
     pendingExecutionKickoff = kickoff;
     // Unknown hosts are treated as idle (send now); only an explicit false is
     // deferred, so fake/older hosts keep the previous behaviour.
     const isIdle =
       typeof (ctx as any).isIdle === "function" ? (ctx as any).isIdle() === true : true;
-    if (isIdle) deliverExecutionKickoff(ctx, kickoff);
+    return isIdle ? deliverExecutionKickoff(ctx, kickoff) : true;
   }
 
   function sendExecuteMessages(
@@ -7358,12 +8130,11 @@ export default function workflowExtension(
       }
       return false;
     }
-    requestExecutionKickoff(ctx, {
+    return requestExecutionKickoff(ctx, {
       planPath,
       ...(feedback ? { feedback } : {}),
       source,
     });
-    return true;
   }
 
   async function handlePlannotatorApprove(
@@ -7842,8 +8613,34 @@ export default function workflowExtension(
 
   try {
     pi.registerCommand("build", {
-      description: "Enable Build mode (full access, idempotent)",
-      handler: async (_args, ctx) => switchWorkflowMode("build", ctx as any),
+      description:
+        "Enable Build mode. Verbs: status, pause [reason], resume, stop. Bare /build switches mode.",
+      handler: async (args, ctx) => {
+        const text = typeof args === "string" ? args.trim() : "";
+        if (!text) {
+          await switchWorkflowMode("build", ctx as any);
+          return;
+        }
+        const [verb, ...rest] = text.split(/\s+/);
+        const note = rest.join(" ").trim();
+        if (verb === "status") {
+          ctx.ui.notify(executionStatusLines().join("\n"), "info");
+          return;
+        }
+        if (verb === "pause") {
+          pauseExecutionByUser(ctx as ExtensionContext, note || "paused by user");
+          return;
+        }
+        if (verb === "resume") {
+          resumeExecutionByUser(ctx as ExtensionContext);
+          return;
+        }
+        if (verb === "stop") {
+          stopExecutionByUser(ctx as ExtensionContext);
+          return;
+        }
+        ctx.ui.notify("Usage: /build [status|pause [reason]|resume|stop]", "info");
+      },
     });
   } catch (_e) {
     void _e;
@@ -8297,8 +9094,8 @@ ${rows}`,
           } as TodoDetails,
         };
       }
-      const renderList = (items: TodoItem[]) =>
-        items.length
+      const renderList = (items: TodoItem[]) => {
+        const base = items.length
           ? `Steps are numbered GLOBALLY 1..${items.length}:
 ` +
             items
@@ -8308,6 +9105,12 @@ ${rows}`,
               })
               .join("\n")
           : "(empty)";
+        if (!executionState) return base;
+        const next = selectNextRow(executionRows(), executionState);
+        if (!next) return base;
+        const nextItem = todos.items.find((item) => todoRef(item) === next.ref);
+        return `${base}\nNext execution row: ${next.ref}${nextItem ? ` — ${nextItem.text}` : ""}`;
+      };
       const refError = (ref: string, resolved: any) =>
         resolved.ambiguous
           ? formatAmbiguity(resolved.ambiguous, ref)
@@ -8334,6 +9137,29 @@ ${rows}`,
             text: t.text,
             status: t.status as TodoStatus,
           }));
+          const evidenceMissing = incoming.find(
+            (entry) =>
+              entry.status === "completed" &&
+              entry.ref !== undefined &&
+              executionEvidenceRequired(String(entry.ref)) &&
+              !hasExecutionEvidence(String(entry.ref)),
+          );
+          if (evidenceMissing) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Update refused: row ${evidenceMissing.ref} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${evidenceMissing.ref}"} first.`,
+                },
+              ],
+              details: {
+                action: "update",
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
+                error: "evidence-required",
+              } as TodoDetails,
+            };
+          }
           const res = todos.update(incoming, {
             allowBulkReplace: params.intent === "replace",
             ...(typeof params.expectedRevision === "number"
@@ -8361,6 +9187,10 @@ ${rows}`,
             };
           }
           onTodoWrite();
+          armStandaloneBuildExecution(
+            (currentSessionCtx ?? _ctx) as ExtensionContext,
+            "Build work",
+          );
           const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}${res.excludedAdded ? `, ${res.excludedAdded} plan step(s) recorded as removed` : ""}. Revision ${res.revision}.`;
           const warningText = res.warnings.length
             ? `\nWarnings:\n${res.warnings.map((w) => `- ${w}`).join("\n")}`
@@ -8418,6 +9248,26 @@ ${rows}`,
           const it = resolved.item;
           const status: TodoStatus =
             params.action === "done" ? "completed" : "pending";
+          if (
+            status === "completed" &&
+            executionEvidenceRequired(todoRef(it)) &&
+            !hasExecutionEvidence(todoRef(it))
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Row ${todoRef(it)} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${todoRef(it)}"} first; the row was not marked done.`,
+                },
+              ],
+              details: {
+                action: params.action,
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
+                error: "evidence-required",
+              } as TodoDetails,
+            };
+          }
           setTodoStatus(it, status);
           try {
             if (currentSessionCtx) {
@@ -8432,7 +9282,7 @@ ${rows}`,
             content: [
               {
                 type: "text",
-                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}`,
+                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}${nextExecutionLine()}`,
               },
             ],
             details: {
@@ -8493,11 +9343,15 @@ ${rows}`,
             void _e;
           }
           onTodoWrite();
+          armStandaloneBuildExecution(
+            (currentSessionCtx ?? _ctx) as ExtensionContext,
+            "Build work",
+          );
           return {
             content: [
               {
                 type: "text",
-                text: `Added ${todoRef(item)}. ${item.text}`,
+                text: `Added ${todoRef(item)}. ${item.text}${nextExecutionLine()}`,
               },
             ],
             details: {
@@ -8539,7 +9393,28 @@ ${rows}`,
             };
           }
           const it = resolved.item;
-          setTodoStatus(it, isDone(it) ? "pending" : "completed");
+          const nextStatus = isDone(it) ? "pending" : "completed";
+          if (
+            nextStatus === "completed" &&
+            executionEvidenceRequired(todoRef(it)) &&
+            !hasExecutionEvidence(todoRef(it))
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Row ${todoRef(it)} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${todoRef(it)}"} first.`,
+                },
+              ],
+              details: {
+                action: "toggle",
+                todos: [...todos.items],
+                nextStep: todos.items.length + 1,
+                error: "evidence-required",
+              } as TodoDetails,
+            };
+          }
+          setTodoStatus(it, nextStatus);
           try {
             if (currentSessionCtx) {
               updateStatus(currentSessionCtx);
@@ -8553,7 +9428,7 @@ ${rows}`,
             content: [
               {
                 type: "text",
-                text: `${todoRef(it)}. ${it.text} toggled to ${it.completed ? "done" : "pending"}`,
+                text: `${todoRef(it)}. ${it.text} toggled to ${it.completed ? "done" : "pending"}${nextExecutionLine()}`,
               },
             ],
             details: {
@@ -11176,6 +12051,187 @@ ${rows}`,
     }
   }
 
+  // ── Build execution control tool ─────────────────────────────────
+  // The model may report progress or a genuine blocker. It cannot pause,
+  // resume, reset the shell guard, or mint completion evidence.
+  pi.registerTool({
+    name: "workflow_execution",
+    label: "Workflow Execution",
+    description:
+      "Report Build execution status, checkpoint non-shell progress, or record a genuine blocker. Actions: status, checkpoint (summary), blocker (category, reason, rowRef, requiredAction). This tool never grants permissions and never resets the shell guard.",
+    promptSnippet: "Report or checkpoint the active Build execution; record a genuine blocker",
+    promptGuidelines: [
+      "workflow_execution: shell quarantine is recoverable — continue with non-shell tools; use action \"blocker\" only when no permitted non-shell action can advance the work.",
+      "workflow_execution: do not claim completion through this tool; completion is runtime-verified from TODO status and checks.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["status", "checkpoint", "verify", "blocker"] as const),
+      summary: Type.Optional(Type.String({ description: "Bounded checkpoint summary" })),
+      rowRef: Type.Optional(Type.String({ description: "Current global row ref" })),
+      category: Type.Optional(
+        StringEnum([
+          "permission",
+          "safety",
+          "external",
+          "verification",
+          "no-permitted-action",
+          "unknown",
+        ] as const),
+      ),
+      reason: Type.Optional(Type.String({ description: "Why progress is blocked" })),
+      requiredAction: Type.Optional(
+        Type.String({ description: "The exact user action needed" }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const ctx = (currentSessionCtx ?? _ctx) as ExtensionContext;
+      if (params.action === "status") {
+        return {
+          content: [{ type: "text", text: executionStatusLines().join("\n") }],
+          details: { action: "status" },
+        };
+      }
+      if (!executionState) {
+        return {
+          content: [{ type: "text", text: "No active Build execution." }],
+          details: { action: params.action, error: "no-execution" },
+        };
+      }
+      const now = Date.now();
+      if (params.action === "verify") {
+        const next = selectNextRow(executionRows(), executionState);
+        const ref = params.rowRef ?? next?.ref;
+        const row = ref ? frozenRowForRef(ref) : undefined;
+        if (!ref || !row) {
+          return {
+            content: [{ type: "text", text: "verify needs a known frozen rowRef." }],
+            details: { action: "verify", error: "row-required" },
+          };
+        }
+        if (row.acceptanceChecks.length === 0) {
+          executionEvidence.set(ref, { signature: "no-executable-checks", at: now });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Row ${ref} has no executable checks; a task-appropriate diff/manual evidence checkpoint is required before completion.`,
+              },
+            ],
+            details: { action: "verify", rowRef: ref, checks: 0 },
+          };
+        }
+        const results: Array<{ command: string; ok: boolean; output: string }> = [];
+        for (const command of row.acceptanceChecks) {
+          if (executionState.shellQuarantine) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Row ${ref} cannot be verified: shell is quarantined. Continue non-shell work; the row remains blocked/unverified.`,
+                },
+              ],
+              details: { action: "verify", rowRef: ref, error: "shell-quarantined" },
+            };
+          }
+          const outcome = await runVerificationCommand(
+            command,
+            ctx?.signal,
+            ctx,
+          );
+          results.push({ command, ...outcome });
+          if (!outcome.ok) break;
+        }
+        const failed = results.find((entry) => !entry.ok);
+        if (failed) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Row ${ref} verification failed: ${failed.command}\n${failed.output.slice(0, 1_500)}`,
+              },
+            ],
+            details: { action: "verify", rowRef: ref, error: "check-failed", results },
+          };
+        }
+        executionEvidence.set(ref, {
+          signature: results.map((entry) => entry.command).join("\n"),
+          at: now,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Row ${ref} verified: ${results.length} check(s) passed.`,
+            },
+          ],
+          details: { action: "verify", rowRef: ref, results },
+        };
+      }
+      if (params.action === "checkpoint") {
+        const applied = applyExecutionEvent(executionState, {
+          type: "progress",
+          at: now,
+          ...(params.summary ? { signature: params.summary.slice(0, 200) } : {}),
+        });
+        if (applied.ok) {
+          executionState = applied.state;
+          persistState();
+          updateStatus(ctx);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: [`Execution checkpoint recorded.`, ...executionStatusLines()].join("\n"),
+            },
+          ],
+          details: { action: "checkpoint" },
+        };
+      }
+      const reason = params.reason?.trim();
+      const category = (params.category ?? "unknown") as ExecutionBlocker["category"];
+      if (!reason) {
+        return {
+          content: [{ type: "text", text: "blocker requires a reason." }],
+          details: { action: "blocker", error: "reason-required" },
+        };
+      }
+      const applied = applyExecutionEvent(executionState, {
+        type: "block",
+        executionId: executionState.executionId,
+        epoch: executionState.epoch,
+        blocker: {
+          category,
+          reason: reason.slice(0, 1000),
+          ...(params.rowRef ? { rowRef: params.rowRef } : {}),
+          ...(params.requiredAction
+            ? { requiredAction: params.requiredAction.slice(0, 500) }
+            : {}),
+          at: now,
+        },
+        at: now,
+      });
+      if (!applied.ok) {
+        return {
+          content: [{ type: "text", text: `Blocker not recorded: ${applied.error}.` }],
+          details: { action: "blocker", error: applied.code },
+        };
+      }
+      executionState = applied.state;
+      persistState();
+      updateStatus(ctx);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Blocked recorded: ${reason}${params.requiredAction ? `\nRequired action: ${params.requiredAction}` : ""}\n${executionStatusLines().join("\n")}`,
+          },
+        ],
+        details: { action: "blocker", category },
+      };
+    },
+  });
+
   // ── Managed worker readiness (orchestrator step 6) ───────────────
   // A worker may read the assignment and its TODOs, but it cannot mutate the
   // workspace or run a shell command until it explicitly acknowledges. The
@@ -11304,11 +12360,8 @@ ${rows}`,
           spec.name === "orchestrator_report"
             ? workerBinding.callReportTool(params)
             : workerBinding.callCheckpointTool(params);
-        if (result.candidateStored && workerControl) {
-          // A report is a CLAIM. It reaches the parent as a candidate event
-          // only through the authenticated channel; the parent verifies it.
-          void workerControl.send("candidate", { report: params.report }).catch(() => false);
-        }
+        // A report is only a CLAIM. Candidate delivery happens at the settled
+        // fence below, never inside the report tool's parallel batch.
         return {
           content: [{ type: "text", text: result.text }],
           details: { ok: result.ok, ...(result.candidateStored ? { candidateStored: true } : {}) },
@@ -11656,6 +12709,8 @@ ${rows}`,
               signal,
               subagentFolderEnv(job.cwd ?? cwd),
               shellGuardLimitsFor(ctx as any).config,
+              executionState?.shellQuarantine !== undefined ||
+                shellGuardRuntime?.isStopped() === true,
             );
             if (signal?.aborted) {
               results[idx] = {
@@ -12209,6 +13264,7 @@ ${rows}`,
     ) {
       try {
         ensureShellGuard(_ctx).reset("new-user-request");
+        clearExecutionShellQuarantine("new-user-request");
       } catch (_e) {
         void _e;
       }
@@ -12325,7 +13381,10 @@ ${rows}`,
     workerControl?.close();
     workerControl = undefined;
     workerBinding = undefined;
+    lastWorkerCandidateSent = undefined;
     workerAdmittedCalls.clear();
+    executionEvidence.clear();
+    orchestratorEvidence.clear();
     orchestrationEpoch += 1;
     const sessionModel: any = (ctx as any)?.model;
     if (sessionModel && typeof sessionModel.id === "string") {
@@ -12476,6 +13535,7 @@ ${rows}`,
     // Recovery is request-scoped; a new/resumed/reloaded session starts clean.
     try {
       ensureShellGuard(ctx as ExtensionContext).reset("session-start");
+      reapplyInheritedShellQuarantine(ctx as ExtensionContext);
     } catch (_e) {
       void _e;
     }
@@ -12564,7 +13624,13 @@ ${rows}`,
             const decoded = decodeWorkflowEntry(d, workflowMode);
             if (decoded) workflowMode = decoded.mode;
             syncLegacyFlags();
-            if (Array.isArray(d.todos)) todos.items = ensureTodoLabels(d.todos);
+            const hasFrozenPayload =
+              d.todoFrozen !== undefined && d.todoFrozen !== null;
+            // A later legacy entry without a frozen payload must never erase
+            // the rows of an already-restored frozen execution.
+            if (Array.isArray(d.todos) && !todos.frozen && !hasFrozenPayload) {
+              todos.items = ensureTodoLabels(d.todos);
+            }
             // Restore durable list identity/removal authority before any
             // reconciliation can run, so a removed step stays removed.
             todos.restore({
@@ -12585,6 +13651,13 @@ ${rows}`,
                 ? { frozenError: d.todoFrozenError }
                 : {}),
             });
+            if (
+              d.execution &&
+              typeof d.execution === "object" &&
+              (d.execution as ExecutionState).version === 1
+            ) {
+              executionState = d.execution as ExecutionState;
+            }
             // Entries written before this feature have no `todoPanel`; they
             // must not erase a value restored from an earlier entry.
             if (d.todoPanel && typeof d.todoPanel === "object") {
@@ -12760,6 +13833,16 @@ ${rows}`,
     } catch (_e) {
       void _e;
     }
+    // Rebind a legacy mutable list to the full approved plan before any
+    // continuation decision. This preserves every global ref and never
+    // dispatches work by itself.
+    migrateLegacyBuildOnRestore(ctx as ExtensionContext);
+    // A restored execution is never running. Persisted history alone must not
+    // start provider requests, edits or child launches.
+    pauseRestoredExecution(ctx as ExtensionContext);
+    // The shell guard's own session reset must not clear a persisted
+    // execution quarantine. Re-adopt it after the restore loop.
+    reapplyPersistedShellQuarantine(ctx as ExtensionContext);
     // A reload rebinds a run that already has a journal; it never dispatches.
     // A running row waits for the explicit probe/retry path.
     if (
@@ -13051,6 +14134,7 @@ ${rows}`,
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.todos, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.orchestrator, undefined);
+    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.execution, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
     // The Terminal review line is a live surface; a quit/reload must not wait
     // for teardown to clear it (teardown later drops currentSessionCtx).
@@ -13080,6 +14164,7 @@ ${rows}`,
     // must not follow it.
     try {
       ensureShellGuard(ctx as ExtensionContext).reset("session-tree");
+      reapplyInheritedShellQuarantine(ctx as ExtensionContext);
     } catch (_e) {
       void _e;
     }
@@ -13106,8 +14191,12 @@ ${rows}`,
       const branch = ctx.sessionManager.getBranch();
       for (const e of branch as any[]) {
         if (e.type === "custom" && e.customType === "workflow") {
-          if (Array.isArray(e.data?.todos)) {
+          const hasFrozenPayload =
+            e.data?.todoFrozen !== undefined && e.data?.todoFrozen !== null;
+          if (Array.isArray(e.data?.todos) && !todos.frozen && !hasFrozenPayload) {
             todos.items = ensureTodoLabels(e.data.todos);
+          }
+          if (Array.isArray(e.data?.todos)) {
             todos.restore({
               ...(typeof e.data.todoRevision === "number"
                 ? { revision: e.data.todoRevision }
@@ -13129,6 +14218,13 @@ ${rows}`,
                 : {}),
             });
             if (e.data.planFile) todos.planPath = e.data.planFile;
+          }
+          if (
+            e.data?.execution &&
+            typeof e.data.execution === "object" &&
+            (e.data.execution as ExecutionState).version === 1
+          ) {
+            executionState = e.data.execution as ExecutionState;
           }
           if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
             const panel = readPersistedTodoPanel(e.data);
@@ -13160,6 +14256,8 @@ ${rows}`,
     } catch (_e) {
       void _e;
     }
+    pauseRestoredExecution(ctx as ExtensionContext);
+    reapplyPersistedShellQuarantine(ctx as ExtensionContext);
     updateStatus(ctx as any);
   });
 
@@ -15159,9 +16257,17 @@ ${rows}`,
   // guard appends guidance and trips the request after a repeat.
   pi.on("tool_result", async (event, ctx) => {
     try {
-      return ensureShellGuard(ctx as ExtensionContext).observeResult(
-        event as any,
-      ) as any;
+      const guard = ensureShellGuard(ctx as ExtensionContext);
+      const patch = guard.observeResult(event as any) as any;
+      noteExecutionShellQuarantine((event as any)?.input?.command);
+      noteToolFailureForExecution(event);
+      if (
+        (event as any)?.toolName === "edit" ||
+        (event as any)?.toolName === "write"
+      ) {
+        if ((event as any)?.isError !== true) clearExecutionEvidence();
+      }
+      return patch;
     } catch (_e) {
       void _e;
       return undefined;
@@ -15173,6 +16279,7 @@ ${rows}`,
   pi.on("tool_execution_end", async (event, ctx) => {
     try {
       ensureShellGuard(ctx as ExtensionContext).observeEnd(event as any);
+      noteExecutionShellQuarantine();
     } catch (_e) {
       void _e;
     }
@@ -15301,12 +16408,158 @@ ${rows}`,
     }
   });
 
+  pi.on("agent_before_settle", async (event, boundaryCtx) => {
+    const state = executionState;
+    if (!state) return undefined;
+    if (workflowMode !== "build") return undefined;
+    if (event.outcome !== "completed") return undefined;
+    if (
+      state.phase === "paused" ||
+      state.phase === "blocked" ||
+      state.phase === "stopped" ||
+      state.phase === "completed"
+    ) {
+      return undefined;
+    }
+    if (state.kickoff?.status !== "acknowledged") return undefined;
+    if (awaitingDecision || pendingHandoffDecision || overlayDepth > 0) return undefined;
+    if (reviewRoundInFlight() || reviewTurnOwns(reviewTurn)) return undefined;
+    const pending = (event.context as any)?.pendingMessages;
+    if (Array.isArray(pending) && pending.length > 0) return undefined;
+    if (typeof (boundaryCtx as any)?.hasPendingMessages === "function" &&
+        (boundaryCtx as any).hasPendingMessages() === true) {
+      return undefined;
+    }
+    const boundaryMessages =
+      (event.context as any)?.llmMessages ??
+      (event.context as any)?.contextMessages ??
+      [];
+    const lastAssistant = [...(Array.isArray(boundaryMessages) ? boundaryMessages : [])]
+      .reverse()
+      .find((message: any) => message?.role === "assistant") as any;
+    if (
+      lastAssistant?.stopReason === "error" ||
+      lastAssistant?.stopReason === "aborted"
+    ) {
+      return undefined;
+    }
+    if (todos.items.length === 0 || !todos.frozen) return undefined;
+    const outcome = evaluateExecutionOutcome(state, executionRows());
+    if (outcome.kind === "complete" || outcome.kind === "complete-with-exclusions") {
+      return undefined;
+    }
+    if (outcome.kind === "paused" || outcome.kind === "stopped" || outcome.kind === "blocked") {
+      return undefined;
+    }
+    const already = (event.entries ?? []).some(
+      (entry: any) =>
+        entry?.type === "custom_message" &&
+        entry?.customType === "workflow-autorun" &&
+        entry?.details?.executionId === state.executionId &&
+        entry?.details?.epoch === state.epoch,
+    );
+    if (already) return undefined;
+    // A shell-quarantined row is still the next row we can make non-shell
+    // progress on. Only a real blocker (state.phase === "blocked") stops us.
+    const next = selectNextRow(executionRows(), state);
+    if (!next) return undefined;
+    const budget = noteExecutionBoundary();
+    if (budget.pause) {
+      const paused = applyExecutionEvent(executionState!, {
+        type: "pause",
+        executionId: executionState!.executionId,
+        epoch: executionState!.epoch,
+        reason: budget.reason ?? "no meaningful progress",
+        at: Date.now(),
+      });
+      if (paused.ok) executionState = paused.state;
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        (boundaryCtx as any)?.ui?.notify?.(
+          `Build execution paused: ${budget.reason ?? "no meaningful progress"}. Resume with /build resume.`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+      return {
+        entries: [
+          ...(event.entries ?? []),
+          {
+            type: "custom_message",
+            customType: "workflow-autorun-paused",
+            content: `Build execution paused after repeated barren boundaries: ${budget.reason ?? "no meaningful progress"}. No work was marked complete. Resume with /build resume; use workflow_execution status for evidence.`,
+            display: true,
+          },
+        ],
+        continue: false,
+      };
+    }
+    const nextItem = todos.items.find((item) => todoRef(item) === next.ref);
+    const remaining = todos.items.filter(
+      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
+    ).length;
+    const content = state.shellQuarantine
+      ? [
+          `[EXECUTION RECOVERY — SHELL QUARANTINED]`,
+          `Execution ${state.executionId}, epoch ${state.epoch}. Do not call bash, powershell, review_bash, a child shell, or any verification adapter.`,
+          `Continue with non-shell tools: read, grep, find, ls, edit, write, and LSP diagnostics.`,
+          `Work on the non-shell parts of ref ${next.ref} or another independent pending row. Do not mark a shell-dependent row complete.`,
+          `Remaining rows: ${remaining}. If no permitted action can advance, report a structured blocker instead of waiting for the user.`,
+        ].join("\n")
+      : [
+          `[EXECUTION CONTINUE]`,
+          `Execution ${state.executionId}, epoch ${state.epoch}. The approved plan is not complete.`,
+          `Next ref ${next.ref}${nextItem ? `: ${nextItem.text}` : ""}. Remaining rows: ${remaining}.`,
+          `Continue implementing and verifying. Do not stop for a routine checkpoint or a self-assessed context limit. Mark progress immediately; never mark a row complete without its required evidence.`,
+        ].join("\n");
+    return {
+      entries: [
+        ...(event.entries ?? []),
+        {
+          type: "custom_message",
+          customType: "workflow-autorun",
+          content,
+          display: false,
+          details: {
+            executionId: state.executionId,
+            epoch: state.epoch,
+            rowRef: next.ref,
+            shellQuarantined: state.shellQuarantine !== undefined,
+          },
+        },
+      ],
+      continue: true,
+    };
+  });
+
   pi.on("agent_settled", async (_event, settledCtx) => {
     // Step 14: only a real settle can close the fence — `agent_end` cannot.
     try {
       workerBinding?.noteSettled();
     } catch (_e) {
       void _e;
+    }
+    // Candidate delivery is attempted only after the fence closes.
+    if (workerBinding && workerControl) {
+      const fence = workerBinding.fence();
+      if (fence.phase === "fenced" && fence.candidate) {
+        const reportId = fence.candidate.reportId;
+        if (lastWorkerCandidateSent !== reportId) {
+          lastWorkerCandidateSent = reportId;
+          void workerControl
+            .send("candidate", { report: fence.candidate, phase: "fenced" })
+            .catch(() => false);
+        }
+      } else if (fence.phase === "fenced") {
+        void workerControl
+          .send("quiescent", { phase: fence.phase, hasCandidate: false })
+          .catch(() => false);
+      }
     }
     // The run is settled and the agent is idle now: release a direct-Build
     // kickoff that was queued while the chooser was still inside `agent_end`.
@@ -15383,6 +16636,32 @@ ${rows}`,
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
+    // A custom workflow kickoff is the first observable start acknowledgement.
+    // It does not by itself prove work advanced, but it distinguishes a
+    // delivered execution from a send that was swallowed.
+    if (
+      (event as any).messageType === "custom" &&
+      (event as any).message?.customType === "workflow-plan-execute" &&
+      executionState &&
+      executionState.kickoff?.status === "sent"
+    ) {
+      executionState = markExecutionKickoff(executionState, "acknowledged", Date.now());
+      try {
+        pi.appendEntry("workflow-execution-kickoff", {
+          at: Date.now(),
+          executionId: executionState.executionId,
+          epoch: executionState.epoch,
+          status: "acknowledged",
+        });
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
     // A new user prompt supersedes a queued direct-Build kickoff.
     if ((event as { messageType?: string }).messageType === "user") {
       pendingExecutionKickoff = null;
@@ -15583,6 +16862,7 @@ ${rows}`,
     const filtered = (event.messages as any[]).filter((m: any) => {
       if (m.customType === "workflow-build-context") return false;
       if (m.customType === "workflow-todo-context") return false;
+      if (m.customType === "workflow-execution-context") return false;
       if (m.customType === "workflow-plan-context") return isPlan;
       if (m.customType === ORCHESTRATOR_CONTEXT_ENTRY) return isOrchestrator;
       if (isPlan) return true;
@@ -15596,6 +16876,15 @@ ${rows}`,
         );
       return true;
     });
+    if (executionState && workflowMode === "build") {
+      filtered.push({
+        role: "custom",
+        customType: "workflow-execution-context",
+        content: executionContextBlock(),
+        display: false,
+        timestamp: Date.now(),
+      });
+    }
     // Throttled passive reminder (Claude Code cadence) whenever a todo list
     // exists — any mode. Unresolved refs from the previous turn bypass the
     // throttle once so the model can learn the right numbers.
@@ -15636,6 +16925,30 @@ ${rows}`,
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);
     const result = markCompletedRefs(text, todos.items);
+    // A [DONE:ref] tag is a claim, not evidence. Revert any newly completed
+    // row whose required checks have no runtime evidence.
+    let reverted = 0;
+    for (const item of todos.items) {
+      const ref = todoRef(item);
+      if (
+        isDone(item) &&
+        executionEvidenceRequired(ref) &&
+        !hasExecutionEvidence(ref)
+      ) {
+        setTodoStatus(item, "pending");
+        reverted += 1;
+      }
+    }
+    if (reverted > 0) {
+      try {
+        currentSessionCtx?.ui?.notify?.(
+          `${reverted} completion tag(s) were ignored: required checks have no runtime evidence. Run workflow_execution {action:"verify"} first.`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
     // Fallback per-step commit for steps completed via [DONE:ref] tags in the
     // response text (the workflow_todo path already committed at its
     // tool_result; the committed-ref set makes this a no-op then).
@@ -16202,8 +17515,18 @@ ${rows}`,
     }
     // `enterBuildModeFromPlan` clears the handoff; restore the routing record so
     // the receipt is recorded against the decision that authorized it.
-    sendExecuteMessages(ctx, routing.planPath, routing.approval?.feedback, "native");
-    await finishHandoffRoute(ctx, routing, { route: "direct-build" });
+    const kickoffSent = sendExecuteMessages(
+      ctx,
+      routing.planPath,
+      routing.approval?.feedback,
+      "native",
+    );
+    await finishHandoffRoute(ctx, routing, {
+      route: "direct-build",
+      ...(kickoffSent
+        ? {}
+        : { failure: "the direct-Build execution kickoff was not delivered" }),
+    });
   }
 
   /** Durable, display-only record of which route an approval took. */
@@ -16425,6 +17748,14 @@ ${rows}`,
         resolvePi: resolvePiCli,
         label: "Pi Terminal",
       }),
+      env: () => ({
+        [SHELL_GUARD_LIMITS_ENV]: encodeShellLimitsEnv(
+          shellGuardLimitsFor(currentSessionCtx).config,
+        ),
+        ...(executionState?.shellQuarantine || shellGuardRuntime?.isStopped()
+          ? { [SHELL_GUARD_QUARANTINE_ENV]: "1" }
+          : {}),
+      }),
     });
     const desktop = ensureDesktopSessionHost();
     orchestratorChildHost = createPreferringChildHost(
@@ -16486,17 +17817,58 @@ ${rows}`,
    * A child event can only advance the parent run when it is the report for
    * the row that is actually running. Everything else is status noise.
    */
+  /** Mirror runtime ownership into the single panel TODO store. */
+  function syncOrchestratorTodos(): void {
+    const view = orchestratorRuntime?.view();
+    if (!view || todos.items.length === 0) return;
+    const byRef = new Map<string, string>();
+    for (const taskId of view.state.order) {
+      const row = rowForTask(view.state, taskId);
+      if (!row) continue;
+      const state = view.state.tasks[taskId]?.state;
+      byRef.set(
+        row.ref,
+        state === "accepted"
+          ? "completed"
+          : state === "running" || state === "candidate" || state === "needs_fix"
+            ? "in_progress"
+            : "pending",
+      );
+    }
+    if (byRef.size === 0) return;
+    const updates = todos.items.map((item) => ({
+      id: item.id,
+      ref: todoRef(item),
+      text: item.text,
+      status: (byRef.get(todoRef(item)) ?? itemStatus(item)) as TodoStatus,
+    }));
+    const applied = todos.update(updates);
+    if (!applied.refused) {
+      try {
+        updateStatusIfBound();
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }
+
   async function ingestOrchestratorEvent(raw: unknown): Promise<void> {
     const runtime = orchestratorRuntime;
     if (!runtime) return;
     const event = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
     const kind = typeof event.kind === "string" ? event.kind : event.type;
     if (kind !== "candidate") return;
+    // A candidate is eligible only after the child fence has settled. The
+    // report tool's parallel batch is deliberately not enough.
+    if (event.phase !== "fenced") return;
     const taskId = typeof event.taskId === "string" ? event.taskId : "";
     const view = runtime.view();
     if (!view || !taskId) return;
     const task = view.state.tasks[taskId];
     if (!task || task.state !== "running") return;
+    // A new report/attempt invalidates any evidence from the previous one.
+    orchestratorEvidence.delete(taskId);
     await runtime.applyEvent({
       type: "task.report",
       runId: view.runId,
@@ -16504,7 +17876,59 @@ ${rows}`,
       taskId,
       ...(typeof event.reportId === "string" ? { reportId: event.reportId } : {}),
     });
+    syncOrchestratorTodos();
     updateStatusIfBound();
+    scheduleOrchestratorPump(taskId);
+  }
+
+  /**
+   * The parent owns verification/acceptance; the model does not have to
+   * remember two calls. Events are coalesced while a pump is in flight.
+   */
+  function scheduleOrchestratorPump(taskId: string): void {
+    if (orchestratorPump) return;
+    orchestratorPump = (async () => {
+      try {
+        const before = orchestratorRuntime?.view();
+        if (!before) return;
+        if (
+          before.phase === "paused" ||
+          before.phase === "blocked" ||
+          before.phase === "completed" ||
+          before.phase === "cancelled"
+        ) {
+          return;
+        }
+        const current = before.state.tasks[taskId];
+        if (!current || current.state !== "candidate") return;
+        const verified = await verifyTaskWithRuntime(undefined, taskId);
+        if (!verified.ok) return;
+        const afterVerify = orchestratorRuntime?.view();
+        if (
+          !afterVerify ||
+          afterVerify.phase === "paused" ||
+          afterVerify.phase === "blocked" ||
+          afterVerify.phase === "cancelled"
+        ) {
+          return;
+        }
+        if (afterVerify.state.tasks[taskId]?.state !== "candidate") return;
+        await acceptTaskWithRuntime(taskId);
+      } catch (error: unknown) {
+        try {
+          pi.appendEntry("workflow-orchestrator-pump-error", {
+            at: Date.now(),
+            taskId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      } finally {
+        orchestratorPump = undefined;
+        updateStatusIfBound();
+      }
+    })();
   }
 
   /** Deliver an explicit operator message to the running child. */
@@ -16631,6 +18055,7 @@ ${rows}`,
         text: `The frozen run is ready, but the child host is unavailable: ${host.reason ?? host.label}.`,
       };
     }
+    orchestratorEvidence.delete(taskId);
     const dispatched = await parentTools.dispatch(taskId);
     return dispatched.ok
       ? { ok: true, text: dispatched.text, details: dispatched.details }
@@ -16795,16 +18220,102 @@ ${rows}`,
   }
 
   /** One deterministic row/plan command, bounded and read-only by convention. */
-  function runVerificationCommand(command: string): { ok: boolean; output: string } {
-    const result = spawnSync(command, {
-      shell: true,
-      cwd: orchestratorRoot(),
-      encoding: "utf8",
-      timeout: 120_000,
-      windowsHide: true,
+  async function runVerificationCommand(
+    command: string,
+    signal?: AbortSignal,
+    ctx?: any,
+  ): Promise<{ ok: boolean; output: string }> {
+    if (shellGuardRuntime?.isStopped() || executionState?.shellQuarantine) {
+      return {
+        ok: false,
+        output:
+          "shell is quarantined; this verification command was refused instead of bypassing the guard",
+      };
+    }
+    // When the host exposes nested tool execution, use the real bash tool so
+    // policy, shell guard, process-tree timeout and cancellation all apply.
+    if (typeof ctx?.executeTool === "function") {
+      try {
+        const nested = await ctx.executeTool(
+          "bash",
+          { command, timeout: 120 },
+          { signal },
+        );
+        const output = (Array.isArray(nested?.content) ? nested.content : [])
+          .map((part: any) =>
+            part?.type === "text" ? String(part.text ?? "") : "",
+          )
+          .join("\n")
+          .trim()
+          .slice(0, 2_000);
+        return { ok: nested?.isError !== true, output };
+      } catch (error: unknown) {
+        return {
+          ok: false,
+          output:
+            error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+    return new Promise((resolve) => {
+      const child = spawn(command, {
+        shell: true,
+        cwd: orchestratorRoot(),
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const finish = (ok: boolean, extra = ""): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve({
+          ok,
+          output: `${stdout}${stderr}${extra}`.trim().slice(0, 2_000),
+        });
+      };
+      const kill = (): void => {
+        try {
+          child.kill("SIGTERM");
+        } catch (_e) {
+          void _e;
+        }
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch (_e) {
+            void _e;
+          }
+        }, 5_000);
+      };
+      const onAbort = (): void => {
+        kill();
+        finish(false, "\nCommand aborted");
+      };
+      const timer = setTimeout(() => {
+        kill();
+        finish(false, "\nCommand timed out after 120 seconds");
+      }, 120_000);
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout?.on("data", (data: Buffer) => {
+        stdout += data.toString();
+      });
+      child.stderr?.on("data", (data: Buffer) => {
+        stderr += data.toString();
+      });
+      child.once("error", (error: Error) => {
+        finish(false, `\n${error.message}`);
+      });
+      child.once("close", (code: number | null) => {
+        finish(code === 0, code === null ? "\nCommand terminated" : "");
+      });
     });
-    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim().slice(0, 2_000);
-    return { ok: result.status === 0, output };
   }
 
   /** Runtime-owned verification: diff + row checks, never a model claim. */
@@ -16849,10 +18360,11 @@ ${rows}`,
         details: { code: "invalid" },
       };
     }
+    orchestratorEvidence.delete(taskId);
     const checks = [...row.acceptanceChecks];
     const results: Array<{ name: string; status: "passed" | "failed"; detail?: string }> = [];
     for (const command of checks) {
-      const outcome = runVerificationCommand(command);
+      const outcome = await runVerificationCommand(command, _ctx?.signal, _ctx);
       results.push({
         name: command.slice(0, 200),
         status: outcome.ok ? "passed" : "failed",
@@ -16902,9 +18414,16 @@ ${rows}`,
 
   /** Run the plan-level Verification commands once, after the last row. */
   async function runFinalPlanChecks(): Promise<{ ok: boolean; failure?: string }> {
-    const checks = orchestratorRuntime?.view()?.todos.planChecks ?? [];
+    const checks =
+      orchestratorRuntime?.view()?.todos.planChecks ??
+      todos.frozen?.planChecks ??
+      [];
     for (const command of checks) {
-      const outcome = runVerificationCommand(command);
+      const outcome = await runVerificationCommand(
+        command,
+        currentSessionCtx?.signal,
+        currentSessionCtx,
+      );
       if (!outcome.ok) {
         return {
           ok: false,
@@ -16945,6 +18464,30 @@ ${rows}`,
         details: { code: "unavailable" },
       };
     }
+    // The final plan gate belongs to the last candidate, before acceptance.
+    // Accepting first and then trying to block an accepted row is incoherent.
+    const remaining = view.state.order.filter((id) => {
+      if (id === taskId) return false;
+      return view.state.tasks[id]?.state !== "accepted";
+    });
+    if (remaining.length === 0) {
+      const finalChecks = await runFinalPlanChecks();
+      if (!finalChecks.ok) {
+        orchestratorEvidence.delete(taskId);
+        await runtime.applyEvent({
+          type: "task.needsFix",
+          runId: view.runId,
+          now: Date.now(),
+          taskId,
+          reason: `final plan check failed: ${finalChecks.failure ?? "unknown"}`,
+        });
+        return {
+          ok: false,
+          text: `Final plan check failed: ${finalChecks.failure}. The row remains a candidate; repair it and verify again.`,
+          details: { phase: "needs_fix", evidenceId: evidence.evidenceId },
+        };
+      }
+    }
     const applied = await runtime.applyEvent({
       type: "task.accept",
       runId: view.runId,
@@ -16961,23 +18504,9 @@ ${rows}`,
       };
     }
     orchestratorEvidence.delete(taskId);
+    syncOrchestratorTodos();
     const after = runtime.view()!;
     if (!after.nextTaskId) {
-      const finalChecks = await runFinalPlanChecks();
-      if (!finalChecks.ok) {
-        await runtime.applyEvent({
-          type: "task.block",
-          runId: after.runId,
-          now: Date.now(),
-          taskId,
-          reason: `final plan check failed: ${finalChecks.failure ?? "unknown"}`,
-        });
-        return {
-          ok: false,
-          text: `All rows are accepted, but the final plan check failed: ${finalChecks.failure}. The run is blocked; retry or repair.`,
-          details: { phase: "blocked", evidenceId: evidence.evidenceId },
-        };
-      }
       const completed = await runtime.complete();
       return completed.ok
         ? {
@@ -17594,8 +19123,10 @@ ${dispatched.text}`,
       (event.toolName === "write" || event.toolName === "edit") &&
       !event.isError
     ) {
-      const p =
-        (event.input as any).path || (event.input as any).file_path || "";
+      // Any source mutation invalidates runtime row evidence.
+      clearExecutionEvidence();
+      const input = (event.input ?? {}) as any;
+      const p = input.path || input.file_path || "";
       if (!p) return;
       const cwd = (ctx as any)?.cwd as string | undefined;
       // Use shared helper when cwd available; fall back to substring check
@@ -17860,22 +19391,65 @@ ${dispatched.text}`,
       } catch (_e) {
         void _e;
       }
-      // Build completion
+      // Build completion. A green card is a verified terminal claim, never a
+      // summary or an all-cancelled list.
       if (workflowMode === "build" && todos.items.length > 0) {
-        const allDone = isTodoListSettled(todos.items);
-        if (allDone) {
-          // One card per list revision: a settled list stays settled across
-          // turns, and re-sending the same card on every agent_end buried the
-          // transcript in duplicates. A new/renamed list or changed statuses
-          // produce a new signature and therefore a new card.
+        const allCompleted = todos.items.every((item) => isDone(item));
+        const outcome = executionState
+          ? evaluateExecutionOutcome(executionState, executionRows())
+          : allCompleted
+            ? ({ kind: "complete", completedRefs: todos.items.map((i) => todoRef(i)) } as const)
+            : undefined;
+        const verified =
+          outcome?.kind === "complete" ||
+          outcome?.kind === "complete-with-exclusions";
+        if (
+          verified &&
+          (executionState || (todos.frozen?.planChecks.length ?? 0) > 0)
+        ) {
+          const final = await runFinalPlanChecks();
+          if (!final.ok) {
+            if (executionState) {
+              const blocked = applyExecutionEvent(executionState, {
+                type: "block",
+                executionId: executionState.executionId,
+                epoch: executionState.epoch,
+                blocker: {
+                  category: "verification",
+                  reason: `final plan check failed: ${final.failure ?? "unknown"}`,
+                  at: Date.now(),
+                },
+                at: Date.now(),
+              });
+              if (blocked.ok) executionState = blocked.state;
+            }
+            persistState();
+            updateStatus(ctx as any);
+            ctx.ui.notify(
+              `Build not complete: final plan check failed (${final.failure ?? "unknown"}). The run is blocked, not green.`,
+              "warning",
+            );
+            return;
+          }
+          if (executionState) {
+            executionState = {
+              ...executionState,
+              phase: "completed",
+              updatedAt: Date.now(),
+            };
+          }
+          persistState();
+        }
+        if (verified) {
           const signature = todoCompletionSignature(todos.items);
           if (signature !== todos.completedSignature) {
             todos.completedSignature = signature;
+            const excluded = outcome?.kind === "complete-with-exclusions";
             try {
               (pi as any).sendMessage?.(
                 {
                   customType: "workflow-complete",
-                  content: `**Build Complete! ✓**\n\n${todos.items.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
+                  content: `${excluded ? "**Build Complete with exclusions!**" : "**Build Complete! ✓**"}\n\n${todos.items.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
                   display: true,
                 },
                 { triggerTurn: false },
@@ -17884,14 +19458,17 @@ ${dispatched.text}`,
               void _e;
             }
           }
-          // keep todos for history but stay in build
           todoStale = false;
           updateStatus(ctx as any);
           persistState();
-        } else if (todos.completedSignature !== null) {
-          // The list reopened (new step or a reverted status): allow the next
-          // completion to emit its own card. Persisted on the next mutation.
-          todos.completedSignature = null;
+        } else {
+          if (todos.completedSignature !== null) todos.completedSignature = null;
+          if (executionState?.shellQuarantine && allCompleted) {
+            ctx.ui.notify(
+              "Build remains blocked/unverified: shell is quarantined and a required final check could not run. No completion card was emitted.",
+              "warning",
+            );
+          }
         }
         return;
       }

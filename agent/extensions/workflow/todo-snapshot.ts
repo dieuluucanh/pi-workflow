@@ -14,7 +14,10 @@
 
 import { createHash } from "node:crypto";
 
-import { extractPlanChecks, extractRowMetadata } from "./plan-checks.ts";
+import {
+  extractPlanChecksDetailed,
+  extractRowMetadata,
+} from "./plan-checks.ts";
 import {
   planStepIdFor,
   todoItemId,
@@ -321,6 +324,10 @@ function parsePlanSteps(markdown: string):
     const metadata = extractRowMetadata(raw.body.join("\n"));
     return { ...raw, ...metadata };
   });
+  const metadataError = withMetadata.find((row) => row.error)?.error;
+  if (metadataError) {
+    return { ok: false, error: metadataError };
+  }
   return { ok: true, rows: withMetadata, title };
 }
 
@@ -398,6 +405,8 @@ export function createFrozenTodosFromPlan(
   }
   const parsed = parsePlanSteps(input.planText);
   if (!parsed.ok) return parsed;
+  const extracted = extractPlanChecksDetailed(input.planText);
+  if (!extracted.ok) return { ok: false, error: extracted.error };
   return {
     ok: true,
     snapshot: buildSnapshot({
@@ -411,7 +420,7 @@ export function createFrozenTodosFromPlan(
         title: parsed.title,
       },
       rows: parsed.rows,
-      planChecks: extractPlanChecks(input.planText),
+      planChecks: extracted.checks,
       ...(input.planChecks === undefined ? {} : { planChecks: input.planChecks }),
     }),
   };

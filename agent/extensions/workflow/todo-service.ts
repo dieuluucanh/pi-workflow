@@ -537,10 +537,16 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     restore(snapshot) {
-      if (Array.isArray(snapshot.items)) {
+      // A later legacy entry without a frozen payload cannot replace the rows
+      // or plan binding of an already-restored frozen execution.
+      const preserveFrozen =
+        store.frozen !== undefined && snapshot.frozen === undefined;
+      if (Array.isArray(snapshot.items) && !preserveFrozen) {
         store.items = ensureTodoLabels(snapshot.items);
       }
-      if (snapshot.planPath !== undefined) store.planPath = snapshot.planPath;
+      if (snapshot.planPath !== undefined && !preserveFrozen) {
+        store.planPath = snapshot.planPath;
+      }
       if (typeof snapshot.revision === "number" && Number.isFinite(snapshot.revision)) {
         store.revision = Math.max(store.revision, Math.floor(snapshot.revision));
       }

@@ -481,9 +481,11 @@ export function readWorkerAssignment(entries: readonly BranchEntryLike[]): Worke
   const acceptanceChecks = stringList(record.acceptanceChecks, 64);
   const expectedFiles = stringList(record.expectedFiles, 512);
   const mutationScope = record.mutationScope === undefined ? [] : stringList(record.mutationScope, 64);
-  if (!covers || covers.length === 0) return { ok: false, reason: "the task scope covers no requirement" };
-  if (!acceptanceChecks || acceptanceChecks.length === 0) {
-    return { ok: false, reason: "the task scope has no acceptance checks" };
+  // Empty coverage/checks are valid for standalone and checkless rows. Only
+  // malformed metadata is rejected; the parent verifies the task evidence.
+  if (!covers) return { ok: false, reason: "the task scope covers is malformed" };
+  if (!acceptanceChecks) {
+    return { ok: false, reason: "the task scope checks are malformed" };
   }
   if (!expectedFiles || !mutationScope) {
     return { ok: false, reason: "the task scope has an invalid change surface" };

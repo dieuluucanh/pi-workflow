@@ -37,6 +37,8 @@ export const SHELL_GUARD_SETTINGS_KEY = "shellGuard";
 
 /** Env var used to carry a parent's limits into a spawned explorer child. */
 export const SHELL_GUARD_LIMITS_ENV = "PI_SHELL_GUARD_LIMITS";
+/** Set only for a child of a shell-quarantined execution. */
+export const SHELL_GUARD_QUARANTINE_ENV = "PI_SHELL_GUARD_QUARANTINED";
 
 export type JsonObject = Record<string, unknown>;
 

@@ -41,6 +41,94 @@ export const REWRITTEN_PLAN = ORIGINAL_PLAN.replace(
   "4. Add tests under tests/export/ following the table-driven pattern",
 );
 
+/** Synthetic 22-step execution fixture; contains no user transcript text. */
+export const HISTORICAL_22_STEP_PLAN = [
+  "# Plan: Synthetic 22-step autonomy fixture",
+  "",
+  "## Plan Steps",
+  ...Array.from({ length: 22 }, (_, i) =>
+    `${i + 1}. Implement synthetic step ${i + 1} in module-${String(i + 1).padStart(2, "0")}.ts`,
+  ),
+  "",
+  "## Verification",
+  "- npm test",
+].join("\n");
+
+/** The historical 300s then 120s timeout shape, without real waits. */
+export const TWO_TIMEOUT_SEQUENCE = [
+  {
+    command: "node --test extension.test.ts",
+    timeoutSeconds: 300,
+    durationMs: 300_569,
+    message: "Command timed out after 300 seconds",
+  },
+  {
+    command: "node --test --test-name-pattern RE1 extension.test.ts",
+    timeoutSeconds: 120,
+    durationMs: 120_477,
+    message: "Command timed out after 120 seconds",
+  },
+] as const;
+
+/** A non-shell work script that must remain executable after quarantine. */
+export const SHELL_QUARANTINE_WORK_SCRIPT = [
+  { kind: "bash", command: TWO_TIMEOUT_SEQUENCE[0].command, timeout: 300 },
+  { kind: "bash", command: TWO_TIMEOUT_SEQUENCE[1].command, timeout: 120 },
+  { kind: "read", path: "module-09.ts" },
+  { kind: "grep", pattern: "TODO", path: "module-09.ts" },
+  { kind: "edit", path: "module-09.ts" },
+  { kind: "lsp", operation: "diagnostics", path: "module-09.ts" },
+  { kind: "next-row", ref: "10" },
+] as const;
+
+/** A model checkpoint that must not end an approved execution. */
+export const PREMATURE_FINAL_ANSWER = {
+  stopReason: "stop" as const,
+  text: "Status: incomplete. I stopped at a reasonable checkpoint.",
+};
+
+/** A checkless standalone row is valid metadata, not a missing assignment. */
+export const CHECKLESS_STANDALONE_ROW = {
+  id: "standalone-docs",
+  ref: "1",
+  text: "Document the public API",
+  source: "steps" as const,
+  acceptanceChecks: [] as string[],
+  expectedFiles: ["docs/api.md"],
+  status: "pending" as const,
+};
+
+/** Exact executable bytes that must survive snapshot/bootstrap round-trips. */
+export const EXACT_CHECK_PAYLOAD =
+  'node --test "suite with spaces.test.ts" && echo "a,b;c"';
+
+/** A plan path that exists in persisted state but cannot be read on resume. */
+export const MISSING_PLAN_RESUME = {
+  persistedPlanPath: ".pi/plans/2026-11-22-missing-plan.md",
+  remainingRefs: ["9", "15", "16", "17", "18", "19", "20", "21", "22"],
+  fullRowCount: 22,
+  expected: "paused with a diagnostic; never a shortened execution",
+} as const;
+
+/** Historical out-of-order progress: step 9 pending while 10-14 are done. */
+export const OUT_OF_ORDER_COMPLETION = {
+  pendingRefs: ["9"],
+  completedRefs: ["1", "2", "3", "4", "5", "6", "7", "8", "10", "11", "12", "13", "14"],
+} as const;
+
+/** More required checks than the current silent cap; must reject or report. */
+export const OVERFLOW_CHECKS = Array.from(
+  { length: 13 },
+  (_, i) => `node --test check-${i + 1}.test.ts`,
+);
+
+/** A pipeline whose display filter hides the real successful exit status. */
+export const GREP_STATUS_MISMATCH = {
+  command: 'npx tsc --noEmit 2>&1 | grep -c "error TS"',
+  printedCount: "0",
+  pipelineExitCode: 1,
+} as const;
+
 export function tmpProject(): { root: string; cwd: string; agentDir: string } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rv-test-"));
   const cwd = path.join(root, "proj");
@@ -487,6 +575,90 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
     },
   };
   return pi;
+}
+
+// ── Boundary / provider-turn harness ─────────────────────────────────
+
+export interface BoundaryRunOptions {
+  outcome?: "completed" | "aborted" | "error";
+  messages?: unknown[];
+  entries?: unknown[];
+  pendingMessages?: unknown[];
+  contextEntries?: unknown[];
+  contextMessages?: unknown[];
+  llmMessages?: unknown[];
+  canContinue?: boolean;
+}
+
+export interface BoundaryRunResult {
+  entries: unknown[];
+  continue: boolean;
+  context: {
+    contextEntries: unknown[];
+    contextMessages: unknown[];
+    llmMessages: unknown[];
+    pendingMessages: unknown[];
+    canContinue: boolean;
+  };
+  results: unknown[];
+}
+
+/**
+ * Drive one Pi `agent_before_settle` boundary with real chaining semantics:
+ * each handler sees prior entries and the current continuation decision.
+ * This is the missing piece that a plain `pi.emit()` cannot model.
+ */
+export async function runBoundary(
+  pi: FakePi,
+  ctx: unknown,
+  over: BoundaryRunOptions = {},
+): Promise<BoundaryRunResult> {
+  let entries = [...(over.entries ?? [])];
+  let continueRequested = false;
+  const context = {
+    contextEntries: [...(over.contextEntries ?? [])],
+    contextMessages: [...(over.contextMessages ?? [])],
+    llmMessages: [...(over.llmMessages ?? [])],
+    pendingMessages: [...(over.pendingMessages ?? [])],
+    canContinue: over.canContinue ?? true,
+  };
+  const results: unknown[] = [];
+  for (const handler of pi.handlers.get("agent_before_settle") ?? []) {
+    const event = {
+      type: "agent_before_settle",
+      entries: [...entries],
+      continue: continueRequested,
+      context,
+      outcome: over.outcome ?? "completed",
+      messages: over.messages ?? [],
+    };
+    const result = (await handler(event, ctx)) as
+      | { entries?: unknown[]; continue?: boolean }
+      | undefined;
+    if (result?.entries) entries = [...result.entries];
+    if (result?.continue !== undefined) continueRequested = result.continue;
+    results.push(result);
+  }
+  return { entries, continue: continueRequested, context, results };
+}
+
+/**
+ * Drive successive synthetic provider turns. A turn stops early when the
+ * boundary does not request continuation. This models the real lifecycle
+ * without a network provider or a real child session.
+ */
+export async function driveBoundaryTurns(
+  pi: FakePi,
+  ctx: unknown,
+  turns: BoundaryRunOptions[],
+): Promise<BoundaryRunResult[]> {
+  const out: BoundaryRunResult[] = [];
+  for (const turn of turns) {
+    const result = await runBoundary(pi, ctx, turn);
+    out.push(result);
+    if (!result.continue) break;
+  }
+  return out;
 }
 
 // ── Fake extension context ───────────────────────────────────────────

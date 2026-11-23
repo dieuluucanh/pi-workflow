@@ -4,6 +4,34 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Added — continuous Build execution and nonfatal shell quarantine
+
+- **Build continues through routine stops.** `agent_before_settle` adds one
+  bounded recovery/continuation message while an approved execution is active.
+  It continues through ordinary test failures and shell quarantine, and pauses
+  after three barren boundaries, a user pause/stop, or an explicit blocker.
+- **The two-attempt shell cap quarantines shell, not the run.** After the
+  second qualifying failure the run stays alive: shell tools are refused while
+  `read`/`grep`/`find`/`ls`/`edit`/`write`/LSP remain available. A required
+  shell check leaves its row **blocked/unverified**, never green. Quarantine
+  survives compaction, reload, tree/fork and child replacement; only a genuine
+  user prompt or `/shell-guard reset` starts a new shell budget.
+- **Execution controls and evidence.** `/build status|pause|resume|stop` and
+  `workflow_execution` provide status, checkpoints, row verification and
+  structured blockers. Completion claims (`done`, `toggle`, bulk update and
+  `[DONE]`) require fresh runtime evidence when a row has checks; editing source
+  invalidates it. The final plan check runs before the last acceptance, and a
+  failing or unavailable final gate cannot emit a green card.
+- **Paused recovery.** Reload/reopen/fork restores the execution paused. One
+  explicit `/build resume` continues the remaining non-shell work; persisted
+  history alone starts no provider request, edit or child.
+- **Lossless checks and child binding.** Verification commands preserve exact
+  quoting/whitespace/separators; overflow is rejected with a source diagnostic.
+  Child tasks inherit the parent shell limits/quarantine, and candidates are
+  delivered only after the child fence settles.
+- **Footer/status:** `workflow-execution` reports paused, blocked, recovering,
+  shell-quarantined and complete lifecycle state.
+
 ### Fixed — child launch, retry recovery and automatic execution start (2026-11-22)
 
 - **A prepared child is actually launched.** `createChildDispatcher.wake()`

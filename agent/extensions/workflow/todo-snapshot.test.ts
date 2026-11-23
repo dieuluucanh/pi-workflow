@@ -17,7 +17,11 @@ import {
   validateFrozenSnapshot,
   type FrozenTodoSnapshot,
 } from "./todo-snapshot.ts";
-import { extractPlanChecks, extractRowMetadata } from "./plan-checks.ts";
+import {
+  extractPlanChecks,
+  extractPlanChecksDetailed,
+  extractRowMetadata,
+} from "./plan-checks.ts";
 
 const PATH = "C:/work/.pi/plans/demo.md";
 
@@ -290,6 +294,54 @@ test("a plan without Verification has no final check commands", () => {
   assert.deepEqual(extractPlanChecks("# Plan: None\n\n## Plan Steps\n\n1. One\n"), []);
 });
 
+test("plan checks preserve exact bytes and fail closed on overflow", () => {
+  const exact = [
+    "# Plan: Exact",
+    "",
+    "## Verification",
+    "",
+    "```bash",
+    'node -e "console.log(\'a,b;c\')"',
+    'node --test "suite with spaces.test.ts"',
+    "```",
+  ].join("\n");
+  assert.deepEqual(extractPlanChecks(exact), [
+    'node -e "console.log(\'a,b;c\')"',
+    'node --test "suite with spaces.test.ts"',
+  ]);
+
+  const overflow = [
+    "# Plan: Overflow",
+    "",
+    "## Verification",
+    "```bash",
+    ...Array.from({ length: 13 }, (_, i) => `node --test check-${i + 1}.test.ts`),
+    "```",
+  ].join("\n");
+  const detailed = extractPlanChecksDetailed(overflow);
+  assert.equal(detailed.ok, false);
+  assert.match(detailed.ok ? "" : detailed.error, /more than 12/);
+
+  const tooLong = [
+    "# Plan: Long",
+    "",
+    "## Verification",
+    "```bash",
+    `node --test ${"x".repeat(4_001)}`,
+    "```",
+  ].join("\n");
+  assert.equal(extractPlanChecksDetailed(tooLong).ok, false);
+  assert.equal(
+    createFrozenTodosFromPlan({
+      planPath: PATH,
+      planText: overflow,
+      mode: "build",
+      now: 1,
+    }).ok,
+    false,
+  );
+});
+
 test("row metadata reads only labelled checks/files and their bullets", () => {
   const metadata = extractRowMetadata(
     [
@@ -311,6 +363,13 @@ test("row metadata reads only labelled checks/files and their bullets", () => {
     "npm run lint",
   ]);
   assert.deepEqual(metadata.expectedFiles, ["src/a.ts", "src/b.ts"]);
+
+  const quoted = extractRowMetadata(
+    'Acceptance: node -e "console.log(\'a,b;c\')"\n',
+  );
+  assert.deepEqual(quoted.acceptanceChecks, [
+    'node -e "console.log(\'a,b;c\')"',
+  ]);
 });
 
 test("frozen plan rows carry their body checks/files and the plan final checks", () => {

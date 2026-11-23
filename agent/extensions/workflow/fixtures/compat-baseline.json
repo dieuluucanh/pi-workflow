@@ -17,6 +17,7 @@
     "orchestrator_status",
     "orchestrator_verify",
     "questionnaire",
+    "workflow_execution",
     "workflow_todo",
     "workflow_worker_ready"
   ],
@@ -95,7 +96,8 @@
     "policy": "workflow-policy",
     "review": "workflow-review",
     "todos": "workflow-todos",
-    "orchestrator": "workflow-orchestrator"
+    "orchestrator": "workflow-orchestrator",
+    "execution": "workflow-execution"
   },
   "widgetKeys": [
     "workflow-review-status",

@@ -180,15 +180,33 @@ The guard exists because of the 2026-11-20 `erp-atom` incident: two valid but **
 - **Every shell surface gets a finite deadline.** The model's omitted `timeout` becomes 120 s; an explicit value is capped at 900 s. Both are user-owned under `workflow.shellGuard` and deliberately finite: no `0`, `off` or `unlimited` escape. A model cannot widen them or edit the settings file.
 - **What it covers.** Main `bash` and `powershell`, explorer children (the parent's effective limits are carried in `PI_SHELL_GUARD_LIMITS` and can only narrow the child's own settings) and the isolated reviewer's `review_bash`. Role, folder, read, write and commit policies still run first and keep their own refusal reasons. Human questionnaire/permission waits are not shell execution and are never timed out.
 - **Empty probes are refused before launch.** Only a direct Python-family stdin script (`python - <<'EOF'`, including `python3`/`py` and a `.exe` path) with a provably empty body and a simple delimiter is blocked. Non-empty scripts, `-c`/`-m`, script files, quoted `<<`, `<<-`, multiple heredocs and missing terminators keep the finite deadline instead. The refusal says “empty interpreter probe”, never “malformed Bash”.
-- **Bounded recovery.** A first qualifying failure (native deadline, empty-probe refusal, invalid timeout value) returns the partial output/error with guidance and allows **one changed approach**. Repeating the same command, or any second qualifying failure in the same request, latches a stop: further shell calls are blocked and the run is aborted. Nothing is replayed automatically, and a timeout never rolls back side effects — inspect before retrying a mutating command.
-- **Request scope.** The budget resets on a genuinely new idle user prompt, a new/resumed session, a rewind, or `/shell-guard reset` while idle. A steer, follow-up, extension-authored message, native retry or compaction does not re-arm a tripped request.
-- **Honest output.** A native timeout keeps the partial output and names the deadline. `/shell-guard status` shows the effective limits, their source, inherited status and the current budget; audit entries record the reason, tool, call id, deadline and failure count — never raw command text or output.
+- **Bounded recovery is nonfatal.** A first qualifying failure (native deadline, empty-probe refusal, invalid timeout value) returns the partial output/error with guidance and allows **one changed approach**. Repeating the same command, or any second qualifying failure in the same execution, **quarantines shell for that execution**; it does not abort the run. Further shell calls are refused, while non-shell tools (`read`, `grep`, `find`, `ls`, `edit`, `write`, LSP diagnostics) remain available. Nothing is replayed automatically, and a timeout never rolls back side effects.
+- **Quarantine survives boundaries.** It is not cleared by `agent_end`, compaction, an automatic continuation, a child replacement, a reload or a tree rewind. A required shell check that cannot run leaves its row/run **blocked/unverified**, never green. Only a genuine user prompt or an explicit `/shell-guard reset` starts a new shell budget; the model cannot reset it.
+- **Request scope.** The budget resets on a genuinely new idle user prompt, a new/resumed session, a rewind, or `/shell-guard reset` (including while a quarantined execution is active). A steer, follow-up, extension-authored message, native retry or compaction does not re-arm a tripped request.
+- **Honest output.** A native timeout keeps the partial output and names the deadline. `/shell-guard status` shows the effective limits, their source, inherited status and the current quarantine; audit entries record the reason, tool, call id, deadline and failure count — never raw command text or output.
+
+## Build execution continuity
+
+An approved direct-Build plan runs its frozen TODO list to completion without routine “continue” prompts. `agent_before_settle` appends one bounded continuation nudge only while an authorized unfinished execution is active. It stops for completion, user pause/stop/Esc, a structured genuine blocker, or three consecutive barren recoveries; it does not stop for a routine checkpoint or a self-assessed context limit.
+
+- `/build status|pause [reason]|resume|stop` — bare `/build` still switches mode. `resume` clears a pause/blocker but **does not** clear shell quarantine.
+- `workflow_execution` — model-facing status/checkpoint/verify/blocker tool. `verify` runs the row’s approved checks through the cancellable adapter; `blocker` records row, category, evidence references and the exact required action. It cannot grant permissions, reset the guard or mark completion.
+- Completion is runtime-gated: a row with required checks needs fresh evidence; editing source invalidates it. The final plan check runs before the last acceptance/completion card. All-cancelled lists and quarantined required checks cannot show an unqualified green card.
+- Reload/reopen/fork restores the execution **paused**. Persisted history alone starts no provider turn, edit or child; one explicit `/build resume` continues the remaining non-shell work. The footer’s `workflow-execution` segment and `/build status` explain why work stopped and what is still possible.
+
+```text
+/build status
+/build pause waiting for the API credential
+/build resume
+/build stop
+/shell-guard reset                  # the only new shell budget after quarantine
+```
 
 ```text
 /shell-guard                                    # status
 /shell-guard limits 60 300                      # global: 60s default, 300s ceiling
 /shell-guard limits 300 900 project             # this repo only
-/shell-guard reset                              # idle: clear a stopped request
+/shell-guard reset                              # clear quarantine / new budget
 ```
 
 Settings are sparse and scoped: global applies by default, a **trusted** project may override either field, and a corrupt existing file is refused rather than replaced. The hard ceiling is 3600 s; raising the defaults is an explicit user edit, not a model action.

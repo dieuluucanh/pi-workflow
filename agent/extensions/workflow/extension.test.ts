@@ -36,6 +36,7 @@ import {
   latestStatus,
   renderReviewWidget,
   renderTodoWidget,
+  runBoundary,
   stripAnsi,
   submitThenFinish,
   tmpProject,
@@ -239,6 +240,7 @@ async function boot(over: BootOptions = {}) {
     confirms,
     selects,
     customs,
+    aborts,
   } = makeFakeCtx({
     cwd,
     hasUI: over.hasUI === true,
@@ -295,6 +297,7 @@ async function boot(over: BootOptions = {}) {
     selects,
     capture,
     customs,
+    aborts,
     plannotatorRequests,
     reviewStatusRequests,
     cleanup,
@@ -4137,6 +4140,792 @@ test("RE2: the explicit direct-Build destination sends exactly one execution pro
       fs.existsSync(runsRoot) && fs.readdirSync(runsRoot).length > 0,
       false,
       "direct Build creates no orchestration run",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE3: direct Build persists control metadata and acknowledges one kickoff", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re3-build.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+
+    const kickoffs = (b.pi.entries as any[]).filter(
+      (entry) => entry.type === "workflow-execution-kickoff",
+    );
+    assert.ok(kickoffs.some((entry) => entry.data?.status === "sent"));
+
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: {
+          customType: "workflow-plan-execute",
+          content: "Execute the plan.",
+          display: true,
+        },
+      },
+      b.ctx,
+    );
+    const acknowledged = (b.pi.entries as any[]).filter(
+      (entry) =>
+        entry.type === "workflow-execution-kickoff" &&
+        entry.data?.status === "acknowledged",
+    );
+    assert.equal(acknowledged.length, 1);
+
+    const workflow = (b.pi.entries as any[])
+      .filter((entry) => entry.type === "workflow")
+      .at(-1);
+    assert.equal(workflow?.data?.execution?.owner, "build");
+    assert.equal(workflow?.data?.execution?.phase, "active");
+    assert.equal(workflow?.data?.execution?.kickoff?.status, "acknowledged");
+
+    const countExecutions = () =>
+      b.pi.sent.filter((entry: any) => {
+        const content = entry.content;
+        const text =
+          content && typeof content === "object"
+            ? String((content as any).content ?? "")
+            : String(content ?? "");
+        return text.includes("Execute the plan");
+      }).length;
+    const before = countExecutions();
+    await b.pi.emit("agent_settled", { aborted: false }, b.ctx);
+    assert.equal(
+      countExecutions(),
+      before,
+      "a settled duplicate does not send a second kickoff",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE4: agent_before_settle continues unfinished Build and stops on abort/queued work", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re4-build.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    const continued = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+    assert.equal(continued.continue, true);
+    const nudge = continued.entries.at(-1) as any;
+    assert.equal(nudge.customType, "workflow-autorun");
+    assert.match(String(nudge.content), /\[EXECUTION CONTINUE\]/);
+    assert.match(String(nudge.content), /Do not stop for a routine checkpoint/);
+
+    const aborted = await runBoundary(b.pi, b.ctx, { outcome: "aborted" });
+    assert.equal(aborted.continue, false);
+    assert.equal(aborted.entries.length, 0);
+
+    const queued = await runBoundary(b.pi, b.ctx, {
+      outcome: "completed",
+      pendingMessages: [{ role: "user", content: "already queued" }],
+    });
+    assert.equal(queued.continue, false);
+    assert.equal(queued.entries.length, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE5: second shell timeout quarantines and the boundary continues non-shell", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re5-build.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    const runShell = async (id: string) => {
+      const prepared = await b.pi.emit(
+        "tool_call",
+        { type: "tool_call", toolName: "bash", toolCallId: id, input: { command: "npm test", timeout: 120 } },
+        b.ctx,
+      );
+      assert.equal(prepared.filter((r: any) => r?.block).length, 0);
+      await b.pi.emit(
+        "tool_result",
+        {
+          type: "tool_result",
+          toolName: "bash",
+          toolCallId: id,
+          isError: true,
+          durationMs: 120_000,
+          content: [{ type: "text", text: "Command timed out after 120 seconds" }],
+        },
+        b.ctx,
+      );
+    };
+    await runShell("shell-1");
+    await runShell("shell-2");
+    assert.equal(b.aborts(), 0, "the guard never aborts the run");
+
+    const nonShell = await b.pi.emit(
+      "tool_call",
+      { type: "tool_call", toolName: "workflow_todo", toolCallId: "todo-after", input: { action: "list" } },
+      b.ctx,
+    );
+    assert.equal(nonShell.filter((r: any) => r?.block).length, 0);
+    const powershell = await b.pi.emit(
+      "tool_call",
+      { type: "tool_call", toolName: "powershell", toolCallId: "ps-after", input: { command: "Get-ChildItem" } },
+      b.ctx,
+    );
+    assert.equal(powershell.filter((r: any) => r?.block).length, 1);
+
+    const recovery = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+    assert.equal(recovery.continue, true);
+    const nudge = recovery.entries.at(-1) as any;
+    assert.equal(nudge.customType, "workflow-autorun");
+    assert.match(String(nudge.content), /SHELL QUARANTINED/);
+    assert.match(String(nudge.content), /Do not call bash/);
+    assert.match(String(nudge.content), /Do not mark a shell-dependent row complete/);
+    const secondRecovery = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+    assert.equal(secondRecovery.continue, true);
+    const thirdRecovery = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+    assert.equal(thirdRecovery.continue, false);
+    assert.ok(
+      thirdRecovery.entries.some(
+        (entry: any) => entry.customType === "workflow-autorun-paused",
+      ),
+    );
+    const context = await b.pi.emit("context", { messages: [] }, b.ctx);
+    const injected = ((context.at(-1) as any)?.messages ?? []).find(
+      (message: any) => message.customType === "workflow-execution-context",
+    );
+    assert.ok(injected);
+    assert.match(String(injected.content), /shell: QUARANTINED/);
+
+    b.setIdle(false);
+    await b.pi.commands["shell-guard"].handler("reset", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /quarantine cleared/);
+    const afterReset = await b.pi.tools.workflow_execution.execute(
+      "status",
+      { action: "status" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.doesNotMatch(JSON.stringify(afterReset), /QUARANTINED/);
+    const shellAgain = await b.pi.emit(
+      "tool_call",
+      { type: "tool_call", toolName: "bash", toolCallId: "shell-after-reset", input: { command: "grep -n foo bar.ts" } },
+      b.ctx,
+    );
+    assert.equal(shellAgain.filter((r: any) => r?.block).length, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE6: 20 voluntary stops continue to completion without a human prompt", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const today = new Date().toISOString().slice(0, 10);
+    const rel = path.join(".pi", "plans", `${today}-re6-twenty.md`);
+    const abs = path.join(b.cwd, rel);
+    const planText = [
+      "# Plan: Twenty-step autonomy",
+      "",
+      "## Plan Steps",
+      ...Array.from({ length: 20 }, (_, i) => `${i + 1}. Synthetic step ${i + 1}`),
+    ].join("\n");
+    fs.writeFileSync(abs, planText, "utf8");
+    await writeResult(b.pi, b.ctx, rel);
+    await b.pi.emit("agent_end", { messages: runMessages(rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    let continuations = 0;
+    for (let ref = 1; ref <= 20; ref += 1) {
+      const done = await b.pi.tools.workflow_todo.execute(
+        `re6-done-${ref}`,
+        { action: "done", step: ref },
+        undefined,
+        undefined,
+        b.ctx,
+      );
+      assert.doesNotMatch(JSON.stringify(done), /not found|refused/i);
+      if (ref === 1) {
+        assert.match(JSON.stringify(done), /Next execution row: 2/);
+      }
+      const boundary = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+      if (ref < 20) {
+        assert.equal(boundary.continue, true, `step ${ref} requests continuation`);
+        continuations += 1;
+      } else {
+        assert.equal(boundary.continue, false, "the final step stops");
+        assert.equal(boundary.entries.length, 0);
+      }
+    }
+    assert.equal(continuations, 19);
+
+    const executions = b.pi.sent.filter((entry: any) => {
+      const content = entry.content;
+      const text =
+        content && typeof content === "object"
+          ? String((content as any).content ?? "")
+          : String(content ?? "");
+      return text.includes("Execute the plan");
+    });
+    assert.equal(executions.length, 1, "exactly one initial kickoff");
+    const runsRoot = path.join(b.agentDir, "orchestrator", "runs");
+    assert.equal(
+      fs.existsSync(runsRoot) && fs.readdirSync(runsRoot).length > 0,
+      false,
+      "direct Build creates no orchestration run",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE7: context re-injects bounded execution state after compaction", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re7-context.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+    const results = await b.pi.emit("context", { messages: [] }, b.ctx);
+    const messages = (results.at(-1) as any)?.messages ?? [];
+    const injected = messages.find(
+      (message: any) => message.customType === "workflow-execution-context",
+    );
+    assert.ok(injected);
+    assert.match(String(injected.content), /\[EXECUTION STATE\]/);
+    assert.match(String(injected.content), /remaining: 4/);
+    assert.match(String(injected.content), /next: 1\./);
+    assert.match(String(injected.content), /Do not stop for a routine checkpoint/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE8: Build controls and workflow_execution pause, resume, block, and stop", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re8-controls.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    await b.pi.commands.build.handler("status", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /Build execution/);
+    assert.match(String(b.notifies.at(-1)?.message), /phase: active/);
+
+    b.setIdle(false);
+    await b.pi.commands["shell-guard"].handler("reset", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /cannot reset while a run is active/);
+    b.setIdle(true);
+
+    const checkpoint = await b.pi.tools.workflow_execution.execute(
+      "checkpoint",
+      { action: "checkpoint", summary: "non-shell inspection" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(checkpoint), /checkpoint recorded/i);
+
+    await b.pi.commands.build.handler("pause", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /paused/);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, false);
+
+    await b.pi.commands.build.handler("resume", b.ctx);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, true);
+
+    const blocker = await b.pi.tools.workflow_execution.execute(
+      "blocked",
+      {
+        action: "blocker",
+        category: "external",
+        rowRef: "1",
+        reason: "needs a credential",
+        requiredAction: "provide the credential",
+      },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(blocker), /Blocked recorded/);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, false);
+
+    await b.pi.commands.build.handler("resume", b.ctx);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, true);
+
+    await b.pi.commands.build.handler("pause", b.ctx);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, false);
+    await b.pi.commands.build.handler("stop", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /stopped/);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, false);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE9: three barren boundaries pause; progress resets the budget", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re9-budget.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, true);
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, true);
+    const paused = await runBoundary(b.pi, b.ctx, { outcome: "completed" });
+    assert.equal(paused.continue, false);
+    assert.ok(
+      paused.entries.some((entry: any) => entry.customType === "workflow-autorun-paused"),
+    );
+
+    await b.pi.commands.build.handler("status", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /phase: paused/);
+    await b.pi.commands.build.handler("resume", b.ctx);
+    await b.pi.tools.workflow_execution.execute(
+      "progress",
+      { action: "checkpoint", summary: "meaningful non-shell progress" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.equal((await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue, true);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE10: required row checks gate done and stale evidence is cleared", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const today = new Date().toISOString().slice(0, 10);
+    const rel = path.join(".pi", "plans", `${today}-re10-evidence.md`);
+    const abs = path.join(b.cwd, rel);
+    fs.writeFileSync(
+      abs,
+      [
+        "# Plan: Evidence gate",
+        "",
+        "## Plan Steps",
+        "",
+        "1. Implement the checked row",
+        '   Acceptance: node -e "process.exit(0)"',
+      ].join("\n"),
+      "utf8",
+    );
+    await writeResult(b.pi, b.ctx, rel);
+    await b.pi.emit("agent_end", { messages: runMessages(rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    const withoutEvidence = await b.pi.tools.workflow_todo.execute(
+      "done-without-evidence",
+      { action: "done", step: 1 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(withoutEvidence), /runtime evidence/);
+
+    const verified = await b.pi.tools.workflow_execution.execute(
+      "verify-row",
+      { action: "verify", rowRef: "1" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(verified), /verified/);
+
+    // A source mutation invalidates the evidence.
+    await b.pi.emit(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "edit",
+        toolCallId: "edit-row",
+        isError: false,
+        content: [{ type: "text", text: "edited" }],
+      },
+      b.ctx,
+    );
+    const stale = await b.pi.tools.workflow_todo.execute(
+      "done-stale",
+      { action: "done", step: 1 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(stale), /runtime evidence/);
+
+    await b.pi.tools.workflow_execution.execute(
+      "verify-again",
+      { action: "verify", rowRef: "1" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    const done = await b.pi.tools.workflow_todo.execute(
+      "done-fresh",
+      { action: "done", step: 1 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(done), /done/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE11: [DONE] cannot bypass evidence and a quarantined row stays unverified", async () => {
+  const b = await boot({
+    enabled: false,
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const today = new Date().toISOString().slice(0, 10);
+    const rel = path.join(".pi", "plans", `${today}-re11-two-checks.md`);
+    const abs = path.join(b.cwd, rel);
+    fs.writeFileSync(
+      abs,
+      [
+        "# Plan: Two checked rows",
+        "",
+        "## Plan Steps",
+        "",
+        "1. First checked row",
+        '   Acceptance: node -e "process.exit(0)"',
+        "2. Second checked row",
+        '   Acceptance: node -e "process.exit(0)"',
+      ].join("\n"),
+      "utf8",
+    );
+    await writeResult(b.pi, b.ctx, rel);
+    await b.pi.emit("agent_end", { messages: runMessages(rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    await b.pi.tools.workflow_execution.execute(
+      "verify-first",
+      { action: "verify", rowRef: "1" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    await b.pi.tools.workflow_todo.execute(
+      "done-first",
+      { action: "done", step: 1 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+
+    // A [DONE:2] tag is reverted because row 2 has no runtime evidence.
+    await b.pi.emit(
+      "turn_end",
+      {
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "[DONE:2]" }],
+        },
+        toolResults: [],
+        entries: [],
+        continue: false,
+        context: { pendingMessages: [] },
+        turnIndex: 0,
+        messageEntryId: "tag",
+        toolResultEntryIds: [],
+        outcome: "completed",
+      },
+      b.ctx,
+    );
+    const afterTag = await b.pi.tools.workflow_todo.execute(
+      "list-after-tag",
+      { action: "list" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.equal(
+      (afterTag as any).details.todos.find((item: any) => item.ref === "2")?.status,
+      "pending",
+    );
+
+    const runShell = async (id: string) => {
+      await b.pi.emit(
+        "tool_call",
+        { type: "tool_call", toolName: "bash", toolCallId: id, input: { command: "npm test", timeout: 120 } },
+        b.ctx,
+      );
+      await b.pi.emit(
+        "tool_result",
+        {
+          type: "tool_result",
+          toolName: "bash",
+          toolCallId: id,
+          isError: true,
+          durationMs: 120_000,
+          content: [{ type: "text", text: "Command timed out after 120 seconds" }],
+        },
+        b.ctx,
+      );
+    };
+    await runShell("re11-shell-1");
+    await runShell("re11-shell-2");
+
+    const blockedDone = await b.pi.tools.workflow_todo.execute(
+      "done-after-shell",
+      { action: "done", step: 2 },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(blockedDone), /runtime evidence/);
+    const blockedVerify = await b.pi.tools.workflow_execution.execute(
+      "verify-after-shell",
+      { action: "verify", rowRef: "2" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.match(JSON.stringify(blockedVerify), /quarantined/);
+    const afterShell = await b.pi.tools.workflow_todo.execute(
+      "list-after-shell",
+      { action: "list" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.equal(
+      (afterShell as any).details.todos.find((item: any) => item.ref === "2")?.status,
+      "pending",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RE12: a failing final gate and an all-cancelled list never show green", async () => {
+  const bootPlan = async (planText: string, name: string) => {
+    const b = await boot({
+      enabled: false,
+      hasUI: true,
+      customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+    });
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const rel = path.join(".pi", "plans", name);
+    fs.writeFileSync(path.join(b.cwd, rel), planText, "utf8");
+    await writeResult(b.pi, b.ctx, rel);
+    await b.pi.emit("agent_end", { messages: runMessages(rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+    return { b, rel };
+  };
+  const cards = (pi: any) =>
+    pi.sent.filter((entry: any) => {
+      const content = entry.content;
+      return content && typeof content === "object" && content.customType === "workflow-complete";
+    }).length;
+
+  const finalFail = await bootPlan(
+    [
+      "# Plan: Final failure",
+      "",
+      "## Plan Steps",
+      "1. Unchecked row",
+      "",
+      "## Verification",
+      "```bash",
+      'node -e "process.exit(1)"',
+      "```",
+    ].join("\n"),
+    "re12-final-fail.md",
+  );
+  try {
+    await finalFail.b.pi.tools.workflow_todo.execute(
+      "done",
+      { action: "done", step: 1 },
+      undefined,
+      undefined,
+      finalFail.b.ctx,
+    );
+    await finalFail.b.pi.emit("agent_end", { messages: [] }, finalFail.b.ctx);
+    assert.equal(cards(finalFail.b.pi), 0);
+    await finalFail.b.pi.commands.build.handler("status", finalFail.b.ctx);
+    assert.match(String(finalFail.b.notifies.at(-1)?.message), /phase: blocked/);
+  } finally {
+    await finalFail.b.cleanup();
+  }
+
+  const cancelled = await bootPlan(
+    "# Plan: Cancelled\n\n## Plan Steps\n\n1. Cancelled row\n",
+    "re12-cancelled.md",
+  );
+  try {
+    await cancelled.b.pi.tools.workflow_todo.execute(
+      "cancel",
+      {
+        action: "update",
+        todos: [{ ref: "1", text: "Cancelled row", status: "cancelled" }],
+      },
+      undefined,
+      undefined,
+      cancelled.b.ctx,
+    );
+    await cancelled.b.pi.emit("agent_end", { messages: [] }, cancelled.b.ctx);
+    assert.equal(cards(cancelled.b.pi), 0);
+  } finally {
+    await cancelled.b.cleanup();
+  }
+});
+
+test("RE13: reload restores paused and only an explicit resume continues", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re13-reload.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await b.pi.emit(
+      "before_agent_start",
+      {
+        messageType: "custom",
+        message: { customType: "workflow-plan-execute", content: "Execute the plan." },
+      },
+      b.ctx,
+    );
+
+    await b.pi.emit("session_start", { reason: "reload" }, b.ctx);
+    await b.pi.commands.build.handler("status", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /phase: paused/);
+    assert.equal(
+      (await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue,
+      false,
+    );
+
+    await b.pi.commands.build.handler("resume", b.ctx);
+    await b.pi.commands.build.handler("status", b.ctx);
+    assert.match(String(b.notifies.at(-1)?.message), /phase: active/);
+    assert.equal(
+      (await runBoundary(b.pi, b.ctx, { outcome: "completed" })).continue,
+      true,
     );
   } finally {
     await b.cleanup();

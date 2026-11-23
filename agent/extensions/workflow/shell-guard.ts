@@ -125,12 +125,12 @@ export function normalizeShellTimeout(
       capped: false,
     };
   }
-  const value =
-    typeof raw === "number"
-      ? raw
-      : typeof raw === "string" && raw.trim() !== ""
-        ? Number(raw)
-        : NaN;
+  let value = NaN;
+  if (typeof raw === "number") {
+    value = raw;
+  } else if (typeof raw === "string" && raw.trim() !== "") {
+    value = Number(raw);
+  }
   if (!Number.isFinite(value) || value <= 0) {
     return {
       ok: false,
@@ -433,6 +433,8 @@ export type ShellGuardDecision =
 export interface ShellGuardRecovery {
   isStopped(): boolean;
   stoppedReason(): string | undefined;
+  /** Restore a durable execution quarantine after a session reset. */
+  quarantine(input: { reason: string; command?: string; at?: number }): void;
   recordFailure(input: {
     kind: ShellGuardFailureKind;
     command: unknown;
@@ -453,7 +455,6 @@ export function shellFingerprint(command: unknown): string {
   return command.replace(/\s+/g, " ").trim().slice(0, 2_000);
 }
 
-const MAX_RECORDED_FAILURES = 20;
 
 /**
  * First qualifying failure → one changed approach. Repeating the same command,
@@ -479,10 +480,15 @@ export function createShellGuardRecovery(): ShellGuardRecovery {
       if (duplicate || failures.length >= 1) {
         stopped = duplicate
           ? "the same shell command failed again after the one allowed changed approach"
-          : "a second shell-guard failure occurred in the same request";
+          : "a second shell-guard failure occurred in the same execution";
+        failures.push({
+          kind,
+          fingerprint,
+          at: typeof at === "number" ? at : Date.now(),
+        });
         return {
           action: "stop",
-          failures: failures.length + 1,
+          failures: failures.length,
           reason: stopped,
         };
       }
@@ -499,17 +505,32 @@ export function createShellGuardRecovery(): ShellGuardRecovery {
           "one changed approach is allowed; do not repeat the failed command, and inspect any partial effects before mutating",
       };
     },
+    quarantine({ reason, command, at }) {
+      if (stopped !== undefined) return;
+      failures.push({
+        kind: "timeout",
+        fingerprint: shellFingerprint(command ?? reason),
+        at: typeof at === "number" ? at : Date.now(),
+      });
+      stopped = reason;
+    },
     reset() {
       failures.length = 0;
       stopped = undefined;
     },
     snapshot() {
-      return {
+      const snapshot: {
+        failures: number;
+        stopped: boolean;
+        stoppedReason?: string;
+        kinds: ShellGuardFailureKind[];
+      } = {
         failures: failures.length,
         stopped: stopped !== undefined,
-        ...(stopped !== undefined ? { stoppedReason: stopped } : {}),
         kinds: failures.map((f) => f.kind),
       };
+      if (stopped !== undefined) snapshot.stoppedReason = stopped;
+      return snapshot;
     },
   };
 }
@@ -523,16 +544,18 @@ export function shellFailureGuidance(
     return [
       "",
       "",
-      `[shell guard stopped this request: ${decision.reason}.]`,
-      "No further shell calls will run automatically. Report what you have and wait for the user's next instruction.",
+      `[shell guard quarantined this execution: ${decision.reason}.]`,
+      "Do not call shell tools again in this execution. Continue with non-shell tools (read, grep, find, ls, edit, write, LSP diagnostics).",
+      "Do not mark a shell-dependent step complete; continue independent non-shell work. If no permitted action can advance, report a structured blocker instead of waiting for the user.",
     ].join("\n");
   }
-  const what =
-    kind === "timeout"
-      ? "The command hit the enforced deadline and was cancelled; it may have produced partial effects and partial output."
-      : kind === "empty-probe"
-        ? "The empty interpreter probe was refused before launch."
-        : "The shell timeout value was invalid, so nothing ran.";
+  let what = "The shell timeout value was invalid, so nothing ran.";
+  if (kind === "timeout") {
+    what =
+      "The command hit the enforced deadline and was cancelled; it may have produced partial effects and partial output.";
+  } else if (kind === "empty-probe") {
+    what = "The empty interpreter probe was refused before launch.";
+  }
   return [
     "",
     "",
@@ -549,7 +572,13 @@ export function classifyShellFailureText(
   text: unknown,
 ): ShellGuardFailureKind | undefined {
   if (typeof text !== "string") return undefined;
-  if (/Command timed out after \d+(?:\.\d+)? seconds/.test(text)) return "timeout";
+  // A real native timeout has no exit status. A failing test/fixture that
+  // merely prints the same sentence, followed by a real exit status, is not a
+  // timeout and must not consume the guard budget.
+  if (/Command exited with code \d+/.test(text)) return undefined;
+  if (/Command timed out after \d+(?:\.\d+)? seconds/.test(text)) {
+    return "timeout";
+  }
   return undefined;
 }
 

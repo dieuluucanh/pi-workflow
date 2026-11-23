@@ -49,6 +49,8 @@ export interface WorkerResumeSpec {
 export const ALLOWED_ENV_KEYS: ReadonlySet<string> = new Set([
   "PI_CODING_AGENT_DIR",
   "PI_DESKTOP_PROFILE",
+  "PI_SHELL_GUARD_LIMITS",
+  "PI_SHELL_GUARD_QUARANTINED",
 ]);
 
 export const FORBIDDEN_PI_ARGS = ["-p", "--print", "--no-session", "--no-extensions"] as const;

@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { readWorkerAssignment } from "./orchestrator-worker-session.ts";
 import {
   beginWorkerStart,
   deliverWake,
@@ -19,6 +20,47 @@ import {
   type WorkerSdkPort,
   type WorkerState,
 } from "./orchestrator-worker.ts";
+
+test("assignment: checkless and standalone rows remain valid", () => {
+  const entries = [
+    {
+      type: "custom",
+      customType: "workflow-managed-session",
+      data: { taskId: "task-1" },
+    },
+    {
+      type: "custom",
+      customType: "workflow-roadmap-reference",
+      data: { path: "roadmap.md", digest: "digest", revision: 1 },
+    },
+    {
+      type: "custom",
+      customType: "workflow-task-scope",
+      data: {
+        covers: [],
+        objective: "Standalone documentation task",
+        acceptanceChecks: [],
+        expectedFiles: ["docs/api.md"],
+        mutationScope: [],
+      },
+    },
+  ];
+  const read = readWorkerAssignment(entries as never);
+  assert.equal(read.ok, true);
+  if (!read.ok) return;
+  assert.deepEqual(read.scope.covers, []);
+  assert.deepEqual(read.scope.acceptanceChecks, []);
+  assert.deepEqual(read.scope.expectedFiles, ["docs/api.md"]);
+
+  const malformed = readWorkerAssignment(
+    entries.map((entry) =>
+      entry.customType === "workflow-task-scope"
+        ? { ...entry, data: { ...entry.data, acceptanceChecks: "not-a-list" } }
+        : entry,
+    ) as never,
+  );
+  assert.equal(malformed.ok, false);
+});
 
 function fakeSdk(over: Partial<WorkerSdkPort> = {}) {
   const calls: string[] = [];

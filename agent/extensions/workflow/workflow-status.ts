@@ -19,6 +19,7 @@ export const WORKFLOW_STATUS_KEYS = {
   review: "workflow-review",
   todos: "workflow-todos",
   orchestrator: "workflow-orchestrator",
+  execution: "workflow-execution",
 } as const;
 
 export interface WorkflowStatusInput {
@@ -60,6 +61,8 @@ export interface WorkflowStatusInput {
     blockedReason?: string;
     nextTaskId?: string;
   };
+  /** Direct-Build execution lifecycle, when one is active. */
+  execution?: string;
 }
 
 export interface WorkflowStatusSegments {
@@ -68,6 +71,8 @@ export interface WorkflowStatusSegments {
   policy: string;
   /** Empty unless an orchestrator run/decision is worth surfacing. */
   orchestrator: string;
+  /** Present only when a direct-Build execution needs attention. */
+  execution?: string;
 }
 
 export function buildWorkflowStatusSegments(
@@ -134,8 +139,15 @@ export function buildWorkflowStatusSegments(
         : "")
     : "";
   const orchestrator = [destination, run].filter(Boolean).join(" · ");
+  const execution = (input.execution ?? "").trim();
 
-  return { mode, profile, policy, orchestrator };
+  return {
+    mode,
+    profile,
+    policy,
+    orchestrator,
+    ...(execution ? { execution } : {}),
+  };
 }
 
 /** Sets a status only while it has text; `undefined` removes a stale key. */

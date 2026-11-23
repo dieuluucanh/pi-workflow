@@ -266,6 +266,24 @@ test("store: snapshot round-trips and a partial restore keeps present fields", (
   assert.deepEqual(restored.items.map((entry) => entry.text), ["two"]);
 });
 
+test("store: a later legacy restore cannot erase a frozen list", async () => {
+  const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
+  const frozen = createFrozenTodosFromPlan({
+    planPath: "C:/work/.pi/plans/frozen.md",
+    planText: "# Plan: Frozen\n\n## Plan Steps\n\n1. One\n2. Two\n",
+    mode: "build",
+    now: 1_000,
+  });
+  assert.equal(frozen.ok, true);
+  if (!frozen.ok) return;
+  const store = createTodoStore();
+  assert.equal(store.freeze(frozen.snapshot).ok, true);
+  store.restore({ items: [item(9, "legacy replacement")] });
+  assert.ok(store.frozen);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
+  assert.equal(store.planPath, "C:/work/.pi/plans/frozen.md");
+});
+
 test("store: ownership is explicit and enforced", () => {
   const roadmap = createTodoStore("roadmap");
   const worker = createTodoStore("worker");
