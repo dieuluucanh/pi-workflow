@@ -259,3 +259,16 @@ explicit `unsupported`/unavailable result, not a Workflow-specific fallback.
   Desktop E2E has been run. The SDK event bus is not publisher authentication.
 - Extensions are trusted executable code; this is not a sandbox boundary.
 - Approval confirms what runs, not the safety of arbitrary project scripts.
+
+
+## Multi-repository workspaces
+
+A run may declare up to eight roots. The session root is primary; declared
+roots are resolved through `realpath` and git top level, deduplicated, and
+rejected when missing, broad, duplicate or overlapping. Rows may bind one or
+more aliases; the first is the child cwd. Baselines and diffs are captured per
+root, a missing/unreadable root is a measurement failure, and committed paths
+only satisfy expected files. Row checks run in the bound root (or the single
+changed root); plan checks use `[alias] command` or `Workspace: alias`. Child
+writes remain subject to the normal folder/write policy — declaring a root is
+not a grant. Old snapshots without roots remain primary-only.

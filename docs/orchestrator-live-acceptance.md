@@ -292,3 +292,16 @@ sequence, not the visible rendering or provider behavior.
 11. Desktop shows identical entries/status/actions, no new tab.
 12. Missing Builder auth/model fails before the row is `running`, naming the
     Builder role; no orphaned child session, subagent or timer.
+
+
+## Multi-repository acceptance
+
+| Case | Expected | Status |
+| --- | --- | --- |
+| D-only row | D diff is attributed and accepted | automated (workspace-set/advance) |
+| W-only change for a D-bound row | repair, not acceptance | automated |
+| Dual W+D row | change in either allowed root | automated |
+| Missing D root | concrete measurement error; no pass | automated |
+| Pre-existing dirty D expected file | not credited unless changed | automated |
+| Reload with roots | roots restored; running row blocked; retry fresh | automated |
+| Real provider/two-repo plan | child launch and live acceptance | NOT RUN |

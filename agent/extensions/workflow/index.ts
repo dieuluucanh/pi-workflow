@@ -279,8 +279,26 @@ import { createRunJournal } from "./orchestrator-store.ts";
 import {
   createGitBaselinePort,
   createNodeJournalIo,
+  createNodeWorkspaceResolver,
+  readGitDiffPaths,
 } from "./orchestrator-adapters.ts";
 import { captureBaseline, diffSinceBaseline, type WorkspaceBaseline } from "./orchestrator-workspace.ts";
+import {
+  captureWorkspaceSetBaseline,
+  diffWorkspaceSet,
+  hasAttributableChangeInSet,
+  parseWorkspaceDeclarations,
+  primaryWorkspace,
+  resolveWorkspaceAlias,
+  resolveWorkspaceSet,
+  scopeCommandToWorkspace,
+  workspaceCheckRoot,
+  workspaceRootForRow,
+  type FrozenWorkspace,
+  type WorkspaceSet,
+  type WorkspaceSetBaseline,
+  type WorkspaceSetDiff,
+} from "./orchestrator-workspace-set.ts";
 import {
   buildOrchestratorMission,
   ORCHESTRATOR_CONTEXT_ENTRY,
@@ -854,7 +872,11 @@ export default function workflowExtension(
   /** Operator command surface; never launches children. */
   let orchestratorOperator: ReturnType<typeof createOperatorRuntime> | undefined;
   let orchestratorBaseline:
-    | { attemptId: string; baseline: WorkspaceBaseline }
+    | {
+        attemptId: string;
+        set: WorkspaceSet;
+        baseline: WorkspaceSetBaseline;
+      }
     | undefined;
   /** Last observed session model, used to resolve real budget limits. */
   let lastKnownModel:
@@ -12380,6 +12402,7 @@ ${rows}`,
     planText?: string;
     title?: string;
     steps?: string[];
+    workspaces?: Array<{ id?: string; path: string }>;
   }): Promise<
     { ok: true; text: string; details: Record<string, unknown> } |
     { ok: false; code: string; text: string }
@@ -12417,7 +12440,26 @@ ${rows}`,
           };
         }
       }
-      started = await runtime.startFromPlan({ planPath: abs, planText: text });
+      const resolved = await resolveWorkspaceSet({
+        primaryRoot: orchestratorRoot(),
+        declarations: parseWorkspaceDeclarations(text),
+        overrides: (input.workspaces ?? []).map((entry, index) => ({
+          id:
+            entry.id ??
+            (entry.path === orchestratorRoot() ? "W" : `R${index + 1}`),
+          path: entry.path,
+        })),
+        resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
+        broadRootReason: (root) => broadGrantRootReason(root, orchestratorRoot()),
+      });
+      if (!resolved.ok) {
+        return { ok: false, code: "invalid", text: resolved.error };
+      }
+      started = await runtime.startFromPlan({
+        planPath: abs,
+        planText: text,
+        workspaces: resolved.value.roots,
+      });
     } else {
       const steps = (input.steps ?? [])
         .map((step) => step.replace(/\s+/g, " ").trim())
@@ -12429,9 +12471,24 @@ ${rows}`,
           text: "Provide an approved planPath or at least one explicitly agreed step.",
         };
       }
+      const resolved = await resolveWorkspaceSet({
+        primaryRoot: orchestratorRoot(),
+        overrides: (input.workspaces ?? []).map((entry, index) => ({
+          id:
+            entry.id ??
+            (entry.path === orchestratorRoot() ? "W" : `R${index + 1}`),
+          path: entry.path,
+        })),
+        resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
+        broadRootReason: (root) => broadGrantRootReason(root, orchestratorRoot()),
+      });
+      if (!resolved.ok) {
+        return { ok: false, code: "invalid", text: resolved.error };
+      }
       started = await runtime.startFromSteps({
         title: input.title?.trim() || "Orchestrator work",
         steps,
+        workspaces: resolved.value.roots,
         sourcePath: path.join(
           getAgentDir(),
           "orchestrator",
@@ -12466,7 +12523,7 @@ ${rows}`,
     }
     return {
       ok: true,
-      text: `Orchestrator run ${view.runId} started with ${view.todos.rows.length} frozen step(s).
+      text: `Orchestrator run ${view.runId} started with ${view.todos.rows.length} frozen step(s) across ${(view.todos.workspaces ?? []).length || 1} workspace(s).
 ${dispatched.text}`,
       details: {
         runId: view.runId,
@@ -17570,43 +17627,70 @@ ${dispatched.text}`,
    * paths since the pre-work baseline. The attempt baseline is never replaced,
    * so a repair round is still attributable.
    */
+  function workspaceSetForRun(): WorkspaceSet {
+    const frozen = orchestratorRuntime?.view()?.todos.workspaces;
+    if (frozen && frozen.length > 0) {
+      const primary = frozen.find((workspace) => workspace.primary) ?? frozen[0]!;
+      return {
+        schemaVersion: 1,
+        primaryId: primary.id,
+        roots: frozen.map((workspace) => ({ ...workspace })),
+      };
+    }
+    const root = path.resolve(orchestratorRoot());
+    return {
+      schemaVersion: 1,
+      primaryId: "W",
+      roots: [
+        {
+          id: "W",
+          key: `git:${orchestratorWorkspaceKey()}`,
+          root,
+          kind: "git",
+          displayPath: orchestratorWorkspaceKey(),
+          primary: true,
+        },
+      ],
+    };
+  }
+
   async function diffOrchestratorWorkspace(
     _taskId: string,
     expectedFiles: readonly string[],
-  ): Promise<ReturnType<typeof diffSinceBaseline> | undefined> {
+    _workspaceIds: readonly string[],
+  ): Promise<
+    { ok: true; diff: WorkspaceSetDiff } | { ok: false; error: string }
+  > {
     const attempt = orchestratorBaseline;
-    if (!attempt) return undefined;
-    const root = path.resolve(orchestratorRoot());
-    const captured = await captureBaseline({
-      workspace: {
-        key: `git:${orchestratorWorkspaceKey()}`,
-        root,
-        kind: "git",
-        displayPath: orchestratorWorkspaceKey(),
-      },
+    if (!attempt) return { ok: false, error: "no attempt baseline is bound" };
+    void expectedFiles;
+    const selected = attempt.baseline.entries.map((entry) => entry.workspaceId);
+    const captured = await captureWorkspaceSetBaseline({
+      set: attempt.set,
       port: createLiveBaselinePort(),
       now: Date.now(),
+      workspaceIds: selected,
     });
-    if (!captured.ok) return undefined;
-    const current = captured.value;
-    let gitDiffPaths: string[] = [];
-    if (attempt.baseline.head && current.head && attempt.baseline.head !== current.head) {
-      const diff = runGitSync(
-        ["diff", "--name-only", `${attempt.baseline.head}..${current.head}`],
-        root,
+    if (!captured.ok) return { ok: false, error: captured.error };
+    const gitDiffPathsByWorkspace: Record<string, string[]> = {};
+    for (const before of attempt.baseline.entries) {
+      const after = captured.value.entries.find(
+        (entry) => entry.workspaceId === before.workspaceId,
       );
-      if (diff.ok) {
-        gitDiffPaths = diff.stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean);
-      }
+      if (!after || !before.baseline.head || !after.baseline.head) continue;
+      const range = readGitDiffPaths({
+        runGit: runGitSync,
+        root: after.baseline.root,
+        fromHead: before.baseline.head,
+        toHead: after.baseline.head,
+      });
+      if (!range.ok) return range;
+      gitDiffPathsByWorkspace[before.workspaceId] = range.paths;
     }
-    const result = diffSinceBaseline(attempt.baseline, current, {
-      expectedPaths: expectedFiles,
-      gitDiffPaths,
+    const diff = diffWorkspaceSet(attempt.baseline, captured.value, {
+      gitDiffPathsByWorkspace,
     });
-    return result;
+    return diff.ok ? { ok: true, diff: diff.value } : { ok: false, error: diff.error };
   }
 
   /** Build the automatic verify/accept/advance engine once per composition. */
@@ -17615,15 +17699,16 @@ ${dispatched.text}`,
     orchestratorAdvance = createOrchestratorAdvance({
       runtime: () => orchestratorRuntime,
       child: () => orchestratorChild,
-      diff: (taskId, expectedFiles) =>
-        diffOrchestratorWorkspace(taskId, expectedFiles),
-      runRowChecks: async (commands) => {
+      diff: (taskId, expectedFiles, workspaceIds) =>
+        diffOrchestratorWorkspace(taskId, expectedFiles, workspaceIds),
+      runRowChecks: async (commands, workspaceRoot) => {
         const results: Array<{ command: string; ok: boolean; output: string }> = [];
         for (const command of commands) {
           const outcome = await runVerificationCommand(
             command,
             currentSessionCtx?.signal,
             currentSessionCtx,
+            workspaceRoot,
           );
           results.push({
             command: command.slice(0, 200),
@@ -17694,7 +17779,6 @@ ${dispatched.text}`,
     ctx: ExtensionContext,
   ): OrchestratorChildController {
     if (orchestratorChild) return orchestratorChild;
-    const cwd = orchestratorRoot();
     const agentDir = getAgentDir();
     const selfPath =
       deps.selfExtensionPath ?? fileURLToPath(import.meta.url);
@@ -17717,6 +17801,21 @@ ${dispatched.text}`,
               "no Builder model is configured — set /role set builder <provider/model> or choose a profile",
           };
         }
+        const workspaceSet = workspaceSetForRun();
+        const workspaceRoot = workspaceRootForRow(workspaceSet, row);
+        const cwd = workspaceRoot?.root ?? orchestratorRoot();
+        const workspaceContext = workspaceRoot
+          ? {
+              id: workspaceRoot.id,
+              root: workspaceRoot.root,
+              primary: workspaceRoot.primary,
+              roots: workspaceSet.roots.map((workspace) => ({
+                id: workspace.id,
+                root: workspace.root,
+                primary: workspace.primary,
+              })),
+            }
+          : undefined;
         const built = await createChild({
           context: {
             version: ORCHESTRATOR_CHILD_VERSION,
@@ -17728,6 +17827,7 @@ ${dispatched.text}`,
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
+            ...(workspaceContext === undefined ? {} : { workspace: workspaceContext }),
             createdAt: Date.now(),
           },
           cwd,
@@ -17763,6 +17863,20 @@ ${dispatched.text}`,
         const view = orchestratorRuntime?.view();
         const row = view ? rowForTask(view.state, input.taskId) : undefined;
         if (!view || !row) return "Work on the assigned frozen row.";
+        const workspaceSet = workspaceSetForRun();
+        const workspaceRoot = workspaceRootForRow(workspaceSet, row);
+        const workspaceContext = workspaceRoot
+          ? {
+              id: workspaceRoot.id,
+              root: workspaceRoot.root,
+              primary: workspaceRoot.primary,
+              roots: workspaceSet.roots.map((workspace) => ({
+                id: workspace.id,
+                root: workspace.root,
+                primary: workspace.primary,
+              })),
+            }
+          : undefined;
         return buildOrchestratorChildKickoff({
           context: {
             version: ORCHESTRATOR_CHILD_VERSION,
@@ -17774,6 +17888,7 @@ ${dispatched.text}`,
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
+            ...(workspaceContext === undefined ? {} : { workspace: workspaceContext }),
             createdAt: Date.now(),
           },
           row,
@@ -17887,10 +18002,23 @@ ${dispatched.text}`,
         text: `The Build child could not start: ${prepared.error}. Nothing was journaled; fix the Builder model/auth and retry.`,
       };
     }
-    try {
-      await captureOrchestratorBaseline(attemptId);
-    } catch {
-      /* a baseline failure must not stop an explicit dispatch */
+    const workspaceSet = workspaceSetForRun();
+    const workspaceIds =
+      row.workspaces && row.workspaces.length > 0
+        ? row.workspaces
+        : workspaceSet.roots.map((workspace) => workspace.id);
+    const captured = await captureOrchestratorBaseline(
+      attemptId,
+      workspaceSet,
+      workspaceIds,
+    );
+    if (!captured.ok) {
+      controller.discardPrepared();
+      return {
+        ok: false,
+        code: "baseline",
+        text: `The workspace baseline could not be captured: ${captured.error}. The row remains pending; fix the workspace and retry.`,
+      };
     }
     const started = await runtime.applyEvent({
       type: "task.start",
@@ -17953,23 +18081,24 @@ ${dispatched.text}`,
     return createGitBaselinePort({ runGit: runGitSync });
   }
 
-  async function captureOrchestratorBaseline(attemptId: string): Promise<void> {
-    if (orchestratorBaseline?.attemptId === attemptId) return;
-    const captured = await captureBaseline({
-      workspace: {
-        key: `git:${orchestratorWorkspaceKey()}`,
-        root: path.resolve(orchestratorRoot()),
-        kind: "git",
-        displayPath: orchestratorWorkspaceKey(),
-      },
+  async function captureOrchestratorBaseline(
+    attemptId: string,
+    set: WorkspaceSet,
+    workspaceIds: readonly string[],
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (orchestratorBaseline?.attemptId === attemptId) return { ok: true };
+    const captured = await captureWorkspaceSetBaseline({
+      set,
       port: createLiveBaselinePort(),
       now: Date.now(),
+      workspaceIds,
     });
-    if (captured.ok) {
-      orchestratorBaseline = { attemptId, baseline: captured.value };
-    } else {
+    if (!captured.ok) {
       orchestratorBaseline = undefined;
+      return captured;
     }
+    orchestratorBaseline = { attemptId, set, baseline: captured.value };
+    return { ok: true };
   }
 
   /** One deterministic row/plan command, bounded and read-only by convention. */
@@ -17977,6 +18106,7 @@ ${dispatched.text}`,
     command: string,
     signal?: AbortSignal,
     ctx?: any,
+    root?: string,
   ): Promise<{ ok: boolean; output: string }> {
     if (shellGuardRuntime?.isStopped() || executionState?.shellQuarantine) {
       return {
@@ -17991,7 +18121,7 @@ ${dispatched.text}`,
       try {
         const nested = await ctx.executeTool(
           "bash",
-          { command, timeout: 120 },
+          { command: scopeCommandToWorkspace(command, root), timeout: 120 },
           { signal },
         );
         const output = (Array.isArray(nested?.content) ? nested.content : [])
@@ -18013,7 +18143,7 @@ ${dispatched.text}`,
     return new Promise((resolve) => {
       const child = spawn(command, {
         shell: true,
-        cwd: orchestratorRoot(),
+        cwd: root ?? orchestratorRoot(),
         windowsHide: true,
       });
       let stdout = "";
@@ -18071,22 +18201,37 @@ ${dispatched.text}`,
     });
   }
 
-  /** Run the plan-level Verification commands once, after the last row. */
+  /** Run the plan-level Verification commands once, in their workspace roots. */
   async function runFinalPlanChecks(): Promise<{ ok: boolean; failure?: string }> {
-    const checks =
-      orchestratorRuntime?.view()?.todos.planChecks ??
-      todos.frozen?.planChecks ??
-      [];
-    for (const command of checks) {
+    const view = orchestratorRuntime?.view();
+    const frozen = view?.todos ?? todos.frozen;
+    const set = view ? workspaceSetForRun() : undefined;
+    const specs: Array<{ command: string; workspace?: string }> =
+      frozen?.planCheckSpecs ??
+      (frozen?.planChecks.map((command) => ({ command })) ?? []);
+    for (const spec of specs ?? []) {
+      let root: string | undefined;
+      if (spec.workspace) {
+        root = resolveWorkspaceAlias(set, spec.workspace)?.root;
+        if (!root) {
+          return {
+            ok: false,
+            failure: `${spec.command.slice(0, 200)}: unknown workspace ${spec.workspace}`,
+          };
+        }
+      } else {
+        root = primaryWorkspace(set)?.root;
+      }
       const outcome = await runVerificationCommand(
-        command,
+        spec.command,
         currentSessionCtx?.signal,
         currentSessionCtx,
+        root,
       );
       if (!outcome.ok) {
         return {
           ok: false,
-          failure: `${command.slice(0, 200)}: ${outcome.output.slice(0, 500) || "non-zero exit"}`,
+          failure: `${spec.command.slice(0, 200)}: ${outcome.output.slice(0, 500) || "non-zero exit"}`,
         };
       }
     }
@@ -18264,14 +18409,15 @@ ${dispatched.text}`,
       diff: async (taskId) => {
         const view = orchestratorRuntime?.view();
         const row = view ? rowForTask(view.state, taskId) : undefined;
-        const diff = await diffOrchestratorWorkspace(
+        const measured = await diffOrchestratorWorkspace(
           taskId,
           row?.expectedFiles ?? [],
+          row?.workspaces ?? [],
         );
-        return diff
+        return measured.ok
           ? {
-              committedPaths: diff.committedPaths,
-              dirtyPaths: diff.dirtyPaths,
+              committedPaths: measured.diff.committedPaths,
+              dirtyPaths: measured.diff.dirtyPaths,
             }
           : undefined;
       },

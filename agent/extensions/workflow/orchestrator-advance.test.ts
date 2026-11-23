@@ -27,7 +27,7 @@ import {
 } from "./orchestrator-advance.ts";
 import { MAX_REPAIR_ROUNDS } from "./orchestrator-state.ts";
 import type { OrchestratorChildPhase } from "./orchestrator-child-controller.ts";
-import type { BaselineDiff } from "./orchestrator-workspace.ts";
+import type { WorkspaceSetDiff } from "./orchestrator-workspace-set.ts";
 
 const PLAN = [
   "# Plan: Advance",
@@ -119,20 +119,38 @@ function portsFor(journal: RunJournal): OrchestratorRuntimePorts {
   return { createJournal: () => journal, now: () => 1_000 };
 }
 
-function positiveDiff(overrides: Partial<BaselineDiff> = {}): BaselineDiff {
-  return {
+function positiveDiff(overrides: Partial<WorkspaceSetDiff> = {}): WorkspaceSetDiff {
+  const diff: WorkspaceSetDiff = {
     changed: true,
+    entries: [
+      {
+        workspaceId: "W",
+        root: "C:/work/W",
+        diff: {
+          changed: true,
+          committedPaths: [],
+          dirtyPaths: ["a.ts"],
+          attributionConflicts: [],
+          workspaceRevision: "rev-1",
+        },
+      },
+    ],
     committedPaths: [],
     dirtyPaths: ["a.ts"],
     attributionConflicts: [],
     workspaceRevision: "rev-1",
     ...overrides,
   };
+  if (overrides.changed !== undefined) diff.entries[0]!.diff.changed = overrides.changed;
+  if (overrides.committedPaths !== undefined) diff.entries[0]!.diff.committedPaths = [...overrides.committedPaths];
+  if (overrides.dirtyPaths !== undefined) diff.entries[0]!.diff.dirtyPaths = [...overrides.dirtyPaths];
+  if (overrides.attributionConflicts !== undefined) diff.entries[0]!.diff.attributionConflicts = [...overrides.attributionConflicts];
+  return diff;
 }
 
 interface HarnessOptions {
   plan?: string;
-  diff?: BaselineDiff | undefined;
+  diff?: WorkspaceSetDiff | undefined;
   diffDelay?: Promise<void>;
   rowChecks?: AdvancePorts["runRowChecks"];
   finalChecks?: AdvancePorts["runFinalChecks"];
@@ -188,14 +206,15 @@ function harness(options: HarnessOptions = {}) {
   const advance = createOrchestratorAdvance({
     runtime: () => runtime,
     child: () => child,
-    diff: async (_taskId, expectedFiles) => {
+    diff: async (_taskId, expectedFiles, workspaceIds) => {
       if (options.diffDelay) await options.diffDelay;
       void expectedFiles;
-      return options.diff === undefined ? positiveDiff() : options.diff;
+      void workspaceIds;
+      return { ok: true, diff: options.diff === undefined ? positiveDiff() : options.diff };
     },
     runRowChecks:
       options.rowChecks ??
-      (async (commands) => {
+      (async (commands, _root) => {
         calls.checks.push([...commands]);
         return { ok: true, results: [] };
       }),

@@ -13,10 +13,19 @@
  */
 
 import { createHash } from "node:crypto";
+import * as path from "node:path";
 
 import {
-  extractPlanChecksDetailed,
+  MAX_WORKSPACES,
+  isInsideWorkspaceRoot,
+  validateWorkspaceSet,
+  type FrozenWorkspace,
+} from "./orchestrator-workspace-set.ts";
+import { isWindowsPath } from "./orchestrator-workspace.ts";
+import {
+  extractPlanChecksWithWorkspaceDetailed,
   extractRowMetadata,
+  type PlanCheckSpec,
 } from "./plan-checks.ts";
 import {
   planStepIdFor,
@@ -50,6 +59,8 @@ export interface FrozenTodoRow {
   planStepId?: string;
   acceptanceChecks: string[];
   expectedFiles: string[];
+  /** Workspace aliases this row may attribute; first is the child cwd. */
+  workspaces?: string[];
   status: TodoStatus;
   /** 1-based source line, when the row came from a plan. */
   sourceLine?: number;
@@ -68,6 +79,10 @@ export interface FrozenTodoSnapshot {
   rows: FrozenTodoRow[];
   /** Plan-level final-gate commands; per-row checks live on the row. */
   planChecks: string[];
+  /** Optional multi-root set; absent means the legacy single session root. */
+  workspaces?: FrozenWorkspace[];
+  /** Optional per-command workspace alias; `planChecks` stays the command list. */
+  planCheckSpecs?: PlanCheckSpec[];
   createdAt: number;
 }
 
@@ -192,6 +207,7 @@ interface RawStep {
   body: string[];
   acceptanceChecks?: string[];
   expectedFiles?: string[];
+  workspaces?: string[];
 }
 
 function parsePlanSteps(markdown: string):
@@ -349,6 +365,8 @@ function buildSnapshot(input: {
   source: FrozenTodoSnapshot["source"];
   rows: RawStep[];
   planChecks?: readonly string[];
+  workspaces?: readonly FrozenWorkspace[];
+  planCheckSpecs?: readonly PlanCheckSpec[];
 }): FrozenTodoSnapshot {
   const now = input.now ?? Date.now();
   const usedIds = new Set<string>();
@@ -375,6 +393,9 @@ function buildSnapshot(input: {
       ...(planId === undefined ? {} : { planStepId: planId }),
       acceptanceChecks: [...(raw.acceptanceChecks ?? [])],
       expectedFiles: [...(raw.expectedFiles ?? [])],
+      ...(raw.workspaces === undefined || raw.workspaces.length === 0
+        ? {}
+        : { workspaces: [...raw.workspaces] }),
       status: "pending" as const,
       sourceLine: raw.sourceLine,
     } satisfies FrozenTodoRow;
@@ -386,8 +407,80 @@ function buildSnapshot(input: {
     source: input.source,
     rows,
     planChecks: [...(input.planChecks ?? [])],
+    ...(input.workspaces === undefined || input.workspaces.length === 0
+      ? {}
+      : { workspaces: input.workspaces.map((workspace) => ({ ...workspace })) }),
+    ...(input.planCheckSpecs === undefined
+      ? {}
+      : { planCheckSpecs: input.planCheckSpecs.map((spec) => ({ ...spec })) }),
     createdAt: now,
   };
+}
+
+function aliasesFor(workspaces: readonly FrozenWorkspace[] | undefined): Map<string, FrozenWorkspace> {
+  return new Map((workspaces ?? []).map((workspace) => [workspace.id.toLowerCase(), workspace]));
+}
+
+function prepareRowsWithWorkspaces(
+  rows: RawStep[],
+  workspaces: readonly FrozenWorkspace[] | undefined,
+  specs: readonly PlanCheckSpec[],
+): { ok: true; rows: RawStep[]; specs: PlanCheckSpec[] } | { ok: false; error: string } {
+  if (!workspaces || workspaces.length === 0) {
+    return { ok: true, rows, specs: [...specs] };
+  }
+  const aliases = aliasesFor(workspaces);
+  const caseInsensitive = workspaces.some((workspace) => isWindowsPath(workspace.root));
+  const outputRows: RawStep[] = [];
+  for (const row of rows) {
+    const rowWorkspaces = new Set<string>();
+    for (const alias of row.workspaces ?? []) {
+      const found = aliases.get(alias.toLowerCase());
+      if (!found) return { ok: false, error: `row references unknown workspace "${alias}"` };
+      rowWorkspaces.add(found.id);
+    }
+    const expectedFiles: string[] = [];
+    for (const file of row.expectedFiles ?? []) {
+      const normalized = file.trim().replace(/\\/g, "/");
+      if (!normalized) continue;
+      if (path.isAbsolute(normalized)) {
+        const owner = workspaces.find((workspace) =>
+          isInsideWorkspaceRoot(normalized, workspace.root, caseInsensitive),
+        );
+        if (owner) {
+          const relative = path.relative(owner.root, normalized).replace(/\\/g, "/");
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+            rowWorkspaces.add(owner.id);
+            expectedFiles.push(relative);
+            continue;
+          }
+        }
+      }
+      expectedFiles.push(file);
+    }
+    const finalWorkspaces = [...rowWorkspaces];
+    if (finalWorkspaces.length > MAX_WORKSPACES) {
+      return { ok: false, error: `row references more than ${MAX_WORKSPACES} workspaces` };
+    }
+    outputRows.push({
+      ...row,
+      expectedFiles,
+      ...(finalWorkspaces.length === 0 ? {} : { workspaces: finalWorkspaces }),
+    });
+  }
+  const outputSpecs: PlanCheckSpec[] = [];
+  for (const spec of specs) {
+    if (!spec.workspace) {
+      outputSpecs.push({ ...spec });
+      continue;
+    }
+    const found = aliases.get(spec.workspace.toLowerCase());
+    if (!found) {
+      return { ok: false, error: `check references unknown workspace "${spec.workspace}"` };
+    }
+    outputSpecs.push({ ...spec, workspace: found.id });
+  }
+  return { ok: true, rows: outputRows, specs: outputSpecs };
 }
 
 /**
@@ -395,7 +488,12 @@ function buildSnapshot(input: {
  * occurrence, in source order; no text dedupe, no truncation, no renumbering.
  */
 export function createFrozenTodosFromPlan(
-  input: FrozenTodoBuildInput & { planPath: string; planText: string },
+  input: FrozenTodoBuildInput & {
+    planPath: string;
+    planText: string;
+    workspaces?: readonly FrozenWorkspace[];
+    planCheckSpecs?: readonly PlanCheckSpec[];
+  },
 ): FrozenTodoResult {
   if (typeof input.planPath !== "string" || input.planPath.trim().length === 0) {
     return { ok: false, error: "a plan path is required" };
@@ -405,8 +503,14 @@ export function createFrozenTodosFromPlan(
   }
   const parsed = parsePlanSteps(input.planText);
   if (!parsed.ok) return parsed;
-  const extracted = extractPlanChecksDetailed(input.planText);
+  const extracted = extractPlanChecksWithWorkspaceDetailed(input.planText);
   if (!extracted.ok) return { ok: false, error: extracted.error };
+  const prepared = prepareRowsWithWorkspaces(
+    parsed.rows,
+    input.workspaces,
+    input.planCheckSpecs ?? extracted.specs,
+  );
+  if (!prepared.ok) return { ok: false, error: prepared.error };
   return {
     ok: true,
     snapshot: buildSnapshot({
@@ -419,8 +523,10 @@ export function createFrozenTodosFromPlan(
         digest: digestOf(input.planText),
         title: parsed.title,
       },
-      rows: parsed.rows,
-      planChecks: extracted.checks,
+      rows: prepared.rows,
+      planChecks: prepared.specs.map((spec) => spec.command),
+      planCheckSpecs: prepared.specs,
+      ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
       ...(input.planChecks === undefined ? {} : { planChecks: input.planChecks }),
     }),
   };
@@ -435,6 +541,8 @@ export function createFrozenTodosFromSteps(
     title: string;
     steps: readonly string[];
     sourceRef?: string;
+    workspaces?: readonly FrozenWorkspace[];
+    planCheckSpecs?: readonly PlanCheckSpec[];
   },
 ): FrozenTodoResult {
   const title = input.title.trim();
@@ -458,7 +566,9 @@ export function createFrozenTodosFromSteps(
         title,
       },
       rows: steps.map((text, index) => ({ text, label: String(index + 1), sourceLine: index + 1, body: [] })),
-      ...(input.planChecks === undefined ? {} : { planChecks: input.planChecks }),
+      planChecks: input.planCheckSpecs?.map((spec) => spec.command) ?? input.planChecks,
+      ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+      ...(input.planCheckSpecs === undefined ? {} : { planCheckSpecs: input.planCheckSpecs }),
     }),
   };
 }
@@ -497,6 +607,19 @@ export function validateFrozenSnapshot(value: unknown): FrozenTodoResult {
     return { ok: false, error: "the frozen snapshot has no rows" };
   }
   if (record.rows.length > 500) return { ok: false, error: "the frozen snapshot has too many rows" };
+  let workspaceAliases: Set<string> | undefined;
+  if (record.workspaces !== undefined) {
+    if (!Array.isArray(record.workspaces)) {
+      return { ok: false, error: "the frozen snapshot has invalid workspaces" };
+    }
+    const roots = record.workspaces as FrozenWorkspace[];
+    const checked = validateWorkspaceSet({
+      roots,
+      caseInsensitive: roots.some((root) => isWindowsPath(root.root)),
+    });
+    if (!checked.ok) return { ok: false, error: checked.error };
+    workspaceAliases = new Set(roots.map((root) => root.id.toLowerCase()));
+  }
   const ids = new Set<string>();
   const refs = new Set<string>();
   let inProgress = 0;
@@ -527,10 +650,51 @@ export function validateFrozenSnapshot(value: unknown): FrozenTodoResult {
     if (!Array.isArray(row.expectedFiles) || row.expectedFiles.some((f) => typeof f !== "string")) {
       return { ok: false, error: `row ${index + 1} has invalid files` };
     }
+    if (row.workspaces !== undefined) {
+      if (!Array.isArray(row.workspaces) || row.workspaces.some((w) => typeof w !== "string")) {
+        return { ok: false, error: `row ${index + 1} has invalid workspaces` };
+      }
+      if (row.workspaces.length > MAX_WORKSPACES) {
+        return { ok: false, error: `row ${index + 1} has too many workspaces` };
+      }
+      if (workspaceAliases) {
+        for (const alias of row.workspaces) {
+          if (!workspaceAliases.has(String(alias).toLowerCase())) {
+            return { ok: false, error: `row ${index + 1} references unknown workspace "${String(alias)}"` };
+          }
+        }
+      }
+    }
   }
   if (inProgress > 1) return { ok: false, error: "more than one row is in progress" };
   if (!Array.isArray(record.planChecks) || record.planChecks.some((c) => typeof c !== "string")) {
     return { ok: false, error: "the frozen snapshot has invalid plan checks" };
+  }
+  const planChecks = record.planChecks as string[];
+  if (record.planCheckSpecs !== undefined) {
+    if (!Array.isArray(record.planCheckSpecs)) {
+      return { ok: false, error: "the frozen snapshot has invalid plan check specs" };
+    }
+    if (record.planCheckSpecs.length > MAX_WORKSPACES + 12) {
+      return { ok: false, error: "the frozen snapshot has too many plan check specs" };
+    }
+    for (const [index, specValue] of record.planCheckSpecs.entries()) {
+      if (!specValue || typeof specValue !== "object" || Array.isArray(specValue)) {
+        return { ok: false, error: `plan check spec ${index + 1} is invalid` };
+      }
+      const spec = specValue as Record<string, unknown>;
+      if (typeof spec.command !== "string" || !planChecks.includes(spec.command)) {
+        return { ok: false, error: `plan check spec ${index + 1} has an unknown command` };
+      }
+      if (spec.workspace !== undefined) {
+        if (typeof spec.workspace !== "string") {
+          return { ok: false, error: `plan check spec ${index + 1} has an invalid workspace` };
+        }
+        if (workspaceAliases && !workspaceAliases.has(spec.workspace.toLowerCase())) {
+          return { ok: false, error: `plan check spec ${index + 1} references unknown workspace "${spec.workspace}"` };
+        }
+      }
+    }
   }
   return { ok: true, snapshot: value as FrozenTodoSnapshot };
 }

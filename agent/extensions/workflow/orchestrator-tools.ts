@@ -57,6 +57,21 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
           items: { type: "string" },
           description: "Explicitly agreed standalone steps; one frozen TODO row each.",
         },
+        workspaces: {
+          type: "array",
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Short alias, e.g. W or D." },
+              path: { type: "string", description: "Absolute path, or a path relative to the session root." },
+            },
+            required: ["path"],
+            additionalProperties: false,
+          },
+          description:
+            "Optional workspace roots for a multi-repo plan. The session root is always primary. Overrides the plan's Repositories/Workspaces declarations.",
+        },
       },
       required: [],
       additionalProperties: false,
@@ -123,7 +138,8 @@ export interface ToolReceipt {
   taskId?: string;
   nextTaskId?: string;
   counts?: { total: number; accepted: number; pending: number; running: number; blocked: number };
-  rows?: Array<{ taskId: string; ref: string; status: string; text: string }>;
+  rows?: Array<{ taskId: string; ref: string; status: string; text: string; workspaces?: string[] }>;
+  workspaces?: Array<{ id: string; root: string; kind: string; primary: boolean }>;
   blockedReason?: string;
   truncated?: boolean;
 }
@@ -156,6 +172,9 @@ export function handleOrchestratorTool(
           ref: row?.ref ?? "?",
           status: state.tasks[taskId]?.state ?? "unknown",
           text: (row?.text ?? "").slice(0, 200),
+          ...(row?.workspaces && row.workspaces.length > 0
+            ? { workspaces: [...row.workspaces] }
+            : {}),
         };
       });
       const next = state.order.find((taskId) => state.tasks[taskId]?.state === "pending");
@@ -172,6 +191,16 @@ export function handleOrchestratorTool(
             (state.blockedReason ? ` · blocked: ${state.blockedReason}` : ""),
           ...(next === undefined ? {} : { nextTaskId: next }),
           counts,
+          ...(state.todos.workspaces && state.todos.workspaces.length > 0
+            ? {
+                workspaces: state.todos.workspaces.map((workspace) => ({
+                  id: workspace.id,
+                  root: workspace.root,
+                  kind: workspace.kind,
+                  primary: workspace.primary,
+                })),
+              }
+            : {}),
           rows,
           ...(state.blockedReason === undefined ? {} : { blockedReason: state.blockedReason }),
           truncated: rows.length < state.order.length,

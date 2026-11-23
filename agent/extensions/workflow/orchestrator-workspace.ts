@@ -367,7 +367,15 @@ function normalizeDiffPath(value: string): string {
   return value.trim().replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-function samePath(fact: string, expected: string): boolean {
+function samePath(
+  fact: string,
+  expected: string,
+  caseInsensitive = false,
+): boolean {
+  if (caseInsensitive) {
+    fact = fact.toLowerCase();
+    expected = expected.toLowerCase();
+  }
   if (fact === expected) return true;
   if (expected.startsWith("*")) return fact.endsWith(expected.slice(1));
   return fact.endsWith(`/${expected}`);
@@ -432,13 +440,18 @@ export function diffSinceBaseline(
 export function hasAttributableChange(
   diff: BaselineDiff,
   expectedPaths: readonly string[] = [],
+  caseInsensitive = false,
 ): boolean {
   if (expectedPaths.length === 0) return diff.changed;
-  const expected = expectedPaths.map(normalizeDiffPath).filter(Boolean);
+  const expected = expectedPaths
+    .map(normalizeDiffPath)
+    .filter(Boolean);
   if (expected.length === 0) return diff.changed;
-  if (diff.committedPaths.length > 0) return true;
-  const observed = [...diff.dirtyPaths];
-  return observed.some((fact) =>
-    expected.some((want) => samePath(fact, want)),
-  );
+  const matches = (observed: readonly string[]): boolean =>
+    observed.some((fact) =>
+      expected.some((want) => samePath(fact, want, caseInsensitive)),
+    );
+  // A commit only satisfies a row when it touches an expected path. The old
+  // unconditional "any commit" check credited unrelated work to every row.
+  return matches(diff.committedPaths) || matches(diff.dirtyPaths);
 }

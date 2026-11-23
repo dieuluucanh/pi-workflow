@@ -125,6 +125,95 @@ export type GitRunner = (args: string[], cwd: string) => {
   error?: string;
 };
 
+export const MAX_GIT_DIFF_PATHS = 5_000;
+
+/**
+ * Real workspace resolver for the multi-root contract. All filesystem access
+ * is read-only; git is injected so tests can run without a repository.
+ */
+export function createNodeWorkspaceResolver(options: {
+  runGit: GitRunner;
+  realpath?: (value: string) => string;
+  statKind?: (value: string) => "file" | "dir" | "other" | null;
+}): import("./orchestrator-workspace-set.ts").WorkspaceSetResolver {
+  const realpath = (value: string): string | null => {
+    try {
+      return options.realpath
+        ? options.realpath(value)
+        : fs.realpathSync.native(value);
+    } catch {
+      return null;
+    }
+  };
+  const statKind = (value: string): "file" | "dir" | "other" | null => {
+    if (options.statKind) return options.statKind(value);
+    try {
+      const stat = fs.statSync(value);
+      return stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
+    } catch {
+      return null;
+    }
+  };
+  return {
+    async realpath(value) {
+      return realpath(value);
+    },
+    async statKind(value) {
+      return statKind(value);
+    },
+    async gitTopLevel(cwd) {
+      const result = options.runGit(["rev-parse", "--show-toplevel"], cwd);
+      if (!result.ok) return null;
+      const top = result.stdout.trim();
+      return top.length > 0 ? top : null;
+    },
+    async gitCommonDir(cwd) {
+      const result = options.runGit(["rev-parse", "--git-common-dir"], cwd);
+      if (!result.ok) return null;
+      const common = result.stdout.trim();
+      if (!common) return null;
+      return path.isAbsolute(common) ? common : path.resolve(cwd, common);
+    },
+  };
+}
+
+/** Per-root committed-path range for `diffWorkspaceSet`. */
+export function readGitDiffPaths(input: {
+  runGit: GitRunner;
+  root: string;
+  fromHead: string;
+  toHead: string;
+}): { ok: true; paths: string[] } | { ok: false; error: string } {
+  if (!input.fromHead || !input.toHead || input.fromHead === input.toHead) {
+    return { ok: true, paths: [] };
+  }
+  const result = input.runGit(
+    ["diff", "--name-only", `${input.fromHead}..${input.toHead}`],
+    input.root,
+  );
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.error?.trim() || "git diff --name-only failed",
+    };
+  }
+  const paths = [
+    ...new Set(
+      result.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+    ),
+  ].sort();
+  if (paths.length > MAX_GIT_DIFF_PATHS) {
+    return {
+      ok: false,
+      error: `git diff returned more than ${MAX_GIT_DIFF_PATHS} paths`,
+    };
+  }
+  return { ok: true, paths };
+}
+
 /** Parse `git status --porcelain=v1 -z` (including renames) into changes. */
 export function parsePorcelainZ(output: string): BaselineChange[] {
   const parts = output.split("\u0000").filter((entry) => entry.length > 0);

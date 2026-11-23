@@ -10,6 +10,7 @@
 
 const MAX_CHECKS = 12;
 const MAX_FILES = 20;
+const MAX_WORKSPACES = 8;
 const MAX_TEXT = 4_000;
 
 const COMMAND_PREFIX =
@@ -27,6 +28,21 @@ function exactCommand(line: string): string | undefined {
     .trim();
   if (!cleaned || !COMMAND_PREFIX.test(cleaned)) return undefined;
   return cleaned;
+}
+
+function exactCommandOnLine(
+  line: string,
+): { command: string; workspace?: string } | undefined {
+  const cleaned = line
+    .replace(/^[\s>*+-]+/, "")
+    .replace(/^`+|`+$/g, "")
+    .trim();
+  if (!cleaned) return undefined;
+  const tagged = /^\[([A-Za-z][A-Za-z0-9_-]{0,23})\]\s+(.+)$/.exec(cleaned);
+  const candidate = tagged ? tagged[2]!.trim() : cleaned;
+  const command = exactCommand(candidate);
+  if (!command) return undefined;
+  return { command, ...(tagged ? { workspace: tagged[1] } : {}) };
 }
 
 function addExact(
@@ -87,13 +103,45 @@ function splitQuotedList(value: string): string[] {
   return out;
 }
 
+export interface PlanCheckSpec {
+  command: string;
+  workspace?: string;
+}
+
 export type PlanChecksResult =
   | { ok: true; checks: string[] }
   | { ok: false; error: string };
 
-export function extractPlanChecksDetailed(markdown: string): PlanChecksResult {
+export type PlanCheckSpecsResult =
+  | { ok: true; specs: PlanCheckSpec[] }
+  | { ok: false; error: string };
+
+function addSpec(
+  specs: PlanCheckSpec[],
+  command: string,
+  workspace: string | undefined,
+): string | undefined {
+  const text = command.trim();
+  if (!text) return undefined;
+  if (text.length > MAX_TEXT) return `plan checks exceeds ${MAX_TEXT} characters`;
+  if (specs.some((spec) => spec.command === text && spec.workspace === workspace)) {
+    return undefined;
+  }
+  if (specs.length >= MAX_CHECKS) return `more than ${MAX_CHECKS} plan checks entries`;
+  specs.push({ command: text, ...(workspace === undefined ? {} : { workspace }) });
+  return undefined;
+}
+
+/**
+ * Plan-level Verification commands with an optional workspace alias. `[D] cmd`
+ * and a preceding `Workspace: D` line are metadata; command bytes are kept.
+ * The old command-only API remains below for callers/tests.
+ */
+export function extractPlanChecksWithWorkspaceDetailed(
+  markdown: string,
+): PlanCheckSpecsResult {
   if (typeof markdown !== "string" || markdown.trim().length === 0) {
-    return { ok: true, checks: [] };
+    return { ok: true, specs: [] };
   }
   const lines = markdown.split(/\r?\n/);
   let start = -1;
@@ -107,15 +155,27 @@ export function extractPlanChecksDetailed(markdown: string): PlanChecksResult {
       break;
     }
   }
-  if (start < 0) return { ok: true, checks: [] };
+  if (start < 0) return { ok: true, specs: [] };
 
-  const checks: string[] = [];
+  const specs: PlanCheckSpec[] = [];
   let error: string | undefined;
   let fence: string | undefined;
+  let workspace: string | undefined;
+  const push = (parsed: { command: string; workspace?: string } | undefined): void => {
+    if (!parsed) return;
+    const added = addSpec(specs, parsed.command, parsed.workspace ?? workspace);
+    if (added) error ??= added;
+  };
   for (let index = start; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     const heading = HEADING.exec(line);
     if (heading && heading[1]!.length <= level) break;
+    const trimmed = line.trim();
+    const label = /^workspace\s*:\s*([A-Za-z][A-Za-z0-9_-]{0,23})\s*$/i.exec(trimmed);
+    if (label) {
+      workspace = label[1];
+      continue;
+    }
     const fenceMatch = FENCE.exec(line);
     if (fenceMatch) {
       const marker = fenceMatch[1]!;
@@ -123,23 +183,20 @@ export function extractPlanChecksDetailed(markdown: string): PlanChecksResult {
       continue;
     }
     if (fence !== undefined) {
-      const command = exactCommand(line);
-      if (command) {
-        const added = addExact(checks, command, MAX_CHECKS, "plan checks");
-        if (added) error ??= added;
-      }
+      push(exactCommandOnLine(line));
       continue;
     }
     const bullet = BULLET.exec(line) ?? NUMBERED.exec(line);
-    if (bullet) {
-      const command = exactCommand(bullet[1]!);
-      if (command) {
-        const added = addExact(checks, command, MAX_CHECKS, "plan checks");
-        if (added) error ??= added;
-      }
-    }
+    if (bullet) push(exactCommandOnLine(bullet[1]!));
   }
-  return error ? { ok: false, error } : { ok: true, checks };
+  return error ? { ok: false, error } : { ok: true, specs };
+}
+
+export function extractPlanChecksDetailed(markdown: string): PlanChecksResult {
+  const result = extractPlanChecksWithWorkspaceDetailed(markdown);
+  return result.ok
+    ? { ok: true, checks: result.specs.map((spec) => spec.command) }
+    : result;
 }
 
 /** Compatibility wrapper for callers that only need display/legacy checks. */
@@ -151,7 +208,8 @@ export function extractPlanChecks(markdown: string): string[] {
 export interface RowMetadata {
   acceptanceChecks: string[];
   expectedFiles: string[];
-  /** Present when a required check/file exceeded a resource boundary. */
+  workspaces: string[];
+  /** Present when a required check/file/workspace exceeded a boundary. */
   error?: string;
 }
 
@@ -163,34 +221,39 @@ export interface RowMetadata {
 export function extractRowMetadata(body: string): RowMetadata {
   const acceptanceChecks: string[] = [];
   const expectedFiles: string[] = [];
+  const workspaces: string[] = [];
   if (typeof body !== "string" || body.trim().length === 0) {
-    return { acceptanceChecks, expectedFiles };
+    return { acceptanceChecks, expectedFiles, workspaces };
   }
-  let mode: "checks" | "files" | undefined;
+  let mode: "checks" | "files" | "workspaces" | undefined;
   let error: string | undefined;
+  const target = (): string[] =>
+    mode === "files" ? expectedFiles : mode === "workspaces" ? workspaces : acceptanceChecks;
+  const max = (): number =>
+    mode === "files" ? MAX_FILES : mode === "workspaces" ? MAX_WORKSPACES : MAX_CHECKS;
+  const label = (): string =>
+    mode === "files" ? "expected files" : mode === "workspaces" ? "workspaces" : "row checks";
   for (const rawLine of body.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) {
       mode = undefined;
       continue;
     }
-    const labelled = /^(acceptance|acceptance checks?|checks?|verify|verification|files?|expected files?|paths?)\s*:\s*(.*)$/i.exec(
-      line,
-    );
+    const labelled =
+      /^(acceptance|acceptance checks?|checks?|verify|verification|files?|expected files?|paths?|workspaces?|repos?|repositories?)\s*:\s*(.*)$/i.exec(
+        line,
+      );
     if (labelled) {
       const key = labelled[1]!.toLowerCase();
       const value = labelled[2]!.trim();
-      mode = /file|path/.test(key) ? "files" : "checks";
+      mode = /workspace|repo/.test(key)
+        ? "workspaces"
+        : /file|path/.test(key)
+          ? "files"
+          : "checks";
       if (value) {
-        const parts =
-          mode === "files" ? splitQuotedList(value) : splitQuotedList(value);
-        for (const part of parts) {
-          const added = addExact(
-            mode === "files" ? expectedFiles : acceptanceChecks,
-            part,
-            mode === "files" ? MAX_FILES : MAX_CHECKS,
-            mode === "files" ? "expected files" : "row checks",
-          );
+        for (const part of splitQuotedList(value)) {
+          const added = addExact(target(), part, max(), label());
           if (added) error ??= added;
         }
       }
@@ -202,15 +265,10 @@ export function extractRowMetadata(body: string): RowMetadata {
       mode = undefined;
       continue;
     }
-    const added = addExact(
-      mode === "files" ? expectedFiles : acceptanceChecks,
-      bullet[1]!,
-      mode === "files" ? MAX_FILES : MAX_CHECKS,
-      mode === "files" ? "expected files" : "row checks",
-    );
+    const added = addExact(target(), bullet[1]!, max(), label());
     if (added) error ??= added;
   }
   return error
-    ? { acceptanceChecks, expectedFiles, error }
-    : { acceptanceChecks, expectedFiles };
+    ? { acceptanceChecks, expectedFiles, workspaces, error }
+    : { acceptanceChecks, expectedFiles, workspaces };
 }

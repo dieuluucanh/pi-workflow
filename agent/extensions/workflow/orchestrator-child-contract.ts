@@ -33,6 +33,13 @@ export interface OrchestratorChildContext {
   mode: "build";
   /** A child may never start its own orchestration run. */
   mayOrchestrate: false;
+  /** The row's bound root and the run's other roots, for prompt context. */
+  workspace?: {
+    id: string;
+    root: string;
+    primary: boolean;
+    roots: Array<{ id: string; root: string; primary: boolean }>;
+  };
   createdAt: number;
 }
 
@@ -97,6 +104,33 @@ export function parseOrchestratorChildContext(
     typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt)
       ? Math.trunc(raw.createdAt)
       : Date.now();
+  let workspace: OrchestratorChildContext["workspace"];
+  if (raw.workspace !== undefined) {
+    if (!isRecord(raw.workspace)) return { ok: false, reason: "invalid workspace context" };
+    const id = stringField("workspace", 24);
+    void id;
+    const workspaceId = typeof raw.workspace.id === "string" ? raw.workspace.id.trim() : "";
+    const root = typeof raw.workspace.root === "string" ? raw.workspace.root.trim() : "";
+    if (!workspaceId || !root) return { ok: false, reason: "invalid workspace context" };
+    const rootsRaw = raw.workspace.roots;
+    const roots = Array.isArray(rootsRaw)
+      ? rootsRaw
+          .filter((entry): entry is Record<string, unknown> => isRecord(entry))
+          .map((entry) => ({
+            id: typeof entry.id === "string" ? entry.id.trim() : "",
+            root: typeof entry.root === "string" ? entry.root.trim() : "",
+            primary: entry.primary === true,
+          }))
+          .filter((entry) => entry.id.length > 0 && entry.root.length > 0)
+          .slice(0, 8)
+      : [];
+    workspace = {
+      id: workspaceId,
+      root,
+      primary: raw.workspace.primary === true,
+      roots,
+    };
+  }
   return {
     ok: true,
     source: "entry",
@@ -110,6 +144,7 @@ export function parseOrchestratorChildContext(
       parentSessionRef,
       mode: "build",
       mayOrchestrate: false,
+      ...(workspace === undefined ? {} : { workspace }),
       createdAt,
     },
   };
@@ -190,7 +225,9 @@ export function buildOrchestratorChildSystemPrompt(
   return [
     "[ORCHESTRATOR BUILD CHILD]",
     `You are the Build child for frozen row ${context.ref}/${context.total} of run ${context.runId} (${context.taskId}).`,
-    "You work in the same workspace as the Orchestrator parent, inside the same Pi process.",
+    context.workspace
+      ? `Your workspace root is ${context.workspace.root} (id ${context.workspace.id}). The run also measures: ${context.workspace.roots.map((root) => `${root.id}=${root.root}`).join(", ")}.`
+      : "You work inside the same Pi process as the Orchestrator parent.",
     "",
     "Rules:",
     "- Work ONLY on this row. Do not start, resume or manage an Orchestrator run; you are not the coordinator.",
@@ -230,6 +267,18 @@ export function buildOrchestratorChildKickoff(
   const files = row.expectedFiles.length
     ? row.expectedFiles.map((file) => `- ${file}`).join("\n")
     : "(not specified)";
+  const workspace = context.workspace
+    ? [
+        "## Workspace",
+        `Root: ${context.workspace.root} (id ${context.workspace.id})`,
+        "Run roots: " +
+          context.workspace.roots
+            .map((root) => `${root.id}=${root.root}${root.primary ? " (primary)" : ""}`)
+            .join(", "),
+        "Other roots follow the normal folder/write policy.",
+        "",
+      ].join("\n")
+    : "";
   const repair = input.repair?.trim()
     ? [
         "",
@@ -257,6 +306,7 @@ export function buildOrchestratorChildKickoff(
       "## Expected files",
       files,
       "",
+      workspace,
       "## Protocol",
       "1. Create your task-local TODO list now with `workflow_todo` — one item per real sub-step. Mutations are refused until it exists.",
       "2. Work the list in order. Mark a step completed immediately; keep one in progress.",

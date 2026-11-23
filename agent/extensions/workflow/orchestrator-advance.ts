@@ -24,9 +24,9 @@ import { rowForTask } from "./orchestrator-state.ts";
 import { MAX_REPAIR_ROUNDS } from "./orchestrator-state.ts";
 import type { TaskId } from "./orchestrator-types.ts";
 import {
-  hasAttributableChange,
-  type BaselineDiff,
-} from "./orchestrator-workspace.ts";
+  hasAttributableChangeInSet,
+  type WorkspaceSetDiff,
+} from "./orchestrator-workspace-set.ts";
 import type { OrchestratorChildState } from "./orchestrator-child-controller.ts";
 import type { FrozenTodoRow } from "./todo-snapshot.ts";
 
@@ -73,9 +73,11 @@ export interface AdvancePorts {
   diff(
     taskId: string,
     expectedFiles: readonly string[],
-  ): Promise<BaselineDiff | undefined>;
+    workspaceIds: readonly string[],
+  ): Promise<{ ok: true; diff: WorkspaceSetDiff } | { ok: false; error: string }>;
   runRowChecks(
     commands: readonly string[],
+    workspaceRoot?: string,
   ): Promise<{ ok: boolean; results: AdvanceRowCheckResult[]; failure?: string }>;
   runFinalChecks(): Promise<{ ok: boolean; failure?: string }>;
   dispatchNext(): Promise<{ ok: boolean; text: string }>;
@@ -345,22 +347,33 @@ export function createOrchestratorAdvance(
     if (!row) return { ok: false, action: "error", text: "the frozen row is missing" };
 
     // ── Diff gate ────────────────────────────────────────────────────
-    let diff: BaselineDiff | undefined;
+    let measured: Awaited<ReturnType<AdvancePorts["diff"]>>;
     try {
-      diff = await ports.diff(event.taskId, row.expectedFiles);
-    } catch {
-      diff = undefined;
+      measured = await ports.diff(
+        event.taskId,
+        row.expectedFiles,
+        row.workspaces ?? [],
+      );
+    } catch (error: unknown) {
+      measured = {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
-    if (!diff) {
+    if (!measured.ok) {
       return repaired(
         runtime,
         current,
         event.taskId,
-        "the workspace diff could not be measured, so the child's work cannot be attributed",
+        `the workspace diff could not be measured: ${measured.error}`,
         event.summary,
       );
     }
-    if (row.expectedFiles.length > 0 && !hasAttributableChange(diff, row.expectedFiles)) {
+    const diff = measured.diff;
+    if (
+      row.expectedFiles.length > 0 &&
+      !hasAttributableChangeInSet(diff, row.workspaces ?? [], row.expectedFiles)
+    ) {
       return repaired(
         runtime,
         current,
@@ -372,7 +385,7 @@ export function createOrchestratorAdvance(
     if (
       row.expectedFiles.length === 0 &&
       row.acceptanceChecks.length === 0 &&
-      !diff.changed
+      !hasAttributableChangeInSet(diff, row.workspaces ?? [], [])
     ) {
       return repaired(
         runtime,
@@ -386,7 +399,14 @@ export function createOrchestratorAdvance(
     // ── Row checks ───────────────────────────────────────────────────
     let checkResults: AdvanceRowCheckResult[] = [];
     if (row.acceptanceChecks.length > 0) {
-      const checks = await ports.runRowChecks(row.acceptanceChecks);
+      const explicit = row.workspaces?.[0]?.toLowerCase();
+      const explicitRoot = explicit
+        ? diff.entries.find((entry) => entry.workspaceId.toLowerCase() === explicit)?.root
+        : undefined;
+      const changed = diff.entries.filter((entry) => entry.diff.changed);
+      const checkRoot =
+        explicitRoot ?? (changed.length === 1 ? changed[0]!.root : undefined);
+      const checks = await ports.runRowChecks(row.acceptanceChecks, checkRoot);
       checkResults = checks.results;
       if (!checks.ok) {
         const failure = checks.failure ?? "a row check failed";

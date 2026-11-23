@@ -33,6 +33,7 @@ export interface ParentToolPorts {
     planPath?: string;
     title?: string;
     steps?: string[];
+    workspaces?: Array<{ id?: string; path: string }>;
   }) => Promise<
     | { ok: true; text: string; details: Record<string, unknown> }
     | { ok: false; code: string; text: string }
@@ -124,9 +125,25 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
             text: "No Orchestrator start service is bound.",
           };
         }
+        const workspaces = Array.isArray(input.workspaces)
+          ? input.workspaces
+              .filter(
+                (entry): entry is Record<string, unknown> =>
+                  !!entry && typeof entry === "object" && !Array.isArray(entry),
+              )
+              .map((entry) => ({
+                ...(typeof entry.id === "string" && entry.id.trim()
+                  ? { id: entry.id.trim() }
+                  : {}),
+                path: typeof entry.path === "string" ? entry.path.trim() : "",
+              }))
+              .filter((entry) => entry.path.length > 0)
+              .slice(0, 8)
+          : undefined;
         const started = await ports.start({
           ...(typeof input.planPath === "string" ? { planPath: input.planPath } : {}),
           ...(typeof input.title === "string" ? { title: input.title } : {}),
+          ...(workspaces && workspaces.length > 0 ? { workspaces } : {}),
           ...(Array.isArray(input.steps)
             ? {
                 steps: input.steps.filter(

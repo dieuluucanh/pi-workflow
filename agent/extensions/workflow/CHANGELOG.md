@@ -1,3 +1,9 @@
+## Unreleased
+
+- Orchestrator multi-repo workspaces: plan/row/tool declarations, per-root
+  baselines and attribution, workspace-scoped row/final checks, child cwd
+  binding, status/mission visibility, and additive old-snapshot compatibility.
+
 # Changelog
 
 All notable changes to this package are documented in this file.

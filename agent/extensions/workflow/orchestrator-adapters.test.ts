@@ -14,9 +14,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  MAX_GIT_DIFF_PATHS,
   createGitBaselinePort,
   createNodeJournalIo,
+  createNodeWorkspaceResolver,
   parsePorcelainZ,
+  readGitDiffPaths,
 } from "./orchestrator-adapters.ts";
 import { createRunJournal } from "./orchestrator-store.ts";
 import { captureBaseline } from "./orchestrator-workspace.ts";
@@ -103,6 +106,119 @@ test("baseline: content digests are real file bytes and bound to the workspace r
   } finally {
     cleanup();
   }
+});
+
+test("workspace resolver: real paths and injected git top level/common dir", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const sub = path.join(dir, "sub");
+    fs.mkdirSync(sub);
+    const file = path.join(dir, "file.txt");
+    fs.writeFileSync(file, "x");
+    const calls: string[][] = [];
+    const resolver = createNodeWorkspaceResolver({
+      runGit: (args, cwd) => {
+        calls.push(args);
+        assert.equal(cwd, dir);
+        if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+          return { ok: true, stdout: `${dir}\n` };
+        }
+        if (args[0] === "rev-parse" && args[1] === "--git-common-dir") {
+          return { ok: true, stdout: ".git\n" };
+        }
+        return { ok: false, stdout: "", error: "unexpected" };
+      },
+    });
+    assert.equal(await resolver.realpath(dir), fs.realpathSync.native(dir));
+    assert.equal(await resolver.realpath(path.join(dir, "missing")), null);
+    assert.equal(await resolver.statKind(sub), "dir");
+    assert.equal(await resolver.statKind(file), "file");
+    assert.equal(await resolver.statKind(path.join(dir, "missing")), null);
+    assert.equal(await resolver.gitTopLevel(dir), dir);
+    assert.equal(await resolver.gitCommonDir?.(dir), path.join(dir, ".git"));
+    assert.deepEqual(calls, [
+      ["rev-parse", "--show-toplevel"],
+      ["rev-parse", "--git-common-dir"],
+    ]);
+
+    const noGit = createNodeWorkspaceResolver({
+      runGit: () => ({ ok: false, stdout: "", error: "not a repo" }),
+    });
+    assert.equal(await noGit.gitTopLevel(dir), null);
+    assert.equal(await noGit.gitCommonDir?.(dir), null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("workspace resolver: a directory link resolves to the same real path", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const target = path.join(dir, "target");
+    const link = path.join(dir, "link");
+    fs.mkdirSync(target);
+    try {
+      fs.symlinkSync(target, link, "junction");
+    } catch {
+      return; // privilege/policy may refuse symlinks; the rest is covered
+    }
+    const resolver = createNodeWorkspaceResolver({
+      runGit: () => ({ ok: false, stdout: "" }),
+    });
+    assert.equal(await resolver.realpath(link), await resolver.realpath(target));
+  } finally {
+    cleanup();
+  }
+});
+
+test("git diff paths: one read-only range command, sorted and deduped", () => {
+  const calls: Array<{ args: string[]; cwd: string }> = [];
+  const result = readGitDiffPaths({
+    runGit: (args, cwd) => {
+      calls.push({ args, cwd });
+      return { ok: true, stdout: "src/b.ts\nsrc/a.ts\nsrc/a.ts\n\n" };
+    },
+    root: "C:/work/D",
+    fromHead: "aaaa",
+    toHead: "bbbb",
+  });
+  assert.deepEqual(result, { ok: true, paths: ["src/a.ts", "src/b.ts"] });
+  assert.deepEqual(calls, [
+    { args: ["diff", "--name-only", "aaaa..bbbb"], cwd: "C:/work/D" },
+  ]);
+
+  const same = readGitDiffPaths({
+    runGit: () => {
+      throw new Error("must not run");
+    },
+    root: "C:/work/D",
+    fromHead: "aaaa",
+    toHead: "aaaa",
+  });
+  assert.deepEqual(same, { ok: true, paths: [] });
+});
+
+test("git diff paths: failures and oversized ranges are errors, not empty", () => {
+  const failed = readGitDiffPaths({
+    runGit: () => ({ ok: false, stdout: "", error: "bad object" }),
+    root: "C:/work/D",
+    fromHead: "a",
+    toHead: "b",
+  });
+  assert.equal(failed.ok, false);
+  assert.match(failed.ok ? "" : failed.error, /bad object/);
+
+  const huge = readGitDiffPaths({
+    runGit: () => ({
+      ok: true,
+      stdout: Array.from({ length: MAX_GIT_DIFF_PATHS + 1 }, (_, index) => `f${index}.ts`).join("\n"),
+    }),
+    root: "C:/work/D",
+    fromHead: "a",
+    toHead: "b",
+  });
+  assert.equal(huge.ok, false);
+  assert.match(huge.ok ? "" : huge.error, /more than/);
 });
 
 test("porcelain: modifications, staged adds, deletes, renames and untracked", () => {

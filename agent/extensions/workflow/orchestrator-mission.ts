@@ -38,6 +38,7 @@ export interface OrchestratorMissionState {
   nextAction?: string;
   pendingDecision?: string;
   taskCounts?: { accepted: number; total: number };
+  workspaces?: string;
 }
 
 function phaseLine(state: OrchestratorMissionState): string {
@@ -97,6 +98,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "3. When the user agrees, freeze the work once: an approved plan (one row per plan step) or an explicitly agreed standalone step list.",
     "4. Call orchestrator_start. The extension freezes the TODO list and runs one in-process Build child per frozen row; no window or tab is opened.",
     "5. Children advance automatically: on a natural settle the extension reports, runs the row checks plus the attributable diff, accepts on pass and dispatches the next row.",
+    "6. Every declared workspace root is measured; a frozen row may bind its work with `Workspaces:` and its first alias becomes the child cwd.",
     "6. A failed check starts a bounded repair on the same attempt. Only exhaustion, a provider failure or the user pauses the run and wakes you.",
     "",
     "Work entry (do this instead of changing mode):",
@@ -115,6 +117,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "- Never ask the user to switch to /build in order to perform orchestration work. /build leaves this mode; only the user chooses that deliberately.",
     "- Never claim work is complete because a child reported it, a TODO is checked, or a command exited zero. Acceptance is mechanical (checks + attributable diff).",
     "",
+    ...(state.workspaces ? [`Workspace roots: ${state.workspaces}`] : []),
     phaseLine(state),
     nextLine(state),
   ];

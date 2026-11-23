@@ -186,6 +186,34 @@ may still show the Orchestrator status/actions rows published here.
   the host-issued, registration-bound grant, and a host without that seam is
   advertised unsupported.
 
+
+### Multi-repository workspaces
+
+The Orchestrator can verify work in more than the session's repository. A plan
+may declare roots with the existing convention:
+
+```text
+Repositories:
+- **W:** `C:/work/W`
+- **D:** `C:/work/D`
+```
+
+or a `## Workspaces` section with `W: `path`` entries. A step may bind itself
+with `Workspaces: D` (first alias becomes the child cwd) or `Workspaces: W, D`.
+A plan-level Verification command may use `[D] npm test` or a preceding
+`Workspace: D` line. `orchestrator_start` may pass `workspaces` explicitly,
+which replaces the plan declarations; the session root is always primary and a
+conflicting `W` declaration is refused. Missing, broad, duplicate or
+overlapping roots fail before a run is created.
+
+Acceptance measures every allowed root and path-scopes committed work. A
+missing root is a measurement error, never a pass. Child writes still follow
+the normal folder/write policy; declaring a root does not grant automatic
+writes or parent reads. Without `Workspaces:` a row starts in the primary root,
+so a cross-repo write may prompt exactly as it does in Build. Old runs and
+snapshots remain single-root compatible. The existing two-repo plan needs no
+edit because its `Repositories and baseline:` section is parsed directly.
+
 ## Shell guard
 
 The guard exists because of the 2026-11-20 `erp-atom` incident: two valid but **empty** `python - <<'EOF'` probes with no `timeout` waited 52m27s and 21m56s before the user aborted them. Pi's Bash tool has no default timeout; the model's `timeout` argument is optional. Prompt advice cannot make that finite, so the guard enforces it at the tool boundary.

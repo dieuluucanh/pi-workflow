@@ -164,6 +164,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
                 ? `plan ${view.plan.path} (digest ${view.plan.digest.slice(0, 12)})`
                 : `standalone: ${view.todos.source.title}`,
               `${counts.accepted}/${counts.total} accepted · ${counts.pending} pending · ${counts.running} in flight · ${counts.blocked} blocked`,
+              ...(view.todos.workspaces && view.todos.workspaces.length > 0
+                ? [`workspaces: ${view.todos.workspaces.map((workspace) => `${workspace.id}=${workspace.root}${workspace.primary ? " (primary)" : ""}`).join(" · ")}`]
+                : []),
               ...(line ? [line] : []),
               ...(view.blockedReason ? [`blocked: ${view.blockedReason}`] : []),
               ...(view.nextTaskId ? [`next: ${view.nextTaskId}`] : []),

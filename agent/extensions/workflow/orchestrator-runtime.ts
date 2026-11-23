@@ -29,6 +29,7 @@ import {
   createFrozenTodosFromSteps,
   type FrozenTodoSnapshot,
 } from "./todo-snapshot.ts";
+import type { FrozenWorkspace, WorkspaceSet } from "./orchestrator-workspace-set.ts";
 
 export const RUNTIME_SCHEMA_VERSION = 1 as const;
 
@@ -69,6 +70,8 @@ export interface OrchestratorRuntime {
   startFromPlan(input: {
     planPath: string;
     planText: string;
+    workspaces?: readonly FrozenWorkspace[];
+    workspaceSet?: WorkspaceSet;
     executionId?: string;
     now?: number;
   }): Promise<RuntimeResult<{ runId: string; view: RuntimeView; frozen: FrozenTodoSnapshot }>>;
@@ -78,6 +81,8 @@ export interface OrchestratorRuntime {
     steps: readonly string[];
     sourcePath?: string;
     sourceRef?: string;
+    workspaces?: readonly FrozenWorkspace[];
+    workspaceSet?: WorkspaceSet;
     executionId?: string;
     now?: number;
   }): Promise<RuntimeResult<{ runId: string; view: RuntimeView; frozen: FrozenTodoSnapshot }>>;
@@ -286,6 +291,10 @@ export function createOrchestratorRuntime(
         planPath: input.planPath,
         planText: text,
         mode: "orchestrator",
+        ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+        ...(input.workspaceSet === undefined
+          ? {}
+          : { workspaces: input.workspaceSet.roots }),
         ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
         ...(input.now === undefined ? {} : { now: input.now }),
       });
@@ -306,6 +315,10 @@ export function createOrchestratorRuntime(
         title: input.title,
         steps: input.steps,
         mode: "orchestrator",
+        ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+        ...(input.workspaceSet === undefined
+          ? {}
+          : { workspaces: input.workspaceSet.roots }),
         ...(input.sourceRef === undefined ? {} : { sourceRef: input.sourceRef }),
         ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
         ...(input.now === undefined ? {} : { now: input.now }),

@@ -628,8 +628,15 @@ function cloneFrozenSnapshot(snapshot: FrozenTodoSnapshot): FrozenTodoSnapshot {
       ...row,
       acceptanceChecks: [...row.acceptanceChecks],
       expectedFiles: [...row.expectedFiles],
+      ...(row.workspaces === undefined ? {} : { workspaces: [...row.workspaces] }),
     })),
     planChecks: [...snapshot.planChecks],
+    ...(snapshot.workspaces === undefined
+      ? {}
+      : { workspaces: snapshot.workspaces.map((workspace) => ({ ...workspace })) }),
+    ...(snapshot.planCheckSpecs === undefined
+      ? {}
+      : { planCheckSpecs: snapshot.planCheckSpecs.map((spec) => ({ ...spec })) }),
   };
 }
 
