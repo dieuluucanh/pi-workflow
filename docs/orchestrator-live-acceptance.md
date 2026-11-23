@@ -177,3 +177,48 @@ Automated gates that DID pass on 2026-11-22:
 - LSP diagnostics on the changed files were **inconclusive** (timeouts; `index.ts`
   exceeds the 5000-line LSP limit). Typecheck is the authoritative compiler
   evidence; LSP is reported separately.
+
+## 2026-11-22 launch repair — evidence and status
+
+Observed live failure before the repair:
+
+```
+[error 2147942593 (0x800700c1) when launching
+ C:\Users\Lenovo\AppData\Roaming\npm\pi --session <child>.jsonl]
+```
+
+`0x800700c1` is `ERROR_BAD_EXE_FORMAT`: Windows was asked to execute the
+extensionless npm shell shim. The child was never shown; the run journal had
+`task.started` + `task.start.intent` and the child session had only bootstrap
+metadata (no assistant turn, no start marker).
+
+Fixed in this change:
+
+- `createChildDispatcher.wake()` launches the child and awaits the sealed
+  `start-ack`; a launch refusal blocks the row (retryable), and an unacked
+  delivery stays `running`/uncertain.
+- `task.launched` is journaled; retry abandons a `running` row only after the
+  probe proves no launch and no child turn.
+- `resolvePiCli` on Windows prefers `process.execPath <cli.js>` or
+  `pi.cmd` via `cmd /c`; it never executes the extensionless shim.
+- Orchestrator handoffs consume again (`orchestrator-start`, legacy receipts
+  still parse).
+- Direct Build and Orchestrator choices report/act at the right boundary; the
+  Direct Build kickoff is released at `agent_settled`.
+
+Manual cases (must still be run in a real Terminal; NOT RUN here):
+
+| Case | Status |
+| --- | --- |
+| Approve plan → choose Orchestrator → a real child window opens and starts | **NOT RUN** |
+| Approve plan → choose direct Build → the session starts implementing with no extra prompt | **NOT RUN** |
+| `/orchestrator retry` recovers the old stuck run and opens a child | **NOT RUN** |
+| Launch refusal (missing `wt.exe`) blocks the row and retry works | **NOT RUN** |
+| Delivered-but-unacked start reports uncertain and does not relaunch | **NOT RUN** |
+| Reload mid-run restores rows/phase with no duplicate child | **NOT RUN** |
+| Windows launcher uses node/`pi.cmd`, never the npm shim | **NOT RUN** (fix verified by resolution logic + unit tests) |
+
+Automated gates after the repair: workflow `typecheck` clean; `npm test`
+**1278/1278**; `read-policy` pass; `check:policy` 100/100 in a disposable HOME;
+root `npm test` 80/80; `verify --packages workflow` 79 files ok. These do not
+substitute for the live cases above.

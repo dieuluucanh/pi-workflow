@@ -97,6 +97,17 @@ export interface OrchestratorRuntime {
   journalEvents(): Promise<RuntimeResult<readonly JournalEvent[]>>;
   view(): RuntimeView | undefined;
   restore(): Promise<RuntimeResult<RuntimeView>>;
+  /**
+   * Restore the deterministic run for an already-approved plan WITHOUT
+   * creating one. A reload uses this; a plan that never started a run stays
+   * unbound instead of getting an empty journal.
+   */
+  restoreFromPlan(input: {
+    planPath: string;
+    planText: string;
+    executionId?: string;
+    now?: number;
+  }): Promise<RuntimeResult<{ runId: string; view: RuntimeView; frozen: FrozenTodoSnapshot }>>;
   cancel(reason: string): Promise<RuntimeResult<{ view: RuntimeView }>>;
   /** Runs the plan-level final checks once, then completes the run. */
   complete(): Promise<RuntimeResult<{ view: RuntimeView }>>;
@@ -401,6 +412,39 @@ export function createOrchestratorRuntime(
       }
       state = { ...state, updatedAt: now() };
       return { ok: true, value: buildView()! };
+    },
+
+    async restoreFromPlan(input) {
+      const frozen = createFrozenTodosFromPlan({
+        planPath: input.planPath,
+        planText: input.planText,
+        mode: "orchestrator",
+        ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
+        ...(input.now === undefined ? {} : { now: input.now }),
+      });
+      if (!frozen.ok) return fail("invalid", frozen.error);
+      const candidateRunId = `run-${slug(
+        input.planPath.split(/[\\/]/).pop() ?? "plan",
+      )}-${frozen.snapshot.source.digest.slice(0, 12)}`;
+      const bound = ports.createJournal(candidateRunId);
+      const existing = await bound.load();
+      if (!existing.ok) return fail("journal", `${existing.code}: ${existing.error}`);
+      if (existing.value.events.length === 0) {
+        return fail("journal", "no run journal exists for this plan yet");
+      }
+      runId = candidateRunId;
+      journal = bound;
+      state = undefined;
+      const restored = await runtime.restore();
+      if (!restored.ok) {
+        runId = undefined;
+        journal = undefined;
+        return restored;
+      }
+      return {
+        ok: true,
+        value: { runId: candidateRunId, view: restored.value, frozen: restored.value.todos },
+      };
     },
 
     async cancel(reason) {

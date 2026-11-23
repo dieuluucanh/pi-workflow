@@ -200,3 +200,27 @@ test("plan rows keep their source order and ids through a status update", () => 
   const after = state.todos.rows.map((row) => `${row.id}|${row.ref}|${row.text}`);
   assert.deepEqual(after, before);
 });
+
+test("a running row can be blocked for an abandoned launch and retried", () => {
+  let state = created(1);
+  state = apply(state, {
+    type: "task.start",
+    now: 2,
+    taskId: "task-1",
+    attemptId: "a1",
+    sessionId: "s-1",
+  });
+  assert.equal(state.tasks["task-1"]!.state, "running");
+  state = apply(state, {
+    type: "task.block",
+    now: 3,
+    taskId: "task-1",
+    reason: "launch never observed",
+  });
+  assert.equal(state.phase, "blocked");
+  assert.match(state.tasks["task-1"]!.blockedReason ?? "", /launch never observed/);
+  state = apply(state, { type: "task.retry", now: 4, taskId: "task-1" });
+  assert.equal(state.phase, "ready");
+  assert.equal(state.tasks["task-1"]!.state, "pending");
+  assert.equal(state.blockedReason, undefined);
+});

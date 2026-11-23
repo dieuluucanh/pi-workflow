@@ -107,6 +107,19 @@ short Plan → Review → Build work keeps its current behavior.
 - **No execution budgets or parent commits.** Usage/cost caps, rollover,
   drift, parity, a second-opinion verifier and the parent commit ledger are
   gone. The child follows the normal Build commit policy.
+- **A dispatch is not a launch.** The parent shows the child window/tab and
+  waits for the child's sealed `start-ack` before reporting "Dispatched". A
+  launcher refusal blocks the row with the real reason (retryable); a delivered
+  start without an ack stays `running` as *uncertain* and is never relaunched
+  automatically.
+- **Retry recovers and dispatches.** `orchestrator_retry` and
+  `/orchestrator retry` unblock a `blocked`/`needs_fix` row and dispatch it
+  immediately. A `running` row is abandoned only when a probe proves there is
+  no launch record and no assistant turn/start marker in the child session;
+  otherwise the retry refuses and asks for inspection.
+- **The chosen execution starts immediately.** A Direct Build choice made while
+  the chooser is still inside `agent_end` is queued once and released at
+  `agent_settled`, so the user does not have to send another prompt.
 - **Failure leaves a retryable row.** A dispatch failure never loses the frozen
   list: the run stays ready/blocked with a concrete reason, and
   `orchestrator_retry` / `/orchestrator retry` resumes it.

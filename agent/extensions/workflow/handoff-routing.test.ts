@@ -217,7 +217,7 @@ test("route: consumed exactly once, with a receipt", () => {
   assert.equal(began.ok, true);
   if (!began.ok) return;
   assert.equal(began.decision.state, "routing");
-  assert.equal(began.route.kind, "orchestrator-prepare");
+  assert.equal(began.route.kind, "orchestrator-start");
 
   const wrongRoute = consumeHandoffRoute(began.decision, {
     now: 1_400,
@@ -229,7 +229,7 @@ test("route: consumed exactly once, with a receipt", () => {
 
   const done = consumeHandoffRoute(began.decision, {
     now: 1_400,
-    route: "orchestrator-prepare",
+    route: "orchestrator-start",
   });
   assert.equal(done.ok, true);
   if (!done.ok) return;
@@ -465,4 +465,32 @@ test("codec: destinations are a closed set", () => {
   assert.equal(isHandoffDestination("build"), true);
   assert.equal(isHandoffDestination("auto"), false);
   assert.equal(HANDOFF_DECISION_VERSION, 3);
+});
+
+test("route: an Orchestrator selection consumes the start kind; legacy receipts still parse", () => {
+  const selected = selectHandoffDestination(approved(), "orchestrator", 1_200);
+  assert.equal(selected.ok, true);
+  if (!selected.ok) return;
+  const began = beginHandoffRoute(selected.decision, {
+    now: 1_300,
+    destination: "orchestrator",
+  });
+  assert.equal(began.ok, true);
+  if (!began.ok) return;
+  assert.equal(began.route.kind, "orchestrator-start");
+
+  const consumed = consumeHandoffRoute(began.decision, {
+    now: 1_400,
+    route: "orchestrator-start",
+  });
+  assert.equal(consumed.ok, true);
+  if (!consumed.ok) return;
+  assert.equal(consumed.decision.state, "consumed");
+  assert.equal(consumed.decision.receipts.at(-1)?.route, "orchestrator-start");
+
+  const legacy = JSON.parse(JSON.stringify(consumed.decision));
+  legacy.receipts[legacy.receipts.length - 1].route = "orchestrator-prepare";
+  const parsed = parseHandoffDecision(legacy);
+  assert.ok(parsed);
+  assert.equal(parsed!.receipts.at(-1)?.route, "orchestrator-prepare");
 });

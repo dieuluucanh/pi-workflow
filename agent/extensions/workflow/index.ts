@@ -6978,6 +6978,7 @@ export default function workflowExtension(
       findingCount?: number;
     },
   ): Promise<"browser" | "native" | "none"> {
+    pendingExecutionKickoff = null;
     const manualSource =
       input.source === "manual" ||
       pendingHandoffSource === "manual" ||
@@ -7254,6 +7255,81 @@ export default function workflowExtension(
   }
 
   /** One execute handoff: todo list + the Build-starting message. */
+  type ExecutionKickoff = {
+    planPath: string;
+    feedback?: string;
+    source: "plannotator" | "native";
+  };
+
+  /**
+   * A direct-Build kickoff is held until the agent is idle. The execution
+   * chooser is presented from `agent_end`, where Pi is still streaming; a
+   * follow-up queued at that moment can wait for the next user prompt instead
+   * of starting the work.
+   */
+  let pendingExecutionKickoff: ExecutionKickoff | null = null;
+
+  function executionKickoffMessages(
+    ctx: ExtensionContext,
+    kickoff: ExecutionKickoff,
+  ): { planTodoListMessage: Record<string, unknown>; execMessage: string } {
+    const remainingList = formatTodoNumberedList(todos.items);
+    const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
+    const firstTodo = todos.items[0];
+    const feedbackBlock = kickoff.feedback ? `\n\nFeedback: ${kickoff.feedback}` : "";
+    return {
+      planTodoListMessage: {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
+        display: true,
+      },
+      execMessage: `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todos.items[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`,
+    };
+  }
+
+  function deliverExecutionKickoff(
+    ctx: ExtensionContext,
+    kickoff: ExecutionKickoff,
+  ): void {
+    pendingExecutionKickoff = null;
+    try {
+      const { planTodoListMessage, execMessage } = executionKickoffMessages(ctx, kickoff);
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      (pi as any).sendMessage?.(
+        {
+          customType: "workflow-plan-execute",
+          content: execMessage,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry("workflow-handoff-result", {
+        at: Date.now(),
+        choice: "execute",
+        source: kickoff.source,
+        planPath: kickoff.planPath,
+      });
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function requestExecutionKickoff(
+    ctx: ExtensionContext,
+    kickoff: ExecutionKickoff,
+  ): void {
+    pendingExecutionKickoff = kickoff;
+    // Unknown hosts are treated as idle (send now); only an explicit false is
+    // deferred, so fake/older hosts keep the previous behaviour.
+    const isIdle =
+      typeof (ctx as any).isIdle === "function" ? (ctx as any).isIdle() === true : true;
+    if (isIdle) deliverExecutionKickoff(ctx, kickoff);
+  }
+
   function sendExecuteMessages(
     ctx: ExtensionContext,
     planPath: string,
@@ -7282,39 +7358,11 @@ export default function workflowExtension(
       }
       return false;
     }
-    try {
-      const remainingList = formatTodoNumberedList(todos.items);
-      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
-      const planTodoListMessage = {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
-        display: true,
-      };
-      const firstTodo = todos.items[0];
-      const feedbackBlock = feedback ? `\n\nFeedback: ${feedback}` : "";
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remainingList}\n\nStart with: ${firstTodo ? firstTodo.text : (todos.items[0]?.text ?? "first step")}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).`;
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
-      (pi as any).sendMessage?.(
-        {
-          customType: "workflow-plan-execute",
-          content: execMessage,
-          display: true,
-        },
-        { triggerTurn: true, deliverAs: "followUp" },
-      );
-    } catch (_e) {
-      void _e;
-    }
-    try {
-      pi.appendEntry("workflow-handoff-result", {
-        at: Date.now(),
-        choice: "execute",
-        source,
-        planPath,
-      });
-    } catch (_e) {
-      void _e;
-    }
+    requestExecutionKickoff(ctx, {
+      planPath,
+      ...(feedback ? { feedback } : {}),
+      source,
+    });
     return true;
   }
 
@@ -7832,6 +7880,17 @@ export default function workflowExtension(
             }
             const started = await startOrchestratorWork(liveCtx, startRest);
             ctx.ui.notify(started.text, started.ok ? "info" : "warning");
+            updateStatus(ctx as any);
+            return;
+          }
+          // `/orchestrator retry` recovers (when proven stale) and dispatches
+          // immediately; it never relies on the operator text alone.
+          if (/^retry(?:\s|$)/i.test(text)) {
+            if (workflowMode !== "orchestrator") {
+              await switchWorkflowMode("orchestrator", ctx as any);
+            }
+            const retried = await parentTools.call("orchestrator_retry", {});
+            ctx.ui.notify(retried.text, retried.ok ? "info" : "warning");
             updateStatus(ctx as any);
             return;
           }
@@ -11397,7 +11456,7 @@ ${rows}`,
       }
       return startOrchestratorRun(owner, input);
     },
-    retry: async () => dispatchNextOrchestratorTask(),
+    probeStale: async (taskId) => probeStaleTask(taskId),
     verify: async (taskId) => verifyTaskWithRuntime(undefined, taskId),
     accept: async (taskId) => acceptTaskWithRuntime(taskId),
     dispatcher: {
@@ -12701,6 +12760,16 @@ ${rows}`,
     } catch (_e) {
       void _e;
     }
+    // A reload rebinds a run that already has a journal; it never dispatches.
+    // A running row waits for the explicit probe/retry path.
+    if (
+      workflowMode === "orchestrator" &&
+      currentPlanFile &&
+      !orchestratorRuntime &&
+      todos.frozen
+    ) {
+      await restoreOrchestratorRun(ctx as ExtensionContext);
+    }
     // Persisted default model: a side-effect-free read. Precedence is resolved
     // once, after the profile seeding below, so the profile cannot silently
     // overwrite a newer explicit choice.
@@ -12930,6 +12999,7 @@ ${rows}`,
     // The session is going away: queued transitions must observe a stale
     // lifetime and stop before persisting/publishing with this context.
     modeSessionGeneration += 1;
+    pendingExecutionKickoff = null;
     // Close any live orchestrator control/host/timers; an open control socket
     // would otherwise outlive the session.
     resetOrchestratorComposition();
@@ -15231,12 +15301,20 @@ ${rows}`,
     }
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (_event, settledCtx) => {
     // Step 14: only a real settle can close the fence — `agent_end` cannot.
     try {
       workerBinding?.noteSettled();
     } catch (_e) {
       void _e;
+    }
+    // The run is settled and the agent is idle now: release a direct-Build
+    // kickoff that was queued while the chooser was still inside `agent_end`.
+    if (pendingExecutionKickoff && workflowMode === "build") {
+      deliverExecutionKickoff(
+        (settledCtx ?? currentSessionCtx) as ExtensionContext,
+        pendingExecutionKickoff,
+      );
     }
     // The run is over (completed, aborted or errored). The /commit flow lives
     // within one run, so both the armed exemption and any unconfirmed flow are
@@ -15305,6 +15383,10 @@ ${rows}`,
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
+    // A new user prompt supersedes a queued direct-Build kickoff.
+    if ((event as { messageType?: string }).messageType === "user") {
+      pendingExecutionKickoff = null;
+    }
     // A bridge can load after workflow (or after /reload): re-detect before
     // registering so `auto` reflects the real presence at handoff time.
     refreshPlannotatorDetection(ctx as any);
@@ -15989,7 +16071,10 @@ ${rows}`,
       return;
     }
     commitHandoffDecision(began.decision);
-    if (began.route.kind === "orchestrator-prepare") {
+    if (
+      began.route.kind === "orchestrator-start" ||
+      began.route.kind === "orchestrator-prepare"
+    ) {
       await enterOrchestratorRoute(ctx, planText);
       return;
     }
@@ -16062,9 +16147,7 @@ ${rows}`,
         planText,
       });
       prepared = started.ok;
-      if (!prepared) {
-        ctx.ui.notify(started.text, "warning");
-      }
+      ctx.ui.notify(started.text, started.ok ? "info" : "warning");
     } catch (error: unknown) {
       await finishHandoffRoute(ctx, routing, {
         route: "orchestrator-start",
@@ -16199,16 +16282,48 @@ ${rows}`,
   } | null> {
     const explicit = (process.env.PI_CLI ?? "").trim();
     if (explicit) {
-      return Promise.resolve(fs.existsSync(explicit) ? { command: explicit } : null);
+      if (!fs.existsSync(explicit)) return Promise.resolve(null);
+      // A JS entrypoint must run through node; anything else is the CLI itself.
+      if (process.platform === "win32" && /\.(c|m)?js$/i.test(explicit)) {
+        return Promise.resolve({ command: process.execPath, baseArgs: [explicit] });
+      }
+      return Promise.resolve({ command: explicit });
     }
     try {
       const finder = process.platform === "win32" ? "where" : "which";
       const found = spawnSync(finder, ["pi"], { encoding: "utf8" });
-      const first = String(found.stdout ?? "")
+      const lines = String(found.stdout ?? "")
         .split(/\r?\n/)
         .map((line) => line.trim())
-        .filter(Boolean)[0];
-      return Promise.resolve(first ? { command: first } : null);
+        .filter(Boolean);
+      if (process.platform !== "win32") {
+        return Promise.resolve(lines[0] ? { command: lines[0] } : null);
+      }
+      // Windows: never exec the extensionless npm shell shim (0x800700c1).
+      const cmd = lines.find((line) => /pi\.cmd$/i.test(line));
+      const exe = lines.find((line) => /pi\.exe$/i.test(line));
+      const chosen = exe ?? cmd ?? lines[0];
+      if (!chosen) return Promise.resolve(null);
+      const cli = path.join(
+        path.dirname(chosen),
+        "node_modules",
+        "@earendil-works",
+        "pi-coding-agent",
+        "dist",
+        "cli.js",
+      );
+      if (fs.existsSync(cli)) {
+        return Promise.resolve({ command: process.execPath, baseArgs: [cli] });
+      }
+      if (cmd) {
+        return Promise.resolve({
+          command: process.env.ComSpec || "cmd.exe",
+          baseArgs: ["/c", cmd],
+        });
+      }
+      // Refuse a bare extensionless shim: Windows cannot exec it (0x800700c1).
+      if (!/.(cmd|exe|bat)$/i.test(chosen)) return Promise.resolve(null);
+      return Promise.resolve({ command: chosen });
     } catch {
       return Promise.resolve(null);
     }
@@ -16520,6 +16635,94 @@ ${rows}`,
     return dispatched.ok
       ? { ok: true, text: dispatched.text, details: dispatched.details }
       : { ok: false, code: dispatched.code, text: dispatched.text };
+  }
+
+  /**
+   * Prove a `running` row never produced a child before retry abandons it.
+   *
+   * A launch record means a window/tab may exist: refuse. Without one, the
+   * journaled intent's session id is inspected; an assistant turn or a start
+   * marker means the child may be alive: refuse. Only a session with none of
+   * those (or no resolvable session) is safe to abandon.
+   */
+  async function probeStaleTask(
+    taskId: string,
+  ): Promise<{ stale: boolean; reason: string }> {
+    const runtime = orchestratorRuntime;
+    const view = runtime?.view();
+    if (!runtime || !view) {
+      return { stale: false, reason: "No orchestrator run is bound." };
+    }
+    const task = view.state.tasks[taskId];
+    if (!task || task.state !== "running") {
+      return {
+        stale: false,
+        reason: `${taskId} is ${task?.state ?? "unknown"}; only a running row is probed.`,
+      };
+    }
+    const events = await runtime.journalEvents();
+    if (!events.ok) {
+      return { stale: false, reason: `The run journal is unreadable: ${events.error}` };
+    }
+    const payloadOf = (event: { payload: unknown }): Record<string, unknown> =>
+      event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+        ? (event.payload as Record<string, unknown>)
+        : {};
+    const attemptId = task.attemptId ?? "";
+    const launched = events.value.find(
+      (event) =>
+        event.type === "task.launched" &&
+        payloadOf(event).taskId === taskId &&
+        payloadOf(event).attemptId === attemptId,
+    );
+    if (launched) {
+      return {
+        stale: false,
+        reason: `${taskId} has a launch record; inspect the child window/tab before abandoning it.`,
+      };
+    }
+    const intent = events.value.find(
+      (event) =>
+        event.type === "task.start.intent" &&
+        payloadOf(event).taskId === taskId &&
+        payloadOf(event).attemptId === attemptId,
+    );
+    const sessionId =
+      intent && typeof payloadOf(intent).sessionId === "string"
+        ? (payloadOf(intent).sessionId as string)
+        : "";
+    if (sessionId) {
+      try {
+        const sdk = await ensureOrchestratorSdk();
+        const file = await sdk.findSessionFile?.(sessionId);
+        if (file) {
+          const started = await sdk.sessionHasStartedTurn?.(file);
+          if (started === true) {
+            return {
+              stale: false,
+              reason: `The child session ${sessionId} already started a turn; inspect it before abandoning.`,
+            };
+          }
+          if (started === undefined) {
+            return {
+              stale: false,
+              reason: `The child session ${sessionId} could not be inspected; refusing to abandon it.`,
+            };
+          }
+        }
+      } catch (error: unknown) {
+        return {
+          stale: false,
+          reason: `The child session could not be inspected: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+    }
+    return {
+      stale: true,
+      reason: `No launch record and no child turn for ${taskId}/${attemptId}; the attempt can be abandoned.`,
+    };
   }
 
   function ensureOrchestratorDispatcher(
@@ -16972,6 +17175,29 @@ ${dispatched.text}`,
       appendEntry: (type, data) => pi.appendEntry(type, data),
     });
     return orchestratorRuntime;
+  }
+
+  /**
+   * Rebind the deterministic run for the current plan after a reload. This
+   * never dispatches: a `running` row is recovered only by the explicit probe.
+   */
+  async function restoreOrchestratorRun(ctx: ExtensionContext): Promise<void> {
+    if (orchestratorRuntime?.view()) return;
+    const planPath = currentPlanFile;
+    if (!planPath) return;
+    let planText: string;
+    try {
+      planText = await fs.promises.readFile(planPath, "utf8");
+    } catch (_e) {
+      void _e;
+      return;
+    }
+    const runtime = ensureOrchestratorRuntime(ctx);
+    const restored = await runtime.restoreFromPlan({ planPath, planText });
+    if (!restored.ok) return;
+    const placed = todos.freeze(restored.value.frozen);
+    if (placed.ok) persistState();
+    updateStatus(ctx);
   }
 
   async function ensureOrchestratorOperator(

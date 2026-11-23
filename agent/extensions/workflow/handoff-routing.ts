@@ -88,7 +88,7 @@ export interface HandoffSelectionReceipt {
 export interface HandoffRouteReceipt {
   at: number;
   destination: HandoffDestination;
-  /** `direct-build` or `orchestrator-prepare`. */
+  /** `direct-build`, `orchestrator-start` (current) or the legacy `orchestrator-prepare`. */
   route: HandoffRouteKind;
   /** Set when the route was attempted but could not be applied. */
   failure?: string;
@@ -423,7 +423,7 @@ export function handoffRouteFor(decision: HandoffDecision): HandoffRoute | undef
     };
   }
   return {
-    kind: "orchestrator-prepare",
+    kind: "orchestrator-start",
     planPath: decision.planPath,
     decisionId: decision.decisionId,
     runHint: decision.planHash.slice(0, 16),
@@ -524,7 +524,7 @@ export function consumeHandoffRoute(
   if (!destination) {
     return { ok: false, code: "no-selection", error: "no destination was selected" };
   }
-  const expected = destination === "build" ? "direct-build" : "orchestrator-prepare";
+  const expected = destination === "build" ? "direct-build" : "orchestrator-start";
   if (input.route !== expected) {
     return {
       ok: false,
@@ -592,7 +592,11 @@ function parseReceipts(raw: unknown): HandoffRouteReceipt[] {
     .flatMap((entry) => {
       if (typeof entry.at !== "number") return [];
       if (!isHandoffDestination(entry.destination)) return [];
-      if (entry.route !== "direct-build" && entry.route !== "orchestrator-prepare") {
+      if (
+        entry.route !== "direct-build" &&
+        entry.route !== "orchestrator-start" &&
+        entry.route !== "orchestrator-prepare"
+      ) {
         return [];
       }
       const failure = bounded(entry.failure, 400);
@@ -600,6 +604,8 @@ function parseReceipts(raw: unknown): HandoffRouteReceipt[] {
         {
           at: entry.at,
           destination: entry.destination,
+          // Legacy receipts keep their value; only new routes write the start
+          // kind. Reading both keeps old decisions describable.
           route: entry.route,
           ...(failure ? { failure } : {}),
           ...(entry.uncertain === true ? { uncertain: true as const } : {}),

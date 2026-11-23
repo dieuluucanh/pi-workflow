@@ -4,6 +4,39 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — child launch, retry recovery and automatic execution start (2026-11-22)
+
+- **A prepared child is actually launched.** `createChildDispatcher.wake()`
+  now calls `host.launch(spec)` and awaits the child's sealed `start-ack`
+  (45 s). It no longer returns success from a map lookup, so
+  "Dispatched … waiting for the report" cannot describe a metadata-only
+  session.
+- **Launch evidence is durable.** A successful launch journals
+  `task.launched` (session ref/file and handle when available). A launch
+  refusal applies `task.block` with the real launcher reason; a
+  delivered-but-unacknowledged start remains `running` and is reported as
+  uncertain instead of being relaunched.
+- **Retry recovers stale runs.** `orchestrator_retry` accepts an optional
+  `taskId`, unblocks `blocked`/`needs_fix` rows, and abandons a `running` row
+  only when a probe proves it never launched (no `task.launched`, no assistant
+  turn, no start marker). It dispatches immediately; `/orchestrator retry` uses
+  the same path.
+- **Orchestrator handoffs consume again.** `handoffRouteFor` and
+  `consumeHandoffRoute` agree on `orchestrator-start`; legacy
+  `orchestrator-prepare` receipts still parse. Choosing Orchestrator once again
+  writes `workflow-handoff-route` and consumes the decision.
+- **The chosen execution starts without another prompt.** A Direct Build
+  kickoff queued while the chooser is inside `agent_end` is released at
+  `agent_settled` (idle), and an Orchestrator start reports its dispatch
+  outcome immediately.
+- **Windows launcher no longer executes the npm shell shim.** `resolvePiCli`
+  prefers the Pi Node entrypoint (`process.execPath <cli.js>`) or `pi.cmd`
+  via `cmd /c`; the extensionless `…\npm\pi` shim previously failed with
+  `0x800700c1` (ERROR_BAD_EXE_FORMAT).
+- **Reload restores, never re-dispatches.** `session_start` rebinds the run
+  from its journal when the frozen list is present; a `running` row waits for
+  the explicit retry/probe path.
+
 ### Changed — Orchestrator simplification: frozen plan TODOs and direct delegation (2026-11-22)
 
 **Breaking.** The Orchestrator no longer has a second planning/approval layer.

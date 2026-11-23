@@ -416,7 +416,15 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
   const now = ports.now ?? (() => Date.now());
   const prepared = new Map<
     string,
-    { spec: WorkerLaunchSpec; sessionRef: string; sessionFile?: string; grant: WorkerGrant }
+    {
+      spec: WorkerLaunchSpec;
+      sessionRef: string;
+      sessionFile?: string;
+      grant: WorkerGrant;
+      /** Set once `launch` succeeded; a retried wake never shows it twice. */
+      launched?: boolean;
+      handle?: string;
+    }
   >();
   let last: { taskId: string; attemptId: string; sessionRef: string; sessionFile?: string } | undefined;
 
@@ -444,7 +452,14 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
       };
       const existing = prepared.get(key(input.taskId, input.attemptId));
       if (existing) {
-        return { ok: true, child: { sessionRef: existing.sessionRef, taskStartId: existing.spec.taskStartId } };
+        return {
+          ok: true,
+          child: {
+            sessionRef: existing.sessionRef,
+            taskStartId: existing.spec.taskStartId,
+            ...(existing.sessionFile === undefined ? {} : { sessionFile: existing.sessionFile }),
+          },
+        };
       }
       const model = ports.builderModel(input.taskId);
       if (!model) {
@@ -521,22 +536,56 @@ export function createChildDispatcher(ports: ChildDispatcherPorts): ChildDispatc
         sessionRef: created.sessionRef,
         ...(created.sessionFile === undefined ? {} : { sessionFile: created.sessionFile }),
       };
-      const child: PreparedChild = { sessionRef: created.sessionRef, taskStartId: created.spec.taskStartId };
+      const child: PreparedChild = {
+        sessionRef: created.sessionRef,
+        taskStartId: created.spec.taskStartId,
+        ...(created.sessionFile === undefined ? {} : { sessionFile: created.sessionFile }),
+      };
       return { ok: true, child };
     },
 
     async wake(input) {
-      if (!prepared.has(key(input.taskId, input.attemptId))) {
+      const entry = prepared.get(key(input.taskId, input.attemptId));
+      if (!entry) {
         return { ok: false, error: "the child was not prepared; nothing was launched" };
       }
       const capability = await ports.host().capabilities();
       if (!capability.available) {
         return { ok: false, error: capability.reason ?? `${capability.label} cannot host a child` };
       }
-      // A delivered start is enough: the durable wake is the start. The
-      // parent does not block on an acknowledgement, so a slow/missing control
-      // channel can never strand the child.
-      return { ok: true, acknowledged: false };
+
+      // Show the child BEFORE waiting. A failed launch must leave no waiter
+      // behind, and the control server delivers the sealed `start` to a child
+      // that connects early, so a fast child cannot be missed.
+      if (entry.launched !== true) {
+        const launched = await ports.host().launch(entry.spec);
+        if (!launched.ok) {
+          return {
+            ok: false,
+            error: `the child could not be shown: ${launched.error}`,
+          };
+        }
+        entry.launched = true;
+        if (launched.handle !== undefined) entry.handle = launched.handle;
+      }
+
+      const control = ports.control();
+      const started = await control.awaitStart({
+        sessionId: entry.grant.sessionId,
+        timeoutMs: 45_000,
+      });
+      if (!started.ok) {
+        return {
+          ok: false,
+          error: started.error,
+          ...(started.uncertain ? { uncertain: true } : {}),
+        };
+      }
+      return {
+        ok: true,
+        acknowledged: true,
+        ...(entry.handle === undefined ? {} : { handle: entry.handle }),
+      };
     },
   };
 

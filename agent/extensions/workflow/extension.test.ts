@@ -4142,3 +4142,40 @@ test("RE2: the explicit direct-Build destination sends exactly one execution pro
     await b.cleanup();
   }
 });
+
+test("K: a Build choice made while streaming starts at agent_settled", async () => {
+  const b = await boot({
+    hasUI: true,
+    customAnswers: [handoffAnswer("approve"), executionAnswer("build")],
+  });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "k-deferred-build.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+
+    // The execution chooser runs inside `agent_end`, where Pi is still
+    // streaming. The kickoff must wait for the settle instead of being queued
+    // into a dying turn.
+    b.setIdle(false);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await waitFor(() => approvedDecisionId(b) !== undefined);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(
+      sentIncludes(b, "Execute the plan"),
+      false,
+      "nothing is sent while the chooser turn is still streaming",
+    );
+
+    b.setIdle(true);
+    await b.pi.emit("agent_settled", { aborted: false }, b.ctx);
+    await waitFor(() => sentIncludes(b, "Execute the plan"));
+    assert.equal(
+      sentIncludes(b, "Execute the plan"),
+      true,
+      "the queued kickoff starts the Build turn exactly at settle",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});

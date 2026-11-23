@@ -49,6 +49,7 @@ export type JournalEventType =
   | "run.transition"
   | "task.started"
   | "task.start.intent"
+  | "task.launched"
   | "task.reported"
   | "task.verified"
   | "task.needs_fix"
@@ -65,6 +66,7 @@ export const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<JournalEventType>(
   "run.transition",
   "task.started",
   "task.start.intent",
+  "task.launched",
   "task.reported",
   "task.verified",
   "task.needs_fix",

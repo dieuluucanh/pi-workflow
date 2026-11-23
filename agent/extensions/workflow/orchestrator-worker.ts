@@ -52,6 +52,10 @@ export interface WorkerSdkPort {
     sessionFile: string,
     wake: { customType: string; content: string; triggerTurn: true },
   ): Promise<void>;
+  /** Resolve a session file by id (bounded SDK session listing). */
+  findSessionFile?(sessionId: string): Promise<string | undefined>;
+  /** True when the session already holds an assistant turn or start marker. */
+  sessionHasStartedTurn?(sessionFile: string): Promise<boolean>;
 }
 
 export interface WorkerResources {

@@ -29,6 +29,7 @@ export const MAX_TOOL_TEXT = 2_000;
 export interface PreparedChild {
   sessionRef: string;
   taskStartId: string;
+  sessionFile?: string;
 }
 
 export interface DispatchPort {
@@ -45,7 +46,10 @@ export interface DispatchPort {
     taskStartId: string;
     taskId: string;
     attemptId: string;
-  }): Promise<{ ok: true; acknowledged: boolean } | { ok: false; error: string }>;
+  }): Promise<
+    | { ok: true; acknowledged: boolean; handle?: string }
+    | { ok: false; error: string; uncertain?: boolean }
+  >;
 }
 
 export interface ParentToolPorts {
@@ -74,10 +78,7 @@ export interface ParentToolPorts {
     | { ok: false; code: string; text: string }
   >;
   /** Retry the next pending row after a dispatch failure. */
-  retry?: () => Promise<
-    | { ok: true; text: string; details: Record<string, unknown> }
-    | { ok: false; code: string; text: string }
-  >;
+  probeStale?: (taskId: string) => Promise<{ stale: boolean; reason: string }>;
   /** Run the real row verification (diff + checks). */
   verify?: (taskId: string) => Promise<{
     ok: boolean;
@@ -299,7 +300,7 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       };
     }
 
-    // (5) exactly one wake.
+    // (5) exactly one wake: show the child, then wait for its start ack.
     const woken = await dispatcher.wake({
       sessionRef: prepared.child.sessionRef,
       taskStartId,
@@ -307,19 +308,60 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
       attemptId,
     });
     if (!woken.ok) {
-      // The visible window/session exists; the row is in flight and the report
-      // cannot arrive until the start turn runs. Leave the honest state.
+      if (woken.uncertain) {
+        // The child may be running; never relaunch or un-run it automatically.
+        await rt.appendJournal(
+          "run.control",
+          { action: "start-uncertain", taskId, attemptId, reason: woken.error },
+          `start-uncertain-${view.runId}-${taskId}-${attemptId}`,
+        );
+        return {
+          ok: false,
+          tool: "orchestrator_dispatch",
+          code: "uncertain",
+          text: `The child was launched but did not acknowledge its start: ${woken.error}. The row stays running; reconcile it explicitly instead of relaunching.`,
+        };
+      }
+      // The launcher refused before any child existed. Keep the row retryable.
+      await rt.applyEvent({
+        type: "task.block",
+        runId: view.runId,
+        now: now(),
+        taskId,
+        reason: `child launch failed: ${woken.error}`.slice(0, 400),
+      });
+      releaseLease();
       return {
         ok: false,
         tool: "orchestrator_dispatch",
         code: "launch",
-        text: `The child was prepared but the start could not be delivered: ${woken.error}. The frozen row is intact; retry after fixing the host.`,
+        text: `The child could not be launched: ${woken.error}. ${taskId} is blocked; /orchestrator retry re-dispatches it.`,
       };
     }
+
+    // Durable launch evidence: recovery uses its presence to distinguish a
+    // never-launched attempt from a child that may still be alive.
+    await rt.appendJournal(
+      "task.launched",
+      {
+        taskId,
+        attemptId,
+        sessionId: prepared.child.sessionRef,
+        taskStartId,
+        generation,
+        at: now(),
+        ...(prepared.child.sessionFile === undefined
+          ? {}
+          : { sessionFile: prepared.child.sessionFile }),
+        ...(woken.handle === undefined ? {} : { handle: woken.handle }),
+      },
+      `launched-${view.runId}-${taskId}-${attemptId}`,
+    );
+
     return {
       ok: true,
       tool: "orchestrator_dispatch",
-      text: `Dispatched ${taskId} to ${prepared.child.sessionRef}; waiting for the child's report.`,
+      text: `Dispatched ${taskId} to ${prepared.child.sessionRef}; the child acknowledged its start and is working.`,
       details: {
         runId: view.runId,
         taskId,
@@ -327,6 +369,10 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         sessionRef: prepared.child.sessionRef,
         taskStartId,
         generation,
+        ...(prepared.child.sessionFile === undefined
+          ? {}
+          : { sessionFile: prepared.child.sessionFile }),
+        ...(woken.handle === undefined ? {} : { handle: woken.handle }),
       },
     };
   };
@@ -387,6 +433,89 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         return accepted.ok
           ? { ok: true, tool: name, text: bounded(accepted.text), details: accepted.details ?? {} }
           : { ok: false, tool: name, code: accepted.code ?? "state", text: accepted.text };
+      }
+
+      if (name === "orchestrator_retry") {
+        const rt = ports.runtime();
+        const view = rt?.view();
+        if (!rt || !view) {
+          return { ok: false, tool: name, code: "unavailable", text: "No orchestrator run is bound." };
+        }
+        const requested = typeof input.taskId === "string" ? input.taskId : "";
+        const blocked = view.state.order.find((id) => {
+          const state = view.state.tasks[id]?.state;
+          return state === "blocked" || state === "needs_fix";
+        });
+        const running = view.state.order.find((id) => view.state.tasks[id]?.state === "running");
+        const target = requested || blocked || running;
+        if (!target) {
+          return {
+            ok: false,
+            tool: name,
+            code: "state",
+            text: "There is no blocked, repaired or stale running row to retry.",
+          };
+        }
+        const task = view.state.tasks[target];
+        if (!task) {
+          return { ok: false, tool: name, code: "state", text: `Unknown task ${target}.` };
+        }
+
+        // A running row is only abandoned when the probe proves no child ever
+        // started; otherwise two children could write the same row.
+        if (task.state === "running") {
+          if (!ports.probeStale) {
+            return {
+              ok: false,
+              tool: name,
+              code: "unavailable",
+              text: "No stale-row probe is bound; inspect the child before retrying.",
+            };
+          }
+          const probe = await ports.probeStale(target);
+          if (!probe.stale) {
+            return { ok: false, tool: name, code: "state", text: probe.reason };
+          }
+          const blockedEvent = await rt.applyEvent({
+            type: "task.block",
+            runId: view.runId,
+            now: now(),
+            taskId: target,
+            reason: `launch never observed; attempt ${task.attemptId ?? "unknown"} abandoned after probe`,
+          });
+          if (!blockedEvent.ok) {
+            return {
+              ok: false,
+              tool: name,
+              code: "journal",
+              text: `The abandoned attempt could not be recorded: ${blockedEvent.error}`,
+            };
+          }
+        }
+
+        const retried = await rt.applyEvent({
+          type: "task.retry",
+          runId: view.runId,
+          now: now(),
+          taskId: target,
+        });
+        if (!retried.ok) {
+          return { ok: false, tool: name, code: "state", text: `Cannot retry ${target}: ${retried.error}` };
+        }
+        const dispatched = await dispatch(target);
+        return dispatched.ok
+          ? {
+              ok: true,
+              tool: name,
+              text: `${target} is retried. ${dispatched.text}`,
+              details: { taskId: target, ...dispatched.details },
+            }
+          : {
+              ok: false,
+              tool: name,
+              code: dispatched.code,
+              text: `${target} is queued again, but the dispatch failed: ${dispatched.text}`,
+            };
       }
 
       const decided = handleOrchestratorTool(name, input, built.context);

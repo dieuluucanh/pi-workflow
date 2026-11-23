@@ -19,6 +19,17 @@
 >   runs are not resumed — restart from the approved plan.
 >
 > See the package README and CHANGELOG for the current operator contract.
+>
+> **Launch and retry semantics (2026-11-22).** A dispatch is complete only
+> after the child window/tab is shown and the child acknowledges the sealed
+> start. A launcher refusal blocks the row with the real reason; retry
+> re-dispatches it. A delivered start without an acknowledgement stays
+> `running` and is reported as uncertain — it is never relaunched
+> automatically. A `running` row is abandoned only when the probe proves it
+> never launched (no `task.launched`, no assistant turn, no start marker);
+> otherwise the retry refuses. On Windows the launcher runs the Pi Node
+> entrypoint or `pi.cmd` — never the extensionless npm shell shim
+> (`0x800700c1`).
 
 Status: **experimental**. The engine, its contracts and the live composition are
 implemented and covered by automated tests; real provider turns and visible-host
@@ -90,14 +101,15 @@ Both the automatic handoff and a direct request use ONE preparation service:
 
 ```text
 /orchestrator                       # enter the mode only
-/orchestrator start [path]          # prepare discussion (default) or an explicit plan
-/orchestrator status                # phase, requirements, approval/next blocker
-/orchestrator preview               # the exact breakdown preview + approval id
-/orchestrator approve preview-<id>  # explicit approval; starts the next ready task
-/orchestrator refine <what>         # durably void the preview/approval
-/orchestrator cancel                # terminal; nothing launched
-/orchestrator pause|resume|stop|retry|inspect|say <text>
+/orchestrator start [path]          # freeze the approved plan / agreed steps and dispatch row 1
+/orchestrator status                # phase, counts, next row, blocker
+/orchestrator retry                 # recover a blocked/stale row and dispatch immediately
+/orchestrator pause|resume|stop|inspect|say <text>|cancel
 ```
+
+The old `preview`, `approve`, `refine` and `finalize` verbs no longer exist.
+The execution chooser (Build / Orchestrator / Decide later) is the only
+execution decision; there is no saved destination and no recommendation.
 
 The normal UI flow asks for this approval in a dialog right after the breakdown
 validates. **Approve** records the approval and dispatches the next
@@ -123,7 +135,13 @@ never carries over to a changed preview.
   coordinated build; until then, treat an older host as generic-contract
   unavailable (not as a Workflow-specific fallback).
 
-## Run lifecycle
+## Run lifecycle (historical — removed pipeline)
+
+The numbered lifecycle below describes the deleted prepare → preview → approval
+pipeline and is kept only as history. The current lifecycle is: freeze one row
+per plan step, dispatch row 1 to a visible Build child, verify the row's diff and
+checks, accept and dispatch the next row, then run the plan's `## Verification`
+commands once. See the README for the authoritative list.
 
 1. **Mode** — opt-in, no launch.
 2. **Source** — discussion snapshot or explicit readable path, captured verbatim

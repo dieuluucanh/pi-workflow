@@ -52,6 +52,10 @@ export interface SdkSessionManagerCtor {
     sessionDir?: string,
     cwdOverride?: string,
   ): SdkSessionManagerLike;
+  /** Bounded listing used only to resolve a child session id after a reload. */
+  listAll?(
+    sessionDir?: string,
+  ): Promise<ReadonlyArray<{ id: string; path: string }>>;
 }
 
 export interface SdkLike {
@@ -254,6 +258,37 @@ export function createSdkWorkerPort(options: SdkWorkerPortOptions): SdkWorkerPor
         customType: wake.customType,
         content: wake.content,
         triggerTurn: true,
+      });
+    },
+
+    async findSessionFile(sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+      const sdk = await options.loadSdk();
+      const listAll = sdk.SessionManager.listAll;
+      if (typeof listAll !== "function") return undefined;
+      try {
+        const sessions = await listAll.call(sdk.SessionManager, options.sessionDir);
+        return sessions.find((session) => session?.id === sessionId)?.path;
+      } catch {
+        return undefined;
+      }
+    },
+
+    async sessionHasStartedTurn(sessionFile) {
+      if (!fs.existsSync(sessionFile)) return false;
+      const sdk = await options.loadSdk();
+      const manager = sdk.SessionManager.open(sessionFile);
+      return manager.getEntries().some((entry) => {
+        const record = entry as {
+          type?: string;
+          customType?: string;
+          message?: { role?: string };
+        };
+        if (record.type === "message" && record.message?.role === "assistant") return true;
+        return (
+          (record.type === "custom" || record.type === "custom_message") &&
+          record.customType === "workflow-task-start"
+        );
       });
     },
 
