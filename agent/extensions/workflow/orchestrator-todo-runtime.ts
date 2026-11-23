@@ -7,7 +7,7 @@
  *
  *   - a parent/Orchestrator list is a projection of frozen rows + task state;
  *   - a checkbox or `[DONE:n]` tag is a claim, never acceptance;
- *   - only `orchestrator_verify` + `orchestrator_accept` move a row.
+ *   - only the automatic verify/accept engine moves a row.
  */
 
 import { rowForTask, taskCounts, type RunState } from "./orchestrator-state.ts";
@@ -92,7 +92,7 @@ export function todoMutationDecision(
           allowed: false,
           owner,
           reason:
-            "The Orchestrator list is frozen; use orchestrator_verify and orchestrator_accept to move a row.",
+            "The Orchestrator list is frozen; verification and acceptance are automatic.",
         };
   }
   return { allowed: true, owner };

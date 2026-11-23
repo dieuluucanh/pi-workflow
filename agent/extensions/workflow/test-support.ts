@@ -865,3 +865,150 @@ export function renderTodoWidget(
   const rows = component?.render?.(width);
   return Array.isArray(rows) ? (rows as string[]) : [];
 }
+
+// ── Fake in-process Orchestrator Build child ────────────────────────
+//
+// The real child is a second SDK session. These tests only need the lifecycle
+// surface the controller drives, so the fake exposes exactly that and lets a
+// test choose when (and whether) it settles.
+
+export interface FakeOrchestratorChildSession {
+  readonly sessionId: string;
+  readonly modelLabel: string;
+  subscribe(listener: (event: unknown) => void): () => void;
+  prompt(text: string): Promise<void>;
+  followUp(text: string): Promise<void>;
+  abort(): Promise<void>;
+  isStreaming(): boolean;
+  dispose(): void;
+  /** Test control: emit one event to the subscribers. */
+  emit(event: unknown): void;
+  /** Test control: emit a summary, todo list and settle. */
+  settle(summary?: string): void;
+  /** Test control: a full prompt → tool events → settle. */
+  settleOnPrompt: boolean;
+}
+
+export interface FakeOrchestratorChildOptions {
+  modelLabel?: string;
+  failCreate?: string;
+  /** Emit a summary + settle as soon as the kickoff prompt arrives. */
+  settleOnPrompt?: boolean;
+  /** Called for every prompt, before the default settle behaviour. */
+  onPrompt?: (
+    text: string,
+    session: FakeOrchestratorChildSession,
+  ) => Promise<void> | void;
+  /** Todos mirrored from a workflow_todo tool result on settle. */
+  todos?: Array<{ text: string; completed?: boolean }>;
+  summary?: string;
+}
+
+export interface FakeOrchestratorChildFactory {
+  factory: (input: {
+    context: { taskId: string; attemptId: string };
+    sessionId?: string;
+  }) => Promise<
+    | { ok: true; child: FakeOrchestratorChildSession; modelLabel: string }
+    | { ok: false; error: string }
+  >;
+  created: FakeOrchestratorChildSession[];
+}
+
+export function makeFakeOrchestratorChildFactory(
+  options: FakeOrchestratorChildOptions = {},
+): FakeOrchestratorChildFactory {
+  const created: FakeOrchestratorChildSession[] = [];
+  const factory: FakeOrchestratorChildFactory["factory"] = async (input) => {
+    if (options.failCreate) return { ok: false, error: options.failCreate };
+    const listeners: Array<(event: unknown) => void> = [];
+    let streaming = false;
+    let disposed = false;
+    const modelLabel = options.modelLabel ?? "builder/fake-model";
+    const emit = (event: unknown): void => {
+      if (disposed) return;
+      for (const listener of [...listeners]) listener(event);
+    };
+    const session: FakeOrchestratorChildSession = {
+      sessionId: input.sessionId ?? "fake-session",
+      modelLabel,
+      subscribe(listener) {
+        listeners.push(listener);
+        return () => {
+          const index = listeners.indexOf(listener);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      async prompt(text) {
+        if (disposed) return;
+        if (options.onPrompt) await options.onPrompt(text, session);
+        streaming = true;
+        emit({
+          type: "tool_execution_start",
+          toolCallId: "c1",
+          toolName: "read",
+          args: { path: "README.md" },
+        });
+        emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "read" });
+        if (options.settleOnPrompt === true) {
+          streaming = false;
+          session.settle();
+        }
+      },
+      async followUp(text) {
+        await session.prompt(text);
+      },
+      async abort() {
+        streaming = false;
+      },
+      isStreaming() {
+        return streaming;
+      },
+      dispose() {
+        disposed = true;
+        streaming = false;
+        listeners.length = 0;
+      },
+      emit,
+      settle(summary) {
+        streaming = false;
+        if (options.todos && options.todos.length > 0) {
+          emit({
+            type: "tool_execution_end",
+            toolCallId: "c2",
+            toolName: "workflow_todo",
+            result: {
+              details: {
+                todos: options.todos.map((todo, index) => ({
+                  step: index + 1,
+                  text: todo.text,
+                  status: todo.completed ? "completed" : "pending",
+                  completed: todo.completed === true,
+                })),
+              },
+            },
+          });
+        }
+        emit({
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: summary ?? options.summary ?? "child finished the row",
+                },
+              ],
+            },
+          ],
+        });
+        emit({ type: "agent_settled" });
+      },
+      settleOnPrompt: options.settleOnPrompt === true,
+    };
+    created.push(session);
+    return { ok: true, child: session, modelLabel };
+  };
+  return { factory, created };
+}

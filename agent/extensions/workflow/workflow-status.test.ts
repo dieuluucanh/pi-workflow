@@ -281,3 +281,39 @@ test("handoff stages are named accurately and a recommendation never executes", 
   assert.match(both.mode, /execution choice pending/);
   assert.doesNotMatch(both.mode, /handoff pending/);
 });
+
+test("the orchestrator segment names the live child and its local todos", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    commitMode: "never",
+    orchestration: {
+      phase: "running",
+      child: {
+        ref: "2",
+        total: 7,
+        phase: "running",
+        model: "builder/model",
+        todoDone: 3,
+        todoTotal: 5,
+      },
+      view: "child",
+    },
+  });
+  assert.equal(
+    segments.orchestrator,
+    "child 2/7 running · builder/model · 3/5 todos",
+  );
+});
+
+test("the orchestrator segment falls back to the run row without a child", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 0,
+    total: 1,
+    commitMode: "never",
+    orchestration: { phase: "paused", nextTaskId: "task-1" },
+  });
+  assert.equal(segments.orchestrator, "run paused · next task-1");
+});

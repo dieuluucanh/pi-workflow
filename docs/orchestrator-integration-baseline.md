@@ -1,5 +1,29 @@
 # Orchestrator integration baseline and seams (2026-11-21)
 
+> **Updated 2026-11-23 — in-process Build child.** The external child chain
+> (Desktop tab / Terminal window / `pi --session` / child host / IPC / start-ack
+> / workspace lease) is removed. The current contract is:
+>
+> - plan approval (or an agreed standalone discussion) freezes ONE TODO list
+>   (one row per top-level plan step) via `orchestrator_start`;
+> - the extension runs one **in-process** SDK Build child per row (no window or
+>   tab); the child loads only this extension plus Pi built-ins and gets the
+>   normal Workflow-managed Build tools and policy gates;
+> - on a natural settle the extension reports, diffs (including
+>   `previous.head..HEAD`), runs the row checks, verifies and accepts, then
+>   starts the next row; a failure repairs the same warm child (max 2 rounds)
+>   and then blocks and pauses;
+> - the parent model only handles blockers, status and recovery; user prose is
+>   forwarded to the running child;
+> - `/orchestrator-pause|resume|abort|view` (and the `/orchestrator` verbs)
+>   control the child; `/orchestrator-view` toggles the pinned panel only;
+> - a reload blocks a `running` row and pauses the run; retry starts a fresh
+>   child. Old managed-worker sessions open as ordinary Build.
+>
+> Parent tools are `orchestrator_start|status|retry`; there is no
+> `workflow_worker_ready`, `orchestrator_verify|accept|repair` or
+> `workflow-bridge`. See the package README and CHANGELOG.
+
 This document records the facts the integration plan (steps 7–25) must build on.
 It is a baseline, not an acceptance claim: no live provider run, terminal window
 or packaged Desktop build is covered here.

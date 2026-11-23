@@ -24,7 +24,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import {
   getUtcDatePrefix,
   isPlanWritePath,
@@ -39,10 +38,17 @@ import {
 import {
   checkReviewerProviderAuth,
   isParentProviderSurface,
-  seedChildRuntimeProviders,
   unconfiguredReviewerProviderMessage,
   type ProviderSeedResult,
 } from "./review-providers.ts";
+import {
+  createInProcessChildSession,
+  type InProcessChildSession,
+} from "./in-process-child.ts";
+
+/** Type-only handle on the Pi SDK. Erased at compile time. */
+export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
+export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
 // Re-exported so `review.ts` is the single import surface for Review Mode.
 export type { ReviewDisposition, ReviewFinding, ReviewTier };
@@ -2617,14 +2623,6 @@ export const REVIEW_SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
- * Type-only handle on the Pi SDK. This is erased at compile time, so importing
- * this module in a plain Node test does not load Pi.
- */
-export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
-
-export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
-
-/**
  * Built-in tool names the reviewer may call. Read-only by construction.
  *
  * This is a BASE, not the whole tool set: Pi's `createAgentSession({ tools })`
@@ -2663,21 +2661,7 @@ export function reviewToolAllowlist(customTools: unknown): string[] {
  * A live reviewer session, narrowed to what Review Mode actually uses.
  * Keeps the orchestrator free of SDK types.
  */
-export interface ReviewChildSession {
-  readonly sessionId: string;
-  readonly modelLabel: string;
-  /** Subscribe to the session's event stream. Returns an unsubscribe function. */
-  subscribe(listener: (event: unknown) => void): () => void;
-  /** Send a prompt. Queues as a steer when the session is already streaming. */
-  prompt(text: string): Promise<void>;
-  /** Send a prompt that is delivered only after the current run stops. */
-  followUp(text: string): Promise<void>;
-  /** Cancel the in-flight run. Never throws. */
-  abort(): Promise<void>;
-  isStreaming(): boolean;
-  /** Unsubscribe and release. Never throws, safe to call twice. */
-  dispose(): void;
-}
+export type ReviewChildSession = InProcessChildSession;
 
 export interface CreateReviewSessionOptions {
   cwd: string;
@@ -2750,137 +2734,6 @@ export interface CreateReviewSessionResult {
 export const REVIEW_CHILD_MARKER_ENV = "PI_WORKFLOW_REVIEW_CHILD";
 
 /**
- * Read the session's enabled tool names, when the SDK exposes them.
- * Returns `undefined` (not `[]`) when the accessor is missing OR throws, so a
- * caller can tell "cannot verify" apart from a verifiably empty tool set.
- */
-function readActiveToolNames(session: unknown): string[] | undefined {
-  try {
-    const get = (session as { getActiveToolNames?: unknown } | undefined)
-      ?.getActiveToolNames;
-    if (typeof get !== "function") return undefined;
-    const names = (get as () => unknown).call(session);
-    if (!Array.isArray(names)) return undefined;
-    return names.filter((n): n is string => typeof n === "string");
-  } catch {
-    return undefined;
-  }
-}
-
-function clampProviderRetries(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 1;
-  return Math.min(2, Math.max(0, Math.trunc(value)));
-}
-
-/**
- * Build the child's runtime-only SettingsManager so its SDK retry budget is
- * bounded. `applyOverrides` is in-memory: the shared settings.json is never
- * written. Feature-detected for older Pi runtimes; a failure here means the
- * child keeps the parent's settings and the chain simply waits that budget out.
- */
-function createChildSettingsManager(
-  sdk: unknown,
-  cwd: string,
-  agentDir: string,
-  providerRetries: number | undefined,
-): unknown | undefined {
-  try {
-    const holder = sdk as {
-      SettingsManager?: { create?: (...args: unknown[]) => unknown };
-    };
-    const SettingsManager = holder?.SettingsManager;
-    const create = SettingsManager?.create;
-    if (typeof create !== "function") return undefined;
-    const manager = create.call(SettingsManager, cwd, agentDir) as {
-      getRetrySettings?: () => Record<string, unknown>;
-      applyOverrides?: (overrides: unknown) => void;
-    };
-    if (!manager || typeof manager !== "object") return undefined;
-    if (typeof manager.applyOverrides !== "function") return manager;
-    const base =
-      typeof manager.getRetrySettings === "function"
-        ? manager.getRetrySettings()
-        : { enabled: true, maxRetries: 3, baseDelayMs: 2_000, maxAgentDelayMs: 60_000 };
-    manager.applyOverrides({
-      retry: {
-        ...base,
-        enabled: true,
-        maxRetries: clampProviderRetries(providerRetries),
-      },
-    });
-    return manager;
-  } catch {
-    return undefined;
-  }
-}
-
-function wrapAgentSession(
-  raw: unknown,
-  modelLabel: string,
-  sessionId: string,
-): ReviewChildSession {
-  const s = raw as {
-    subscribe: (l: (e: unknown) => void) => () => void;
-    prompt: (
-      t: string,
-      o?: { streamingBehavior?: "steer" | "followUp" },
-    ) => Promise<void>;
-    followUp: (t: string) => Promise<void>;
-    abort: () => Promise<void>;
-    isStreaming: boolean;
-  };
-  let disposed = false;
-  const unsubscribers: Array<() => void> = [];
-  return {
-    sessionId,
-    modelLabel,
-    subscribe(listener) {
-      const un = s.subscribe(listener);
-      if (disposed) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-        return () => {};
-      }
-      unsubscribers.push(un);
-      return un;
-    },
-    async prompt(text) {
-      if (disposed) return;
-      if (s.isStreaming) await s.prompt(text, { streamingBehavior: "steer" });
-      else await s.prompt(text);
-    },
-    async followUp(text) {
-      if (disposed) return;
-      await s.followUp(text);
-    },
-    async abort() {
-      try {
-        await s.abort();
-      } catch {
-        /* aborted sessions can throw; cancellation is best-effort */
-      }
-    },
-    isStreaming() {
-      return !disposed && Boolean(s.isStreaming);
-    },
-    dispose() {
-      if (disposed) return;
-      disposed = true;
-      for (const un of unsubscribers.splice(0)) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-      }
-    },
-  };
-}
-
-/**
  * Create the reviewer's in-process child session.
  *
  * Isolation properties that matter:
@@ -2897,61 +2750,40 @@ function wrapAgentSession(
 export async function createReviewSession(
   options: CreateReviewSessionOptions,
 ): Promise<CreateReviewSessionResult> {
-  const modelLabel = `${options.modelRef.provider}/${options.modelRef.id}`;
-  const loadSdk =
-    options.loadSdk ?? (() => import("@earendil-works/pi-coding-agent"));
-  const sessionId = `review-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
-
-  const previousMarker = process.env[REVIEW_CHILD_MARKER_ENV];
-  try {
-    const sdk = await loadSdk();
-
-    const model = options.findModel(
-      options.modelRef.provider,
-      options.modelRef.id,
-    );
-    if (!model) {
+  const expectedTools = reviewToolAllowlist(options.customTools);
+  const result = await createInProcessChildSession({
+    cwd: options.cwd,
+    agentDir: options.agentDir,
+    modelRef: options.modelRef,
+    findModel: options.findModel,
+    parentProviders: options.parentProviders,
+    providerRetries: options.providerRetries,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    systemPrompt: REVIEW_SYSTEM_PROMPT,
+    appendSystemPrompt: [options.reviewPrompt],
+    tools: expectedTools,
+    requiredTools: expectedTools,
+    customTools: options.customTools,
+    sessionManager: (sdk, sessionId) =>
+      sdk.SessionManager.inMemory(options.cwd, { id: sessionId }),
+    sessionIdPrefix: "review",
+    markerEnv: REVIEW_CHILD_MARKER_ENV,
+    bindMode: "print",
+    missingModelError: (modelLabel) =>
+      `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
+    describeMissingTools: (missing) =>
+      `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
+    authCheck: async ({ modelRuntime, providerSeed }) => {
+      const auth = await checkReviewerProviderAuth(
+        modelRuntime,
+        options.modelRef.provider,
+      );
+      if (auth.configured) return { ok: true };
       return {
         ok: false,
-        modelLabel,
-        error: `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
-      };
-    }
-
-    let modelRuntime: unknown;
-    try {
-      modelRuntime = await sdk.ModelRuntime.create();
-    } catch (e: unknown) {
-      return {
-        ok: false,
-        modelLabel,
-        error: `could not create a model runtime for the reviewer (auth/model catalog problem): ${
-          e instanceof Error ? e.message : String(e)
-        }`,
-      };
-    }
-
-    // Seed providers the child does not compose yet (e.g. providers registered
-    // only in the parent session) BEFORE the session exists. Present-probe:
-    // only the difference is registered, native-first, per-provider
-    // fault-isolated — never fatal, never layer-aware.
-    const providerSeed = seedChildRuntimeProviders(
-      modelRuntime,
-      options.parentProviders,
-    );
-
-    // Provider-agnostic auth preflight, mirroring the child session's own
-    // prompt gate: fail fast here — with the seed report and the generic
-    // escape hatch — instead of mid-review with a bare "No API key found".
-    const auth = await checkReviewerProviderAuth(
-      modelRuntime,
-      options.modelRef.provider,
-    );
-    if (!auth.configured) {
-      return {
-        ok: false,
-        modelLabel,
-        providerSeed,
         error: unconfiguredReviewerProviderMessage({
           providerId: options.modelRef.provider,
           seed: providerSeed,
@@ -2959,115 +2791,16 @@ export async function createReviewSession(
           modelsJsonPath: path.join(options.agentDir, "models.json"),
         }),
       };
-    }
+    },
+    loadSdk: options.loadSdk,
+  });
 
-    // No ambient extensions, no skills/prompts/themes: the reviewer gets exactly
-    // the system prompt below and nothing from the user's other packages.
-    // Project context files (AGENTS.md etc.) DO load — they are the framework
-    // signal the reviewer is meant to align with.
-    const loader = new sdk.DefaultResourceLoader({
-      cwd: options.cwd,
-      agentDir: options.agentDir,
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      systemPrompt: REVIEW_SYSTEM_PROMPT,
-      appendSystemPrompt: [options.reviewPrompt],
-    });
-    try {
-      await loader.reload?.();
-    } catch {
-      /* a reload failure must not abort the review; defaults still apply */
-    }
-
-    const sessionManager = sdk.SessionManager.inMemory(options.cwd, {
-      id: sessionId,
-    });
-
-    // MUST include the custom tool names: `tools` is an allowlist that filters
-    // custom tools too, so a built-ins-only list would silently remove
-    // `review_submit_plan` and make every review fail (see REVIEW_BUILTIN_TOOLS).
-    const expectedTools = reviewToolAllowlist(options.customTools);
-    // The child gets its own retry budget. The shared settings file is not
-    // touched: applyOverrides is runtime-only.
-    const settingsManager = createChildSettingsManager(
-      sdk,
-      options.cwd,
-      options.agentDir,
-      options.providerRetries,
-    );
-
-    process.env[REVIEW_CHILD_MARKER_ENV] = "1";
-    let created: { session?: unknown; modelFallbackMessage?: string };
-    try {
-      created = await sdk.createAgentSession({
-        cwd: options.cwd,
-        agentDir: options.agentDir,
-        modelRuntime,
-        model,
-        thinkingLevel: options.modelRef.thinking as never,
-        tools: expectedTools,
-        customTools: options.customTools as never,
-        resourceLoader: loader,
-        sessionManager,
-        ...(settingsManager ? { settingsManager } : {}),
-        sessionStartEvent: { type: "session_start", reason: "startup" },
-      } as never);
-    } finally {
-      if (previousMarker === undefined)
-        delete process.env[REVIEW_CHILD_MARKER_ENV];
-      else process.env[REVIEW_CHILD_MARKER_ENV] = previousMarker;
-    }
-
-    if (!created?.session) {
-      return {
-        ok: false,
-        modelLabel,
-        error: "createAgentSession returned no session",
-      };
-    }
-
-    // Defence in depth: assert the SDK really enabled the reviewer's tools.
-    // Without `review_submit_plan` a review can only ever end in a fallback, so
-    // failing here (instantly, with the missing names) beats a 10-minute pass
-    // that silently cannot succeed. Feature-detected: an SDK that does not
-    // expose the accessor is trusted rather than blocked.
-    const activeTools = readActiveToolNames(created.session);
-    if (activeTools) {
-      const missing = expectedTools.filter((n) => !activeTools.includes(n));
-      if (missing.length > 0) {
-        return {
-          ok: false,
-          modelLabel,
-          activeTools,
-          error: `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
-        };
-      }
-    }
-
-    // Bind in print mode so the child's UI context is explicitly non-interactive.
-    // Best-effort: a binding failure is not fatal because the child has no extensions.
-    try {
-      const bindable = created.session as {
-        bindExtensions?: (b: { mode: string }) => Promise<void>;
-      };
-      await bindable.bindExtensions?.({ mode: "print" });
-    } catch {
-      /* ignore */
-    }
-
-    return {
-      ok: true,
-      modelLabel,
-      ...(activeTools ? { activeTools } : {}),
-      session: wrapAgentSession(created.session, modelLabel, sessionId),
-    };
-  } catch (e: unknown) {
-    return {
-      ok: false,
-      modelLabel,
-      error: e instanceof Error ? e.message : String(e),
-    };
-  }
+  return {
+    ok: result.ok,
+    modelLabel: result.modelLabel,
+    ...(result.session ? { session: result.session } : {}),
+    ...(result.activeTools ? { activeTools: result.activeTools } : {}),
+    ...(result.providerSeed ? { providerSeed: result.providerSeed } : {}),
+    ...(result.error ? { error: result.error } : {}),
+  };
 }

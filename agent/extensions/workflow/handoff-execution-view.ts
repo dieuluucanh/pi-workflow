@@ -23,9 +23,9 @@ import type { HandoffDestination } from "./handoff-routing.ts";
 /** Header tab of the execution question. */
 export const EXECUTION_QUESTION_HEADER = "Execution";
 
-/** Create a frozen TODO list and delegate each plan step to a Build child. */
+/** Freeze the plan and run one in-process Build child per step. */
 export const EXECUTION_ORCHESTRATOR_LABEL =
-  "Orchestrator — delegate each plan step";
+  "Orchestrator — in-process Build child per step (no new window)";
 /** Implement the approved plan in this session. */
 export const EXECUTION_BUILD_LABEL =
   "Direct Build — implement in this session";
@@ -52,7 +52,7 @@ export function executionLabel(destination: HandoffDestination): string {
 /** One-line meaning of a destination, for the row description and notices. */
 export function describeExecutionChoice(destination: HandoffDestination): string {
   return destination === "orchestrator"
-    ? "Freeze the approved plan into one TODO row per step and delegate each row to a visible Build child"
+    ? "Freeze the approved plan into one TODO row per step and run each row in an in-process Build child; no window or tab opens and rows advance automatically"
     : "Enter this session's Build mode and implement the approved plan here";
 }
 

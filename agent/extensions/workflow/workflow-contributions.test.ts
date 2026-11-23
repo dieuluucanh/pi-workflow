@@ -373,3 +373,26 @@ test("build: no resume action without an approved wait", () => {
   const idle = buildWorkflowContributions({ mode: "plan", done: 0, total: 0 });
   assert.equal(idle.some((entry) => entry.id === "handoff-continue"), false);
 });
+
+test("orchestrator child rows expose pause/resume/abort and the view toggle", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    orchestration: {
+      phase: "running",
+      child: { ref: "2", total: 7, phase: "running", model: "builder/model", todoDone: 1, todoTotal: 2 },
+      view: "child",
+    },
+  });
+  const byId = new Map(contributions.map((entry) => [entry.id, entry]));
+  assert.match(
+    String((byId.get("orchestrator-child") as { text?: string })?.text),
+    /child 2\/7 · running · builder\/model · 1\/2 todos/,
+  );
+  for (const id of ["orchestrator-view", "orchestrator-pause", "orchestrator-abort"]) {
+    assert.ok(byId.has(id), id);
+  }
+  assert.equal(byId.has("orchestrator-direct-build"), false);
+  assert.equal(byId.has("orchestrator-host"), false);
+});

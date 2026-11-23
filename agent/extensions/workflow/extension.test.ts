@@ -31,6 +31,8 @@ import {
   ORIGINAL_PLAN,
   REWRITTEN_PLAN,
   fakeSdk,
+  makeFakeOrchestratorChildFactory,
+  type FakeOrchestratorChildFactory,
   makeFakeCtx,
   makeFakePi,
   latestStatus,
@@ -96,6 +98,8 @@ interface BootOptions {
    */
   /** `unset` leaves the field absent so the PRODUCT default is exercised. */
   executionMode?: "orchestrator" | "build" | "unset";
+  /** Fake in-process Build child for Orchestrator runs. */
+  child?: FakeOrchestratorChildFactory;
 }
 
 async function boot(over: BootOptions = {}) {
@@ -215,8 +219,11 @@ async function boot(over: BootOptions = {}) {
       }
     });
   }
+  const childFactory = over.child ?? makeFakeOrchestratorChildFactory();
   await workflowExtension(pi as never, {
     loadSdk: async () => sdk as never,
+    createOrchestratorChild: childFactory.factory as never,
+    selfExtensionPath: "/fake/workflow/index.ts",
     // The fake host has no Plannotator listener unless `plannotator: true`, so
     // an untuned handoff would wait the production 15 s before falling back to
     // the native questionnaire. Keep the fallback path fast in tests.
@@ -300,6 +307,7 @@ async function boot(over: BootOptions = {}) {
     aborts,
     plannotatorRequests,
     reviewStatusRequests,
+    child: childFactory,
     cleanup,
   };
 }
@@ -430,7 +438,7 @@ function executionAnswer(
   destination: "orchestrator" | "build" | "later",
 ): unknown {
   const labels = {
-    orchestrator: "Orchestrator — delegate each plan step",
+    orchestrator: "Orchestrator — in-process Build child per step (no new window)",
     build: "Direct Build — implement in this session",
     later: "Decide later (stay in Plan)",
   };
@@ -4964,6 +4972,160 @@ test("K: a Build choice made while streaming starts at agent_settled", async () 
       true,
       "the queued kickoff starts the Build turn exactly at settle",
     );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── In-process Orchestrator child (end-to-end, fake SDK) ─────────────
+
+function orchestratorPlan(steps: string[]): string {
+  return [
+    "# Plan: In-process child",
+    "",
+    "## Plan Steps",
+    "",
+    ...steps.map((step, index) => `${index + 1}. ${step}`),
+    "",
+  ].join("\n");
+}
+
+test("OE1: child 1 settles, is auto-accepted, child 2 starts, and the run completes", async () => {
+  let projectCwd = "";
+  let writes = 0;
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: true,
+    onPrompt: () => {
+      writes += 1;
+      fs.writeFileSync(
+        path.join(projectCwd, `child-output-${writes}.txt`),
+        `work ${writes}`,
+      );
+    },
+  });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  projectCwd = b.cwd;
+  try {
+    const plan = placePlan(b.cwd, "oe1.md");
+    fs.writeFileSync(
+      plan.abs,
+      orchestratorPlan(["Write the first file", "Write the second file"]),
+    );
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    // Both children settle synchronously on their prompt; give the async
+    // verification chain a tick to finish.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(b.child.created.length, 2, "one child per frozen row");
+    const status = await b.pi.tools.orchestrator_status.execute("oe1-status", {});
+    const text = JSON.stringify(status);
+    assert.match(text, /"accepted":2/);
+    assert.match(text, /"summary":"completed/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE2: a failing row check repairs on a warm child, then blocks and pauses", async () => {
+  let projectCwd = "";
+  let writes = 0;
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: true,
+    onPrompt: () => {
+      writes += 1;
+      fs.writeFileSync(path.join(projectCwd, `repair-${writes}.txt`), "x");
+    },
+  });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  projectCwd = b.cwd;
+  try {
+    const plan = placePlan(b.cwd, "oe2.md");
+    fs.writeFileSync(
+      plan.abs,
+      [
+        "# Plan: Repair",
+        "",
+        "## Plan Steps",
+        "",
+        "1. Always fails",
+        "   Acceptance:",
+        '   - node -e "process.exit(1)"',
+        "",
+      ].join("\n"),
+    );
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    // The failing check spawns a real shell; poll for the terminal state.
+    let text = "";
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const status = await b.pi.tools.orchestrator_status.execute("oe2-status", {});
+      text = JSON.stringify(status);
+      if (/"phase":"paused"/.test(text) || /"accepted":1/.test(text)) break;
+    }
+    // Initial attempt + bounded repair rounds re-prompt the SAME child.
+    assert.equal(b.child.created.length, 1, "the warm child is reused");
+    assert.match(text, /"blocked":1/);
+    assert.match(text, /"summary":"paused/);
+    await b.pi.commands.orchestrator.handler("inspect task-1", b.ctx);
+    assert.match(
+      String(b.notifies.at(-1)?.message ?? ""),
+      /repair budget exhausted/,
+      "the concrete blocker is inspectable",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE3: prose is forwarded to a running child and never starts a parent turn", async () => {
+  const delivered: string[] = [];
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: false,
+    onPrompt: (text) => {
+      delivered.push(text);
+    },
+  });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oe3.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    const before = b.pi.sent.length;
+    await b.pi.emit(
+      "input",
+      { text: "please also add a test", source: "user", streamingBehavior: undefined },
+      b.ctx,
+    );
+    assert.equal(b.pi.sent.length, before, "the parent model was not prompted");
+    assert.ok(
+      delivered.some((text) => text.includes("please also add a test")),
+      "the child received the prose verbatim",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE4: abort pauses the row; retry starts a fresh child", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oe4.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    assert.equal(b.child.created.length, 1);
+
+    await b.pi.commands["orchestrator-abort"].handler("", b.ctx);
+    let status = await b.pi.tools.orchestrator_status.execute("oe4-a", {});
+    assert.match(JSON.stringify(status), /"blocked":1/);
+
+    await b.pi.commands.orchestrator.handler("retry", b.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(b.child.created.length, 2, "retry started a fresh child");
+    status = await b.pi.tools.orchestrator_status.execute("oe4-b", {});
+    assert.match(JSON.stringify(status), /"running":1/);
   } finally {
     await b.cleanup();
   }

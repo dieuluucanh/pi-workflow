@@ -171,7 +171,7 @@ export function buildHandoffQuestion(
     {
       label: HANDOFF_APPROVE_LABEL,
       description:
-        "Approve this plan, then choose Orchestrator preparation or direct Build",
+        "Approve this plan, then choose Orchestrator (in-process child per step) or direct Build",
     },
     {
       label: HANDOFF_FEEDBACK_LABEL,

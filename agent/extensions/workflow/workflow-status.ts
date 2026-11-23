@@ -60,6 +60,15 @@ export interface WorkflowStatusInput {
     phase: string;
     blockedReason?: string;
     nextTaskId?: string;
+    child?: {
+      ref: string;
+      total: number;
+      phase: string;
+      model?: string;
+      todoDone?: number;
+      todoTotal?: number;
+    };
+    view?: "auto" | "parent" | "child";
   };
   /** Direct-Build execution lifecycle, when one is active. */
   execution?: string;
@@ -130,15 +139,28 @@ export function buildWorkflowStatusSegments(
     mode = `${base}${stageSuffix}`;
   }
 
-  const destination = "";
-  const run = input.orchestration
-    ? `run ${input.orchestration.phase}` +
-      (input.orchestration.nextTaskId ? ` · next ${input.orchestration.nextTaskId}` : "") +
-      (input.orchestration.blockedReason
-        ? ` · blocked: ${input.orchestration.blockedReason.slice(0, 120)}`
-        : "")
+  const orchestration = input.orchestration;
+  const child = orchestration?.child;
+  const childParts = child
+    ? [
+        `child ${child.ref}/${child.total} ${child.phase}`,
+        child.model ?? "",
+        typeof child.todoTotal === "number" && child.todoTotal > 0
+          ? `${child.todoDone ?? 0}/${child.todoTotal} todos`
+          : "",
+      ].filter(Boolean)
+    : [];
+  const run = orchestration
+    ? childParts.length > 0
+      ? childParts.join(" · ")
+      : `run ${orchestration.phase}` +
+        (orchestration.nextTaskId ? ` · next ${orchestration.nextTaskId}` : "")
     : "";
-  const orchestrator = [destination, run].filter(Boolean).join(" · ");
+  const blocked =
+    orchestration?.blockedReason
+      ? `blocked: ${orchestration.blockedReason.slice(0, 120)}`
+      : "";
+  const orchestrator = [run, blocked].filter(Boolean).join(" · ");
   const execution = (input.execution ?? "").trim();
 
   return {

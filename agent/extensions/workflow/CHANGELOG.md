@@ -4,6 +4,39 @@ All notable changes to this package are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Orchestrator runs an in-process Build child (no window or tab)
+
+- **One child per frozen row, inside this Pi process.** The external child chain
+  (Desktop tab, Terminal window, `pi --session`, child host, IPC pipe, start-ack,
+  workspace lease, 45 s wait) is gone. Each row is a second SDK `AgentSession`
+  with its own model runtime, an in-memory session and a fresh Workflow
+  extension instance, so it gets the Workflow-managed Build tools and every
+  policy gate. Extensions installed separately do not load inside the child.
+- **Automatic acceptance.** A natural settle journals the report, diffs the
+  workspace (including `previous.head..HEAD`, so a committed row is
+  attributable), runs the row checks, journals verification and accepts —
+  then starts the next row. A failure repairs the same warm child (max 2
+  rounds); exhaustion blocks the row, pauses the run and wakes the parent model.
+- **Prompt cascade.** Prose typed while a child runs is forwarded to it
+  (`you → child`) and does not start a parent turn; while paused, one note is
+  queued for the resume. Slash commands pass through.
+- **Commands.** Added `/orchestrator-pause`, `/orchestrator-resume`,
+  `/orchestrator-abort` and `/orchestrator-view` (the `/orchestrator` verbs
+  remain). `/orchestrator-view` toggles the pinned panel between the parent
+  roadmap and the child's local TODOs; it never changes prompt routing.
+- **Reload.** A restored `running` row is blocked ("the in-process Build child
+  did not survive the reload") and the run pauses; retry starts a fresh child.
+  Old managed-worker child sessions open as ordinary Build with a warning.
+- **Removed:** tools `workflow_worker_ready`, `orchestrator_report`,
+  `orchestrator_checkpoint`, `orchestrator_verify`, `orchestrator_accept`,
+  `orchestrator_repair`; the `workflow-bridge` command; the managed-worker
+  mode ring and its tool set; the Desktop related-session request for
+  Orchestrator. Parent tools are now `orchestrator_start|status|retry`.
+- **Host contract:** `session-host.ts` and the generic `related-session`
+  contribution kind remain for other features; Workflow's Orchestrator use of
+  them is gone.
+
+
 ### Added — continuous Build execution and nonfatal shell quarantine
 
 - **Build continues through routine stops.** `agent_before_settle` adds one

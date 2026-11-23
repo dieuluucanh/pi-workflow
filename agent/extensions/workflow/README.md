@@ -92,31 +92,47 @@ short Plan → Review → Build work keeps its current behavior.
   no `/handoff execution|once`. Feedback keeps the session in Plan.
 - **Direct Build stays in-session.** It uses the same frozen list and the same
   status-only contract; it does not start an Orchestrator child.
-- **The child is a normal Build session.** A managed child switches to Build
-  immediately (no edit interlock, no `workflow_worker_ready` prerequisite),
-  creates its own task-local TODO list, edits normally and reports with
-  `orchestrator_report`. It never enters Orchestrator or edits the parent run.
+- **The child is an in-process Build session — no window or tab.** Each frozen
+  row runs in a second SDK session inside the same Pi process: its own model
+  runtime, an in-memory session and a fresh Workflow extension instance. It
+  gets the Workflow-managed Build tool set and every policy gate (write, folder,
+  read, commit, shell), creates its own task-local TODO list before the first
+  edit, and never orchestrates or edits the parent run. Extensions the user
+  installed separately do not load inside the child; that is the capability
+  boundary. Permission dialogs still reach the real user through the parent UI.
 - **One panel list authority.** The active execution's frozen snapshot is
   installed in the session `TodoStore`; the pinned panel renders that store.
   In Orchestrator mode `workflow_todo` is read-only for the run rows.
-- **Verification is the parent's.** Per row, the parent captures the baseline
-  diff and runs the row's `acceptanceChecks`; `orchestrator_accept` journals
-  the acceptance and dispatches the next row. A failing check records a bounded
-  repair round (max 2) against the same child. After the last row the plan's
-  `## Verification` commands run once as the final gate.
+- **Advancement is automatic and mechanical.** On a natural child settle the
+  extension journals the report, diffs the workspace including the
+  `previous.head..HEAD` commit range, runs the row's `acceptanceChecks`, journals
+  the verification marker and accepts on pass — then starts the next row. A
+  failing check records a bounded repair round (max 2) against the **same warm
+  child** and re-prompts it; a gone child is replaced for the same attempt.
+  Budget exhaustion blocks the row, pauses the run and wakes the parent model.
+  After the last row the plan's `## Verification` commands run once as the final
+  gate. The parent model never calls verify/accept for a healthy row.
 - **No execution budgets or parent commits.** Usage/cost caps, rollover,
   drift, parity, a second-opinion verifier and the parent commit ledger are
   gone. The child follows the normal Build commit policy.
-- **A dispatch is not a launch.** The parent shows the child window/tab and
-  waits for the child's sealed `start-ack` before reporting "Dispatched". A
-  launcher refusal blocks the row with the real reason (retryable); a delivered
-  start without an ack stays `running` as *uncertain* and is never relaunched
-  automatically.
+- **A dispatch is a real child, not a launch.** The Builder model, provider
+  auth and the Workflow extension load are proven before the `task.start` row
+  transition; a failure leaves the row pending and nothing is journaled as
+  running. There is no window/tab, grant file, IPC pipe or start-ack.
 - **Retry recovers and dispatches.** `orchestrator_retry` and
-  `/orchestrator retry` unblock a `blocked`/`needs_fix` row and dispatch it
-  immediately. A `running` row is abandoned only when a probe proves there is
-  no launch record and no assistant turn/start marker in the child session;
-  otherwise the retry refuses and asks for inspection.
+  `/orchestrator retry` unblock a `blocked`/`needs_fix` row and start a fresh
+  child for it. `/orchestrator-resume` continues a paused warm child.
+- **Prompt cascade.** While a child runs, a normal prompt is recorded as
+  `you → child` and forwarded verbatim; the parent model does not answer it.
+  While paused, one note is queued for the resume. Slash commands pass through.
+- **Command-only child interaction.** `/orchestrator-pause|resume|abort|view`
+  (and the `/orchestrator` verbs) control the child. `/orchestrator-view`
+  toggles the pinned panel between the parent roadmap and the child's local
+  TODO list; it never changes prompt routing.
+- **Reload loses the child, not the run.** A `running` row restored after a
+  reload is blocked with a concrete reason and the run pauses; nothing is
+  replayed. Retry starts a fresh child. Old managed-worker child sessions open
+  as ordinary Build with a one-line warning (clean slate).
 - **The chosen execution starts immediately.** A Direct Build choice made while
   the chooser is still inside `agent_end` is queued once and released at
   `agent_settled`, so the user does not have to send another prompt.
@@ -137,35 +153,32 @@ ownership is derived from a registered command's source info, not from an owner
 string in the payload. Two unrelated fixture extensions cover this contract in
 both repos (`fixtures/two-extension-contract.json`).
 
+Orchestrator no longer requests a Desktop related session or a new tab. The
+`related-session` contribution kind and `session-host.ts` remain as the generic
+host contract for other features; Workflow's own use of them is gone. Pi Desktop
+may still show the Orchestrator status/actions rows published here.
+
 ### What is wired, and what still needs a live run
 
 - **Wired in the entrypoint:** the four-mode ring, a fresh authoritative
   mission injection, `orchestrator_start` (plan path or explicit steps), the
-  frozen TODO snapshot and its persistence, the scheduler auto-dispatch, row
-  verification (diff + `acceptanceChecks`), acceptance and the final plan
-  check, the parent tools (`orchestrator_start|status|verify|repair|accept|
-  retry`), operator commands (`/orchestrator status|start|pause|resume|stop|
-  inspect|say|retry|cancel`), and the neutral execution chooser.
-- **Child host binding:** dispatch composes a real child host — a source-bound
-  Desktop tab when that host announces the capability, otherwise a visible
-  Terminal window running `pi --session <file>` (never a headless print worker).
-  The parent creates the durable session and private grant, arms the control
-  window, launches, then waits for the child's authenticated `start` ack. The
-  terminal host's readiness includes an SDK probe: the SDK peer dependency must
-  resolve to a `SessionManager` class/object with static `create` and `open`, or
-  the host is reported unavailable before approval. A host that is neither
-  announced nor resolvable fails closed with an actionable reason; there is no
-  silent direct-Build fallback.
-- **Two-step authorization:** the signed start grant is held after delivery.
-  `workflow_worker_ready` applies it; only then does the worker's mutation gate
-  open. The control secret lives in a private 0600 grant file, and only its path
-  is written into the child's session metadata.
-- **Runtime-owned evidence:** `orchestrator_verify` captures the baseline,
-  runs the task's checks through the gated tool executor and applies acceptance
-  itself. `orchestrator_accept` only re-reads that decision; a model-supplied
-  evidence object is refused.
-- **NOT RUN:** real provider/model turns, real Windows Terminal / macOS Terminal /
-  Linux tmux launches, packaged Desktop E2E and cross-platform signoff. See
+  frozen TODO snapshot and its persistence, the automatic settle →
+  report → diff → checks → verify → accept → next-row engine, the parent tools
+  (`orchestrator_start|status|retry`), the child lifecycle controller, the
+  transcript entries and the operator commands (`/orchestrator status|start|
+  pause|resume|abort|stop|inspect|view|say|retry|cancel` plus the
+  `/orchestrator-*` aliases), and the neutral execution chooser.
+- **Child composition:** one in-process SDK session per row with
+  `noExtensions: true` + this extension as the only additional path, an explicit
+  Workflow-managed Build allowlist (`questionnaire` and `orchestrator_*` are
+  excluded), the parent UI bridge for permission dialogs, and a registered
+  teardown that runs after `AgentSession.dispose()` (which never emits
+  `session_shutdown`).
+- **Runtime-owned evidence:** the engine captures the baseline and the diff,
+  runs the checks through the gated executor and applies acceptance itself. No
+  model-supplied evidence exists.
+- **NOT RUN:** real provider/model turns, real terminal/Desktop rendering of the
+  child transcript entries, and `/reload` in a live TUI. See
   [`../../../docs/orchestrator-live-acceptance.md`](../../../docs/orchestrator-live-acceptance.md)
   for the exact human matrix (currently **NOT RUN**).
 - The installed SDK's anonymous event bus is not publisher authentication;

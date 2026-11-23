@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 import {
   captureBaseline,
   compareBaseline,
-  createWorkspaceLeases,
+  diffSinceBaseline,
+  hasAttributableChange,
   resolveWorkspaceIdentity,
   type BaselinePort,
   type WorkspaceResolver,
@@ -85,54 +86,6 @@ test("non-git folders get a plain key; a missing path is refused", async () => {
     resolver: resolver({ realpath: async () => null }),
   });
   assert.equal(missing.ok, false);
-});
-
-test("lease: one holder, stale generation, expiry without theft, explicit reclaim", () => {
-  let clock = 1_000;
-  const leases = createWorkspaceLeases({ ttlMs: 1_000, now: () => clock });
-  const grant = {
-    workspaceKey: "git:c:/work/app",
-    runId: "run-1",
-    taskId: "task-1",
-    attemptId: "a-1",
-    sessionId: "s-1",
-    generation: 1,
-  };
-  const first = leases.acquire(grant);
-  assert.equal(first.ok, true);
-  assert.equal(leases.isWriter((first as any).grant), true);
-
-  // Same attempt can re-enter; another attempt cannot.
-  assert.equal(leases.acquire(grant).ok, true);
-  const held = leases.acquire({ ...grant, taskId: "task-2", attemptId: "a-2", generation: 2 });
-  assert.equal((held as any).code, "held");
-
-  clock = 2_001;
-  const expired = leases.acquire({ ...grant, taskId: "task-2", attemptId: "a-2", generation: 2 });
-  assert.equal((expired as any).code, "expired", "never stolen implicitly");
-  assert.equal(
-    (
-      leases.reclaim({
-        workspaceKey: grant.workspaceKey,
-        grant: { ...grant, taskId: "task-2", attemptId: "a-2", generation: 2 },
-        confirmation: "no",
-      }) as any
-    ).code,
-    "confirmation",
-  );
-  const reclaimed = leases.reclaim({
-    workspaceKey: grant.workspaceKey,
-    grant: { ...grant, taskId: "task-2", attemptId: "a-2", generation: 2 },
-    confirmation: "reclaim-stale",
-  });
-  assert.equal(reclaimed.ok, true);
-  assert.equal(leases.isWriter((first as any).grant), false);
-  assert.equal(leases.isWriter((reclaimed as any).grant), true);
-
-  // A stale generation cannot be used even after release.
-  leases.release((reclaimed as any).grant);
-  const stale = leases.acquire({ ...grant, generation: 2 });
-  assert.equal((stale as any).code, "stale_generation");
 });
 
 test("baseline captures tracked/untracked/binary/mode state deterministically", async () => {
@@ -279,4 +232,90 @@ test("unreadable or oversized content is reported as incomplete, not unchanged",
   const value = (captured as any).value;
   assert.equal(value.contentComplete, false);
   assert.equal(value.changes.find((change: any) => change.path === "gone.ts").contentDigest, undefined);
+});
+
+// ── HEAD-aware diff (attributable work) ──────────────────────────────
+
+function baseline(head: string | undefined, changes: Array<{ path: string; status?: string }>) {
+  return {
+    schemaVersion: 1 as const,
+    workspaceKey: "git:c:/app",
+    root: "c:/app",
+    kind: "git" as const,
+    capturedAt: 1,
+    ...(head ? { head } : {}),
+    changes: changes.map((change) => ({
+      path: change.path,
+      status: (change.status ?? "modified") as "modified",
+      staged: false,
+    })),
+    counts: { staged: 0, unstaged: changes.length, untracked: 0, deleted: 0, binary: 0 },
+    truncated: false,
+    digest: `digest-${head ?? "none"}-${changes.map((c) => c.path).join(",")}`,
+  };
+}
+
+test("diffSinceBaseline reports committed work from the HEAD range", () => {
+  const before = baseline("aaaa", []);
+  const after = baseline("bbbb", []);
+  const diff = diffSinceBaseline(before, after, {
+    gitDiffPaths: ["src/app.ts", "src/app.ts", "docs/readme.md"],
+  });
+  assert.equal(diff.changed, true);
+  assert.deepEqual(diff.committedPaths, ["docs/readme.md", "src/app.ts"]);
+  assert.deepEqual(diff.dirtyPaths, []);
+  assert.equal(hasAttributableChange(diff, ["src/app.ts"]), true);
+});
+
+test("diffSinceBaseline reports new dirty paths and a revision", () => {
+  const before = baseline("aaaa", [{ path: "src/old.ts" }]);
+  const after = baseline("aaaa", [
+    { path: "src/old.ts" },
+    { path: "src/new.ts" },
+  ]);
+  const diff = diffSinceBaseline(before, after, { expectedPaths: ["src/new.ts"] });
+  assert.equal(diff.changed, true);
+  assert.deepEqual(diff.committedPaths, []);
+  assert.deepEqual(diff.dirtyPaths, ["src/new.ts"]);
+  assert.match(diff.workspaceRevision, /^[0-9a-f]{64}$/);
+  assert.equal(hasAttributableChange(diff, ["src/new.ts"]), true);
+});
+
+test("diffSinceBaseline stays clean when nothing changed and no head moved", () => {
+  const before = baseline("aaaa", []);
+  const after = baseline("aaaa", []);
+  const diff = diffSinceBaseline(before, after);
+  assert.equal(diff.changed, false);
+  assert.deepEqual(diff.committedPaths, []);
+  assert.deepEqual(diff.dirtyPaths, []);
+  assert.equal(hasAttributableChange(diff, []), false);
+});
+
+test("diffSinceBaseline only reports dirty paths outside a git workspace", () => {
+  const before = baseline(undefined, []);
+  const after = baseline(undefined, [{ path: "notes.txt", status: "untracked" }]);
+  const diff = diffSinceBaseline(before, after, {
+    gitDiffPaths: ["ignored.ts"],
+  });
+  assert.deepEqual(diff.committedPaths, []);
+  assert.deepEqual(diff.dirtyPaths, ["notes.txt"]);
+  assert.equal(diff.changed, true);
+});
+
+test("a pre-existing dirty file on an expected path is an attribution conflict, not attributed work", () => {
+  const before = baseline("aaaa", [{ path: "src/app.ts" }]);
+  const after = baseline("aaaa", [{ path: "src/app.ts" }]);
+  const diff = diffSinceBaseline(before, after, { expectedPaths: ["src/app.ts"] });
+  assert.deepEqual(diff.attributionConflicts, ["src/app.ts"]);
+  assert.equal(diff.changed, false);
+  assert.equal(hasAttributableChange(diff, ["src/app.ts"]), false);
+});
+
+test("hasAttributableChange matches nested expected paths by suffix", () => {
+  const diff = diffSinceBaseline(baseline("aaaa", []), baseline("aaaa", [{ path: "agent/extensions/workflow/x.ts" }]));
+  assert.equal(
+    hasAttributableChange(diff, ["workflow/x.ts"]),
+    true,
+  );
+  assert.equal(hasAttributableChange(diff, ["unrelated.ts"]), false);
 });

@@ -18,6 +18,11 @@
  * Every boot is hermetic: `PI_CODING_AGENT_DIR` points at the test's temp
  * agent directory, so a user's real roles/profiles/settings never leak into
  * the fixture.
+ *
+ * 2026-11-23 (in-process Orchestrator child): the baseline changed
+ * deliberately — `workflow_worker_ready`, `orchestrator_report|checkpoint|
+ * verify|accept|repair` and the `workflow-bridge` command were removed;
+ * `orchestrator-pause|resume|abort|view` were added. See CHANGELOG.md.
  */
 
 import { test } from "node:test";
@@ -37,15 +42,6 @@ import {
   submitThenFinish,
   tmpProject,
 } from "./test-support.ts";
-import {
-  makeFakeChildBus,
-  makeFakeClock,
-  makeFakeHost,
-  makeFakeLauncher,
-  makeMemoryFs,
-  normalizeFakePath,
-} from "./test-support-ports.ts";
-import type { LauncherPort } from "./ports.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASELINE_PATH = path.join(HERE, "fixtures", "compat-baseline.json");
@@ -230,135 +226,4 @@ test("compat baseline: session startup sets the status keys and stays idempotent
       assert.ok(cleared.includes(key), `session_shutdown must clear ${key}`);
     }
   });
-});
-
-// ── Port fakes ───────────────────────────────────────────────────────
-// Later steps rely on these fakes being honest. Each test pins the property
-// the orchestration code will depend on.
-
-test("port fake: virtual clock only advances on demand", () => {
-  const clock = makeFakeClock(1_000);
-  const seen: number[] = [];
-  clock.setTimeout(() => seen.push(clock.now()), 500);
-  clock.setTimeout(() => seen.push(clock.now()), 100);
-  assert.deepEqual(seen, []);
-  assert.equal(clock.pending(), 2);
-  clock.advance(100);
-  assert.deepEqual(seen, [1_100]);
-  clock.advance(400);
-  assert.deepEqual(seen, [1_100, 1_500]);
-  assert.equal(clock.pending(), 0);
-  assert.equal(clock.now(), 1_500);
-});
-
-test("port fake: filesystem replaces atomically and models a torn write", async () => {
-  const mem = makeMemoryFs({ "/run/a.json": "old" });
-  await mem.writeFileAtomic("/run/a.json", "new");
-  assert.equal(await mem.readFileText("/run/a.json"), "new");
-  assert.deepEqual(mem.writes().map((entry) => entry.path), ["/run/a.json"]);
-
-  mem.faults.failNextWrite = "/run/a.json";
-  await assert.rejects(() => mem.writeFileAtomic("/run/a.json", "loser"));
-  // The torn write must not have replaced the committed value.
-  assert.equal(await mem.readFileText("/run/a.json"), "new");
-
-  mem.faults.truncateNextWriteTo = 3;
-  await mem.writeFileAtomic("/run/a.json", "abcdef");
-  assert.equal(await mem.readFileText("/run/a.json"), "new");
-
-  assert.equal(normalizeFakePath("C:\\x\\..\\y"), "C:/y");
-  assert.equal(await mem.readFileText("/missing", { missingOk: true }), undefined);
-});
-
-test("port fake: launcher failures are explicit, never a hidden fallback", async () => {
-  const launcher = makeFakeLauncher({ available: true, label: "test-wt" });
-  assert.equal((await launcher.capabilities()).label, "test-wt");
-  const first = await launcher.launch({
-    sessionId: "s1",
-    cwd: "/p",
-    executable: "/pi",
-    args: ["--session-id", "s1"],
-  });
-  assert.equal(first.ok, true);
-  assert.equal(launcher.launches.length, 1);
-
-  launcher.failNextLaunch("wt.exe not found");
-  const failed = await launcher.launch({
-    sessionId: "s2",
-    cwd: "/p",
-    executable: "/pi",
-    args: [],
-  });
-  assert.deepEqual(failed, { ok: false, reason: "wt.exe not found" });
-  assert.equal(launcher.launches.length, 1);
-
-  launcher.setCapabilities({ available: false, separateWindow: false, reason: "no terminal" });
-  const caps = await launcher.capabilities();
-  assert.equal(caps.available, false);
-  assert.equal(caps.separateWindow, false);
-  if (first.ok) assert.equal(typeof first.handle.ref, "string");
-});
-
-test("port fake: child bus orders per session and reports transport state", async () => {
-  const bus = makeFakeChildBus();
-  const got: number[] = [];
-  bus.subscribe((event) => got.push(event.seq));
-  bus.send({
-    runId: "r1",
-    sessionId: "w1",
-    taskId: "t1",
-    attemptId: "a1",
-    message: { kind: "ready", taskId: "t1", attemptId: "a1", sessionId: "w1" },
-  });
-  bus.send({
-    runId: "r1",
-    sessionId: "w1",
-    taskId: "t1",
-    attemptId: "a1",
-    message: { kind: "heartbeat", taskId: "t1", attemptId: "a1", sessionId: "w1" },
-  });
-  bus.send({
-    runId: "r1",
-    sessionId: "w2",
-    taskId: "t2",
-    attemptId: "a2",
-    message: { kind: "ready", taskId: "t2", attemptId: "a2", sessionId: "w2" },
-  });
-  assert.deepEqual(got, [1, 2, 1]);
-
-  bus.setConnected(false, "socket closed");
-  assert.deepEqual(bus.status(), { connected: false, detail: "socket closed" });
-  const rejected = await bus.publish({
-    seq: 3,
-    sessionId: "w1",
-    runId: "r1",
-    taskId: "t1",
-    attemptId: "a1",
-    at: 0,
-    message: { kind: "candidate", taskId: "t1", attemptId: "a1", reportId: "rep" },
-  });
-  assert.equal(rejected.ok, false);
-});
-
-test("port fake: host records effects without touching a real Pi host", async () => {
-  const host = makeFakeHost();
-  host.commands["orchestrator"] = async (args) => {
-    host.notify(`ran ${args}`);
-  };
-  host.setStatus("workflow-run", "▶ run");
-  host.setWidget("workflow-run", ["line"]);
-  const result = await host.runCommand("orchestrator", "status");
-  assert.deepEqual(result, { ran: true });
-  assert.deepEqual(host.notifications, [{ message: "ran status" }]);
-  assert.deepEqual(host.statusCalls, [{ key: "workflow-run", text: "▶ run" }]);
-  assert.deepEqual(host.widgetCalls, [{ key: "workflow-run", lines: ["line"] }]);
-  const missing = await host.runCommand("nope");
-  assert.deepEqual(missing, { ran: false });
-});
-
-test("port fake: a launcher satisfies the port contract (type-level guard)", () => {
-  // Compile-time guard: if `LauncherPort` changes, this assignment fails
-  // typecheck instead of every orchestration test failing at runtime.
-  const launcher: LauncherPort = makeFakeLauncher();
-  assert.equal(typeof launcher.capabilities, "function");
 });

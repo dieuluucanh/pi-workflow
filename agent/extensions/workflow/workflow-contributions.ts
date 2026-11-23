@@ -53,10 +53,17 @@ export interface WorkflowContributionInput {
     phase: string;
     blockedReason?: string;
     nextTaskId?: string;
-    /** Whether a visible child host can be reached right now. */
-    hostReady?: boolean;
-    hostLabel?: string;
-    hostReason?: string;
+    /** The live in-process Build child (no window/tab). */
+    child?: {
+      ref: string;
+      total: number;
+      phase: string;
+      model?: string;
+      todoDone?: number;
+      todoTotal?: number;
+    };
+    /** Which TODO panel the pinned widget shows; display-only. */
+    view?: "auto" | "parent" | "child";
   };
 }
 
@@ -272,6 +279,13 @@ export function buildWorkflowContributions(
 
   if (input.mode === "orchestrator" && input.orchestration) {
     const run = input.orchestration;
+    const child = run.child;
+    const childLive =
+      child !== undefined &&
+      (child.phase === "starting" ||
+        child.phase === "running" ||
+        child.phase === "paused" ||
+        child.phase === "settling");
     out.push({
       id: "orchestrator-run",
       kind: "status",
@@ -280,6 +294,67 @@ export function buildWorkflowContributions(
       tone: "info",
       order: 41,
     });
+    if (child) {
+      const todos =
+        typeof child.todoTotal === "number" && child.todoTotal > 0
+          ? ` · ${child.todoDone ?? 0}/${child.todoTotal} todos`
+          : "";
+      out.push({
+        id: "orchestrator-child",
+        kind: "status",
+        slot: "status",
+        text: `child ${child.ref}/${child.total} · ${child.phase}${child.model ? ` · ${child.model}` : ""}${todos}`,
+        tone: child.phase === "paused" ? "warning" : "accent",
+        order: 42,
+      });
+      out.push({
+        id: "orchestrator-view",
+        kind: "action",
+        slot: "action",
+        label: run.view === "child" ? "Show parent todos" : "Show child todos",
+        tone: "neutral",
+        order: 43,
+        command: {
+          name: "orchestrator-view",
+          args: run.view === "child" ? "parent" : "child",
+        },
+        enabled: true,
+      });
+      if (child.phase === "running" || child.phase === "starting") {
+        out.push({
+          id: "orchestrator-pause",
+          kind: "action",
+          slot: "action",
+          label: "Pause child",
+          tone: "warning",
+          order: 44,
+          command: { name: "orchestrator-pause" },
+          enabled: true,
+        });
+      }
+      if (child.phase === "paused") {
+        out.push({
+          id: "orchestrator-resume",
+          kind: "action",
+          slot: "action",
+          label: "Resume child",
+          tone: "info",
+          order: 44,
+          command: { name: "orchestrator-resume" },
+          enabled: true,
+        });
+      }
+      out.push({
+        id: "orchestrator-abort",
+        kind: "action",
+        slot: "action",
+        label: "Abort child",
+        tone: "warning",
+        order: 45,
+        command: { name: "orchestrator-abort" },
+        enabled: true,
+      });
+    }
     if (run.blockedReason) {
       out.push({
         id: "orchestrator-blocked",
@@ -287,29 +362,19 @@ export function buildWorkflowContributions(
         slot: "status",
         text: `blocked: ${run.blockedReason.slice(0, 160)}`,
         tone: "warning",
-        order: 42,
+        order: 46,
       });
     }
-    if (run.hostReady === false) {
+    if (childLive) {
+      // Prompts still reach the parent; the extension forwards them to the
+      // child (steer). Say so instead of locking the composer.
       out.push({
-        id: "orchestrator-host",
+        id: "orchestrator-input-hint",
         kind: "status",
         slot: "status",
-        text: `${run.hostLabel ?? "child host"} unavailable: ${(run.hostReason ?? "no visible child host").slice(0, 160)}`,
-        tone: "warning",
-        order: 43,
-      });
-      // An explicit escape, never an automatic fallback: the user chooses.
-      out.push({
-        id: "orchestrator-direct-build",
-        kind: "action",
-        slot: "action",
-        label: "Use direct Build",
-        description: "Leave coordination and continue in this session as Build. Nothing is dispatched.",
-        tone: "warning",
-        command: { name: "build" },
-        enabled: true,
-        order: 44,
+        text: "prompts are forwarded to the Build child",
+        tone: "neutral",
+        order: 47,
       });
     }
   }

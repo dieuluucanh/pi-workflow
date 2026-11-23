@@ -11,7 +11,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import workflowExtension from "./index.ts";
-import { MANAGED_SESSION_ENTRY } from "./managed-session.ts";
 import {
   fakeSdk,
   makeFakeCtx,
@@ -221,45 +220,6 @@ test("mode cycle: entry never sends a prompt, starts a run or launches a child",
     assert.equal(
       b.notifies.some((note) => /dispatching|launched child/i.test(note.message)),
       false,
-    );
-  } finally {
-    await b.cleanup();
-  }
-});
-
-test("mode cycle: a managed worker skips Orchestrator and cannot enter it", async () => {
-  const b = await boot({
-    branch: [
-      {
-        type: "custom",
-        customType: MANAGED_SESSION_ENTRY,
-        data: {
-          version: 1,
-          runId: "run-1",
-          taskId: "task-1",
-          attemptId: "attempt-1",
-          parentSessionRef: "parent-session",
-          relation: "child",
-          mode: "build",
-        },
-      },
-    ],
-  });
-  try {
-    await b.pi.commands.build.handler("", b.ctx);
-    const seen: Array<string | null> = [];
-    for (let i = 0; i < 4; i += 1) {
-      await tap(b.pi, b.ctx);
-      seen.push(persistedMode(b.pi));
-    }
-    assert.deepEqual(seen, [null, "plan", "build", null]);
-    assert.equal(seen.includes("orchestrator"), false);
-
-    await b.pi.commands.orchestrator.handler("", b.ctx);
-    assert.notEqual(persistedMode(b.pi), "orchestrator");
-    assert.ok(
-      b.notifies.some((note) => /managed Build worker/i.test(note.message)),
-      "the refusal is explained",
     );
   } finally {
     await b.cleanup();

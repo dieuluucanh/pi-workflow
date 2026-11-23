@@ -13,14 +13,12 @@ import {
   MODE_CYCLE_ORDER,
   PLAN_MODE_TOOLS,
   NORMAL_MODE_TOOLS,
-  WORKER_MODE_CYCLE_ORDER,
   buildModeTools,
   cycleMode,
   decodeWorkflowEntry,
   encodeWorkflowMode,
   isManagedTool,
   isWorkflowMode,
-  modeCycleOrder,
   modeLabel,
   planModeTools,
   roleForMode,
@@ -93,23 +91,16 @@ test("cycle: Tab is Default → Plan → Orchestrator → Build → Default, and
   assert.equal(cycleMode(null, -1), "build");
 });
 
-test("cycle: one ring is exported and the worker ring omits Orchestrator", () => {
+test("cycle: one ring is exported in both directions", () => {
   assert.deepEqual(MODE_CYCLE_ORDER, [null, "plan", "orchestrator", "build"]);
-  assert.deepEqual(modeCycleOrder({ managedWorker: false }), MODE_CYCLE_ORDER);
-  assert.deepEqual(modeCycleOrder({ managedWorker: true }), WORKER_MODE_CYCLE_ORDER);
-  // A worker never reaches Orchestrator in either direction.
-  for (let i = 0; i < 6; i += 1) {
-    let workerMode: WorkflowMode = null;
-    for (let step = 0; step < 7; step += 1) {
-      workerMode = cycleMode(workerMode, 1, WORKER_MODE_CYCLE_ORDER);
-      assert.notEqual(workerMode, "orchestrator");
-    }
-    assert.equal(cycleMode("build", -1, WORKER_MODE_CYCLE_ORDER), "plan");
-  }
+  assert.equal(cycleMode(null), "plan");
+  assert.equal(cycleMode("plan"), "orchestrator");
+  assert.equal(cycleMode("orchestrator"), "build");
+  assert.equal(cycleMode("build"), null);
 });
 
 test("cycle: a mode outside the supplied ring resolves to its first entry", () => {
-  assert.equal(cycleMode("orchestrator", 1, WORKER_MODE_CYCLE_ORDER), null);
+  assert.equal(cycleMode("orchestrator", 1, [null, "plan", "build"]), null);
   assert.equal(cycleMode("someday" as WorkflowMode, 1), null);
 });
 
@@ -193,4 +184,34 @@ test("codec: optional fields are validated, not trusted", () => {
   const empty = decodeWorkflowEntry({ mode: "build", planFile: "", toolsBeforePlanMode: "read" });
   assert.equal(empty?.planFile, undefined);
   assert.equal(empty?.toolsBeforePlanMode, undefined);
+});
+
+test("the persisted orchestrator view survives decode and resets to undefined when absent", () => {
+  const decoded = decodeWorkflowEntry({
+    mode: "orchestrator",
+    enabled: false,
+    executing: false,
+    orchestratorView: "child",
+  });
+  assert.equal(decoded?.orchestratorView, "child");
+  // Unknown values are dropped, never guessed.
+  const unknown = decodeWorkflowEntry({
+    mode: "orchestrator",
+    orchestratorView: "split",
+  });
+  assert.equal(unknown?.orchestratorView, undefined);
+});
+
+test("encodeWorkflowMode writes the view only when provided", () => {
+  assert.deepEqual(encodeWorkflowMode("orchestrator"), {
+    mode: "orchestrator",
+    enabled: false,
+    executing: false,
+  });
+  assert.deepEqual(encodeWorkflowMode("orchestrator", "parent"), {
+    mode: "orchestrator",
+    enabled: false,
+    executing: false,
+    orchestratorView: "parent",
+  });
 });

@@ -89,7 +89,7 @@ test("the chooser never preselects a destination", () => {
 
 test("descriptions distinguish in-session Build from delegated Orchestrator", () => {
   assert.match(describeExecutionChoice("orchestrator"), /TODO row per step/);
-  assert.match(describeExecutionChoice("orchestrator"), /delegate/);
+  assert.match(describeExecutionChoice("orchestrator"), /in-process Build child/);
   assert.match(describeExecutionChoice("build"), /Build mode/);
   assert.match(describeExecutionChoice("build"), /implement/);
 });

@@ -133,12 +133,6 @@ export const MODE_CYCLE_ORDER: readonly WorkflowMode[] = [
   "build",
 ];
 
-/**
- * Managed workers may use Plan/Build but can never promote themselves into the
- * parent scheduler. Their eligible ring therefore omits Orchestrator; explicit
- * `/orchestrator` is refused by the mode controller.
- */
-export const WORKER_MODE_CYCLE_ORDER: readonly WorkflowMode[] = [null, "plan", "build"];
 
 /** Tab / Ctrl+Alt+P order: Default → Plan → Orchestrator → Build → Default. */
 export function cycleMode(
@@ -155,11 +149,6 @@ export function cycleMode(
   }
   const next = (index + direction + ring.length) % ring.length;
   return ring[next] ?? null;
-}
-
-/** The cycle ring for this session; a managed worker excludes Orchestrator. */
-export function modeCycleOrder(options: { managedWorker: boolean }): readonly WorkflowMode[] {
-  return options.managedWorker ? WORKER_MODE_CYCLE_ORDER : MODE_CYCLE_ORDER;
 }
 
 export type ModeRole = "planner" | "builder" | "orchestrator" | null;
@@ -186,6 +175,8 @@ export function modeLabel(mode: WorkflowMode): string {
  * The durable part of the `workflow` custom entry this module understands.
  * Other fields (todos, handoff correlation, …) are owned by their features.
  */
+export type OrchestratorView = "auto" | "parent" | "child";
+
 export interface WorkflowStateFields {
   mode: WorkflowMode;
   /** Legacy mirrors, still written for older readers. */
@@ -194,6 +185,11 @@ export interface WorkflowStateFields {
   toolsBeforePlanMode?: string[];
   planFile?: string;
   todos?: TodoItem[];
+  /**
+   * Which TODO panel the pinned widget shows while Orchestrator runs. Decoded
+   * here or it silently resets to `auto` on every reload.
+   */
+  orchestratorView?: OrchestratorView;
 }
 
 export interface DecodedWorkflowEntry {
@@ -202,6 +198,7 @@ export interface DecodedWorkflowEntry {
   legacy: boolean;
   toolsBeforePlanMode?: string[];
   planFile?: string;
+  orchestratorView?: OrchestratorView;
 }
 
 /**
@@ -255,11 +252,19 @@ export function decodeWorkflowEntry(
       ? record.planFile
       : undefined;
 
+  const orchestratorView =
+    record.orchestratorView === "child" ||
+    record.orchestratorView === "parent" ||
+    record.orchestratorView === "auto"
+      ? record.orchestratorView
+      : undefined;
+
   return {
     mode,
     legacy,
     ...(toolsBeforePlanMode === undefined ? {} : { toolsBeforePlanMode }),
     ...(planFile === undefined ? {} : { planFile }),
+    ...(orchestratorView === undefined ? {} : { orchestratorView }),
   };
 }
 
@@ -268,13 +273,15 @@ export function decodeWorkflowEntry(
  * readers written before the `mode` field existed; they are derived, never
  * authoritative.
  */
-export function encodeWorkflowMode(mode: WorkflowMode): Pick<
-  WorkflowStateFields,
-  "mode" | "enabled" | "executing"
-> {
+export function encodeWorkflowMode(
+  mode: WorkflowMode,
+  orchestratorView?: OrchestratorView,
+): Pick<WorkflowStateFields, "mode" | "enabled" | "executing"> &
+  Partial<Pick<WorkflowStateFields, "orchestratorView">> {
   return {
     mode,
     enabled: mode === "plan",
     executing: mode === "build",
+    ...(orchestratorView === undefined ? {} : { orchestratorView }),
   };
 }

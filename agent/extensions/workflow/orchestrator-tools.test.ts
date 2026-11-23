@@ -1,8 +1,8 @@
 /**
  * Parent tool surface tests (Orchestrator simplification, steps 10/20).
  *
- * The model sees six tools; there is no propose/preview/dispatch tool, no
- * pump and no model-supplied acceptance evidence.
+ * The model sees three tools (start, status, retry). Verification, acceptance
+ * and repair are automatic and have no model-facing tool.
  */
 
 import assert from "node:assert/strict";
@@ -70,18 +70,17 @@ const ctx = (currentState: RunState, evidence?: Map<string, { taskId: string; ev
   ...(evidence === undefined ? {} : { evidence }),
 });
 
-test("the model-facing surface is exactly the six simplified tools", () => {
+test("the model-facing surface is exactly start, status and retry", () => {
   assert.deepEqual([...ORCHESTRATOR_TOOL_NAMES], [
     "orchestrator_start",
     "orchestrator_status",
-    "orchestrator_verify",
-    "orchestrator_repair",
-    "orchestrator_accept",
     "orchestrator_retry",
   ]);
-  assert.equal(ORCHESTRATOR_TOOLS.length, 6);
+  assert.equal(ORCHESTRATOR_TOOLS.length, 3);
   assert.equal(
-    ORCHESTRATOR_TOOLS.some((spec) => /propose|prepare|dispatch|preview/.test(spec.name)),
+    ORCHESTRATOR_TOOLS.some((spec) =>
+      /propose|prepare|dispatch|preview|verify|accept|repair/.test(spec.name),
+    ),
     false,
   );
 });
@@ -97,45 +96,26 @@ test("status reports phase, counts and the next frozen row", () => {
   assert.equal(result.receipt.rows?.length, 2);
 });
 
-test("verify requires a reported candidate and emits the marker event", () => {
-  const early = handleOrchestratorTool("orchestrator_verify", { taskId: "task-1" }, ctx(state()));
-  assert.equal(early.ok, false);
-
-  const ready = handleOrchestratorTool("orchestrator_verify", { taskId: "task-1" }, ctx(candidate()));
-  assert.equal(ready.ok, true);
-  if (!ready.ok) return;
-  assert.equal(ready.event?.type, "task.verify");
-});
-
-test("accept refuses model-supplied evidence; runtime evidence emits the event", () => {
-  const refused = handleOrchestratorTool("orchestrator_accept", { taskId: "task-1" }, ctx(candidate()));
-  assert.equal(refused.ok, false);
-  assert.match((refused as { error: string }).error, /runtime-owned/);
-
-  const accepted = handleOrchestratorTool(
-    "orchestrator_accept",
-    { taskId: "task-1" },
-    ctx(candidate(), new Map([["task-1", { taskId: "task-1", evidenceId: "evidence-1", workspaceRevision: "abc" }]])),
-  );
-  assert.equal(accepted.ok, true);
-  if (!accepted.ok) return;
-  assert.equal(accepted.event?.type, "task.accept");
-});
-
-test("repair is bounded and cannot target an accepted row", () => {
-  const repair = handleOrchestratorTool(
-    "orchestrator_repair",
-    { taskId: "task-1", reason: "the check failed" },
-    ctx(candidate()),
-  );
-  assert.equal(repair.ok, true);
-  if (!repair.ok) return;
-  assert.equal(repair.event?.type, "task.needsFix");
-});
-
 test("retry only applies to a blocked or repaired row", () => {
   const idle = handleOrchestratorTool("orchestrator_retry", {}, ctx(candidate()));
   assert.equal(idle.ok, false);
+
+  const base = state();
+  const blocked = applyRunEvent(base, {
+    type: "task.block",
+    runId: "run-1",
+    expectedRevision: base.revision,
+    now: 1_003,
+    taskId: "task-1",
+    reason: "check failed",
+  });
+  assert.equal(blocked.ok, true);
+  if (!blocked.ok) return;
+  const retry = handleOrchestratorTool("orchestrator_retry", {}, ctx(blocked.state));
+  assert.equal(retry.ok, true);
+  if (!retry.ok) return;
+  assert.equal(retry.event?.type, "task.retry");
+  assert.equal(retry.receipt.taskId, "task-1");
 });
 
 test("start is handled by the extension service, never the pure tool layer", () => {

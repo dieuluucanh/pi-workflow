@@ -211,7 +211,7 @@ test("native plan rows never carry an execution destination", () => {
   const question = buildHandoffQuestion({ planPath: "p", reason: "reviewed" });
   assert.equal(question.options.length, 3);
   assert.equal(question.options[0]?.label, HANDOFF_APPROVE_LABEL);
-  assert.match(String(question.options[0]?.description), /choose Orchestrator preparation or direct Build/);
+  assert.match(String(question.options[0]?.description), /choose Orchestrator \(in-process child per step\) or direct Build/);
   for (const option of question.options) {
     assert.doesNotMatch(
       option.label,

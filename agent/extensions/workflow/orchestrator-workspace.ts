@@ -1,13 +1,14 @@
 /**
- * Workflow Extension — workspace identity, cooperative lease and baseline (step 22).
+ * Workflow Extension — workspace identity, baseline and attributable diff.
  *
  * Three separate concerns, all pure/ported:
  *   1. identity — one key for cwd aliases, symlinks, worktrees and Windows path
  *      forms, so two sessions cannot think they are in different workspaces;
- *   2. lease — one cooperative mutation holder per workspace. A stale lease is
- *      never silently stolen: TTL expiry requires an explicit reclaim;
- *   3. baseline — bounded tracked/untracked/deleted/binary/mode snapshot and a
- *      comparison that reports EXTERNAL changes for revalidation.
+ *   2. baseline — bounded tracked/untracked/deleted/binary/mode snapshot;
+ *   3. diff — dirty changes plus the `previous.head..HEAD` commit range, so a
+ *      child that commits its work is still attributable. (The cooperative
+ *      cross-process lease was removed with the external child: one in-process
+ *      child per run writes sequentially.)
  *
  * Nothing here touches git history or the project `.git`: there is no checkout,
  * reset or clean. Git state arrives through an injected port; non-Git projects
@@ -18,7 +19,6 @@
 import { createHash } from "node:crypto";
 
 export const WORKSPACE_SCHEMA_VERSION = 1 as const;
-export const DEFAULT_LEASE_TTL_MS = 60_000;
 export const DEFAULT_MAX_BASELINE_FILES = 5_000;
 export const MAX_PATH_CHARS = 4_000;
 
@@ -96,197 +96,6 @@ export async function resolveWorkspaceIdentity(input: {
     ok: true,
     value: { key: `plain:${root}`, root, kind: "plain", displayPath: real },
   };
-}
-
-// ── Cooperative lease ────────────────────────────────────────────────
-
-export interface LeaseGrant {
-  workspaceKey: string;
-  runId: string;
-  taskId: string;
-  attemptId: string;
-  sessionId: string;
-  generation: number;
-  acquiredAt: number;
-  expiresAt: number;
-}
-
-export type LeaseCode =
-  | "held"
-  | "expired"
-  | "stale_generation"
-  | "invalid"
-  | "confirmation"
-  | "not_holder";
-
-export type LeaseResult =
-  | { ok: true; grant: LeaseGrant }
-  | { ok: false; code: LeaseCode; error: string; holder?: LeaseGrant };
-
-function sameHolder(grant: LeaseGrant, other: Partial<LeaseGrant>): boolean {
-  return (
-    grant.runId === other.runId &&
-    grant.taskId === other.taskId &&
-    grant.attemptId === other.attemptId &&
-    grant.sessionId === other.sessionId &&
-    grant.generation === other.generation
-  );
-}
-
-export interface WorkspaceLeases {
-  acquire(input: Omit<LeaseGrant, "acquiredAt" | "expiresAt">): LeaseResult;
-  renew(grant: LeaseGrant): LeaseResult;
-  release(grant: LeaseGrant): { ok: true } | { ok: false; code: LeaseCode; error: string };
-  holder(workspaceKey: string): LeaseGrant | undefined;
-  isWriter(grant: LeaseGrant): boolean;
-  /** Explicit recovery of an expired lease; never implicit. */
-  reclaim(input: {
-    workspaceKey: string;
-    grant: Omit<LeaseGrant, "acquiredAt" | "expiresAt">;
-    confirmation: string;
-  }): LeaseResult;
-  /**
-   * Durably reserves the next workspace-wide fencing token. Task/attempt
-   * counters must never be used as this number: a second task would otherwise
-   * propose generation 1 again.
-   */
-  nextGeneration?(workspaceKey: string): number;
-}
-
-export function createWorkspaceLeases(options: {
-  ttlMs?: number;
-  now?: () => number;
-} = {}): WorkspaceLeases {
-  const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS;
-  const now = options.now ?? (() => Date.now());
-  const holders = new Map<string, LeaseGrant>();
-  const generations = new Map<string, number>();
-  const reserved = new Map<string, number>();
-
-  const expired = (grant: LeaseGrant): boolean => grant.expiresAt <= now();
-  const tokenAllowed = (workspaceKey: string, token: number): boolean => {
-    const last = generations.get(workspaceKey) ?? 0;
-    const pending = reserved.get(workspaceKey) ?? 0;
-    if (token > Math.max(last, pending)) return true;
-    return token === pending && token > last;
-  };
-
-  const leases: WorkspaceLeases = {
-    acquire(input) {
-      if (
-        !input.workspaceKey ||
-        !input.runId ||
-        !input.taskId ||
-        !input.attemptId ||
-        !input.sessionId ||
-        !Number.isInteger(input.generation) ||
-        input.generation < 1
-      ) {
-        return { ok: false, code: "invalid", error: "lease identity is incomplete" };
-      }
-      const current = holders.get(input.workspaceKey);
-      if (current) {
-        if (!expired(current)) {
-          if (sameHolder(current, input)) return { ok: true, grant: { ...current } };
-          return {
-            ok: false,
-            code: "held",
-            error: `workspace is held by ${current.taskId}/${current.attemptId}`,
-            holder: { ...current },
-          };
-        }
-        // Expired but not released: the old writer may still be alive, so only
-        // an explicit reclaim may take it.
-        return {
-          ok: false,
-          code: "expired",
-          error: "the previous lease expired without release; reclaim it explicitly",
-          holder: { ...current },
-        };
-      }
-      const last = generations.get(input.workspaceKey) ?? 0;
-      if (!tokenAllowed(input.workspaceKey, input.generation)) {
-        return { ok: false, code: "stale_generation", error: `generation must exceed ${last}` };
-      }
-      const grant: LeaseGrant = {
-        ...input,
-        acquiredAt: now(),
-        expiresAt: now() + ttlMs,
-      };
-      holders.set(input.workspaceKey, grant);
-      generations.set(input.workspaceKey, input.generation);
-      reserved.delete(input.workspaceKey);
-      return { ok: true, grant: { ...grant } };
-    },
-
-    renew(grant) {
-      const current = holders.get(grant.workspaceKey);
-      if (!current || !sameHolder(current, grant)) {
-        return { ok: false, code: "not_holder", error: "the lease is not held by this attempt" };
-      }
-      if (expired(current)) {
-        return { ok: false, code: "expired", error: "the lease expired; reclaim it explicitly" };
-      }
-      const next: LeaseGrant = { ...current, expiresAt: now() + ttlMs };
-      holders.set(grant.workspaceKey, next);
-      return { ok: true, grant: { ...next } };
-    },
-
-    release(grant) {
-      const current = holders.get(grant.workspaceKey);
-      if (!current || !sameHolder(current, grant)) {
-        return { ok: false, code: "not_holder", error: "the lease is not held by this attempt" };
-      }
-      holders.delete(grant.workspaceKey);
-      return { ok: true };
-    },
-
-    holder(workspaceKey) {
-      const current = holders.get(workspaceKey);
-      return current ? { ...current } : undefined;
-    },
-
-    isWriter(grant) {
-      const current = holders.get(grant.workspaceKey);
-      return !!current && !expired(current) && sameHolder(current, grant);
-    },
-
-    reclaim(input) {
-      if (input.confirmation !== "reclaim-stale") {
-        return {
-          ok: false,
-          code: "confirmation",
-          error: "reclaiming a lease needs an explicit confirmation",
-        };
-      }
-      const current = holders.get(input.workspaceKey);
-      if (current && !expired(current)) {
-        return { ok: false, code: "held", error: "the lease is still live", holder: { ...current } };
-      }
-      const last = generations.get(input.workspaceKey) ?? 0;
-      if (!tokenAllowed(input.workspaceKey, input.grant.generation)) {
-        return { ok: false, code: "stale_generation", error: `generation must exceed ${last}` };
-      }
-      const grant: LeaseGrant = {
-        ...input.grant,
-        acquiredAt: now(),
-        expiresAt: now() + ttlMs,
-      };
-      holders.set(input.workspaceKey, grant);
-      generations.set(input.workspaceKey, input.grant.generation);
-      reserved.delete(input.workspaceKey);
-      return { ok: true, grant: { ...grant } };
-    },
-
-    nextGeneration(workspaceKey) {
-      const last = generations.get(workspaceKey) ?? 0;
-      const pending = reserved.get(workspaceKey) ?? 0;
-      const next = Math.max(last, pending) + 1;
-      reserved.set(workspaceKey, next);
-      return next;
-    },
-  };
-  return leases;
 }
 
 // ── Baseline ─────────────────────────────────────────────────────────
@@ -503,6 +312,15 @@ export function compareBaseline(
   current: WorkspaceBaseline,
   options: { expectedPaths?: readonly string[] } = {},
 ): BaselineComparison {
+  const comparison = compareDirtyBaseline(previous, current, options);
+  return comparison;
+}
+
+function compareDirtyBaseline(
+  previous: WorkspaceBaseline,
+  current: WorkspaceBaseline,
+  options: { expectedPaths?: readonly string[] } = {},
+): BaselineComparison {
   const key = (change: BaselineChange) =>
     `${change.staged ? "s" : "u"}\u0000${change.status}\u0000${change.path}\u0000${
       change.mode ?? ""
@@ -528,4 +346,99 @@ export function compareBaseline(
     requiresRevalidation: external.length > 0,
     attributionConflicts: [...new Set(attributionConflicts)].sort(),
   };
+}
+
+// ── HEAD-aware diff (attributable work since an attempt baseline) ─────
+
+export interface BaselineDiff {
+  /** True when the child produced a committed or dirty change. */
+  changed: boolean;
+  /** Paths committed between `previous.head` and `current.head`. */
+  committedPaths: string[];
+  /** Paths whose dirty state differs from the baseline. */
+  dirtyPaths: string[];
+  /** Pre-existing user work on a path this row expects to change. */
+  attributionConflicts: string[];
+  /** Opaque identity of this observation, journaled as acceptance evidence. */
+  workspaceRevision: string;
+}
+
+function normalizeDiffPath(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function samePath(fact: string, expected: string): boolean {
+  if (fact === expected) return true;
+  if (expected.startsWith("*")) return fact.endsWith(expected.slice(1));
+  return fact.endsWith(`/${expected}`);
+}
+
+/**
+ * Compare two attempt baselines including the commit range between their HEADs.
+ *
+ * `compareBaseline` only looks at dirty entries, so a child that commits its
+ * work reads as "unchanged". This adds `previous.head..current.head` from
+ * `git diff --name-only` (the injected `gitDiffPaths`), which is the only
+ * attribution signal for a committed row. A missing head means a non-Git
+ * workspace: only dirty entries are compared.
+ */
+export function diffSinceBaseline(
+  previous: WorkspaceBaseline,
+  current: WorkspaceBaseline,
+  options: {
+    expectedPaths?: readonly string[];
+    /** Pre-computed `git diff --name-only <previous.head>..<current.head>`. */
+    gitDiffPaths?: readonly string[];
+  } = {},
+): BaselineDiff {
+  const comparison = compareDirtyBaseline(previous, current, {
+    ...(options.expectedPaths === undefined
+      ? {}
+      : { expectedPaths: options.expectedPaths }),
+  });
+  const committedPaths = previous.head && current.head && previous.head !== current.head
+    ? [...new Set((options.gitDiffPaths ?? []).map(normalizeDiffPath).filter(Boolean))].sort()
+    : [];
+  const dirtyPaths = [...comparison.externalChanges];
+  const changed = committedPaths.length > 0 || dirtyPaths.length > 0;
+  const workspaceRevision = createHash("sha256")
+    .update(
+      canonical({
+        previousHead: previous.head ?? null,
+        currentHead: current.head ?? null,
+        previousDigest: previous.digest,
+        currentDigest: current.digest,
+        committedPaths,
+        dirtyPaths,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+  return {
+    changed,
+    committedPaths,
+    dirtyPaths,
+    attributionConflicts: comparison.attributionConflicts,
+    workspaceRevision,
+  };
+}
+
+/**
+ * True when at least one attributable path matches the row's expected files.
+ * Committed paths always count (a child may commit under a different relative
+ * form); dirty paths match by exact path or suffix so a nested workspace path
+ * still matches a repo-relative expectation.
+ */
+export function hasAttributableChange(
+  diff: BaselineDiff,
+  expectedPaths: readonly string[] = [],
+): boolean {
+  if (expectedPaths.length === 0) return diff.changed;
+  const expected = expectedPaths.map(normalizeDiffPath).filter(Boolean);
+  if (expected.length === 0) return diff.changed;
+  if (diff.committedPaths.length > 0) return true;
+  const observed = [...diff.dirtyPaths];
+  return observed.some((fact) =>
+    expected.some((want) => samePath(fact, want)),
+  );
 }

@@ -1,5 +1,29 @@
 # Orchestrator live acceptance — manual signoff
 
+> **Updated 2026-11-23 — in-process Build child.** The external child chain
+> (Desktop tab / Terminal window / `pi --session` / child host / IPC / start-ack
+> / workspace lease) is removed. The current contract is:
+>
+> - plan approval (or an agreed standalone discussion) freezes ONE TODO list
+>   (one row per top-level plan step) via `orchestrator_start`;
+> - the extension runs one **in-process** SDK Build child per row (no window or
+>   tab); the child loads only this extension plus Pi built-ins and gets the
+>   normal Workflow-managed Build tools and policy gates;
+> - on a natural settle the extension reports, diffs (including
+>   `previous.head..HEAD`), runs the row checks, verifies and accepts, then
+>   starts the next row; a failure repairs the same warm child (max 2 rounds)
+>   and then blocks and pauses;
+> - the parent model only handles blockers, status and recovery; user prose is
+>   forwarded to the running child;
+> - `/orchestrator-pause|resume|abort|view` (and the `/orchestrator` verbs)
+>   control the child; `/orchestrator-view` toggles the pinned panel only;
+> - a reload blocks a `running` row and pauses the run; retry starts a fresh
+>   child. Old managed-worker sessions open as ordinary Build.
+>
+> Parent tools are `orchestrator_start|status|retry`; there is no
+> `workflow_worker_ready`, `orchestrator_verify|accept|repair` or
+> `workflow-bridge`. See the package README and CHANGELOG.
+
 > **Superseded 2026-11-22 (Orchestrator simplification).** The
 > propose → preview → execution-approval pipeline described in the older body of
 > this document no longer exists. The current contract is:
@@ -222,3 +246,49 @@ Automated gates after the repair: workflow `typecheck` clean; `npm test`
 **1278/1278**; `read-policy` pass; `check:policy` 100/100 in a disposable HOME;
 root `npm test` 80/80; `verify --packages workflow` 79 files ok. These do not
 substitute for the live cases above.
+
+## Automated evidence — 2026-11-23 (in-process Build child)
+
+Recorded from `agent/extensions/workflow` and the repo root after the migration.
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Workflow typecheck | `npm run typecheck` | clean (0 errors) |
+| Workflow tests | `npm test` | **1260 / 1260 pass** (60 files) |
+| Read policy | `npm run check:read-policy` | all checks passed |
+| Write policy | `npm run check:policy` | 100/100 checks passed (disposable HOME) |
+| Root tests | `npm test` | 80 / 80 pass |
+| Package gate | `npm run verify -- --packages workflow` | 1/1 ok (72 files packed) |
+| Static: external host chain | `rg "createChildDispatcher|createTerminalHost|createRelated\(|controlGrant|workflow-bridge"` (non-test, non-store) | no hits (`session-host.ts` is the kept pure contract) |
+| Static: retired launch events | `rg "task\.launched|task\.start\.intent"` (non-test, non-store) | no hits |
+| Static: removed tools | `rg "workflow_worker_ready|orchestrator_report|orchestrator_checkpoint|orchestrator_verify|orchestrator_accept|orchestrator_repair"` | only docs/changelog history |
+| LSP | changed modules except `index.ts` | typecheck authoritative; one pre-existing ast-grep advisory in `ports.ts` (`ClockPort` handle is `unknown` by design) |
+
+New behavior tests: `orchestrator-advance.test.ts` (12), `orchestrator-operator.test.ts`
+(20), `orchestrator-child` contract/controller tests, `in-process-child` tests,
+codec/status/contributions cases, and end-to-end `OE1–OE4` in `extension.test.ts`
+(auto-accept chain, repair exhaustion, prompt cascade, abort → retry).
+
+## Manual matrix — 2026-11-23
+
+Status: **NOT RUN.** Every row needs a human at a terminal/Desktop with real
+provider credentials. Automated tests use a fake SDK child and prove the
+sequence, not the visible rendering or provider behavior.
+
+1. Approve a plan → Orchestrator → child 1 appears in the parent transcript and
+   status; **no new Terminal window or Desktop tab**.
+2. Child creates its own TODO list, edits, and commits per policy.
+3. Child 1 settles → verification runs → auto-accept → child 2 starts.
+4. A failing row check triggers a repair prompt; two failures block and pause.
+5. Typing a normal prompt while a child runs shows `you → child`; the child
+   receives it; the parent does not start a second turn.
+6. `/orchestrator-pause` stops the turn; `/orchestrator-resume` continues.
+7. `/orchestrator-abort` disposes the child and pauses; retry starts a fresh
+   child.
+8. `/orchestrator-view child|parent` toggles the pinned panel only.
+9. `/profile` mid-run changes only the next child.
+10. `/reload` mid-run leaves the run paused, the row blocked, no child; retry
+    works.
+11. Desktop shows identical entries/status/actions, no new tab.
+12. Missing Builder auth/model fails before the row is `running`, naming the
+    Builder role; no orphaned child session, subagent or timer.

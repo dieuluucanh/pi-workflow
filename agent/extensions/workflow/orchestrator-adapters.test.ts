@@ -14,10 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
-  createFileWorkspaceLeases,
   createGitBaselinePort,
-  createNodeClock,
-  createNodeFsPort,
   createNodeJournalIo,
   parsePorcelainZ,
 } from "./orchestrator-adapters.ts";
@@ -89,157 +86,6 @@ test("journal io: the writer lock is exclusive per process", async () => {
   }
 });
 
-test("fs port: stat/readdir/remove and missingOk behave like the contract", async () => {
-  const { dir, cleanup } = tempDir();
-  try {
-    const port = createNodeFsPort();
-    await port.writeFileAtomic(path.join(dir, "a", "b.txt"), "hi", { mkdirp: true });
-    const stat = await port.stat(path.join(dir, "a", "b.txt"));
-    assert.equal(stat?.kind, "file");
-    assert.equal(await port.readFileText(path.join(dir, "missing"), { missingOk: true }), undefined);
-    assert.deepEqual((await port.readdir(path.join(dir, "a"))).map((e) => e.name), ["b.txt"]);
-    assert.deepEqual(await port.readdir(path.join(dir, "nope")), []);
-    await port.remove(path.join(dir, "a"), { recursive: true });
-    assert.equal(await port.stat(path.join(dir, "a")), undefined);
-    // A same-directory rename reports failure as a value.
-    const moved = await port.rename(path.join(dir, "x"), path.join(dir, "y"));
-    assert.equal(moved.ok, false);
-  } finally {
-    cleanup();
-  }
-});
-
-const GRANT = {
-  workspaceKey: "ws-1",
-  runId: "run-1",
-  taskId: "task-1",
-  attemptId: "attempt-1",
-  sessionId: "session-1",
-};
-
-test("leases: a second identity is refused while the first holds the workspace", () => {
-  const { dir, cleanup } = tempDir();
-  try {
-    const leases = createFileWorkspaceLeases({ root: dir, ttlMs: 1_000 });
-    const first = leases.acquire({ ...GRANT, generation: 1 });
-    assert.equal(first.ok, true);
-
-    const other = leases.acquire({
-      ...GRANT,
-      attemptId: "attempt-2",
-      sessionId: "session-2",
-      generation: 2,
-    });
-    assert.equal(other.ok, false);
-    assert.equal((other as any).code, "held");
-
-    // Same identity is idempotent.
-    const again = leases.acquire({ ...GRANT, generation: 1 });
-    assert.equal(again.ok, true);
-  } finally {
-    cleanup();
-  }
-});
-
-test("leases: expiry needs an explicit reclaim and generations never go backwards", () => {
-  const { dir, cleanup } = tempDir();
-  let clock = 1_000;
-  try {
-    const leases = createFileWorkspaceLeases({ root: dir, ttlMs: 100, now: () => clock });
-    assert.equal(leases.acquire({ ...GRANT, generation: 1 }).ok, true);
-
-    clock += 200;
-    const expired = leases.acquire({
-      ...GRANT,
-      attemptId: "attempt-2",
-      sessionId: "session-2",
-      generation: 2,
-    });
-    assert.equal((expired as any).code, "expired", "expiry alone never grants");
-
-    const noConfirm = leases.reclaim({
-      workspaceKey: GRANT.workspaceKey,
-      grant: { ...GRANT, attemptId: "attempt-2", sessionId: "session-2", generation: 2 },
-      confirmation: "yes",
-    } as never);
-    assert.equal((noConfirm as any).code, "confirmation");
-
-    const stale = leases.reclaim({
-      workspaceKey: GRANT.workspaceKey,
-      grant: { ...GRANT, attemptId: "attempt-2", sessionId: "session-2", generation: 1 },
-      confirmation: "reclaim-stale",
-    });
-    assert.equal((stale as any).code, "stale_generation");
-
-    const reclaimed = leases.reclaim({
-      workspaceKey: GRANT.workspaceKey,
-      grant: { ...GRANT, attemptId: "attempt-2", sessionId: "session-2", generation: 2 },
-      confirmation: "reclaim-stale",
-    });
-    assert.equal(reclaimed.ok, true);
-    assert.equal(leases.isWriter({
-      ...GRANT,
-      attemptId: "attempt-1",
-      sessionId: "session-1",
-      generation: 1,
-      acquiredAt: 1,
-      expiresAt: 2,
-    }), false, "the old holder is fenced out");
-  } finally {
-    cleanup();
-  }
-});
-
-test("leases: the generation high-water mark survives release, a new task and a restart", () => {
-  const { dir, cleanup } = tempDir();
-  try {
-    const leases = createFileWorkspaceLeases({ root: dir, ttlMs: 10_000 });
-
-    const firstGen = leases.nextGeneration!(GRANT.workspaceKey);
-    assert.equal(firstGen, 1);
-    const first = leases.acquire({ ...GRANT, generation: firstGen });
-    assert.equal(first.ok, true);
-    assert.equal(leases.release((first as any).grant).ok, true);
-
-    // Task two must NOT propose generation 1 again; the high-water mark is
-    // workspace-wide, not task/attempt-local.
-    const secondGen = leases.nextGeneration!(GRANT.workspaceKey);
-    assert.equal(secondGen, 2);
-    const second = leases.acquire({
-      ...GRANT,
-      taskId: "task-2",
-      attemptId: "attempt-2",
-      sessionId: "session-2",
-      generation: secondGen,
-    });
-    assert.equal(second.ok, true, second.ok ? "" : second.error);
-    const staleTaskOne = leases.acquire({
-      ...GRANT,
-      attemptId: "attempt-1b",
-      sessionId: "session-1b",
-      generation: 1,
-    });
-    assert.equal((staleTaskOne as any).code, "held", "the live lease refuses an old generation");
-    assert.equal(leases.release((second as any).grant).ok, true);
-
-    // A new adapter instance (a restarted parent) reads the same high-water
-    // mark from disk instead of resetting to 0.
-    const restarted = createFileWorkspaceLeases({ root: dir, ttlMs: 10_000 });
-    assert.equal(restarted.nextGeneration!(GRANT.workspaceKey), 3);
-    const newRun = restarted.acquire({
-      ...GRANT,
-      runId: "run-2",
-      taskId: "task-1",
-      attemptId: "attempt-1",
-      sessionId: "session-3",
-      generation: 3,
-    });
-    assert.equal(newRun.ok, true);
-  } finally {
-    cleanup();
-  }
-});
-
 test("baseline: content digests are real file bytes and bound to the workspace root", async () => {
   const { dir, cleanup } = tempDir();
   try {
@@ -254,26 +100,6 @@ test("baseline: content digests are real file bytes and bound to the workspace r
     assert.notEqual(first, second, "same size, different bytes");
     assert.equal(await port.contentDigest!(dir, "../outside.txt"), null);
     assert.equal(await port.contentDigest!(dir, "missing.txt"), null);
-  } finally {
-    cleanup();
-  }
-});
-
-test("leases: release is holder-only, so a stale generation cannot free a live lease", () => {
-  const { dir, cleanup } = tempDir();
-  try {
-    const leases = createFileWorkspaceLeases({ root: dir });
-    const acquired = leases.acquire({ ...GRANT, generation: 1 });
-    assert.equal(acquired.ok, true);
-    if (!acquired.ok) return;
-
-    const foreign = leases.release({
-      ...acquired.grant,
-      attemptId: "attempt-other",
-      generation: 9,
-    });
-    assert.equal(foreign.ok, false);
-    assert.equal(leases.release(acquired.grant).ok, true);
   } finally {
     cleanup();
   }
@@ -367,11 +193,4 @@ test("baseline: a non-Git folder gets a bounded listing, never a failure", async
   } finally {
     cleanup();
   }
-});
-
-test("clock: real timers can be created and cleared", () => {
-  const clock = createNodeClock();
-  const handle = clock.setTimeout(() => undefined, 10_000);
-  clock.clearTimeout(handle);
-  assert.equal(typeof clock.now(), "number");
 });

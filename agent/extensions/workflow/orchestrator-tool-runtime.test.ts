@@ -1,16 +1,24 @@
 /**
- * Parent dispatch/retry behavior (launch evidence, honest failure, recovery).
+ * Parent tool adapter behavior.
+ *
+ * The surface is start/status/retry. Acceptance is automatic, so these tests
+ * pin: start delegates, status is read-only, retry re-queues the exact row and
+ * dispatches it through the in-process child dispatcher, and a dispatch failure
+ * is reported honestly.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createParentToolRuntime, type ParentToolPorts } from "./orchestrator-tool-runtime.ts";
+import {
+  createParentToolRuntime,
+  type ParentToolPorts,
+} from "./orchestrator-tool-runtime.ts";
 import {
   applyRunEvent,
   createRunState,
-  type RunState,
   type RunEvent,
+  type RunState,
 } from "./orchestrator-state.ts";
 import { createFrozenTodosFromSteps } from "./todo-snapshot.ts";
 import type { OrchestratorRuntime, RuntimeView } from "./orchestrator-runtime.ts";
@@ -34,7 +42,9 @@ function fakeRuntime(initial?: RunState) {
   if (!created.ok) throw new Error((created as { error: string }).error);
   let state = initial ?? created.state;
   const events: string[] = [];
-  const applyEvent = async (event: Parameters<OrchestratorRuntime["applyEvent"]>[0]) => {
+  const applyEvent = async (
+    event: Parameters<OrchestratorRuntime["applyEvent"]>[0],
+  ) => {
     const result = applyRunEvent(state, {
       ...(event as RunEvent),
       expectedRevision: state.revision,
@@ -51,7 +61,11 @@ function fakeRuntime(initial?: RunState) {
     ...(state.plan === undefined ? {} : { plan: state.plan }),
     ...(state.order.find((id) => state.tasks[id]?.state === "pending") === undefined
       ? {}
-      : { nextTaskId: state.order.find((id) => state.tasks[id]?.state === "pending") }),
+      : {
+          nextTaskId: state.order.find(
+            (id) => state.tasks[id]?.state === "pending",
+          ),
+        }),
     state,
   });
   const runtime = {
@@ -61,15 +75,26 @@ function fakeRuntime(initial?: RunState) {
       events.push(type);
       return { ok: true as const, value: undefined };
     },
-    journalEvents: async () =>
-      ({
-        ok: true as const,
-        value: [] as JournalEvent[],
-      }),
+    journalEvents: async () => ({
+      ok: true as const,
+      value: [] as JournalEvent[],
+    }),
     restore: async () => ({ ok: true as const, value: view() }),
-    startFromPlan: async () => ({ ok: false as const, code: "state" as const, error: "unused" }),
-    startFromSteps: async () => ({ ok: false as const, code: "state" as const, error: "unused" }),
-    restoreFromPlan: async () => ({ ok: false as const, code: "state" as const, error: "unused" }),
+    startFromPlan: async () => ({
+      ok: false as const,
+      code: "state" as const,
+      error: "unused",
+    }),
+    startFromSteps: async () => ({
+      ok: false as const,
+      code: "state" as const,
+      error: "unused",
+    }),
+    restoreFromPlan: async () => ({
+      ok: false as const,
+      code: "state" as const,
+      error: "unused",
+    }),
     cancel: async () => ({ ok: true as const, value: { view: view() } }),
     complete: async () => ({ ok: true as const, value: { view: view() } }),
   } as unknown as OrchestratorRuntime;
@@ -77,92 +102,53 @@ function fakeRuntime(initial?: RunState) {
 }
 
 function ports(options: {
-  // A fresh generation per dispatch, like the workspace lease allocator.
-  // (The counter lives per harness; two harnesses both start at 1.)
   runtime: OrchestratorRuntime;
-  wake: () => Promise<{ ok: true; acknowledged: boolean; handle?: string } | { ok: false; error: string; uncertain?: boolean }>;
-  probeStale?: (taskId: string) => Promise<{ stale: boolean; reason: string }>;
+  dispatchNext?: ParentToolPorts["dispatchNext"];
+  start?: ParentToolPorts["start"];
 }): ParentToolPorts {
   return {
     runtime: () => options.runtime,
     epoch: () => 1,
-    dispatcher: {
-      prepare: async (input: {
-        runId: string;
-        taskId: string;
-        attemptId: string;
-        generation: number;
-      }) => ({
-        ok: true as const,
-        child: {
-          sessionRef: `session-${input.taskId}`,
-          taskStartId: "start-1",
-          sessionFile: "/tmp/child.jsonl",
-        },
-      }),
-      wake: options.wake,
-    },
-    allocateGeneration: (() => {
-      let generation = 1;
-      return () => {
-        generation += 1;
-        return generation;
-      };
-    })(),
     now: () => 2_000,
-    ...(options.probeStale === undefined ? {} : { probeStale: options.probeStale }),
-  } as unknown as ParentToolPorts;
+    ...(options.start === undefined ? {} : { start: options.start }),
+    ...(options.dispatchNext === undefined
+      ? {}
+      : { dispatchNext: options.dispatchNext }),
+  };
 }
 
-test("dispatch journals start, launch evidence, and only then reports success", async () => {
+test("start delegates to the extension start service", async () => {
   const fake = fakeRuntime();
+  const calls: Array<Record<string, unknown>> = [];
   const tools = createParentToolRuntime(
-    ports({ runtime: fake.runtime, wake: async () => ({ ok: true, acknowledged: true }) }),
+    ports({
+      runtime: fake.runtime,
+      start: async (input) => {
+        calls.push({ ...input });
+        return { ok: true, text: "started", details: { runId: "run-1" } };
+      },
+    }),
   );
-  const outcome = await tools.dispatch("task-1");
+  const outcome = await tools.call("orchestrator_start", {
+    title: "standalone",
+    steps: ["one"],
+  });
   assert.equal(outcome.ok, true);
-  assert.match(outcome.text, /Dispatched/);
-  assert.deepEqual(fake.events, ["task.start", "task.start.intent", "task.launched"]);
-  assert.equal(fake.getState().tasks["task-1"]!.state, "running");
+  assert.deepEqual(calls, [{ title: "standalone", steps: ["one"] }]);
+  assert.equal(fake.events.length, 0, "start does not apply a raw reducer event");
 });
 
-test("a launch failure blocks the row and never says Dispatched", async () => {
+test("status is read-only and reports the next row", async () => {
   const fake = fakeRuntime();
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: fake.runtime,
-      wake: async () => ({ ok: false, error: "wt.exe is missing" }),
-    }),
-  );
-  const outcome = await tools.dispatch("task-1");
-  assert.equal(outcome.ok, false);
-  assert.equal((outcome as { code: string }).code, "launch");
-  assert.doesNotMatch(outcome.text, /Dispatched/);
-  assert.match(outcome.text, /blocked/);
-  assert.equal(fake.getState().tasks["task-1"]!.state, "blocked");
-  assert.equal(fake.getState().phase, "blocked");
+  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
+  const outcome = await tools.call("orchestrator_status", {});
+  assert.equal(outcome.ok, true);
+  assert.match(outcome.text, /ready/);
+  assert.equal((outcome.details as { nextTaskId?: string }).nextTaskId, "task-1");
+  assert.equal(fake.events.length, 0);
 });
 
-test("an unacknowledged delivery stays running and reports uncertainty", async () => {
-  const fake = fakeRuntime();
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: fake.runtime,
-      wake: async () => ({
-        ok: false,
-        error: "no ack within 45s",
-        uncertain: true,
-      }),
-    }),
-  );
-  const outcome = await tools.dispatch("task-1");
-  assert.equal(outcome.ok, false);
-  assert.equal((outcome as { code: string }).code, "uncertain");
-  assert.equal(fake.getState().tasks["task-1"]!.state, "running");
-  assert.ok(fake.events.includes("run.control"));
-});
-
-test("retry re-dispatches a blocked row immediately", async () => {
+test("retry re-queues the blocked row and dispatches it immediately", async () => {
   const fake = fakeRuntime();
   const blocked = applyRunEvent(fake.getState(), {
     type: "task.block",
@@ -170,71 +156,80 @@ test("retry re-dispatches a blocked row immediately", async () => {
     expectedRevision: fake.getState().revision,
     now: 1_100,
     taskId: "task-1",
-    reason: "host unavailable",
+    reason: "check failed",
+  });
+  assert.equal(blocked.ok, true);
+  if (!blocked.ok) return;
+  const next = fakeRuntime(blocked.state);
+  const dispatched: string[] = [];
+  const tools = createParentToolRuntime(
+    ports({
+      runtime: next.runtime,
+      dispatchNext: async (taskId) => {
+        dispatched.push(taskId);
+        return { ok: true, text: "child started", details: {} };
+      },
+    }),
+  );
+  const outcome = await tools.call("orchestrator_retry", {});
+  assert.equal(outcome.ok, true);
+  assert.deepEqual(dispatched, ["task-1"]);
+  assert.equal(next.getState().tasks["task-1"]!.state, "pending");
+  assert.deepEqual(next.events, ["task.retry"]);
+});
+
+test("retry refuses when no row is blocked or repaired", async () => {
+  const fake = fakeRuntime();
+  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
+  const outcome = await tools.call("orchestrator_retry", {});
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.text, /no blocked or repaired row/i);
+  assert.equal(fake.events.length, 0);
+});
+
+test("retry reports a failed dispatch without hiding the re-queue", async () => {
+  const fake = fakeRuntime();
+  const blocked = applyRunEvent(fake.getState(), {
+    type: "task.block",
+    runId: "run-1",
+    expectedRevision: fake.getState().revision,
+    now: 1_100,
+    taskId: "task-1",
+    reason: "check failed",
   });
   assert.equal(blocked.ok, true);
   if (!blocked.ok) return;
   const next = fakeRuntime(blocked.state);
   const tools = createParentToolRuntime(
-    ports({ runtime: next.runtime, wake: async () => ({ ok: true, acknowledged: true }) }),
-  );
-  const outcome = await tools.call("orchestrator_retry", {});
-  assert.equal(outcome.ok, true);
-  assert.match(outcome.text, /retried/i);
-  assert.equal(next.getState().tasks["task-1"]!.state, "running");
-});
-
-test("retry abandons a never-launched running row only after a stale probe", async () => {
-  const fake = fakeRuntime();
-  const started = applyRunEvent(fake.getState(), {
-    type: "task.start",
-    runId: "run-1",
-    expectedRevision: fake.getState().revision,
-    now: 1_100,
-    taskId: "task-1",
-    attemptId: "task-1-attempt-1",
-    sessionId: "session-1",
-  });
-  assert.equal(started.ok, true);
-  if (!started.ok) return;
-  const next = fakeRuntime(started.state);
-  const tools = createParentToolRuntime(
     ports({
       runtime: next.runtime,
-      wake: async () => ({ ok: true, acknowledged: true }),
-      probeStale: async () => ({ stale: true, reason: "no launch record" }),
-    }),
-  );
-  const outcome = await tools.call("orchestrator_retry", {});
-  assert.equal(outcome.ok, true);
-  assert.equal(next.getState().tasks["task-1"]!.state, "running");
-  // The new start carries a new attempt id.
-  assert.notEqual(next.getState().tasks["task-1"]!.attemptId, "task-1-attempt-1");
-});
-
-test("retry refuses a running row that may still have a child", async () => {
-  const fake = fakeRuntime();
-  const started = applyRunEvent(fake.getState(), {
-    type: "task.start",
-    runId: "run-1",
-    expectedRevision: fake.getState().revision,
-    now: 1_100,
-    taskId: "task-1",
-    attemptId: "task-1-attempt-1",
-    sessionId: "session-1",
-  });
-  assert.equal(started.ok, true);
-  if (!started.ok) return;
-  const next = fakeRuntime(started.state);
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: next.runtime,
-      wake: async () => ({ ok: true, acknowledged: true }),
-      probeStale: async () => ({ stale: false, reason: "the child session already started a turn" }),
+      dispatchNext: async () => ({
+        ok: false,
+        code: "child",
+        text: "no Builder model",
+      }),
     }),
   );
   const outcome = await tools.call("orchestrator_retry", {});
   assert.equal(outcome.ok, false);
-  assert.match(outcome.text, /already started a turn/);
-  assert.equal(next.getState().tasks["task-1"]!.state, "running");
+  assert.equal((outcome as { code: string }).code, "child");
+  assert.match(outcome.text, /no Builder model/);
+  assert.equal(next.getState().tasks["task-1"]!.state, "pending");
+});
+
+test("register exposes exactly start, status and retry", async () => {
+  const fake = fakeRuntime();
+  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
+  const names: string[] = [];
+  const registered = tools.register({
+    registerTool: (definition) => {
+      names.push(definition.name);
+    },
+  });
+  assert.deepEqual(registered.registered, [
+    "orchestrator_start",
+    "orchestrator_status",
+    "orchestrator_retry",
+  ]);
+  assert.deepEqual(names, registered.registered);
 });
