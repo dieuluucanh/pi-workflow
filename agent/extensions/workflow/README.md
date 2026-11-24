@@ -131,8 +131,10 @@ short Plan → Review → Build work keeps its current behavior.
   While paused, one note is queued for the resume. Slash commands pass through.
 - **Command-only child interaction.** `/orchestrator-pause|resume|abort|view`
   (and the `/orchestrator` verbs) control the child. `/orchestrator-view`
-  toggles the pinned panel between the parent roadmap and the child's local
-  TODO list; it never changes prompt routing.
+  switches BOTH the pinned panel (parent roadmap ↔ the child's local TODO list)
+  and the footer's child line: `child`/`auto` show the child's live model,
+  context %, tokens and elapsed time, `parent` shows the run/next row plus a
+  compact child hint. It never changes prompt routing.
 - **Reload loses the child, not the run.** A `running` row restored after a
   reload is blocked with a concrete reason and the run pauses; nothing is
   replayed. Retry starts a fresh child. Old managed-worker child sessions open
@@ -326,6 +328,7 @@ A profile is a **named combination of role model settings** — one `{provider, 
 - **Activation is session-scoped.** `/profile use` changes only the current session and rides the session's `workflow` entry, so `/resume` restores it and **two concurrent sessions can run different profiles** — session 1 on a cheap provider, session 2 on a premium one. There is deliberately no global "active profile" file.
 - **Optional default**: `workflow.defaultProfile` (see [Settings](#settings)) seeds sessions that never made an explicit choice; an explicit `/profile use <name|none>` always wins for that session.
 - **Effect**: `/plan` switches to the profile's planner, `/build` to the profile's builder, `explore` subagents run on the profile's explorer, and Review Mode's reviewer session uses the profile's reviewer (planner fallback preserved). Activating while in plan/build re-applies the mode model immediately; in Default mode nothing switches until the next plan/build/explore/review use — the manual chat model is never touched by activation.
+- **Live children follow the switch.** An Orchestrator Build child and a Review reviewer already running are switched in place (`/profile use`, `/profile` prompt-pick, `/role set`, and the role picker): the in-flight request finishes on the old model and the next provider request uses the new one — no abort, no session restart. A paused child switches before resume. The next child/round always launches on the new model. If the switch is refused (missing model, provider auth), the live session keeps its model, the warning names both, and the next child/round still uses the profile. The child never writes the global default model/thinking.
 - **`/role` keeps editing the base roles.** With a profile active, the `/role` picker shows a notice and `/role list` prints the profile's overrides; `/profile edit <name>` is the way to change what actually runs.
 - **Fallback**: no profiles (or none active) → the roles.json flow, identical to before profiles existed. A profile referencing a model missing from the registry is warned about at save time and refused at switch time ("staying on current model"), same as `/role`.
 
@@ -389,7 +392,7 @@ Review Mode runs in its own session with its own model, taken from the **`review
 
 If the reviewer role has no model, Review Mode falls back to the planner model and warns rather than silently doing nothing.
 
-The model is **snapshotted when a round starts**: a `/role` or `/profile` switch mid-round takes effect **next round**, never mid-pass. The mode band, the status widget and `/review-status` name the snapshotted model — the one actually auditing.
+The model is **snapshotted when a round starts**, but a `/role` or `/profile` switch now also switches the LIVE reviewer session in place (the next provider request uses it, the round is not aborted, and the warm session is kept for the next round). The mode band, the status widget and `/review-status` name the model that is actually auditing. A switch made in the cold-start window (before the session exists) is retained for that first session. If the switch is refused, the live reviewer keeps its model and the next round applies the new one.
 
 Roles load from `~/.pi/agent/roles.json` (with a `<cwd>/.pi/roles.json` project override) **at session start and again whenever either file changes on disk**, so a `/role` change made in another window is picked up without `/reload`. A missing, unreadable, or legacy `roles.json` is never overwritten: the built-in defaults are used in memory and a warning naming the file is shown, leaving it intact. `/review-mode status`, the mode band and the reviewer run all read through the same loader.
 

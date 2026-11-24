@@ -17,6 +17,11 @@ export const OPERATOR_SCHEMA_VERSION = 2 as const;
 export const MAX_SAY_CHARS = 2_000;
 
 import { rowForTask, taskCounts } from "./orchestrator-state.ts";
+import {
+  formatChildStatusLine,
+  modelRefFromLabel,
+  sanitizeStatLine,
+} from "./child-stats.ts";
 
 export const OPERATOR_VERBS = [
   "status",
@@ -52,9 +57,16 @@ export function parseOperatorArgs(raw: string): ParsedOperator {
 
 export interface OperatorChildSnapshot {
   phase: string;
+  ref?: string;
+  total?: number;
   modelLabel?: string;
+  /** Structured live model, when the child can report one. */
+  modelRef?: { provider: string; id: string; thinking?: string };
+  stats?: import("./child-stats.ts").ChildRuntimeStats;
   lastTool?: string;
   lastError?: string;
+  /** Elapsed active time, already frozen by the caller when paused. */
+  elapsedMs?: number;
   todos: Array<{ text: string; completed: boolean }>;
 }
 
@@ -92,14 +104,23 @@ export interface OperatorRuntime {
 
 function childLine(child: OperatorChildSnapshot | undefined): string | undefined {
   if (!child) return undefined;
-  const todos =
-    child.todos.length > 0
-      ? ` · ${child.todos.filter((item) => item.completed).length}/${child.todos.length} todos`
-      : "";
-  const model = child.modelLabel ? ` · ${child.modelLabel}` : "";
-  const tool = child.lastTool ? ` · ${child.lastTool}` : "";
-  const error = child.lastError ? ` · error: ${child.lastError.slice(0, 200)}` : "";
-  return `child ${child.phase}${model}${tool}${todos}${error}`;
+  const model =
+    child.modelRef ??
+    (child.modelLabel ? modelRefFromLabel(child.modelLabel) : undefined);
+  const line = formatChildStatusLine({
+    ...(child.ref ? { ref: child.ref } : {}),
+    ...(child.total === undefined ? {} : { total: child.total }),
+    phase: child.phase,
+    ...(model ? { model } : {}),
+    ...(child.stats ? { stats: child.stats } : {}),
+    ...(child.elapsedMs === undefined ? {} : { elapsedMs: child.elapsedMs }),
+    todoDone: child.todos.filter((item) => item.completed).length,
+    todoTotal: child.todos.length,
+  });
+  const error = child.lastError
+    ? ` · error: ${sanitizeStatLine(child.lastError).slice(0, 200)}`
+    : "";
+  return `${line}${error}`;
 }
 
 export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRuntime {

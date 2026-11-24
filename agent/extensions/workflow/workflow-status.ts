@@ -12,6 +12,9 @@
  * The other keys are additive.
  */
 
+import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
+import { formatChildStatusLine, modelRefFromLabel, sanitizeStatLine } from "./child-stats.ts";
+
 export const WORKFLOW_STATUS_KEYS = {
   mode: "workflow",
   profile: "workflow-profile",
@@ -64,7 +67,16 @@ export interface WorkflowStatusInput {
       ref: string;
       total: number;
       phase: string;
+      /** Launch/live model label (`provider/id`), kept for older readers. */
       model?: string;
+      /** The structured model ref, when the child can report one. */
+      modelRef?: ChildModelRef;
+      /** Context usage and cumulative tokens, when observable. */
+      stats?: ChildRuntimeStats;
+      thinking?: string;
+      /** Elapsed ACTIVE time; the caller freezes it on pause. */
+      elapsedMs?: number;
+      lastTool?: string;
       todoDone?: number;
       todoTotal?: number;
     };
@@ -83,6 +95,61 @@ export interface WorkflowStatusSegments {
   /** Present only when a direct-Build execution needs attention. */
   execution?: string;
 }
+
+/**
+ * The Orchestrator footer segment. View-aware on purpose:
+ *
+ *   - `parent`  → the run's own state (phase/next) plus a compact child hint;
+ *   - `child` / live `auto` → the full child line with the model, context,
+ *     tokens and elapsed time that the native footer cannot show;
+ *   - no child → the run line (historical behaviour).
+ *
+ * Always exactly one line: the child formatter sanitizes control characters,
+ * and the blocked reason is clipped.
+ */
+export function buildOrchestrationSegment(
+  orchestration: WorkflowStatusInput["orchestration"],
+): string {
+  if (!orchestration) return "";
+  const blocked = orchestration.blockedReason
+    ? `blocked: ${sanitizeStatLine(orchestration.blockedReason).slice(0, 120)}`
+    : "";
+  const runLine =
+    `run ${orchestration.phase}` +
+    (orchestration.nextTaskId ? ` · next ${orchestration.nextTaskId}` : "");
+  const child = orchestration.child;
+  if (!child) {
+    return [runLine, blocked].filter(Boolean).join(" · ");
+  }
+  const live =
+    child.phase === "starting" ||
+    child.phase === "running" ||
+    child.phase === "paused" ||
+    child.phase === "settling";
+  const view = orchestration.view ?? "auto";
+  // A parent view stays about the RUN; the child is a one-glance hint. `auto`
+  // and `child` show the child's own telemetry (the whole point of the toggle).
+  const showChild = live && (view === "child" || view === "auto");
+  if (!showChild) {
+    const hint = `child ${child.ref}/${child.total} ${child.phase}`;
+    return [runLine, hint, blocked].filter(Boolean).join(" · ");
+  }
+  const model =
+    child.modelRef ?? (child.model ? modelRefFromLabel(child.model) : undefined);
+  const line = formatChildStatusLine({
+    ref: child.ref,
+    total: child.total,
+    phase: child.phase,
+    ...(model ? { model } : {}),
+    ...(child.stats ? { stats: child.stats } : {}),
+    ...(child.todoDone === undefined ? {} : { todoDone: child.todoDone }),
+    ...(child.todoTotal === undefined ? {} : { todoTotal: child.todoTotal }),
+    ...(child.elapsedMs === undefined ? {} : { elapsedMs: child.elapsedMs }),
+  });
+  return [line, blocked].filter(Boolean).join(" · ");
+}
+
+/** Split an older `provider/id` label into a structured ref. */
 
 export function buildWorkflowStatusSegments(
   input: WorkflowStatusInput,
@@ -139,28 +206,7 @@ export function buildWorkflowStatusSegments(
     mode = `${base}${stageSuffix}`;
   }
 
-  const orchestration = input.orchestration;
-  const child = orchestration?.child;
-  const childParts = child
-    ? [
-        `child ${child.ref}/${child.total} ${child.phase}`,
-        child.model ?? "",
-        typeof child.todoTotal === "number" && child.todoTotal > 0
-          ? `${child.todoDone ?? 0}/${child.todoTotal} todos`
-          : "",
-      ].filter(Boolean)
-    : [];
-  const run = orchestration
-    ? childParts.length > 0
-      ? childParts.join(" · ")
-      : `run ${orchestration.phase}` +
-        (orchestration.nextTaskId ? ` · next ${orchestration.nextTaskId}` : "")
-    : "";
-  const blocked =
-    orchestration?.blockedReason
-      ? `blocked: ${orchestration.blockedReason.slice(0, 120)}`
-      : "";
-  const orchestrator = [run, blocked].filter(Boolean).join(" · ");
+  const orchestrator = buildOrchestrationSegment(input.orchestration);
   const execution = (input.execution ?? "").trim();
 
   return {

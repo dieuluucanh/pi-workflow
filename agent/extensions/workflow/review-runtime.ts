@@ -195,6 +195,17 @@ export interface ReviewRuntime {
   isAlive(): boolean;
   /** True while `runRound` is in flight — used to route prompt input. */
   isRoundActive(): boolean;
+  /**
+   * Switch the reviewer model WITHOUT aborting the round or discarding the warm
+   * session. A live session is switched in place; with no session yet (or one
+   * still booting) the choice is retained for the next session. The next round
+   * reuses the warm session instead of restarting it.
+   */
+  switchModel(model: {
+    provider: string;
+    id: string;
+    thinking: string;
+  }): Promise<ReviewModelSwitchResult>;
   /** Cancel the in-flight review but keep the session. */
   abortRound(): Promise<void>;
   /**
@@ -206,6 +217,15 @@ export interface ReviewRuntime {
   sendUserMessage(text: string, images?: unknown[]): Promise<boolean>;
   /** Abort and release everything (approve / reload / shutdown). */
   teardown(): Promise<void>;
+}
+
+export interface ReviewModelSwitchResult {
+  ok: boolean;
+  /** False when the session already ran the requested model/thinking. */
+  changed?: boolean;
+  /** The model the session reports after the switch. */
+  model?: { provider: string; id: string; thinking: string };
+  error?: string;
 }
 
 /** Prompt for pass 1: review and rewrite. */
@@ -408,6 +428,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let abortController: AbortController | undefined;
   /** `provider/id/thinking` the live session was created with (step 10). */
   let sessionModelKey: string | undefined;
+  /**
+   * A model chosen while no session was alive (or one was still booting).
+   * `ensureSession` consumes it so a `/profile use` in the cold-start window is
+   * not lost.
+   */
+  let pendingModel:
+    | { provider: string; id: string; thinking: string }
+    | undefined;
+  /** Serializes model switches; never held across a prompt or a boot. */
+  let modelLane: Promise<unknown> = Promise.resolve();
   /** True while `runRound` is in flight (gates prompt routing). */
   let roundActive = false;
   /**
@@ -793,6 +823,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     state = undefined;
     transcript = undefined;
     sessionModelKey = undefined;
+    // A choice for a session that never existed has no target anymore.
+    pendingModel = undefined;
     gate = createReviewRoundGate();
     resetPlanAssembler();
     if (options.keepRoundController !== true) abortController = undefined;
@@ -819,7 +851,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     id: string;
     thinking: string;
   }): Promise<EnsureSessionResult> {
-    const modelRef = modelRefOverride ?? deps.reviewerModel();
+    // A live switch that is still in flight must finish before the key compare,
+    // or the next round would restart a session that is about to be correct.
+    // Only when a session EXISTS: awaiting the lane while booting could
+    // deadlock against a switch waiting for that same boot.
+    if (session) await modelLane;
+    const modelRef = pendingModel ?? modelRefOverride ?? deps.reviewerModel();
     const modelKey = modelRef
       ? `${modelRef.provider}/${modelRef.id}/${modelRef.thinking}`
       : "";
@@ -1672,6 +1709,87 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     },
     isAlive: () => Boolean(session),
     isRoundActive: () => roundActive,
+    async switchModel(model) {
+      /** Apply to the live session; keeps it warm by recording the new key. */
+      const applyToLive = async (): Promise<ReviewModelSwitchResult> => {
+        const target = session;
+        if (!target) return { ok: false, error: "the reviewer session is gone" };
+        const current = target.currentModel?.();
+        const sameModel =
+          current?.provider === model.provider && current.id === model.id;
+        const sameThinking =
+          !current?.thinking || current.thinking === model.thinking;
+        if (sameModel && sameThinking) {
+          const thinking = current?.thinking ?? model.thinking;
+          sessionModelKey = `${model.provider}/${model.id}/${thinking}`;
+          return {
+            ok: true,
+            changed: false,
+            model: { provider: model.provider, id: model.id, thinking },
+          };
+        }
+        if (typeof target.setModel !== "function") {
+          return {
+            ok: false,
+            error: "this reviewer session cannot switch models (unsupported SDK)",
+          };
+        }
+        const result = await target.setModel(
+          model.provider,
+          model.id,
+          model.thinking,
+        );
+        if (!result.ok) return { ok: false, error: result.error };
+        const applied = {
+          provider: result.model.provider,
+          id: result.model.id,
+          thinking: result.model.thinking ?? model.thinking,
+        };
+        // Keeping the session WARM is the point: the recorded key stops the next
+        // `ensureSession` from restarting it just to adopt the new model.
+        sessionModelKey = `${applied.provider}/${applied.id}/${applied.thinking}`;
+        if (state) {
+          state.modelLabel = `${applied.provider}/${applied.id}`;
+          try {
+            deps.onState?.(state);
+          } catch {
+            /* display-only */
+          }
+        }
+        pushStatus(
+          `reviewer model → ${applied.provider}/${applied.id}${
+            applied.thinking ? ` (${applied.thinking})` : ""
+          }`,
+        );
+        return { ok: true, changed: true, model: applied };
+      };
+
+      const run = async (): Promise<ReviewModelSwitchResult> => {
+        if (session) return applyToLive();
+        // No session (or one still booting): retain the choice for the session
+        // that `ensureSession` is about to create, then adopt it if it landed.
+        pendingModel = { ...model };
+        if (starting) {
+          try {
+            await starting;
+          } catch {
+            /* a failed boot leaves pendingModel for the next attempt */
+          }
+          if (session) {
+            pendingModel = undefined;
+            return applyToLive();
+          }
+        }
+        return { ok: true, changed: true, model: { ...model } };
+      };
+
+      const next = modelLane.then(run, run);
+      modelLane = next.then(
+        () => undefined,
+        () => undefined,
+      );
+      return next;
+    },
     async abortRound() {
       try {
         abortController?.abort();

@@ -397,6 +397,52 @@ test("orchestrator child rows expose pause/resume/abort and the view toggle", ()
   assert.equal(byId.has("orchestrator-host"), false);
 });
 
+test("the orchestrator child row is view-aware and carries child stats", () => {
+  const child = {
+    ref: "2",
+    total: 7,
+    phase: "running",
+    model: "open/muse-spark",
+    modelRef: { provider: "open", id: "muse-spark", thinking: "high" },
+    stats: {
+      tokens: {
+        input: 12_000,
+        output: 3_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 15_000,
+      },
+      context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
+    },
+    elapsedMs: 83_000,
+    todoDone: 1,
+    todoTotal: 2,
+  };
+  const base = { mode: "orchestrator" as const, done: 1, total: 3 };
+  const textFor = (view: "child" | "parent" | "auto") => {
+    const contributions = buildWorkflowContributions({
+      ...base,
+      orchestration: { phase: "running", child, view },
+    });
+    const row = contributions.find((entry) => entry.id === "orchestrator-child");
+    return String((row as { text?: string } | undefined)?.text ?? "");
+  };
+
+  assert.equal(
+    textFor("child"),
+    "child 2/7 · running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 1/2 todos",
+  );
+  assert.equal(textFor("auto"), textFor("child"), "auto follows a live child");
+  assert.equal(
+    textFor("parent"),
+    "child 2/7 · running · open/muse-spark · 1/2 todos",
+    "parent view keeps the compact hint",
+  );
+  for (const view of ["child", "parent", "auto"] as const) {
+    assert.equal(/[\r\n\t]/.test(textFor(view)), false, `${view} is one line`);
+  }
+});
+
 // ── Generic composer-transform publication ───────────────────────────
 
 import {

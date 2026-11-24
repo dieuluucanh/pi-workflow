@@ -109,7 +109,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "Interaction:",
     "- User prompts while a child runs are forwarded to that child. Do not answer them yourself and do not ask the user to switch modes.",
     "- The child interaction surface is command-only: /orchestrator-pause, /orchestrator-resume, /orchestrator-abort, /orchestrator-view and /orchestrator inspect.",
-    "- /profile changes only the next child; the live child keeps its model.",
+    "- /profile and /role switch the live Build child in place; the next child always launches on the same effective model.",
     "",
     "Permissions and limits:",
     "- You may inspect, read, run read-only/verify commands, start, retry, pause, resume, abort and stop.",

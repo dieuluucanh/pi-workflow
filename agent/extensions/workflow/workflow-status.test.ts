@@ -317,3 +317,117 @@ test("the orchestrator segment falls back to the run row without a child", () =>
   });
   assert.equal(segments.orchestrator, "run paused · next task-1");
 });
+
+test("the orchestrator segment is view-aware: parent shows the run, child shows stats", () => {
+  const child = {
+    ref: "2",
+    total: 7,
+    phase: "running",
+    model: "open/muse-spark",
+    modelRef: { provider: "open", id: "muse-spark", thinking: "high" },
+    stats: {
+      tokens: {
+        input: 12_000,
+        output: 3_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 15_000,
+      },
+      context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
+    },
+    elapsedMs: 83_000,
+    todoDone: 3,
+    todoTotal: 5,
+  };
+  const base = {
+    mode: "orchestrator" as const,
+    done: 1,
+    total: 3,
+    commitMode: "never",
+  };
+
+  const parent = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", nextTaskId: "task-2", child, view: "parent" },
+  });
+  assert.equal(
+    parent.orchestrator,
+    "run running · next task-2 · child 2/7 running",
+    "parent view stays about the run",
+  );
+
+  const childView = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", nextTaskId: "task-2", child, view: "child" },
+  });
+  assert.equal(
+    childView.orchestrator,
+    "child 2/7 running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 3/5 todos",
+    "child view carries the child's own telemetry",
+  );
+
+  const auto = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", child, view: "auto" },
+  });
+  assert.equal(auto.orchestrator, childView.orchestrator, "auto follows a live child");
+
+  // No stats yet: the historical shape survives (prefix + model + todos).
+  const bare = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "running",
+      child: {
+        ref: "2",
+        total: 7,
+        phase: "running",
+        model: "builder/model",
+        todoDone: 3,
+        todoTotal: 5,
+      },
+      view: "child",
+    },
+  });
+  assert.equal(
+    bare.orchestrator,
+    "child 2/7 running · builder/model · 3/5 todos",
+  );
+
+  // A pause still names the child; elapsed is frozen by the caller.
+  const paused = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "paused",
+      child: { ...child, phase: "paused", elapsedMs: 120_000 },
+      view: "child",
+    },
+  });
+  assert.match(paused.orchestrator, /^child 2\/7 paused · /);
+  assert.match(paused.orchestrator, /02:00/);
+});
+
+test("the orchestrator segment is always exactly one line", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    commitMode: "never",
+    orchestration: {
+      phase: "running",
+      blockedReason: "line one\nline two\twith\ttabs",
+      child: {
+        ref: "1",
+        total: 2,
+        phase: "running",
+        model: "open/model\nwith newline",
+        stats: {
+          tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+          context: { tokens: 1, contextWindow: 10, percent: 10 },
+        },
+      },
+      view: "child",
+    },
+  });
+  assert.equal(/[\r\n\t]/.test(segments.orchestrator), false);
+  assert.ok(segments.orchestrator.length < 220);
+});

@@ -243,11 +243,20 @@ import {
   thinkingLevelsForPair,
 } from "./thinking-levels.ts";
 import {
+  buildOrchestrationSegment,
   buildWorkflowStatusSegments,
   setWorkflowStatus,
   setWorkflowWidget,
   WORKFLOW_STATUS_KEYS,
 } from "./workflow-status.ts";
+import {
+  formatChildPanelHeader,
+  modelRefFromLabel,
+} from "./child-stats.ts";
+import {
+  createStatsClock,
+  type StatsClock,
+} from "./orchestrator-stats-clock.ts";
 import {
   buildTodoRows,
   deriveTodoPanel,
@@ -328,6 +337,7 @@ import {
 import {
   ORCHESTRATOR_CHILD_BAND_ENTRY,
   ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY,
+  formatOrchestratorChildProgress,
   formatOrchestratorChildStatus,
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
@@ -1000,6 +1010,8 @@ export default function workflowExtension(
   /** Automatic verify/accept/advance engine; owns acceptance evidence. */
   let orchestratorAdvance: OrchestratorAdvance | undefined;
   let orchestratorChildView: "auto" | "parent" | "child" = "auto";
+  /** One repaint clock for the child's elapsed time; created on first need. */
+  let orchestratorStatsClock: StatsClock | undefined;
   let orchestratorChildUi: ChildUiBridge | undefined;
   /** Set only inside the child session; suppresses parent-only surfaces. */
   let inProcessChildContext: OrchestratorChildContext | undefined;
@@ -1489,7 +1501,11 @@ export default function workflowExtension(
         `  ${missing.join(", ")}: base role models (not overridden by this profile)`,
       );
     }
-    if (workflowMode) {
+    if (workflowMode === "orchestrator") {
+      lines.push(
+        "  Applied to orchestrator mode now; a live Build child switches immediately, and the next child always uses it.",
+      );
+    } else if (workflowMode) {
       lines.push(`  Applied to ${workflowMode} mode now; explore/review pick it up on next use.`);
     } else {
       lines.push(
@@ -1714,6 +1730,12 @@ export default function workflowExtension(
         "info",
       );
     }
+    // A live Build child follows the same profile. Switching only the parent
+    // is what made `/profile use` look inert in `/orchestrator-view child`.
+    await reconcileLiveRoleModels(ctx, {
+      ...(opts?.quiet ? { quiet: true } : {}),
+      reason: "profile",
+    });
   }
 
   function activeRoleLabel(): string {
@@ -1823,7 +1845,14 @@ export default function workflowExtension(
     const childState = orchestratorChild?.state();
     const header =
       showChild && childState
-        ? `▌ CHILD ${childState.ref ?? "?"}/${childState.total ?? "?"} · local todos`
+        ? formatChildPanelHeader({
+            ...(childState.ref ? { ref: childState.ref } : {}),
+            ...(childState.total === undefined ? {} : { total: childState.total }),
+            ...(childState.modelLabel
+              ? { model: modelRefFromLabel(childState.modelLabel) }
+              : {}),
+            ...(childState.stats ? { stats: childState.stats } : {}),
+          })
         : undefined;
     const view = deriveTodoPanel({
       items: panelItems,
@@ -1881,7 +1910,16 @@ export default function workflowExtension(
           const liveState = orchestratorChild?.state();
           const liveHeader =
             liveChild && liveState
-              ? `▌ CHILD ${liveState.ref ?? "?"}/${liveState.total ?? "?"} · local todos`
+              ? formatChildPanelHeader({
+                  ...(liveState.ref ? { ref: liveState.ref } : {}),
+                  ...(liveState.total === undefined
+                    ? {}
+                    : { total: liveState.total }),
+                  ...(liveState.modelLabel
+                    ? { model: modelRefFromLabel(liveState.modelLabel) }
+                    : {}),
+                  ...(liveState.stats ? { stats: liveState.stats } : {}),
+                })
               : undefined;
           if (live.state === "collapsed") {
             return [
@@ -1959,7 +1997,13 @@ export default function workflowExtension(
           ref: string;
           total: number;
           phase: string;
+          /** Launch/live model label, kept for older readers. */
           model?: string;
+          modelRef?: { provider: string; id: string; thinking?: string };
+          stats?: import("./child-stats.ts").ChildRuntimeStats;
+          thinking?: string;
+          elapsedMs?: number;
+          lastTool?: string;
           todoDone?: number;
           todoTotal?: number;
         };
@@ -1974,6 +2018,12 @@ export default function workflowExtension(
       child !== undefined &&
       child.phase !== "idle" &&
       child.phase !== "disposed";
+    // A paused child stops accumulating wall time: the footer must show the
+    // active duration, not "how long ago it started".
+    const elapsedMs =
+      child?.startedAt === undefined
+        ? undefined
+        : Math.max(0, (child.pausedAt ?? Date.now()) - child.startedAt);
     return {
       phase: view.phase,
       ...(blocked ? { blockedReason: blocked } : {}),
@@ -1985,6 +2035,11 @@ export default function workflowExtension(
               total: child.total ?? view.state.order.length,
               phase: child.phase,
               ...(child.modelLabel ? { model: child.modelLabel } : {}),
+              ...(child.stats?.model ? { modelRef: child.stats.model } : {}),
+              ...(child.stats ? { stats: child.stats } : {}),
+              ...(child.thinking ? { thinking: child.thinking } : {}),
+              ...(elapsedMs === undefined ? {} : { elapsedMs }),
+              ...(child.lastTool ? { lastTool: child.lastTool } : {}),
               todoDone: child.todos.filter((item) => item.completed).length,
               todoTotal: child.todos.length,
             },
@@ -2003,6 +2058,53 @@ export default function workflowExtension(
     if (state.phase === "completed") return "✓ execution complete";
     if (state.phase === "recovering-shell") return "◇ execution recovering";
     return undefined;
+  }
+
+  /**
+   * Repaint ONLY the orchestrator status key.
+   *
+   * The stats clock must never re-register a widget or republish the whole
+   * contribution set once a second: this is the one cheap write a tick is
+   * allowed to make, and `setWorkflowStatus` is already diff-free/cheap.
+   */
+  function paintOrchestratorStatus(ctx: ExtensionContext): void {
+    try {
+      const segment = buildOrchestrationSegment(orchestrationStatus());
+      setWorkflowStatus(
+        ctx.ui,
+        WORKFLOW_STATUS_KEYS.orchestrator,
+        segment ? ctx.ui.theme.fg("muted", segment) : "",
+      );
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Arm/disarm the child-stats clock for the current view/phase.
+   *
+   * Only a child that is `starting`/`running` in a view that shows it needs a
+   * ticking elapsed value. Every other case (parent view, pause, settle, no
+   * run) stops the interval so nothing keeps repainting after the work ends.
+   */
+  function syncOrchestratorClock(ctx: ExtensionContext): void {
+    try {
+      const phase = orchestratorChild?.state().phase;
+      const live =
+        childPanelActive() && (phase === "starting" || phase === "running");
+      if (!live) {
+        orchestratorStatsClock?.setLive(false);
+        return;
+      }
+      if (!orchestratorStatsClock) {
+        orchestratorStatsClock = createStatsClock({
+          onTick: () => paintOrchestratorStatus(ctx),
+        });
+      }
+      orchestratorStatsClock.setLive(true);
+    } catch (_e) {
+      void _e;
+    }
   }
 
   function updateStatus(ctx: ExtensionContext) {
@@ -2137,6 +2239,8 @@ export default function workflowExtension(
     // Republish so the generic host sees the same mode/progress/panel state.
     // The publisher drops an unchanged set, so a status refresh is cheap.
     publishContributions();
+    // View/phase changed: arm or disarm the elapsed-time repaint clock.
+    syncOrchestratorClock(ctx);
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -6218,7 +6322,7 @@ export default function workflowExtension(
           ? `  note    : revision ${abortedReviewHash} was aborted — it will not be auto-reviewed until the plan changes`
           : "",
         reviewRuntime?.isRoundActive()
-          ? "  live    : round in flight — /role and /profile switches apply next round; /review say <msg> to steer"
+          ? "  live    : round in flight — /role and /profile switches apply to the live reviewer now (and to the next round); /review say <msg> to steer"
           : "",
         ...reviewTurnStatusLines(),
         pendingHandoffStatusLine(),
@@ -11269,6 +11373,10 @@ ${rows}`,
       const saveAndSync = (msg: string): boolean => {
         try {
           saveRoleConfig(roleConfig, "user");
+          // Roles are mutated IN PLACE, so the effective-roles cache keyed on
+          // the config object identity would keep serving the OLD model. That
+          // made `/role set builder` look inert to a live Build child.
+          invalidateEffectiveRoles();
         } catch (e: any) {
           ctx.ui.notify(
             `Role updated but file save failed: ${String(e?.message || e)}`,
@@ -11378,7 +11486,11 @@ ${rows}`,
         );
         // An explicit /role set is an explicit choice of model: it becomes the
         // saved default for the next session too (mode entry never does).
-        if (saved) persistModelDefault(ctx as any, role.model, "role-default");
+        if (saved) {
+          persistModelDefault(ctx as any, role.model, "role-default");
+          // The Builder role drives the live child: apply it now as well.
+          await reconcileLiveRoleModels(ctx as any, { reason: "role" });
+        }
         return;
       }
 
@@ -13609,6 +13721,9 @@ ${rows}`,
     }
     try {
       saveRoleConfig(roleConfig, "user");
+      // The role models were replaced in place; drop the overlay cache so
+      // `getEffectiveRole("builder")` (the live child's target) sees them.
+      invalidateEffectiveRoles();
     } catch (e: any) {
       ctx.ui.notify(
         `Roles updated but file save failed: ${String(e?.message || e)}`,
@@ -13625,6 +13740,9 @@ ${rows}`,
       })
       .join(" · ");
     ctx.ui.notify(`Roles saved: ${summary}`, "info");
+    // A live Build child follows the role change immediately (the next child
+    // already resolves it from the effective roles).
+    await reconcileLiveRoleModels(ctx, { reason: "role" });
     // An explicit picker save is an explicit choice: the role that defines the
     // Default-mode default (the forced active role, else the planner) becomes
     // the saved default for the next session. Entering Plan/Build does not.
@@ -19119,6 +19237,193 @@ ${dispatched.text}`,
     return resolved.ok ? resolved.launch : undefined;
   }
 
+  /**
+   * Bring a LIVE Orchestrator Build child to the model this session now wants.
+   *
+   * `/profile use` and `/role set builder` already re-resolve the parent model
+   * and the next child's launch model. Without this, a child that is already
+   * running keeps auditing its launch model while the only visible model
+   * surface (the native footer) shows the parent — which reads as "nothing
+   * happened" in `/orchestrator-view child`.
+   *
+   * The switch is serialized with resume inside the controller, never persists a
+   * default, and never blocks the row. View selection is deliberately NOT
+   * consulted: the child is the same child in `parent`, `child` and `auto`.
+   */
+  async function reconcileLiveBuilderModel(
+    ctx: ExtensionContext,
+    opts?: { quiet?: boolean; reason?: "profile" | "role" },
+  ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
+    // A child extension instance has no child of its own and must never notify.
+    if (inProcessChildContext) return { applied: false };
+    const controller = orchestratorChild;
+    if (!controller) return { applied: false };
+    const state = controller.state();
+    if (state.phase === "idle" || state.phase === "disposed") {
+      return { applied: false };
+    }
+    if (state.phase === "settling") {
+      if (!opts?.quiet) {
+        notifyReview(
+          "The Build child is already finishing; the next child will use the updated model.",
+          "info",
+        );
+      }
+      return { applied: false };
+    }
+    const plan = builderModelPlan();
+    if (!plan) {
+      if (!opts?.quiet) {
+        notifyReview(
+          "No Builder model is configured — the live child keeps its current model.",
+          "warning",
+        );
+      }
+      return { applied: false, error: "no Builder model is configured" };
+    }
+    let result: Awaited<ReturnType<typeof controller.applyModel>>;
+    try {
+      result = await controller.applyModel(plan);
+    } catch (error: unknown) {
+      result = {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    try {
+      updateStatusIfBound();
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+    if (result.ok) {
+      if (result.changed && !opts?.quiet) {
+        const model = result.model;
+        const label = model
+          ? `${model.provider}/${model.id}${model.thinking ? ` (${model.thinking})` : ""}`
+          : `${plan.provider}/${plan.id}`;
+        notifyReview(
+          `Live Builder → ${label}. The next child uses the same ${opts?.reason ?? "model"} selection.`,
+          "info",
+        );
+      }
+      return { applied: true, changed: result.changed };
+    }
+    if (!opts?.quiet) {
+      notifyReview(
+        `Live Builder keeps ${state.modelLabel ?? "its current model"} — switching to ${plan.provider}/${plan.id} failed (${result.error ?? "unknown error"}). The next child will use it.`,
+        "warning",
+      );
+    }
+    return { applied: true, changed: false, error: result.error };
+  }
+
+  /**
+   * Bring a LIVE reviewer to the model this session now wants.
+   *
+   * Review is a separate isolated session, so a profile switch only reached it
+   * at the NEXT round (the round snapshot) — the live reviewer kept auditing
+   * the old model while the user believed the switch worked. This switches the
+   * warm session in place, never aborts the round, and keeps the next round on
+   * the same session (the runtime records the new key).
+   */
+  async function reconcileLiveReviewerModel(
+    ctx: ExtensionContext,
+    opts?: { quiet?: boolean; reason?: "profile" | "role" },
+  ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
+    if (inProcessChildContext) return { applied: false };
+    const runtime = reviewRuntime;
+    if (!runtime || typeof runtime.switchModel !== "function") {
+      return { applied: false };
+    }
+    // Only a live review turn owns a reviewer session. A retained terminal
+    // state from an older round must not look like a switchable session.
+    let roundActive = false;
+    try {
+      roundActive = runtime.isRoundActive() === true;
+    } catch (_e) {
+      void _e;
+    }
+    if (
+      reviewTurn === "idle" &&
+      !roundActive &&
+      activeReview === undefined &&
+      currentPausedReview() === undefined
+    ) {
+      return { applied: false };
+    }
+    const model = resolveReviewerModel();
+    if (!model) {
+      if (!opts?.quiet) {
+        notifyReview(
+          "No reviewer model is configured — the live reviewer keeps its current model.",
+          "warning",
+        );
+      }
+      return { applied: false, error: "no reviewer model is configured" };
+    }
+    let result: Awaited<ReturnType<typeof runtime.switchModel>>;
+    try {
+      result = await runtime.switchModel(model);
+    } catch (error: unknown) {
+      result = {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (result.ok) {
+      // The snapshot is what the running round audits with; keep every surface
+      // (band, /review-status, status line) on the model that actually runs.
+      const appliedThinking = result.model?.thinking;
+      reviewModelSnapshot =
+        result.model && appliedThinking && isValidThinkingLevel(appliedThinking)
+          ? {
+              provider: result.model.provider,
+              id: result.model.id,
+              thinking: appliedThinking,
+            }
+          : model;
+      try {
+        updateStatusIfBound();
+        persistState();
+      } catch (_e) {
+        void _e;
+      }
+      if (result.changed && !opts?.quiet) {
+        const applied = result.model;
+        notifyReview(
+          `Live reviewer → ${applied ? `${applied.provider}/${applied.id}` : `${model.provider}/${model.id}`}${
+            applied?.thinking ? ` (${applied.thinking})` : ""
+          }. The next round uses the same ${opts?.reason ?? "model"} selection.`,
+          "info",
+        );
+      }
+      return { applied: true, changed: result.changed };
+    }
+    if (!opts?.quiet) {
+      notifyReview(
+        `Live reviewer keeps ${reviewState?.modelLabel ?? "its current model"} — switching to ${model.provider}/${model.id} failed (${result.error ?? "unknown error"}). The next round will use it.`,
+        "warning",
+      );
+    }
+    return { applied: true, changed: false, error: result.error };
+  }
+
+  /**
+   * One activation surface for every live in-process child.
+   *
+   * `/profile use` and `/role` save both change effective role models; both
+   * children must follow from BOTH paths, which is why this wrapper exists
+   * (rather than two calls each activation site could forget).
+   */
+  async function reconcileLiveRoleModels(
+    ctx: ExtensionContext,
+    opts?: { quiet?: boolean; reason?: "profile" | "role" },
+  ): Promise<void> {
+    await reconcileLiveBuilderModel(ctx, opts);
+    await reconcileLiveReviewerModel(ctx, opts);
+  }
+
   /** Provider-catalogue limits for a model that is not the live session model. */
   function registryLimitsFor(ref: {
     provider: string;
@@ -19328,6 +19633,9 @@ ${dispatched.text}`,
     });
     let lastBandPhase: string | undefined;
     orchestratorChild = createOrchestratorChildController({
+      // The controller reconciles a prepared child (and a resume) against this,
+      // so a profile switch that races child creation is still honoured.
+      desiredModel: () => builderModelPlan(),
       create: async (input) => {
         const view = orchestratorRuntime?.view();
         const row = view ? rowForTask(view.state, input.taskId) : undefined;
@@ -19472,8 +19780,8 @@ ${dispatched.text}`,
                     ? "done"
                     : "start",
               ...(state.modelLabel ? { model: state.modelLabel } : {}),
-              ...(formatOrchestratorChildStatus(state)
-                ? { detail: formatOrchestratorChildStatus(state) }
+              ...(formatOrchestratorChildProgress(state)
+                ? { detail: formatOrchestratorChildProgress(state) }
                 : {}),
             });
           }
@@ -19779,6 +20087,14 @@ ${dispatched.text}`,
   function resetOrchestratorComposition(): void {
     orchestratorBaseline = undefined;
     orchestratorAdvance = undefined;
+    // A rebind/shutdown must not leave a repaint interval behind: it would
+    // write into a session that no longer exists.
+    try {
+      orchestratorStatsClock?.dispose();
+    } catch (_e) {
+      void _e;
+    }
+    orchestratorStatsClock = undefined;
     try {
       orchestratorChildUi?.dispose();
     } catch (_e) {
@@ -19914,7 +20230,19 @@ ${dispatched.text}`,
         }
         return {
           phase: state.phase,
+          ...(state.ref ? { ref: state.ref } : {}),
+          ...(state.total === undefined ? {} : { total: state.total }),
           ...(state.modelLabel ? { modelLabel: state.modelLabel } : {}),
+          ...(state.stats?.model ? { modelRef: state.stats.model } : {}),
+          ...(state.stats ? { stats: state.stats } : {}),
+          ...(state.startedAt === undefined
+            ? {}
+            : {
+                elapsedMs: Math.max(
+                  0,
+                  (state.pausedAt ?? Date.now()) - state.startedAt,
+                ),
+              }),
           ...(state.lastTool ? { lastTool: state.lastTool } : {}),
           ...(state.lastError ? { lastError: state.lastError } : {}),
           todos: state.todos.map((item) => ({
@@ -21236,6 +21564,12 @@ ${dispatched.text}`,
           typeof selected.maxOutputTokens === "number" ? selected.maxOutputTokens : null,
       };
     }
+    // An Orchestrator Build child is a managed session: the parent owns model
+    // selection (`/profile use`, `/role set builder`). A programmatic switch in
+    // the child emits `model_select` here, and persisting it would rewrite the
+    // user's GLOBAL default model from a child's internal switch. Never persist
+    // in a child instance; the parent path below is unchanged.
+    if (inProcessChildContext) return;
     // `restore` is Pi re-applying a recorded model (session resume / reload):
     // never a user gesture. Extension-initiated switches are suppressed. The
     // classifier preserves `shouldPersistModelSelect`'s explicit-choice verdict
@@ -21263,6 +21597,9 @@ ${dispatched.text}`,
   });
   pi.on("thinking_level_select", async (event, ctx) => {
     updateStatus(ctx as any);
+    // Same boundary as `model_select`: a Build child's thinking level is applied
+    // by the parent's live switch and must never become the global default.
+    if (inProcessChildContext) return;
     // Only the Default-mode model's thinking is a default. A role model's
     // level belongs to that role (roles.json / profiles.json), so persisting
     // it here would corrupt the next session's default.

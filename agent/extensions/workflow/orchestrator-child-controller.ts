@@ -9,6 +9,7 @@
 import { formatActionLabel } from "./review.ts";
 import type { ReviewLineKind } from "./review.ts";
 import type { InProcessChildSession } from "./in-process-child.ts";
+import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
 import type { TodoItem } from "./utils.ts";
 
 export type OrchestratorChildPhase =
@@ -24,10 +25,17 @@ export interface OrchestratorChildState {
   taskId?: string;
   attemptId?: string;
   sessionId?: string;
+  /** The model the child ACTUALLY runs (follows a live switch). */
   modelLabel?: string;
+  /** Thinking level of the live child, when the session reports one. */
+  thinking?: string;
+  /** Context window usage and cumulative tokens, when observable. */
+  stats?: ChildRuntimeStats;
   ref?: string;
   total?: number;
   startedAt?: number;
+  /** Set while paused, so elapsed time freezes instead of draining. */
+  pausedAt?: number;
   lastTool?: string;
   todos: TodoItem[];
   lastError?: string;
@@ -77,6 +85,12 @@ export interface OrchestratorChildPorts {
   onSettled?: (input: ChildSettledInput) => void | Promise<void>;
   onError?: (input: { taskId: string; attemptId: string; error: string }) => void | Promise<void>;
   onAborted?: (input: { taskId: string; attemptId: string; reason: string }) => void | Promise<void>;
+  /**
+   * The model the parent currently wants this child to run (the effective
+   * Builder role, profile overlay applied). Read at start/resume so a profile
+   * switch that raced child creation is still honoured.
+   */
+  desiredModel?: () => { provider: string; id: string; thinking?: string } | undefined;
   now?: () => number;
   timeoutMs?: number;
   maxToolCalls?: number;
@@ -97,6 +111,21 @@ export interface OrchestratorChildController {
   /** Dispose a prepared-but-never-started child (e.g. the journal failed). */
   discardPrepared(): void;
   start(input: StartChildInput): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Switch the live (or prepared) child to `ref` WITHOUT aborting it.
+   * Serialized with resume so a prompt never runs on a half-switched session.
+   * Never fails the row: a refusal is reported to the caller for display only.
+   */
+  applyModel(ref: {
+    provider: string;
+    id: string;
+    thinking?: string;
+  }): Promise<{
+    ok: boolean;
+    changed?: boolean;
+    model?: ChildModelRef;
+    error?: string;
+  }>;
   /**
    * Re-prompt the warm child for a repair round after a failed verification.
    * Returns false when the session is gone, so the caller can replace it.
@@ -192,6 +221,121 @@ export function createOrchestratorChildController(
         modelLabel?: string;
       }
     | undefined;
+  /** Deduplicates stats publication so a render loop cannot churn the UI. */
+  let lastStatsKey = "";
+  /** Serializes model switches with resume; never held across a prompt. */
+  let modelLane: Promise<unknown> = Promise.resolve();
+
+  const runInModelLane = <T>(work: () => Promise<T>): Promise<T> => {
+    const next = modelLane.then(work, work);
+    modelLane = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+
+  /**
+   * Republish the child's stats when they actually changed.
+   *
+   * `getSessionStats()` is O(entries), and every `entry_appended` would ask for
+   * it: the dedupe key is what keeps a busy child from repainting on each event.
+   */
+  const refreshStats = (): void => {
+    const target = child ?? prepared?.child;
+    const read = target?.stats;
+    if (!read) return;
+    let stats: ChildRuntimeStats | undefined;
+    try {
+      stats = read.call(target);
+    } catch {
+      return;
+    }
+    if (!stats) return;
+    const key = JSON.stringify(stats);
+    if (key === lastStatsKey) return;
+    lastStatsKey = key;
+    publish({
+      stats,
+      ...(stats.model?.thinking ? { thinking: stats.model.thinking } : {}),
+    });
+  };
+
+  /** Apply `ref` to one session, updating state/prepared/transcript. */
+  const applyToSession = async (
+    target: InProcessChildSession,
+    ref: { provider: string; id: string; thinking?: string },
+  ): Promise<{ ok: boolean; changed?: boolean; model?: ChildModelRef; error?: string }> => {
+    const current = target.currentModel?.();
+    const sameModel =
+      current?.provider === ref.provider && current.id === ref.id;
+    const sameThinking =
+      !ref.thinking || !current?.thinking || ref.thinking === current.thinking;
+    if (sameModel && sameThinking) {
+      return { ok: true, changed: false, ...(current ? { model: current } : {}) };
+    }
+    if (typeof target.setModel !== "function") {
+      return {
+        ok: false,
+        error: "this child cannot switch models (unsupported SDK)",
+      };
+    }
+    const result = await target.setModel(
+      ref.provider,
+      ref.id,
+      ref.thinking,
+    );
+    if (!result.ok) return { ok: false, error: result.error };
+    const model = result.model;
+    const label = `${model.provider}/${model.id}`;
+    if (target === child) {
+      publish({
+        modelLabel: label,
+        ...(model.thinking ? { thinking: model.thinking } : {}),
+      });
+      ops([
+        {
+          op: "new",
+          kind: "notice",
+          text: `model → ${label}${model.thinking ? ` (${model.thinking})` : ""}`,
+        },
+      ]);
+      refreshStats();
+    } else if (prepared && prepared.child === target) {
+      prepared.modelLabel = label;
+    }
+    return { ok: true, changed: true, model };
+  };
+
+  /**
+   * Bring a session to the parent's desired model. A mismatch is switched; a
+   * refusal is reported so the caller can decide (a prepared child is replaced,
+   * a running one is left alone).
+   */
+  const ensureDesiredModel = async (
+    target: InProcessChildSession,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const desired = ports.desiredModel?.();
+    if (!desired) return { ok: true };
+    const current = target.currentModel?.();
+    if (
+      current &&
+      current.provider === desired.provider &&
+      current.id === desired.id &&
+      (!desired.thinking ||
+        !current.thinking ||
+        desired.thinking === current.thinking)
+    ) {
+      return { ok: true };
+    }
+    // A session that cannot report/switch a model is accepted as-is: the
+    // launch model was already resolved from the same effective role.
+    if (typeof target.setModel !== "function") return { ok: true };
+    const applied = await applyToSession(target, desired);
+    return applied.ok
+      ? { ok: true }
+      : { ok: false, error: applied.error ?? "the model switch failed" };
+  };
 
   const publish = (patch: Partial<OrchestratorChildState>): void => {
     state = { ...state, ...patch };
@@ -215,6 +359,26 @@ export function createOrchestratorChildController(
     if (timer !== undefined) {
       clearTimeout(timer);
       timer = undefined;
+    }
+  };
+
+  /**
+   * Arm the execution deadline.
+   *
+   * `unref()`ed: the deadline is an enforcement budget, not work, so it must
+   * never keep the process alive on its own (headless runs, tests, shutdown
+   * after the last row). The child's own streaming keeps the loop alive while
+   * there is real work.
+   */
+  const armDeadline = (callback: () => void): void => {
+    timer = setTimeout(callback, timeoutMs);
+    // SAFETY: Node's Timeout carries `unref()`; the DOM-style numeric handle a
+    // non-Node host may return does not, and the optional call keeps it safe.
+    const handle = timer as unknown as { unref?: () => void };
+    try {
+      handle.unref?.();
+    } catch {
+      /* an unref refusal must not break the deadline */
     }
   };
 
@@ -313,9 +477,17 @@ export function createOrchestratorChildController(
     if (type === "agent_end") {
       const text = assistantText(event.messages);
       if (text) summary = text;
+      refreshStats();
+      return;
+    }
+    if (type === "message_end" || type === "entry_appended") {
+      // Usage/model changes arrive here; `refreshStats` dedupes so a busy run
+      // does not repaint on every entry.
+      refreshStats();
       return;
     }
     if (type === "agent_settled") {
+      refreshStats();
       if (expectedAbort !== undefined) {
         expectedAbort = undefined;
         return;
@@ -396,6 +568,32 @@ export function createOrchestratorChildController(
       prepared = undefined;
     },
 
+    async applyModel(ref) {
+      // A finishing/disposed child must not be switched: its session is about
+      // to be released and the next row resolves the profile fresh anyway.
+      if (state.phase === "settling" || state.phase === "disposed") {
+        return { ok: false, error: "the child is finishing" };
+      }
+      const target = child ?? prepared?.child;
+      if (!target) {
+        return { ok: false, error: "no child is active" };
+      }
+      return runInModelLane(async () => {
+        const at = child ?? prepared?.child;
+        if (!at) {
+          return { ok: false, error: "no child is active" };
+        }
+        try {
+          return await applyToSession(at, ref);
+        } catch (error: unknown) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      });
+    },
+
     async start(input) {
       if (state.phase === "starting" || state.phase === "running") {
         return { ok: false, error: "a child is already active" };
@@ -422,11 +620,35 @@ export function createOrchestratorChildController(
       });
 
       let modelLabel: string | undefined;
+      let adopted: InProcessChildSession | undefined;
       if (prepared && prepared.attemptId === input.attemptId) {
         modelLabel = prepared.modelLabel;
-        child = prepared.child;
+        adopted = prepared.child;
         prepared = undefined;
-      } else {
+        // A `/profile` or `/role` switch can land between `prepare()` (which
+        // created this session) and `start()`. Bring it to the parent's current
+        // Builder model BEFORE the first prompt; a refusal replaces it with a
+        // fresh child created from the same current plan.
+        const reconciled = await ensureDesiredModel(adopted);
+        if (gen !== generation) {
+          try {
+            adopted.dispose();
+          } catch {
+            /* ignore */
+          }
+          return { ok: false, error: "superseded" };
+        }
+        if (!reconciled.ok) {
+          try {
+            adopted.dispose();
+          } catch {
+            /* ignore */
+          }
+          adopted = undefined;
+          modelLabel = undefined;
+        }
+      }
+      if (!adopted) {
         const created = await ports.create({
           sessionId: input.sessionId,
           taskId: input.taskId,
@@ -449,22 +671,33 @@ export function createOrchestratorChildController(
           fail(created.error ?? "the child session could not be created");
           return { ok: false, error: created.error ?? "child creation failed" };
         }
-        child = created.child;
+        adopted = created.child;
         modelLabel = created.modelLabel;
+        // Correct a silently substituted launch model; a refusal is not fatal.
+        await ensureDesiredModel(adopted);
       }
+      child = adopted;
+      // Report the model the session ACTUALLY resolved, not the request.
+      const actual = child.currentModel?.();
+      const actualLabel = actual
+        ? `${actual.provider}/${actual.id}`
+        : modelLabel;
       publish({
         phase: "running",
-        modelLabel,
+        ...(actualLabel ? { modelLabel: actualLabel } : {}),
+        ...(actual?.thinking ? { thinking: actual.thinking } : {}),
         sessionId: child.sessionId,
+        pausedAt: undefined,
       });
+      refreshStats();
       unsubscribe = child.subscribe(onEvent);
-      timer = setTimeout(() => {
+      armDeadline(() => {
         if (gen !== generation || settledOnce) return;
         expectedAbort = "abort";
         void child?.abort();
         release();
         fail(`the child did not finish within ${Math.round(timeoutMs / 1000)}s`);
-      }, timeoutMs);
+      });
       try {
         await child.prompt(
           ports.buildPrompt({
@@ -488,9 +721,9 @@ export function createOrchestratorChildController(
     },
 
     async pause() {
-      if (state.phase !== "running" || !child) return false;
-      expectedAbort = "pause";
-      publish({ phase: "paused" });
+      if (state.phase !== "running" || !child) return false;      expectedAbort = "pause";
+      // Freeze elapsed on pause: a warm child must not accumulate wall time.
+      publish({ phase: "paused", pausedAt: now() });
       try {
         await child.abort();
       } catch {
@@ -512,14 +745,14 @@ export function createOrchestratorChildController(
       settledOnce = false;
       expectedAbort = undefined;
       summary = "";
-      publish({ phase: "running" });
-      timer = setTimeout(() => {
+      publish({ phase: "running", pausedAt: undefined });
+      armDeadline(() => {
         if (settledOnce) return;
         expectedAbort = "abort";
         void child?.abort();
         release();
         fail(`the child did not finish within ${Math.round(timeoutMs / 1000)}s`);
-      }, timeoutMs);
+      });
       try {
         await child.prompt(
           ports.buildPrompt({ taskId, attemptId, ref, total, repair }),
@@ -539,9 +772,17 @@ export function createOrchestratorChildController(
         queuedNote ||
         "Continue the assigned row from where you stopped. Keep your task-local TODO list current, then finish with a short summary.";
       queuedNote = undefined;
+      // Never prompt on a half-switched session: finish any in-flight switch
+      // and apply the current desired model first. A refusal keeps the old
+      // model (still resumable) and never blocks the resume.
+      await runInModelLane(async () => {
+        if (!child) return;
+        await ensureDesiredModel(child);
+      });
+      if (state.phase !== "paused" || !child) return false;
       expectedAbort = undefined;
       settledOnce = false;
-      publish({ phase: "running" });
+      publish({ phase: "running", pausedAt: undefined });
       try {
         await child.prompt(text);
         return true;

@@ -13,6 +13,11 @@ import {
   formatReviewTranscriptLines,
 } from "./review-ui.ts";
 import type { OrchestratorChildState } from "./orchestrator-child-controller.ts";
+import {
+  formatChildProgress,
+  formatChildStatusLine,
+  modelRefFromLabel,
+} from "./child-stats.ts";
 
 export const ORCHESTRATOR_CHILD_BAND_ENTRY = "workflow-orchestrator-child-band";
 export const ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY =
@@ -107,22 +112,49 @@ export function registerOrchestratorChildRenderers(
   );
 }
 
-/** Footer/status text; bounded and truthful. */
+/**
+ * Footer/status text; one bounded, truthful line.
+ *
+ * Shares `formatChildStatusLine`, so the footer, the pinned panel, the operator
+ * text and the host contributions can never disagree about the child's model,
+ * context or todos.
+ */
 export function formatOrchestratorChildStatus(
+  state: OrchestratorChildState | undefined,
+  now: number = Date.now(),
+): string {
+  if (!state || state.phase === "idle" || state.phase === "disposed") {
+    return "";
+  }
+  const phase = state.phase === "settling" ? "verifying" : state.phase;
+  const model =
+    state.stats?.model ?? modelRefFromLabel(state.modelLabel);
+  const elapsedMs =
+    state.startedAt === undefined
+      ? undefined
+      : Math.max(0, (state.pausedAt ?? now) - state.startedAt);
+  return formatChildStatusLine({
+    ...(state.ref ? { ref: state.ref } : {}),
+    ...(state.total === undefined ? {} : { total: state.total }),
+    phase,
+    ...(model ? { model } : {}),
+    ...(state.stats ? { stats: state.stats } : {}),
+    ...(elapsedMs === undefined ? {} : { elapsedMs }),
+    todoDone: state.todos.filter((item) => item.completed).length,
+    todoTotal: state.todos.length,
+  });
+}
+
+/** The compact detail carried by the historical child band (model excluded). */
+export function formatOrchestratorChildProgress(
   state: OrchestratorChildState | undefined,
 ): string {
   if (!state || state.phase === "idle" || state.phase === "disposed") {
     return "";
   }
-  const ref =
-    state.ref && state.total ? `child ${state.ref}/${state.total}` : "child";
-  const todos =
-    state.todos.length > 0
-      ? ` · ${state.todos.filter((item) => item.completed).length}/${state.todos.length} todos`
-      : "";
-  if (state.phase === "starting") return `${ref} starting…`;
-  if (state.phase === "settling") return `${ref} verifying…`;
-  if (state.phase === "paused") return `⏸ ${ref} paused`;
-  const tool = state.lastTool ? ` · ${state.lastTool}` : "";
-  return `${ref}${tool}${todos}`;
+  return formatChildProgress({
+    ...(state.lastTool ? { lastTool: state.lastTool } : {}),
+    todoDone: state.todos.filter((item) => item.completed).length,
+    todoTotal: state.todos.length,
+  });
 }

@@ -69,6 +69,7 @@ import {
   reviewModeLockFooter,
   reviewModeLockKind,
   reviewInputDecision,
+  reviewInputAllowed,
   reviewModeLockNotice,
   reviewModeLockStatusLine,
   reviewNoticeText,
@@ -2928,6 +2929,43 @@ test("reviewInputDecision allows /handoff fallback during a review handoff", () 
   assert.ok(notice.includes("/handoff fallback"));
 });
 
+test("Review allows /profile and /role mid-round and still blocks prose", () => {
+  for (const command of [
+    "/profile use fast",
+    "/profile",
+    "/role set reviewer open/muse high",
+    "/role",
+    "/model open/muse",
+    "/thinking high",
+  ]) {
+    assert.equal(reviewInputAllowed(command), true, command);
+  }
+  for (const text of [
+    "please change the plan",
+    "/plan",
+    "/build",
+    "/todos clear",
+    "/orchestrator status",
+  ]) {
+    assert.equal(reviewInputAllowed(text), false, text);
+  }
+
+  const running = reviewInputDecision("please change the plan", "running");
+  assert.equal(running.action, "block");
+  assert.match(
+    running.action === "block" ? running.notice : "",
+    /change model\/profile/,
+    "the block notice names the allowed profile/role escape",
+  );
+  // A profile switch is a command, so it passes the same gate during a pause
+  // and a handoff: the live-switch path must not need a special allowance.
+  for (const phase of ["running", "paused", "handoff"] as const) {
+    assert.deepEqual(reviewInputDecision("/profile use fast", phase), {
+      action: "allow",
+    });
+  }
+});
+
 test("reviewGatePhaseOnResume makes a gated pause auditing again", () => {
   assert.equal(reviewGatePhaseOnResume("paused"), "auditing");
   assert.equal(reviewGatePhaseOnResume("auditing"), "auditing");
@@ -3492,6 +3530,159 @@ function runtimeDeps(
   }
   return { deps, writes, logs };
 }
+
+test("runtime: switchModel switches a live reviewer and keeps the warm session", async () => {
+  const { capture, sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  let reviewerModel = { provider: "p", id: "m", thinking: "xhigh" };
+  const { deps } = runtimeDeps(sdk);
+  // Mirror the extension: `reviewerModel()` follows the snapshot the switch
+  // updates, and the registry resolves the requested pair.
+  (deps as Record<string, unknown>).reviewerModel = () => reviewerModel;
+  (deps as Record<string, unknown>).findModel = (provider: string, id: string) => ({
+    provider,
+    id,
+  });
+  const rt = createReviewRuntime(deps as never);
+
+  assert.equal(await rt.ensureStarted(), true);
+  assert.equal(capture.createCalls, 1);
+
+  const result = await rt.switchModel({
+    provider: "other",
+    id: "m2",
+    thinking: "high",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.deepEqual(capture.setModelCalls, [
+    { provider: "other", id: "m2", thinking: "high" },
+  ]);
+  assert.deepEqual(result.model, {
+    provider: "other",
+    id: "m2",
+    thinking: "high",
+  });
+  assert.ok(
+    rt.getTranscript().some((line) => line.includes("reviewer model → other/m2")),
+    "the switch is recorded in the reviewer transcript",
+  );
+
+  // The next round reuses the warm session instead of restarting it: the new
+  // snapshot matches the key the runtime recorded on switch.
+  reviewerModel = { provider: "other", id: "m2", thinking: "high" };
+  assert.equal(await rt.ensureStarted(), true);
+  assert.equal(capture.createCalls, 1, "no second session is created");
+  assert.equal(capture.disposeCount, 0, "the warm session is never disposed");
+});
+
+test("runtime: switchModel to the same model is a no-op", async () => {
+  const { capture, sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const { deps } = runtimeDeps(sdk);
+  (deps as Record<string, unknown>).findModel = (provider: string, id: string) => ({
+    provider,
+    id,
+  });
+  const rt = createReviewRuntime(deps as never);
+  await rt.ensureStarted();
+
+  const result = await rt.switchModel({ provider: "p", id: "m", thinking: "xhigh" });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.equal(capture.setModelCalls.length, 0);
+});
+
+test("runtime: a refused reviewer switch keeps the live session", async () => {
+  const { capture, sdk } = fakeSdk({
+    pass1: submitThenFinish(REWRITTEN_PLAN),
+    setModelError: new Error("No API key for provider"),
+  });
+  const { deps } = runtimeDeps(sdk);
+  (deps as Record<string, unknown>).findModel = (provider: string, id: string) => ({
+    provider,
+    id,
+  });
+  const rt = createReviewRuntime(deps as never);
+  await rt.ensureStarted();
+
+  const result = await rt.switchModel({
+    provider: "other",
+    id: "m2",
+    thinking: "high",
+  });
+  assert.equal(result.ok, false);
+  assert.match(String(result.error), /No API key/);
+  assert.equal(rt.isAlive(), true, "the session survives a refused switch");
+  assert.equal(capture.disposeCount, 0);
+  assert.equal(capture.createCalls, 1, "no restart on a refusal");
+});
+
+test("runtime: a switch before the session exists is used by the next boot", async () => {
+  const { capture, sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const { deps } = runtimeDeps(sdk);
+  (deps as Record<string, unknown>).findModel = (provider: string, id: string) => ({
+    provider,
+    id,
+  });
+  const rt = createReviewRuntime(deps as never);
+
+  const result = await rt.switchModel({
+    provider: "early",
+    id: "m3",
+    thinking: "low",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(capture.createCalls, 0, "nothing is created for a pending choice");
+
+  assert.equal(await rt.ensureStarted(), true);
+  assert.deepEqual(
+    capture.createdWith,
+    { provider: "early", id: "m3", thinking: "low" },
+    "the cold-start choice is not lost",
+  );
+});
+
+test("runtime: a live switch does not abort the round or restart the session", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { capture, sdk } = fakeSdk({
+    pass1: async (c) => {
+      await submitThenFinish(REWRITTEN_PLAN)(c);
+      await gate;
+    },
+  });
+  const { deps } = runtimeDeps(sdk);
+  (deps as Record<string, unknown>).findModel = (provider: string, id: string) => ({
+    provider,
+    id,
+  });
+  const rt = createReviewRuntime(deps as never);
+
+  const round = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const switched = await rt.switchModel({
+    provider: "other",
+    id: "m2",
+    thinking: "high",
+  });
+  assert.equal(switched.ok, true);
+  assert.equal(
+    rt.getState()?.modelLabel,
+    "other/m2",
+    "the live round reports the model that actually audits",
+  );
+  release();
+  const result = await round;
+
+  assert.equal(result.ok, true, "the round still completes");
+  assert.equal(capture.aborts, 0, "switching never aborts the round");
+  assert.equal(capture.createCalls, 1, "the session is not restarted");
+});
 
 test("runtime: full round wires all tools, verifies, and returns the rewrite", async () => {
   const { capture, sdk } = fakeSdk({

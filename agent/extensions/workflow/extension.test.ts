@@ -20,6 +20,7 @@ import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
 import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
+import { ORCHESTRATOR_CHILD_ENTRY } from "./orchestrator-child-contract.ts";
 import {
   REVIEW_HANDOFF_LINE,
   REVIEW_PAUSED_LINE,
@@ -44,6 +45,7 @@ import {
   stripAnsi,
   submitThenFinish,
   tmpProject,
+  writeProfilesJson,
   type FakeCapture,
 } from "./test-support.ts";
 
@@ -1471,6 +1473,65 @@ test("S5: a paused manual review hands off after /review-resume", async () => {
       1,
       "the resumed manual round opens the browser once",
     );
+  } finally {
+    release();
+    await b.cleanup();
+  }
+});
+
+test("RE1: /profile use switches a PAUSED reviewer and resume reuses the session", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const b = await boot({
+    hasUI: true,
+    plannotator: true,
+    script: {
+      pass1: async (c) => {
+        if (c.prompts.length === 1) await gate;
+        await submitThenFinish(REWRITTEN_PLAN)(c);
+      },
+    },
+  });
+  try {
+    writeProfilesJson(b.agentDir, [
+      {
+        name: "fast",
+        roles: {
+          planner: { provider: "open", id: "muse", thinking: "high" },
+          reviewer: { provider: "open", id: "muse", thinking: "high" },
+        },
+      },
+    ]);
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "re1.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+    const manual = b.pi.commands.review.handler("", b.ctx);
+    for (let i = 0; i < 100 && b.capture.prompts.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(b.capture.prompts.length, 1);
+    await b.pi.commands["review-pause"].handler("", b.ctx);
+    release();
+    await manual;
+
+    const createsBefore = b.capture.createCalls;
+    await b.pi.commands.profile.handler("use fast", b.ctx);
+    assert.deepEqual(
+      b.capture.setModelCalls,
+      [{ provider: "open", id: "muse", thinking: "high" }],
+      "the paused reviewer switches in place",
+    );
+
+    await b.pi.commands["review-resume"].handler("", b.ctx);
+    assert.equal(
+      b.capture.createCalls,
+      createsBefore,
+      "the resumed round reuses the warm reviewer session",
+    );
+    assert.equal(b.capture.disposeCount, 0, "no reviewer session is discarded");
   } finally {
     release();
     await b.cleanup();
@@ -5167,6 +5228,286 @@ test("OE4: abort pauses the row; retry starts a fresh child", async () => {
     assert.equal(b.child.created.length, 2, "retry started a fresh child");
     status = await b.pi.tools.orchestrator_status.execute("oe4-b", {});
     assert.match(JSON.stringify(status), /"running":1/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE5: a Build child never persists a model or thinking default", async () => {
+  const childContext = {
+    version: 1,
+    runId: "run-child",
+    taskId: "task-1",
+    attemptId: "attempt-1",
+    ref: "1",
+    total: 1,
+    parentSessionRef: "parent-session-ref",
+    mode: "build",
+    mayOrchestrate: false,
+    createdAt: Date.now(),
+  };
+  const b = await boot({
+    globalSettings: {
+      defaultProvider: "pi",
+      defaultModel: "main-model",
+      defaultThinkingLevel: "high",
+      workflow: { modelDefault: { provider: "pi", id: "main-model" } },
+    },
+    branch: [
+      {
+        type: "custom",
+        customType: ORCHESTRATOR_CHILD_ENTRY,
+        data: childContext,
+      },
+    ],
+  });
+  try {
+    const globalPath = path.join(b.agentDir, "settings.json");
+    const before = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+
+    // A programmatic parent-driven switch inside the child emits these events.
+    await b.pi.emit(
+      "model_select",
+      {
+        type: "model_select",
+        model: { provider: "other", id: "child-model" },
+        source: "set",
+      },
+      b.ctx,
+    );
+    await b.pi.emit(
+      "thinking_level_select",
+      { type: "thinking_level_select", level: "max", previousLevel: "high" },
+      b.ctx,
+    );
+
+    const after = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+    assert.deepEqual(
+      after.workflow.modelDefault,
+      before.workflow.modelDefault,
+      "a child switch must not rewrite the global default model",
+    );
+    assert.equal(
+      after.defaultThinkingLevel,
+      before.defaultThinkingLevel,
+      "a child switch must not rewrite the global default thinking level",
+    );
+    assert.equal(after.defaultModel, "main-model");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE5b: the parent still persists an explicit model choice", async () => {
+  const b = await boot({
+    globalSettings: {
+      defaultProvider: "pi",
+      defaultModel: "main-model",
+      defaultThinkingLevel: "high",
+      workflow: { modelDefault: { provider: "pi", id: "main-model" } },
+    },
+  });
+  try {
+    await b.pi.emit(
+      "model_select",
+      {
+        type: "model_select",
+        model: { provider: "open", id: "muse" },
+        source: "set",
+      },
+      b.ctx,
+    );
+    const after = JSON.parse(
+      fs.readFileSync(path.join(b.agentDir, "settings.json"), "utf8"),
+    );
+    assert.deepEqual(after.workflow.modelDefault, {
+      provider: "open",
+      id: "muse",
+    });
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE6: /profile use switches a RUNNING Build child in both views", async () => {
+  for (const view of ["child", "parent"] as const) {
+    const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+    const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+    try {
+      writeProfilesJson(b.agentDir, [
+        {
+          name: "fast",
+          roles: {
+            builder: { provider: "open", id: "muse", thinking: "high" },
+            orchestrator: { provider: "open", id: "muse", thinking: "high" },
+          },
+        },
+      ]);
+      const plan = placePlan(b.cwd, `oe6-${view}.md`);
+      fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+      await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+      await b.pi.commands["orchestrator-view"].handler(view, b.ctx);
+      const live = child.created[0]!;
+      assert.equal(live.setModelCalls.length, 0);
+      if (view === "child") {
+        // The pinned panel header carries the child's identity, model and
+        // context — the same truth as the footer.
+        const panel = renderTodoWidget(b.widgetCalls, 100).join("\n");
+        assert.match(
+          panel,
+          /▌ CHILD 1\/1 · .+ · ctx 15% · local todos/,
+          "the child panel header shows the child's model and context",
+        );
+      }
+
+      await b.pi.commands.profile.handler("use fast", b.ctx);
+
+      assert.deepEqual(
+        live.setModelCalls,
+        [{ provider: "open", id: "muse", thinking: "high" }],
+        `${view} view: the live Builder follows the profile`,
+      );
+      assert.deepEqual(live.currentModel(), {
+        provider: "open",
+        id: "muse",
+        thinking: "high",
+      });
+      assert.equal(live.disposeCalls, 0, "the live child is never recreated");
+      const status = await b.pi.tools.orchestrator_status.execute("oe6", {});
+      assert.match(JSON.stringify(status), /"running":1/);
+    } finally {
+      await b.cleanup();
+    }
+  }
+});
+
+test("OE7: a paused Build child switches, and resume runs on the new model", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    writeProfilesJson(b.agentDir, [
+      {
+        name: "fast",
+        roles: {
+          builder: { provider: "open", id: "muse", thinking: "high" },
+          orchestrator: { provider: "open", id: "muse", thinking: "high" },
+        },
+      },
+    ]);
+    const plan = placePlan(b.cwd, "oe7.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    const live = child.created[0]!;
+    const promptsBefore = live.promptCalls;
+
+    await b.pi.commands["orchestrator-pause"].handler("", b.ctx);
+    await b.pi.commands.profile.handler("use fast", b.ctx);
+    assert.equal(live.setModelCalls.length, 1, "a paused child switches immediately");
+
+    await b.pi.commands["orchestrator-resume"].handler("", b.ctx);
+    assert.equal(live.promptCalls, promptsBefore + 1, "resume prompts the same warm child");
+    assert.deepEqual(live.currentModel(), {
+      provider: "open",
+      id: "muse",
+      thinking: "high",
+    });
+    assert.equal(live.disposeCalls, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE8: a refused live switch warns and keeps the child running", async () => {
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: false,
+    setModelError: "No API key for provider",
+  });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    writeProfilesJson(b.agentDir, [
+      {
+        name: "fast",
+        roles: {
+          builder: { provider: "open", id: "muse" },
+          orchestrator: { provider: "open", id: "muse" },
+        },
+      },
+    ]);
+    const plan = placePlan(b.cwd, "oe8.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    const live = child.created[0]!;
+    const launchModel = live.currentModel();
+
+    await b.pi.commands.profile.handler("use fast", b.ctx);
+
+    assert.deepEqual(
+      live.currentModel(),
+      launchModel,
+      "the refused switch leaves the child on its launch model",
+    );
+    assert.equal(live.disposeCalls, 0);
+    const warning = b.notifies.find((n) =>
+      /Live Builder keeps/.test(String(n.message)),
+    );
+    assert.ok(warning, "the refusal is surfaced honestly");
+    assert.match(String(warning.message), /next child will use it/);
+    const status = await b.pi.tools.orchestrator_status.execute("oe8", {});
+    assert.match(JSON.stringify(status), /"running":1/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE9: the NEXT child launches on the profile's Builder model", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    writeProfilesJson(b.agentDir, [
+      {
+        name: "fast",
+        roles: {
+          builder: { provider: "open", id: "muse", thinking: "high" },
+          orchestrator: { provider: "open", id: "muse", thinking: "high" },
+        },
+      },
+    ]);
+    const plan = placePlan(b.cwd, "oe9.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    await b.pi.commands.profile.handler("use fast", b.ctx);
+    assert.equal(child.modelRefs.length, 1);
+
+    await b.pi.commands["orchestrator-abort"].handler("", b.ctx);
+    await b.pi.commands.orchestrator.handler("retry", b.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(child.created.length, 2, "retry starts a fresh child");
+    assert.deepEqual(child.modelRefs.at(-1), {
+      provider: "open",
+      id: "muse",
+      thinking: "high",
+    });
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE10: /role set builder switches the live child too", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oe10.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    const live = child.created[0]!;
+
+    await b.pi.commands.role.handler("set builder open/muse high", b.ctx);
+
+    assert.deepEqual(live.setModelCalls, [
+      { provider: "open", id: "muse", thinking: "high" },
+    ]);
+    assert.equal(live.disposeCalls, 0);
   } finally {
     await b.cleanup();
   }

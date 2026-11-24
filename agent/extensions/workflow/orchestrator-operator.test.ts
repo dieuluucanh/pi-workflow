@@ -301,6 +301,49 @@ test("say refuses without a child", async () => {
   assert.match(result.text, /no orchestrator child/i);
 });
 
+test("status and inspect name the child's model, context, tokens and elapsed time", async () => {
+  const h = harness({
+    child: () => ({
+      phase: "running",
+      ref: "2",
+      total: 7,
+      modelLabel: "open/muse-spark",
+      modelRef: { provider: "open", id: "muse-spark", thinking: "high" },
+      stats: {
+        model: { provider: "open", id: "muse-spark", thinking: "high" },
+        tokens: {
+          input: 12_000,
+          output: 3_000,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 15_000,
+        },
+        context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
+      },
+      elapsedMs: 83_000,
+      todos: [
+        { text: "a", completed: true },
+        { text: "b", completed: false },
+      ],
+    }),
+  });
+  const status = await h.operator.run("status");
+  assert.equal(status.ok, true);
+  assert.match(
+    status.text,
+    /child 2\/7 running · open\/muse-spark · ctx 43% \(86k\/200k\) · ↑12k ↓3\.0k · 01:23 · 1\/2 todos/,
+  );
+
+  const inspect = await h.operator.run("inspect task-1");
+  assert.equal(inspect.ok, true);
+  assert.match(inspect.text, /child 2\/7 running · open\/muse-spark · ctx 43%/);
+
+  // Every line the operator prints stays single-line and bounded.
+  for (const text of [status.text, inspect.text]) {
+    assert.equal(/[\r\n\t]/.test(text.replace(/\n/g, " ")), false);
+  }
+});
+
 test("retry starts a fresh child for a blocked row", async () => {
   const h = harness({ state: blockedRun() });
   const result = await h.operator.run("retry");

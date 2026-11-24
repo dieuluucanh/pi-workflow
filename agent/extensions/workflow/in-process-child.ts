@@ -19,6 +19,13 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderSeedResult } from "./review-providers.ts";
 import { seedChildRuntimeProviders } from "./review-providers.ts";
+import {
+  childModelLabel,
+  type ChildContextUsage,
+  type ChildModelRef,
+  type ChildRuntimeStats,
+  type ChildTokenTotals,
+} from "./child-stats.ts";
 
 /**
  * Structural handle on the Pi SDK. Erased at compile time so importing this
@@ -49,9 +56,15 @@ export type ReviewSdkLoader = InProcessChildSdkLoader;
 /**
  * A live child session, narrowed to what the parent orchestration needs.
  * Deliberately keeps the rest of the extension free of SDK types.
+ *
+ * `currentModel`, `stats` and `setModel` are OPTIONAL: they are implemented over
+ * public `AgentSession` APIs and feature-detected at call time, so an older SDK
+ * (or a test double) still satisfies the handle. Callers must treat `undefined`
+ * as "this session cannot report/switch" rather than as a failure.
  */
 export interface InProcessChildSession {
   readonly sessionId: string;
+  /** The model this session is actually running (launch label as fallback). */
   readonly modelLabel: string;
   /** Subscribe to the session's event stream. Returns an unsubscribe function. */
   subscribe(listener: (event: unknown) => void): () => void;
@@ -64,7 +77,25 @@ export interface InProcessChildSession {
   isStreaming(): boolean;
   /** Unsubscribe and release. Never throws, safe to call twice. */
   dispose(): void;
+  /** The model/thinking the session is running right now. */
+  currentModel?(): ChildModelRef | undefined;
+  /** Current context usage and cumulative tokens, when the SDK reports them. */
+  stats?(): ChildRuntimeStats | undefined;
+  /**
+   * Switch the live session's model (and thinking) WITHOUT aborting it.
+   * Auth and registry resolution happen inside the session's own runtime.
+   * Never throws: a refusal is a `{ ok: false, error }` result.
+   */
+  setModel?(
+    provider: string,
+    id: string,
+    thinking?: string,
+  ): Promise<SwitchChildModelResult>;
 }
+
+export type SwitchChildModelResult =
+  | { ok: true; model: ChildModelRef }
+  | { ok: false; error: string };
 
 export interface InProcessChildAuthInput {
   modelRuntime: unknown;
@@ -444,6 +475,177 @@ function asSdk(raw: unknown): InProcessChildSdk {
   return raw as InProcessChildSdk;
 }
 
+/** The raw `AgentSession` surface this wrapper feature-detects. */
+interface RawChildSession {
+  subscribe: (l: (e: unknown) => void) => () => void;
+  prompt: (
+    t: string,
+    o?: { streamingBehavior?: "steer" | "followUp" },
+  ) => Promise<void>;
+  followUp: (t: string) => Promise<void>;
+  abort: () => Promise<void>;
+  isStreaming: boolean;
+  dispose?: () => void | Promise<void>;
+  model?: {
+    provider?: unknown;
+    id?: unknown;
+    modelId?: unknown;
+    thinking?: unknown;
+  };
+  thinkingLevel?: unknown;
+  getSessionStats?: () => unknown;
+  getContextUsage?: () => unknown;
+  modelRuntime?: { getModel?: (provider: string, id: string) => unknown };
+  setModel?: (
+    model: unknown,
+    options?: { persist?: boolean },
+  ) => Promise<void> | void;
+  setThinkingLevel?: (level: string, options?: { persist?: boolean }) => void;
+}
+
+/** The model the raw session is running, or undefined when not exposed. */
+function readRawChildModel(s: RawChildSession): ChildModelRef | undefined {
+  try {
+    const raw = s.model;
+    if (!raw || typeof raw !== "object") return undefined;
+    const provider = raw.provider;
+    const id = raw.id ?? raw.modelId;
+    if (typeof provider !== "string" || provider.length === 0) return undefined;
+    if (typeof id !== "string" || id.length === 0) return undefined;
+    const thinking =
+      typeof raw.thinking === "string"
+        ? raw.thinking
+        : typeof s.thinkingLevel === "string"
+          ? s.thinkingLevel
+          : undefined;
+    return { provider, id, ...(thinking ? { thinking } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Current context usage, when the SDK exposes it. */
+function readRawChildContext(
+  s: RawChildSession,
+): ChildContextUsage | undefined {
+  try {
+    const usage = s.getContextUsage?.();
+    if (!usage || typeof usage !== "object") return undefined;
+    const record = usage as Record<string, unknown>;
+    const contextWindow =
+      typeof record.contextWindow === "number" &&
+      Number.isFinite(record.contextWindow)
+        ? record.contextWindow
+        : 0;
+    const tokens =
+      typeof record.tokens === "number" && Number.isFinite(record.tokens)
+        ? record.tokens
+        : null;
+    const percent =
+      typeof record.percent === "number" && Number.isFinite(record.percent)
+        ? record.percent
+        : null;
+    if (contextWindow <= 0 && tokens === null) return undefined;
+    return { tokens, contextWindow, percent };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Cumulative token totals, when the SDK exposes session stats. */
+function readRawChildTokens(
+  s: RawChildSession,
+): ChildTokenTotals | undefined {
+  try {
+    const stats = s.getSessionStats?.();
+    if (!stats || typeof stats !== "object") return undefined;
+    const tokens = (stats as { tokens?: unknown }).tokens;
+    if (!tokens || typeof tokens !== "object") return undefined;
+    const record = tokens as Record<string, unknown>;
+    const num = (value: unknown): number =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? value
+        : 0;
+    return {
+      input: num(record.input),
+      output: num(record.output),
+      cacheRead: num(record.cacheRead),
+      cacheWrite: num(record.cacheWrite),
+      total: num(record.total),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Switch the raw session's model without aborting it. Resolution and auth
+ * happen inside the session's own runtime (the same path Pi's `/model` uses).
+ */
+async function switchRawChildModel(
+  s: RawChildSession,
+  provider: string,
+  id: string,
+  thinking: string | undefined,
+): Promise<SwitchChildModelResult> {
+  if (typeof s.setModel !== "function") {
+    return {
+      ok: false,
+      error: "this session cannot switch models (unsupported SDK)",
+    };
+  }
+  let resolved: unknown;
+  try {
+    resolved = s.modelRuntime?.getModel?.(provider, id);
+  } catch {
+    resolved = undefined;
+  }
+  if (!resolved) {
+    return {
+      ok: false,
+      error: `${provider}/${id} is not available in the child's model registry`,
+    };
+  }
+  try {
+    // NEVER persist: the child's switch must not rewrite the user's default.
+    await s.setModel(resolved, { persist: false });
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (thinking && typeof s.setThinkingLevel === "function") {
+    try {
+      s.setThinkingLevel(thinking, { persist: false });
+    } catch {
+      /* a thinking refusal must not undo an applied model switch */
+    }
+  }
+  return {
+    ok: true,
+    model: mergeRequestedThinking(readRawChildModel(s), provider, id, thinking),
+  };
+}
+
+/**
+ * Report what the session runs, but never silently drop a thinking level we
+ * deliberately applied when the session does not echo one back.
+ */
+function mergeRequestedThinking(
+  actual: ChildModelRef | undefined,
+  provider: string,
+  id: string,
+  thinking: string | undefined,
+): ChildModelRef {
+  if (!actual) {
+    return { provider, id, ...(thinking ? { thinking } : {}) };
+  }
+  return thinking && !actual.thinking
+    ? { ...actual, thinking }
+    : { ...actual };
+}
+
 /**
  * Wrap a raw AgentSession in the narrow child handle. `dispose` is idempotent
  * and never throws; a disposed session ignores later prompts.
@@ -454,22 +656,15 @@ export function wrapAgentSession(
   sessionId: string,
   onDispose?: () => void,
 ): InProcessChildSession {
-  const s = raw as {
-    subscribe: (l: (e: unknown) => void) => () => void;
-    prompt: (
-      t: string,
-      o?: { streamingBehavior?: "steer" | "followUp" },
-    ) => Promise<void>;
-    followUp: (t: string) => Promise<void>;
-    abort: () => Promise<void>;
-    isStreaming: boolean;
-    dispose?: () => void | Promise<void>;
-  };
+  const s = raw as RawChildSession;
   let disposed = false;
   const unsubscribers: Array<() => void> = [];
   return {
     sessionId,
-    modelLabel,
+    // The model the session actually runs, not just what was requested.
+    get modelLabel() {
+      return childModelLabel(readRawChildModel(s), modelLabel);
+    },
     subscribe(listener) {
       const un = s.subscribe(listener);
       if (disposed) {
@@ -501,6 +696,28 @@ export function wrapAgentSession(
     },
     isStreaming() {
       return !disposed && Boolean(s.isStreaming);
+    },
+    currentModel() {
+      return disposed ? undefined : readRawChildModel(s);
+    },
+    stats(): ChildRuntimeStats | undefined {
+      if (disposed) return undefined;
+      const model = readRawChildModel(s);
+      const context = readRawChildContext(s);
+      const tokens = readRawChildTokens(s);
+      if (!model && !context && !tokens) return undefined;
+      return {
+        ...(model ? { model } : {}),
+        ...(model?.thinking ? { thinking: model.thinking } : {}),
+        ...(tokens ? { tokens } : {}),
+        ...(context ? { context } : {}),
+      };
+    },
+    async setModel(provider: string, id: string, thinking?: string) {
+      if (disposed) {
+        return { ok: false, error: "the child session is disposed" };
+      }
+      return switchRawChildModel(s, provider, id, thinking);
     },
     dispose() {
       if (disposed) return;

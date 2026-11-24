@@ -12,6 +12,14 @@
 
 import type { Contribution } from "./host-contributions.ts";
 import type { WorkflowMode } from "./workflow-mode.ts";
+import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
+import {
+  formatChildModel,
+  formatChildTokens,
+  formatContextUsage,
+  formatElapsed,
+  modelRefFromLabel,
+} from "./child-stats.ts";
 import {
   COMPOSER_CONTROL_KIND,
   COMPOSER_CONTROL_SLOT,
@@ -67,6 +75,10 @@ export interface WorkflowContributionInput {
       total: number;
       phase: string;
       model?: string;
+      modelRef?: ChildModelRef;
+      stats?: ChildRuntimeStats;
+      thinking?: string;
+      elapsedMs?: number;
       todoDone?: number;
       todoTotal?: number;
     };
@@ -393,15 +405,33 @@ export function buildWorkflowContributions(
       order: 41,
     });
     if (child) {
-      const todos =
-        typeof child.todoTotal === "number" && child.todoTotal > 0
-          ? ` · ${child.todoDone ?? 0}/${child.todoTotal} todos`
-          : "";
+      // Same truth as the footer, but this row keeps its historical
+      // `child N/M · phase · model · …` shape so older hosts keep parsing it;
+      // the stats are appended, never substituted.
+      const view = run.view ?? "auto";
+      const showDetails = view === "child" || view === "auto";
+      const model =
+        child.modelRef ??
+        (child.model ? modelRefFromLabel(child.model) : undefined);
+      const bits = [`child ${child.ref}/${child.total}`, child.phase];
+      const modelText = formatChildModel(model);
+      if (modelText) bits.push(modelText);
+      if (showDetails) {
+        const context = formatContextUsage(child.stats?.context, { long: true });
+        if (context) bits.push(context);
+        const tokens = formatChildTokens(child.stats?.tokens);
+        if (tokens) bits.push(tokens);
+        const elapsed = formatElapsed(child.elapsedMs);
+        if (elapsed) bits.push(elapsed);
+      }
+      if (typeof child.todoTotal === "number" && child.todoTotal > 0) {
+        bits.push(`${child.todoDone ?? 0}/${child.todoTotal} todos`);
+      }
       out.push({
         id: "orchestrator-child",
         kind: "status",
         slot: "status",
-        text: `child ${child.ref}/${child.total} · ${child.phase}${child.model ? ` · ${child.model}` : ""}${todos}`,
+        text: bits.join(" · "),
         tone: child.phase === "paused" ? "warning" : "accent",
         order: 42,
       });

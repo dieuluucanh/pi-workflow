@@ -140,6 +140,62 @@ export function tmpProject(): { root: string; cwd: string; agentDir: string } {
   return { root, cwd, agentDir };
 }
 
+/**
+ * Write a v1 `profiles.json` into a test agent dir (or a project `.pi`).
+ *
+ * Profile activation is session-scoped and file-backed, so a test that switches
+ * profiles needs a real file: `ensureProfilesConfig` reads (and fingerprints)
+ * it instead of the empty default config.
+ */
+export function writeProfilesJson(
+  dir: string,
+  profiles: Array<{
+    name: string;
+    roles?: Record<
+      string,
+      { provider: string; id: string; thinking?: string }
+    >;
+    defaultModel?: { provider: string; id: string; thinking?: string };
+  }>,
+): string {
+  const file = path.join(dir, "profiles.json");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        version: 1,
+        profiles: profiles.map((profile) => ({
+          name: profile.name,
+          description: "",
+          roles: profile.roles ?? {},
+          ...(profile.defaultModel
+            ? { defaultModel: profile.defaultModel }
+            : {}),
+        })),
+      },
+      null,
+      2,
+    ),
+  );
+  return file;
+}
+
+/** Parse `provider/id` (optionally `provider/id(thinking)`) into a model ref. */
+export function parseFakeModelLabel(label: string): {
+  provider: string;
+  id: string;
+  thinking?: string;
+} {
+  const match = /^([^/]+)\/(.+?)(?:\((\w+)\))?$/.exec(label.trim());
+  if (!match) return { provider: "builder", id: label.trim() || "fake-model" };
+  return {
+    provider: match[1]!,
+    id: match[2]!,
+    ...(match[3] ? { thinking: match[3] } : {}),
+  };
+}
+
 export const HIGH_FINDING = {
   id: "F1",
   severity: 9,
@@ -173,6 +229,20 @@ export interface FakeCapture {
   subscribeCalls: number;
   /** Emit an arbitrary child-session event (provider-error scripts use this). */
   emit: (event: unknown) => void;
+  /**
+   * Model switches requested through the wrapped session's `setModel`.
+   * Records the provider/id/thinking the runtime asked for so a test can
+   * assert that a live switch happened without a restart.
+   */
+  setModelCalls: Array<{
+    provider: string;
+    id: string;
+    thinking?: string;
+  }>;
+  /** The model/thinking the fake session currently runs on. */
+  currentModel: { provider: string; id: string; thinking?: string } | undefined;
+  /** The modelRef `createAgentSession` was asked to run (launch model). */
+  createdWith: { provider: string; id: string; thinking?: string } | undefined;
 }
 
 /** Built-in tool names the SDK registers before the allowlist is applied. */
@@ -221,6 +291,10 @@ export function fakeSdk(script: {
    * provider request is created.
    */
   abortEnd?: { stopReason: "error" | "aborted"; errorMessage: string };
+  /** Throw from the child's `setModel` (auth/registry/model failure). */
+  setModelError?: unknown;
+  /** Return undefined from the child's `modelRuntime.getModel` (unknown model). */
+  registryModels?: boolean;
 }): { capture: FakeCapture; sdk: unknown } {
   const capture: FakeCapture = {
     prompts: [],
@@ -234,6 +308,9 @@ export function fakeSdk(script: {
     disposeCount: 0,
     subscribeCalls: 0,
     emit: () => {},
+    setModelCalls: [],
+    currentModel: undefined,
+    createdWith: undefined,
   };
   const sdk = {
     ModelRuntime: { create: async () => script.runtime ?? {} },
@@ -256,10 +333,26 @@ export function fakeSdk(script: {
     createAgentSession: async (opts: {
       tools?: string[];
       customTools?: Array<{ name: string }>;
+      model?: { provider: string; id: string; thinking?: string };
+      thinkingLevel?: string;
     }) => {
       if (script.shouldThrowOnCreate) throw new Error("session create failed");
       capture.createCalls += 1;
       capture.toolAllowlist = [...(opts.tools ?? [])];
+      // The launch model is what the runtime asked for; `currentModel` starts
+      // there and follows `setModel`, mirroring the real session's shape.
+      const launchModel = opts.model
+        ? {
+            provider: opts.model.provider,
+            id: opts.model.id,
+            ...((opts.model.thinking ?? opts.thinkingLevel)
+              ? { thinking: opts.model.thinking ?? opts.thinkingLevel }
+              : {}),
+          }
+        : undefined;
+      capture.createdWith = launchModel;
+      capture.currentModel = launchModel;
+      let thinkingLevel = opts.thinkingLevel ?? launchModel?.thinking ?? "off";
       for (const t of opts.customTools ?? []) {
         capture.tools[t.name] = t as never;
       }
@@ -293,6 +386,72 @@ export function fakeSdk(script: {
           get isStreaming() {
             return streaming;
           },
+          get model() {
+            return capture.currentModel
+              ? { ...capture.currentModel }
+              : undefined;
+          },
+          get thinkingLevel() {
+            return thinkingLevel;
+          },
+          // Mirrors the real AgentSession: resolve a registry model and
+          // switch it, never aborting or disposing the session.
+          modelRuntime: {
+            getModel: (provider: string, id: string) =>
+              script.registryModels === false
+                ? undefined
+                : { provider, id },
+          },
+          setModel: async (
+            model: { provider: string; id: string },
+            _options?: { persist?: boolean },
+          ) => {
+            if (script.setModelError !== undefined) {
+              throw script.setModelError instanceof Error
+                ? script.setModelError
+                : new Error(String(script.setModelError));
+            }
+            capture.setModelCalls.push({
+              provider: model.provider,
+              id: model.id,
+              ...(capture.currentModel?.thinking
+                ? { thinking: capture.currentModel.thinking }
+                : {}),
+            });
+            capture.currentModel = {
+              provider: model.provider,
+              id: model.id,
+              ...(capture.currentModel?.thinking
+                ? { thinking: capture.currentModel.thinking }
+                : {}),
+            };
+            emit({ type: "model_select", model, source: "set" });
+          },
+          setThinkingLevel: (level: string) => {
+            thinkingLevel = level;
+            if (capture.currentModel) {
+              capture.currentModel = { ...capture.currentModel, thinking: level };
+            }
+            // The wrapper applies thinking AFTER `setModel`; fold it into the
+            // recorded switch so a test sees the requested level.
+            const last = capture.setModelCalls.at(-1);
+            if (last) last.thinking = level;
+            emit({ type: "thinking_level_changed", level });
+          },
+          getSessionStats: () => ({
+            tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, total: 150 },
+            cost: 0,
+            contextUsage: {
+              tokens: 150,
+              contextWindow: 1000,
+              percent: 15,
+            },
+          }),
+          getContextUsage: () => ({
+            tokens: 150,
+            contextWindow: 1000,
+            percent: 15,
+          }),
           subscribe: (listener: (event: unknown) => void) => {
             capture.subscribeCalls += 1;
             capture.unsubscribeCount += 1;
@@ -850,6 +1009,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       },
       theme: {
         fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
         strikethrough: (text: string) => text,
       },
     },
@@ -934,6 +1094,7 @@ export function renderTodoWidget(
   }
   const component = (call.value as Function)({}, {
     fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
     strikethrough: (text: string) => text,
   });
   const rows = component?.render?.(width);
@@ -965,10 +1126,32 @@ export interface FakeOrchestratorChildSession {
   promptCalls: number;
   /** How many `dispose()` calls the session received. */
   disposeCalls: number;
+  /** Model switches requested through `setModel` (live-switch assertions). */
+  setModelCalls: Array<{
+    provider: string;
+    id: string;
+    thinking?: string;
+  }>;
+  /** The child's actual model; follows `setModel`, else the launch label. */
+  currentModel(): { provider: string; id: string; thinking?: string } | undefined;
+  /** Switch the fake child's model without restarting it. */
+  setModel(
+    provider: string,
+    id: string,
+    thinking?: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Runtime stats the parent reads through the widened handle. */
+  stats(): {
+    model?: { provider: string; id: string; thinking?: string };
+    tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+    context?: { tokens: number | null; contextWindow: number; percent: number | null };
+  } | undefined;
 }
 
 export interface FakeOrchestratorChildOptions {
   modelLabel?: string;
+  /** Structured launch model (defaults parsed from `modelLabel`). */
+  modelRef?: { provider: string; id: string; thinking?: string };
   failCreate?: string;
   /** Emit a summary + settle as soon as the kickoff prompt arrives. */
   settleOnPrompt?: boolean;
@@ -980,6 +1163,15 @@ export interface FakeOrchestratorChildOptions {
   /** Todos mirrored from a workflow_todo tool result on settle. */
   todos?: Array<{ text: string; completed?: boolean }>;
   summary?: string;
+  /** Values the fake `stats()` reports (defaults are a small sample). */
+  stats?: {
+    tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+    context?: { tokens: number | null; contextWindow: number; percent: number | null };
+  };
+  /** Reject `setModel` with this value (switch-failure assertions). */
+  setModelError?: unknown;
+  /** Emit an assistant `message_end` with usage from `settle()`. */
+  usageOnSettle?: boolean;
 }
 
 export interface FakeOrchestratorChildFactory {
@@ -993,112 +1185,221 @@ export interface FakeOrchestratorChildFactory {
   created: FakeOrchestratorChildSession[];
   /** How many factory (child create) attempts were served. */
   startCount: number;
+  /** The `modelRef` each factory call was asked to launch with. */
+  modelRefs: Array<{ provider: string; id: string; thinking?: string }>;
+}
+
+/** Emit the settle sequence (usage → todos → summary → settled). */
+function emitFakeSettle(
+  options: FakeOrchestratorChildOptions,
+  emit: (event: unknown) => void,
+  summary: string | undefined,
+): void {
+  if (options.usageOnSettle === true) {
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: summary ?? options.summary ?? "done" }],
+        usage: {
+          input: options.stats?.tokens?.input ?? 120,
+          output: options.stats?.tokens?.output ?? 40,
+          cacheRead: 0,
+          cacheWrite: 0,
+        },
+      },
+    });
+  }
+  if (options.todos && options.todos.length > 0) {
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "c2",
+      toolName: "workflow_todo",
+      result: {
+        details: {
+          todos: options.todos.map((todo, index) => ({
+            step: index + 1,
+            text: todo.text,
+            status: todo.completed ? "completed" : "pending",
+            completed: todo.completed === true,
+          })),
+        },
+      },
+    });
+  }
+  emit({
+    type: "agent_end",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: summary ?? options.summary ?? "child finished the row",
+          },
+        ],
+      },
+    ],
+  });
+  emit({ type: "agent_settled" });
+}
+
+/** The fake child's runtime stats, with the same shape the real handle reports. */
+function buildFakeChildStats(
+  options: FakeOrchestratorChildOptions,
+  current: { provider: string; id: string; thinking?: string },
+) {
+  return {
+    model: { ...current },
+    tokens: {
+      input: options.stats?.tokens?.input ?? 100,
+      output: options.stats?.tokens?.output ?? 50,
+      cacheRead: options.stats?.tokens?.cacheRead ?? 0,
+      cacheWrite: options.stats?.tokens?.cacheWrite ?? 0,
+      total: options.stats?.tokens?.total ?? 150,
+    },
+    context: options.stats?.context ?? {
+      tokens: 150,
+      contextWindow: 1000,
+      percent: 15,
+    },
+  };
+}
+
+/**
+ * Build one fake child session. Extracted from the factory so the factory
+ * itself stays a thin creation/capture shim (and readable).
+ */
+function buildFakeOrchestratorSession(
+  options: FakeOrchestratorChildOptions,
+  input: {
+    context: { taskId: string; attemptId: string };
+    sessionId?: string;
+    modelRef?: { provider: string; id: string; thinking?: string };
+  },
+): { session: FakeOrchestratorChildSession; modelLabel: string } {
+  const listeners: Array<(event: unknown) => void> = [];
+  let streaming = false;
+  let disposed = false;
+  const launchModel =
+    options.modelRef ??
+    (input.modelRef
+      ? { ...input.modelRef }
+      : parseFakeModelLabel(options.modelLabel ?? "builder/fake-model"));
+  const modelLabel =
+    options.modelLabel ?? `${launchModel.provider}/${launchModel.id}`;
+  let current = { ...launchModel };
+  const emit = (event: unknown): void => {
+    if (disposed) return;
+    for (const listener of [...listeners]) listener(event);
+  };
+  const session: FakeOrchestratorChildSession = {
+    sessionId: input.sessionId ?? "fake-session",
+    modelLabel,
+    subscribe(listener) {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    async prompt(text) {
+      if (disposed) return;
+      session.promptCalls += 1;
+      if (options.onPrompt) await options.onPrompt(text, session);
+      streaming = true;
+      emit({
+        type: "tool_execution_start",
+        toolCallId: "c1",
+        toolName: "read",
+        args: { path: "README.md" },
+      });
+      emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "read" });
+      if (options.settleOnPrompt === true) {
+        streaming = false;
+        session.settle();
+      }
+    },
+    async followUp(text) {
+      await session.prompt(text);
+    },
+    async abort() {
+      streaming = false;
+    },
+    isStreaming() {
+      return streaming;
+    },
+    dispose() {
+      session.disposeCalls += 1;
+      disposed = true;
+      streaming = false;
+      listeners.length = 0;
+    },
+    emit,
+    settle(summary) {
+      streaming = false;
+      emitFakeSettle(options, emit, summary);
+    },
+    settleOnPrompt: options.settleOnPrompt === true,
+    promptCalls: 0,
+    disposeCalls: 0,
+    setModelCalls: [],
+    currentModel: () => ({ ...current }),
+    async setModel(provider, id, thinking) {
+      if (options.setModelError !== undefined) {
+        return {
+          ok: false,
+          error:
+            options.setModelError instanceof Error
+              ? options.setModelError.message
+              : String(options.setModelError),
+        };
+      }
+      session.setModelCalls.push({
+        provider,
+        id,
+        ...(thinking ? { thinking } : {}),
+      });
+      const nextThinking = thinking ?? current.thinking;
+      current = {
+        provider,
+        id,
+        ...(nextThinking ? { thinking: nextThinking } : {}),
+      };
+      return { ok: true };
+    },
+    stats() {
+      return buildFakeChildStats(options, current);
+    },
+  };
+  return { session, modelLabel };
 }
 
 export function makeFakeOrchestratorChildFactory(
   options: FakeOrchestratorChildOptions = {},
 ): FakeOrchestratorChildFactory {
   const created: FakeOrchestratorChildSession[] = [];
+  const modelRefs: Array<{ provider: string; id: string; thinking?: string }> =
+    [];
   let startCount = 0;
   const factory: FakeOrchestratorChildFactory["factory"] = async (input) => {
     startCount += 1;
+    const requested = (
+      input as { modelRef?: { provider: string; id: string; thinking?: string } }
+    ).modelRef;
+    if (requested) modelRefs.push({ ...requested });
     if (options.failCreate) return { ok: false, error: options.failCreate };
-    const listeners: Array<(event: unknown) => void> = [];
-    let streaming = false;
-    let disposed = false;
-    const modelLabel = options.modelLabel ?? "builder/fake-model";
-    const emit = (event: unknown): void => {
-      if (disposed) return;
-      for (const listener of [...listeners]) listener(event);
-    };
-    const session: FakeOrchestratorChildSession = {
-      sessionId: input.sessionId ?? "fake-session",
-      modelLabel,
-      subscribe(listener) {
-        listeners.push(listener);
-        return () => {
-          const index = listeners.indexOf(listener);
-          if (index >= 0) listeners.splice(index, 1);
-        };
-      },
-      async prompt(text) {
-        if (disposed) return;
-        session.promptCalls += 1;
-        if (options.onPrompt) await options.onPrompt(text, session);
-        streaming = true;
-        emit({
-          type: "tool_execution_start",
-          toolCallId: "c1",
-          toolName: "read",
-          args: { path: "README.md" },
-        });
-        emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "read" });
-        if (options.settleOnPrompt === true) {
-          streaming = false;
-          session.settle();
-        }
-      },
-      async followUp(text) {
-        await session.prompt(text);
-      },
-      async abort() {
-        streaming = false;
-      },
-      isStreaming() {
-        return streaming;
-      },
-      dispose() {
-        session.disposeCalls += 1;
-        disposed = true;
-        streaming = false;
-        listeners.length = 0;
-      },
-      emit,
-      settle(summary) {
-        streaming = false;
-        if (options.todos && options.todos.length > 0) {
-          emit({
-            type: "tool_execution_end",
-            toolCallId: "c2",
-            toolName: "workflow_todo",
-            result: {
-              details: {
-                todos: options.todos.map((todo, index) => ({
-                  step: index + 1,
-                  text: todo.text,
-                  status: todo.completed ? "completed" : "pending",
-                  completed: todo.completed === true,
-                })),
-              },
-            },
-          });
-        }
-        emit({
-          type: "agent_end",
-          messages: [
-            {
-              role: "assistant",
-              content: [
-                {
-                  type: "text",
-                  text: summary ?? options.summary ?? "child finished the row",
-                },
-              ],
-            },
-          ],
-        });
-        emit({ type: "agent_settled" });
-      },
-      settleOnPrompt: options.settleOnPrompt === true,
-      promptCalls: 0,
-      disposeCalls: 0,
-    };
+    const { session, modelLabel } = buildFakeOrchestratorSession(options, {
+      ...input,
+      ...(requested ? { modelRef: requested } : {}),
+    });
     created.push(session);
     return { ok: true, child: session, modelLabel };
   };
   return {
     factory,
     created,
+    modelRefs,
     get startCount() {
       return startCount;
     },
