@@ -53,6 +53,31 @@ named platform/provider.
 The implementation is opt-in and experimental. Orchestrator mode is off by
 default; ordinary Plan → Review → Build is unchanged.
 
+## Status update (2026-11-24, step 33 parity)
+
+**Automated (run and green, not live acceptance):** workflow
+`orchestrator-parity.test.ts` pins the Builder model/source bootstrap
+(role vs session fallback, no borrowed thinking level), the exact child tool
+allowlist (never `orchestrator_*` or `questionnaire`), duplicate-launch
+refusal, stale/superseded launch disposal, honest host/provider failure
+without a settle, pause/resume/abort settling once, and the display-only child
+visibility projection. Desktop
+`tests/host/workflow-artifact-parity.test.ts` loads the **real staged
+`@dieulc/workflow` bundle** and proves Orchestrator mode entry/status dispatch
+nothing, an Orchestrator start without an approved plan refuses, the child
+controls are inert without a live child, the parent `edit`/`write` tool-call is
+blocked, and `/prompt` shows usage while calling zero orchestrator commands and
+emitting zero `session-host:request` messages.
+
+**Contract note:** the parent-only commit ledger described by older text is
+superseded. The parent cannot edit/write; the row's in-process Build child
+follows the normal Build commit policy with the user-owned approval surface.
+
+**Live (NOT RUN):** no real provider/model turn, visible terminal child,
+separate window/pane, real `/reload` or real parent/host kill was executed for
+this step. Every manual row below remains **NOT RUN**; a fake-provider fixture
+pass is not a substitute.
+
 ## Status update (2026-11-22)
 
 **Automated (run and green):** workflow `npm run typecheck`, the full workflow

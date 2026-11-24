@@ -1,0 +1,31 @@
+{
+  "ctxMode": "tui",
+  "custom": "function",
+  "ctxKeys": [
+    "ui",
+    "mode",
+    "hasUI",
+    "cwd",
+    "sessionManager",
+    "modelRegistry",
+    "model",
+    "scopedModels",
+    "thinkingLevel",
+    "isIdle",
+    "isProjectTrusted",
+    "signal",
+    "abort",
+    "hasPendingMessages",
+    "shutdown",
+    "getContextUsage",
+    "compact",
+    "getSystemPrompt",
+    "getSystemPromptOptions",
+    "waitForIdle",
+    "newSession",
+    "fork",
+    "navigateTree",
+    "switchSession",
+    "reload"
+  ]
+}

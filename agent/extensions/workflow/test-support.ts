@@ -10,9 +10,11 @@
  * whole review round runs without a provider or network.
  */
 
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 // ── Plan fixtures ────────────────────────────────────────────────────
 
@@ -230,6 +232,9 @@ export function fakeSdk(script: {
       async reload() {}
     },
     SessionManager: { inMemory: () => ({}) },
+    // Isolated sessions require in-memory settings; the fake mirrors the real
+    // SDK surface so `createIsolatedSession`'s preflight passes.
+    SettingsManager: { inMemory: () => ({}) },
     createBashToolDefinition: () => ({
       parameters: {},
       execute: async () => ({
@@ -470,8 +475,16 @@ export interface FakePi {
   setModel(model: unknown): void;
   sendMessage(content: unknown, options?: unknown): void;
   sendUserMessage(content: unknown, options?: unknown): void;
+  exec(
+    command: string,
+    args?: string[],
+    options?: { cwd?: string; signal?: AbortSignal },
+  ): Promise<{ stdout: string; stderr: string; code: number }>;
   events: {
-    on(event: string, handler: (payload: unknown) => unknown): void;
+    on(
+      event: string,
+      handler: (payload: unknown) => unknown,
+    ): () => void;
     emit(event: string, payload?: unknown): void;
     listenerCount(event?: string): number;
   };
@@ -544,11 +557,37 @@ export function makeFakePi(over: { activeTools?: string[] } = {}): FakePi {
       sent.push({ content, options });
       timeline.push({ kind: "send", content });
     },
+    // Checkpoints, `/rewind` and `/commit` shell out to git through `pi.exec`.
+    // Run it for real so a temp repo/empty dir behaves like the host does
+    // (a missing repo must fail closed, not report a fabricated success).
+    exec(command, args = [], options) {
+      return promisify(execFile)(command, args, {
+        maxBuffer: 4 * 1024 * 1024,
+        ...(options?.cwd ? { cwd: options.cwd } : {}),
+        ...(options?.signal ? { signal: options.signal } : {}),
+      })
+        .then(({ stdout, stderr }) => ({ stdout, stderr, code: 0 }))
+        .catch((error: { stdout?: string; stderr?: string; code?: number | string }) => ({
+          stdout: String(error?.stdout ?? ""),
+          stderr: String(error?.stderr ?? ""),
+          code: typeof error?.code === "number" ? error.code : 1,
+        }));
+    },
     events: {
       on(event, handler) {
         const list = busHandlers.get(event) ?? [];
         list.push(handler);
         busHandlers.set(event, list);
+        // Mirror the SDK EventBus: `on` returns the unsubscribe for the
+        // handler, so an extension can own its listener lifetime.
+        return () => {
+          const live = busHandlers.get(event);
+          if (!live) return;
+          const index = live.indexOf(handler);
+          if (index === -1) return;
+          live.splice(index, 1);
+          if (live.length === 0) busHandlers.delete(event);
+        };
       },
       emit(event, payload) {
         for (const handler of busHandlers.get(event) ?? []) {
@@ -697,6 +736,8 @@ export interface FakeCtxOptions {
 
 export function makeFakeCtx(over: FakeCtxOptions) {
   const notifies: Array<{ message: string; level?: string }> = [];
+  /** `ctx.navigateTree` calls (rewind moves the conversation branch). */
+  const navigations: Array<{ id: string; options?: unknown }> = [];
   const statuses: unknown[] = [];
   const statusCalls: Array<{ key: string; value: unknown }> = [];
   const widgets: unknown[] = [];
@@ -732,6 +773,10 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     sessionManager: {
       getBranch: () => over.branch ?? [],
       buildContextEntries: () => over.branch ?? [],
+      getLeafEntry: () => (over.branch ?? []).at(-1),
+    },
+    async navigateTree(id: string, options?: unknown) {
+      navigations.push({ id, options });
     },
     ui: {
       async select(title: string, options: unknown[]) {
@@ -803,6 +848,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     confirms,
     selects,
     customs,
+    navigations,
   };
 }
 

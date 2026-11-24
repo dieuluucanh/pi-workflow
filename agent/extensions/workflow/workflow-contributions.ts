@@ -12,6 +12,14 @@
 
 import type { Contribution } from "./host-contributions.ts";
 import type { WorkflowMode } from "./workflow-mode.ts";
+import {
+  COMPOSER_CONTROL_KIND,
+  COMPOSER_CONTROL_SLOT,
+  COMPOSER_TRANSFORM_CONTRACT,
+  type ComposerControlContribution,
+  type ComposerControlIcon,
+  type ComposerControlTone,
+} from "./composer-transform.ts";
 
 export const WORKFLOW_OWNER_ID = "@dieulc/workflow";
 
@@ -65,6 +73,96 @@ export interface WorkflowContributionInput {
     /** Which TODO panel the pinned widget shows; display-only. */
     view?: "auto" | "parent" | "child";
   };
+  /**
+   * Composer-transform publication state. `undefined` means the host did not
+   * negotiate `composer-transform-v1`, so no composer-control is published and
+   * the existing status/action fallback plus `/prompt` remain the surface.
+   */
+  composer?: WorkflowComposerInput;
+}
+
+/**
+ * Everything Workflow publishes for the generic composer control. The host
+ * resolves `actionRef`/`transformActionRef` from the current registry; this
+ * mapper never hard-codes a host or Desktop-specific consumer.
+ */
+export interface WorkflowComposerInput {
+  controlId: string;
+  toggleActionId: string;
+  transformActionId: string;
+  label: string;
+  description?: string;
+  icon?: ComposerControlIcon;
+  tone?: ComposerControlTone;
+  order?: number;
+  checked: boolean;
+  enabled: boolean;
+  disabledReason?: string;
+  publicCommand: string;
+  companionCommand: string;
+  /** Same-owner action command names resolved by the host. */
+  toggleCommand: string;
+  transformCommand: string;
+}
+
+/**
+ * Publishes the generic `composer-control`, plus the two same-owner actions its
+ * references resolve to. The transform action invokes the public input command
+ * with no args: operation transport never rides on contribution args.
+ */
+export function buildWorkflowComposerContributions(
+  input: WorkflowComposerInput,
+): Contribution[] {
+  const enabled = input.enabled !== false;
+  const reason = input.disabledReason;
+  const control: ComposerControlContribution = {
+    id: input.controlId,
+    kind: COMPOSER_CONTROL_KIND,
+    slot: COMPOSER_CONTROL_SLOT,
+    tone: input.tone ?? "accent",
+    order: input.order ?? 14,
+    label: input.label,
+    ...(input.description === undefined ? {} : { description: input.description }),
+    ...(input.icon === undefined ? {} : { icon: input.icon }),
+    checked: input.checked === true,
+    enabled,
+    ...(enabled || reason === undefined ? {} : { disabledReason: reason }),
+    behavior: "one-shot-return",
+    actionRef: input.toggleActionId,
+    transformActionRef: input.transformActionId,
+    operation: {
+      contract: COMPOSER_TRANSFORM_CONTRACT,
+      publicCommand: input.publicCommand,
+      companionCommand: input.companionCommand,
+    },
+  };
+  return [
+    {
+      id: input.toggleActionId,
+      kind: "action",
+      slot: "action",
+      label: input.checked ? "Refinement armed" : "Refine prompt",
+      tone: input.checked ? "accent" : "neutral",
+      order: 13,
+      command: { name: input.toggleCommand },
+      enabled,
+      ...(enabled || reason === undefined ? {} : { disabledReason: reason }),
+    },
+    {
+      id: input.transformActionId,
+      kind: "action",
+      slot: "action",
+      label: "Refine prompt",
+      tone: "accent",
+      order: 14,
+      // No args: the host routes structured input through its typed
+      // `composer.transform` method, never through a command string.
+      command: { name: input.transformCommand },
+      enabled,
+      ...(enabled || reason === undefined ? {} : { disabledReason: reason }),
+    },
+    control,
+  ];
 }
 
 /** Human-readable panel state for the generic progress detail (display only). */
@@ -392,6 +490,11 @@ export function buildWorkflowContributions(
       tone: "neutral",
       order: 40,
     });
+  }
+
+  // Composer control is additive and only appears after a v1 negotiation.
+  if (input.composer) {
+    out.push(...buildWorkflowComposerContributions(input.composer));
   }
 
   return out;

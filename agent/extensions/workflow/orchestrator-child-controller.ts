@@ -434,7 +434,17 @@ export function createOrchestratorChildController(
           ref: input.ref,
           total: input.total,
         });
-        if (gen !== generation) return { ok: false, error: "superseded" };
+        if (gen !== generation) {
+          // A newer start/abort/dispose happened while the session was being
+          // created. Dispose the half-created child instead of leaking a live
+          // session nobody owns (stale launch, reload or host failure).
+          try {
+            created.child?.dispose();
+          } catch {
+            /* ignore */
+          }
+          return { ok: false, error: "superseded" };
+        }
         if (!created.ok || !created.child) {
           fail(created.error ?? "the child session could not be created");
           return { ok: false, error: created.error ?? "child creation failed" };

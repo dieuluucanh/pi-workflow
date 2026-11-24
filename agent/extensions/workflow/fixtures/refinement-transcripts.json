@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "contract": "composer-transform-v1",
+  "note": "Cross-host refinement transcript fixture. Terminal W and Desktop's actual staged W artifact both drive this exact file: the same fake-provider turns, inspection, questions, candidate and negative-execution expectations. It is compiler-agnostic data only: no imports, no host-specific fields. A contract change updates this file once and copies it verbatim to pi-desktop tests/shared/fixtures/refinement-transcripts.json (both suites pin the SHA-256 below).",
+  "digestNote": "The fixture digest is pinned by both test suites; changing any byte requires updating both copies and both constants.",
+  "cases": {
+    "inspectAskCandidate": {
+      "title": "inspect one real file, ask one relevant question, submit one candidate",
+      "draftText": "Pleae make the child-session lifecycle description clearer and keep /prompt-model inherit working.",
+      "draftExpandedText": "Pleae make the child-session lifecycle description clearer and keep /prompt-model inherit working.",
+      "model": {
+        "provider": "fixture",
+        "id": "refiner",
+        "thinking": "medium",
+        "label": "fixture/refiner"
+      },
+      "projectFiles": [
+        {
+          "path": "src/child-session.ts",
+          "text": "export function createChildSession(): ChildSession {\n  // child-session lifecycle: open -> running -> settled\n  return openChildSession();\n}\n"
+        }
+      ],
+      "inspection": [
+        {
+          "tool": "read",
+          "args": {
+            "path": "src/child-session.ts"
+          },
+          "expectContains": "createChildSession"
+        }
+      ],
+      "questions": [
+        {
+          "prompt": "Should the refined request keep this as a coding task?",
+          "header": "Scope",
+          "context": "The draft names a source symbol and a command.",
+          "options": [
+            {
+              "label": "Keep it a coding request",
+              "recommended": true
+            },
+            {
+              "label": "Rewrite it as prose only"
+            }
+          ],
+          "answer": "Keep it a coding request"
+        }
+      ],
+      "submission": {
+        "schemaVersion": 1,
+        "candidate": "# Objective\n\nClarify how the child-session lifecycle is described, and keep `/prompt-model inherit` behavior unchanged.\n\n## Requirements\n\n1. Preserve the existing public child-session behavior.\n2. Correct only unambiguous typos in the description.\n\n## Acceptance criteria\n\n- `/prompt-model inherit` still follows the Default-mode model.\n- No validation behavior changes.",
+        "changeSummary": [
+          "Fixed the unambiguous typo and grouped the request into Objective, Requirements and Acceptance criteria.",
+          "Kept the source command `/prompt-model inherit` literal."
+        ],
+        "suggestions": [],
+        "language": "en"
+      },
+      "expect": {
+        "modelLabel": "fixture/refiner",
+        "candidateText": "# Objective\n\nClarify how the child-session lifecycle is described, and keep `/prompt-model inherit` behavior unchanged.\n\n## Requirements\n\n1. Preserve the existing public child-session behavior.\n2. Correct only unambiguous typos in the description.\n\n## Acceptance criteria\n\n- `/prompt-model inherit` still follows the Default-mode model.\n- No validation behavior changes.",
+        "events": ["started", "provider-request", "inspection", "question", "answer", "candidate"],
+        "requiresEvents": ["started", "inspection", "question", "answer", "candidate"],
+        "usage": {
+          "providerRequests": 1,
+          "promptSends": 1,
+          "inspectionCalls": 1,
+          "questionRounds": 1,
+          "answersReceived": 1
+        },
+        "zeroUntilHumanSend": {
+          "parentProviderTurns": 0,
+          "taskWrites": 0,
+          "planFiles": 0,
+          "commitAuthorizations": 0,
+          "childLaunches": 0
+        },
+        "changeSummary": [
+          "Fixed the unambiguous typo and grouped the request into Objective, Requirements and Acceptance criteria.",
+          "Kept the source command `/prompt-model inherit` literal."
+        ]
+      }
+    },
+    "revokeAfterInspection": {
+      "title": "policy revocation after the inspection result, before the next provider turn",
+      "draftText": "Read the child-session source and rewrite this request.",
+      "model": {
+        "provider": "fixture",
+        "id": "refiner",
+        "thinking": "medium",
+        "label": "fixture/refiner"
+      },
+      "projectFiles": [
+        {
+          "path": "src/child-session.ts",
+          "text": "export function createChildSession() { return 'child-session'; }\n"
+        }
+      ],
+      "inspection": [
+        {
+          "tool": "read",
+          "args": {
+            "path": "src/child-session.ts"
+          },
+          "expectContains": "createChildSession"
+        }
+      ],
+      "questions": [
+        {
+          "prompt": "Should this stay a coding request?",
+          "header": "Scope",
+          "options": [
+            {
+              "label": "Keep it",
+              "recommended": true
+            }
+          ],
+          "answer": "Keep it"
+        }
+      ],
+      "expect": {
+        "invalidated": true,
+        "failureReason": "invalidated-policy-generation",
+        "candidateText": null,
+        "noFurtherProviderRequests": true,
+        "noFurtherInspectionResults": true,
+        "disclosuresWithheld": true,
+        "zeroUntilHumanSend": {
+          "parentProviderTurns": 0,
+          "taskWrites": 0,
+          "planFiles": 0,
+          "commitAuthorizations": 0,
+          "childLaunches": 0
+        }
+      }
+    },
+    "revokeWhileCandidatePending": {
+      "title": "policy revocation after a candidate reached the live binding but before apply",
+      "draftText": "Tighten this request and keep the identifiers literal.",
+      "model": {
+        "provider": "fixture",
+        "id": "refiner",
+        "thinking": "medium",
+        "label": "fixture/refiner"
+      },
+      "submission": {
+        "schemaVersion": 1,
+        "candidate": "# Objective\n\nTighten this request without renaming any identifier.",
+        "changeSummary": ["Grouped the request under a single objective."],
+        "suggestions": [],
+        "language": "en"
+      },
+      "expect": {
+        "candidateDelivered": true,
+        "invalidateReason": "read policy revoked while a candidate was pending",
+        "applyRefused": true,
+        "operationNeverApplies": true,
+        "disclosuresWithheld": true,
+        "zeroUntilHumanSend": {
+          "parentProviderTurns": 0,
+          "taskWrites": 0,
+          "planFiles": 0,
+          "commitAuthorizations": 0,
+          "childLaunches": 0
+        }
+      }
+    },
+    "duplicateReplay": {
+      "title": "duplicate companion claim and request-id replay cannot start a second runtime",
+      "requestId": "req-cross-host-0001",
+      "expect": {
+        "duplicateClaimRefused": true,
+        "requestIdReplayJoined": true,
+        "conflictingBodyRefused": "request-conflict",
+        "starts": 1
+      }
+    }
+  },
+  "secondExtension": {
+    "ownerId": "fixture.second-transform",
+    "controlId": "second-refine",
+    "toggleActionId": "second-refine-toggle",
+    "transformActionId": "second-refine-transform",
+    "label": "Second refine",
+    "description": "An unrelated transform publisher used only by conformance tests.",
+    "icon": "wand",
+    "companionCommand": "second-refine-companion",
+    "publicCommand": "second-refine",
+    "candidateText": "# Objective\n\nA second, unrelated transform candidate.",
+    "note": "This is a real registered command on the shared EventBus, not a mock structured-registration API."
+  },
+  "oldHostFallback": {
+    "reason": "host does not implement composer-transform-v1",
+    "textCommand": "prompt",
+    "nativeControl": false,
+    "attachmentAware": false
+  }
+}

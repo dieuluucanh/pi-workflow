@@ -24,6 +24,11 @@
           "provider": "opencode-go",
           "id": "deepseek-v4.1-flash",
           "thinking": "max"
+        },
+        "orchestrator": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "max"
         }
       },
       "defaultModel": {

@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes as nodeRandomBytes } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type {
@@ -93,9 +94,15 @@ import {
   gitCommitPolicyHit,
   permissionsArgumentCompletions,
   resolveSessionRole,
-  subagentEnv,
   type WorkflowRole,
 } from "./permissions.ts";
+import {
+  buildSubagentArgv,
+  composeSubagentEnv,
+  resolveSubagentLauncher,
+  resolveWorkflowPolicy,
+  terminateSubagent,
+} from "./subagent-launch.ts";
 import {
   COMMIT_AUTH_MAX_COMMITS,
   COMMIT_AUTH_TTL_MS,
@@ -265,6 +272,7 @@ import { createContributionPublisher } from "./host-contributions-publisher.ts";
 import {
   buildWorkflowContributions,
   WORKFLOW_OWNER_ID,
+  type WorkflowComposerInput,
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
 import { createOrchestratorRuntime, type OrchestratorRuntime } from "./orchestrator-runtime.ts";
@@ -327,6 +335,7 @@ import {
   formatOrchestratorChildStatus,
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
+import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
 import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
 import {
   applyExecutionEvent,
@@ -442,12 +451,59 @@ import {
   projectDefaultModel,
   readModelDefault,
   resolveDefaultModeModel,
+  sameModelRef,
   shouldApplyModelDefaultAtSessionStart,
-  shouldPersistModelSelect,
   shouldPersistThinkingSelect,
   writeModelDefault,
   type PersistedModelDefault,
 } from "./model-default.ts";
+import {
+  captureDefaultBaseline,
+  classifyModelSelectionEvent,
+  describeRefinementModel,
+  resolveDefaultModeModelAccessor,
+  resolveRefinementModel,
+  type DefaultModeModelSnapshot,
+  type RefinementModelResolution,
+} from "./default-mode-model.ts";
+import {
+  formatRefinementModelStatus,
+  formatRefinementOverride,
+  promptModelArgumentCompletions,
+  readRefinementModelConfig,
+  refinementOverrideOf,
+  validateRefinementModelChoice,
+  writeRefinementModelSetting,
+  type RefinementModelSetting,
+} from "./prompt-refinement-config.ts";
+import {
+  createPromptRefinementCommand,
+  refinementStage,
+  REFINEMENT_PROGRESS_WIDGET,
+  type PromptCommandHost,
+  type PromptRefinementCommand,
+  type RefinementEligibilityFacts,
+  type RefinementProgressPort,
+} from "./prompt-refinement-command.ts";
+import { prepareRefinementContext } from "./prompt-refinement-context.ts";
+import {
+  createComposerTransformAdapter,
+  defaultComposerTransformDescriptor,
+  type ComposerRefineContext,
+  type ComposerRefinementOutcome,
+  type ComposerTransformAdapter,
+} from "./composer-transform-adapter.ts";
+import {
+  createRefinementRuntime,
+  type RefinementRuntimeEvent,
+} from "./prompt-refinement-runtime.ts";
+import type {
+  RefinerAskOutcome,
+  RefinerQuestionInput,
+} from "./prompt-refinement-tools.ts";
+import { presentClarification } from "./clarification-presenter.ts";
+import { createInspectionAuthority } from "./inspection-policy.ts";
+import { createIsolatedSession } from "./isolated-session.ts";
 import {
   applySubmittedPlan,
   buildReviewerFallbacks,
@@ -648,12 +704,7 @@ export type ActiveSubagents = Set<
   import("node:child_process").ChildProcess
 >;
 
-/**
- * Child-extension teardown keyed by session id. `AgentSession.dispose()` never
- * emits `session_shutdown`, so the child instance registers its cleanup here
- * and the parent controller runs it after disposing the SDK session.
- */
-const orchestratorChildTeardowns = new Map<string, () => void>();
+
 
 async function runSingleAgent(
   cwd: string,
@@ -664,12 +715,56 @@ async function runSingleAgent(
   shellLimits: ShellLimits | undefined,
   shellQuarantined: boolean,
   activeSubagents: ActiveSubagents,
+  selfPath?: string,
 ): Promise<{ messages: any[]; stderr: string; exitCode: number; usage: any }> {
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+
+  // The child must be a real Pi CLI. In a host (Pi Desktop) `process.argv[1]` is
+  // a wrapper entry, so the host supplies the launcher explicitly; a descriptor
+  // that is present but unusable is a refusal, never a silent fallback.
+  const fieldExists = (target: string): boolean => {
+    try {
+      return fs.existsSync(target);
+    } catch (_e) {
+      void _e;
+      return false;
+    }
+  };
+  const launcher = resolveSubagentLauncher({
+    env: process.env,
+    platform: process.platform,
+    exists: fieldExists,
+    execPath: process.execPath,
+    argvEntry: process.argv[1],
+  });
+  if (!launcher.ok) {
+    return {
+      messages: [],
+      stderr: `subagent launcher: ${launcher.reason}`,
+      exitCode: 1,
+      usage,
+    };
+  }
+
+  // The child's bash gate comes from the Workflow extension loaded *there*. If
+  // the resolved policy cannot be located for a gated role, starting the child
+  // would admit bash without that gate — refuse instead.
+  const policy = resolveWorkflowPolicy({
+    env: process.env,
+    exists: fieldExists,
+    selfPath: selfPath ?? extensionSelfPath() ?? null,
+    role: agent.role,
+  });
+  if (!policy.ok) {
+    return { messages: [], stderr: policy.reason, exitCode: 1, usage };
+  }
+
   const tmpDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "pi-subagent-"),
   );
   const promptPath = path.join(tmpDir, `prompt-${agent.name}.md`);
-  if (agent.systemPrompt.trim()) {
+  const hasPrompt = agent.systemPrompt.trim().length > 0;
+  if (hasPrompt) {
     await withFileMutationQueue(promptPath, async () => {
       await fs.promises.writeFile(promptPath, agent.systemPrompt, {
         encoding: "utf-8",
@@ -677,76 +772,94 @@ async function runSingleAgent(
       });
     });
   }
-  // Actually pi --mode json -p --no-session ; ensure correct
-  const cleanArgs = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) cleanArgs.push("--model", agent.model);
-  if (agent.thinking) cleanArgs.push("--thinking", agent.thinking);
-  if (agent.tools?.length) cleanArgs.push("--tools", agent.tools.join(","));
-  if (agent.systemPrompt.trim())
-    cleanArgs.push("--append-system-prompt", promptPath);
-  cleanArgs.push(`Task: ${task}`);
 
-  // Resolve pi invocation
-  const piCmd =
-    process.argv[1] &&
-    fs.existsSync(process.argv[1]) &&
-    !process.argv[1].startsWith("/$bunfs/")
-      ? process.execPath
-      : "pi";
-  return new Promise((resolve) => {
-    // Carry the parent's effective shell deadlines into the child. The child's
-    // workflow extension re-reads its own settings, then applies these as an
-    // upper bound, so a project-level setting in the child cannot widen them.
-    let inheritedShellLimits: string | undefined;
-    try {
-      if (shellLimits) inheritedShellLimits = encodeShellLimitsEnv(shellLimits);
-    } catch (_e) {
-      void _e;
+  // Every value is its own argv entry: a path with spaces, a model id or a task
+  // full of shell metacharacters can never become part of a command line.
+  const built = buildSubagentArgv({
+    agent: {
+      name: agent.name,
+      model: agent.model,
+      thinking: agent.thinking,
+      tools: agent.tools,
+    },
+    promptPath: hasPrompt ? promptPath : null,
+    task,
+    policyArgs: policy.args,
+  });
+  if (!built.ok) {
+    fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    return { messages: [], stderr: built.reason, exitCode: 1, usage };
+  }
+
+  // Carry the parent's effective shell deadlines into the child. The child's
+  // workflow extension re-reads its own settings, then applies these as an
+  // upper bound, so a project-level setting in the child cannot widen them.
+  const shellEnv: Record<string, string> = {};
+  try {
+    if (shellLimits) {
+      shellEnv[SHELL_GUARD_LIMITS_ENV] = encodeShellLimitsEnv(shellLimits);
     }
+  } catch (_e) {
+    void _e;
+  }
+  if (shellQuarantined) shellEnv[SHELL_GUARD_QUARANTINE_ENV] = "1";
+
+  const childEnv = composeSubagentEnv({
+    baseEnv: process.env,
+    role: agent.role,
+    roleEnvName: WORKFLOW_ROLE_ENV,
+    // Lock the folder roots so the child cannot expand its scope through a
+    // sibling project's settings.
+    folderEnv: folderEnv ?? {
+      PI_FOLDER_POLICY_LOCKED: "1",
+      PI_FOLDER_POLICY_ROOTS: JSON.stringify([detectRepoRoot(cwd) ?? cwd]),
+      PI_FOLDER_POLICY_SOURCE: "parent",
+    },
+    shellEnv,
+  });
+
+  return new Promise((resolve) => {
     const proc = spawn(
-      piCmd,
-      piCmd === "pi" ? cleanArgs : [process.argv[1], ...cleanArgs],
+      launcher.launcher.command,
+      [...launcher.launcher.prefix, ...built.args],
       {
-        cwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Carry the role into the child so its workflow extension gates bash
-        // with the same policy the parent applies (see permissions.ts), and
-        // lock the folder roots so the child cannot expand via a sibling
-        // project's settings.
-        env: {
-          ...subagentEnv(process.env, agent.role),
-          ...(inheritedShellLimits
-            ? { [SHELL_GUARD_LIMITS_ENV]: inheritedShellLimits }
-            : {}),
-          ...(shellQuarantined
-            ? { [SHELL_GUARD_QUARANTINE_ENV]: "1" }
-            : {}),
-          ...(folderEnv ?? {
-            PI_FOLDER_POLICY_LOCKED: "1",
-            PI_FOLDER_POLICY_ROOTS: JSON.stringify([
-              detectRepoRoot(cwd) ?? cwd,
-            ]),
-            PI_FOLDER_POLICY_SOURCE: "parent",
-          }),
-        },
-      },
-    );
+      cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
+      windowsHide: true,
+    });
     // Track for cleanup on session_shutdown — prevents orphaned subagents
     // if pi crashes while explore is running (up to 4 concurrent).
     activeSubagents.add(proc);
     let buffer = "";
     const messages: any[] = [];
     let stderr = "";
-    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
 
-    const onAbort = () => {
-      try {
-        proc.kill("SIGTERM");
-      } catch (_e) {
-        void _e;
+    const stop = (escalate: boolean): void => {
+      // Windows: taskkill /T so bash children die too. POSIX: SIGTERM now and a
+      // bounded SIGKILL if the CLI ignores it.
+      terminateSubagent(proc.pid, {
+        platform: process.platform,
+        kill: (pid, sig) => process.kill(pid, sig),
+        spawn: (cmd, args, options) => spawn(cmd, [...args], options),
+      });
+      if (escalate && process.platform !== "win32") {
+        killTimer = setTimeout(() => {
+          if (settled) return;
+          try {
+            proc.kill("SIGKILL");
+          } catch (_e) {
+            void _e;
+          }
+        }, 5000);
+        killTimer.unref?.();
       }
     };
+
+    const onAbort = (): void => stop(true);
     if (signal) {
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
@@ -780,6 +893,8 @@ async function runSingleAgent(
       stderr += d.toString();
     });
     proc.on("close", (code) => {
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
       activeSubagents.delete(proc);
       if (signal) signal.removeEventListener("abort", onAbort);
       // cleanup tmp
@@ -787,10 +902,29 @@ async function runSingleAgent(
       resolve({ messages, stderr, exitCode: code ?? 0, usage });
     });
     proc.on("error", (err) => {
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
       activeSubagents.delete(proc);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       resolve({ messages, stderr: stderr + String(err), exitCode: 1, usage });
     });
   });
+}
+
+/**
+ * This extension's own file, the policy the child CLI must load.
+ *
+ * A bundled/virtual path is not a runnable file; the caller passes the path the
+ * host resolved in that case (`PI_SUBAGENT_WORKFLOW_EXTENSION`).
+ */
+function extensionSelfPath(): string | undefined {
+  try {
+    return fileURLToPath(import.meta.url);
+  } catch (_e) {
+    void _e;
+    return undefined;
+  }
 }
 
 function getFinalOutput(messages: any[]): string {
@@ -971,6 +1105,31 @@ export default function workflowExtension(
   let defaultModel:
     | { provider: string; id: string; thinking?: string }
     | undefined;
+  /**
+   * Authoritative Default-mode model for this session, as resolved by the
+   * narrow accessor in `default-mode-model.ts`. Prompt refinement reads this
+   * (never the active role model); `defaultModel` above remains the model used
+   * for Default-mode restore, so the two stay behaviourally compatible.
+   */
+  let defaultModeSnapshot: DefaultModeModelSnapshot = {
+    model: undefined,
+    source: "none",
+    trust: "none",
+    authoritative: false,
+    refusedRoleModel: false,
+  };
+  /**
+   * Bounded in-memory audit of Pi's internal `restore` events. A restore is
+   * never persisted and never treated as a user selection; recording it (with
+   * whether it diverged from the recorded default) keeps that distinction
+   * diagnosable without writing a session entry on every resume.
+   */
+  const modelRestoreAudit: Array<{
+    provider?: string;
+    id?: string;
+    at: number;
+    diverged: boolean;
+  }> = [];
   let currentPlanFile: string | undefined;
   /** Last plan path written into a persisted `workflow` entry. */
   let lastPersistedPlanFile: string | undefined;
@@ -978,6 +1137,24 @@ export default function workflowExtension(
   let lastHandoffAt: number | undefined;
   let handoffInFlight: Promise<void> | null = null;
   let btwNotes: string[] = [];
+  /**
+   * Notes already delivered to the model as a live custom message. They stay
+   * out of `before_agent_start`'s queued injection so one `/btw` produces one
+   * transcript message and one model disclosure, not three.
+   */
+  const btwDelivered = new Set<string>();
+  /**
+   * Consume the notes that still need a model disclosure. A note delivered
+   * live by `/btw` is already a transcript message; re-injecting it here would
+   * duplicate it in the same turn. The set is scoped to one consumption so a
+   * later identical note is still delivered.
+   */
+  function takePendingBtwNotes(): string[] {
+    const pending = btwNotes.filter((note) => !btwDelivered.has(note));
+    btwNotes = [];
+    btwDelivered.clear();
+    return pending;
+  }
 
   // ── Plannotator bridge state ──────────────────────────────────
   /**
@@ -992,6 +1169,12 @@ export default function workflowExtension(
   let lastReviewId: string | null = null;
   let plannotatorListenersRegistered = false;
   let currentSessionCtx: ExtensionContext | null = null;
+  /**
+   * Per-instance detach for the external `pi-code:plan-mode` bridge. It is set
+   * on session_start and cleared on session_shutdown, so a losing built-in
+   * factory call leaves zero listeners and a reload cannot stack duplicates.
+   */
+  let detachExternalPlanModeBridge: (() => void) | undefined;
 
   // ── Shell hang guard (2026-11-20 incident) ────────────────────────
   // One request-scoped runtime. The limits are re-read per call so a
@@ -2817,6 +3000,7 @@ export default function workflowExtension(
         executionState?.shellQuarantine !== undefined ||
           shellGuardRuntime?.isStopped() === true,
         activeSubagents,
+        extensionSelfPath(),
       );
       const out = getFinalOutput(res.messages);
       if (!out && res.exitCode !== 0) {
@@ -4266,6 +4450,879 @@ export default function workflowExtension(
       handoffArgumentCompletions(prefix),
   });
 
+  // ── /prompt-model: scoped refinement-model setting ──────────────────
+  // Independent of the main session model: it only writes/workflow
+  // `workflow.promptRefinement.model`. The refinement runtime consumes it via
+  // resolveRefinementModelForSession.
+  const promptModelRefLabels = (): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    try {
+      const reg = (currentSessionCtx as any)?.modelRegistry;
+      const models: any[] =
+        reg && typeof reg.getAvailable === "function"
+          ? [...reg.getAvailable()]
+          : reg && typeof reg.getAll === "function"
+            ? [...reg.getAll()]
+            : [];
+      for (const m of models) {
+        if (!m || typeof m.provider !== "string" || typeof m.id !== "string")
+          continue;
+        const key = `${m.provider}/${m.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(key);
+        if (out.length >= 200) break;
+      }
+    } catch (_e) {
+      void _e;
+    }
+    return out;
+  };
+
+  pi.registerCommand("prompt-model", {
+    description:
+      "View or set the prompt-refinement model (workflow.promptRefinement.model): /prompt-model [status] | set <provider/model> [thinking] [global|project] | inherit|reset [global|project]",
+    handler: async (args, ctx) => {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      const agentDir = getAgentDir();
+      const trusted = (ctx as any)?.isProjectTrusted?.() === true;
+      const tokens = String(args || "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const sub = (tokens[0] || "status").toLowerCase();
+      const read = () => readRefinementModelConfig(cwd, agentDir, { trusted });
+      const usage = [
+        "Usage: /prompt-model [status] | set <provider/model> [thinking] [global|project] | inherit [global|project] | reset [global|project]",
+        "  status   effective model, thinking, source, inheritance and shadowing",
+        "  set      save a validated override (default scope: global)",
+        "  inherit  write an explicit inherit sentinel at that scope",
+        "  reset    remove only that scope (project reset reveals global)",
+      ].join("\n");
+
+      if (!tokens.length || sub === "status") {
+        const resolved = read();
+        let capabilityNote = "";
+        if (resolved.setting?.kind === "override") {
+          try {
+            const found = (ctx as any)?.modelRegistry?.find?.(
+              resolved.setting.model.provider,
+              resolved.setting.model.id,
+            );
+            if (found === undefined) {
+              capabilityNote =
+                "\n  capability: model not found in the current registry — refinement will refuse until it is available";
+            }
+          } catch (_e) {
+            void _e;
+          }
+        }
+        ctx.ui.notify(
+          formatRefinementModelStatus(resolved) + capabilityNote,
+          resolved.source === "invalid" ? "warning" : "info",
+        );
+        return;
+      }
+
+      if (sub !== "set" && sub !== "inherit" && sub !== "reset") {
+        ctx.ui.notify(usage, "info");
+        return;
+      }
+
+      // Scope is the last token. A model id cannot be exactly global/project in
+      // this command position, so removing it is unambiguous.
+      let scope: "global" | "project" = "global";
+      const last = (tokens[tokens.length - 1] || "").toLowerCase();
+      if (last === "global" || last === "project") {
+        scope = last;
+        tokens.pop();
+      }
+      if (scope === "project" && !trusted) {
+        ctx.ui.notify(
+          "Project refinement settings require a trusted project. Trust this project first, or use the global scope.",
+          "warning",
+        );
+        return;
+      }
+
+      if (sub === "set") {
+        const ref = tokens[1];
+        const thinkingRaw = tokens[2];
+        if (!ref || tokens.length > 3) {
+          ctx.ui.notify(usage, "info");
+          return;
+        }
+        const { provider, id } = parseModelRef(ref);
+        let model: unknown;
+        let registryAvailable = false;
+        try {
+          const reg = (ctx as any)?.modelRegistry;
+          if (reg && typeof reg.find === "function") {
+            registryAvailable = true;
+            model = reg.find(provider, id);
+          }
+        } catch (_e) {
+          void _e;
+        }
+        const choice = validateRefinementModelChoice({
+          ref,
+          thinking: thinkingRaw,
+          model,
+          registryAvailable,
+        });
+        if (!choice.ok) {
+          ctx.ui.notify(choice.error, "warning");
+          return;
+        }
+        const written = await writeRefinementModelSetting(
+          scope,
+          cwd,
+          agentDir,
+          { kind: "override", model: choice.model },
+        );
+        if (!written.ok) {
+          ctx.ui.notify(
+            `Could not write refinement model (${written.path}): ${written.error ?? "unknown error"}`,
+            "error",
+          );
+          return;
+        }
+        for (const warning of choice.warnings) {
+          ctx.ui.notify(warning, "warning");
+        }
+        ctx.ui.notify(
+          [
+            `Refinement model → ${formatRefinementOverride(choice.model)} (${scope}${written.changed ? "" : ", unchanged"})`,
+            `Settings: ${written.path}`,
+            formatRefinementModelStatus(read()),
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (tokens.length > 1) {
+        ctx.ui.notify(usage, "info");
+        return;
+      }
+
+      const value: RefinementModelSetting | null =
+        sub === "inherit" ? { kind: "inherit" } : null;
+      const written = await writeRefinementModelSetting(
+        scope,
+        cwd,
+        agentDir,
+        value,
+      );
+      if (!written.ok) {
+        ctx.ui.notify(
+          `Could not write refinement model (${written.path}): ${written.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+      const action =
+        sub === "inherit"
+          ? `Refinement model → explicit inherit at ${scope} scope`
+          : `Refinement model reset at ${scope} scope${written.changed ? "" : " (nothing to remove)"}`;
+      ctx.ui.notify(
+        [
+          action,
+          `Settings: ${written.path}`,
+          formatRefinementModelStatus(read()),
+        ].join("\n"),
+        "info",
+      );
+    },
+    getArgumentCompletions: (prefix: string) =>
+      promptModelArgumentCompletions(prefix, {
+        modelRefs: promptModelRefLabels(),
+      }),
+  });
+
+  // ── /prompt: refine the drafted request and return it to the composer ──
+  // The literal arguments ARE the draft. Success places one candidate in the
+  // editor and does not send/execute it, change modes, create plans/todos/
+  // checkpoints or invoke Review/handoff. One `/prompt` service per extension
+  // instance owns at most one operation, its AbortController and its progress
+  // surface. `index.ts` supplies only live ports (model, isolated session,
+  // authority, questions, editor); all policy lives in the command module.
+  let promptRefinement: PromptRefinementCommand | undefined;
+  /**
+   * Generic composer-transform adapter. Created lazily on the first host
+   * bootstrap/toggle so a terminal session that never negotiates v1 performs no
+   * I/O and registers no rendezvous listener before it starts.
+   */
+  let composerTransform: ComposerTransformAdapter | undefined;
+  let composerTransformCtx: any;
+  /** Incremented on every session/composer rebind; fences stale operations. */
+  let composerBindingGeneration = 0;
+  let composerBindingEpoch = 0;
+  /** Depth of native write/read/commit permission dialogs. */
+  let permissionPromptDepth = 0;
+
+  function refinementSessionId(ctx: unknown): string {
+    try {
+      const manager = (ctx as any)?.sessionManager;
+      const id =
+        typeof manager?.getSessionId === "function"
+          ? manager.getSessionId()
+          : undefined;
+      if (typeof id === "string" && id) return id;
+    } catch (_e) {
+      void _e;
+    }
+    return "workflow-session";
+  }
+
+  /** One non-nested terminal progress line; the questionnaire owns it next. */
+  function refinementProgress(ui: any): RefinementProgressPort {
+    let label = "Refining prompt…";
+    let live = false;
+    let closed = false;
+    const render = (): void => {
+      if (!live || closed) return;
+      setWorkflowWidget(ui, REFINEMENT_PROGRESS_WIDGET, [label]);
+    };
+    return {
+      start(next) {
+        if (closed) return;
+        live = true;
+        label = next;
+        render();
+      },
+      update(next) {
+        if (closed || !live) return;
+        label = next;
+        render();
+      },
+      suspend() {
+        setWorkflowWidget(ui, REFINEMENT_PROGRESS_WIDGET, []);
+      },
+      resume() {
+        render();
+      },
+      dispose() {
+        closed = true;
+        live = false;
+        setWorkflowWidget(ui, REFINEMENT_PROGRESS_WIDGET, []);
+      },
+    };
+  }
+
+  /** Every ownership fact is resolved live, immediately before starting. */
+  function refinementFacts(ctx: any): RefinementEligibilityFacts {
+    const idle = (() => {
+      try {
+        return typeof ctx?.isIdle === "function" ? ctx.isIdle() === true : true;
+      } catch (_e) {
+        void _e;
+        return true;
+      }
+    })();
+    const pending = (() => {
+      try {
+        return typeof ctx?.hasPendingMessages === "function"
+          ? ctx.hasPendingMessages() === true
+          : false;
+      } catch (_e) {
+        void _e;
+        return false;
+      }
+    })();
+    const reviewOwned = (() => {
+      try {
+        return (
+          reviewRoundInFlight() ||
+          reviewTurnOwns(reviewTurn) ||
+          reviewModeLockKindNow() !== undefined
+        );
+      } catch (_e) {
+        void _e;
+        return false;
+      }
+    })();
+    const childActive = (() => {
+      try {
+        const phase = orchestratorChild?.state().phase;
+        return (
+          phase === "starting" ||
+          phase === "running" ||
+          phase === "paused" ||
+          phase === "settling"
+        );
+      } catch (_e) {
+        void _e;
+        return false;
+      }
+    })();
+    return {
+      hasUi:
+        ctx?.hasUI === true &&
+        typeof ctx?.ui?.getEditorText === "function" &&
+        typeof ctx?.ui?.setEditorText === "function",
+      isIdle: idle,
+      hasPendingMessages: pending,
+      reviewOwned,
+      handoffOwned:
+        awaitingDecision ||
+        planHandoffPhase === "pending" ||
+        handoffInFlight !== null,
+      permissionPromptOpen: permissionPromptDepth > 0,
+      overlayDepth,
+      managedWorker:
+        inProcessChildContext !== undefined || childActive,
+      operationActive: promptRefinement?.activeOperationId() !== undefined,
+    };
+  }
+
+  /** Map the adapter's live state onto the generic publication input. */
+  function composerContributionInput(): WorkflowComposerInput | undefined {
+    if (!composerTransform) return undefined;
+    if (!composerTransform.supported()) return undefined;
+    const descriptor = composerTransform.descriptor();
+    const state = composerTransform.state();
+    const active = state.operationId !== undefined;
+    const enabled = state.enabled && !active;
+    const disabledReason = active
+      ? "a prompt refinement is already running"
+      : (state.disabledReason ?? "this host cannot run composer refinement");
+    return {
+      controlId: descriptor.controlId,
+      toggleActionId: descriptor.toggleActionId,
+      transformActionId: descriptor.transformActionId,
+      label: descriptor.label,
+      ...(descriptor.description === undefined
+        ? {}
+        : { description: descriptor.description }),
+      icon: descriptor.icon,
+      tone: descriptor.tone,
+      order: descriptor.order,
+      checked: state.checked,
+      enabled,
+      ...(enabled ? {} : { disabledReason }),
+      publicCommand: descriptor.publicCommand,
+      companionCommand: descriptor.companionCommand,
+      toggleCommand: descriptor.toggleCommand,
+      transformCommand: descriptor.publicCommand,
+    };
+  }
+
+  /**
+   * Runs the SAME refinement runtime as `/prompt`, but hands the candidate to
+   * the typed host port instead of the legacy editor. The capture composer is
+   * never the live editor, so a host-backed `/prompt` cannot double-write the
+   * draft through `setEditorText` and the host's apply receipt stays the only
+   * composer mutation.
+   */
+  async function runStructuredRefinement(
+    context: ComposerRefineContext,
+  ): Promise<ComposerRefinementOutcome> {
+    const ctx = composerTransformCtx;
+    const service = ensurePromptRefinement();
+    const baseline = context.request.snapshot.text;
+    let candidateText: string | undefined;
+    // One progress surface for the whole operation. The effective model comes
+    // from the runtime's `started` event (captured once per operation) and is
+    // repeated in every stage line so the host can show both without parsing a
+    // status glyph or reading the main session's model.
+    let effectiveModel = "the refinement model";
+    const progress = (update: { phase: string; label: string }): void => {
+      const message = `${effectiveModel} · ${update.label}`.slice(0, 180);
+      context.progress({ state: "running", phase: update.phase, message });
+    };
+    const host: PromptCommandHost = {
+      ctx,
+      // The port delivers the result, so the editor is not required here.
+      facts: { ...refinementFacts(ctx), hasUi: true },
+      composer: {
+        getText: () => baseline,
+        setText: (text) => {
+          candidateText = text;
+          return true;
+        },
+      },
+      progress: {
+        start: (label) => context.progress({ state: "running", phase: "refining", message: label }),
+        update: (label) =>
+          context.progress({ state: "running", phase: "refining", message: label }),
+        suspend: () => {},
+        resume: () => {},
+        dispose: () => {},
+      },
+      notify: () => {},
+      presentQuestions: async (questions, options) => {
+        // The questionnaire surface replaces the composer (Desktop mounts it in
+        // place of the Composer), so the operation's own progress reports the
+        // ownership change instead of leaving a stale "inspecting" line. After
+        // the answer the same surface resumes its previous state.
+        context.progress({
+          state: "awaiting-input",
+          phase: "question",
+          message: `${effectiveModel} · waiting for your answer`.slice(0, 180),
+        });
+        try {
+          return await presentRefinementQuestions(ctx, questions, options.signal);
+        } finally {
+          if (!options.signal.aborted) {
+            context.progress({
+              state: "running",
+              phase: "refining",
+              message: `${effectiveModel} · continuing after your answer`.slice(0, 180),
+            });
+          }
+        }
+      },
+      onEvent: (event) => {
+        if (event.type === "started" && event.message) effectiveModel = event.message;
+        const stage = refinementStage(event);
+        if (stage) progress(stage);
+      },
+    };
+    let result: Awaited<ReturnType<PromptRefinementCommand["run"]>>;
+    try {
+      result = await service.run(baseline, host);
+    } catch (error: unknown) {
+      return {
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: true,
+      };
+    }
+    if (result.status === "cancelled") {
+      return { status: "cancelled", message: result.message };
+    }
+    if (result.review && typeof result.review.candidateText === "string") {
+      return {
+        status: "candidate",
+        candidateText: result.review.candidateText,
+        candidateRevision: 1,
+        summary: result.review.changeHeadline,
+      };
+    }
+    if (result.status === "applied" && candidateText !== undefined) {
+      return { status: "candidate", candidateText, candidateRevision: 1 };
+    }
+    return {
+      status: "failed",
+      message: result.message,
+      retryable: result.status !== "refused",
+    };
+  }
+
+  /** Lazily create the composer-transform adapter for the live binding. */
+  function ensureComposerTransformAdapter(ctx: any): ComposerTransformAdapter {
+    composerTransformCtx = ctx;
+    if (composerTransform) return composerTransform;
+    composerTransform = createComposerTransformAdapter({
+      bus: (pi as any).events,
+      descriptor: defaultComposerTransformDescriptor(),
+      binding: () => ({
+        sessionId: refinementSessionId(composerTransformCtx),
+        epoch: composerBindingEpoch,
+        bindingId: refinementSessionId(composerTransformCtx),
+        hostGeneration: composerBindingGeneration,
+      }),
+      capabilities: () => contributionsPublisher?.capabilities()?.composerTransform,
+      randomBytes: (size) => new Uint8Array(nodeRandomBytes(size)),
+      refine: (context) => runStructuredRefinement(context),
+      onStateChange: () => publishContributions(),
+    });
+    return composerTransform;
+  }
+
+  /** Map the refiner's question shape onto the side-effect-free presenter. */
+  async function presentRefinementQuestions(
+    ctx: any,
+    questions: RefinerQuestionInput[],
+    signal: AbortSignal,
+  ): Promise<RefinerAskOutcome> {
+    const outcome = await presentClarification(
+      questions.map((question) => ({
+        ...(question.questionId ? { questionId: question.questionId } : {}),
+        prompt: question.prompt,
+        ...(question.header ? { header: question.header } : {}),
+        ...(question.context ? { context: question.context } : {}),
+        options: question.options.map((option) => ({
+          label: option.label,
+          ...(option.description ? { description: option.description } : {}),
+          ...(option.recommended ? { recommended: true } : {}),
+        })),
+      })),
+      {
+        host: ctx.ui,
+        surface: "terminal",
+        // The real Pi SDK keeps the run mode on the session context, not on
+        // `ctx.ui`; without it the presenter resolves the TUI as headless and
+        // silently returns "questions cannot be shown".
+        ...(typeof ctx?.mode === "string"
+          ? { mode: ctx.mode as "tui" | "rpc" | "json" | "print" }
+          : {}),
+        // `hasUI` lives on the session context in the real SDK; `ctx.ui`
+        // itself does not expose it.
+        ...(typeof ctx?.hasUI === "boolean" ? { hasUI: ctx.hasUI } : {}),
+        signal,
+        // The presenter brackets its own overlay; the extension keeps the
+        // counter so `/prompt` cannot start inside another modal.
+        acquireOverlay: () => {
+          overlayDepth += 1;
+        },
+        releaseOverlay: () => {
+          overlayDepth = Math.max(0, overlayDepth - 1);
+        },
+      },
+    );
+    switch (outcome.kind) {
+      case "finished":
+        return {
+          kind: "finished",
+          answers: outcome.answers.map((answer) => ({
+            ...(answer.questionId ? { questionId: answer.questionId } : {}),
+            prompt: answer.prompt,
+            ...(answer.header ? { header: answer.header } : {}),
+            answer: answer.answer,
+            ...(answer.wasCustom ? { wasCustom: true } : {}),
+          })),
+        };
+      case "skipped":
+        return { kind: "skipped", reason: outcome.reason };
+      case "cancelled":
+        return { kind: "cancelled", reason: outcome.reason };
+      case "unsupported":
+        return {
+          kind: "unsupported",
+          capability: outcome.capability,
+          reason: outcome.reason,
+        };
+      case "invalid":
+        return { kind: "invalid", reason: outcome.reason };
+      case "failed":
+        return { kind: "failed", reason: outcome.reason };
+    }
+  }
+
+  /** Lazily build the one `/prompt` service; registrations do no I/O. */
+  function ensurePromptRefinement(): PromptRefinementCommand {
+    if (promptRefinement) return promptRefinement;
+    promptRefinement = createPromptRefinementCommand({
+      sessionId: (ctx) => refinementSessionId(ctx),
+      now: () => Date.now(),
+      buildRuntime: async (request) => {
+        const ctx = request.host.ctx as any;
+        const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd();
+        const agentDir = getAgentDir();
+        const trusted = ctx?.isProjectTrusted?.() === true;
+        const sdk = deps.loadSdk
+          ? await deps.loadSdk()
+          : await import("@earendil-works/pi-coding-agent");
+
+        const authority = () => {
+          const liveCwd = typeof ctx?.cwd === "string" ? ctx.cwd : cwd;
+          const liveTrusted = ctx?.isProjectTrusted?.() === true;
+          return createInspectionAuthority(
+            liveCwd,
+            {
+              config: readFolderPolicyConfig(liveCwd, getAgentDir(), {
+                trusted: liveTrusted,
+              }).config,
+              grants: readReadPolicyConfig(liveCwd, getAgentDir(), {
+                trusted: liveTrusted,
+              }).config.allowedPaths,
+            },
+            liveTrusted,
+          );
+        };
+
+        return createRefinementRuntime({
+          operationId: request.operationId,
+          sessionId: request.sessionId,
+          ...(request.bindingId ? { bindingId: request.bindingId } : {}),
+          cwd,
+          input: { originalText: request.text, suggestionsAllowed: false },
+          authority,
+          // The Default-mode model (or a scoped override), never the active
+          // Plan/Build role model. `/prompt-model` is read per operation.
+          resolveModel: () => {
+            const resolved = resolveRefinementModelForSession();
+            if (!resolved.ok || !resolved.model) {
+              return { ok: false, reason: describeRefinementModel(resolved) };
+            }
+            const model = resolved.model;
+            let found: any;
+            try {
+              found = ctx?.modelRegistry?.find?.(model.provider, model.id);
+            } catch (_e) {
+              void _e;
+              found = undefined;
+            }
+            const input = Array.isArray(found?.input)
+              ? found.input.filter((value: unknown) => typeof value === "string")
+              : undefined;
+            return {
+              ok: true,
+              model: {
+                provider: model.provider,
+                id: model.id,
+                ...(model.thinking ? { thinking: model.thinking } : {}),
+                label: `${model.provider}/${model.id}`,
+                ...(input && input.length > 0
+                  ? { input, inputCapabilityKnown: true }
+                  : {}),
+              },
+            };
+          },
+          prepareContext: ({ policy, model }) => {
+            let branch: unknown = [];
+            try {
+              branch = ctx?.sessionManager?.getBranch?.() ?? [];
+            } catch (_e) {
+              void _e;
+            }
+            return prepareRefinementContext({
+              branch,
+              policy,
+              ...(model.input ? { modelInput: model.input } : {}),
+              ...(model.inputCapabilityKnown === true
+                ? { modelCapabilityKnown: true }
+                : {}),
+            });
+          },
+          createSession: async (sessionRequest) => {
+            const created = await createIsolatedSession({
+              cwd,
+              agentDir,
+              modelRef: {
+                provider: sessionRequest.model.provider,
+                id: sessionRequest.model.id,
+                ...(sessionRequest.model.thinking
+                  ? { thinking: sessionRequest.model.thinking }
+                  : {}),
+              },
+              findModel: (provider, id) => {
+                try {
+                  return ctx?.modelRegistry?.find?.(provider, id);
+                } catch (_e) {
+                  void _e;
+                  return undefined;
+                }
+              },
+              parentProviders: findParentProviderSurface(ctx),
+              systemPrompt: sessionRequest.systemPrompt,
+              context:
+                sessionRequest.contextText.length > 0
+                  ? [sessionRequest.contextText]
+                  : [],
+              tools: [...sessionRequest.toolNames],
+              customTools: [...sessionRequest.tools],
+              sessionIdPrefix: "refine",
+              label: "refinement session",
+              providerRetries: 0,
+              // No legacy env marker: refinement is identified by its own
+              // operation/session handles, never by process-global state.
+              loadSdk: async () => sdk,
+            });
+            if (!created.ok || !created.session) {
+              return {
+                ok: false,
+                error:
+                  created.error ??
+                  "the isolated refinement session could not be created",
+              };
+            }
+            return { ok: true, session: created.session };
+          },
+          ask: request.ask,
+          signal: request.signal,
+          onEvent: request.onEvent,
+          sdk,
+          log: (message, level) => {
+            try {
+              ctx?.ui?.notify?.(
+                message,
+                level === "error"
+                  ? "error"
+                  : level === "warning"
+                    ? "warning"
+                    : "info",
+              );
+            } catch (_e) {
+              void _e;
+            }
+          },
+        });
+      },
+    });
+    return promptRefinement;
+  }
+
+  pi.registerCommand("prompt", {
+    description:
+      "Refine the drafted request in an isolated child session and return it to the composer without sending/running it: /prompt <request>",
+    handler: async (args, ctx) => {
+      const service = ensurePromptRefinement();
+      if (composerTransform?.supported()) {
+        // Host-backed composer: the host owns applying the candidate through
+        // the typed port. The legacy editor write must not also run.
+        try {
+          (ctx as any)?.ui?.notify?.(
+            "This host returns refined prompts through its Refine prompt control; /prompt is handled by the host.",
+            "info",
+          );
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
+      const ui = (ctx as any)?.ui;
+      const host: PromptCommandHost = {
+        ctx,
+        facts: refinementFacts(ctx),
+        composer: {
+          getText: () => {
+            try {
+              return typeof ui?.getEditorText === "function"
+                ? ui.getEditorText()
+                : undefined;
+            } catch (_e) {
+              void _e;
+              return undefined;
+            }
+          },
+          setText: (text) => {
+            try {
+              if (typeof ui?.setEditorText !== "function") {
+                return { ok: false, error: "this host has no editor" };
+              }
+              ui.setEditorText(text);
+              return true;
+            } catch (error: unknown) {
+              return {
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+              };
+            }
+          },
+          // View stays in the transcript via notify; no clipboard surface is
+          // promised when the host does not expose one.
+          showText: (title, text) => {
+            try {
+              ui?.notify?.(`${title}\n\n${text}`, "info");
+            } catch (_e) {
+              void _e;
+            }
+          },
+        },
+        progress: refinementProgress(ui),
+        notify: (message, level) => {
+          try {
+            ui?.notify?.(message, level ?? "info");
+          } catch (_e) {
+            void _e;
+          }
+        },
+        presentQuestions: (questions, options) =>
+          presentRefinementQuestions(ctx, questions, options.signal),
+      };
+      // Escape cancels THIS refinement first (parity plan row 22): the
+      // listener exists only while the command runs, consumes the key only
+      // when an operation is live, and is detached in `finally` so a second
+      // Escape after completion reaches the editor normally. It never pauses
+      // or aborts a Review round: refinement is refused while Review owns the
+      // turn, so no refinement listener can be live beside it.
+      let detachEsc: (() => void) | undefined;
+      try {
+        if (typeof ui?.onTerminalInput === "function") {
+          detachEsc = ui.onTerminalInput((data: string) => {
+            try {
+              if (isKeyRelease(data)) return undefined;
+              if (!matchesKey(data, Key.escape)) return undefined;
+              if (service.activeOperationId() === undefined) return undefined;
+              service.cancelActive("the prompt refinement was cancelled with Escape");
+              // Always consume: an unconsumed Escape would abort the parent
+              // turn, which owns no part of this refinement.
+              return { consume: true };
+            } catch (_e) {
+              void _e;
+              return undefined;
+            }
+          });
+        }
+      } catch (_e) {
+        void _e;
+        detachEsc = undefined;
+      }
+      try {
+        await service.run(args, host);
+      } finally {
+        try {
+          detachEsc?.();
+        } catch (_e) {
+          void _e;
+        }
+      }
+    },
+  });
+
+  // ── Composer-transform companion + toggle (composer-transform-v1) ──
+  // The host arms a one-use rendezvous and invokes this companion with a
+  // grant-only bootstrap. The handler never treats `/prompt` literal text as
+  // internal JSON and never performs model work itself: it only claims the
+  // rendezvous, which starts the shared refinement runtime asynchronously.
+  pi.registerCommand("prompt-refine-companion", {
+    description:
+      "Internal grant-only bootstrap for composer prompt refinement (invoked by a composer-transform host).",
+    handler: async (args, ctx) => {
+      try {
+        const adapter = ensureComposerTransformAdapter(ctx);
+        const claimed = adapter.handleBootstrap(args);
+        if (!claimed.ok && claimed.error.code !== "rendezvous-claimed") {
+          // Never log the bootstrap string; only the bounded error code.
+          try {
+            (ctx as any)?.ui?.notify?.(
+              `Composer refinement bootstrap refused (${claimed.error.code}).`,
+              "warning",
+            );
+          } catch (_e) {
+            void _e;
+          }
+        }
+      } catch (_e) {
+        void _e;
+      }
+    },
+  });
+
+  // The control action behind the published `actionRef`. It only flips the
+  // one-shot arm state and republishes; no model, session or runtime work.
+  pi.registerCommand("prompt-refine", {
+    description:
+      "Toggle one-shot prompt refinement for this composer (Send refines and returns the draft; it does not run the task).",
+    handler: async (args, ctx) => {
+      try {
+        const adapter = ensureComposerTransformAdapter(ctx);
+        const token = String(args || "")
+          .trim()
+          .toLowerCase();
+        const state =
+          token === "off"
+            ? adapter.disable("turned off by /prompt-refine off")
+            : token === "on"
+              ? adapter.setArmed(true)
+              : adapter.toggle();
+        (ctx as any)?.ui?.notify?.(
+          state.checked
+            ? "Prompt refinement armed: the next Send refines this draft and returns it here; it will not run the task."
+            : "Prompt refinement off: Send runs your draft normally.",
+          "info",
+        );
+        publishContributions();
+      } catch (_e) {
+        void _e;
+      }
+    },
+  });
+
   // ── /commit-policy: view/set the commit policy (workflow.commitPolicy) ──
   // Available in every mode: it only writes settings JSON; the gate itself
   // lives in tool_call and plan mode keeps its own stricter rules.
@@ -5678,19 +6735,163 @@ export default function workflowExtension(
     return true;
   }
 
-  /** Capture the model currently active so Default mode can restore it later. */
-  function captureDefaultModel(ctx: ExtensionContext) {
+  /**
+   * Resolve the role model a mode would apply, using the effective roles (base
+   * roles + active profile overlay). Used to prove a live model is a role model
+   * and must not become the Default baseline.
+   */
+  function modeRoleModel(
+    mode: WorkflowMode,
+  ): PersistedModelDefault | undefined {
+    try {
+      const cfg: RoleConfig = { ...roleConfig, roles: effectiveRoles() };
+      const resolved = resolveModeModel(cfg, mode);
+      if (!resolved?.model) return undefined;
+      return (
+        coerceModelDefault(resolved.model) ?? {
+          provider: resolved.model.provider,
+          id: resolved.model.id,
+        }
+      );
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
+  /**
+   * Capture the model currently active so Default mode can restore it later.
+   *
+   * `enteringMode` is the mode the caller is ABOUT to switch to (the setters
+   * call this before assigning `workflowMode`). The Default baseline is only
+   * captured from Default mode; a live model that is the target mode's role
+   * model is refused unless it is also the authoritative persisted default, so
+   * an automatic role switch can never become the user's remembered default.
+   */
+  function captureDefaultModel(
+    ctx: ExtensionContext,
+    enteringMode?: WorkflowMode,
+  ) {
     try {
       const cur =
         (pi as any)?.getCurrentModel?.() ?? (ctx as any)?.model ?? null;
-      if (cur?.provider && cur?.id) {
-        let thinking: string | undefined;
+      const live =
+        cur?.provider && cur?.id
+          ? { provider: String(cur.provider), id: String(cur.id) }
+          : undefined;
+      let thinking: string | undefined;
+      try {
+        thinking = (pi as any)?.getThinkingLevel?.();
+      } catch (_e) {
+        void _e;
+      }
+      const persisted = readPersistedDefaultModel(ctx);
+      const roleModel = modeRoleModel(enteringMode ?? workflowMode);
+      // A live role model is acceptable only when it is also the persisted
+      // explicit default; otherwise it is a role model, not the user's default.
+      const liveIsPersisted =
+        live !== undefined &&
+        persisted !== undefined &&
+        sameModelRef(live, persisted);
+      const result = captureDefaultBaseline({
+        mode: workflowMode,
+        live: live ? coerceModelDefault({ ...live, thinking }) : undefined,
+        previous: coerceModelDefault(defaultModel ?? undefined),
+        activeRoleModel: liveIsPersisted ? undefined : roleModel,
+      });
+      if (result.baseline) {
+        defaultModel = {
+          provider: result.baseline.provider,
+          id: result.baseline.id,
+          thinking: result.baseline.thinking,
+        };
+        defaultModeSnapshot = {
+          model: result.baseline,
+          source: "entry",
+          trust: "session",
+          authoritative: true,
+          refusedRoleModel: false,
+        };
+      }
+      if (result.action === "refused") {
         try {
-          thinking = (pi as any)?.getThinkingLevel?.();
+          console.warn(
+            `[workflow] Default baseline not captured: ${result.reason}`,
+          );
         } catch (_e) {
           void _e;
         }
-        defaultModel = { provider: cur.provider, id: cur.id, thinking };
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * The refinement-model resolution seam for this session. Refinement is
+   * implemented by a later step; exposing one resolver now keeps that step from
+   * re-deriving precedence (or accidentally borrowing the active role model).
+   *
+   * The scoped settings file is read here, so a `/prompt-model` change takes
+   * effect on the next refinement without mutating the main session model.
+   */
+  function resolveRefinementModelForSession(): RefinementModelResolution {
+    const { cwd, agentDir } = modelDefaultContext(currentSessionCtx);
+    let trusted = false;
+    try {
+      trusted = (currentSessionCtx as any)?.isProjectTrusted?.() === true;
+    } catch (_e) {
+      void _e;
+    }
+    const config = readRefinementModelConfig(cwd, agentDir, { trusted });
+    if (config.source === "invalid") {
+      return {
+        ok: false,
+        source: "none",
+        reason: "invalid-refinement-setting",
+      };
+    }
+    const projectOverride =
+      config.source === "project"
+        ? refinementOverrideOf(config.setting)
+        : undefined;
+    const configuredOverride =
+      config.source === "global"
+        ? refinementOverrideOf(config.setting)
+        : undefined;
+    return resolveRefinementModel({
+      configuredOverride,
+      projectOverride,
+      projectInherit:
+        config.source === "project" && config.setting?.kind === "inherit",
+      projectTrusted: config.scopes.projectTrusted,
+      defaultMode: defaultModeSnapshot,
+      activeRoleModel: modeRoleModel(workflowMode),
+    });
+  }
+
+  /**
+   * Record Pi's internal `restore` event. It is never persisted (the gate
+   * refuses it), but it can be mistaken for a user pick when it diverges from
+   * the recorded Default model — log that once so the distinction is auditable.
+   */
+  function auditSuppressedRestore(model: any): void {
+    try {
+      const provider =
+        typeof model?.provider === "string" ? model.provider : undefined;
+      const id = typeof model?.id === "string" ? model.id : undefined;
+      const diverged =
+        !defaultModeSnapshot.model ||
+        !provider ||
+        !id ||
+        provider !== defaultModeSnapshot.model.provider ||
+        id !== defaultModeSnapshot.model.id;
+      modelRestoreAudit.push({ provider, id, at: Date.now(), diverged });
+      if (modelRestoreAudit.length > 20) modelRestoreAudit.shift();
+      if (diverged) {
+        console.warn(
+          `[workflow] Pi restored ${provider ?? "?"}/${id ?? "?"} (not the recorded Default-mode model) — treated as an internal restore, not a user selection.`,
+        );
       }
     } catch (_e) {
       void _e;
@@ -5979,6 +7180,9 @@ export default function workflowExtension(
           ...(orchestrationStatus() === undefined
             ? {}
             : { orchestration: orchestrationStatus()! }),
+          ...(composerContributionInput() === undefined
+            ? {}
+            : { composer: composerContributionInput()! }),
         }),
       );
       if (!result.ok) {
@@ -6653,7 +7857,7 @@ export default function workflowExtension(
     if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
     if (opts?.fromReview === true && reviewRoundInFlight()) return;
     // Leaving Default mode: remember its model so it can be restored on return.
-    if (workflowMode === null) captureDefaultModel(ctx);
+    if (workflowMode === null) captureDefaultModel(ctx, "plan");
     workflowMode = "plan";
     syncLegacyFlags();
     // Do NOT reset per-run provenance here. A fresh prompt already does it at
@@ -6703,7 +7907,7 @@ export default function workflowExtension(
     // Refuse before assigning the mode / swapping tools / suspending review.
     if (blockModeSwitchDuringReview(ctx)) return;
     // Leaving Default mode (e.g. /build from default): remember its model.
-    if (workflowMode === null) captureDefaultModel(ctx);
+    if (workflowMode === null) captureDefaultModel(ctx, "build");
     workflowMode = "build";
     syncLegacyFlags();
     // Leaving Plan invalidates this cycle's handoff/provenance.
@@ -6771,7 +7975,7 @@ export default function workflowExtension(
     // competing mode switch: the caller owns the `transition` state exactly as
     // it does for `enterBuildModeFromPlan`.
     if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
-    if (workflowMode === null) captureDefaultModel(ctx);
+    if (workflowMode === null) captureDefaultModel(ctx, "orchestrator");
     workflowMode = "orchestrator";
     syncLegacyFlags();
     clearPendingHandoffDecision();
@@ -8727,11 +9931,19 @@ export default function workflowExtension(
       handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
     });
   } catch {
-    // pi-code already owns /plan — add /workflow as our alias
+    // pi-code already owns /plan — the /workflow alias below still works.
+  }
+  // `/workflow` is the stable, host-independent Plan entry. It used to be a
+  // fallback for hosts where pi-code owns /plan, which meant Pi Desktop (no
+  // pi-code) never got it. Register it independently; a foreign owner of
+  // /workflow is tolerated the same way as /plan.
+  try {
     pi.registerCommand("workflow", {
       description: "Enable Plan mode (alias for /plan)",
       handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
     });
+  } catch (_e) {
+    void _e;
   }
 
   try {
@@ -12739,6 +13951,7 @@ ${dispatched.text}`,
               executionState?.shellQuarantine !== undefined ||
                 shellGuardRuntime?.isStopped() === true,
               activeSubagents,
+              extensionSelfPath(),
             );
             if (signal?.aborted) {
               results[idx] = {
@@ -13226,28 +14439,38 @@ ${dispatched.text}`,
       } catch (_e) {
         void _e;
       }
-      // Inject as custom message so next LLM turn sees it
+      // Deliver exactly ONE visible custom message. The SDK's sendMessage
+      // appends a custom_message entry (and defers it while streaming); the
+      // sessionManager call is only the fallback for hosts/SDKs without it.
+      btwDelivered.add(note);
+      let delivered = false;
       try {
-        (pi as any).sendMessage?.(
-          {
-            customType: "workflow-btw",
-            content: `[BTW] ${note}`,
-            display: true,
-          },
-          { triggerTurn: false },
-        );
+        const send = (pi as any).sendMessage;
+        if (typeof send === "function") {
+          send.call(
+            pi,
+            {
+              customType: "workflow-btw",
+              content: `[BTW] ${note}`,
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+          delivered = true;
+        }
       } catch (_e) {
         void _e;
       }
-      // Also append via sessionManager if available
-      try {
-        (ctx.sessionManager as any).appendCustomMessageEntry?.(
-          "workflow-btw",
-          `[BTW] ${note}`,
-          true,
-        );
-      } catch (_e) {
-        void _e;
+      if (!delivered) {
+        try {
+          (ctx.sessionManager as any).appendCustomMessageEntry?.(
+            "workflow-btw",
+            `[BTW] ${note}`,
+            true,
+          );
+        } catch (_e) {
+          void _e;
+        }
       }
 
       if ((ctx as any).isIdle?.() === false) {
@@ -13461,7 +14684,10 @@ ${dispatched.text}`,
             ? String((ctx.sessionManager as any).getSessionId())
             : undefined;
         if (childSessionId) {
-          orchestratorChildTeardowns.set(childSessionId, () => {
+          // Publish only this child's opaque cleanup, keyed by its own session
+          // id. The registry is bounded and TTL'd; another session (or a
+          // resource-inspector load) can never take or replace it.
+          orchestratorChildTeardowns.register(childSessionId, () => {
             for (const proc of [...activeSubagents]) {
               try {
                 proc.kill("SIGTERM");
@@ -13509,6 +14735,16 @@ ${dispatched.text}`,
           : {}),
       });
       contributionsPublisher.probe();
+    } catch (_e) {
+      void _e;
+    }
+    // A session/composer rebind invalidates every composer-transform grant,
+    // job and rendezvous listener. The toggle starts off for the new binding
+    // (the renderer preserves its own draft text independently).
+    composerBindingGeneration += 1;
+    composerBindingEpoch += 1;
+    try {
+      composerTransform?.rebind();
     } catch (_e) {
       void _e;
     }
@@ -13801,8 +15037,7 @@ ${dispatched.text}`,
           e.data?.note
         ) {
           btwNotes.push(e.data.note);
-        }
-        if (
+        }        if (
           e.type === "custom" &&
           e.customType === "workflow-checkpoint" &&
           e.data?.entryId &&
@@ -13894,6 +15129,24 @@ ${dispatched.text}`,
       profileModel,
     });
     defaultModel = defaultResolution.inMemory;
+    // Exposure-side snapshot for prompt refinement (and later diagnostics).
+    // `defaultModel` above stays the Default-mode restore value, so its
+    // behaviour is unchanged; the snapshot adds provenance + the trusted
+    // project default and never falls back to the active role model.
+    try {
+      const { cwd, agentDir } = modelDefaultContext(ctx as any);
+      const trusted = (ctx as any)?.isProjectTrusted?.() === true;
+      defaultModeSnapshot = resolveDefaultModeModelAccessor({
+        entryModel: entryDefaultModel,
+        persistedModel: persistedDefault,
+        profileModel,
+        projectModel: projectDefaultModel(cwd, agentDir),
+        projectTrusted: trusted,
+        activeRoleModel: modeRoleModel(workflowMode),
+      });
+    } catch (_e) {
+      void _e;
+    }
     // Adopt the saved default on a brand-new session. This is what makes a
     // model OUTSIDE `enabledModels` stick: Pi's own findInitialModel prefers
     // the first scoped model over settings.defaultModel, so writing
@@ -14057,6 +15310,9 @@ ${dispatched.text}`,
     // our own request listener cannot be mistaken for a host.
     refreshPlannotatorDetection(ctx as any);
     ensurePlannotatorListeners();
+    // Own the external plan-mode bridge for this session lifetime (a losing
+    // built-in factory call never installs it).
+    ensureExternalPlanModeBridge();
     // Recovery is asynchronous (it may query Plannotator); session start must
     // not wait up to the status timeout. The gate is restored/cleared before
     // the next user turn.
@@ -14068,7 +15324,47 @@ ${dispatched.text}`,
     // The session is going away: queued transitions must observe a stale
     // lifetime and stop before persisting/publishing with this context.
     modeSessionGeneration += 1;
+    // The external plan-mode bridge is owned by this session lifetime; drop it
+    // so a reload starts with zero listeners and no duplicate subscriptions.
+    try {
+      detachExternalPlanModeBridge?.();
+    } catch (_e) {
+      void _e;
+    }
+    detachExternalPlanModeBridge = undefined;
+    // A child instance also owns its teardown handshake entry. If the SDK
+    // disposes the child session without the parent's dispose handshake, drop
+    // the closure (and its captured subagent set) instead of retaining it.
+    if (inProcessChildContext) {
+      try {
+        const ownSessionId =
+          typeof (ctx.sessionManager as any).getSessionId === "function"
+            ? String((ctx.sessionManager as any).getSessionId())
+            : undefined;
+        if (ownSessionId) orchestratorChildTeardowns.take(ownSessionId);
+      } catch (_e) {
+        void _e;
+      }
+    }
     pendingExecutionKickoff = null;
+    // Abort any live `/prompt` operation and remove its progress surface; the
+    // composer itself belongs to the host and is not touched on shutdown.
+    try {
+      promptRefinement?.dispose();
+      promptRefinement = undefined;
+      setWorkflowWidget(ctx.ui, REFINEMENT_PROGRESS_WIDGET, []);
+    } catch (_e) {
+      void _e;
+    }
+    // Composer-transform grants and rendezvous listeners belong to the old
+    // binding; drop them before the bus/session goes away.
+    try {
+      composerTransform?.dispose();
+      composerTransform = undefined;
+      composerTransformCtx = undefined;
+    } catch (_e) {
+      void _e;
+    }
     // Dispose the in-process Build child first: this aborts its turn, releases
     // the SDK session and runs the child extension's own teardown (subagents,
     // timers). `AgentSession.dispose()` alone would leak them.
@@ -14098,11 +15394,11 @@ ${dispatched.text}`,
     // (up to 4 concurrent) could survive if VS Code closes the terminal
     // or pi crashes, holding file handles and confusing the next session.
     for (const proc of [...activeSubagents]) {
-      try {
-        proc.kill("SIGTERM");
-      } catch (_e) {
-        void _e;
-      }
+      terminateSubagent(proc.pid, {
+        platform: process.platform,
+        kill: (pid, sig) => process.kill(pid, sig),
+        spawn: (cmd, args, options) => spawn(cmd, [...args], options),
+      });
     }
     activeSubagents.clear();
     // A reload/resume/fork can recover a browser review in the replacement
@@ -14168,6 +15464,7 @@ ${dispatched.text}`,
     todos.frozen = undefined;
     todos.frozenError = undefined;
     btwNotes = [];
+    btwDelivered.clear();
     // A rewind is a branch boundary: the panel choice belongs to the branch.
     todos.panelPreference = "auto";
     todos.panelScope = null;
@@ -14588,6 +15885,7 @@ ${dispatched.text}`,
         : undefined;
     let sel: unknown;
     try {
+      permissionPromptDepth += 1;
       sel = await ui.select(
         `${folderOutside ? "Folder" : "Commit"} policy 'ask': allow \`git ${hit}\`?` +
           `\nRepository: ${repoRoot}` +
@@ -14601,6 +15899,8 @@ ${dispatched.text}`,
       );
     } catch {
       sel = undefined;
+    } finally {
+      permissionPromptDepth = Math.max(0, permissionPromptDepth - 1);
     }
     const answer = String(sel ?? "");
     if (answer.startsWith("Always allow")) {
@@ -15172,6 +16472,7 @@ ${dispatched.text}`,
       });
       let sel: unknown;
       try {
+        permissionPromptDepth += 1;
         sel = await ui.select(
           writeGateTitle(items, gateSource, baseRoot, {
             grantBlockedReason: writeGrantBlockedReason,
@@ -15181,6 +16482,8 @@ ${dispatched.text}`,
       } catch (_e) {
         void _e;
         sel = undefined;
+      } finally {
+        permissionPromptDepth = Math.max(0, permissionPromptDepth - 1);
       }
       const choice = parseWriteGateChoice(sel);
       if (choice === "allow-once") {
@@ -15610,12 +16913,15 @@ ${dispatched.text}`,
       });
       let sel: unknown;
       try {
+        permissionPromptDepth += 1;
         sel = await ui.select(
           readGateTitle(items, baseRoot, { grantBlockedReason }),
           options,
         );
       } catch {
         sel = undefined;
+      } finally {
+        permissionPromptDepth = Math.max(0, permissionPromptDepth - 1);
       }
       const choice = parseReadGateChoice(sel);
       if (choice === "allow-once") {
@@ -16731,12 +18037,12 @@ ${dispatched.text}`,
             .length
         : 0;
       const total = view?.state.order.length ?? 0;
-      const notes = btwNotes.length
-        ? `\n\n[BTW notes from user (address these)]:\n${btwNotes
+      const pendingBtw = takePendingBtwNotes();
+      const notes = pendingBtw.length
+        ? `\n\n[BTW notes from user (address these)]:\n${pendingBtw
             .map((note) => `- ${note}`)
             .join("\n")}`
         : "";
-      btwNotes = [];
       const mission = buildOrchestratorMission({
         phase: (view?.phase ?? "unbound") as OrchestratorPhase,
         ...(view
@@ -16756,10 +18062,10 @@ ${dispatched.text}`,
       } as any;
     }
     if (workflowMode === "plan") {
-      const btwBlock = btwNotes.length
-        ? `\n\n[BTW notes from user (address these)]:\n${btwNotes.map((n) => `- ${n}`).join("\n")}`
+      const pendingBtw = takePendingBtwNotes();
+      const btwBlock = pendingBtw.length
+        ? `\n\n[BTW notes from user (address these)]:\n${pendingBtw.map((n) => `- ${n}`).join("\n")}`
         : "";
-      btwNotes = []; // consume
       const today = getUtcDatePrefix();
       // One neutral line only: Plan Mode must NOT see the reviewer's prompt,
       // findings, or transcript (requirement: Plan cannot see Review's context).
@@ -16777,13 +18083,12 @@ ${dispatched.text}`,
         },
       } as any;
     }
-    if (btwNotes.length) {
-      const notes = [...btwNotes];
-      btwNotes = [];
+    const pendingBtw = takePendingBtwNotes();
+    if (pendingBtw.length) {
       return {
         message: {
           customType: "workflow-btw",
-          content: `[BTW] ${notes.join("\n[BTW] ")}`,
+          content: `[BTW] ${pendingBtw.join("\n[BTW] ")}`,
           display: true,
         },
       } as any;
@@ -17846,8 +19151,7 @@ ${dispatched.text}`,
             : {}),
           sessionId: input.sessionId,
           onDispose: () => {
-            const teardown = orchestratorChildTeardowns.get(input.sessionId);
-            orchestratorChildTeardowns.delete(input.sessionId);
+            const teardown = orchestratorChildTeardowns.take(input.sessionId);
             try {
               teardown?.();
             } catch {
@@ -19661,9 +20965,16 @@ ${dispatched.text}`,
       };
     }
     // `restore` is Pi re-applying a recorded model (session resume / reload):
-    // never a user gesture. Extension-initiated switches are suppressed.
-    if (!shouldPersistModelSelect({ source: event.source, suppressed: persistSuppressed }))
-      return;
+    // never a user gesture. Extension-initiated switches are suppressed. The
+    // classifier preserves `shouldPersistModelSelect`'s explicit-choice verdict
+    // exactly and additionally separates an auditable internal restore from a
+    // user pick, so a resume can never be mistaken for a saved default.
+    const selection = classifyModelSelectionEvent({
+      source: event.source,
+      suppressed: persistSuppressed,
+    });
+    if (selection.auditRestore) auditSuppressedRestore(selected);
+    if (!selection.persist) return;
     const model: any = event.model;
     if (!model?.provider || !model?.id) return;
     let thinking: string | undefined;
@@ -19707,11 +21018,18 @@ ${dispatched.text}`,
     );
   });
 
-  // Sync with pi-code's plan-mode bus if present (so /plan from pi-code toggles our state too)
-  try {
-    const bus: any = (pi as any).events;
-    if (bus && typeof bus.on === "function") {
-      bus.on("pi-code:plan-mode", (state: any) => {
+  // Sync with pi-code's plan-mode bus if present (so /plan from pi-code toggles our state too).
+  //
+  // Registered by `ensureExternalPlanModeBridge` on the session lifecycle, never
+  // during factory load: the SDK drops a replaceable built-in extension AFTER
+  // its factory ran, so a load-time bus subscription would survive as an active
+  // handler for an extension that is not part of the session.
+  function ensureExternalPlanModeBridge(): void {
+    if (detachExternalPlanModeBridge) return;
+    try {
+      const bus: any = (pi as any).events;
+      if (!bus || typeof bus.on !== "function") return;
+      const detach = bus.on("pi-code:plan-mode", (state: any) => {
         // A child session must never mirror an external plan-mode toggle: it
         // would re-apply the standard tool list and break the child contract.
         if (inProcessChildContext) {
@@ -19769,8 +21087,15 @@ ${dispatched.text}`,
           persistState();
         }
       });
+      detachExternalPlanModeBridge = () => {
+        try {
+          if (typeof detach === "function") detach();
+        } catch (_e) {
+          void _e;
+        }
+      };
+    } catch (_e) {
+      void _e;
     }
-  } catch (_e) {
-    void _e;
   }
 }

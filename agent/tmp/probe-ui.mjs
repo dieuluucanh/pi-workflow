@@ -1,0 +1,17 @@
+import { pathToFileURL } from "node:url";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const pty = (await import(pathToFileURL("C:/Users/Lenovo/Projects/pi-desktop/node_modules/node-pty/lib/index.js").href)).default;
+const profile = mkdtempSync(join(tmpdir(), "pi-sdk-profile-"));
+const project = mkdtempSync(join(tmpdir(), "pi-sdk-project-"));
+const out = join(profile, "probe.json");
+writeFileSync(join(profile, "settings.json"), JSON.stringify({ defaultProvider: "fake", defaultModel: "fake-1" }));
+writeFileSync(join(profile, "models.json"), JSON.stringify({ providers: { fake: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "k", models: [{ id: "fake-1", name: "F", input: ["text"] }] } } }));
+const cli = "C:/Users/Lenovo/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
+const term = pty.spawn(process.execPath, [cli, "-e", "C:/Users/Lenovo/.pi/agent/extensions/workflow/tmp-ui-probe.ts", "-ne", "-ns", "-np", "--no-session", "--offline", "--tui-mode", "regular", "--provider", "fake", "--model", "fake-1"], { name: "xterm-256color", cols: 100, rows: 30, cwd: project, env: { ...process.env, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PROBE_OUT: out } });
+term.onData(() => {});
+await new Promise((r) => setTimeout(r, 9000));
+term.kill();
+console.log(existsSync(out) ? readFileSync(out, "utf8") : "NO OUTPUT");
+process.exit(0);

@@ -396,3 +396,144 @@ test("orchestrator child rows expose pause/resume/abort and the view toggle", ()
   assert.equal(byId.has("orchestrator-direct-build"), false);
   assert.equal(byId.has("orchestrator-host"), false);
 });
+
+// ── Generic composer-transform publication ───────────────────────────
+
+import {
+  buildWorkflowComposerContributions,
+  type WorkflowComposerInput,
+} from "./workflow-contributions.ts";
+import {
+  parseComposerControlContribution,
+  resolveComposerControlTargets,
+  COMPOSER_TRANSFORM_CONTRACT,
+} from "./composer-transform.ts";
+
+function composerInput(overrides: Partial<WorkflowComposerInput> = {}): WorkflowComposerInput {
+  return {
+    controlId: "refine-prompt",
+    toggleActionId: "refine-prompt-toggle",
+    transformActionId: "refine-prompt-transform",
+    label: "Refine prompt",
+    description: "Send refines this draft and returns it here; it will not run the task.",
+    icon: "sparkles",
+    checked: false,
+    enabled: true,
+    publicCommand: "prompt",
+    companionCommand: "prompt-refine-companion",
+    toggleCommand: "prompt-refine",
+    transformCommand: "prompt",
+    ...overrides,
+  };
+}
+
+test("composer control publishes same-owner action refs and companion metadata", () => {
+  const contributions = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    composer: composerInput(),
+  });
+  const parsed = envelopeFor(contributions);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
+  if (!parsed.ok) return;
+
+  const control = contributions.find((entry) => entry.kind === "composer-control");
+  assert.ok(control);
+  const validated = parseComposerControlContribution(control);
+  assert.equal(validated.ok, true, validated.ok ? "" : validated.error.message);
+  if (!validated.ok) return;
+  assert.equal(validated.value.checked, false);
+  assert.equal(validated.value.enabled, true);
+  assert.equal(validated.value.operation.contract, COMPOSER_TRANSFORM_CONTRACT);
+  assert.equal(validated.value.operation.companionCommand, "prompt-refine-companion");
+
+  // The host resolves both references from the same owner and checks that the
+  // transform action invokes the declared public command with no args.
+  const projected = contributions.map((entry) => ({
+    ownerId: "@dieulc/workflow",
+    id: entry.id,
+    kind: entry.kind,
+    ...(entry.kind === "action"
+      ? { label: entry.label, command: entry.command }
+      : {}),
+  }));
+  const resolved = resolveComposerControlTargets(
+    "@dieulc/workflow",
+    validated.value,
+    projected,
+  );
+  assert.equal(resolved.ok, true, resolved.ok ? "" : resolved.error.message);
+  if (resolved.ok) {
+    assert.deepEqual(resolved.value.transform.command, { name: "prompt" });
+    assert.deepEqual(resolved.value.toggle.command, { name: "prompt-refine" });
+  }
+});
+
+test("composer control reflects checked, disabled and no-composer states", () => {
+  const armed = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    composer: composerInput({ checked: true }),
+  });
+  const control = armed.find((entry) => entry.kind === "composer-control");
+  assert.ok(control && control.kind === "composer-control");
+  assert.equal(control?.checked, true);
+  assert.equal(
+    armed.find((entry) => entry.id === "refine-prompt-toggle")?.kind,
+    "action",
+  );
+
+  const disabled = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    composer: composerInput({ enabled: false, disabledReason: "unsupported host" }),
+  });
+  const off = disabled.find((entry) => entry.kind === "composer-control");
+  assert.ok(off && off.kind === "composer-control");
+  assert.equal(off?.enabled, false);
+  assert.equal(off?.disabledReason, "unsupported host");
+
+  // No negotiated composer input means no composer rows at all (old hosts keep
+  // the status/action fallback and `/prompt`).
+  const none = buildWorkflowContributions({ mode: null, done: 0, total: 0 });
+  assert.equal(none.some((entry) => entry.kind === "composer-control"), false);
+  assert.equal(none.some((entry) => entry.id === "refine-prompt-toggle"), false);
+});
+
+test("review mode owns input and publishes no composer control", () => {
+  const contributions = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    reviewPhase: "running",
+    composer: composerInput({ checked: true }),
+  });
+  assert.equal(contributions.some((entry) => entry.kind === "composer-control"), false);
+});
+
+test("composer publication is generic: two publishers build the same shape", () => {
+  const a = buildWorkflowComposerContributions(composerInput());
+  const b = buildWorkflowComposerContributions(
+    composerInput({
+      controlId: "other-control",
+      toggleActionId: "other-toggle",
+      transformActionId: "other-transform",
+      label: "Rewrite",
+      toggleCommand: "other-toggle",
+      transformCommand: "other-rewrite",
+      publicCommand: "other-rewrite",
+      companionCommand: "other-companion",
+      icon: "wand",
+    }),
+  );
+  for (const set of [a, b]) {
+    const control = set.find((entry) => entry.kind === "composer-control");
+    assert.ok(control);
+    assert.equal(parseComposerControlContribution(control).ok, true);
+  }
+  assert.equal(a.length, 3);
+  assert.equal(b.length, 3);
+});

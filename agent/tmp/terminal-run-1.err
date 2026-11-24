@@ -1,0 +1,109 @@
+FAIL prefix-return — the command line is consumed
+C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13
+var consoleProcessList = getConsoleProcessList(shellPid);
+                         ^
+
+Error: AttachConsole failed
+    at Object.<anonymous> (C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13:26)
+    at Module._compile (node:internal/modules/cjs/loader:1929:14)
+    at Object..js (node:internal/modules/cjs/loader:2060:10)
+    at Module.load (node:internal/modules/cjs/loader:1651:32)
+    at Module._load (node:internal/modules/cjs/loader:1443:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.22.2
+C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13
+var consoleProcessList = getConsoleProcessList(shellPid);
+                         ^
+
+Error: AttachConsole failed
+    at Object.<anonymous> (C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13:26)
+    at Module._compile (node:internal/modules/cjs/loader:1929:14)
+    at Object..js (node:internal/modules/cjs/loader:2060:10)
+    at Module.load (node:internal/modules/cjs/loader:1651:32)
+    at Module._load (node:internal/modules/cjs/loader:1443:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.22.2
+FAIL questionnaire — question surface: never appeared within 90000ms.
+--- tail ---
+[>7u[>4;2m
+ ▀▀█  v1.5.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.[Extensions]
+  workflow[Extension issues]
+  path (temp) ~\.pi\agent\extensions\workflow\index.ts
+    Extension shortcut conflict: 'tab' is built-in shortcut for tui.input.tab and
+C:\Users\Lenovo\.pi\agent\extensions\workflow\index.ts. Using C:\Users\Lenovo\.pi\agent\extensions\workflow\index.ts.    Warning: Roles: no roles.json at C:\Users\Lenovo\AppData\Local\Temp\pi-terminal-acceptance-profile-qb4c3A\roles.json — 
+ using in-memory defaults────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-xEDBYS
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo/prompt summarise the failure for the release notes                                                                     
+                                                                                                                         Refining prompt — waiting for the refinement model…
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-xEDBYS
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo Refined prompt ready (1 change). Nothing was run or changed. Nothing was sent or run; edit and send it yourself.       
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Refined prompt: written for maintainers, keeping the failure details. 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-xEDBYS
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo
+C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13
+var consoleProcessList = getConsoleProcessList(shellPid);
+                         ^
+
+Error: AttachConsole failed
+    at Object.<anonymous> (C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13:26)
+    at Module._compile (node:internal/modules/cjs/loader:1929:14)
+    at Object..js (node:internal/modules/cjs/loader:2060:10)
+    at Module.load (node:internal/modules/cjs/loader:1651:32)
+    at Module._load (node:internal/modules/cjs/loader:1443:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.22.2
+FAIL paste-marker — history does not resurrect the marker
+C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13
+var consoleProcessList = getConsoleProcessList(shellPid);
+                         ^
+
+Error: AttachConsole failed
+    at Object.<anonymous> (C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13:26)
+    at Module._compile (node:internal/modules/cjs/loader:1929:14)
+    at Object..js (node:internal/modules/cjs/loader:2060:10)
+    at Module.load (node:internal/modules/cjs/loader:1651:32)
+    at Module._load (node:internal/modules/cjs/loader:1443:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.22.2
+C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13
+var consoleProcessList = getConsoleProcessList(shellPid);
+                         ^
+
+Error: AttachConsole failed
+    at Object.<anonymous> (C:\Users\Lenovo\Projects\pi-desktop\node_modules\node-pty\lib\conpty_console_list_agent.js:13:26)
+    at Module._compile (node:internal/modules/cjs/loader:1929:14)
+    at Object..js (node:internal/modules/cjs/loader:2060:10)
+    at Module.load (node:internal/modules/cjs/loader:1651:32)
+    at Module._load (node:internal/modules/cjs/loader:1443:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.22.2

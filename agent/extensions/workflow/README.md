@@ -16,6 +16,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Shell guard** — finite native deadlines for every shell surface (120 s default, 900 s ceiling), a pre-launch refusal for provably empty interpreter-stdin heredocs, and a request-scoped recovery budget: one changed approach, then stop. Covers main `bash`/`powershell`, explorer subprocesses and the isolated reviewer's `review_bash`; never times out human dialogs. See [Shell guard](#shell-guard).
 - **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
 - **Orchestrator (experimental)** — opt-in long-roadmap execution engine: task-only execution TODOs, durable run journal, visible normal Build children, parent-owned verification/acceptance, bounded repair and rollover, and parent-only commits. Mode entry never launches work; the ordinary Plan → Review → Build flow is unchanged. See [Orchestrator](#orchestrator-experimental) below.
+- **Prompt refinement (`/prompt`)** — rewrite a drafted request in an isolated child session and hand the candidate back to the *composer* — never send it, never run it. `/prompt <draft>` is the Terminal entry; a Desktop host arms the same runtime through the typed `composer-transform-v1` capability (a one-shot composer control, not slash concatenation). `/prompt-model` gives it an independent model, Default-mode inheritance is the fallback, and the main session model, roles and profiles are never touched. Refinement is bounded (inspect → ask → compose → submit), policy-safe, cancellable and recoverable. See [Prompt refinement](#prompt-refinement) below.
 
 ## Install
 
@@ -39,6 +40,9 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/btw` | Queue note for next turn |
 | `/role` | Config screen: one model + thinking per role (planner/explorer/builder/reviewer tabs, custom roles included; type to filter models by `provider/id` or display name). CLI: `list`, `set <role> <provider/model> [thinking]`, `use <role\|auto>`, `add/remove/reset` |
 | `/profile` | Switch or manage model profiles (named role-model combinations). Picker: activate / edit / rename / delete / New profile… / Default… (fuzzy type-to-filter; completed actions close the picker). CLI: `list`, `show <name>`, `use <name\|none>`, `create <name>`, `edit <name>`, `rename <old> <new>`, `delete <name>`, `default [name\|none] [global\|project]`, `retarget-provider <old> <new> [global\|project] [--apply]` |
+| `/prompt <draft>` | Refine the drafted request in an isolated child session and return it to the composer without sending or running it. Literal arguments; empty shows usage. Handled by the host on a Desktop build that advertises the structured composer capability (use the composer's **Refine prompt** control there); the Terminal path writes only the editor. Never starts a task, mode, plan, todo, checkpoint, review, handoff or Orchestrator dispatch |
+| `/prompt-refine [on\|off]` | Toggle the one-shot composer arm (the control a `composer-control` publisher exposes). Armed means the next **Send** refines the draft and returns it in place; it does not run the task. `off` cancels/disarms a live operation. No model, session or runtime work happens on the toggle itself |
+| `/prompt-model [status]` | Show the effective prompt-refinement model and thinking level, its source (trusted project / global / Default-mode inherit) and any shadowed scope. `set <provider/model> [thinking] [global\|project]` saves a validated override; `inherit [global\|project]` writes an explicit inherit sentinel (a trusted project inherit suppresses a global override); `reset [global\|project]` removes only that scope. Never changes the main session model |
 | `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout, and any shadowed scope. `off` is allowed while a finished handoff is pending (it becomes a plain handoff) but refused while a reviewer round/pause/gate is active (`/review-abort` first) |
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes only `timeoutMs` to global settings by default; it never pins `enabled` |
 | `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
@@ -157,6 +161,54 @@ Orchestrator no longer requests a Desktop related session or a new tab. The
 `related-session` contribution kind and `session-host.ts` remain as the generic
 host contract for other features; Workflow's own use of them is gone. Pi Desktop
 may still show the Orchestrator status/actions rows published here.
+
+#### Composer transform (frozen wire contract)
+
+`composer-transform.ts` freezes the additive `composer-transform-v1`
+capability that lets any extension refine the live composer draft without
+sending it. The same wire format is read independently by Pi Desktop
+(`src/shared/composer-transform.ts`);
+`fixtures/composer-transform.conformance.json` is copied byte-for-byte into
+Desktop's `tests/shared/fixtures/` and both suites assert the same SHA-256 and
+verdicts.
+
+- **Contribution.** A `kind: "composer-control"` row uses the
+  `composer-actions` slot, a closed semantic icon list, checked/enabled/disabled
+  reason, and an explicit `one-shot-return` (or `persistent`) behaviour. Its
+  same-owner `actionRef` toggles refinement and `transformActionRef` starts the
+  operation; the host resolves both live actions and their registered commands
+  and refuses a foreign or wrong-kind id. The renderer never supplies command
+  text.
+- **Operation metadata and source binding.** `operation` names the public input
+  command and the registered bootstrap companion. The host resolves both from
+  live SDK registrations and requires the same `sourceInfo` (`path`, `source`,
+  `scope`) — matching names alone are not authority. A foreign command or
+  companion is refused before any work starts.
+- **Transport.** Start request, started receipt, progress, candidate result,
+  status, cancellation, apply receipt and lifecycle failures are separate
+  bounded frames. Drafts, expanded paste text, image bytes, model/provider
+  context and grants never travel through contribution `command.args`; the old
+  static 1 000-character args limit is deliberately unchanged. Attachment
+  identity/digest metadata stays separate from optional in-band image bytes, and
+  diagnostics expose counts/ids/revisions only (never draft text, digest,
+  bytes, model or context). The request carries binding/session/epoch,
+  contribution revision and a live draft snapshot with a monotonic draft
+  revision; duplicate request ids join/replay, conflicting reuse is refused.
+- **Bootstrap/rendezvous.** SDK 1.5 registers string-only command handlers, so
+  the companion receives a **grant-only** JSON bootstrap. The host installs a
+  single-use, unpredictable request-scoped listener on the existing in-process
+  EventBus *before* invoking the companion; the grant id selects the private
+  channel and a random proof must match. Exactly one claim is accepted and the
+  typed port is handed directly to the companion callback. Prompt/image data
+  never touches the bus, command string, status row or logs; listeners are
+  removed on claim, expiry, rejection and teardown. The handshake is tested
+  against the unmodified SDK 1.5 `EventBus` and a real string command handler in
+  `composer-transform.test.ts`.
+- **Old hosts and fallback.** Contribution v1 stays additive: an older Desktop
+  drops the unknown `composer-control` kind and keeps rendering supported
+  status/action rows plus the public text command. `composerTransformFallback()`
+  explicitly reports `nativeControl: false` and `attachmentAware: false`; a
+  text-only fallback never promises attachment-aware transformation.
 
 ### What is wired, and what still needs a live run
 
@@ -503,6 +555,8 @@ The reviewer is an in-process child session created with `createAgentSession`, a
 
 An environment marker (`PI_WORKFLOW_REVIEW_CHILD`) is set only for the duration of session creation and restored immediately — the child runs in the same process, so leaking it would affect a later `/reload`.
 
+The general bootstrap lives in `isolated-session.ts` (shared with prompt refinement): in-memory session and settings managers, no ambient extensions/skills/templates/themes/context files, explicit caller-filtered context blocks, its own `ModelRuntime`, parent provider seeding plus a provider-agnostic auth preflight, an exact active-tool assertion, and disposal of the raw child on every bootstrap failure. A model substitution is a hard failure, never a silent fallback. Review keeps its own system prompt, tool set, fallback policy and the opt-in marker above; prompt refinement sets no process-global environment marker and is identified only by its operation/session handles.
+
 ### Provider seeding
 
 The isolation above has one consequence: a provider that exists **only** because an extension registered it in the parent session (`pi.registerProvider(...)`) does not exist in the reviewer's freshly created runtime — every review round would fail with `No API key found for <provider>.` even though `/login` had stored a valid credential.
@@ -568,6 +622,229 @@ doctor prints the same recommendation when it sees a single-wire Command Code pr
 ### Configuration
 
 Settings live under `workflow.reviewMode` in `~/.pi/agent/settings.json` (global) or `<cwd>/.pi/settings.json` (project). Project values win field-by-field over global. Writing them preserves every other key in the file.
+
+## Prompt refinement
+
+Prompt refinement rewrites a **drafted request** in an isolated child session and
+returns the candidate to the composer. It never sends the request, executes a
+tool, writes a file, starts a task, mode, plan, todo, checkpoint, review, handoff
+or Orchestrator dispatch. Nothing is run until a separate human Send.
+
+### Operation
+
+One refinement is one bounded `inspect → ask → reinspect → compose → submit`
+operation, run against a frozen model, system prompt, prepared context and the
+**initial** read-policy/trust/grant ceiling. It caps model turns (24), inspection
+calls (80), question rounds (6) and active time (8 minutes) by default; a budget
+that runs out is a recoverable failure, never a silently truncated candidate.
+An answer that changes scope re-prepares context; a new grant never widens a
+running operation. Sessions, subscriptions, timers and outstanding question
+signals are released on every exit, and a child that finishes bootstrapping
+after cancellation is disposed rather than used.
+
+### Context and provider privacy
+
+The child is a second in-memory SDK session with its own `ModelRuntime`. It
+loads no ambient extensions, skills, prompt templates, themes or AGENTS/CLAUDE
+context files, and its settings manager is in-memory, so a refinement cannot
+read or write the session's own settings or transcript. Context is an explicit,
+bounded selection the parent picks for the refiner: compaction-aware recent
+relevant text, never hidden thinking, credentials, unrelated history or raw logs.
+Repository data and prompt injections are treated as untrusted task data, not
+instructions.
+
+File evidence is subject to the read policy (see
+[Folder and read permission](#folder-and-read-permission)): approved roots,
+grants, sensitive paths, symlink/Windows aliases and result sizes are enforced
+per file before any output reaches the child model. The **starting snapshot is
+only a ceiling**: the live trust/grant/exclusion generation is re-resolved before
+every inspection, provider request, question and candidate delivery (plus turn
+boundaries). Relevant narrowing — or any policy-generation change once file
+evidence exists — invalidates the operation, revokes its toolset/evidence and
+disposes the child while preserving the original draft for a retry. Local policy
+commands invalidate immediately; a later grant never widens a running operation.
+
+**Revocation is forward-looking, not retroactive.** A narrowed policy stops
+future reads and future provider turns, and a stale candidate is not delivered.
+It cannot un-disclose what a provider already received in an earlier request
+(prompts, file excerpts or model context). This is stated rather than implied.
+
+### Model scope, inherit and reset (`/prompt-model`)
+
+Refinement uses its own optional model setting, independent of the main session
+model, roles and profiles. Precedence is: a **trusted** project override
+(`<cwd>/.pi/settings.json`) → the global setting (`~/.pi/agent/settings.json`) →
+the **Default-mode model**. An explicit inherit sentinel suppresses a global
+override so a trusted project can deliberately fall back to the Default model:
+
+```json
+{ "workflow": { "promptRefinement": { "model": { "provider": "opencode-go", "id": "deepseek-v4.1-flash", "thinking": "medium" } } } }
+{ "workflow": { "promptRefinement": { "model": { "inherit": true } } } }
+```
+
+`/prompt-model` writes the value read-modify-write, preserving every other
+settings key. `set` validates the provider/model against the registry and clamps
+an explicit thinking level to the model's capabilities (a nonreasoning model
+stores `off`); provider-qualified IDs may contain additional `/` characters.
+Missing or invalid explicit settings are reported and refinement **refuses**
+rather than silently falling back to another model. `inherit` writes the
+sentinel; `reset` removes only the chosen scope, so resetting a project override
+reveals a global one. Project writes require a trusted project, and a malformed
+settings file is never rewritten as `{}`. The main session model, roles,
+profiles and Pi's default-model mirror are never modified.
+
+### One-shot composer toggle
+
+On a host that advertises the `composer-transform-v1` capability (Pi Desktop),
+refinement is an armed **composer control**, not a slash command. Arming is
+one-shot: the next Send refines the draft and returns it **in place**, without
+running the task. `/prompt-refine on|off` toggles the same arm state and does no
+model, session or runtime work itself; explicit `off` cancels/disarms a live
+operation. The adapter disarms only after the host acknowledges the apply.
+
+### Busy behaviour
+
+A refinement is refused — never queued over an unrelated busy surface — while a
+run owns the turn, a Review round is active or paused, a handoff or
+questionnaire owns input, an overlay or non-nested progress surface already owns
+the composer, or a managed Orchestrator child owns the operation. On a
+structured host, a second start for the same tab/session binding is a
+`request-conflict`; a renderer reload adopts the live operation instead of
+starting a duplicate provider call. Normal Send, steer/follow-up and shell
+behaviour are unchanged when refinement is off.
+
+### Cancellation and conflicts
+
+Escape/Stop cancels the current refinement first and never pauses or aborts an
+unrelated Review; the Escape listener exists only while an operation is live and
+is detached in `finally`. Explicit toggle-off cancels and disarms; other
+cancel/error paths leave the control armed for a retry. A candidate is applied
+only to its exact still-current draft revision: newer typing, an attachment
+add/remove/reorder, an ABA edit or a tab switch yields an explicit **conflict**,
+and the candidate is kept viewable and copyable with an explicit replace
+affordance. Duplicate completion/apply frames are refused (idempotent receipt),
+never written twice.
+
+### Failure and recovery
+
+The original draft, the candidate and a short change summary live in a bounded
+in-memory review store, never in the parent conversation, session files or logs,
+and the original stays View/Copy-able. A provider/tool/budget failure is
+recoverable: the draft is preserved for a retry. On a structured host, a lost
+apply acknowledgement is settled from the host's bounded settled-receipts map;
+a renderer reload/activation queries the live operation rather than restarting
+it; host restart/crash, new/resume/fork/rewind, `/reload`, publisher
+disablement or withdrawal, tab close and app quit cancel/invalidate the job and
+grant while keeping the candidate viewable (never apply-able) and the draft text
+preserved. Binary attachments live only in renderer memory and do **not**
+survive a full app/renderer process loss; text drafts do. Surviving images would
+require a separate secure draft-blob store, which this build deliberately does
+not have.
+
+### Images and Terminal paths
+
+A Desktop host may send bounded image bytes/IDs and the runtime attaches them
+only after validating the selected model's vision capability; unsupported images
+are disclosed and the request asks for text descriptions instead of switching
+models. A **Terminal command handler receives no structured images**: `/prompt
+<draft>` treats a path such as `images/error.png` as literal prompt text, so no
+image bytes are attached and the model must not claim to have inspected a file
+it did not read. This is an accepted Terminal limitation, not an upstream patch;
+attachment-aware transformation requires the structured capability.
+
+### Capabilities for third-party frontend consumers
+
+The public, additive `composer-transform-v1` contract
+(`composer-transform.ts`, fixture `fixtures/composer-transform.conformance.json`)
+lets an unrelated host drive a refinement without any Workflow identifier in the
+host. Copy the fixture byte-for-byte; both suites assert the same SHA-256.
+
+- **Contribution.** `kind: "composer-control"`, `slot: "composer-actions"`, a
+  closed semantic icon allowlist, checked/enabled/disabled-reason, an explicit
+  `one-shot-return` or `persistent` behaviour, and same-owner `actionRef`
+  (toggle) plus `transformActionRef` (operation) references. `operation` names
+  the public input command (`/prompt`) and the registered bootstrap companion
+  (`/prompt-refine-companion`). Drafts, images, model/context and grants never
+  travel through contribution args; the old 1 000-character args limit is
+  unchanged.
+- **Grant-only bootstrap and the private structured handoff.** SDK 1.5 command
+  handlers are string-only, so the handoff is two-stage. The host resolves both
+  commands' live SDK `sourceInfo` (`path`/`source`/`scope`) and refuses equal
+  names from different extensions. It then arms a **single-use** listener on the
+  SDK EventBus, mints an unpredictable request-scoped grant, and invokes the
+  companion with a grant-only JSON string (`contract` + `grant`; extra fields
+  are refused). The grant id selects a private channel and a random proof must
+  match before the typed in-process port is handed to the companion callback —
+  the public `/prompt` literal text is never parsed as internal JSON. Listeners
+  are removed on claim, expiry, rejection and teardown. The handshake is proven
+  against unmodified SDK 1.5.
+- **Frames.** Start request, started receipt, progress, candidate, status query/
+  response, cancellation, apply receipt and lifecycle errors each have an
+  independent validator. Diagnostics expose bounded ids/counts/revisions only,
+  never draft text, expanded text, image bytes/digests, grants or model context.
+- **Old hosts.** Contribution v1 is additive: an older Desktop drops the
+  unknown kind and keeps the status/action rows plus the text command. The
+  fallback reports `nativeControl: false` and `attachmentAware: false`; a text
+  fallback never promises attachment-aware transformation.
+- **Live-policy revocation.** A frontend must re-resolve trust/grants/policy at
+  each authority boundary and treat a narrowing policy-generation change as
+  cancellation, never as an applicable cached result. As above, revocation
+  stops future disclosure; it does not recall provider data already sent.
+
+A minimal generic host integration uses the **structured capability**, not slash
+concatenation: read the published `composer-control`, resolve its
+`transformActionRef` to the declared public command and its `operation`
+companion, verify both share one `sourceInfo`, arm a one-use rendezvous, pass the
+grant-only bootstrap, then drive `start`/`progress`/`candidate`/`cancel`/`apply`
+with typed frames. Only a host that has none of this may fall back to running the
+plain text `/prompt` command, and it must report that it is not
+attachment-aware. See the Pi Desktop
+[`architecture/extension-ui.md`](https://github.com/dieuluucanh/pi-desktop/blob/main/docs/architecture/extension-ui.md)
+composer-transform section for the host-side walkthrough and a worked example.
+
+### Bundled source, override, disable and safe mode
+
+Pi Desktop bundles a pinned `@dieulc/workflow` artifact (`builtin:workflow`,
+staged from a verified tarball or release artifact with recorded integrity).
+Startup loads it offline and independently of a developer checkout; the resource
+hub and About/Diagnostics report the builtin version, source and replacement
+state. Explicit npm/git/local/project installs override the builtin exactly once
+(a provenance warning states which won). `-builtin:workflow` opts the builtin out
+without touching your `packages`/settings; the Extensions hub can disable and
+re-enable it; and safe mode loads neither the builtin nor a third-party copy.
+Terminal Pi is unaffected — it loads the extension from npm or a checkout as
+before. No install happens at runtime and no settings file is rewritten by
+these paths.
+
+### Compatibility matrix
+
+| Concern | Terminal Pi (W) | Pi Desktop (D) |
+| --- | --- | --- |
+| Entry point | `/prompt <draft>` writes the editor | Armed composer control; typed `/prompt` routes through the structured path |
+| Refinement model | `/prompt-model` + Default-mode inherit | Same (extension-owned setting) |
+| Structured capability | Publishes `composer-transform-v1` | Consumes it; unknown kinds fail safe |
+| Images | Path is literal text; no bytes (accepted limitation) | Bounded image bytes after vision-capability validation |
+| Apply | `setEditorText` with an expected-buffer check | CAS apply on the exact draft revision + idempotent receipt |
+| Old host / old extension | — | Additive fallback: text/status only, `attachmentAware: false` |
+
+**Tested versions.** Workflow 0.13.0 against Pi SDK 1.5.0 (Pi Desktop's exact
+pin). The structured handshake is verified against unmodified SDK 1.5; automated
+suites are listed under [Development](#development) and in W `docs/`.
+
+### Honest acceptance limits
+
+- Semantic intent quality is an evaluation/human-review property, not a
+  deterministic guarantee. The rubric corpus and fake-provider harness check
+  preserved literals, consent, language and non-execution; they do not prove a
+  candidate is *better*.
+- A live-model quality sample, Playwright composer E2E and real Terminal keyboard
+  acceptance are **NOT RUN** in this environment and are recorded as such, not
+  inferred from unit substitutes (see W `docs/orchestrator-live-acceptance.md`
+  and D `docs/architecture/refinement-acceptance-2026-11-24.md`).
+- Terminal structured images remain an accepted limitation; differing native/TUI
+  rendering is an accepted platform difference.
+- Generic SDK APIs Workflow does not use are outside this contract; they are not
+  advertised as supported.
 
 ## Folder and read permission
 
@@ -813,6 +1090,36 @@ The value is stored in `settings.json` (global `~/.pi/agent/settings.json`, or t
 
 Every other settings key (including `workflow.commitPolicy`, `workflow.writePolicy`, `workflow.defaultProfile`, `enabledModels`) is preserved by the read-modify-write. Clear the default by deleting `workflow.modelDefault` and the three top-level keys, or simply select a different model. `/role list` and the `/profile` picker show the full answer to "what starts next": the model, the file that defines it, and the profile that will be auto-activated.
 
+### Prompt-refinement model (`/prompt-model`)
+
+Prompt refinement uses its own optional model setting, independent of the main session model, roles and profiles:
+
+```json
+{
+  "workflow": {
+    "promptRefinement": {
+      "model": { "provider": "opencode-go", "id": "deepseek-v4.1-flash", "thinking": "medium" }
+    }
+  }
+}
+```
+
+Scopes and precedence: a **trusted** project setting (`<cwd>/.pi/settings.json`) wins over the global setting (`~/.pi/agent/settings.json`), which wins over inheriting the Default-mode model. An explicit inherit sentinel suppresses a global override:
+
+```json
+{ "workflow": { "promptRefinement": { "model": { "inherit": true } } } }
+```
+
+`/prompt-model` writes `{ provider, id, thinking? }` (or the sentinel) read-modify-write, preserving every other settings key. `set` validates the provider/model against the registry and clamps an explicit thinking level to the model's capabilities (a nonreasoning model stores `off`); provider-qualified IDs may contain additional `/` characters. Missing/invalid explicit settings are reported and refinement refuses rather than silently falling back to another model. `reset` removes only the chosen scope, so resetting a project override reveals a global one. Project writes require a trusted project. A malformed settings file is never rewritten as `{}`.
+
+The refinement prompt and wire contracts are versioned, provider-neutral code (`prompt-refinement-prompt.ts`): a single system prompt plus `pi.workflow.prompt-refinement.input.v1` and `pi.workflow.prompt-refinement.result.v1` JSON schemas/validators. They preserve intent, constraints, original language(s), code/paths/commands and deliberately distinct terms; terminology substitutions need a cited `evidenceId`; optional suggestions require `suggestionsAllowed`; and refinement never executes the request or claims it did. Results are refused for a wrong version, unknown fields, an empty candidate, unconsented suggestions or unsupported terminology. The quality rubric (`docs/prompt-refinement-rubrics.md`) and its 14-case corpus (`fixtures/prompt-refinement-cases.json`: typo-heavy, terminology-with-evidence, distinct terms, multilingual/mixed, quoted commands, noncoding, sparse, no-repo, ambiguous terminology, prompt injection, vision/no-vision and long-context) are frozen before tuning; only literals are asserted byte-for-byte.
+
+The quality **evaluation harness** (`prompt-refinement-eval.ts`, `node scripts/eval-prompt-refinement.mjs`) runs that corpus through the real refinement runtime with a deterministic scripted provider/tool harness and grades named properties (literal fences, required/forbidden phrases, language retention, evidenced terminology, suggestion consent, non-execution, injection resistance, clarification behaviour, vision disclosure, bounded size). Ten generic mutants (dropped literal, execution claim, unconsented suggestion, unbacked terminology, invented literal, obeyed injection, skipped question, translated language, missing vision disclosure, bloat) must be caught, so a deterministic pass is not vacuous. A live-model sample requires `--live --model provider/model-id` plus `PI_PROMPT_REFINEMENT_EVAL_AUTHORIZED=1` and is still only a sample; fake-harness properties, live measurements and human rubric sign-off are reported separately under `docs/evaluations/`.
+
+The refinement **runtime** (`prompt-refinement-runtime.ts`) runs one bounded inspect→ask→reinspect→compose→submit operation against a frozen model, system prompt, prepared context and the **initial** read-policy/trust/grant ceiling. It tracks active work time separately from time spent waiting for an answer, and caps model turns (24), inspection calls (80), question rounds (6) and active time (8 minutes) by default; exhaustion is a recoverable failure, never a silently truncated candidate. Exactly one structured candidate is accepted, revalidated for schema/length/empty prose and delivered through a composer-only port — the runtime never sends, executes or applies the request. Policy/trust/grant authority is resolved again before every provider request, question, inspection and candidate delivery (plus turn boundaries); relevant narrowing — or any policy-generation change once file evidence exists — invalidates the operation, revokes its toolset/evidence and disposes the child while preserving the original draft for a retry. Local policy commands invalidate immediately; a later grant never widens a running operation. Sessions, subscriptions, timers and outstanding question signals are released on every exit, and a child that finishes bootstrapping after cancellation is disposed rather than used.
+
+The refinement **result review and apply policy** (`prompt-refinement-review.ts`) sits between the runtime's accepted candidate and the composer. The original draft, the candidate and a short change summary live in a bounded in-memory `RefinementReviewStore`, never in the parent model conversation, session files or logs. Before hand-back the candidate is re-validated and checked for composer readiness: non-empty, within the hard size cap (an over-cap candidate is refused, never truncated), no explicit truncation marker, no first-person "I implemented/applied/ran" claim, and no chat preamble posing as the prompt. Transport wrappers are removed only when they unambiguously wrap the whole text — a leading `/prompt` prefix, a short "Here is the refined prompt:" label, a whole-text Markdown fence or result-JSON envelope, and a trailing "let me know…" sign-off — while headings, lists, quotes, inline code and fences with a real language stay byte-identical. The review surfaces the original and candidate for View/Copy, a short change summary, and advisory findings for literals and constraint sentences that may not have survived (hints for human review, never a claim of semantic equivalence). Ordinary success inserts once without a second approval dialog; if the draft changed while it was being refined, the candidate is kept as a recoverable result and only an explicit replacement writes it, re-reading and comparing the exact revision the user confirmed before overwriting.
+
 Review Mode settings live under `workflow.reviewMode`:
 
 | Key | Default | Meaning |
@@ -1029,7 +1336,7 @@ Plannotator's loopback URL is valid — the same URL loads when you use the tab'
 cd agent/extensions/workflow
 npm install
 npm run typecheck   # tsc --noEmit (covers every source file, including the review modules)
-npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts shell-guard.test.ts shell-guard-config.test.ts shell-guard-extension.test.ts shell-guard-process.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts folder-exclude.test.ts
+npm test            # node --test utils.todo.test.ts permissions.test.ts shell-text.test.ts shell-guard.test.ts shell-guard-config.test.ts shell-guard-extension.test.ts shell-guard-process.test.ts roles.test.ts profiles.test.ts provider-retarget.test.ts thinking-levels.test.ts workflow-status.test.ts picker.test.ts questionnaire-layout.test.ts questionnaire-view.test.ts model-default.test.ts default-mode-model.test.ts prompt-refinement-config.test.ts prompt-refinement-prompt.test.ts prompt-refinement-state.test.ts review.test.ts review-ui.test.ts extension.test.ts commit-policy.test.ts edit-policy.test.ts tab-policy.test.ts tab-editor.test.ts folder-policy.test.ts folder-exclude.test.ts
 ```
 
 The write policy also has an end-to-end check that drives the real `tool_call` handler against the real `settings.json` (it temporarily writes your global settings and restores them afterwards):

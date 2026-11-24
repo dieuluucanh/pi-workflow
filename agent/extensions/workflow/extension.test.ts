@@ -14,6 +14,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -100,6 +101,8 @@ interface BootOptions {
   executionMode?: "orchestrator" | "build" | "unset";
   /** Fake in-process Build child for Orchestrator runs. */
   child?: FakeOrchestratorChildFactory;
+  /** `ctx.isProjectTrusted()`; defaults to true in the fake host. */
+  projectTrusted?: boolean;
 }
 
 async function boot(over: BootOptions = {}) {
@@ -247,6 +250,7 @@ async function boot(over: BootOptions = {}) {
     confirms,
     selects,
     customs,
+    navigations,
     aborts,
   } = makeFakeCtx({
     cwd,
@@ -270,6 +274,9 @@ async function boot(over: BootOptions = {}) {
       ? {}
       : { confirmAnswer: over.confirmAnswer }),
     ...(over.ctxSettings ? { settings: over.ctxSettings } : {}),
+    ...(over.projectTrusted === undefined
+      ? {}
+      : { projectTrusted: over.projectTrusted }),
   });
   await pi.emit("session_start", { reason: over.startReason ?? "startup" }, ctx);
   const cleanup = async () => {
@@ -304,6 +311,7 @@ async function boot(over: BootOptions = {}) {
     selects,
     capture,
     customs,
+    navigations,
     aborts,
     plannotatorRequests,
     reviewStatusRequests,
@@ -5126,6 +5134,521 @@ test("OE4: abort pauses the row; retry starts a fresh child", async () => {
     assert.equal(b.child.created.length, 2, "retry started a fresh child");
     status = await b.pi.tools.orchestrator_status.execute("oe4-b", {});
     assert.match(JSON.stringify(status), /"running":1/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("PM1: /prompt-model status/set/inherit/reset are scoped and never touch the main model", async () => {
+  const b = await boot({
+    globalSettings: {
+      defaultProvider: "pi",
+      defaultModel: "main-model",
+      defaultThinkingLevel: "high",
+      workflow: { modelDefault: { provider: "pi", id: "main-model" } },
+      profiles: { active: "work" },
+    },
+    modelRegistry: {
+      find: (provider: string, id: string) =>
+        provider === "open" && id === "muse"
+          ? { provider, id, reasoning: true }
+          : undefined,
+    },
+  });
+  try {
+    const command = b.pi.commands["prompt-model"];
+    assert.ok(command, "/prompt-model is registered");
+
+    await command.handler("", b.ctx);
+    assert.match(
+      b.notifies.at(-1)?.message ?? "",
+      /Refinement model: Default-mode model/,
+    );
+
+    const completions = command.getArgumentCompletions?.("inherit ") as
+      | Array<{ label: string }>
+      | null;
+    assert.deepEqual(
+      completions?.map((item) => item.label),
+      ["global", "project"],
+    );
+
+    await command.handler("set open/muse high global", b.ctx);
+    assert.match(
+      b.notifies.at(-1)?.message ?? "",
+      /Refinement model → open\/muse \(high\) \(global\)/,
+    );
+
+    const globalPath = path.join(b.agentDir, "settings.json");
+    let settings = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+    assert.deepEqual(settings.workflow.promptRefinement.model, {
+      provider: "open",
+      id: "muse",
+      thinking: "high",
+    });
+    assert.equal(settings.defaultProvider, "pi");
+    assert.equal(settings.defaultModel, "main-model");
+    assert.equal(settings.defaultThinkingLevel, "high");
+    assert.deepEqual(settings.workflow.modelDefault, {
+      provider: "pi",
+      id: "main-model",
+    });
+    assert.deepEqual(settings.profiles, { active: "work" });
+
+    await command.handler("inherit global", b.ctx);
+    settings = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+    assert.deepEqual(settings.workflow.promptRefinement.model, {
+      inherit: true,
+    });
+    assert.equal(settings.defaultProvider, "pi");
+
+    await command.handler("reset global", b.ctx);
+    settings = JSON.parse(fs.readFileSync(globalPath, "utf8"));
+    assert.equal(settings.workflow.promptRefinement, undefined);
+    assert.equal(settings.defaultProvider, "pi");
+    assert.deepEqual(settings.workflow.modelDefault, {
+      provider: "pi",
+      id: "main-model",
+    });
+
+    await command.handler("set open/muse bogus", b.ctx);
+    assert.match(
+      b.notifies.at(-1)?.message ?? "",
+      /Invalid thinking level/,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("PM2: an untrusted project refuses /prompt-model project writes", async () => {
+  const b = await boot({ projectTrusted: false });
+  try {
+    await b.pi.commands["prompt-model"].handler(
+      "set open/muse project",
+      b.ctx,
+    );
+    assert.match(
+      b.notifies.at(-1)?.message ?? "",
+      /require a trusted project/,
+    );
+    const projectSettings = JSON.parse(
+      fs.readFileSync(path.join(b.cwd, ".pi", "settings.json"), "utf8"),
+    );
+    assert.equal(projectSettings.workflow.promptRefinement, undefined);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("host-backed /prompt does not write the legacy editor and toggle starts no run", async () => {
+  const b = await boot({ hasUI: true });
+  try {
+    b.pi.events.emit("host-contributions:hello", {
+      contractVersion: 1,
+      kinds: [
+        "mode",
+        "progress",
+        "status",
+        "action",
+        "input",
+        "related-session",
+        "composer-control",
+      ],
+      slots: [
+        "mode",
+        "progress",
+        "status",
+        "action",
+        "input",
+        "sessions",
+        "composer-actions",
+      ],
+      composerTransform: {
+        contractVersion: 1,
+        kinds: ["composer-control"],
+        slots: ["composer-actions"],
+      },
+    });
+    // The control command lazily creates the adapter; it must not send or model.
+    await b.pi.commands["prompt-refine"].handler("on", b.ctx);
+    assert.equal(b.pi.sent.length, 0, "toggling the control must not send a prompt");
+    assert.ok(
+      b.notifies.some((entry) => /Prompt refinement armed/.test(entry.message)),
+    );
+
+    let editorWrites = 0;
+    (b.ctx.ui as any).setEditorText = () => {
+      editorWrites += 1;
+    };
+    await b.pi.commands["prompt"].handler("improve this draft", b.ctx);
+    assert.equal(
+      editorWrites,
+      0,
+      "host-backed /prompt must not also call legacy setEditorText",
+    );
+    assert.equal(b.pi.sent.length, 0, "no task was sent");
+    assert.ok(
+      b.notifies.some((entry) => /handled by the host/.test(entry.message)),
+      "the host-backed notice is shown",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+// ══════════════════════════════════════════════════════════════════════
+// /btw · read-only explore · /rewind (parity plan step 32)
+// ══════════════════════════════════════════════════════════════════════
+
+/** Run git in a temp project without inheriting developer config. */
+function gitIn(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+  });
+}
+
+/** Run every `before_agent_start` handler and collect their results. */
+async function beforeStart(b: { pi: any; ctx: any }, prompt = "continue"): Promise<any[]> {
+  const out: any[] = [];
+  for (const handler of b.pi.handlers.get("before_agent_start") ?? []) {
+    out.push(await handler({ messageType: "user", prompt }, b.ctx));
+  }
+  return out;
+}
+
+/** Two user checkpoints the rewind picker can offer. */
+function rewindBranch(): unknown[] {
+  return [
+    {
+      id: "entry-1",
+      type: "message",
+      timestamp: new Date("2026-11-24T10:00:00Z").toISOString(),
+      message: { role: "user", content: "add CSV export" },
+    },
+    {
+      id: "entry-2",
+      type: "message",
+      timestamp: new Date("2026-11-24T10:05:00Z").toISOString(),
+      message: { role: "user", content: "include headers" },
+    },
+  ];
+}
+
+test("BTW1: /btw records one note, one visible message and no duplicate disclosure", async () => {
+  const b = await boot();
+  try {
+    await b.pi.commands.btw.handler("keep the CSV header order stable", b.ctx);
+
+    const persisted = b.pi.entries.filter((e) => e.type === "workflow-btw");
+    assert.equal(persisted.length, 1, "one persisted custom entry");
+    assert.equal(
+      (persisted[0].data as { note?: string }).note,
+      "keep the CSV header order stable",
+    );
+    assert.equal(b.pi.sent.length, 1, "one visible custom transcript message");
+    assert.equal((b.pi.sent[0].content as any).customType, "workflow-btw");
+    assert.ok(b.notifies.some((n) => /note added/i.test(n.message)));
+
+    // The live message is already in the next turn's context; the context hook
+    // must not inject the same note a second time.
+    const injections = await beforeStart(b);
+    assert.equal(
+      injections.filter((r) => r?.message?.customType === "workflow-btw").length,
+      0,
+      "a live-delivered note is not re-injected",
+    );
+    assert.equal(b.pi.sent.length, 1, "the context hook sent no second message");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("BTW2: an input-prefixed /btw queues exactly one note for the next turn", async () => {
+  const b = await boot();
+  try {
+    let handled: any;
+    for (const handler of b.pi.handlers.get("input") ?? []) {
+      const result = (await handler(
+        { text: "/btw add the header test", source: "interactive" },
+        b.ctx,
+      )) as { action?: string } | undefined;
+      if (result?.action === "handled") {
+        handled = result;
+        break;
+      }
+    }
+    assert.ok(handled, "the input hook claims the /btw prefix");
+    assert.equal(b.pi.entries.filter((e) => e.type === "workflow-btw").length, 1);
+
+    const first = (await beforeStart(b)).filter(
+      (r) => r?.message?.customType === "workflow-btw",
+    );
+    assert.equal(first.length, 1, "the queued note is disclosed once");
+    assert.match(first[0].message.content, /add the header test/);
+
+    // Consumed: a second turn does not repeat it.
+    const second = (await beforeStart(b)).filter(
+      (r) => r?.message?.customType === "workflow-btw",
+    );
+    assert.equal(second.length, 0, "the queued note is consumed exactly once");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("BTW3: Plan context carries a queued note but not a live-delivered one", async () => {
+  const queued = await boot({
+    branch: [
+      {
+        id: "btw-entry",
+        type: "custom",
+        customType: "workflow-btw",
+        data: { note: "restored from the branch" },
+        timestamp: new Date().toISOString(),
+      },
+      {
+        id: "user-entry",
+        type: "message",
+        message: { role: "user", content: "write the plan" },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
+  try {
+    await queued.pi.commands.plan.handler("", queued.ctx);
+    const planContext = (await beforeStart(queued)).find(
+      (r) => r?.message?.customType === "workflow-plan-context",
+    );
+    assert.ok(planContext, "Plan injects its context");
+    assert.match(planContext!.message.content, /restored from the branch/);
+    assert.equal(
+      planContext!.message.content.split("restored from the branch").length - 1,
+      1,
+      "the restored note appears exactly once",
+    );
+  } finally {
+    await queued.cleanup();
+  }
+
+  const live = await boot();
+  try {
+    await live.pi.commands.plan.handler("", live.ctx);
+    await live.pi.commands.btw.handler("already delivered live", live.ctx);
+    const planContext = (await beforeStart(live)).find(
+      (r) => r?.message?.customType === "workflow-plan-context",
+    );
+    assert.ok(planContext);
+    assert.doesNotMatch(
+      planContext!.message.content,
+      /already delivered live/,
+      "Plan does not repeat a note that is already a transcript message",
+    );
+  } finally {
+    await live.cleanup();
+  }
+});
+
+test("EX1: explore routes an agent without a model to the read-only explorer role", async () => {
+  const b = await boot();
+  // No real child may start from a unit test: present an unusable launcher
+  // descriptor so the injected port refuses BEFORE spawn (fail closed).
+  const savedCli = process.env.PI_SUBAGENT_PI_CLI;
+  process.env.PI_SUBAGENT_PI_CLI = path.join(b.root, "missing", "pi-cli.js");
+  try {
+    // A project agent with no model in its frontmatter must use the explorer
+    // role, never the builder/planner model.
+    const agentsDir = path.join(b.agentDir, "agents");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentsDir, "scout.md"),
+      ["---", "name: scout", "description: fast recon", "tools: read, grep, find", "---", "Read only.", ""].join(
+        "\n",
+      ),
+    );
+
+    const explore = b.pi.tools.explore as any;
+    assert.ok(explore?.execute);
+    const result = await explore.execute(
+      "call-1",
+      { agent: "scout", task: "find the export module" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+
+    assert.equal(result.details.routing, "explorer-single");
+    assert.equal(result.details.results.length, 1);
+    // The role is explorer (read-only) and no child was silently started with
+    // an unverified launcher: this environment has no Pi CLI descriptor, so the
+    // port fails closed with a launcher/policy refusal.
+    assert.equal(result.details.results[0].role, "explorer");
+    assert.match(String(result.details.results[0].error), /launcher|policy|model/i);
+  } finally {
+    if (savedCli === undefined) delete process.env.PI_SUBAGENT_PI_CLI;
+    else process.env.PI_SUBAGENT_PI_CLI = savedCli;
+    await b.cleanup();
+  }
+});
+
+test("EX2: explore rejects an unknown agent instead of inheriting the parent tools", async () => {
+  const b = await boot();
+  const savedCli = process.env.PI_SUBAGENT_PI_CLI;
+  process.env.PI_SUBAGENT_PI_CLI = path.join(b.root, "missing", "pi-cli.js");
+  try {
+    const explore = b.pi.tools.explore as any;
+    const result = await explore.execute(
+      "call-1",
+      { agent: "does-not-exist", task: "do something" },
+      undefined,
+      undefined,
+      b.ctx,
+    );
+    assert.equal(result.details.results.length, 1);
+    assert.match(String(result.details.results[0].error), /unknown agent/i);
+  } finally {
+    if (savedCli === undefined) delete process.env.PI_SUBAGENT_PI_CLI;
+    else process.env.PI_SUBAGENT_PI_CLI = savedCli;
+    await b.cleanup();
+  }
+});
+
+test("RW1: /rewind with no history keeps the working tree untouched", async () => {
+  const b = await boot();
+  try {
+    fs.writeFileSync(path.join(b.cwd, "tracked.txt"), "original\n");
+    await b.pi.commands.rewind.handler("", b.ctx);
+    assert.ok(b.notifies.some((n) => /no history/i.test(n.message)));
+    assert.equal(b.customs.length, 0, "no checkpoint picker opened");
+    assert.equal(fs.readFileSync(path.join(b.cwd, "tracked.txt"), "utf8"), "original\n");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RW2: /rewind needs an explicit dirty-tree confirmation before restoring files", async () => {
+  const branch = rewindBranch();
+  const b = await boot({
+    branch,
+    customAnswers: ["entry-2"],
+    selectAnswer: "Cancel",
+    hasUI: true,
+  });
+  try {
+    gitIn(b.cwd, "init", "-b", "main");
+    gitIn(b.cwd, "config", "user.email", "test@example.com");
+    gitIn(b.cwd, "config", "user.name", "Test");
+    fs.writeFileSync(path.join(b.cwd, "tracked.txt"), "committed\n");
+    gitIn(b.cwd, "add", "tracked.txt");
+    gitIn(b.cwd, "commit", "-qm", "init");
+
+    // Establish the branch leaf and take a real shadow checkpoint, as a turn
+    // would, BEFORE dirtying the tree.
+    await b.pi.emit(
+      "tool_result",
+      { toolName: "read", isError: false, input: { path: "tracked.txt" }, content: [] },
+      b.ctx,
+    );
+    await b.pi.emit("turn_start", {}, b.ctx);
+    assert.ok(
+      b.pi.entries.some((e) => e.type === "workflow-checkpoint"),
+      "the turn created a checkpoint",
+    );
+
+    fs.writeFileSync(path.join(b.cwd, "tracked.txt"), "dirty\n");
+    await b.pi.commands.rewind.handler("", b.ctx);
+
+    assert.ok(
+      b.selects.some((s) => /uncommitted changes/i.test(s.title)),
+      "the dirty tree is confirmed explicitly",
+    );
+    // Cancel: messages and files are preserved.
+    assert.equal(b.navigations.length, 0);
+    assert.equal(fs.readFileSync(path.join(b.cwd, "tracked.txt"), "utf8"), "dirty\n");
+    assert.ok(b.notifies.some((n) => /cancelled|preserved/i.test(n.message)));
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RW3: /rewind restores messages and tracked files after confirmation", async () => {
+  const branch = rewindBranch();
+  const b = await boot({
+    branch,
+    customAnswers: ["entry-2"],
+    selectAnswer: "Restore — snapshot current state then revert tracked files",
+    hasUI: true,
+  });
+  try {
+    gitIn(b.cwd, "init", "-b", "main");
+    gitIn(b.cwd, "config", "user.email", "test@example.com");
+    gitIn(b.cwd, "config", "user.name", "Test");
+    fs.writeFileSync(path.join(b.cwd, "tracked.txt"), "committed\n");
+    gitIn(b.cwd, "add", "tracked.txt");
+    gitIn(b.cwd, "commit", "-qm", "init");
+
+    await b.pi.emit(
+      "tool_result",
+      { toolName: "read", isError: false, input: { path: "tracked.txt" }, content: [] },
+      b.ctx,
+    );
+    await b.pi.emit("turn_start", {}, b.ctx);
+
+    fs.writeFileSync(path.join(b.cwd, "tracked.txt"), "dirty\n");
+    await b.pi.commands.rewind.handler("", b.ctx);
+
+    assert.equal(b.navigations.length, 1, "the conversation branch moved once");
+    assert.equal(b.navigations[0].id, "entry-2");
+    assert.equal(
+      fs.readFileSync(path.join(b.cwd, "tracked.txt"), "utf8"),
+      "committed\n",
+      "the tracked file is restored to the checkpoint",
+    );
+    assert.ok(b.notifies.some((n) => /files restored/i.test(n.message)));
+  } finally {
+    await b.cleanup();
+  }
+});
+test("RV1: /review-prompt shows guidance headlessly and saves only an explicit edit", async () => {
+  const headless = await boot({ hasUI: false });
+  try {
+    await headless.pi.commands["review-prompt"].handler("", headless.ctx);
+    assert.ok(
+      headless.notifies.some((n) => /Reviewer guidance/i.test(n.message)),
+      "headless prints the resolved guidance instead of opening an editor",
+    );
+    assert.equal(
+      fs.existsSync(path.join(headless.cwd, ".pi", "review-prompt.md")),
+      false,
+      "reading the guidance writes no file",
+    );
+    assert.equal(headless.pi.sent.length, 0, "no model turn");
+  } finally {
+    await headless.cleanup();
+  }
+
+  const edited = await boot({ hasUI: true, editorAnswer: "cite the framework docs" });
+  try {
+    await edited.pi.commands["review-prompt"].handler("project", edited.ctx);
+    const saved = fs.readFileSync(path.join(edited.cwd, ".pi", "review-prompt.md"), "utf8");
+    assert.match(saved, /cite the framework docs/);
+    assert.ok(edited.notifies.some((n) => /saved \(project\)/i.test(n.message)));
+    assert.equal(edited.pi.sent.length, 0, "saving guidance is not an execution");
+  } finally {
+    await edited.cleanup();
+  }
+});
+
+test("RV2: /review-status reports the idle state without starting a reviewer", async () => {
+  const b = await boot();
+  try {
+    await b.pi.commands["review-status"].handler("", b.ctx);
+    assert.ok(b.notifies.some((n) => /review/i.test(n.message)));
+    assert.equal(b.pi.sent.length, 0);
+    // No reviewer tools were swapped into the session.
+    assert.equal(b.pi.timeline.filter((entry) => entry.kind === "tools").length, 0);
   } finally {
     await b.cleanup();
   }

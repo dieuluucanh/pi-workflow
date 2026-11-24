@@ -37,6 +37,7 @@ import { PROFILE_ROLES } from "./profiles.ts";
 import { WORKFLOW_STATUS_KEYS } from "./workflow-status.ts";
 import {
   fakeSdk,
+  latestStatus,
   makeFakeCtx,
   makeFakePi,
   submitThenFinish,
@@ -226,4 +227,52 @@ test("compat baseline: session startup sets the status keys and stays idempotent
       assert.ok(cleared.includes(key), `session_shutdown must clear ${key}`);
     }
   });
+});
+
+test("compat baseline: /workflow is a Plan entry on every host", async () => {
+  // Parity regression (Workflow plan step 31). `/workflow` used to be registered
+  // only inside the `/plan` catch, so a host that does not own `/plan` (Pi
+  // Desktop ships no pi-code extension) never got the documented alias.
+  await withBoot(async ({ pi, made }) => {
+    assert.ok(pi.commands.workflow, "a host without pi-code must still expose /workflow");
+    assert.ok(pi.commands.plan, "the /plan entry stays registered too");
+
+    made.statusCalls.length = 0;
+    await pi.commands.workflow.handler("", made.ctx);
+    assert.match(String(latestStatus(made.statusCalls, "workflow") ?? ""), /plan/);
+  });
+});
+
+test("compat baseline: /workflow survives a foreign owner of /plan", async () => {
+  // The original reason for the alias: pi-code owns /plan, so registering it
+  // throws. /workflow must still register and still switch to Plan.
+  const { cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const pi = makeFakePi({ activeTools: ["read", "write", "edit", "bash"] });
+    const register = pi.registerCommand.bind(pi);
+    pi.registerCommand = ((name: string, opts: never) => {
+      if (name === "plan") throw new Error("already registered by pi-code");
+      return register(name, opts);
+    }) as typeof pi.registerCommand;
+    const { sdk } = fakeSdk({ pass1: submitThenFinish("# Plan: alias") });
+    await workflowExtension(pi as never, {
+      loadSdk: async () => sdk as never,
+      plannotatorRequestTimeoutMs: 20,
+      plannotatorRecoveryTimeoutMs: 20,
+      isTerminalHost: () => true,
+    });
+    assert.equal(pi.commands.plan, undefined);
+    assert.ok(pi.commands.workflow, "/workflow is the fallback Plan entry");
+
+    const made = makeFakeCtx({ cwd, hasUI: false, branch: [] });
+    await pi.emit("session_start", { reason: "startup" }, made.ctx);
+    made.statusCalls.length = 0;
+    await pi.commands.workflow.handler("", made.ctx);
+    assert.match(String(latestStatus(made.statusCalls, "workflow") ?? ""), /plan/);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
 });

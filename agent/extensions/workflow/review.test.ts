@@ -2992,6 +2992,8 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
     followUp: async () => {},
     abort: async () => {},
     isStreaming: false,
+    getActiveToolNames: () =>
+      [...((captured.sessionOpts?.tools as string[] | undefined) ?? [])],
     bindExtensions: async () => {},
   };
   const sdk = {
@@ -3003,6 +3005,7 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
       async reload() {}
     },
     SessionManager: { inMemory: () => ({}) },
+    SettingsManager: { inMemory: () => ({}) },
     createAgentSession: async (opts: Record<string, unknown>) => {
       captured.sessionOpts = opts;
       captured.markerDuringCreate = process.env.PI_WORKFLOW_REVIEW_CHILD;
@@ -3072,7 +3075,8 @@ test("createReviewSession: isolates the reviewer from the parent", async () => {
 
 test("createReviewSession: bounds the child SDK retry budget in memory only", async () => {
   const captured: {
-    createArgs?: { cwd: string; agentDir: string };
+    inMemorySettings?: Record<string, unknown>;
+    createCalled?: boolean;
     overrides?: Record<string, unknown>;
     sessionOpts?: Record<string, unknown>;
   } = {};
@@ -3082,6 +3086,8 @@ test("createReviewSession: bounds the child SDK retry budget in memory only", as
     followUp: async () => {},
     abort: async () => {},
     isStreaming: false,
+    getActiveToolNames: () =>
+      [...((captured.sessionOpts?.tools as string[] | undefined) ?? [])],
     bindExtensions: async () => {},
   };
   const manager = {
@@ -3102,8 +3108,13 @@ test("createReviewSession: bounds the child SDK retry budget in memory only", as
     },
     SessionManager: { inMemory: () => ({}) },
     SettingsManager: {
-      create: (cwd: string, agentDir: string) => {
-        captured.createArgs = { cwd, agentDir };
+      // Must never be used: an isolated session has no file-backed settings.
+      create: () => {
+        captured.createCalled = true;
+        return manager;
+      },
+      inMemory: (settings: Record<string, unknown>) => {
+        captured.inMemorySettings = settings;
         return manager;
       },
     },
@@ -3125,7 +3136,16 @@ test("createReviewSession: bounds the child SDK retry budget in memory only", as
   });
 
   assert.equal(res.ok, true);
-  assert.deepEqual(captured.createArgs, { cwd: "/proj", agentDir: "/agent" });
+  assert.deepEqual(
+    captured.inMemorySettings,
+    {},
+    "settings are built in memory, never loaded from disk",
+  );
+  assert.equal(
+    captured.createCalled,
+    undefined,
+    "no file-backed SettingsManager.create call",
+  );
   assert.deepEqual(captured.overrides, {
     retry: {
       enabled: true,
@@ -3176,6 +3196,7 @@ function allowlistSdk(activeOverride?: string[]): {
       async reload() {}
     },
     SessionManager: { inMemory: () => ({}) },
+    SettingsManager: { inMemory: () => ({}) },
     createAgentSession: async (opts: {
       tools?: string[];
       customTools?: Array<{ name: string }>;
@@ -3274,7 +3295,7 @@ test("createReviewSession: reports failures instead of throwing", async () => {
   const missing = await createReviewSession({
     ...base,
     findModel: () => undefined,
-    loadSdk: async () => ({}) as never,
+    loadSdk: async () => allowlistSdk().sdk as never,
   });
   assert.equal(missing.ok, false);
   assert.match(missing.error ?? "", /not in the model registry/);
@@ -3287,7 +3308,7 @@ test("createReviewSession: reports failures instead of throwing", async () => {
     },
   });
   assert.equal(badImport.ok, false);
-  assert.equal(badImport.error, "cannot resolve sdk");
+  assert.match(badImport.error ?? "", /cannot resolve sdk/);
 });
 
 test("createReviewSession: preserves a pre-existing marker env value", async () => {
@@ -3308,6 +3329,7 @@ test("createReviewSession: preserves a pre-existing marker env value", async () 
             async reload() {}
           },
           SessionManager: { inMemory: () => ({}) },
+          SettingsManager: { inMemory: () => ({}) },
           createAgentSession: async () => ({
             session: {
               subscribe: () => () => {},
@@ -3315,6 +3337,7 @@ test("createReviewSession: preserves a pre-existing marker env value", async () 
               followUp: async () => {},
               abort: async () => {},
               isStreaming: false,
+              getActiveToolNames: () => [...REVIEW_BUILTIN_TOOLS],
             },
           }),
         }) as never,
@@ -4702,6 +4725,7 @@ function seedingSdk(childRuntime: unknown, calls: string[]) {
       async reload() {}
     },
     SessionManager: { inMemory: () => ({}) },
+    SettingsManager: { inMemory: () => ({}) },
     createAgentSession: async (opts: Record<string, unknown>) => {
       calls.push("createAgentSession");
       sessionOpts = opts;
@@ -4712,6 +4736,9 @@ function seedingSdk(childRuntime: unknown, calls: string[]) {
           followUp: async () => {},
           abort: async () => {},
           isStreaming: false,
+          // The real SDK reports the survivors of the global tool allowlist;
+          // the exact-set assertion needs this to be verifiable.
+          getActiveToolNames: () => [...((opts.tools as string[]) ?? [])],
           bindExtensions: async () => {},
         },
       };

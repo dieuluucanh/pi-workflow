@@ -15,7 +15,7 @@ Each extension is its own npm package (install just what you want):
 
 | Path | npm package | Description |
 | --- | --- | --- |
-| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, shared folder/read permissions, Review Mode, questionnaire (1–4 Qs, dedup), subagent `explore`, pinned `workflow_todo` panel, `/rewind` shadow-checkpoint, Plannotator bridge with a native handoff fallback |
+| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, shared folder/read permissions, Review Mode, prompt refinement (`/prompt`, `/prompt-model`, one-shot composer control), questionnaire (1–4 Qs, dedup), subagent `explore`, pinned `workflow_todo` panel, `/rewind` shadow-checkpoint, Plannotator bridge with a native handoff fallback, experimental Orchestrator |
 | `agent/extensions/autocompact/` | `@dieulc/autocompact` | Intelligent compaction: plan/todo-aware summary, 70% pre-warming, cheap model override, `/autocompact` |
 | `agent/extensions/server-logs/` | `@dieulc/server-logs` | Docker + systemd log inspection tools (remote SSH or local) |
 | `agent/extensions/browser-inspector/` | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP: console, network, screenshots (fresh browser or real session) |
@@ -43,6 +43,33 @@ see [`docs/orchestrator-live-acceptance.md`](docs/orchestrator-live-acceptance.m
 for the automated evidence and the live signoff that has **not** been run.
 
 > This repo root is **not** a Pi package and is not published (`"private": true`). Install the extensions individually, or clone the repo for the dotfiles.
+
+### Prompt refinement (`/prompt`)
+
+`@dieulc/workflow` can rewrite a **drafted request** in an isolated child session
+and hand the candidate back to the composer — it never sends or runs it. On
+Terminal Pi, `/prompt <draft>` writes the editor (a path is literal text, not an
+attachment). On Pi Desktop the extension publishes the additive
+`composer-transform-v1` capability, so the same runtime is driven by a one-shot
+composer control through a grant-only bootstrap and a private, single-use
+handoff — never by slash concatenation. `/prompt-model` gives refinement an
+independent model (trusted project → global → Default-mode inherit, with an
+explicit inherit sentinel and per-scope reset) and never changes the main
+session model, roles or profiles.
+
+Refinement is bounded, policy-safe and recoverable: an initial read/trust/grant
+ceiling is re-resolved before every inspection, provider request, question and
+candidate delivery; narrowing invalidates the operation and disposes the child.
+Revocation stops future disclosure — it cannot recall provider data already
+sent. A conflict is never overwritten; the original draft stays recoverable.
+Pi Desktop can bundle a pinned Workflow artifact with explicit
+override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
+checkout. Tested against Workflow **0.13.0** + Pi SDK **1.5.0**; semantic quality
+and live desktop/Terminal acceptance remain human-verified, not inferred from
+unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
+and the Pi Desktop
+[`architecture/extension-ui.md`](https://github.com/dieuluucanh/pi-desktop/blob/main/docs/architecture/extension-ui.md)
+composer-transform contract.
 
 ## Install
 

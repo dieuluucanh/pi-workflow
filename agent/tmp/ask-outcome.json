@@ -1,0 +1,10 @@
+{
+  "kind": "unsupported",
+  "outcome": {
+    "kind": "unsupported",
+    "capability": "headless",
+    "reason": "headless"
+  },
+  "surface": "terminal",
+  "hasUI": true
+}

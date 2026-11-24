@@ -33,6 +33,28 @@ export const ORCHESTRATOR_CHILD_REQUIRED_TOOLS = [
   "workflow_todo",
 ] as const;
 
+/**
+ * The exact in-process child tool allowlist.
+ *
+ * A child may never orchestrate (`orchestrator_*`) and may never arm the
+ * parent's questionnaire/commit authority, no matter which tools the parent
+ * session has active. Exported so the boundary is testable without an SDK
+ * session and cannot silently drift back to a plain union.
+ */
+export function orchestratorChildTools(
+  extraTools: readonly string[] = [],
+): string[] {
+  return [
+    ...new Set([
+      ...ORCHESTRATOR_CHILD_REQUIRED_TOOLS,
+      "explore",
+      ...extraTools,
+    ]),
+  ].filter(
+    (name) => name !== "questionnaire" && !name.startsWith("orchestrator_"),
+  );
+}
+
 export interface CreateOrchestratorChildInput {
   context: OrchestratorChildContext;
   cwd: string;
@@ -67,13 +89,7 @@ export interface CreateOrchestratorChildResult {
 export async function createOrchestratorBuildChild(
   input: CreateOrchestratorChildInput,
 ): Promise<CreateOrchestratorChildResult> {
-  const tools = [
-    ...new Set([
-      ...ORCHESTRATOR_CHILD_REQUIRED_TOOLS,
-      "explore",
-      ...(input.extraTools ?? []),
-    ]),
-  ].filter((name) => name !== "questionnaire" && !name.startsWith("orchestrator_"));
+  const tools = orchestratorChildTools(input.extraTools);
 
   const result = await createInProcessChildSession({
     cwd: input.cwd,

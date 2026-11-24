@@ -165,6 +165,13 @@ export function createContributionPublisher(
             ...(typeof record.maxContributions === "number"
               ? { maxContributions: record.maxContributions }
               : {}),
+            ...(record.composerTransform && typeof record.composerTransform === "object"
+              ? {
+                  composerTransform: record.composerTransform as NonNullable<
+                    HostContributionCapabilities["composerTransform"]
+                  >,
+                }
+              : {}),
           });
         }),
       );

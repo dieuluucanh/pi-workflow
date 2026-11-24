@@ -55,6 +55,10 @@
     "permissions",
     "plan",
     "profile",
+    "prompt",
+    "prompt-model",
+    "prompt-refine",
+    "prompt-refine-companion",
     "read-policy",
     "review",
     "review-abort",
@@ -67,6 +71,7 @@
     "role",
     "shell-guard",
     "todos",
+    "workflow",
     "workflow-cycle",
     "write-policy"
   ],

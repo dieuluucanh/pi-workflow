@@ -1,8 +1,156 @@
 ## Unreleased
 
+- Documentation for the prompt-refinement feature set (parity plan step 41):
+  the package README now documents the `/prompt` and `/prompt-refine` commands,
+  the bounded inspect→ask→compose→submit operation, context/provider privacy
+  (no ambient extensions/skills/templates/themes or AGENTS/CLAUDE injection,
+  bounded parent-selected context, repository text treated as untrusted data),
+  `/prompt-model` scope/inherit/reset with Default-mode inheritance, the one-shot
+  composer arm, busy refusal and binding conflicts, Escape/Stop cancellation
+  scoped to the operation, conflict handling on a moved draft, failure/recovery
+  and attachment loss on process restart, image/Terminal-path limits, the public
+  `composer-transform-v1` capability (contribution shape, grant-only bootstrap,
+  private single-use rendezvous handoff, typed frames, old-host fallback, live
+  policy revocation), bundled/override/disable/safe-mode behavior for Pi
+  Desktop, a compatibility matrix, tested versions (0.13.0 + Pi SDK 1.5.0) and
+  honest acceptance limits (semantic quality is human-reviewed; live desktop,
+  real-terminal keyboard and Playwright composer runs remain NOT RUN). The root
+  README gains a matching `/prompt` summary. No behavior change, no version bump.
+
+- Prompt-refinement quality evaluation harness (parity plan step 35):
+  `prompt-refinement-eval.ts` (with `prompt-refinement-eval.test.ts`) and
+  `scripts/eval-prompt-refinement.mjs` run the frozen rubric corpus through the
+  real runtime with a deterministic scripted provider/tool harness, grade named
+  properties (literal fences, required/forbidden phrases, language retention,
+  evidenced terminology, suggestion consent, non-execution, injection
+  resistance, clarification, vision disclosure, bounded size) and require ten
+  generic mutants to be caught. The evaluation corpus grows to v2 with
+  no-repo, ambiguous `sub-session` vs `child session`, prompt-injection,
+  vision/no-vision and long-context cases; rubric weights and the prompt/result
+  versions are unchanged. A live-model sample is gated behind
+  `PI_PROMPT_REFINEMENT_EVAL_AUTHORIZED=1` plus an explicit `--model`, and the
+  recorded result at `docs/evaluations/2026-11-24-prompt-refinement-quality.md`
+  keeps fake-provider properties, live measurements (NOT RUN) and human rubric
+  sign-off (PENDING) separate.
+
+- `/btw` now delivers a note exactly once (parity fix, plan step 32). The
+  command used to append the same note three ways — a persisted
+  `workflow-btw` custom entry, a visible custom message through
+  `sendMessage`, and a second `sessionManager.appendCustomMessageEntry` — and
+  then re-inject it again from `before_agent_start`. The result was duplicate
+  transcript rows and a duplicate model disclosure. It now appends the entry,
+  sends one visible custom message (sessionManager fallback only when the host
+  has no `sendMessage`), and marks that note delivered so the per-mode context
+  hook injects only genuinely queued notes. Rewind clears the delivered scope
+  with the queue. Covered by `BTW1`–`BTW3` in `extension.test.ts`.
+
+- `/workflow` is now registered unconditionally as the Plan-mode entry
+  (parity fix, plan step 31). It used to exist only as the fallback when
+  `/plan` was already owned by another extension (pi-code), so hosts without
+  that package — Pi Desktop ships none — never had the documented alias.
+  `/plan` keeps its own registration and conflict tolerance; `/workflow` is no
+  longer tied to it. The frozen command baseline records both.
+
+- Frozen `composer-transform-v1` contract (`composer-transform.ts`,
+  `fixtures/composer-transform.conformance.json`): additive
+  `composer-control` contribution (composer-actions slot, semantic icon list,
+  checked/enabled state, one-shot return discriminator, same-owner toggle and
+  transform references, public-command/companion operation metadata), bounded
+  start/progress/candidate/status/cancel/apply/lifecycle frames, live SDK
+  `sourceInfo` binding for both commands, grant-only string bootstrap and the
+  single-use private EventBus rendezvous that hands the typed port to the
+  companion. The fixture is byte-identical with Pi Desktop and both suites
+  assert the same SHA-256 and verdicts. Drafts, images, model/context and
+  grants never travel through contribution args (the old 1 000-character args
+  limit is unchanged); diagnostics expose identity/counts only. An older host
+  drops the unknown kind and keeps text/status fallback, explicitly not
+  attachment-aware. The handshake is proven against unmodified SDK 1.5.
+
+- Shared isolated-session infrastructure (`isolated-session.ts`, `provider-auth.ts`):
+  Review and prompt refinement now share only the general second-session
+  bootstrap. Child sessions use an in-memory `SessionManager` and an in-memory
+  `SettingsManager` (no session/settings files), no ambient extensions, skills,
+  prompt templates, themes or AGENTS/CLAUDE context files, and explicit
+  caller-filtered context blocks. They get their own `ModelRuntime`, parent-only
+  provider seeding, a provider-agnostic auth preflight, an exact active-tool
+  assertion (missing, unexpected or unverifiable tools fail) and disposal of the
+  raw SDK session on every bootstrap failure. A substituted model fails instead
+  of falling back silently. Review keeps its prompts, submission tools, fallback
+  policy and legacy opt-in anti-recursion marker; prompt refinement sets no
+  process-global environment marker. `provider-auth.ts` holds the shared auth
+  probe while `review-providers.ts` keeps its reviewer-facing aliases and
+  messages.
+- Prompt-refinement prompt/schema contracts (v1): a provider-neutral system
+  prompt plus `pi.workflow.prompt-refinement.input.v1` and
+  `...result.v1` JSON schemas/validators. The prompt preserves intent,
+  constraints, original language(s), code/paths/commands and deliberately
+  distinct terms; terminology changes cite evidence; optional suggestions
+  require consent; refinement never executes or claims execution. Results
+  reject wrong versions, unknown fields, empty candidates, unconsented
+  suggestions and unsupported terminology. Adds the eight-case evaluation
+  corpus (typo-heavy, evidence-backed terminology, distinct terms,
+  multilingual/mixed, quoted commands, noncoding, sparse) and a versioned
+  quality rubric frozen before tuning.
+- Bounded prompt-refinement runtime (`prompt-refinement-runtime.ts`): one
+  inspect→ask→reinspect→compose→submit operation with a frozen model, system
+  prompt, prepared context and the initial read-policy/trust/grant ceiling.
+  Active work time is tracked separately from waiting for the user, and model
+  turns, inspection calls, question rounds and active time are hard-capped;
+  exhaustion is a recoverable failure. Exactly one structured candidate is
+  accepted and revalidated (schema, length, non-empty/truncated prose,
+  unapproved scope claims), then handed only to an injected composer port — the
+  runtime never sends or executes the request. Live authority is rechecked at
+  every provider request, question, inspection, turn boundary and candidate
+  delivery; narrowing (or any policy-generation change once file evidence
+  exists) invalidates the operation, revokes evidence and disposes the child
+  while preserving the draft. Local policy commands invalidate immediately,
+  later grants never widen a running operation, late tool/provider/session
+  completions cannot deliver, and sessions/subscriptions/timers/question
+  signals are released on every exit. Tests cover budgets, no-progress and
+  repeated questions, provider errors, untrusted/no-relevant-code operations,
+  scope-changing answers, revocation during questions or provider work, and
+  late completions.
+- Prompt-refinement result review and apply policy
+  (`prompt-refinement-review.ts`): the accepted candidate is re-validated at
+  the hand-back boundary and checked for composer readiness — non-empty, within
+  the hard size cap (over-cap is refused, never truncated), no explicit
+  truncation marker, no first-person implementation/verification claim and no
+  chat preamble posing as the prompt. Transport wrappers are stripped only when
+  they unambiguously wrap the whole text (`/prompt` prefix, short
+  "Here is the refined prompt:" label, whole-text Markdown fence or result-JSON
+  envelope, trailing sign-off), so headings, lists, quotes, inline code and
+  fences with a real language remain byte-identical. Original draft, candidate
+  and a short change summary live in a bounded in-memory review store outside
+  the parent conversation; View/Copy expose both texts plus advisory
+  literal/constraint findings (human-review hints, not a semantic guarantee).
+  Ordinary success inserts once without a second approval; a draft changed
+  during refinement is never overwritten — the candidate stays recoverable and
+  only an explicit replacement writes it, re-reading the exact confirmed
+  revision first. Tests cover size boundaries, wrong/missing/extra submission
+  fields, false implementation claims and refusals, malicious prompt text,
+  unapproved over-expansion, wrapper-vs-Markdown stripping, View/Copy and the
+  conflict/replacement policy.
+- Prompt-refinement model settings (`/prompt-model`): validated
+  `workflow.promptRefinement.model` overrides with trusted project/global
+  precedence, an explicit inherit sentinel, per-scope reset, capability/thinking
+  clamping, actionable invalid-setting refusals, serialized atomic writes that
+  preserve unrelated keys, and scoped argument completions. The main session
+  model, roles, profiles and Pi default-model mirror are never modified.
 - Orchestrator multi-repo workspaces: plan/row/tool declarations, per-root
   baselines and attribution, workspace-scoped row/final checks, child cwd
   binding, status/mission visibility, and additive old-snapshot compatibility.
+- Policy-safe inspection primitives: the reviewer's guarded read/grep/find/ls
+  construction now lives in reusable `inspection-policy.ts` + `inspection-tools.ts`.
+  A live authority resolver is re-read for every target and again before async
+  results are exposed (the build-time snapshot is only a ceiling); revoked
+  grants, new exclude/sensitive rules or lost trust refuse the in-flight result.
+  Recursive grep evaluates each enumerated file before reading it and renders
+  structured per-file matches after the final recheck (never the legacy text
+  parser as the boundary); find/ls filter each delegated entry. Symlink/Windows
+  alias escapes, unresolvable existing paths, content/details sizes and
+  temp-output/structured channels are constrained. Glass tests cover excluded
+  descendants, escapes, output modes, leaks, cancellation and mid-flight
+  grant/exclusion/trust changes; Review Mode behavior is unchanged.
 
 # Changelog
 

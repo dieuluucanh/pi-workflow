@@ -36,15 +36,11 @@ import {
   type ReviewTier,
 } from "./utils.ts";
 import {
-  checkReviewerProviderAuth,
-  isParentProviderSurface,
   unconfiguredReviewerProviderMessage,
   type ProviderSeedResult,
 } from "./review-providers.ts";
-import {
-  createInProcessChildSession,
-  type InProcessChildSession,
-} from "./in-process-child.ts";
+import type { InProcessChildSession } from "./in-process-child.ts";
+import { createIsolatedSession } from "./isolated-session.ts";
 
 /** Type-only handle on the Pi SDK. Erased at compile time. */
 export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
@@ -2736,13 +2732,12 @@ export const REVIEW_CHILD_MARKER_ENV = "PI_WORKFLOW_REVIEW_CHILD";
 /**
  * Create the reviewer's in-process child session.
  *
- * Isolation properties that matter:
- * - `noExtensions: true` → the child never loads this or any other extension,
- *   so Review Mode cannot recurse or observe the parent's hooks.
- * - `SessionManager.inMemory(...)` → the child never writes a session file and
- *   never touches the parent's session history.
- * - its own `ModelRuntime` → no contention with the parent's model state.
- * - read-only built-in tools + reviewer-only custom tools.
+ * The general bootstrap (in-memory session/settings, no ambient extensions /
+ * skills / templates / themes, its own ModelRuntime, provider seeding and the
+ * auth preflight, exact active-tool assertion, disposal on failure, no silent
+ * model fallback) lives in `isolated-session.ts`. This wrapper owns only
+ * Review-specific semantics: its system prompt, user guidance, tool allowlist,
+ * provider-auth wording and the legacy anti-recursion marker.
  *
  * Never throws: a failure is returned as `{ ok: false, error }` so the caller
  * can fall back to the author's plan (config.fallbackOnError).
@@ -2751,47 +2746,38 @@ export async function createReviewSession(
   options: CreateReviewSessionOptions,
 ): Promise<CreateReviewSessionResult> {
   const expectedTools = reviewToolAllowlist(options.customTools);
-  const result = await createInProcessChildSession({
+  const result = await createIsolatedSession({
     cwd: options.cwd,
     agentDir: options.agentDir,
     modelRef: options.modelRef,
     findModel: options.findModel,
     parentProviders: options.parentProviders,
     providerRetries: options.providerRetries,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
     systemPrompt: REVIEW_SYSTEM_PROMPT,
-    appendSystemPrompt: [options.reviewPrompt],
+    context: options.reviewPrompt ? [options.reviewPrompt] : [],
     tools: expectedTools,
-    requiredTools: expectedTools,
     customTools: options.customTools,
-    sessionManager: (sdk, sessionId) =>
-      sdk.SessionManager.inMemory(options.cwd, { id: sessionId }),
     sessionIdPrefix: "review",
     markerEnv: REVIEW_CHILD_MARKER_ENV,
-    bindMode: "print",
+    // Review keeps its documented ambient project-context files; its explicit
+    // prompt already carries Plan Mode's context. Refinement defaults to off.
+    noContextFiles: false,
+    label: "reviewer",
     missingModelError: (modelLabel) =>
       `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
-    describeMissingTools: (missing) =>
-      `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
-    authCheck: async ({ modelRuntime, providerSeed }) => {
-      const auth = await checkReviewerProviderAuth(
-        modelRuntime,
-        options.modelRef.provider,
-      );
-      if (auth.configured) return { ok: true };
-      return {
-        ok: false,
-        error: unconfiguredReviewerProviderMessage({
-          providerId: options.modelRef.provider,
-          seed: providerSeed,
-          parentSurfaceFound: isParentProviderSurface(options.parentProviders),
-          modelsJsonPath: path.join(options.agentDir, "models.json"),
-        }),
-      };
-    },
+    describeToolMismatch: (mismatch) =>
+      `reviewer tools are not active: ${mismatch.missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan${
+        mismatch.unexpected.length > 0
+          ? ` (unexpected: ${mismatch.unexpected.join(", ")})`
+          : ""
+      }`,
+    describeProviderAuthFailure: ({ providerId, seed, parentSurfaceFound }) =>
+      unconfiguredReviewerProviderMessage({
+        providerId,
+        seed,
+        parentSurfaceFound,
+        modelsJsonPath: path.join(options.agentDir, "models.json"),
+      }),
     loadSdk: options.loadSdk,
   });
 
