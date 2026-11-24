@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ORCHESTRATOR_CHILD_VERSION,
   buildOrchestratorChildKickoff,
   buildOrchestratorChildSystemPrompt,
   parseOrchestratorChildContext,
@@ -9,7 +10,7 @@ import {
 } from "./orchestrator-child-contract.ts";
 
 const context: OrchestratorChildContext = {
-  version: 1,
+  version: ORCHESTRATOR_CHILD_VERSION,
   runId: "run-1",
   taskId: "task-1",
   attemptId: "attempt-1",
@@ -22,10 +23,6 @@ const context: OrchestratorChildContext = {
     id: "D",
     root: "C:/work/D",
     primary: false,
-    roots: [
-      { id: "W", root: "C:/work/W", primary: true },
-      { id: "D", root: "C:/work/D", primary: false },
-    ],
   },
   createdAt: 1,
 };
@@ -35,34 +32,53 @@ test("child context accepts an optional workspace and rejects a malformed one", 
   assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
   if (!parsed.ok) return;
   assert.equal(parsed.context.workspace?.id, "D");
+  assert.equal(parsed.context.workspace?.root, "C:/work/D");
   const invalid = parseOrchestratorChildContext({ ...context, workspace: { id: "D" } });
   assert.equal(invalid.ok, false);
 });
 
-test("child system prompt names its root and every run root", () => {
-  const prompt = buildOrchestratorChildSystemPrompt(context);
-  assert.match(prompt, /C:\/work\/D/);
-  assert.match(prompt, /W=C:\/work\/W/);
-  assert.match(prompt, /D=C:\/work\/D/);
-  assert.doesNotMatch(prompt, new RegExp(["same", "workspace", "as", "the", "Orchestrator", "parent"].join(" ")));
+test("child context fails closed on an older prompt-contract version", () => {
+  const parsed = parseOrchestratorChildContext({ ...context, version: 1 });
+  assert.equal(parsed.ok, false);
+  if (parsed.ok) return;
+  assert.match(parsed.reason, /unsupported orchestrator-child version 1/);
 });
 
-test("kickoff carries the workspace section and row metadata", () => {
+test("child system prompt names only its own root", () => {
+  const prompt = buildOrchestratorChildSystemPrompt(context);
+  assert.match(prompt, /C:\/work\/D/);
+  assert.match(prompt, /Other roots belong to other rows/);
+  assert.doesNotMatch(prompt, /C:\/work\/W/, "a later row's root is not advertised");
+  assert.doesNotMatch(prompt, /frozen row/i);
+  assert.doesNotMatch(prompt, /parent verifies and accepts/i);
+});
+
+test("kickoff carries the row root and the parent instruction, with no acceptance sections", () => {
   const kickoff = buildOrchestratorChildKickoff({
     context,
     row: {
-      id: "todo-1",
       ref: "1",
       text: "Implement D",
-      source: "plan",
-      acceptanceChecks: ["npm test"],
-      expectedFiles: ["src/d.ts"],
-      status: "pending",
+      instruction: "Touch only src/d.ts.",
+      workspace: { id: "D", root: "C:/work/D" },
     },
   });
   assert.match(kickoff, /## Workspace/);
   assert.match(kickoff, /Root: C:\/work\/D/);
-  assert.match(kickoff, /W=C:\/work\/W/);
-  assert.match(kickoff, /npm test/);
-  assert.match(kickoff, /src\/d\.ts/);
+  assert.match(kickoff, /## Parent instructions\nTouch only src\/d\.ts\./);
+  assert.match(kickoff, /parent trusts your report/i);
+  assert.doesNotMatch(kickoff, /Acceptance checks/);
+  assert.doesNotMatch(kickoff, /Expected files/);
+  assert.doesNotMatch(kickoff, /Run roots:/);
+});
+
+test("a repair round names the concrete blocker without claiming acceptance", () => {
+  const kickoff = buildOrchestratorChildKickoff({
+    context,
+    row: { ref: "1", text: "Implement D" },
+    repair: "typecheck failed at src/d.ts:12",
+  });
+  assert.match(kickoff, /## Repair round/);
+  assert.match(kickoff, /typecheck failed at src\/d\.ts:12/);
+  assert.doesNotMatch(kickoff, /acceptance/i);
 });

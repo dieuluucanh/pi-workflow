@@ -3,12 +3,32 @@ import assert from "node:assert/strict";
 
 import {
   createOrchestratorRun,
+  markRunInterrupted,
   nextPendingRow,
   recordDispatch,
   recordReport,
   restoreOrchestratorRun,
   setRunPhase,
+  workspaceForRow,
 } from "./orchestrator-run.ts";
+import type { OrchestratorRunWorkspace } from "./orchestrator-run.ts";
+
+const WORKSPACES: OrchestratorRunWorkspace[] = [
+  {
+    id: "W",
+    root: "C:/repo/main",
+    kind: "git",
+    displayPath: ".",
+    primary: true,
+  },
+  {
+    id: "B",
+    root: "C:/repo/other",
+    kind: "git",
+    displayPath: "C:/repo/other",
+    primary: false,
+  },
+];
 
 test("run: steps become stable rows and a dispatch/report round-trips", () => {
   const run = createOrchestratorRun({
@@ -60,4 +80,135 @@ test("run: a corrupt or foreign record is ignored, never half-restored", () => {
   assert.equal(restoreOrchestratorRun(undefined), undefined);
   assert.equal(restoreOrchestratorRun({ schemaVersion: 99 }), undefined);
   assert.equal(restoreOrchestratorRun({ schemaVersion: 1, runId: "x", rows: [] }), undefined);
+});
+
+test("run: workspaces default a bare step to the primary root and round-trip", () => {
+  const run = createOrchestratorRun({
+    title: "Two repos",
+    workspaces: WORKSPACES,
+    steps: [
+      "Root step",
+      { text: "Other repo step", workspace: "B" },
+      { text: "Explicit primary", workspace: "W" },
+    ],
+  });
+  assert.deepEqual(run.workspaces, WORKSPACES);
+  assert.deepEqual(
+    run.rows.map((row) => [row.workspaceId, row.cwd]),
+    [
+      ["W", "C:/repo/main"],
+      ["B", "C:/repo/other"],
+      ["W", "C:/repo/main"],
+    ],
+  );
+  assert.equal(workspaceForRow(run, run.rows[1])?.root, "C:/repo/other");
+  assert.deepEqual(restoreOrchestratorRun(JSON.parse(JSON.stringify(run))), run);
+});
+
+test("run: an undeclared step workspace is refused, with or without a set", () => {
+  assert.throws(
+    () =>
+      createOrchestratorRun({
+        title: "Bad",
+        workspaces: WORKSPACES,
+        steps: [{ text: "Nope", workspace: "Z" }],
+      }),
+    /Unknown workspace "Z" on step 1; declared workspaces: W, B\./,
+  );
+  assert.throws(
+    () =>
+      createOrchestratorRun({
+        title: "No set",
+        steps: [{ text: "Nope", workspace: "W" }],
+      }),
+    /Unknown workspace "W" on step 1; declared workspaces: none declared\./,
+  );
+});
+
+test("run: dispatch records the row workspace and cwd, clearing the blocked reason", () => {
+  const run = createOrchestratorRun({
+    title: "Two repos",
+    workspaces: WORKSPACES,
+    steps: ["Root step", { text: "Other repo step", workspace: "B" }],
+  });
+  const blocked = markRunInterrupted(run, { reason: "child crashed", now: 42 });
+  assert.equal(blocked.phase, "interrupted");
+  assert.equal(blocked.blockedReason, "child crashed");
+  assert.equal(blocked.updatedAt, 42);
+
+  const dispatched = recordDispatch(blocked, {
+    rowRef: "2",
+    instruction: "Re-run it.",
+    cwd: "C:/repo/other",
+    workspaceId: "B",
+  });
+  assert.equal(dispatched.phase, "running");
+  assert.equal(dispatched.blockedReason, undefined);
+  assert.equal(dispatched.rows[1]?.workspaceId, "B");
+  assert.equal(dispatched.rows[1]?.cwd, "C:/repo/other");
+});
+
+test("run: interrupted, cancelled and paused phases survive a restore", () => {
+  const run = createOrchestratorRun({ title: "Phases", steps: ["Only step"] });
+  const interrupted = markRunInterrupted(run);
+  assert.match(interrupted.blockedReason ?? "", /did not survive the reload/);
+
+  for (const phase of ["interrupted", "cancelled", "paused"] as const) {
+    const phased = setRunPhase(interrupted, phase);
+    const restored = restoreOrchestratorRun(JSON.parse(JSON.stringify(phased)));
+    assert.equal(restored?.phase, phase);
+  }
+  assert.equal(restoreOrchestratorRun({ ...JSON.parse(JSON.stringify(interrupted)) })?.phase, "interrupted");
+  const cancelledFromIdle = restoreOrchestratorRun({
+    schemaVersion: 1,
+    runId: "run-x",
+    title: "x",
+    phase: "cancelled",
+    rows: [{ ref: "1", text: "One" }],
+  });
+  assert.equal(cancelledFromIdle?.phase, "cancelled", "a reload must not revive a cancelled run as idle");
+});
+
+test("run: an old v1 record without workspaces still restores", () => {
+  const restored = restoreOrchestratorRun({
+    schemaVersion: 1,
+    runId: "run-old",
+    title: "Old run",
+    phase: "running",
+    rows: [{ ref: "1", text: "One", instruction: "Go", lastReport: "Done", lastReportAt: 7 }],
+    createdAt: 1,
+    updatedAt: 2,
+  });
+  assert.deepEqual(restored?.rows, [
+    { ref: "1", text: "One", instruction: "Go", lastReport: "Done", lastReportAt: 7 },
+  ]);
+  assert.equal(restored?.workspaces, undefined);
+});
+
+test("run: a corrupt workspace entry is dropped, not half-restored", () => {
+  const restored = restoreOrchestratorRun({
+    schemaVersion: 1,
+    runId: "run-ws",
+    title: "Broken set",
+    phase: "idle",
+    workspaces: [
+      { id: "W", root: "C:/repo/main", kind: "git", primary: true },
+      { id: "", root: "C:/repo/broken" },
+      { id: "B", root: "   " },
+      { id: "W", root: "C:/repo/duplicate", kind: "git" },
+      "not-an-object",
+    ],
+    rows: [{ ref: "1", text: "One", workspaceId: "B", cwd: "C:/repo/ghost" }],
+  });
+  assert.equal(
+    restored?.workspaces?.length,
+    1,
+    "invalid and duplicate entries are dropped, never half-restored",
+  );
+  assert.equal(restored?.workspaces?.[0]?.id, "W");
+  assert.equal(
+    restored?.rows[0]?.workspaceId,
+    undefined,
+    "a row reference to a dropped workspace is not kept",
+  );
 });

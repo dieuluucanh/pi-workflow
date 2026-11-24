@@ -5,23 +5,23 @@
  * the argument surface:
  *
  *   status | start [path] | pause | resume | abort | stop | retry |
- *   inspect [taskId] | view [child|parent|auto] | say <text> | cancel | help
+ *   inspect [rowRef] | view [child|parent|auto] | say <text> | cancel | help
  *
- * The run is a durable journal plus one in-process Build child. There is no
- * preview, approve, refine or execution-approval verb: the plan approval is the
- * only decision. `start` is handled by the command host, which owns the frozen
- * list; this module reports and controls an already-bound run.
+ * The run is the session's `OrchestratorRun` record plus one in-process Build
+ * child. There is no preview, approve, refine or acceptance verb: the plan
+ * approval is the only decision. `start` is a model tool; this module reports
+ * and controls an already-bound run.
  */
 
-export const OPERATOR_SCHEMA_VERSION = 2 as const;
-export const MAX_SAY_CHARS = 2_000;
-
-import { rowForTask, taskCounts } from "./orchestrator-state.ts";
 import {
   formatChildStatusLine,
   modelRefFromLabel,
   sanitizeStatLine,
 } from "./child-stats.ts";
+import type { OrchestratorRun, OrchestratorRunPhase } from "./orchestrator-run.ts";
+
+export const OPERATOR_SCHEMA_VERSION = 3 as const;
+export const MAX_SAY_CHARS = 2_000;
 
 export const OPERATOR_VERBS = [
   "status",
@@ -76,8 +76,17 @@ export interface OperatorChildSnapshot {
 
 export type OperatorView = "auto" | "parent" | "child";
 
+/** One row of the parent's plain TODO list, as the operator sees it. */
+export interface OperatorTodoRow {
+  ref: string;
+  text: string;
+  completed: boolean;
+}
+
 export interface OperatorRuntimePorts {
-  runtime: () => import("./orchestrator-runtime.ts").OrchestratorRuntime | undefined;
+  run: () => OrchestratorRun | undefined;
+  /** The live TODO list; completion decides whether a row is done. */
+  todos?: () => OperatorTodoRow[];
   now?: () => number;
   /** The live in-process child, when one exists. */
   child?: () => OperatorChildSnapshot | undefined;
@@ -88,12 +97,10 @@ export interface OperatorRuntimePorts {
   deliver?: (text: string) => Promise<{ ok: boolean; queued?: boolean; error?: string }>;
   view?: () => OperatorView;
   setView?: (view: OperatorView) => void;
-  /** HEAD-aware diff for `inspect`, when a baseline exists. */
-  diff?: (
-    taskId: string,
-  ) => Promise<{ committedPaths: string[]; dirtyPaths: string[] } | undefined>;
-  /** Start a fresh child for a pending/blocked row (resume/retry recovery). */
-  dispatchRow?: (taskId: string) => Promise<{ ok: boolean; text: string }>;
+  /** Record a run phase change (pause/resume/abort/stop). */
+  setPhase?: (phase: OrchestratorRunPhase) => void;
+  /** Re-dispatch the current or named row with its stored instruction. */
+  retry?: (rowRef?: string) => Promise<{ ok: boolean; text: string }>;
 }
 
 export interface OperatorResult {
@@ -112,8 +119,8 @@ function childLine(child: OperatorChildSnapshot | undefined): string | undefined
     child.modelRef ??
     (child.modelLabel ? modelRefFromLabel(child.modelLabel) : undefined);
   // Unlike the one-row footer and the composer border, this is a multi-line
-  // report: naming the frozen row and the child's own todo progress is useful
-  // and nothing is competing for the width.
+  // report: naming the row and the child's own todo progress is useful and
+  // nothing is competing for the width.
   const line = formatChildStatusLine(
     {
       ...(child.ref ? { ref: child.ref } : {}),
@@ -137,13 +144,16 @@ function childLine(child: OperatorChildSnapshot | undefined): string | undefined
   return `${line}${error}`;
 }
 
-export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRuntime {
-  const now = ports.now ?? (() => Date.now());
+/** Rows the TODO list reports complete, keyed by run ref. */
+function completedRefs(rows: readonly OperatorTodoRow[]): Set<string> {
+  return new Set(rows.filter((row) => row.completed).map((row) => row.ref));
+}
 
+export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRuntime {
   return {
     async run(args: string): Promise<OperatorResult> {
       const parsed = parseOperatorArgs(args);
-      const owner = ports.runtime();
+      const run = ports.run();
       const child = ports.child?.();
       const fail = (text: string): OperatorResult => ({
         ok: false,
@@ -154,10 +164,10 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         ok: true,
         verb: parsed.verb,
         text: [
-          "Usage: /orchestrator [status|start [path]|pause|resume|abort|stop|retry|inspect [taskId]|view [child|parent|auto]|say <text>|cancel]",
-          "Bare /orchestrator enters the mode. Start freezes the approved plan into one TODO row per step and runs the first in-process Build child; there is no second breakdown approval.",
+          "Usage: /orchestrator [status|start [path]|pause|resume|abort|stop|retry|inspect [rowRef]|view [child|parent|auto]|say <text>|cancel]",
+          "Bare /orchestrator enters the mode. Start is the model tool orchestrator_start: it records one row per plan step and the parent dispatches them one at a time.",
           "Aliases: /orchestrator-pause, /orchestrator-resume, /orchestrator-abort, /orchestrator-view.",
-          "While a Builder owns the composer: Esc (or /orchestrator-pause) pauses; /orchestrator-resume continues; /orchestrator-abort stops. Repeated Esc never aborts.",
+          "While a child owns the composer: Esc (or /orchestrator-pause) pauses; /orchestrator-resume continues; /orchestrator-abort stops. Repeated Esc never aborts.",
         ].join("\n"),
       });
 
@@ -179,79 +189,68 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         };
       }
 
-      if (!owner) {
+      if (!run) {
         return fail(
-          "No orchestrator run is bound yet. Run /orchestrator start [path] (or agree the steps and let the model call orchestrator_start). Nothing was launched.",
+          "No Orchestrator run is bound. Call orchestrator_start with the approved steps, or restart from the approved plan. Nothing was launched.",
         );
       }
-      const view = owner.view();
-      if (!view) return fail("No orchestrator run is bound.");
+
+      const rows = ports.todos?.() ?? [];
+      const doneRefs = completedRefs(rows);
+      const done = run.rows.filter((row) => doneRefs.has(row.ref)).length;
+      const total = run.rows.length;
+      const next = run.rows.find((row) => !doneRefs.has(row.ref));
+      const target = (): string | undefined =>
+        parsed.rest.trim() || run.currentRef || next?.ref;
 
       switch (parsed.verb) {
         case "status": {
-          const counts = taskCounts(view.state);
           const line = childLine(child);
           return {
             ok: true,
             verb: parsed.verb,
             text: [
-              `run ${view.runId} · ${view.phase}`,
-              view.plan
-                ? `plan ${view.plan.path} (digest ${view.plan.digest.slice(0, 12)})`
-                : `standalone: ${view.todos.source.title}`,
-              `${counts.accepted}/${counts.total} accepted · ${counts.pending} pending · ${counts.running} in flight · ${counts.blocked} blocked`,
-              ...(view.todos.workspaces && view.todos.workspaces.length > 0
-                ? [`workspaces: ${view.todos.workspaces.map((workspace) => `${workspace.id}=${workspace.root}${workspace.primary ? " (primary)" : ""}`).join(" · ")}`]
+              `run ${run.runId} · ${run.phase}`,
+              run.planPath ? `plan ${run.planPath}` : `standalone: ${run.title}`,
+              `${done}/${total} rows done${next ? ` · next ${next.ref}` : ""}`,
+              ...(run.workspaces && run.workspaces.length > 0
+                ? [
+                    `workspaces: ${run.workspaces
+                      .map(
+                        (workspace) =>
+                          `${workspace.id}=${workspace.root}${workspace.primary ? " (primary)" : ""}`,
+                      )
+                      .join(" · ")}`,
+                  ]
                 : []),
               ...(line ? [line] : []),
-              ...(view.blockedReason ? [`blocked: ${view.blockedReason}`] : []),
-              ...(view.nextTaskId ? [`next: ${view.nextTaskId}`] : []),
+              ...(run.blockedReason ? [`blocked: ${run.blockedReason}`] : []),
+              ...(next ? [`next row: ${next.ref} — ${next.text.slice(0, 200)}`] : ["every row is done"]),
             ].join("\n"),
           };
         }
 
         case "start": {
           return fail(
-            view.nextTaskId
-              ? `Run ${view.runId} is already bound; ${view.nextTaskId} is the next frozen row. Use /orchestrator retry if it is not dispatched.`
-              : `Run ${view.runId} is ${view.phase}; there is no pending row to start.`,
+            run.rows.length > 0
+              ? `Run ${run.runId} is already bound. Start a new run only after the current one is cancelled or completed; otherwise dispatch the next row or retry the current one.`
+              : `Run ${run.runId} has no rows. Call orchestrator_start with the plan's steps.`,
           );
         }
 
         case "pause": {
-          if (
-            view.phase === "completed" ||
-            view.phase === "cancelled" ||
-            view.phase === "failed"
-          ) {
-            return fail(`The run is ${view.phase}; it cannot be paused.`);
+          if (run.phase === "completed" || run.phase === "cancelled") {
+            return fail(`The run is ${run.phase}; it cannot be paused.`);
           }
-          // Reconcile a durable "paused" whose child is still running (a
-          // transition raced the pause). A truly paused run stays idempotent.
-          if (view.phase === "paused" && (!child || child.phase !== "running")) {
-            return fail("The run is already paused.");
+          if (child?.phase === "paused") return fail("The run is already paused.");
+          if (!child || (child.phase !== "running" && child.phase !== "starting")) {
+            return fail("No live child to pause; the run is already idle.");
           }
           const paused = await ports.pauseChild?.();
           if (!paused) {
-            return fail(
-              child
-                ? "The child could not be paused; the run was left unchanged."
-                : "No live child to pause; the warm session is already gone.",
-            );
+            return fail("The child could not be paused; the run was left unchanged.");
           }
-          if (view.phase !== "paused") {
-            const transitioned = await owner.applyEvent({
-              type: "run.transition",
-              runId: view.runId,
-              now: now(),
-              to: "paused",
-            });
-            if (!transitioned.ok) {
-              return fail(
-                `The child is paused, but the run could not record it: ${transitioned.error}`,
-              );
-            }
-          }
+          ports.setPhase?.("paused");
           return {
             ok: true,
             verb: parsed.verb,
@@ -261,88 +260,38 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
 
         case "resume": {
           if (child && (child.phase === "paused" || child.phase === "settling")) {
-            const moved = view.phase === "paused";
-            if (moved) {
-              const transitioned = await owner.applyEvent({
-                type: "run.transition",
-                runId: view.runId,
-                now: now(),
-                to: "running",
-              });
-              if (!transitioned.ok) {
-                return fail(`Cannot resume ${view.runId}: ${transitioned.error}`);
-              }
-            }
-            // Admission is bounded and short: it starts the prompt, it does not
-            // wait for the whole resumed row (a new Esc must stay responsive).
             const resumed = await ports.resumeChild?.(parsed.rest || undefined);
             if (!resumed) {
-              if (moved) {
-                const back = await owner.applyEvent({
-                  type: "run.transition",
-                  runId: view.runId,
-                  now: now(),
-                  to: "paused",
-                });
-                return fail(
-                  back.ok
-                    ? "The child could not be resumed; the run was returned to paused."
-                    : "The child could not be resumed and the run phase needs /orchestrator status.",
-                );
-              }
               return fail(
                 "The child could not be resumed; /orchestrator retry starts a fresh one.",
               );
             }
+            ports.setPhase?.("running");
             return { ok: true, verb: parsed.verb, text: "Child resumed." };
           }
-          // No warm child: recover a blocked/repaired row with a fresh child.
-          const target =
-            view.state.order.find((id) => {
-              const task = view.state.tasks[id];
-              return task?.state === "blocked" || task?.state === "needs_fix";
-            }) ?? view.nextTaskId;
-          if (!target) return fail(`The run is ${view.phase} and there is no row to resume.`);
-          if (view.phase === "blocked" || view.phase === "paused") {
-            await owner.applyEvent({
-              type: "run.transition",
-              runId: view.runId,
-              now: now(),
-              to: "ready",
-            });
+          const rowRef = target();
+          if (!rowRef) {
+            return fail(`The run is ${run.phase} and every row is done.`);
           }
-          const task = view.state.tasks[target];
-          if (task?.state === "blocked" || task?.state === "needs_fix") {
-            const retried = await owner.applyEvent({
-              type: "task.retry",
-              runId: view.runId,
-              now: now(),
-              taskId: target,
-            });
-            if (!retried.ok) return fail(`Cannot resume ${target}: ${retried.error}`);
+          const retried = await ports.retry?.(rowRef);
+          if (retried?.ok) {
+            return {
+              ok: true,
+              verb: parsed.verb,
+              text: `Fresh child started for row ${rowRef}.\n${retried.text}`,
+            };
           }
-          const dispatched = await ports.dispatchRow?.(target);
-          return dispatched?.ok
-            ? { ok: true, verb: parsed.verb, text: `Fresh child started for ${target}.\n${dispatched.text}` }
-            : fail(
-                dispatched
-                  ? `Could not start ${target}: ${dispatched.text}`
-                  : `No child dispatcher is bound; ${target} is queued again.`,
-              );
+          return fail(
+            retried
+              ? `Could not start row ${rowRef}: ${retried.text}`
+              : `No child dispatcher is bound; row ${rowRef} stays pending.`,
+          );
         }
 
         case "abort": {
           if (!child) return fail("No Orchestrator child is active.");
           await ports.abortChild?.("user abort");
-          const after = owner.view();
-          if (after && after.phase !== "paused" && after.phase !== "cancelled") {
-            await owner.applyEvent({
-              type: "run.transition",
-              runId: after.runId,
-              now: now(),
-              to: "paused",
-            });
-          }
+          ports.setPhase?.("paused");
           return {
             ok: true,
             verb: parsed.verb,
@@ -353,40 +302,31 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         case "stop":
         case "cancel": {
           await ports.stopChild?.();
-          const cancelled = await owner.cancel(
-            parsed.verb === "stop" ? "operator stop" : "operator cancel",
-          );
-          return cancelled.ok
-            ? { ok: true, verb: parsed.verb, text: "Run cancelled and the child disposed. Edits and history are preserved." }
-            : fail(`Cannot cancel: ${cancelled.error}`);
+          ports.setPhase?.("cancelled");
+          return {
+            ok: true,
+            verb: parsed.verb,
+            text: "Run cancelled and the child disposed. Edits and history are preserved.",
+          };
         }
 
         case "inspect": {
-          const taskId = parsed.rest || view.nextTaskId;
-          if (!taskId) return fail("No task is active; pass a task id.");
-          const task = view.state.tasks[taskId];
-          if (!task) return fail(`Unknown task ${taskId}.`);
-          const row = rowForTask(view.state, taskId);
-          let diffLine: string | undefined;
-          if (ports.diff) {
-            try {
-              const diff = await ports.diff(taskId);
-              if (diff) {
-                diffLine = `changed: ${[...diff.committedPaths, ...diff.dirtyPaths].slice(0, 20).join(", ") || "(none)"}`;
-              }
-            } catch {
-              diffLine = "changed: (diff unavailable)";
-            }
-          }
+          const rowRef = target();
+          if (!rowRef) return fail("No row is active; pass a row ref.");
+          const row = run.rows.find((entry) => entry.ref === rowRef);
+          if (!row) return fail(`Unknown row ${rowRef}.`);
+          const workspace = run.workspaces?.find(
+            (entry) => entry.id === row.workspaceId,
+          );
           return {
             ok: true,
             verb: parsed.verb,
             text: [
-              `${task.taskId} · ${task.state}${task.blockedReason ? ` · blocked: ${task.blockedReason}` : ""}`,
-              `row ${row?.ref ?? "?"}: ${(row?.text ?? "").slice(0, 400)}`,
-              `checks: ${row?.acceptanceChecks.join("; ") || "(none)"}`,
-              `files: ${row?.expectedFiles.join(", ") || "(none)"}`,
-              `repairs ${task.repairRounds}`,
+              `row ${row.ref} · ${run.phase}`,
+              `root: ${row.cwd ?? workspace?.root ?? "(session root)"}${workspace ? ` (id ${workspace.id}${workspace.primary ? ", primary" : ""})` : ""}`,
+              `text: ${row.text.slice(0, 800)}`,
+              `instruction: ${(row.instruction ?? "(not dispatched yet)").slice(0, 800)}`,
+              `last report: ${(row.lastReport ?? "(none)").slice(0, 1_200)}`,
               ...(childLine(child) ? [childLine(child)!] : []),
               ...(child && child.todos.length > 0
                 ? [
@@ -396,7 +336,6 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
                       .join(" | ")}`,
                   ]
                 : []),
-              ...(diffLine ? [diffLine] : []),
               ...(child?.lastError ? [`child error: ${child.lastError.slice(0, 300)}`] : []),
             ].join("\n"),
           };
@@ -425,36 +364,19 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "retry": {
-          const target = view.state.order.find((id) => {
-            const task = view.state.tasks[id];
-            return task?.state === "blocked" || task?.state === "needs_fix";
-          }) ?? view.nextTaskId;
-          if (!target) return fail("There is no blocked, repaired or pending row to retry.");
-          const task = view.state.tasks[target];
-          if (view.phase === "blocked" || view.phase === "paused") {
-            await owner.applyEvent({
-              type: "run.transition",
-              runId: view.runId,
-              now: now(),
-              to: "ready",
-            });
-          }
-          if (task?.state === "blocked" || task?.state === "needs_fix") {
-            const retried = await owner.applyEvent({
-              type: "task.retry",
-              runId: view.runId,
-              now: now(),
-              taskId: target,
-            });
-            if (!retried.ok) return fail(`Cannot retry ${target}: ${retried.error}`);
-          }
-          const dispatched = await ports.dispatchRow?.(target);
-          return dispatched?.ok
-            ? { ok: true, verb: parsed.verb, text: `Fresh child started for ${target}.\n${dispatched.text}` }
+          const rowRef = target();
+          if (!rowRef) return fail("There is no row to retry.");
+          const retried = await ports.retry?.(rowRef);
+          return retried?.ok
+            ? {
+                ok: true,
+                verb: parsed.verb,
+                text: `Fresh child started for row ${rowRef}.\n${retried.text}`,
+              }
             : fail(
-                dispatched
-                  ? `Could not start ${target}: ${dispatched.text}`
-                  : `Run is ready; no child dispatcher is bound, so ${target} stays queued.`,
+                retried
+                  ? `Could not start row ${rowRef}: ${retried.text}`
+                  : `No child dispatcher is bound, so row ${rowRef} stays pending.`,
               );
         }
 

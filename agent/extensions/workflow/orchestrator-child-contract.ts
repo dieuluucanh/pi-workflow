@@ -13,11 +13,17 @@
  *    message (JSON text), so a host that writes either shape still works.
  */
 
-import type { FrozenTodoRow } from "./todo-snapshot.ts";
-
 /** Custom-entry type written into the child's in-memory session. */
 export const ORCHESTRATOR_CHILD_ENTRY = "workflow-orchestrator-child";
-export const ORCHESTRATOR_CHILD_VERSION = 1 as const;
+export const ORCHESTRATOR_CHILD_VERSION = 2 as const;
+
+/** One run row as the child receives it; the parent's instruction is separate. */
+export interface ChildRow {
+  ref: string;
+  text: string;
+  instruction?: string;
+  workspace?: { id: string; root: string };
+}
 
 export interface OrchestratorChildContext {
   version: typeof ORCHESTRATOR_CHILD_VERSION;
@@ -33,12 +39,11 @@ export interface OrchestratorChildContext {
   mode: "build";
   /** A child may never start its own orchestration run. */
   mayOrchestrate: false;
-  /** The row's bound root and the run's other roots, for prompt context. */
+  /** The single root this row targets; other roots belong to other rows. */
   workspace?: {
     id: string;
     root: string;
     primary: boolean;
-    roots: Array<{ id: string; root: string; primary: boolean }>;
   };
   createdAt: number;
 }
@@ -107,28 +112,13 @@ export function parseOrchestratorChildContext(
   let workspace: OrchestratorChildContext["workspace"];
   if (raw.workspace !== undefined) {
     if (!isRecord(raw.workspace)) return { ok: false, reason: "invalid workspace context" };
-    const id = stringField("workspace", 24);
-    void id;
     const workspaceId = typeof raw.workspace.id === "string" ? raw.workspace.id.trim() : "";
     const root = typeof raw.workspace.root === "string" ? raw.workspace.root.trim() : "";
     if (!workspaceId || !root) return { ok: false, reason: "invalid workspace context" };
-    const rootsRaw = raw.workspace.roots;
-    const roots = Array.isArray(rootsRaw)
-      ? rootsRaw
-          .filter((entry): entry is Record<string, unknown> => isRecord(entry))
-          .map((entry) => ({
-            id: typeof entry.id === "string" ? entry.id.trim() : "",
-            root: typeof entry.root === "string" ? entry.root.trim() : "",
-            primary: entry.primary === true,
-          }))
-          .filter((entry) => entry.id.length > 0 && entry.root.length > 0)
-          .slice(0, 8)
-      : [];
     workspace = {
       id: workspaceId,
       root,
       primary: raw.workspace.primary === true,
-      roots,
     };
   }
   return {
@@ -224,9 +214,9 @@ export function buildOrchestratorChildSystemPrompt(
 ): string {
   return [
     "[ORCHESTRATOR BUILD CHILD]",
-    `You are the Build child for frozen row ${context.ref}/${context.total} of run ${context.runId} (${context.taskId}).`,
+    `You are the Build child for row ${context.ref}/${context.total} of run ${context.runId} (${context.taskId}).`,
     context.workspace
-      ? `Your workspace root is ${context.workspace.root} (id ${context.workspace.id}). The run also measures: ${context.workspace.roots.map((root) => `${root.id}=${root.root}`).join(", ")}.`
+      ? `Your workspace root is ${context.workspace.root} (id ${context.workspace.id}). Other roots belong to other rows; do not edit them.`
       : "You work inside the same Pi process as the Orchestrator parent.",
     "",
     "Rules:",
@@ -236,13 +226,13 @@ export function buildOrchestratorChildSystemPrompt(
     "- Do not ask the user to switch modes or to use /build. You already have full Build tools and policies.",
     "- Do not ask the user questions; if a decision is genuinely ambiguous, choose the safest reasonable assumption and state it in your final summary.",
     "- Use read/edit/write/bash/grep/find/ls normally. The normal write, folder, read, commit and shell policies apply.",
-    "- When the row is done, stop with a short summary of what changed, the files touched, and the checks you ran. The parent verifies and accepts; do not claim acceptance.",
+    "- When the row is done, stop with a short summary of what changed, the files touched and exactly what you ran to verify it. The parent trusts your report; do not claim acceptance.",
   ].join("\n");
 }
 
 export interface OrchestratorChildKickoffInput {
   context: OrchestratorChildContext;
-  row: FrozenTodoRow;
+  row: ChildRow;
   /** Concrete failure from the previous attempt, for a repair round. */
   repair?: string;
 }
@@ -261,32 +251,25 @@ export function buildOrchestratorChildKickoff(
   input: OrchestratorChildKickoffInput,
 ): string {
   const { context, row } = input;
-  const checks = row.acceptanceChecks.length
-    ? row.acceptanceChecks.map((check, i) => `${i + 1}. ${check}`).join("\n")
-    : "(none — the parent uses the diff-presence gate)";
-  const files = row.expectedFiles.length
-    ? row.expectedFiles.map((file) => `- ${file}`).join("\n")
-    : "(not specified)";
   const workspace = context.workspace
     ? [
         "## Workspace",
         `Root: ${context.workspace.root} (id ${context.workspace.id})`,
-        "Run roots: " +
-          context.workspace.roots
-            .map((root) => `${root.id}=${root.root}${root.primary ? " (primary)" : ""}`)
-            .join(", "),
-        "Other roots follow the normal folder/write policy.",
+        "Other roots belong to other rows; do not edit them.",
         "",
       ].join("\n")
+    : "";
+  const instruction = row.instruction?.trim()
+    ? ["## Parent instructions", row.instruction.trim(), ""].join("\n")
     : "";
   const repair = input.repair?.trim()
     ? [
         "",
         "## Repair round",
-        "The previous attempt did not satisfy the parent's verification:",
+        "The previous attempt did not resolve the reported blocker:",
         input.repair.trim().slice(0, 4_000),
         "",
-        "Fix the concrete failure, then finish with a short summary. Do not start over unless the failure requires it.",
+        "Address the concrete problem, then finish with a short summary. Do not start over unless the problem requires it.",
       ].join("\n")
     : "";
   return bound(
@@ -298,22 +281,17 @@ export function buildOrchestratorChildKickoff(
       `Attempt: ${context.attemptId}`,
       "",
       "## Your row",
-      row.label ? `[${row.label}] ${row.text}` : row.text,
+      row.text,
       "",
-      "## Acceptance checks",
-      checks,
-      "",
-      "## Expected files",
-      files,
-      "",
+      instruction,
       workspace,
       "## Protocol",
       "1. Create your task-local TODO list now with `workflow_todo` — one item per real sub-step. Mutations are refused until it exists.",
       "2. Work the list in order. Mark a step completed immediately; keep one in progress.",
-      "3. Run the acceptance checks you can run locally.",
+      "3. Run the verification the row or the plan names, then say exactly what you ran and what it printed.",
       "4. Stop and answer with a concise summary: what changed, files touched, checks run, anything the parent must know.",
       "",
-      "Do not orchestrate, do not edit the parent run, do not ask the user to switch modes, and do not claim acceptance.",
+      "Do not orchestrate, do not edit the parent run, and do not ask the user to switch modes. The parent trusts your report instead of re-verifying it.",
       repair,
     ].join("\n"),
   );

@@ -21,7 +21,7 @@
  */
 
 import type { OrchestratorChildPhase } from "./orchestrator-child-controller.ts";
-import type { RunPhase } from "./orchestrator-types.ts";
+import type { OrchestratorRunPhase } from "./orchestrator-run.ts";
 import type { WorkflowMode } from "./workflow-mode.ts";
 
 /** What is asking for a Reviewer round. */
@@ -36,23 +36,24 @@ export const EXECUTING_CHILD_PHASES: readonly OrchestratorChildPhase[] = [
 ];
 
 /**
- * Frozen-run phases in which the run owns the session (no child required).
- * A paused/blocked run is idle from the user's point of view: they may leave
- * the mode or start a review. Only a live dispatch owns the session.
+ * Run phases in which the run owns the session (no child required).
+ *
+ * Only a live dispatch owns the session. `idle`, `paused`, `interrupted`,
+ * `cancelled` and `completed` are idle from the user's point of view: they may
+ * leave the mode or start a review.
  */
-export const EXECUTING_RUN_PHASES: readonly RunPhase[] = ["running"];
+export const EXECUTING_RUN_PHASES: readonly OrchestratorRunPhase[] = ["running"];
 
 export interface ExecutionOwnershipInput {
   childPhase?: OrchestratorChildPhase;
-  runPhase?: RunPhase;
+  runPhase?: OrchestratorRunPhase;
 }
 
 /**
  * True when an Orchestrator execution currently owns the session.
  *
- * `paused`/`blocked` are included on purpose: a suspended run still owns the
- * session and between-row windows have no live child, so checking only the
- * child would leave a hole.
+ * A live child always owns the session; a run with `running` owns it between
+ * rows, when no child is live yet.
  */
 export function executionOwnsSession(
   input: ExecutionOwnershipInput,

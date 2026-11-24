@@ -22,21 +22,18 @@ import {
   ORCHESTRATOR_SETTINGS_KEY,
   coerceOrchestratorLimits,
   describeOrchestratorLimits,
-  effectiveVerificationTimeoutSeconds,
   extractOrchestratorRaw,
   mergeOrchestratorLimits,
   orchestratorConfigPaths,
   orchestratorFieldSourceOf,
   orchestratorLimitDiagnostics,
+  deprecatedVerificationTimeoutDiagnostics,
   readOrchestratorLimits,
 } from "./orchestrator-config.ts";
 import { DEFAULT_CHILD_TIMEOUT_MS } from "./orchestrator-child-controller.ts";
-import { DEFAULT_GIT_TIMEOUT_MS } from "./check-executor.ts";
+import { DEFAULT_GIT_TIMEOUT_MS } from "./git-bounded.ts";
 import { WORKFLOW_SETTINGS_KEY } from "./review.ts";
-import {
-  HARD_MAX_SHELL_TIMEOUT_SECONDS,
-  DEFAULT_SHELL_MAX_TIMEOUT_SECONDS,
-} from "./shell-guard.ts";
+import { HARD_MAX_SHELL_TIMEOUT_SECONDS } from "./shell-guard.ts";
 import { createOrchestratorChildController } from "./orchestrator-child-controller.ts";
 import { tmpProject } from "./test-support.ts";
 
@@ -53,11 +50,8 @@ function writeSettings(dir: string, value: unknown, project = false): string {
 
 test("orchestrator limits: defaults mirror the execution constants", () => {
   assert.equal(DEFAULT_ORCHESTRATOR_LIMITS.childTimeoutMs, DEFAULT_CHILD_TIMEOUT_MS);
-  assert.equal(
-    DEFAULT_ORCHESTRATOR_LIMITS.verificationTimeoutSeconds,
-    DEFAULT_SHELL_MAX_TIMEOUT_SECONDS,
-  );
   assert.equal(DEFAULT_ORCHESTRATOR_LIMITS.gitTimeoutMs, DEFAULT_GIT_TIMEOUT_MS);
+  assert.deepEqual([...ORCHESTRATOR_LIMIT_KEYS], ["childTimeoutMs", "gitTimeoutMs"]);
 });
 
 test("orchestrator coerce: garbage and missing keys keep the defaults", () => {
@@ -71,41 +65,29 @@ test("orchestrator coerce: garbage and missing keys keep the defaults", () => {
 test("orchestrator coerce: valid values are floored, never widened past the cap", () => {
   const coerced = coerceOrchestratorLimits({
     childTimeoutMs: 1_234.9,
-    verificationTimeoutSeconds: 120.8,
     gitTimeoutMs: 5_000,
   });
   assert.deepEqual(coerced, {
     childTimeoutMs: 1_234,
-    verificationTimeoutSeconds: 120,
     gitTimeoutMs: 5_000,
   });
 
   const capped = coerceOrchestratorLimits({
     childTimeoutMs: HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000 * 10,
-    verificationTimeoutSeconds: HARD_MAX_SHELL_TIMEOUT_SECONDS * 10,
     gitTimeoutMs: HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000 * 10,
   });
   assert.equal(capped.childTimeoutMs, HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000);
-  assert.equal(capped.verificationTimeoutSeconds, HARD_MAX_SHELL_TIMEOUT_SECONDS);
   assert.equal(capped.gitTimeoutMs, HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000);
 });
 
 test("orchestrator coerce: invalid values fall back to the base", () => {
   const base = {
     childTimeoutMs: 10_000,
-    verificationTimeoutSeconds: 30,
     gitTimeoutMs: 20_000,
   };
   for (const bad of ["60000", -1, 0, Number.NaN, Number.POSITIVE_INFINITY, null, {}]) {
     assert.deepEqual(
-      coerceOrchestratorLimits(
-        {
-          childTimeoutMs: bad,
-          verificationTimeoutSeconds: bad,
-          gitTimeoutMs: bad,
-        },
-        base,
-      ),
+      coerceOrchestratorLimits({ childTimeoutMs: bad, gitTimeoutMs: bad }, base),
       base,
     );
   }
@@ -117,8 +99,7 @@ test("orchestrator diagnostics: one entry per invalid present value", () => {
   const diagnostics = orchestratorLimitDiagnostics(
     {
       childTimeoutMs: "soon",
-      verificationTimeoutSeconds: -5,
-      gitTimeoutMs: 1_000,
+      gitTimeoutMs: -5,
       unknownKey: 1,
     },
     "project",
@@ -126,7 +107,7 @@ test("orchestrator diagnostics: one entry per invalid present value", () => {
   assert.equal(diagnostics.length, 2);
   assert.deepEqual(
     diagnostics.map((entry) => entry.key).sort(),
-    ["childTimeoutMs", "verificationTimeoutSeconds"],
+    ["childTimeoutMs", "gitTimeoutMs"],
   );
   for (const entry of diagnostics) {
     assert.equal(entry.scope, "project");
@@ -174,12 +155,11 @@ test("orchestrator extract: only a nested object fragment is read", () => {
 
 test("orchestrator merge: project wins field by field over global and default", () => {
   const merged = mergeOrchestratorLimits(
-    { childTimeoutMs: 1_000, verificationTimeoutSeconds: 60 },
-    { verificationTimeoutSeconds: 30, gitTimeoutMs: 5_000 },
+    { childTimeoutMs: 1_000 },
+    { gitTimeoutMs: 5_000 },
   );
   assert.deepEqual(merged, {
     childTimeoutMs: 1_000,
-    verificationTimeoutSeconds: 30,
     gitTimeoutMs: 5_000,
   });
 });
@@ -219,28 +199,33 @@ test("orchestrator read: global then project from disk, with provenance", () => 
     [WORKFLOW_SETTINGS_KEY]: {
       [ORCHESTRATOR_SETTINGS_KEY]: {
         childTimeoutMs: 60_000,
-        verificationTimeoutSeconds: 120,
       },
     },
   });
   writeSettings(cwd, {
     [WORKFLOW_SETTINGS_KEY]: {
-      [ORCHESTRATOR_SETTINGS_KEY]: { verificationTimeoutSeconds: 45 },
+      [ORCHESTRATOR_SETTINGS_KEY]: {
+        gitTimeoutMs: 45_000,
+        // Removed key: reported, never applied.
+        verificationTimeoutSeconds: 45,
+      },
     },
   }, true);
 
   const resolved = readOrchestratorLimits(cwd, agentDir);
   assert.deepEqual(resolved.config, {
     childTimeoutMs: 60_000,
-    verificationTimeoutSeconds: 45,
-    gitTimeoutMs: DEFAULT_ORCHESTRATOR_LIMITS.gitTimeoutMs,
+    gitTimeoutMs: 45_000,
   });
   assert.equal(resolved.sources.childTimeout, "global");
-  assert.equal(resolved.sources.verificationTimeout, "project");
-  assert.equal(resolved.sources.gitTimeout, "default");
+  assert.equal(resolved.sources.gitTimeout, "project");
   assert.equal(resolved.sources.global, true);
   assert.equal(resolved.sources.project, true);
-  assert.deepEqual(resolved.diagnostics, []);
+  assert.deepEqual(
+    resolved.diagnostics.map((entry) => entry.key),
+    ["verificationTimeoutSeconds"],
+  );
+  assert.match(resolved.diagnostics[0]?.message ?? "", /no longer used/);
 });
 
 test("orchestrator read: corrupt files fall back to defaults without throwing", () => {
@@ -271,24 +256,24 @@ test("orchestrator read: invalid values are reported with their scope", () => {
 
 // ── effective verification deadline ─────────────────────────────────
 
-test("verification deadline: the smallest of setting, shell max and hard cap wins", () => {
-  const config = { ...DEFAULT_ORCHESTRATOR_LIMITS, verificationTimeoutSeconds: 600 };
-  assert.equal(effectiveVerificationTimeoutSeconds(config, 300), 300);
-  assert.equal(effectiveVerificationTimeoutSeconds(config, 900), 600);
-  assert.equal(effectiveVerificationTimeoutSeconds(config, undefined), 600);
-  assert.equal(
-    effectiveVerificationTimeoutSeconds(
-      { ...config, verificationTimeoutSeconds: HARD_MAX_SHELL_TIMEOUT_SECONDS * 2 },
-      HARD_MAX_SHELL_TIMEOUT_SECONDS * 2,
-    ),
-    HARD_MAX_SHELL_TIMEOUT_SECONDS,
+test("a removed verificationTimeoutSeconds is reported, never applied", () => {
+  const diagnostics = deprecatedVerificationTimeoutDiagnostics(
+    { verificationTimeoutSeconds: 900 },
+    "global",
+  );
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0]?.key, "verificationTimeoutSeconds");
+  assert.match(diagnostics[0]?.message ?? "", /no longer used/);
+  assert.deepEqual(
+    deprecatedVerificationTimeoutDiagnostics({ childTimeoutMs: 1 }, "global"),
+    [],
   );
 });
 
 test("describe: one bounded line names every limit", () => {
   const line = describeOrchestratorLimits(DEFAULT_ORCHESTRATOR_LIMITS);
   assert.match(line, /child \d+s/);
-  assert.match(line, /checks \d+s/);
+  assert.doesNotMatch(line, /checks/);
   assert.match(line, /git \d+s/);
 });
 
@@ -337,6 +322,5 @@ test("orchestrator keys match the limits interface", () => {
   assert.deepEqual([...ORCHESTRATOR_LIMIT_KEYS].sort(), [
     "childTimeoutMs",
     "gitTimeoutMs",
-    "verificationTimeoutSeconds",
   ]);
 });

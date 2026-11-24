@@ -13,6 +13,8 @@
  * handler, never by an automatic continuation, retry or compaction.
  */
 
+import { createHash } from "node:crypto";
+
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   SHELL_GUARD_AUDIT_ENTRY,
@@ -27,7 +29,11 @@ import {
   type ShellGuardToolName,
   type ShellLimits,
 } from "./shell-guard.ts";
-import { shellCommandHash } from "./execution-state.ts";
+
+/** SHA-256 of the exact command text; the shell guard's quarantine key. */
+export function shellCommandHash(command: string): string {
+  return createHash("sha256").update(command, "utf8").digest("hex");
+}
 
 export interface PreparedShellCall {
   toolCallId: string;

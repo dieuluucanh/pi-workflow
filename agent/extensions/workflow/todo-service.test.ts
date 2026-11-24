@@ -1,16 +1,20 @@
 /**
- * Session-scoped TODO store tests (step 3).
+ * Session-scoped TODO store tests (plain mutable list).
  *
  * The store is the storage seam: one instance per extension factory call. These
  * tests pin isolation (two sessions cannot share a list), ownership, the
- * plan-merge rules and the persistence snapshot — while the existing TODO and
- * extension suites keep pinning the public `workflow_todo` behaviour.
+ * wholesale-update rule and the persistence snapshot. There is no freeze, no
+ * plan merge, no exclusion set and no recovery receipt.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createTodoStore, assertListOwner } from "./todo-service.ts";
+import {
+  TODO_LIST_OWNERS,
+  assertListOwner,
+  createTodoStore,
+} from "./todo-service.ts";
 import type { TodoItem } from "./utils.ts";
 
 const item = (step: number, text: string, over: Partial<TodoItem> = {}): TodoItem => ({
@@ -23,16 +27,6 @@ const item = (step: number, text: string, over: Partial<TodoItem> = {}): TodoIte
   source: "plan",
   ...over,
 });
-
-const PLAN = [
-  "# Plan: demo",
-  "",
-  "## Plan Steps",
-  "",
-  "1. Scaffold the app",
-  "2. Add the API",
-  "3. Add the UI",
-].join("\n");
 
 test("store: two instances never share items, plan path or panel state", () => {
   const a = createTodoStore("ordinary");
@@ -60,181 +54,67 @@ test("store: replace normalizes refs and dedupes", () => {
   assert.deepEqual(store.items.map((entry) => entry.ref), ["1", "2"]);
 });
 
-test("store: the same plan merges and preserves completion", () => {
-  const store = createTodoStore();
-  const first = store.loadFromPlanMarkdown({
-    markdown: PLAN,
-    planPath: "/p/plan.md",
-    cwd: "/p",
-  });
-  assert.equal(first.replaced, true);
-  assert.equal(first.count, 3);
-
-  store.setStatus(store.items[0]?.ref ?? "1", "completed");
-  // An agent-added step is not in the plan, so the same-plan merge keeps it.
-  const adHoc = store.add({ text: "manual follow-up" });
-  assert.equal(adHoc.duplicate, false);
-  assert.equal(store.items.length, 4);
-
-  const second = store.loadFromPlanMarkdown({
-    markdown: `${PLAN}\n4. Ship it`,
-    planPath: "/p/plan.md",
-    cwd: "/p",
-  });
-  assert.equal(second.replaced, false);
-  assert.equal(second.count, 5);
-  assert.equal(second.preserved, 1);
-  assert.equal(store.items[0]?.status, "completed");
-  assert.ok(store.items.some((entry) => entry.text === "manual follow-up"));
-});
-
-test("store: a different plan replaces the list", () => {
-  const store = createTodoStore();
-  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/a.md", cwd: "/p" });
-  store.setStatus("1", "completed");
-  const next = store.loadFromPlanMarkdown({
-    markdown: "# Plan: other\n\n## Plan Steps\n\n1. Only step",
-    planPath: "/p/b.md",
-    cwd: "/p",
-  });
-  assert.equal(next.replaced, true);
-  assert.equal(store.items.length, 1);
-  assert.equal(store.items[0]?.status, "pending");
-});
-
-test("store: a title-only plan synthesizes one placeholder step", () => {
-  const store = createTodoStore();
-  const result = store.loadFromPlanMarkdown({
-    markdown: "# Plan: Login flow\n\nNo numbered steps here.",
-    planPath: "/p/login.md",
-    cwd: "/p",
-  });
-  assert.equal(result.count, 1);
-  assert.equal(result.synthesized, true);
-  assert.match(store.items[0]?.text ?? "", /Login flow/);
-});
-
-test("store: empty markdown leaves the list untouched", () => {
-  const store = createTodoStore();
-  store.replace([item(1, "keep me")]);
-  const result = store.loadFromPlanMarkdown({ markdown: "", planPath: "/p/x.md", cwd: "/p" });
-  assert.equal(result.replaced, false);
-  assert.equal(result.count, 1);
-  assert.deepEqual(store.items.map((entry) => entry.text), ["keep me"]);
-});
-
-test("store: wholesale update removes omitted items, like the public tool", () => {
+test("store: wholesale update removes omitted items", () => {
   const store = createTodoStore();
   store.replace([item(1, "one"), item(2, "two"), item(3, "three")]);
   const result = store.update([
-    { ref: "1", status: "in_progress" },
-    { ref: "3", status: "completed" },
+    { ref: "1", text: "one" },
+    { ref: "3", text: "three" },
   ]);
-  assert.equal(result.removed, 1);
+  assert.equal(result.refused, undefined);
   assert.deepEqual(store.items.map((entry) => entry.text), ["one", "three"]);
-  assert.equal(store.doneCount(), 1);
-  assert.equal(store.remainingCount(), 1);
+  assert.equal(result.removed, 1);
 });
 
-test("store: a ref-less wholesale rewrite of a plan-linked list is refused", () => {
+test("store: a ref-less wholesale rewrite is accepted (no plan-linked guard)", () => {
   const store = createTodoStore();
-  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
-  const before = store.items.map((entry) => entry.text);
-  const revision = store.revision;
-
-  const refused = store.update([
-    { text: "scaffold" },
-    { text: "api" },
-    { text: "ui" },
+  store.replace([item(1, "one"), item(2, "two"), item(3, "three")]);
+  const result = store.update([{ text: "rewritten one" }, { text: "rewritten two" }]);
+  assert.equal(result.refused, undefined);
+  assert.deepEqual(store.items.map((entry) => entry.text), [
+    "rewritten one",
+    "rewritten two",
   ]);
-  assert.ok(refused.refused, "the ambiguous replacement is refused");
-  assert.deepEqual(store.items.map((entry) => entry.text), before);
-  assert.equal(store.revision, revision, "a refusal is not a mutation");
-  assert.equal(refused.added, 0);
 });
 
-test("store: an explicit replacement records excluded plan steps", () => {
+test("store: a stale expectedRevision is refused without mutating", () => {
   const store = createTodoStore();
-  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
-  const third = store.items[2]?.planStepId;
-  assert.ok(third);
+  store.replace([item(1, "one")]);
+  const revision = store.revision;
+  const refused = store.update([{ text: "other" }], { expectedRevision: revision - 1 });
+  assert.match(refused.refused ?? "", /re-read it and retry/);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["one"]);
 
-  const replaced = store.update(
-    [
-      { ref: "1", status: "completed" },
-      { ref: "2", text: "Add the API layer", status: "pending" },
-    ],
-    { allowBulkReplace: true },
-  );
-  assert.equal(replaced.refused, undefined);
-  assert.equal(store.items.length, 2);
-  assert.equal(store.excludedPlanSteps.has(third!), true);
-  // Rewording by ref preserves the plan binding (no second task).
-  assert.ok(store.items[1]?.planStepId);
-  assert.equal(store.items[1]?.source, "plan");
-});
-
-test("store: passive reconciliation never restores a removed plan step; explicit sync does", () => {
-  const store = createTodoStore();
-  store.loadFromPlanMarkdown({ markdown: PLAN, planPath: "/p/plan.md", cwd: "/p" });
-  store.update([{ ref: "1" }, { ref: "2" }], { allowBulkReplace: true });
-  assert.equal(store.items.length, 2);
-
-  const passive = store.loadFromPlanMarkdown({
-    markdown: PLAN,
-    planPath: "/p/plan.md",
-    cwd: "/p",
-  });
-  assert.equal(passive.excluded, 1, "the removed step stays excluded");
-  assert.equal(store.items.length, 2, "no silent restoration");
-
-  const restored = store.loadFromPlanMarkdown({
-    markdown: PLAN,
-    planPath: "/p/plan.md",
-    cwd: "/p",
-    restoreExcluded: true,
-  });
-  assert.equal(restored.restored, 1, "explicit sync restores it once");
-  assert.equal(store.items.length, 3);
-  assert.equal(store.excludedPlanSteps.size, 0);
-});
-
-test("store: a reviewed recovery is idempotent per receipt", () => {
-  const store = createTodoStore();
-  const canonical = [
-    item(1, "Full plan step one", { source: "plan", status: "completed", completed: true }),
-    item(2, "Full plan step two", { source: "plan" }),
-  ];
-  const first = store.recover(canonical, "recovery-1");
-  assert.equal(first.applied, true);
-  assert.equal(store.items.length, 2);
-  const second = store.recover(canonical, "recovery-1");
-  assert.equal(second.applied, false, "a retry does not apply twice");
+  const applied = store.update([{ text: "other" }], { expectedRevision: revision });
+  assert.equal(applied.refused, undefined);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["other"]);
 });
 
 test("store: done tags mark refs and settle the list", () => {
   const store = createTodoStore();
   store.replace([item(1, "one"), item(2, "two")]);
-  const marked = store.markDoneTags("finished [DONE:1] and [DONE:2]");
-  assert.equal(marked.marked, 2);
+  const marked = store.markDoneTags("[DONE:1] finished");
+  assert.equal(marked.marked, 1);
+  assert.equal(store.doneCount(), 1);
+  assert.equal(store.isSettled(), false);
+  store.setStatus("2", "completed");
   assert.equal(store.isSettled(), true);
-  assert.ok(store.signature()?.includes("completed"));
+  assert.match(store.signature() ?? "", /^1:completed:one\|2:completed:two$/);
 });
 
-test("store: add is duplicate-aware, toggle flips, clear removes the plan link", () => {
+test("store: add is duplicate-aware, toggle flips, clear drops the plan link", () => {
   const store = createTodoStore();
-  store.replace([item(1, "one")]);
   store.planPath = "/p/plan.md";
-
-  const first = store.add({ text: "two" });
+  const first = store.add({ text: "Do X" });
   assert.equal(first.duplicate, false);
-  assert.equal(store.items.length, 2);
-  const again = store.add({ text: "two" });
+  const again = store.add({ text: "do  x" });
   assert.equal(again.duplicate, true);
-  assert.equal(store.items.length, 2);
+  assert.equal(again.item.step, first.item.step);
 
-  assert.equal(store.setStatus("1", "completed")?.status, "completed");
-  assert.equal(store.toggle("1")?.status, "pending");
+  const toggled = store.toggle(first.item.ref!);
+  assert.equal(toggled?.completed, true);
+  const back = store.toggle(first.item.ref!);
+  assert.equal(back?.completed, false);
 
   store.clear();
   assert.deepEqual(store.items, []);
@@ -244,89 +124,44 @@ test("store: add is duplicate-aware, toggle flips, clear removes the plan link",
 test("store: snapshot round-trips and a partial restore keeps present fields", () => {
   const store = createTodoStore("worker");
   store.replace([item(1, "one")]);
-  store.planPath = "/p/w.md";
+  store.planPath = "/p/plan.md";
   store.panelPreference = "collapsed";
-  store.panelScope = "scope-w";
-  store.promptAfterSettle = true;
+  store.panelScope = "scope";
   store.completedSignature = "sig";
-
   const snapshot = store.snapshot();
-  assert.equal(snapshot.owner, "worker");
-  assert.equal(snapshot.panel.preference, "collapsed");
+  assert.deepEqual(snapshot.panel, {
+    preference: "collapsed",
+    preferenceScope: "scope",
+    promptAfterSettle: false,
+    completedSignature: "sig",
+  });
+  assert.deepEqual(Object.keys(snapshot).sort(), [
+    "items",
+    "owner",
+    "panel",
+    "planPath",
+    "revision",
+  ]);
 
   const restored = createTodoStore("worker");
   restored.restore(snapshot);
   assert.deepEqual(restored.items.map((entry) => entry.text), ["one"]);
+  assert.equal(restored.planPath, "/p/plan.md");
   assert.equal(restored.panelPreference, "collapsed");
-  assert.equal(restored.promptAfterSettle, true);
 
-  // An older entry without panel fields must not erase the current state.
-  restored.restore({ items: [item(2, "two")] });
+  // A later entry that omits a field must not erase the restored value.
+  restored.restore({ items: [item(1, "two")], revision: restored.revision });
   assert.equal(restored.panelPreference, "collapsed");
+  assert.equal(restored.planPath, "/p/plan.md");
   assert.deepEqual(restored.items.map((entry) => entry.text), ["two"]);
 });
 
-test("store: a freeze installs rows but the list stays mutable", async () => {
-  const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
-  const frozen = createFrozenTodosFromPlan({
-    planPath: "C:/work/.pi/plans/frozen.md",
-    planText: "# Plan: Frozen\n\n## Plan Steps\n\n1. One\n2. Two\n",
-    mode: "build",
-    now: 1_000,
-  });
-  assert.equal(frozen.ok, true);
-  if (!frozen.ok) return;
-  const store = createTodoStore();
-  assert.equal(store.freeze(frozen.snapshot).ok, true);
-  assert.equal(store.frozen, undefined, "no frozen state is installed");
-  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
-  store.restore({ items: [item(9, "legacy replacement")] });
-  assert.deepEqual(store.items.map((entry) => entry.text), ["legacy replacement"]);
-  assert.equal(store.planPath, "C:/work/.pi/plans/frozen.md");
-});
-
 test("store: ownership is explicit and enforced", () => {
-  const roadmap = createTodoStore("roadmap");
+  assert.deepEqual([...TODO_LIST_OWNERS], ["ordinary", "worker"]);
   const worker = createTodoStore("worker");
-  assert.doesNotThrow(() => assertListOwner(roadmap, "roadmap"));
-  assert.throws(() => assertListOwner(worker, "roadmap"), /owner mismatch/);
-  // A worker list cannot be mistaken for the ordinary Plan/Build list.
+  assert.doesNotThrow(() => assertListOwner(worker, "worker"));
   assert.throws(() => assertListOwner(worker, "ordinary"), /owner mismatch/);
-});
-
-test("store: a seeded list accepts structural edits", async () => {
-  const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
-  const frozen = createFrozenTodosFromPlan({
-    planPath: "C:/work/.pi/plans/frozen.md",
-    planText: "# Plan: Frozen\n\n## Plan Steps\n\n1. One\n2. Two\n",
-    mode: "build",
-    now: 1_000,
-  });
-  assert.equal(frozen.ok, true);
-  if (!frozen.ok) return;
-  const store = createTodoStore();
-  assert.equal(store.freeze(frozen.snapshot).ok, true);
-  const ids = store.items.map((entry) => entry.id);
-  assert.ok(ids[0] && ids[1]);
-
-  const status = store.update([
-    { id: ids[0], text: "One", status: "in_progress" },
-    { id: ids[1], text: "Two", status: "pending" },
-  ]);
-  assert.equal(status.refused, undefined);
-  assert.equal(store.items[0]?.status, "in_progress");
-
-  const rename = store.update([
-    { id: ids[0], text: "One renamed", status: "in_progress" },
-    { id: ids[1], text: "Two", status: "pending" },
-  ]);
-  assert.equal(rename.refused, undefined);
-  assert.deepEqual(store.items.map((entry) => entry.text), ["One renamed", "Two"]);
-
-  store.add({ text: "Injected" });
-  assert.ok(store.items.some((entry) => entry.text === "Injected"));
-  store.clear();
-  assert.equal(store.items.length, 0);
-  store.replace([{ step: 1, text: "Replaced", completed: false }]);
-  assert.deepEqual(store.items.map((entry) => entry.text), ["Replaced"]);
+  // A parent/roadmap list is an ordinary list now.
+  const parent = createTodoStore("ordinary");
+  assert.doesNotThrow(() => assertListOwner(parent, "ordinary"));
 });

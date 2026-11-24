@@ -36,7 +36,7 @@ is a prompt convention, not a mechanical cage.
 - **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, appends its findings and required revisions as a `## Reviewer Revisions` section, streams its work into the main transcript, and hands the result to the configured presenter (`/handoff`: Plannotator, or the workflow's native questionnaire). If Plannotator is unavailable or answers with an error, the handoff falls back to the native questionnaire (the plan is printed into the transcript, the choices are pinned at the bottom). Off by default; see [Review Mode](#review-mode) below.
 - **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, and an inline `↳ Your answer:` editor. Rendered as a bounded bottom-sheet overlay: a short question and the choices stay pinned, while a long question or the optional `context` body (e.g. a proposed commit message) scrolls with the wheel, `PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The freeform editor takes the pane while typing.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
-- **Todos** — plan-faithful todo list (global step refs + statuses + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/update/done/pending/add/toggle/sync/clear`) with industry-style wholesale `update` (send the COMPLETE list; omitted items are removed) plus idempotent `done`/`pending`, lenient `[DONE:<ref>]` markers, throttled Claude-Code-style reminders, a tool-result footer, and a stale ⚠ notice — but **no forced turns and no heuristic auto-completion** (reference: Claude Code / OpenCode / Codex practice). A pinned panel shows the active list, collapses to one summary line when every step settles, and is controlled by `/todos show|expand|collapse|hide|auto` or `Ctrl+Alt+O` (terminal Pi). In Pi Desktop the native Todo bar above the panel exposes the same verbs and the desktop chord is `Ctrl+Alt+L` (Sessions keeps `Ctrl+Alt+O`). The display choice is sticky for the current plan across Build edits and Review re-syncs; a different plan returns to automatic.
+- **Todos** — plan-faithful todo list (global step refs + statuses + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/update/done/pending/add/toggle/clear`) with industry-style wholesale `update` (send the COMPLETE list; omitted items are removed) plus idempotent `done`/`pending`, lenient `[DONE:<ref>]` markers, throttled Claude-Code-style reminders, a tool-result footer, and a stale ⚠ notice — but **no forced turns and no heuristic auto-completion** (reference: Claude Code / OpenCode / Codex practice). A pinned panel shows the active list, collapses to one summary line when every step settles, and is controlled by `/todos show|expand|collapse|hide|auto` or `Ctrl+Alt+O` (terminal Pi). In Pi Desktop the native Todo bar above the panel exposes the same verbs and the desktop chord is `Ctrl+Alt+L` (Sessions keeps `Ctrl+Alt+O`). The display choice is sticky for the current plan across Build edits and Review re-syncs; a different plan returns to automatic.
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
 - **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, with a native handoff fallback (the plan is printed into the transcript as a durable entry; a bottom-sheet questionnaire offers Approve / Feedback / Skip). `workflow.handoff` + `/handoff` choose between `auto` (default), `native` (never open the browser) and `plannotator` (always try, native fallback). **Approving the plan and choosing where it runs are two separate decisions:** the configured presenter asks about the PLAN first, and only an approval opens the execution chooser (Orchestrator or direct Build). `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all). The thinking list follows the selected model's `thinkingLevelMap`; unsupported stored levels are clamped on save/activation with a warning.
@@ -99,7 +99,6 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/orchestrator-resume` | Resume a paused in-process Build child on the warm session |
 | `/orchestrator-abort` | Abort the in-process Build child and pause the run |
 | `/orchestrator-view [child\|parent\|auto]` | Show the current Orchestrator child view in the pinned panel and footer |
-| `/orchestrator-repair-checks [status] [--file <manifest.json>] [--from-plan] [--allow-empty] [--yes]` | Inspect or amend the frozen final plan checks with one append-only `plan-check-specs-repair` event (see [Plan format and executable checks](#plan-format-and-executable-checks)) |
 | `/prompt-refine-companion` | Internal grant-only bootstrap a `composer-transform` host invokes for prompt refinement; not a normal user command |
 
 Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a **reviewer round or review-owned handoff** owns the turn — `running`, `paused`, or a handoff produced by `/review`/Review Mode, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review). A **plain plan handoff** (Review Mode off) does not lock modes or prompts: switching or typing a new prompt supersedes it, and the plan file stays on disk.
@@ -117,101 +116,44 @@ short Plan → Review → Build work keeps its current behavior.
 - **Mode entry is not execution.** Tab or `/orchestrator` enters the mode;
   nothing runs until the user approves a plan (or explicitly agrees the
   standalone steps) and picks an execution destination.
-- **One frozen TODO list per execution.** Plan approval or an agreed standalone
-  discussion produces rows ONCE: one row per top-level plan step, stable ids,
-  stable `1..N` refs, header/line evidence and optional per-row checks/files.
-  From then on only status changes. There is no re-proposal, rebaseline,
-  renumbering, split/combine, coverage map or DAG.
-- **Ask it to work — do not switch to `/build`.** After the discussion is
-  agreed the model calls `orchestrator_start` with the explicit steps (or an
-  approved plan path). The tool freezes the list and the scheduler dispatches
-  row 1. `/orchestrator start [path]` is the same service from the command
-  line. No second approval dialog exists.
+- **The model owns the row list.** After the discussion is agreed the model
+  calls `orchestrator_start` with one step per row (a string, or
+  `{text, workspace}` for a non-primary root) and the workspaces the plan
+  declares. The extension records the rows and the resolved roots; it does not
+  compile or validate the plan.
 - **Neutral destination every time.** An approved plan always asks: direct
   Build, or Orchestrator, plus *Decide later*. Both options are equal: there is
-  no saved default, no `workflow.handoff.executionMode`, no recommendation and
-  no `/handoff execution|once`. Feedback keeps the session in Plan.
-- **Direct Build stays in-session.** It uses the same frozen list and the same
-  status-only contract; it does not start an Orchestrator child.
-- **The child is an in-process Build session — no window or tab.** Each frozen
-  row runs in a second SDK session inside the same Pi process: its own model
-  runtime, an in-memory session and a fresh Workflow extension instance. It
-  gets the Workflow-managed Build tool set and every policy gate (write, folder,
-  read, commit, shell), creates its own task-local TODO list before the first
-  edit, and never orchestrates or edits the parent run. Extensions the user
-  installed separately do not load inside the child; that is the capability
-  boundary. Permission dialogs still reach the real user through the parent UI.
-- **One panel list authority.** The active execution's frozen snapshot is
-  installed in the session `TodoStore`; the pinned panel renders that store.
-  In Orchestrator mode `workflow_todo` is read-only for the run rows.
-- **Advancement is automatic and mechanical.** On a natural child settle the
-  extension journals the report, diffs the workspace including the
-  `previous.head..HEAD` commit range, runs the row's `acceptanceChecks`, journals
-  the verification marker and accepts on pass — then starts the next row. A
-  failing check records a bounded repair round (max 2) against the **same warm
-  child** and re-prompts it; a gone child is replaced for the same attempt.
-  Budget exhaustion blocks the row, pauses the run and wakes the parent model.
-  After the last row the plan's `## Verification` commands run once as the final
-  gate. The parent model never calls verify/accept for a healthy row.
-- **No execution budgets or parent commits.** Usage/cost caps, rollover,
-  drift, parity, a second-opinion verifier and the parent commit ledger are
-  gone. The child follows the normal Build commit policy.
-- **A dispatch is a real child, not a launch.** The Builder model, provider
-  auth and the Workflow extension load are proven before the `task.start` row
-  transition; a failure leaves the row pending and nothing is journaled as
-  running. There is no window/tab, grant file, IPC pipe or start-ack.
-- **Retry recovers and dispatches.** `orchestrator_retry` and
-  `/orchestrator retry` unblock a `blocked`/`needs_fix` row and start a fresh
-  child for it. `/orchestrator-resume` continues a paused warm child.
-- **Prompt cascade.** While a child runs, a normal prompt is recorded as
-  `you → child` and forwarded verbatim; the parent model does not answer it.
-  While paused, one note is queued for the resume. Slash commands pass through.
-- **Command-only child interaction.** `/orchestrator-pause|resume|abort|view`
-  (and the `/orchestrator` verbs) control the child. `/orchestrator-view`
-  switches BOTH the pinned panel (parent roadmap ↔ the child's local TODO list)
-  and the footer's child line: `child`/`auto` show `child <phase> · <model> ·
-  ctx <n>% (used/window) · ↑in ↓out · mm:ss`, `parent` shows the run/next row
-  plus a counter-free `child <phase>` hint. The row pointer and the child's own
-  todo counter belong to the pinned TODO pane, so neither line repeats them;
-  `/orchestrator status|view` still names the row in its multi-line report. It
-  never changes prompt routing.
-- **Frozen final-check repair.** A malformed frozen `planChecks` list can be
-  amended without rewriting the journal: `/orchestrator-repair-checks` shows the
-  current → proposed checks, confirms, and appends one durable
-  `plan-check-specs-repair` `run.control` event (rows, statuses, workspaces and
-  the revision fence are untouched). `--file <manifest.json>`, `--from-plan`,
-  `--allow-empty` and `--yes` cover the in-session path;
-  `scripts/repair-orchestrator-checks.mjs` does the same out of session with
-  `--dry-run`/`--apply --yes` and `--expect-seq`/`--expect-accepted` fences.
-- **Working/Paused on the composer itself.** The composer's top border shows the
-  in-process Builder's activity in Parent, Child AND Auto views: `Working · ESC
-  or /orchestrator-pause to pause · /orchestrator-abort to stop`, then
-  `Paused · /orchestrator-resume to continue · /orchestrator-abort to stop`,
-  `Pausing…`, `Verifying`, `Starting…` and `Waiting · answer the dialog`. The
-  border carries the phase and the controls **only**: the latest tool/command and
-  the `Builder n/m` row pointer are deliberately absent, because a tool label can
-  be 100 characters long and used to push the state out of the border. Progress
-  stays in the pinned TODO pane, tool lines stay in the transcript band, and
-  model/context/tokens/elapsed stay in the footer. Esc pauses only while the
-  child owns the composer; every repeat
-  press while pausing/paused/verifying is consumed, so it can never become an
-  abort. A completion menu and a focused dialog keep their own Esc. A foreign
-  editor gets the same line as a fallback widget without the Esc hint.
-  Paused prose is queued, not delivered; the footer/contribution hint says so.
-- **Reload loses the child, not the run.** A `running` row restored after a
-  reload is blocked with a concrete reason and the run pauses; nothing is
-  replayed. Retry starts a fresh child. Old managed-worker child sessions open
-  as ordinary Build with a one-line warning (clean slate).
-- **The chosen execution starts immediately.** A Direct Build choice made while
-  the chooser is still inside `agent_end` is queued once and released at
-  `agent_settled`, so the user does not have to send another prompt.
-- **Failure leaves a retryable row.** A dispatch failure never loses the frozen
-  list: the run stays ready/blocked with a concrete reason, and
-  `orchestrator_retry` / `/orchestrator retry` resumes it.
-- **Legacy records survive.** Handoff decisions are version 3; version 2 is
-  still readable (its recommendation fields are ignored), and an approved record
-  still requires its explicit `destination`. Old runs are not resumed: restart
-  from the approved plan with the new flow.
+  no saved default, no recommendation and no `/handoff execution|once`.
+  Feedback keeps the session in Plan.
+- **Direct Build stays in-session.** It receives one plain kickoff, keeps any
+  rows the model already created and has no freeze/merge step.
+- **The child is an in-process Build session — no window or tab.** Each row
+  runs in a second SDK session inside the same Pi process with the row's root
+  as `cwd`: its own model runtime, an in-memory session and a fresh Workflow
+  extension instance. It gets the Workflow-managed Build tool set and every
+  policy gate (write, folder, read, commit, shell), creates its own task-local
+  TODO list before the first edit, and never orchestrates or edits the parent
+  run. A managed child is exempt from the parent/child worktree exclusion; the
+  parent itself is refused edit/write/mutating shell while a child is live.
+- **One panel list authority.** The session `TodoStore` is the list the pinned
+  panel renders and the list `workflow_todo` mutates; a child has its own.
+- **The parent trusts the report.** A settled child's report wakes the parent
+  with `workflow_todo`/`orchestrator_dispatch` instructions. The parent reads
+  it, marks the row done with `workflow_todo`, and dispatches the next row. It
+  does not re-run the child's checks and does not fix code itself.
+- **Blockers stay visible.** A blocked report leaves the row in progress: the
+  parent inspects the root cause, amends the instruction and re-dispatches
+  (`orchestrator_retry` reuses the stored instruction).
+- **Reload is a lost child.** `restoreOrchestratorRun` restores the record; a
+  `running` phase becomes `interrupted` and the footer says so. Old journals,
+  frozen snapshots and run directories are never read or migrated.
+- **Verification is ordinary bash.** The model runs the plan's
+  `## Verification` before the last row is marked done and states exactly what
+  it ran. There is no hidden gate, no `workflow_execution` tool and no final
+  check executor.
+- **Cross-repo work is multiple rows.** One row, one root. `cwd` is a declared
+  alias or an absolute path inside a declared root; an unknown or ambiguous
+  root is refused rather than guessed.
 
 ### Host contract
 
@@ -304,127 +246,77 @@ verdicts.
   advertised unsupported.
 
 
-### Plan lint and pre-approval gating
+### Approval has no lint or check preview
 
-The plan compiler is now the single authority for what a plan will execute, and
-it runs *before* approval instead of at run creation:
+Approval is a plain confirm plus a destination choice. No code compiles the
+plan, previews executable checks or gates the approval on a check list:
 
-- `/plan lint [path]` (also `/workflow lint [path]`) and the `plan_validate`
-  tool compile the current plan and print the row count, gate/diagnostic/manual
-  counts, every exact final and per-row command, its workspace, timeout and
-  expected exit code, and all warnings/errors with a line number. Read-only:
-  they never freeze, write or execute.
-- The handoff sheet shows the same compiled check preview, so approval shows
-  exactly what will run.
-- A plan that does not compile is refused at approval; nothing reaches
-  `run.created`. An ambiguous check (a command mixed with prose, unsupported
-  `checks:` YAML, a duplicate check id inside a `checks:` block) fails with the
-  offending line.
-- A compilable plan with **no final `gate` check** (prose-only verification, or
-  only `diagnostic`/`manual` checks) requires an explicit acknowledgement
-  before it can be frozen. A plan whose `## Verification` is fenced command
-  lines freezes with no extra prompt.
-- Reviewer rewrites are compiled too: a rewrite that introduces an ambiguous
-  check, or silently removes every final gate, is rejected before it replaces
-  the plan on disk.
+- there is no `plan_validate` tool, no `/plan lint`, no `/workflow lint` and
+  no `checkPreview` in the handoff questionnaire;
+- a plan with indented headings, no `## Verification`, or prose-only
+  verification is approved like any other plan;
+- the model reads the plan and runs its `## Verification` as ordinary bash
+  when it gets there; the real command and its output are visible.
 
-The authoring surface is unchanged for existing plans: a fenced
-one-command-per-line block in `## Verification` still produces gates, and a
-whole-bullet code span is still one command. `Acceptance:` is always prose
-evidence and is never executed.
+### Plan format
 
-### Plan format and executable checks
+A plan is a normal markdown document, usually
+`.pi/plans/<UTC-date>-<slug>.md`:
 
-A plan is `.pi/plans/<UTC-date>-<slug>.md` with `# Plan:`, `## Context`,
-`## Decisions`, `## Exploration Summary`, `## Plan Steps`, `## Risks` and
-`## Verification`. `## Plan Steps` is the only row source; `## Verification`
-is the final gate. A row may carry `Checks:`/`Verify:`, `Files:`,
-`Workspaces:` and `Acceptance:`; `### Phase …` sub-headings inside
-`## Plan Steps` set the row's group (there is no `Label:` metadata line). A
-check becomes executable in exactly three
-ways: a fenced one-command-per-line `bash`/`sh` block (first-class and
-backwards compatible), a whole-bullet code span, or a fenced `checks:` block
-for the typed fields (`id`, `command`, `kind`, `workspace`, `timeoutMs`,
-`expectedExitCode`) in a restricted YAML subset that fails closed with a line
-number on anything it does not understand. `Acceptance:` is evidence, never a
-command; a bullet mixing a command with prose is refused, never executed.
-Limits: 12 checks per row/final gate, 20 files, 8 workspaces, 500 rows, 4000
-chars per command, `timeoutMs` 1–3 600 000, `expectedExitCode` 0–255.
-`kind: gate` (default) gates acceptance, `diagnostic` reports without blocking,
-`manual` is a human attestation and never runs. The full reference is
-[`docs/plan-format.md`](../../../docs/plan-format.md); the canonical skeleton is
-[`docs/plan-template.md`](../../../docs/plan-template.md). Migrating an
-existing plan or run starts with the read-only
-[`scripts/migration-report.mjs`](scripts/migration-report.mjs) inventory.
+```markdown
+# Plan: Add the export endpoint
 
-- **Failure taxonomy.** Every check returns `none`, `test`, `timeout`,
-  `metadata`, `policy`, `environment` or `manual`. Only `test`/`timeout` start a
-  bounded repair round on the warm child; `metadata`/`policy`/`environment`
-  block with a concrete fix, and `manual` cannot auto-accept.
-- **Final-gate marker.** The plan checks run once and are journaled as a
-  `final_gate` event carrying the content hash of exactly what ran, bounded
-  results, a failure class and the workspace revisions. Completion needs a
-  passing record whose hash matches the current snapshot, so a second call path
-  cannot re-run a passed gate and an amended check list needs a new pass. A
-  tampered record is never a pass.
-- **Amending a frozen run.** `/orchestrator-repair-checks`
-  (`status|--file <manifest.json>|--from-plan|--allow-empty|--yes`) or
-  `scripts/repair-orchestrator-checks.mjs`
-  (`--run-dir|--manifest|--dry-run|--apply --yes|--expect-seq|--expect-accepted|--status|--json`)
-  appends ONE `plan-check-specs-repair` `run.control` event. Rows, statuses,
-  workspaces and the revision fence are untouched, an apply is idempotent, and
-  the journal is never hand-edited or re-frozen from changed plan text.
-- **Read-only migration report.** `scripts/migration-report.mjs`
-  (`--runs-dir`, `--plans-dir`, `--plan`, `--json`, `--strict`) inventories
-  existing state without writing: stored snapshot version and read-upcast,
-  malformed/quarantined checks (with the exact bytes that never execute),
-  checks bound to an unbound workspace alias, prose `acceptanceChecks`,
-  a stale `snapshot.json`, and plans that no longer compile. It ends with an
-  explicit repair list; fixing a run stays with the amendment tool above. The
-  live run keeps its v1 bytes and is not migrated to v2.
-- **`workflow.orchestrator` settings.** `childTimeoutMs` (default 2 700 000 ms),
-  `verificationTimeoutSeconds` (900) and `gitTimeoutMs` (60 000) merge project
-  over global over default, are clamped to the 3600 s hard cap, and ignore an
-  invalid value with a diagnostic instead of silently defaulting.
-- **v1 → v2 compatibility.** Journals keep their v1 line framing, checksum and
-  `prev` chain; new frozen snapshots are `schemaVersion: 2` with provenance,
-  typed checks, workspaces and a validation report. A v1 snapshot upcasts in
-  memory, a command-shaped v1 value becomes a typed check, and a malformed v1
-  check is quarantined with its bytes and a repair instruction (never executed,
-  never fatal to loading). Unknown event types, payload versions and future
-  snapshot versions fail closed. Restore uses the journaled snapshot, so a
-  changed or missing plan file cannot lose a run.
-- **Never auto-executed.** `Acceptance:` criteria, `Files:`/`Workspaces:`
-  metadata, `manual` checks, prose-only `## Verification` bullets, and any
-  hand-edited journal/snapshot/frozen list. Only the runtime reports
-  acceptance.
+## Context
+
+Why this change is needed.
+
+## Steps
+
+1. Add the route and its handler.
+2. Cover the happy path and the validation error.
+
+## Verification
+
+- `npm run typecheck`
+- `npm test`
+```
+
+`## Steps` (or a numbered list under `## Plan Steps`) is the human plan; the
+model turns it into TODO rows with `workflow_todo`. `## Verification` is a
+normal list of commands the model runs before the last row is marked done.
+Nothing parses the plan, validates a schema, compiles checks or reads
+`Acceptance:`/`Files:` metadata at runtime. Old plans with those sections are
+still readable — the extra sections are simply prose.
 
 ### Multi-repository workspaces
 
-The Orchestrator can verify work in more than the session's repository. A plan
-may declare roots with the existing convention:
+One row targets one repository root. The model declares the roots it needs:
 
-```text
-Repositories:
-- **W:** `C:/work/W`
-- **D:** `C:/work/D`
+```json
+{
+  "steps": [
+    "Add the endpoint",
+    { "text": "Update the client", "workspace": "B" }
+  ],
+  "workspaces": [
+    { "id": "A", "path": "C:/work/api" },
+    { "id": "B", "path": "C:/work/client" }
+  ]
+}
 ```
 
-or a `## Workspaces` section with `W: `path`` entries. A step may bind itself
-with `Workspaces: D` (first alias becomes the child cwd) or `Workspaces: W, D`.
-A plan-level Verification command may use `[D] npm test` or a preceding
-`Workspace: D` line. `orchestrator_start` may pass `workspaces` explicitly,
-which replaces the plan declarations; the session root is always primary and a
-conflicting `W` declaration is refused. Missing, broad, duplicate or
-overlapping roots fail before a run is created.
-
-Acceptance measures every allowed root and path-scopes committed work. A
-missing root is a measurement error, never a pass. Child writes still follow
-the normal folder/write policy; declaring a root does not grant automatic
-writes or parent reads. Without `Workspaces:` a row starts in the primary root,
-so a cross-repo write may prompt exactly as it does in Build. Old runs and
-snapshots remain single-root compatible. The existing two-repo plan needs no
-edit because its `Repositories and baseline:` section is parsed directly.
+- The session root is always resolved as a root (`W` when undeclared).
+- A step omits `workspace` for the primary root and names one otherwise.
+- `orchestrator_dispatch.cwd` may be a declared workspace id or an absolute
+  path inside a declared root; otherwise the row's stored root is used.
+- A multi-root run with a row that names no root fails closed instead of
+  silently running in the primary repository.
+- An unknown alias, a missing path, a duplicate alias, a broad root (drive,
+  home, system umbrella) or overlapping roots is refused before the run is
+  created, with a message naming the declared ids.
+- Cross-repo work is multiple rows. A child launched with a row root as `cwd`
+  edits only that root; the normal folder/write policy still applies, so
+  declaring a root does not grant automatic cross-root writes.
 
 ## Shell guard
 
@@ -438,33 +330,23 @@ The guard exists because of the 2026-11-20 `erp-atom` incident: two valid but **
 - **Request scope.** The budget resets on a genuinely new idle user prompt, a new/resumed session, a rewind, or `/shell-guard reset` (including while a quarantined execution is active). A steer, follow-up, extension-authored message, native retry or compaction does not re-arm a tripped request.
 - **Honest output.** A native timeout keeps the partial output and names the deadline. `/shell-guard status` shows the effective limits, their source, inherited status and the current quarantine; audit entries record the reason, tool, call id, deadline and failure count — never raw command text or output.
 
-## Build execution continuity
+## Build completion and reload
 
-An approved direct-Build plan runs its frozen TODO list to completion without routine “continue” prompts. `agent_before_settle` appends one bounded continuation nudge only while an authorized unfinished execution is active. It stops for completion, user pause/stop/Esc, a structured genuine blocker, or three consecutive barren recoveries; it does not stop for a routine checkpoint or a self-assessed context limit.
+Build completion is plain TODO state: when every non-cancelled row is done,
+the extension emits the completion card. There is no final gate, no
+`workflow_execution` tool and no execution-state machine. Verification is an
+ordinary bash command the model runs; its real output is the evidence.
 
-- `/build status|pause [reason]|resume|stop` — bare `/build` still switches mode. `resume` clears a pause/blocker but **does not** clear shell quarantine.
-- `workflow_execution` — model-facing status/checkpoint/verify/blocker tool. `verify` runs the row’s approved checks through the cancellable adapter; `blocker` records row, category, evidence references and the exact required action. It cannot grant permissions, reset the guard or mark completion.
-- Completion is runtime-gated: a row with required checks needs fresh evidence; editing source invalidates it. The final plan check runs before the last acceptance/completion card. All-cancelled lists and quarantined required checks cannot show an unqualified green card.
-- Reload/reopen/fork restores the execution **paused**. Persisted history alone starts no provider turn, edit or child; one explicit `/build resume` continues the remaining non-shell work. The footer’s `workflow-execution` segment and `/build status` explain why work stopped and what is still possible.
-
-```text
-/build status
-/build pause waiting for the API credential
-/build resume
-/build stop
-/shell-guard reset                  # the only new shell budget after quarantine
-```
-
-```text
-/shell-guard                                    # status
-/shell-guard limits 60 300                      # global: 60s default, 300s ceiling
-/shell-guard limits 300 900 project             # this repo only
-/shell-guard reset                              # clear quarantine / new budget
-```
-
-Settings are sparse and scoped: global applies by default, a **trusted** project may override either field, and a corrupt existing file is refused rather than replaced. The hard ceiling is 3600 s; raising the defaults is an explicit user edit, not a model action.
-
-> The backends remain cooperative at the host boundary: a third-party tool that ignores the supplied timeout or abort signal is not magically cancellable. The guard reports what it enforced instead of claiming universal process control.
+- `/build` switches to Build mode. The pause/resume/stop execution verbs were
+  removed with the execution engine; an Orchestrator child is paused or aborted
+  with its own controls, and a shell quarantine with `/shell-guard reset`.
+- A reload never resumes a run. The stored `OrchestratorRun` restores; a
+  `running` phase becomes `interrupted`, the footer says so, and
+  `/orchestrator retry` starts a fresh child. Old frozen/journal entries are
+  ignored, not migrated: restart from the approved plan.
+- A persisted shell quarantine is re-adopted on reload under the `workflow`
+  entry's `shellQuarantine` key, so the guard's guarantee survives the session
+  boundary without an execution state.
 
 ## Model Profiles
 
@@ -502,7 +384,7 @@ Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-
 
 An independent second agent audits the plan before the handoff renders. The handoff waits for the gated round; the reviewed plan (the reviewer writes the plan file mid-round) is what you see, and the todo steps are re-synced to match. The reviewer runs in its own child session, so Plan Mode and Build Mode never see its prompt, findings or transcript.
 
-**The Reviewer is a Plan artifact.** A review round starts only in a parent Plan session: automatically after a plan submitted in this run (when Review Mode is on), or through an explicit `/review`/`/review-resume` in Plan mode. Configuration ON is **not** a trigger, and no reviewer session is pre-warmed speculatively: an ordinary Build turn, an Orchestrator parent turn and every in-process Build child boot **zero** reviewer sessions. Orchestrator row acceptance is **mechanical** (diff gate, acceptance checks, `task.verify` evidence, final plan checks) — it is not a review round and never asks a model to audit a child's work. Outside Plan, a manual start refuses with guidance (`/plan`, then `/review`) and never switches modes implicitly; `/review-status`, `/review-pause` and `/review-abort` stay available for recovery. Automatic review binds to the terminal end of a run: retries, compaction retries, queued messages and continuation boundaries do not review an incomplete plan, and the later terminal attempt owns the handoff.
+**The Reviewer is a Plan artifact.** A review round starts only in a parent Plan session: automatically after a plan submitted in this run (when Review Mode is on), or through an explicit `/review`/`/review-resume` in Plan mode. Configuration ON is **not** a trigger, and no reviewer session is pre-warmed speculatively: an ordinary Build turn, an Orchestrator parent turn and every in-process Build child boot **zero** reviewer sessions. Orchestrator row completion is a parent decision from the child report plus `workflow_todo` — it is not a review round and never asks a model to audit a child's work. Outside Plan, a manual start refuses with guidance (`/plan`, then `/review`) and never switches modes implicitly; `/review-status`, `/review-pause` and `/review-abort` stay available for recovery. Automatic review binds to the terminal end of a run: retries, compaction retries, queued messages and continuation boundaries do not review an incomplete plan, and the later terminal attempt owns the handoff.
 
 ```text
 Plan Mode (main session) ──plan file──▶ Review Mode (child session, gated)
@@ -594,29 +476,12 @@ Compound commands are checked segment-by-segment, and each check reads the view 
 
 The built-in `bash`, `edit` and `write` tools are never given to the reviewer at all.
 
-### Chunked rewrite submission
+### One append-only submission
 
-A plan rewrite is the one response in the flow that can be longer than a provider gateway allows a
-stream to live. Nothing is written until a submission succeeds, so a cut mid-response loses the
-whole rewrite and burns the round. Chunking makes the rewrite survive that:
-
-1. `review_plan_begin` (optionally with `totalChunks`) resets the assembler.
-2. `review_plan_chunk` appends `index` 1, 2, 3, … — each at most `chunkChars` characters. A
-   rejected chunk (out of order, repeated, oversized, or cut before it arrived) is answered with
-   the index the assembler expects next, so the retry continues **without restarting**: already
-   accepted chunks are kept. Calling `review_plan_begin` again is the explicit "throw it away" move.
-3. `review_plan_finalize` validates completeness (`totalChunks`, when declared) and calls the same
-   submit funnel the one-shot path uses — `writePlan` stays the single writer and the review gate
-   is notified exactly once.
-
-Pass 1 asks for the chunked protocol when `chunkChars > 0` **and** the plan is longer than
-`chunkChars × 2`; shorter plans keep the one-shot `review_submit_plan`. `chunkedSubmit: "off"` or
-`chunkChars: 0` disables chunking entirely (the runtime then refuses `review_plan_begin`). Pass 2
-reads the assembled rewrite and its diff, so a chunked pass 1 feeds the self-verify pass unchanged.
-On abort, teardown, a new round or a provider switch the assembler is cleared, so a partial rewrite
-can never be stitched onto a different attempt.
-
-The child session is created with an explicit tool allowlist: the read-only built-ins **plus every reviewer tool above**. That union is load-bearing — Pi's `createAgentSession({ tools })` option is a *global* allowlist that filters custom tools too, so a built-ins-only list silently removes `review_submit_plan` and makes every review end in a fallback. The runtime therefore reads `getActiveToolNames()` straight after creation and refuses the session (naming the missing tools) rather than starting a review that cannot succeed; the active tool set is also logged once per session.
+The reviewer submits findings, a verdict and a summary in one call; the
+harness appends a `## Reviewer Revisions (round N)` section and preserves the
+original plan body. The chunked `review_plan_begin`/`chunk`/`finalize` write
+path and the `replacement-body` submission are gone.
 
 ### Two passes
 

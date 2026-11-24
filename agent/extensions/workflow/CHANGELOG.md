@@ -1,5 +1,53 @@
 ## Unreleased
 
+### Breaking — legacy engine deletion (2026-11-24 sweep, v0.14.0)
+
+This sweep finishes the 2026-11-24 refactor: the old engine is now actually
+deleted, not merely unreferenced by the new paths.
+
+- **Removed modules:** `orchestrator-runtime`, `orchestrator-state`,
+  `orchestrator-store`, `journal-payloads`, `orchestrator-types`,
+  `orchestrator-check-repair`, `orchestrator-repair-manifest`,
+  `orchestrator-adapters`, `plan-spec`, `plan-compiler`, `plan-checks`,
+  `plan-checks-block`, `plan-lint`, `plan-command-shape`, `frozen-snapshot`,
+  `todo-snapshot`, `final-gate`, `check-executor`, `execution-state`,
+  `verification-deadline`, `legacy-recovery`, and
+  `scripts/repair-orchestrator-checks.mjs`. The live workspace resolver and
+  bounded git runner moved to `workspace-node.ts` and `git-bounded.ts`.
+- **Removed tools/commands/status keys:** `workflow_execution`,
+  `/orchestrator-repair-checks`, the `workflow-execution` footer key and its
+  `execution` segment, and the `planContract` compat block.
+- **Run record is the only orchestration state.** `OrchestratorRun` holds the
+  plan path, rows, per-row workspace/cwd, instructions, reports, phase and
+  `blockedReason`. A reload restores it; a `running` phase becomes
+  `interrupted`. Old journals, frozen v1/v2 snapshots and run directories are
+  never read or migrated — restart from the approved plan.
+- **Multi-repo is first-class.** `orchestrator_start` takes
+  `workspaces: [{id, path}]` and steps of `string | {text, workspace?}`;
+  `orchestrator_dispatch` takes a declared alias or an absolute root as `cwd`.
+  Unknown, missing, broad or overlapping roots are refused; a multi-root run
+  with an unbound row fails closed.
+- **No Build execution engine.** Build completes when every non-cancelled TODO
+  row is done. The final gate, check executor, evidence map, barren-boundary
+  pause and `[DONE:ref]` evidence revert are gone. Verification is ordinary
+  bash. The shell quarantine survives a reload through the `workflow` entry's
+  `shellQuarantine` key.
+- **The parent is excluded from the worktree while a child is live.**
+  `parentMutationRefusal` (pure, in `parent-exclusion.ts`) refuses parent
+  `edit`/`write`/`powershell` and any `bash` command the classifier cannot
+  prove read-only during `starting|running|settling`; the managed child, a
+  paused child and a settled parent are allowed.
+- **Approval has no lint/check preview** and the handoff questionnaire has no
+  `checkPreview` option.
+- **Docs:** the plan-format/template/migration guides are now a normal markdown
+  guide; historical engine docs carry a **Superseded (2026-11-24)** banner.
+
+*Correction:* the earlier 2026-11-24 entry below described the removals as
+landed while the old modules, commands and tool were still reachable. They are
+now actually removed; that entry is retained for the contract decisions it
+records.
+
+
 ### Breaking — model-driven Orchestrator and append-only review (2026-11-24)
 
 - **Orchestrator has Build permissions.** `ROLE_POLICIES.orchestrator` is now

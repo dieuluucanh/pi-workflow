@@ -1,442 +1,239 @@
 /**
- * Operator command surface and input routing.
+ * Operator command tests (run-record verbs).
  *
- * The router is the prompt cascade: prose goes to the child, slash commands
- * pass through, and a run with no live child refuses prose with a recovery
- * command instead of starting a second owner.
+ * The operator reports and controls an already-bound `OrchestratorRun`. It
+ * never journals an event, never compiles a plan and never dispatches by
+ * itself: retry/resume call the injected retry port with the stored
+ * instruction.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  OPERATOR_VERBS,
+  OPERATOR_SCHEMA_VERSION,
+  createOperatorRuntime,
   orchestratorInputDecision,
   parseOperatorArgs,
-} from "./orchestrator-operator.ts";
-
-test("parseOperatorArgs maps verbs, aliases and unknown input", () => {
-  assert.deepEqual(parseOperatorArgs(""), { verb: "mode-entry", rest: "" });
-  assert.deepEqual(parseOperatorArgs("pause"), { verb: "pause", rest: "" });
-  assert.deepEqual(parseOperatorArgs("say hello child"), {
-    verb: "say",
-    rest: "hello child",
-  });
-  assert.deepEqual(parseOperatorArgs("cancel"), { verb: "cancel", rest: "" });
-  assert.equal(parseOperatorArgs("nonsense").verb, "help");
-});
-
-test("the verb surface includes abort and view", () => {
-  for (const verb of ["status", "start", "pause", "resume", "abort", "stop", "retry", "inspect", "view", "say", "help"]) {
-    assert.equal(
-      (OPERATOR_VERBS as readonly string[]).includes(verb),
-      verb === "abort" || verb === "view" ? (OPERATOR_VERBS as readonly string[]).includes(verb) : true,
-      verb,
-    );
-  }
-});
-
-test("prose while the child runs is forwarded", () => {
-  assert.deepEqual(
-    orchestratorInputDecision("please also update the README", {
-      childPhase: "running",
-      hasRun: true,
-    }),
-    { action: "forward" },
-  );
-  assert.deepEqual(
-    orchestratorInputDecision("start now", { childPhase: "starting", hasRun: true }),
-    {
-      action: "refuse",
-      notice:
-        "The Build child is starting. Wait until the composer shows Working, then send the note again.",
-    },
-  );
-});
-
-test("prose while the child is paused is queued", () => {
-  assert.deepEqual(
-    orchestratorInputDecision("add a test", { childPhase: "paused", hasRun: true }),
-    { action: "queue" },
-  );
-});
-
-test("slash commands always pass through", () => {
-  for (const phase of ["running", "paused", "settling", "idle"] as const) {
-    assert.deepEqual(
-      orchestratorInputDecision("/orchestrator-pause", {
-        childPhase: phase,
-        hasRun: true,
-      }),
-      { action: "allow" },
-    );
-  }
-});
-
-test("a bound run with no live child refuses prose with recovery", () => {
-  const decision = orchestratorInputDecision("do it all again", {
-    childPhase: "disposed",
-    hasRun: true,
-  });
-  assert.equal(decision.action, "refuse");
-  if (decision.action !== "refuse") return;
-  assert.match(decision.notice, /orchestrator-resume|orchestrator retry/i);
-});
-
-test("no run and no child allows the prompt", () => {
-  assert.deepEqual(
-    orchestratorInputDecision("hello", { childPhase: undefined, hasRun: false }),
-    { action: "allow" },
-  );
-  assert.deepEqual(
-    orchestratorInputDecision("   ", { childPhase: "running", hasRun: true }),
-    { action: "allow" },
-  );
-});
-
-// ── Operator verbs against a bound run ───────────────────────────────
-
-import {
-  createOperatorRuntime,
-  type OperatorChildSnapshot,
   type OperatorRuntimePorts,
+  type OperatorTodoRow,
 } from "./orchestrator-operator.ts";
-import { applyRunEvent, createRunState } from "./orchestrator-state.ts";
-import { createFrozenTodosFromSteps } from "./todo-snapshot.ts";
-import type { OrchestratorRuntime, RuntimeView } from "./orchestrator-runtime.ts";
-import type { RunEvent, RunState } from "./orchestrator-state.ts";
+import {
+  createOrchestratorRun,
+  recordDispatch,
+  recordReport,
+  setRunPhase,
+  type OrchestratorRun,
+} from "./orchestrator-run.ts";
 
-function runState(): RunState {
-  const frozen = createFrozenTodosFromSteps({
-    title: "operator",
-    steps: ["first", "second"],
-    mode: "orchestrator",
+const TODO_ROWS: OperatorTodoRow[] = [
+  { ref: "1", text: "First row", completed: true },
+  { ref: "2", text: "Second row", completed: false },
+];
+
+function boundRun(): OrchestratorRun {
+  const created = createOrchestratorRun({
+    title: "Operator demo",
+    planPath: ".pi/plans/x.md",
+    steps: ["First row", "Second row"],
+    workspaces: [
+      { id: "W", root: "C:/repo/main", kind: "git", displayPath: ".", primary: true },
+      { id: "B", root: "C:/repo/other", kind: "git", displayPath: "C:/repo/other", primary: false },
+    ],
     now: 1,
   });
-  assert.equal(frozen.ok, true);
-  if (!frozen.ok) throw new Error("frozen");
-  const created = createRunState({ runId: "run-1", todos: frozen.snapshot, now: 1_000 });
-  assert.equal(created.ok, true);
-  if (!created.ok) throw new Error("state");
-  return created.state;
+  const dispatched = recordDispatch(created, {
+    rowRef: "2",
+    instruction: "Do row two.",
+  });
+  return recordReport(dispatched, { rowRef: "2", report: "Blocked on a missing token." });
 }
 
-function harness(options: {
-  state?: RunState;
-  child?: () => OperatorChildSnapshot | undefined;
-  overrides?: Partial<OperatorRuntimePorts>;
-} = {}) {
-  let state = options.state ?? runState();
-  const events: string[] = [];
-  const calls = {
-    paused: 0,
-    resumed: 0,
-    aborted: 0,
-    stopped: 0,
-    delivered: [] as string[],
-    dispatched: [] as string[],
-    cancelled: 0,
-    view: "auto" as "auto" | "parent" | "child",
-  };
-  const view = (): RuntimeView => ({
-    runId: state.runId,
-    phase: state.phase,
-    todos: state.todos,
-    ...(state.order.find((id) => state.tasks[id]?.state === "pending") === undefined
-      ? {}
-      : { nextTaskId: state.order.find((id) => state.tasks[id]?.state === "pending") }),
-    state,
-  });
-  const runtime = {
-    view,
-    applyEvent: async (event: Parameters<OrchestratorRuntime["applyEvent"]>[0]) => {
-      const result = applyRunEvent(state, {
-        ...(event as RunEvent),
-        expectedRevision: state.revision,
-      } as RunEvent);
-      if (!result.ok) return { ok: false as const, code: "state" as const, error: result.error };
-      state = result.state;
-      events.push(event.type);
-      return { ok: true as const, value: { revision: state.revision, view: view() } };
-    },
-    cancel: async () => {
-      calls.cancelled += 1;
-      return { ok: true as const, value: { view: view() } };
-    },
-  } as unknown as OrchestratorRuntime;
-
+function harness(overrides: Partial<OperatorRuntimePorts> = {}) {
+  const calls: string[] = [];
   const ports: OperatorRuntimePorts = {
-    runtime: () => runtime,
-    now: () => 2_000,
-    child: options.child ?? (() => undefined),
+    run: () => boundRun(),
+    todos: () => TODO_ROWS,
+    child: () => ({
+      phase: "running",
+      ref: "2",
+      total: 2,
+      todos: [],
+    }),
     pauseChild: async () => {
-      calls.paused += 1;
+      calls.push("pauseChild");
       return true;
     },
     resumeChild: async () => {
-      calls.resumed += 1;
+      calls.push("resumeChild");
       return true;
     },
     abortChild: async () => {
-      calls.aborted += 1;
+      calls.push("abortChild");
     },
     stopChild: async () => {
-      calls.stopped += 1;
+      calls.push("stopChild");
     },
-    deliver: async (text) => {
-      calls.delivered.push(text);
-      return { ok: true };
-    },
-    view: () => calls.view,
-    setView: (next) => {
-      calls.view = next;
-    },
-    dispatchRow: async (taskId) => {
-      calls.dispatched.push(taskId);
+    deliver: async () => ({ ok: true }),
+    view: () => "auto",
+    setView: (view) => calls.push(`view:${view}`),
+    setPhase: (phase) => calls.push(`phase:${phase}`),
+    retry: async (rowRef) => {
+      calls.push(`retry:${rowRef ?? "?"}`);
       return { ok: true, text: "child started" };
     },
-    ...options.overrides,
+    ...overrides,
   };
-  const operator = createOperatorRuntime(ports);
-  return { operator, calls, events, getState: () => state };
+  return { operator: createOperatorRuntime(ports), calls };
 }
 
-function pausedRun(): RunState {
-  const base = runState();
-  const paused = applyRunEvent(base, {
-    type: "run.transition",
-    runId: "run-1",
-    expectedRevision: base.revision,
-    now: 1_100,
-    to: "paused",
-  });
-  assert.equal(paused.ok, true);
-  if (!paused.ok) throw new Error("paused");
-  return paused.state;
-}
-
-function blockedRun(): RunState {
-  const base = runState();
-  const blocked = applyRunEvent(base, {
-    type: "task.block",
-    runId: "run-1",
-    expectedRevision: base.revision,
-    now: 1_100,
-    taskId: "task-1",
-    reason: "check failed",
-  });
-  assert.equal(blocked.ok, true);
-  if (!blocked.ok) throw new Error("blocked");
-  return blocked.state;
-}
-
-test("pause pauses the child and the run", async () => {
-  const h = harness({ child: () => ({ phase: "running", todos: [] }) });
-  const result = await h.operator.run("pause");
-  assert.equal(result.ok, true);
-  assert.equal(h.calls.paused, 1);
-  assert.equal(h.getState().phase, "paused");
+test("the operator schema version tracks the rewritten verbs", () => {
+  assert.equal(OPERATOR_SCHEMA_VERSION, 3);
 });
 
-test("pause refuses when the run is already paused", async () => {
-  const h = harness({
-    state: pausedRun(),
-    child: () => ({ phase: "paused", todos: [] }),
-  });
-  const result = await h.operator.run("pause");
+test("parse: bare is mode entry, an unknown verb is help", () => {
+  assert.deepEqual(parseOperatorArgs(""), { verb: "mode-entry", rest: "" });
+  assert.deepEqual(parseOperatorArgs("status now"), { verb: "status", rest: "now" });
+  assert.deepEqual(parseOperatorArgs("nonsense"), { verb: "help", rest: "" });
+});
+
+test("status reports the run record, TODO completion and the next row", async () => {
+  const { operator } = harness();
+  const result = await operator.run("status");
+  assert.equal(result.ok, true);
+  assert.match(result.text, /run-.*· idle/);
+  assert.match(result.text, /plan \.pi\/plans\/x\.md/);
+  assert.match(result.text, /1\/2 rows done · next 2/);
+  assert.match(result.text, /W=C:\/repo\/main \(primary\)/);
+  assert.match(result.text, /next row: 2/);
+  assert.doesNotMatch(result.text, /accepted/i);
+});
+
+test("status without a run explains how to bind one", async () => {
+  const { operator } = harness({ run: () => undefined });
+  const result = await operator.run("status");
   assert.equal(result.ok, false);
-  assert.match(result.text, /already paused/i);
+  assert.match(result.text, /orchestrator_start/);
 });
 
-test("resume continues the warm child", async () => {
-  const h = harness({
-    state: pausedRun(),
-    child: () => ({ phase: "paused", todos: [] }),
-  });
-  const result = await h.operator.run("resume now");
-  assert.equal(result.ok, true);
-  assert.equal(h.calls.resumed, 1);
-  assert.equal(h.getState().phase, "running");
-});
-
-test("resume without a warm child starts a fresh one for the blocked row", async () => {
-  const h = harness({ state: blockedRun() });
-  const result = await h.operator.run("resume");
-  assert.equal(result.ok, true);
-  assert.deepEqual(h.calls.dispatched, ["task-1"]);
-  assert.equal(h.getState().tasks["task-1"]?.state, "pending");
-});
-
-test("abort disposes the child and pauses the run", async () => {
-  const h = harness({ child: () => ({ phase: "running", todos: [] }) });
-  const result = await h.operator.run("abort");
-  assert.equal(result.ok, true);
-  assert.equal(h.calls.aborted, 1);
-  assert.equal(h.getState().phase, "paused");
-});
-
-test("abort refuses without a child", async () => {
-  const h = harness();
-  const result = await h.operator.run("abort");
+test("start points at the model tool instead of creating a run", async () => {
+  const { operator } = harness();
+  const result = await operator.run("start");
   assert.equal(result.ok, false);
-  assert.match(result.text, /no orchestrator child/i);
+  assert.match(result.text, /already bound/i);
+  assert.doesNotMatch(result.text, /frozen/i);
 });
 
-test("stop cancels the run and disposes the child", async () => {
-  const h = harness({ child: () => ({ phase: "running", todos: [] }) });
-  const result = await h.operator.run("stop");
+test("pause controls the child and records the phase", async () => {
+  const { operator, calls } = harness();
+  const result = await operator.run("pause");
   assert.equal(result.ok, true);
-  assert.equal(h.calls.stopped, 1);
-  assert.equal(h.calls.cancelled, 1);
+  assert.deepEqual(calls, ["pauseChild", "phase:paused"]);
 });
 
-test("say delivers immediately to a live child", async () => {
-  const h = harness({ child: () => ({ phase: "running", todos: [] }) });
-  const result = await h.operator.run("say tighten the test");
+test("pause refuses a terminal run and a missing child", async () => {
+  const done = harness({ run: () => setRunPhase(boundRun(), "completed") });
+  assert.match((await done.operator.run("pause")).text, /cannot be paused/);
+
+  const idle = harness({ child: () => undefined });
+  assert.match((await idle.operator.run("pause")).text, /No live child to pause/);
+
+  const paused = harness({ child: () => ({ phase: "paused", todos: [] }) });
+  assert.match((await paused.operator.run("pause")).text, /already paused/);
+});
+
+test("resume continues a warm paused child and records running", async () => {
+  const { operator, calls } = harness({ child: () => ({ phase: "paused", todos: [] }) });
+  const result = await operator.run("resume");
   assert.equal(result.ok, true);
-  assert.deepEqual(h.calls.delivered, ["tighten the test"]);
-  assert.match(result.text, /delivered/i);
+  assert.deepEqual(calls, ["resumeChild", "phase:running"]);
 });
 
-test("say refuses without a child", async () => {
-  const h = harness();
-  const result = await h.operator.run("say hello");
-  assert.equal(result.ok, false);
-  assert.match(result.text, /no orchestrator child/i);
+test("resume without a warm child re-dispatches the current row", async () => {
+  const { operator, calls } = harness({ child: () => undefined });
+  const result = await operator.run("resume");
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["retry:2"]);
+  assert.match(result.text, /Fresh child started for row 2/);
 });
 
-test("status and inspect name the child's model, context, tokens and elapsed time", async () => {
-  const h = harness({
-    child: () => ({
-      phase: "running",
-      ref: "2",
-      total: 7,
-      modelLabel: "open/muse-spark",
-      modelRef: { provider: "open", id: "muse-spark", thinking: "high" },
-      stats: {
-        model: { provider: "open", id: "muse-spark", thinking: "high" },
-        tokens: {
-          input: 12_000,
-          output: 3_000,
-          cacheRead: 0,
-          cacheWrite: 0,
-          total: 15_000,
-        },
-        context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
-      },
-      elapsedMs: 83_000,
-      todos: [
-        { text: "a", completed: true },
-        { text: "b", completed: false },
-      ],
-    }),
+test("abort and stop dispose the child and record the phase", async () => {
+  const aborted = harness();
+  assert.equal((await aborted.operator.run("abort")).ok, true);
+  assert.deepEqual(aborted.calls, ["abortChild", "phase:paused"]);
+
+  const stopped = harness();
+  assert.equal((await stopped.operator.run("stop")).ok, true);
+  assert.deepEqual(stopped.calls, ["stopChild", "phase:cancelled"]);
+
+  const cancelled = harness();
+  assert.equal((await cancelled.operator.run("cancel")).ok, true);
+  assert.deepEqual(cancelled.calls, ["stopChild", "phase:cancelled"]);
+
+  const none = harness({ child: () => undefined });
+  assert.equal((await none.operator.run("abort")).ok, false);
+});
+
+test("retry re-dispatches the stored instruction for the current or named row", async () => {
+  const { operator, calls } = harness();
+  assert.equal((await operator.run("retry")).ok, true);
+  assert.deepEqual(calls, ["retry:2"]);
+
+  const named = harness();
+  assert.equal((await named.operator.run("retry 1")).ok, true);
+  assert.deepEqual(named.calls, ["retry:1"]);
+});
+
+test("say delivers to the live child and refuses without one", async () => {
+  const delivered = harness({ deliver: async () => ({ ok: true, queued: true }) });
+  const result = await delivered.operator.run("say continue");
+  assert.equal(result.ok, true);
+  assert.match(result.text, /queued/);
+
+  const none = harness({ child: () => undefined });
+  assert.equal((await none.operator.run("say hi")).ok, false);
+});
+
+test("inspect shows the row instruction, last report and root", async () => {
+  const { operator } = harness();
+  const result = await operator.run("inspect 2");
+  assert.equal(result.ok, true);
+  assert.match(result.text, /instruction: Do row two\./);
+  assert.match(result.text, /last report: Blocked on a missing token\./);
+  assert.match(result.text, /root: C:\/repo\/main/);
+  assert.doesNotMatch(result.text, /checks:|repairs|files:/);
+});
+
+test("view stores and reports the composer view", async () => {
+  const { operator, calls } = harness();
+  const result = await operator.run("view child");
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["view:child"]);
+  assert.match(result.text, /View: auto/);
+});
+
+test("help names the run-record verbs and never mentions acceptance", async () => {
+  const { operator } = harness();
+  const result = await operator.run("help");
+  assert.match(result.text, /orchestrator_start/);
+  assert.match(result.text, /inspect \[rowRef\]/);
+  assert.doesNotMatch(result.text, /accepted|frozen/i);
+});
+
+test("input routing forwards, queues and refuses around the live child", () => {
+  assert.deepEqual(orchestratorInputDecision("/status", { childPhase: "running", hasRun: true }), {
+    action: "allow",
   });
-  const status = await h.operator.run("status");
-  assert.equal(status.ok, true);
-  assert.match(
-    status.text,
-    /child 2\/7 running · open\/muse-spark · ctx 43% \(86k\/200k\) · ↑12k ↓3\.0k · 01:23 · 1\/2 todos/,
-  );
-
-  const inspect = await h.operator.run("inspect task-1");
-  assert.equal(inspect.ok, true);
-  assert.match(inspect.text, /child 2\/7 running · open\/muse-spark · ctx 43%/);
-
-  // Every line the operator prints stays single-line and bounded.
-  for (const text of [status.text, inspect.text]) {
-    assert.equal(/[\r\n\t]/.test(text.replace(/\n/g, " ")), false);
-  }
-});
-
-test("retry starts a fresh child for a blocked row", async () => {
-  const h = harness({ state: blockedRun() });
-  const result = await h.operator.run("retry");
-  assert.equal(result.ok, true);
-  assert.deepEqual(h.calls.dispatched, ["task-1"]);
-});
-
-test("view toggles the panel without touching prompts", async () => {
-  const h = harness({ child: () => ({ phase: "running", todos: [] }) });
-  const result = await h.operator.run("view child");
-  assert.equal(result.ok, true);
-  assert.equal(h.calls.view, "child");
-  assert.match(result.text, /View: child/);
-});
-
-test("inspect reports the row, child and changed files", async () => {
-  const h = harness({
-    state: blockedRun(),
-    child: () => ({
-      phase: "running",
-      modelLabel: "builder/model",
-      lastTool: "edit",
-      todos: [{ text: "write the test", completed: true }],
-    }),
-    overrides: {
-      diff: async () => ({ committedPaths: ["src/a.ts"], dirtyPaths: ["src/b.ts"] }),
-    },
+  assert.deepEqual(orchestratorInputDecision("keep going", { childPhase: "running", hasRun: true }), {
+    action: "forward",
   });
-  const result = await h.operator.run("inspect task-1");
-  assert.equal(result.ok, true);
-  assert.match(result.text, /task-1 · blocked/);
-  assert.match(result.text, /builder\/model/);
-  assert.match(result.text, /src\/a\.ts, src\/b\.ts/);
-  assert.match(result.text, /write the test/);
-});
-
-test("status names the frozen row and the child's todos (the report stays rich)", async () => {
-  const h = harness({
-    child: () => ({
-      phase: "running",
-      ref: "2",
-      total: 7,
-      modelLabel: "open/muse-spark",
-      stats: {
-        tokens: {
-          input: 12_000,
-          output: 3_000,
-          cacheRead: 0,
-          cacheWrite: 0,
-          total: 15_000,
-        },
-        context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
-      },
-      elapsedMs: 83_000,
-      todos: [
-        { text: "a", completed: true },
-        { text: "b", completed: false },
-      ],
-    }),
+  assert.deepEqual(orchestratorInputDecision("keep going", { childPhase: "paused", hasRun: true }), {
+    action: "queue",
   });
-  const result = await h.operator.run("status");
-  assert.equal(result.ok, true);
-  assert.match(
-    result.text,
-    /child 2\/7 running · open\/muse-spark · ctx 43% \(86k\/200k\) · ↑12k ↓3\.0k · 01:23 · 1\/2 todos/,
-    "the multi-line report keeps the row pointer and the child's todo count",
-  );
-});
-
-test("the operator report uses the shared phase word", async () => {
-  const lineFor = async (child: Record<string, unknown>) => {
-    const h = harness({
-      child: () => ({ ref: "2", total: 7, todos: [], ...child }) as never,
-    });
-    const result = await h.operator.run("status");
-    return result.text.split("\n").find((line) => line.startsWith("child ")) ?? "";
-  };
-
-  assert.match(await lineFor({ phase: "settling" }), /^child 2\/7 verifying/);
-  assert.match(
-    await lineFor({ phase: "paused", pausePending: true }),
-    /^child 2\/7 pausing/,
-  );
-  assert.match(await lineFor({ phase: "paused" }), /^child 2\/7 paused/);
-  assert.match(await lineFor({ phase: "running", retrying: true }), /^child 2\/7 retrying/);
-});
-
-test("each operator alias resolves to the same verb", () => {
-  for (const verb of ["pause", "resume", "abort", "view", "retry", "inspect", "say", "stop", "cancel"]) {
-    assert.equal(parseOperatorArgs(verb).verb, verb);
-  }
+  const idle = orchestratorInputDecision("keep going", { childPhase: "idle", hasRun: true });
+  assert.equal(idle.action, "refuse");
+  assert.match(idle.action === "refuse" ? idle.notice : "", /orchestrator retry/);
+  assert.deepEqual(orchestratorInputDecision("start", { childPhase: undefined, hasRun: false }), {
+    action: "allow",
+  });
 });

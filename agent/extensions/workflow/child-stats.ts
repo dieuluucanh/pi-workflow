@@ -213,10 +213,10 @@ export interface ChildStatusInput {
  * Desktop status) default to BOTH `false`: the pinned TODO pane owns progress
  * and the child's own counters, and the row has no columns to spare. The
  * multi-line `/orchestrator status` report opts into both, because naming the
- * frozen row there is useful and nothing is competing for the width.
+ * run row there is useful and nothing is competing for the width.
  */
 export interface ChildStatusOptions {
-  /** Include the frozen-row pointer (`child 2/7 running`). */
+  /** Include the row pointer (`child 2/7 running`). */
   showRow?: boolean;
   /** Include the child's own `n/m todos` counter. */
   showTodoCount?: boolean;

@@ -7,7 +7,6 @@
  *
  *   { "workflow": { "orchestrator": {
  *       "childTimeoutMs": 2700000,
- *       "verificationTimeoutSeconds": 900,
  *       "gitTimeoutMs": 60000
  *   } } }
  *
@@ -24,16 +23,11 @@
  */
 
 import * as fs from "node:fs";
-import * as path from "node:path";
 
 import { reviewConfigPaths, WORKFLOW_SETTINGS_KEY } from "./review.ts";
 import { DEFAULT_CHILD_TIMEOUT_MS } from "./orchestrator-child-controller.ts";
-import { DEFAULT_GIT_TIMEOUT_MS } from "./check-executor.ts";
-import {
-  DEFAULT_SHELL_MAX_TIMEOUT_SECONDS,
-  HARD_MAX_SHELL_TIMEOUT_SECONDS,
-  clampShellSeconds,
-} from "./shell-guard.ts";
+import { DEFAULT_GIT_TIMEOUT_MS } from "./git-bounded.ts";
+import { HARD_MAX_SHELL_TIMEOUT_SECONDS } from "./shell-guard.ts";
 
 /** Nested key under `workflow` in settings.json. */
 export const ORCHESTRATOR_SETTINGS_KEY = "orchestrator";
@@ -44,22 +38,18 @@ export type JsonObject = Record<string, unknown>;
 export interface OrchestratorLimits {
   /** Wall-clock bound on one Build child turn. */
   childTimeoutMs: number;
-  /** Deadline for one row/plan check; also bounded by the shell guard. */
-  verificationTimeoutSeconds: number;
-  /** Bound on one `git` invocation in the baseline/diff path. */
+  /** Bound on one `git` invocation in the workspace resolver path. */
   gitTimeoutMs: number;
 }
 
 export const ORCHESTRATOR_LIMIT_KEYS = [
   "childTimeoutMs",
-  "verificationTimeoutSeconds",
   "gitTimeoutMs",
 ] as const;
 export type OrchestratorLimitKey = (typeof ORCHESTRATOR_LIMIT_KEYS)[number];
 
 export const DEFAULT_ORCHESTRATOR_LIMITS: Readonly<OrchestratorLimits> = {
   childTimeoutMs: DEFAULT_CHILD_TIMEOUT_MS,
-  verificationTimeoutSeconds: DEFAULT_SHELL_MAX_TIMEOUT_SECONDS,
   gitTimeoutMs: DEFAULT_GIT_TIMEOUT_MS,
 };
 
@@ -74,10 +64,6 @@ const LIMIT_BOUNDS: Readonly<Record<OrchestratorLimitKey, LimitBound>> = {
     max: HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000,
     unit: "milliseconds",
   },
-  verificationTimeoutSeconds: {
-    max: HARD_MAX_SHELL_TIMEOUT_SECONDS,
-    unit: "seconds",
-  },
   gitTimeoutMs: {
     max: HARD_MAX_SHELL_TIMEOUT_SECONDS * 1_000,
     unit: "milliseconds",
@@ -90,7 +76,7 @@ export type OrchestratorLimitScopeSource = "default" | "global" | "project";
 /** One ignored setting, so the caller can tell the user what was wrong. */
 export interface OrchestratorLimitDiagnostic {
   scope: "global" | "project";
-  key: OrchestratorLimitKey;
+  key: OrchestratorLimitKey | "verificationTimeoutSeconds";
   value: unknown;
   message: string;
 }
@@ -101,7 +87,6 @@ export interface ResolvedOrchestratorLimits {
     global: boolean;
     project: boolean;
     childTimeout: OrchestratorLimitScopeSource;
-    verificationTimeout: OrchestratorLimitScopeSource;
     gitTimeout: OrchestratorLimitScopeSource;
   };
   diagnostics: OrchestratorLimitDiagnostic[];
@@ -279,46 +264,44 @@ export function readOrchestratorLimits(
       global: globalRaw !== undefined,
       project: projectRaw !== undefined,
       childTimeout: orchestratorFieldSourceOf(globalRaw, projectRaw, "childTimeoutMs"),
-      verificationTimeout: orchestratorFieldSourceOf(
-        globalRaw,
-        projectRaw,
-        "verificationTimeoutSeconds",
-      ),
       gitTimeout: orchestratorFieldSourceOf(globalRaw, projectRaw, "gitTimeoutMs"),
     },
     diagnostics: [
       ...orchestratorLimitDiagnostics(globalRaw, "global"),
       ...orchestratorLimitDiagnostics(projectRaw, "project"),
+      ...deprecatedVerificationTimeoutDiagnostics(globalRaw, "global"),
+      ...deprecatedVerificationTimeoutDiagnostics(projectRaw, "project"),
     ],
   };
 }
 
 /**
- * The deadline a check may actually use: the orchestrator setting, the shell
- * guard's configured maximum and the hard cap all apply; the smallest wins.
- * A configured shell maximum can therefore tighten the orchestrator setting but
- * never be widened by it.
+ * A removed setting must not be silently ignored. A user who still has
+ * `workflow.orchestrator.verificationTimeoutSeconds` sees one diagnostic; the
+ * value no longer bounds anything because verification is ordinary bash.
  */
-export function effectiveVerificationTimeoutSeconds(
-  config: OrchestratorLimits,
-  shellGuardMaxTimeoutSeconds?: unknown,
-): number {
-  const shellMax = clampShellSeconds(
-    shellGuardMaxTimeoutSeconds,
-    DEFAULT_SHELL_MAX_TIMEOUT_SECONDS,
-  );
-  return Math.min(
-    HARD_MAX_SHELL_TIMEOUT_SECONDS,
-    shellMax,
-    config.verificationTimeoutSeconds,
-  );
+export function deprecatedVerificationTimeoutDiagnostics(
+  raw: unknown,
+  scope: "global" | "project",
+): OrchestratorLimitDiagnostic[] {
+  if (!isJsonObject(raw) || !Object.prototype.hasOwnProperty.call(raw, "verificationTimeoutSeconds")) {
+    return [];
+  }
+  return [
+    {
+      scope,
+      key: "verificationTimeoutSeconds",
+      value: raw.verificationTimeoutSeconds,
+      message:
+        "workflow.orchestrator.verificationTimeoutSeconds is no longer used; verification runs as ordinary bash and is bounded by the shell guard",
+    },
+  ];
 }
 
 /** One-line display, used by status output and diagnostics. */
 export function describeOrchestratorLimits(config: OrchestratorLimits): string {
   return [
     `child ${Math.round(config.childTimeoutMs / 1_000)}s`,
-    `checks ${config.verificationTimeoutSeconds}s`,
     `git ${Math.round(config.gitTimeoutMs / 1_000)}s`,
   ].join(" · ");
 }

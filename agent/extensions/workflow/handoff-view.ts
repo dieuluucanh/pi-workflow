@@ -97,12 +97,6 @@ export interface HandoffQuestionInput {
   reason: HandoffReason;
   verdict?: string;
   findingCount?: number;
-  /**
-   * Compiled check preview: the exact final commands, workspaces and timeouts
-   * that will run after approval, plus any acknowledgement warning. Absent when
-   * the caller could not read the plan.
-   */
-  checkPreview?: string;
 }
 
 function normalize(value: string): string {
@@ -172,9 +166,6 @@ export function buildHandoffQuestion(
     lines.push(`Review: ${input.verdict.trim()}${count}`);
   }
   lines.push("The plan is printed above in the transcript — scroll up to read it.");
-  if (typeof input.checkPreview === "string" && input.checkPreview.trim()) {
-    lines.push("", input.checkPreview.trim());
-  }
   lines.push("Approving the plan is not execution: you choose where it runs next.");
   const options: QuestionnaireOption[] = [
     {

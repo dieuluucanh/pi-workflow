@@ -158,7 +158,6 @@ test("the status keys are stable", () => {
     review: "workflow-review",
     todos: "workflow-todos",
     orchestrator: "workflow-orchestrator",
-    execution: "workflow-execution",
   });
 });
 

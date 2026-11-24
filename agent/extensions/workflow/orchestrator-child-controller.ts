@@ -57,6 +57,10 @@ export interface CreateChildInput {
   attemptId: string;
   ref: string;
   total: number;
+  /** Absolute root this row targets; defaults to the session root. */
+  cwd?: string;
+  /** The declared workspace behind `cwd`, for the prompt only. */
+  workspace?: { id: string; root: string };
 }
 
 export interface StartChildInput extends CreateChildInput {
@@ -82,6 +86,8 @@ export interface OrchestratorChildPorts {
     attemptId: string;
     ref: string;
     total: number;
+    cwd?: string;
+    workspace?: { id: string; root: string };
     repair?: string;
   }) => string;
   onOps?: (ops: OrchestratorChildOp[]) => void;
@@ -229,6 +235,8 @@ export function createOrchestratorChildController(
   let deadlineStartedAt: number | undefined;
   let deadlineGen = -1;
   let queuedNote: string | undefined;
+  /** The last row input, so a re-prompt targets the same root. */
+  let lastInput: CreateChildInput | undefined;
   let prepared:
     | {
         attemptId: string;
@@ -723,6 +731,7 @@ export function createOrchestratorChildController(
       summary = "";
       queuedNote = undefined;
       startedAt = now();
+      lastInput = input;
       publish({
         phase: "starting",
         taskId: input.taskId,
@@ -833,6 +842,8 @@ export function createOrchestratorChildController(
             attemptId: input.attemptId,
             ref: input.ref,
             total: input.total,
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            ...(input.workspace ? { workspace: input.workspace } : {}),
             ...(input.repair ? { repair: input.repair } : {}),
           }),
         );
@@ -906,7 +917,15 @@ export function createOrchestratorChildController(
       armDeadline(gen);
       try {
         await child.prompt(
-          ports.buildPrompt({ taskId, attemptId, ref, total, repair }),
+          ports.buildPrompt({
+            taskId,
+            attemptId,
+            ref,
+            total,
+            repair,
+            ...(lastInput?.cwd ? { cwd: lastInput.cwd } : {}),
+            ...(lastInput?.workspace ? { workspace: lastInput.workspace } : {}),
+          }),
         );
         return true;
       } catch (error: unknown) {

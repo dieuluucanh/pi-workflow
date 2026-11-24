@@ -31,7 +31,10 @@ import {
   orchestratorChildTeardowns,
   resetOrchestratorChildTeardownsForTests,
 } from "./orchestrator-child-teardown.ts";
-import { ORCHESTRATOR_CHILD_ENTRY } from "./orchestrator-child-contract.ts";
+import {
+  ORCHESTRATOR_CHILD_ENTRY,
+  ORCHESTRATOR_CHILD_VERSION,
+} from "./orchestrator-child-contract.ts";
 import { makeFakeCtx, makeFakePi } from "./test-support.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -203,7 +206,7 @@ function childBranch(): unknown[] {
       type: "custom",
       customType: ORCHESTRATOR_CHILD_ENTRY,
       data: {
-        version: 1,
+        version: ORCHESTRATOR_CHILD_VERSION,
         runId: "run-1",
         taskId: "task-1",
         attemptId: "attempt-1",

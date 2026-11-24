@@ -1,42 +1,31 @@
 /**
- * Workflow Extension — session-scoped TODO store.
+ * Workflow Extension — session-scoped TODO store (plain mutable list).
  *
- * The todo list used to live as a handful of mutable closure variables inside
- * the (very large) extension factory. This module is the storage seam: one
- * instance per session, explicit ownership, and the pure helpers from
- * `utils.ts` for every mutation.
+ * One instance per session, explicit ownership, and the pure helpers from
+ * `utils.ts` for every mutation. There is no freeze, no plan digest, no
+ * exclusion set and no recovery receipt: the model owns a mutable list and the
+ * store only remembers it.
  *
- * Why ownership is explicit (orchestrator plan step 3):
+ * Ownership stays explicit:
  *
- *   - `ordinary` — a normal Plan/Build list. `workflow_todo` and plan-file
- *     reconciliation drive it exactly as before.
- *   - `roadmap`  — the parent Orchestrator's projection. Only accepted task
- *     coverage may complete a step; it must never be reinterpreted as worker
- *     progress.
+ *   - `ordinary` — a normal Plan/Build/parent list. `workflow_todo` drives it.
  *   - `worker`   — a child session's task-local list. It cannot touch parent
- *     roadmap state or trigger a parent commit.
+ *                  state or trigger a parent commit.
  *
  * The store holds no module-level state, so two sessions (or a parent and its
  * child in one process) can never share items, ref numbering or panel
- * preferences. `owner` is recorded so a future projection layer can refuse a
- * cross-list mutation instead of guessing from display numbers.
- *
- * Everything here is pure or I/O-light; file reads are injected by the caller.
+ * preferences.
  */
 
 import {
   applyTodoUpdate,
   dedupeTodoItems,
   ensureTodoLabels,
-  extractPlanStepsFromMarkdown,
   isDone,
   itemStatus,
   markCompletedRefs,
-  mergeTodoItems,
   resolveTodoRef,
-  samePlanPath,
   setTodoStatus,
-  synthesizeFromPlanTitle,
   todoKey,
   type TodoItem,
   type TodoRefResolution,
@@ -44,17 +33,8 @@ import {
   type TodoUpdateEntry,
 } from "./utils.ts";
 
-import {
-  applyFrozenStatusUpdate,
-  frozenRowsToTodoItems,
-  validateFrozenSnapshot,
-  type FrozenStatusUpdate,
-  type FrozenTodoResult,
-  type FrozenTodoSnapshot,
-} from "./todo-snapshot.ts";
-
 /** Which list a store instance owns. */
-export const TODO_LIST_OWNERS = ["ordinary", "roadmap", "worker"] as const;
+export const TODO_LIST_OWNERS = ["ordinary", "worker"] as const;
 export type TodoListOwner = (typeof TODO_LIST_OWNERS)[number];
 
 /** The panel preference values `/todos` accepts (presentation only). */
@@ -64,18 +44,10 @@ export type TodoPanelPreference = "auto" | "expanded" | "collapsed" | "hidden";
 export interface TodoStoreSnapshot {
   owner: TodoListOwner;
   items: TodoItem[];
+  /** Display-only reminder of the plan the list came from. */
   planPath?: string;
   /** Monotonic list revision; a stale expected revision is refused. */
   revision?: number;
-  /** Plan bindings deliberately removed; passive reconciliation must not restore them. */
-  excludedPlanSteps?: string[];
-  planDigest?: string;
-  /** Idempotency key of the last applied reviewed recovery. */
-  recoveryReceiptId?: string;
-  /** Versioned frozen execution. Its presence makes the list structural-immutable. */
-  frozen?: FrozenTodoSnapshot;
-  /** A present-but-corrupt frozen field is reported, never silently downgraded. */
-  frozenError?: string;
   panel: {
     preference: TodoPanelPreference;
     preferenceScope: string | null;
@@ -89,20 +61,10 @@ export interface TodoStore {
 
   /** The live list. Replaced by `replace`/`update`; never mutated by callers. */
   items: TodoItem[];
-  /** Plan file the current list was derived from (drives merge vs replace). */
+  /** Plan file the list is displayed against; display-only. */
   planPath: string | undefined;
   /** Monotonic list revision; bumped by every authoritative mutation. */
   revision: number;
-  /** Plan bindings the user deliberately removed (durable exclusions). */
-  excludedPlanSteps: Set<string>;
-  /** Digest of the plan bytes last imported, when known. */
-  planDigest: string | undefined;
-  /** The frozen execution, when this list is forward-only. */
-  frozen: FrozenTodoSnapshot | undefined;
-  /** Set when a persisted frozen field was present but invalid. */
-  frozenError: string | undefined;
-  /** Last applied recovery receipt (idempotency). */
-  recoveryReceiptId: string | undefined;
 
   // Panel presentation. Kept beside the list because it is scoped to it.
   panelPreference: TodoPanelPreference;
@@ -112,60 +74,21 @@ export interface TodoStore {
 
   /** Replace the whole list (already-extracted steps are normalized). */
   replace(items: TodoItem[]): void;
-  /** Install a frozen execution. Structural methods then refuse. */
-  freeze(snapshot: FrozenTodoSnapshot): FrozenTodoResult;
-  /**
-   * Industry-style wholesale update: omitted items are removed.
-   *
-   * A plan-linked list refuses a text-only bulk rewrite that would replace
-   * most plan rows with new agent rows (that is how the 23→46 duplication
-   * happened). `allowBulkReplace` is the explicit replacement intent.
-   */
+  /** Wholesale update: omitted items are removed. */
   update(
     incoming: TodoUpdateEntry[],
-    options?: { allowBulkReplace?: boolean; expectedRevision?: number },
+    options?: { expectedRevision?: number },
   ): ReturnType<typeof applyTodoUpdate>;
   /** Mark `[DONE:ref]` tags from assistant text. */
   markDoneTags(text: string): ReturnType<typeof markCompletedRefs>;
   resolve(ref: string): TodoRefResolution;
   setStatus(ref: string, status: TodoStatus): TodoItem | undefined;
   toggle(ref: string): TodoItem | undefined;
-  add(input: { text: string; group?: string; label?: string }): { item: TodoItem; duplicate: boolean };
+  add(input: { text: string; group?: string; label?: string }): {
+    item: TodoItem;
+    duplicate: boolean;
+  };
   clear(): void;
-
-  /**
-   * Extract steps from plan markdown and merge them:
-   * same plan file → completion-preserving merge; different/absent → replace.
-   * Returns whether the list was replaced and how many items were preserved.
-   */
-  loadFromPlanMarkdown(input: {
-    markdown: string;
-    planPath: string;
-    cwd: string;
-    /** Explicit sync may restore deliberately removed steps. */
-    restoreExcluded?: boolean;
-  }): {
-    replaced: boolean;
-    count: number;
-    preserved: number;
-    synthesized: boolean;
-    excluded: number;
-    restored: number;
-  };
-
-  /** Merge freshly extracted steps from the SAME plan file. */
-  mergeExtracted(
-    extracted: TodoItem[],
-    planPath: string,
-    cwd: string,
-    options?: { restoreExcluded?: boolean },
-  ): {
-    replaced: boolean;
-    count: number;
-    preserved: number;
-    excluded: number;
-    restored: number;
-  };
 
   doneCount(): number;
   remainingCount(): number;
@@ -175,11 +98,6 @@ export interface TodoStore {
 
   snapshot(): TodoStoreSnapshot;
   restore(snapshot: Partial<TodoStoreSnapshot>): void;
-  /**
-   * Apply a reviewed recovery of a damaged list. Idempotent per receipt id;
-   * it is bookkeeping only and never proves completion or triggers commits.
-   */
-  recover(items: TodoItem[], receiptId: string): { applied: boolean };
 }
 
 export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
@@ -188,35 +106,14 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     items: [],
     planPath: undefined,
     revision: 0,
-    excludedPlanSteps: new Set<string>(),
-    planDigest: undefined,
-    frozen: undefined,
-    frozenError: undefined,
-    recoveryReceiptId: undefined,
     panelPreference: "auto",
     panelScope: null,
     promptAfterSettle: false,
     completedSignature: null,
 
     replace(items) {
-      if (store.frozen) return;
       store.items = ensureTodoLabels(dedupeTodoItems(items));
-    },
-
-    freeze(snapshot) {
-      // The frozen run model is being removed. A freeze call now only installs
-      // the initial rows; the list stays fully mutable like any Build list.
-      const checked = validateFrozenSnapshot(snapshot);
-      if (!checked.ok) {
-        store.frozenError = checked.error;
-        return checked;
-      }
-      store.frozen = undefined;
-      store.frozenError = undefined;
-      store.items = frozenRowsToTodoItems(checked.snapshot);
-      store.planPath = checked.snapshot.source.path;
       store.revision += 1;
-      return { ok: true, snapshot: checked.snapshot };
     },
 
     update(incoming, options) {
@@ -235,108 +132,13 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
           revision: store.revision,
         };
       }
-      const planRows = store.items.filter((item) => item.planStepId);
-      if (store.frozen) {
-        const rows = store.frozen.rows;
-        const entries = incoming ?? [];
-        if (entries.length !== rows.length) {
-          return frozenRefusal(store.items,
-            "A frozen list accepts only a complete status update with every row in order.",
-          );
-        }
-        const updates: FrozenStatusUpdate[] = [];
-        for (let index = 0; index < entries.length; index += 1) {
-          const entry = entries[index]!;
-          const row = rows[index]!;
-          const resolved =
-            (entry.id !== undefined ? rows.find((candidate) => candidate.id === entry.id) : undefined) ??
-            (entry.ref !== undefined ? rows.find((candidate) => candidate.ref === entry.ref) : undefined);
-          if (!resolved || resolved.id !== row.id) {
-            return frozenRefusal(store.items,
-              "A frozen list cannot reorder, add, or rename rows; send the same ids/refs in the same order.",
-            );
-          }
-          if (entry.text !== undefined && entry.text.trim() !== row.text) {
-            return frozenRefusal(store.items, "A frozen list cannot change row text; only status may change.");
-          }
-          if (entry.status !== undefined) updates.push({ id: row.id, status: entry.status });
-        }
-        const applied = applyFrozenStatusUpdate(store.frozen, updates);
-        if (!applied.ok) return frozenRefusal(store.items, applied.error);
-        store.frozen = applied.snapshot;
-        store.items = frozenRowsToTodoItems(applied.snapshot);
-        store.revision += 1;
-        return {
-          items: [...store.items],
-          added: 0,
-          removed: 0,
-          kept: store.items.length,
-          normalized: 0,
-          warnings: [],
-          revision: store.revision,
-        };
-      }
-      const identifiable = (incoming ?? []).filter(
-        (entry) =>
-          (entry.id !== undefined && String(entry.id).trim().length > 0) ||
-          (entry.ref !== undefined && String(entry.ref).trim().length > 0),
-      ).length;
-      // Ref-less wholesale rewording of a plan-linked list is the exact shape
-      // that created a second copy of every task. Refuse before mutating.
-      if (
-        options?.allowBulkReplace !== true &&
-        planRows.length >= 3 &&
-        identifiable < Math.ceil(planRows.length / 2)
-      ) {
-        return {
-          items: [...store.items],
-          added: 0,
-          removed: 0,
-          kept: 0,
-          normalized: 0,
-          warnings: [],
-          refused:
-            "This list is linked to a plan. Update existing items with their id/ref; a text-only wholesale rewrite could duplicate tasks. Pass intent:\"replace\" to replace the list deliberately.",
-          revision: store.revision,
-        };
-      }
-      const before = new Map(store.items.map((item) => [item.id, item]));
       const result = applyTodoUpdate(store.items, incoming);
-      const keptIds = new Set(result.items.map((item) => item.id));
-      let excludedAdded = 0;
-      for (const item of before.values()) {
-        if (!item?.planStepId || !item.id) continue;
-        if (keptIds.has(item.id)) continue;
-        store.excludedPlanSteps.add(item.planStepId);
-        excludedAdded += 1;
-      }
       store.items = result.items;
       store.revision += 1;
-      return { ...result, revision: store.revision, excludedAdded };
+      return { ...result, revision: store.revision };
     },
 
     markDoneTags(text) {
-      if (store.frozen) {
-        const copy = store.items.map((item) => ({ ...item }));
-        const result = markCompletedRefs(text, copy);
-        const updates: FrozenStatusUpdate[] = [];
-        for (const item of copy) {
-          const before = store.items.find((candidate) => candidate.id === item.id);
-          const after = itemStatus(item);
-          if (before && item.id && itemStatus(before) !== after) {
-            updates.push({ id: item.id, status: after });
-          }
-        }
-        if (updates.length > 0) {
-          const applied = applyFrozenStatusUpdate(store.frozen, updates);
-          if (applied.ok) {
-            store.frozen = applied.snapshot;
-            store.items = frozenRowsToTodoItems(applied.snapshot);
-            store.revision += 1;
-          }
-        }
-        return result;
-      }
       return markCompletedRefs(text, store.items);
     },
 
@@ -345,14 +147,6 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     setStatus(ref, status) {
-      if (store.frozen) {
-        const applied = applyFrozenStatusUpdate(store.frozen, [{ ref, status }]);
-        if (!applied.ok) return undefined;
-        store.frozen = applied.snapshot;
-        store.items = frozenRowsToTodoItems(applied.snapshot);
-        store.revision += 1;
-        return store.items.find((item) => item.ref === ref || item.id === ref);
-      }
       const resolved = resolveTodoRef(store.items, ref);
       if (!resolved.item) return undefined;
       setTodoStatus(resolved.item, status);
@@ -360,17 +154,6 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     toggle(ref) {
-      if (store.frozen) {
-        const resolved = resolveTodoRef(store.items, ref);
-        if (!resolved.item) return undefined;
-        const status = isDone(resolved.item) ? "pending" : "completed";
-        const applied = applyFrozenStatusUpdate(store.frozen, [{ ref, status }]);
-        if (!applied.ok) return undefined;
-        store.frozen = applied.snapshot;
-        store.items = frozenRowsToTodoItems(applied.snapshot);
-        store.revision += 1;
-        return store.items.find((item) => item.ref === ref || item.id === ref);
-      }
       const resolved = resolveTodoRef(store.items, ref);
       if (!resolved.item) return undefined;
       setTodoStatus(resolved.item, isDone(resolved.item) ? "pending" : "completed");
@@ -378,9 +161,6 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     add(input) {
-      if (store.frozen) {
-        return { item: store.items[0]!, duplicate: true };
-      }
       const text = input.text.trim();
       const key = todoKey({ text, group: input.group });
       const existing = store.items.find((item) => todoKey(item) === key);
@@ -401,97 +181,9 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     clear() {
-      if (store.frozen) return;
-      // An explicit clear is a deliberate membership decision: remember the
-      // plan bindings so passive reconciliation cannot resurrect them.
-      for (const item of store.items) {
-        if (item.planStepId) store.excludedPlanSteps.add(item.planStepId);
-      }
       store.items = [];
       store.planPath = undefined;
       store.revision += 1;
-    },
-
-    loadFromPlanMarkdown({ markdown, planPath, cwd, restoreExcluded }) {
-      if (store.frozen) {
-        return {
-          replaced: false,
-          count: store.items.length,
-          preserved: store.items.length,
-          synthesized: false,
-          excluded: 0,
-          restored: 0,
-        };
-      }
-      let extracted = extractPlanStepsFromMarkdown(markdown);
-      let synthesized = false;
-      if (extracted.length === 0) {
-        const synth = synthesizeFromPlanTitle(markdown);
-        if (synth) {
-          extracted = [synth];
-          synthesized = true;
-        }
-      }
-      if (extracted.length === 0) {
-        return {
-          replaced: false,
-          count: store.items.length,
-          preserved: 0,
-          synthesized: false,
-          excluded: 0,
-          restored: 0,
-        };
-      }
-      const merged = store.mergeExtracted(extracted, planPath, cwd, {
-        ...(restoreExcluded === undefined ? {} : { restoreExcluded }),
-      });
-      return { ...merged, synthesized };
-    },
-
-    mergeExtracted(extracted, planPath, cwd, options) {
-      if (store.frozen) {
-        return {
-          replaced: false,
-          count: store.items.length,
-          preserved: store.items.length,
-          excluded: 0,
-          restored: 0,
-        };
-      }
-      const samePlan =
-        store.planPath !== undefined && samePlanPath(store.planPath, planPath, cwd);
-      if (samePlan) {
-        const restoreExcluded = options?.restoreExcluded === true;
-        const merged = mergeTodoItems(store.items, extracted, {
-          excludedPlanStepIds: store.excludedPlanSteps,
-          ...(restoreExcluded ? { restoreExcluded: true } : {}),
-        });
-        // An explicit sync is the only operation that clears membership
-        // exclusions; passive reconciliation never does.
-        if (restoreExcluded) store.excludedPlanSteps.clear();
-        store.items = merged.items;
-        store.planPath = planPath;
-        store.revision += 1;
-        return {
-          replaced: false,
-          count: store.items.length,
-          preserved: merged.preserved,
-          excluded: merged.excluded,
-          restored: merged.restored,
-        };
-      }
-      // A new plan lineage: exclusions belong to the previous plan.
-      store.excludedPlanSteps.clear();
-      store.items = ensureTodoLabels(extracted);
-      store.planPath = planPath;
-      store.revision += 1;
-      return {
-        replaced: true,
-        count: store.items.length,
-        preserved: 0,
-        excluded: 0,
-        restored: 0,
-      };
     },
 
     doneCount() {
@@ -521,13 +213,6 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         items: store.items.map((item) => ({ ...item })),
         ...(store.planPath === undefined ? {} : { planPath: store.planPath }),
         revision: store.revision,
-        excludedPlanSteps: [...store.excludedPlanSteps],
-        ...(store.planDigest === undefined ? {} : { planDigest: store.planDigest }),
-        ...(store.frozen === undefined ? {} : { frozen: cloneFrozenSnapshot(store.frozen) }),
-        ...(store.frozenError === undefined ? {} : { frozenError: store.frozenError }),
-        ...(store.recoveryReceiptId === undefined
-          ? {}
-          : { recoveryReceiptId: store.recoveryReceiptId }),
         panel: {
           preference: store.panelPreference,
           preferenceScope: store.panelScope,
@@ -538,45 +223,14 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     restore(snapshot) {
-      // A later legacy entry without a frozen payload cannot replace the rows
-      // or plan binding of an already-restored frozen execution.
-      const preserveFrozen =
-        store.frozen !== undefined && snapshot.frozen === undefined;
-      if (Array.isArray(snapshot.items) && !preserveFrozen) {
+      if (Array.isArray(snapshot.items)) {
         store.items = ensureTodoLabels(snapshot.items);
       }
-      if (snapshot.planPath !== undefined && !preserveFrozen) {
+      if (snapshot.planPath !== undefined) {
         store.planPath = snapshot.planPath;
       }
       if (typeof snapshot.revision === "number" && Number.isFinite(snapshot.revision)) {
         store.revision = Math.max(store.revision, Math.floor(snapshot.revision));
-      }
-      if (Array.isArray(snapshot.excludedPlanSteps)) {
-        store.excludedPlanSteps = new Set(
-          snapshot.excludedPlanSteps.filter(
-            (entry): entry is string => typeof entry === "string" && entry.length > 0,
-          ),
-        );
-      }
-      if (typeof snapshot.planDigest === "string") store.planDigest = snapshot.planDigest;
-      if (snapshot.frozen !== undefined) {
-        const checked = validateFrozenSnapshot(snapshot.frozen);
-        if (checked.ok) {
-          store.frozen = checked.snapshot;
-          store.frozenError = undefined;
-          store.items = frozenRowsToTodoItems(checked.snapshot);
-          store.planPath = checked.snapshot.source.path;
-          store.planDigest = checked.snapshot.source.digest;
-        } else {
-          store.frozen = undefined;
-          store.frozenError = checked.error;
-          store.items = [];
-        }
-      } else if (typeof snapshot.frozenError === "string") {
-        store.frozenError = snapshot.frozenError;
-      }
-      if (typeof snapshot.recoveryReceiptId === "string") {
-        store.recoveryReceiptId = snapshot.recoveryReceiptId;
       }
       const panel = snapshot.panel;
       if (panel) {
@@ -589,62 +243,21 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
         if (typeof panel.promptAfterSettle === "boolean") {
           store.promptAfterSettle = panel.promptAfterSettle;
         }
-        if (panel.completedSignature === null || typeof panel.completedSignature === "string") {
+        if (
+          panel.completedSignature === null ||
+          typeof panel.completedSignature === "string"
+        ) {
           store.completedSignature = panel.completedSignature;
         }
       }
-    },
-
-    recover(items, receiptId) {
-      if (store.frozen) return { applied: false };
-      if (store.recoveryReceiptId === receiptId) return { applied: false };
-      // The reviewed list is authoritative; keep stable ids/bindings it carries.
-      store.items = ensureTodoLabels(dedupeTodoItems(items));
-      store.recoveryReceiptId = receiptId;
-      store.revision += 1;
-      return { applied: true };
     },
   };
   return store;
 }
 
-function frozenRefusal(items: TodoItem[], refused: string) {
-  return {
-    items: [...items],
-    added: 0,
-    removed: 0,
-    kept: 0,
-    normalized: 0,
-    warnings: [] as string[],
-    refused,
-    revision: 0,
-  };
-}
-
-function cloneFrozenSnapshot(snapshot: FrozenTodoSnapshot): FrozenTodoSnapshot {
-  return {
-    ...snapshot,
-    source: { ...snapshot.source },
-    rows: snapshot.rows.map((row) => ({
-      ...row,
-      acceptanceChecks: [...row.acceptanceChecks],
-      expectedFiles: [...row.expectedFiles],
-      ...(row.workspaces === undefined ? {} : { workspaces: [...row.workspaces] }),
-    })),
-    planChecks: [...snapshot.planChecks],
-    ...(snapshot.workspaces === undefined
-      ? {}
-      : { workspaces: snapshot.workspaces.map((workspace) => ({ ...workspace })) }),
-    ...(snapshot.planCheckSpecs === undefined
-      ? {}
-      : { planCheckSpecs: snapshot.planCheckSpecs.map((spec) => ({ ...spec })) }),
-  };
-}
-
 /**
- * A defensive check for the projection layer: only an `ordinary` list may be
- * driven by `workflow_todo`/plan reconciliation, and a worker list can never
- * be the parent's roadmap list.
+ * A defensive check for the projection layer: only the expected owner may
+ * drive a list, and a worker list can never be the parent's list.
  */
 export function assertListOwner(
   store: Pick<TodoStore, "owner">,

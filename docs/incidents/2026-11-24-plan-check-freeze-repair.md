@@ -1,3 +1,9 @@
+> **Superseded (2026-11-24).** This document describes the removed frozen /
+> journaled Orchestrator engine and Build execution engine. It is retained as
+> historical evidence, not current behaviour. Current flow: the model-driven
+> dispatcher in `agent/extensions/workflow/README.md` (model-supplied rows, one
+> in-process child per row, verification as ordinary bash).
+
 # Repair + retry handoff: malformed frozen plan checks (2026-11-24)
 
 Audit time: 2026-11-24T06:25:35Z. This note is the step-7 output of

@@ -47,11 +47,8 @@ import {
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  extractTodoItems,
-  extractPlanStepsFromMarkdown,
   markCompletedRefs,
   resolveTodoRef,
-  mergeTodoItems,
   ensureTodoLabels,
   synthesizeFromPlanTitle,
   normalizeStepText,
@@ -271,11 +268,6 @@ import {
   type TodoPanelPreference,
 } from "./todo-panel.ts";
 import { createTodoStore } from "./todo-service.ts";
-import {
-  createFrozenTodosFromPlan,
-  createFrozenTodosFromSteps,
-} from "./todo-snapshot.ts";
-import { rebindLegacyTodosToPlan } from "./legacy-recovery.ts";
 import { resolveRolePolicy } from "./policy-runtime.ts";
 import { createContributionPublisher } from "./host-contributions-publisher.ts";
 import {
@@ -284,45 +276,35 @@ import {
   type WorkflowComposerInput,
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
-import { createOrchestratorRuntime, type OrchestratorRuntime } from "./orchestrator-runtime.ts";
 import {
   createOrchestratorRun,
+  markRunInterrupted,
   nextPendingRow,
   recordDispatch,
   recordReport,
   restoreOrchestratorRun as restoreOrchestratorRunRecord,
   runRow,
+  setRunPhase,
+  workspaceForRow,
   type OrchestratorRun,
+  type OrchestratorRunStep,
 } from "./orchestrator-run.ts";
-import { parseRepairManifest } from "./orchestrator-repair-manifest.ts";
+import { parentMutationRefusal } from "./parent-exclusion.ts";
 import { createParentToolRuntime } from "./orchestrator-tool-runtime.ts";
-import { rowForTask } from "./orchestrator-state.ts";
 import {
   createOperatorRuntime,
   orchestratorInputDecision,
 } from "./orchestrator-operator.ts";
 import { resolveModelPlan } from "./orchestrator-model-plan.ts";
-import { createRunJournal } from "./orchestrator-store.ts";
+import { createNodeWorkspaceResolver } from "./workspace-node.ts";
 import {
-  createGitBaselinePort,
-  createNodeJournalIo,
-  createNodeWorkspaceResolver,
-  readGitDiffPaths,
-} from "./orchestrator-adapters.ts";
-import {
-  captureWorkspaceSetBaseline,
-  diffWorkspaceSet,
-  parseWorkspaceDeclarations,
+  isInsideWorkspaceRoot,
   resolveWorkspaceSet,
-  workspaceRootForRow,
-  type WorkspaceSet,
-  type WorkspaceSetBaseline,
-  type WorkspaceSetDiff,
+  type WorkspaceDeclaration,
 } from "./orchestrator-workspace-set.ts";
 import {
   buildOrchestratorMission,
   ORCHESTRATOR_CONTEXT_ENTRY,
-  type OrchestratorPhase,
 } from "./orchestrator-mission.ts";
 import {
   ORCHESTRATOR_CHILD_VERSION,
@@ -345,17 +327,6 @@ import {
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
 import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
-import {
-  applyExecutionEvent,
-  armExecution,
-  evaluateExecutionOutcome,
-  markExecutionKickoff,
-  selectNextRow,
-  shellCommandHash,
-  type ExecutionBlocker,
-  type ExecutionRow,
-  type ExecutionState,
-} from "./execution-state.ts";
 import {
   buildModeTools,
   orchestratorModeTools,
@@ -606,24 +577,8 @@ import {
   SHELL_GUARD_LIMITS_ENV,
 } from "./shell-guard-config.ts";
 import { describeShellLimits, type ShellLimits } from "./shell-guard.ts";
-import {
-  effectiveVerificationTimeoutSeconds,
-  readOrchestratorLimits,
-} from "./orchestrator-config.ts";
-import { validateCommandShape, validatePlanCheckSpecs, extractPlanChecksWithWorkspaceDetailed } from "./plan-checks.ts";
-import { formatPlanPreview, lintPlan } from "./plan-lint.ts";
-import {
-  createCheckExecutor,
-  createHeadlessCheckTransport,
-  createHostCheckTransport,
-  runBoundedGitSync,
-  type CheckExecutionResult,
-} from "./check-executor.ts";
-import {
-  computeFinalGateSpecHash,
-  executablePlanCheckSpecs,
-  finalGateCheckSpecs,
-} from "./final-gate.ts";
+import { readOrchestratorLimits } from "./orchestrator-config.ts";
+import { runBoundedGitSync } from "./git-bounded.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -1010,11 +965,12 @@ export default function workflowExtension(
   registerOrchestratorChildRenderers(pi);
   let workflowMode: WorkflowMode = null;
   /** Durable control metadata for the current direct-Build execution. */
-  let executionState: ExecutionState | undefined;
-  /** Runtime-owned row evidence; cleared by any source mutation. */
-  const executionEvidence = new Map<string, { signature: string; at: number }>();
-  let lastToolFailureKey: string | undefined;
-  let repeatedToolFailureCount = 0;
+  /** Shell quarantine restored from the workflow entry; re-adopted on reload. */
+  let restoredShellQuarantine:
+    | { reason: string; commandHash?: string; at: number }
+    | undefined;
+  /** Last quarantine reason persisted, to avoid one entry per tool result. */
+  let lastPersistedQuarantine: string | undefined;
   // overlay guard: depth of the ctx.ui.custom overlay stack (questionnaire/role
   // pickers/rewind/decision gate/refine editor). A counter — not a boolean —
   // so nested modals cannot clobber each other: each opener pushes, each
@@ -1023,8 +979,6 @@ export default function workflowExtension(
   // Session-scoped TODO storage. One instance per extension factory call, so
   // two sessions can never share items, refs or panel preferences (step 3).
   const todos = createTodoStore("ordinary");
-  /** Parent orchestration runtime (step 15); created per approved run. */
-  let orchestratorRuntime: OrchestratorRuntime | undefined;
   /** Model-driven run record: the plan path, rows, instructions and reports. */
   let orchestratorRun: OrchestratorRun | undefined;
   /** The parent's instruction for the row currently being dispatched. */
@@ -1047,29 +1001,8 @@ export default function workflowExtension(
   let orchestratorPauseInFlight = false;
   /** Set only inside the child session; suppresses parent-only surfaces. */
   let inProcessChildContext: OrchestratorChildContext | undefined;
-  /** Incremented on every session/run rebind so stale tool calls are refused. */
-  let orchestrationEpoch = 1;
   /** Operator command surface; never launches children. */
   let orchestratorOperator: ReturnType<typeof createOperatorRuntime> | undefined;
-  /**
-   * Precise reason the last reload could not reattach a saved run. Kept so
-   * `/orchestrator status` and `retry` can report the real failure instead of
-   * pretending no run ever existed.
-   */
-  let orchestratorRestoreError: string | undefined;
-  let orchestratorBaseline:
-    | {
-        attemptId: string;
-        set: WorkspaceSet;
-        baseline: WorkspaceSetBaseline;
-      }
-    | undefined;
-  /**
-   * Direct-Build final-gate memory (no run journal exists). Keyed by the
-   * content hash of the executable spec, so the two completion call paths run
-   * one gate per spec instead of executing the same checks twice.
-   */
-  const finalGatePasses = new Map<string, number>();
   /** Last observed session model, used to resolve real budget limits. */
   let lastKnownModel:
     | { provider?: string; id: string; contextWindow: number | null; maxOutputTokens: number | null }
@@ -1156,7 +1089,6 @@ export default function workflowExtension(
   let footerInjectedThisTurn = false;
   let lastStaleNoticeAt: number | undefined;
   // Path+content hash of the last plan-file reconciliation (skip no-op merges).
-  let lastReconcileKey: string | undefined;
   let toolsBeforePlanMode: string[] | undefined;
   // Track the model active in Default mode so it can be restored when
   // returning from Plan/Build (otherwise the role model leaks into Default).
@@ -1817,7 +1749,6 @@ export default function workflowExtension(
     turnsSinceLastTodoWrite = 0;
     mutatedSinceLastTodoWrite = false;
     todoStale = false;
-    noteExecutionProgress(`todo-${todos.revision}`);
   }
 
   /**
@@ -2041,6 +1972,17 @@ export default function workflowExtension(
     return undefined;
   }
 
+  /** Rows the live TODO list reports complete, keyed by run ref. */
+  function completedRunRefs(): Set<string> {
+    const refs = new Set<string>();
+    for (const item of todos.snapshot().items) {
+      if (item.status === "completed" || item.completed === true) {
+        refs.add(item.ref ?? String(item.step));
+      }
+    }
+    return refs;
+  }
+
   /** Bound-run phase/approval, for the footer; absent when no run exists. */
   function orchestrationStatus():
     | {
@@ -2068,9 +2010,9 @@ export default function workflowExtension(
         view?: "auto" | "parent" | "child";
       }
     | undefined {
-    const view = orchestratorRuntime?.view?.();
-    if (!view) return undefined;
-    const blocked = view.state?.blockedReason;
+    const run = orchestratorRun;
+    if (!run) return undefined;
+    const blocked = run.blockedReason;
     const child = orchestratorChild?.state();
     const childLive =
       child !== undefined &&
@@ -2082,15 +2024,17 @@ export default function workflowExtension(
       child?.startedAt === undefined
         ? undefined
         : Math.max(0, (child.pausedAt ?? Date.now()) - child.startedAt);
+    const doneRefs = completedRunRefs();
+    const nextRow = nextPendingRow(run, (ref) => doneRefs.has(ref));
     return {
-      phase: view.phase,
+      phase: run.phase,
       ...(blocked ? { blockedReason: blocked } : {}),
-      ...(view.nextTaskId ? { nextTaskId: view.nextTaskId } : {}),
+      ...(nextRow ? { nextTaskId: nextRow.ref } : {}),
       ...(childLive
         ? {
             child: {
               ref: child.ref ?? "?",
-              total: child.total ?? view.state.order.length,
+              total: child.total ?? run.rows.length,
               phase: child.phase,
               ...(child.pausePending === undefined
                 ? {}
@@ -2111,17 +2055,6 @@ export default function workflowExtension(
         : {}),
       view: orchestratorChildView,
     };
-  }
-
-  function executionFooterStatus(): string | undefined {
-    const state = executionState;
-    if (!state) return undefined;
-    if (state.shellQuarantine) return "⛔ shell quarantined — non-shell only";
-    if (state.phase === "paused") return "⏸ execution paused";
-    if (state.phase === "blocked") return "⛔ execution blocked";
-    if (state.phase === "completed") return "✓ execution complete";
-    if (state.phase === "recovering-shell") return "◇ execution recovering";
-    return undefined;
   }
 
   /**
@@ -2181,17 +2114,15 @@ export default function workflowExtension(
    */
   function composerActivity(): ReturnType<typeof orchestratorActivity> {
     try {
-      const view = orchestratorRuntime?.view();
+      const run = orchestratorRun;
       const child = orchestratorChild?.state();
       const childLive =
         child !== undefined &&
         child.phase !== "idle" &&
         child.phase !== "disposed";
       return orchestratorActivity({
-        ...(view ? { runPhase: view.phase } : {}),
-        ...(view?.state?.blockedReason
-          ? { blockedReason: view.state.blockedReason }
-          : {}),
+        ...(run ? { runPhase: run.phase } : {}),
+        ...(run?.blockedReason ? { blockedReason: run.blockedReason } : {}),
         ...(childLive ? { child } : {}),
         awaitingDialog: orchestratorDialogActive,
         escAvailable: workflowEditor !== undefined,
@@ -2337,9 +2268,6 @@ export default function workflowExtension(
       ...(orchestrationStatus() === undefined
         ? {}
         : { orchestration: orchestrationStatus() }),
-      ...(executionFooterStatus() === undefined
-        ? {}
-        : { execution: executionFooterStatus() }),
     });
     const modeTone =
       reviewTurn !== "idle"
@@ -2355,11 +2283,6 @@ export default function workflowExtension(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.mode,
       ctx.ui.theme.fg(modeTone, segments.mode),
-    );
-    setWorkflowStatus(
-      ctx.ui,
-      WORKFLOW_STATUS_KEYS.execution,
-      executionFooterStatus() ? ctx.ui.theme.fg("warning", executionFooterStatus()!) : "",
     );
     setWorkflowStatus(
       ctx.ui,
@@ -3112,20 +3035,15 @@ export default function workflowExtension(
 
   /**
    * Live ownership facts for the shared Reviewer policy. The in-process Build
-   * child and the frozen Orchestrator run are independent owners; either one
-   * (including a paused/blocked run with no live child) forbids a Reviewer.
+   * child and the Orchestrator run are independent owners; either one (a live
+   * child, or a `running` run between rows) forbids a Reviewer.
    */
   function reviewOwnershipFacts(): {
     childPhase?: Parameters<typeof admitReviewer>[0]["childPhase"];
     runPhase?: Parameters<typeof admitReviewer>[0]["runPhase"];
   } {
     const childPhase = orchestratorChild?.state().phase;
-    let runPhase: Parameters<typeof admitReviewer>[0]["runPhase"];
-    try {
-      runPhase = orchestratorRuntime?.view()?.phase;
-    } catch (_e) {
-      void _e;
-    }
+    const runPhase = orchestratorRun?.phase;
     return {
       ...(childPhase === undefined ? {} : { childPhase }),
       ...(runPhase === undefined ? {} : { runPhase }),
@@ -3391,8 +3309,7 @@ export default function workflowExtension(
         signal,
         subagentFolderEnv(cwd),
         shellGuardLimitsFor(currentSessionCtx).config,
-        executionState?.shellQuarantine !== undefined ||
-          shellGuardRuntime?.isStopped() === true,
+        shellGuardRuntime?.isStopped() === true,
         activeSubagents,
         extensionSelfPath(),
       );
@@ -6321,7 +6238,7 @@ export default function workflowExtension(
         return;
       }
       if (parsed.action === "reset") {
-        const quarantined = executionState?.shellQuarantine !== undefined;
+        const quarantined = shellGuardRuntime?.isStopped() === true;
         if ((ctx as any).isIdle?.() === false && !quarantined) {
           ctx.ui.notify(
             "Shell guard: cannot reset while a run is active. Wait for it to settle or press Esc.",
@@ -6330,7 +6247,6 @@ export default function workflowExtension(
           return;
         }
         ensureShellGuard(ctx as ExtensionContext).reset("command-reset");
-        if (quarantined) clearExecutionShellQuarantine("command-reset");
         ctx.ui.notify(
           quarantined
             ? "Shell guard: quarantine cleared; a new bounded shell budget is active."
@@ -7708,554 +7624,6 @@ export default function workflowExtension(
     }
   }
 
-  function isExecutionTerminalState(state: ExecutionState): boolean {
-    return state.phase === "completed" || state.phase === "stopped";
-  }
-
-  function frozenRowForRef(ref: string) {
-    return todos.frozen?.rows.find((row) => row.ref === ref);
-  }
-
-  function executionEvidenceRequired(ref: string): boolean {
-    void ref;
-    // No parent-side check evidence: the child owns verification and the
-    // parent trusts its report. Completion is a model decision, not a gate.
-    return false;
-  }
-
-  function hasExecutionEvidence(ref: string): boolean {
-    return executionEvidence.has(ref);
-  }
-
-  function clearExecutionEvidence(): void {
-    executionEvidence.clear();
-  }
-
-  function executionRows(): ExecutionRow[] {
-    const frozenRows = new Map(
-      (todos.frozen?.rows ?? []).map((row) => [row.ref, row]),
-    );
-    return todos.items.map((item) => {
-      const ref = todoRef(item);
-      const frozen = frozenRows.get(ref);
-      return {
-        id: item.id ?? frozen?.id ?? todoKey(item),
-        ref,
-        status: itemStatus(item) as ExecutionRow["status"],
-        ...(frozen && frozen.acceptanceChecks.length > 0
-          ? { requiredChecks: frozen.acceptanceChecks.length }
-          : {}),
-      };
-    });
-  }
-
-  function executionConflictReason(
-    planPath: string,
-    digest: string,
-  ): string | undefined {
-    const existing = executionState;
-    if (!existing) return undefined;
-    if (isExecutionTerminalState(existing)) return undefined;
-    if (existing.source.digest === digest) return undefined;
-    return `a different frozen execution (${existing.executionId}) is still active; finish or stop it before replacing it with ${planPath}`;
-  }
-
-  function armBuildExecution(
-    planPath: string,
-    planText?: string,
-  ): { ok: boolean; error?: string } {
-    if (!todos.frozen || todos.frozen.rows.length === 0) {
-      return { ok: false, error: "the approved plan produced no frozen rows" };
-    }
-    const digest =
-      todos.frozen?.source.digest ??
-      (planText ? planHash(planText) : todos.planDigest);
-    if (!digest) {
-      return { ok: false, error: "the approved plan has no stable digest" };
-    }
-    const conflict = executionConflictReason(planPath, digest);
-    if (conflict) return { ok: false, error: conflict };
-    if (
-      executionState &&
-      executionState.source.digest === digest &&
-      !isExecutionTerminalState(executionState)
-    ) {
-      return { ok: true };
-    }
-    executionState = armExecution({
-      executionId: `build-${digest.slice(0, 16)}`,
-      owner: "build",
-      source: { kind: "plan", path: planPath, digest },
-    });
-    executionEvidence.clear();
-    return { ok: true };
-  }
-
-  function armStandaloneBuildExecution(
-    ctx: ExtensionContext,
-    title = "Build work",
-  ): void {
-    if (
-      workflowMode !== "build" ||
-      executionState ||
-      todos.frozen ||
-      currentPlanFile ||
-      todos.items.length === 0
-    ) {
-      return;
-    }
-    const scopedTitle = title;
-    const frozen = createFrozenTodosFromSteps({
-      title: scopedTitle,
-      steps: todos.items.map((item) => item.text),
-      mode: "build",
-    });
-    if (!frozen.ok) {
-      pauseBuildExecution(`the standalone list could not be frozen: ${frozen.error}`);
-      return;
-    }
-    const placed = todos.freeze(frozen.snapshot);
-    if (!placed.ok) {
-      pauseBuildExecution(`the standalone list could not be frozen: ${placed.error}`);
-      return;
-    }
-    executionState = armExecution({
-      executionId: `build-${frozen.snapshot.source.digest.slice(0, 16)}`,
-      owner: "build",
-      source: {
-        kind: "steps",
-        digest: frozen.snapshot.source.digest,
-      },
-    });
-    updateStatus(ctx);
-    persistState();
-  }
-
-  function migrateLegacyBuildOnRestore(ctx: ExtensionContext): void {
-    if (
-      workflowMode !== "build" ||
-      todos.frozen ||
-      todos.items.length === 0 ||
-      (!currentPlanFile && !todos.planPath)
-    ) {
-      return;
-    }
-    const planPath = currentPlanFile ?? todos.planPath!;
-    try {
-      const abs = path.isAbsolute(planPath)
-        ? planPath
-        : path.join((ctx as any)?.cwd ?? process.cwd(), planPath);
-      const planText = fs.readFileSync(abs, "utf8");
-      const digest = planHash(planText);
-      // A restore must never freeze from whatever plan bytes happen to be on
-      // disk. Without a recorded digest there is no proof the plan still
-      // matches this legacy list, so the list stays paused for an explicit
-      // recovery choice instead of being silently re-frozen from mutable text.
-      if (!todos.planDigest) {
-        ctx.ui.notify(
-          `Build recovery: this legacy list has no recorded plan digest, so it cannot prove the plan at ${abs} is unchanged; it was left paused for an explicit recovery choice.`,
-          "warning",
-        );
-        return;
-      }
-      if (todos.planDigest !== digest) {
-        ctx.ui.notify(
-          `Build recovery: the plan at ${abs} changed since this list was written; keeping the legacy list paused for an explicit recovery choice.`,
-          "warning",
-        );
-        return;
-      }
-      const rebound = rebindLegacyTodosToPlan({
-        planPath: abs,
-        planText,
-        priorItems: todos.items,
-        now: Date.now(),
-      });
-      if (!rebound.ok) {
-        ctx.ui.notify(
-          `Build recovery: the legacy list could not be rebound (${rebound.error}); it was left paused.`,
-          "warning",
-        );
-        return;
-      }
-      const placed = todos.freeze(rebound.snapshot);
-      if (!placed.ok) {
-        ctx.ui.notify(
-          `Build recovery: the rebind could not be installed (${placed.error}); it was left paused.`,
-          "warning",
-        );
-        return;
-      }
-      updateStatus(ctx);
-      persistState();
-    } catch (error: unknown) {
-      ctx.ui.notify(
-        `Build recovery: the plan could not be read (${error instanceof Error ? error.message : String(error)}); the legacy list was left paused.`,
-        "warning",
-      );
-    }
-  }
-
-  function noteExecutionShellQuarantine(command?: string): void {
-    if (!executionState || executionState.shellQuarantine) return;
-    const info = ensureShellGuard().quarantineInfo?.();
-    if (!info) return;
-    const next = selectNextRow(executionRows(), executionState);
-    const applied = applyExecutionEvent(executionState, {
-      type: "shell-timeout",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      ...(next ? { rowRef: next.ref } : {}),
-      reason: info.reason,
-      commandHash:
-        info.commandHash ??
-        shellCommandHash(command ?? "shell guard quarantine"),
-      at: info.at,
-    });
-    if (applied.ok) {
-      executionState = applied.state;
-      // Shell quarantine invalidates evidence gathered by running checks.
-      executionEvidence.clear();
-      try {
-        persistState();
-      } catch (_e) {
-        void _e;
-      }
-    }
-  }
-
-  function noteToolFailureForExecution(event: any): void {
-    if (!executionState) return;
-    if (event?.isError !== true) {
-      lastToolFailureKey = undefined;
-      repeatedToolFailureCount = 0;
-      return;
-    }
-    if (executionState.shellQuarantine) return;
-    const text = (event.content ?? [])
-      .map((part: any) => (part?.type === "text" ? String(part.text ?? "") : ""))
-      .join("\n")
-      .trim();
-    const key = `${String(event.toolName ?? "tool")}:${text.slice(0, 240)}`;
-    if (key === lastToolFailureKey) repeatedToolFailureCount += 1;
-    else {
-      lastToolFailureKey = key;
-      repeatedToolFailureCount = 1;
-    }
-    if (repeatedToolFailureCount < 3) return;
-    if (executionState.phase === "paused" || executionState.phase === "blocked") return;
-    const reason = `repeated identical ${String(event.toolName ?? "tool")} failure (${repeatedToolFailureCount}x)`;
-    const paused = applyExecutionEvent(executionState, {
-      type: "pause",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      reason,
-      blocker: {
-        category: "no-permitted-action",
-        reason,
-        at: Date.now(),
-      },
-      at: Date.now(),
-    });
-    if (paused.ok) {
-      executionState = paused.state;
-      repeatedToolFailureCount = 0;
-      lastToolFailureKey = undefined;
-      persistState();
-      try {
-        (currentSessionCtx as any)?.ui?.notify?.(
-          `Build execution paused: ${reason}. Resume with /build resume after changing the approach.`,
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
-      }
-    }
-  }
-
-  function noteExecutionProgress(signature: string): void {
-    if (!executionState) return;
-    const applied = applyExecutionEvent(executionState, {
-      type: "progress",
-      at: Date.now(),
-      signature,
-    });
-    if (!applied.ok) return;
-    executionState = applied.state;
-    try {
-      persistState();
-    } catch (_e) {
-      void _e;
-    }
-  }
-
-  function noteExecutionBoundary(): { pause: boolean; reason?: string } {
-    const state = executionState;
-    if (!state) return { pause: false };
-    const now = Date.now();
-    const lastProgress = state.progress.lastProgressAt ?? 0;
-    const lastBoundary = state.progress.lastBoundaryAt ?? 0;
-    // Timestamps can collide on a fast machine; an equal progress stamp is
-    // still progress, not a barren boundary.
-    const progressed = lastProgress > 0 && lastProgress >= lastBoundary;
-    const recovery = state.shellQuarantine !== undefined;
-    const count = progressed
-      ? 0
-      : recovery
-        ? state.progress.recoveryBoundariesWithoutProgress + 1
-        : state.progress.boundariesWithoutProgress + 1;
-    executionState = {
-      ...state,
-      progress: {
-        ...state.progress,
-        lastBoundaryAt: now,
-        ...(recovery
-          ? { recoveryBoundariesWithoutProgress: count }
-          : { boundariesWithoutProgress: count }),
-      },
-      updatedAt: now,
-    };
-    try {
-      persistState();
-    } catch (_e) {
-      void _e;
-    }
-    if (count >= 3) {
-      return {
-        pause: true,
-        reason: `${count} autonomous boundaries without meaningful progress`,
-      };
-    }
-    return { pause: false };
-  }
-
-  function nextExecutionLine(): string {
-    if (!executionState) return "";
-    const next = selectNextRow(executionRows(), executionState);
-    if (!next) return "";
-    const item = todos.items.find((entry) => todoRef(entry) === next.ref);
-    return `\nNext execution row: ${next.ref}${item ? ` — ${item.text}` : ""}`;
-  }
-
-  function executionContextBlock(): string {
-    const state = executionState;
-    if (!state) return "";
-    const outcome = evaluateExecutionOutcome(state, executionRows());
-    const next = selectNextRow(executionRows(), state);
-    const remaining = todos.items.filter(
-      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
-    ).length;
-    const nextItem = next
-      ? todos.items.find((item) => todoRef(item) === next.ref)
-      : undefined;
-    const lines = [
-      "[EXECUTION STATE]",
-      `id: ${state.executionId} · epoch: ${state.epoch} · phase: ${state.phase}`,
-      `remaining: ${remaining} · next: ${next ? `${next.ref}. ${nextItem?.text ?? "pending row"}` : "none"}`,
-      "Update the TODO status immediately after each verified step. Never mark a row complete without its required evidence.",
-      "Do not stop for a routine checkpoint or a self-assessed context limit; continue until the execution is complete or a genuine blocker remains.",
-    ];
-    if (state.shellQuarantine) {
-      lines.push(
-        "shell: QUARANTINED after the two-attempt cap. Do not call bash, powershell, review_bash, or any verification adapter. Continue with read/grep/find/ls/edit/write and LSP diagnostics; required shell checks remain blocked/unverified.",
-      );
-    }
-    if (state.blocker) {
-      lines.push(
-        `blocker: ${state.blocker.category}${state.blocker.rowRef ? ` at row ${state.blocker.rowRef}` : ""} — ${state.blocker.reason}`,
-      );
-    }
-    if (outcome.kind === "blocked-unverified") {
-      lines.push(`unverified rows: ${outcome.blockedRefs.join(", ")} — do not report green completion.`);
-    }
-    return lines.join("\n");
-  }
-
-  function auditExecution(
-    event: string,
-    data: Record<string, unknown> = {},
-  ): void {
-    try {
-      pi.appendEntry("workflow-execution-audit", {
-        at: Date.now(),
-        event,
-        ...(executionState
-          ? {
-              executionId: executionState.executionId,
-              epoch: executionState.epoch,
-              phase: executionState.phase,
-            }
-          : {}),
-        ...data,
-      });
-    } catch (_e) {
-      void _e;
-    }
-  }
-
-  function executionStatusLines(): string[] {
-    const state = executionState;
-    if (!state) return ["Build execution: none."];
-    const outcome = evaluateExecutionOutcome(state, executionRows());
-    const next = selectNextRow(executionRows(), state);
-    const remaining = todos.items.filter(
-      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
-    ).length;
-    const lines = [
-      `Build execution ${state.executionId} · epoch ${state.epoch}`,
-      `  phase: ${state.phase}`,
-      `  remaining: ${remaining} · next: ${next ? next.ref : "none"}`,
-      `  outcome: ${outcome.kind}`,
-    ];
-    if (state.kickoff) lines.push(`  kickoff: ${state.kickoff.status}`);
-    if (state.shellQuarantine) {
-      lines.push(
-        `  shell: QUARANTINED — ${state.shellQuarantine.reason}`,
-        "  work available: read/grep/find/ls/edit/write/LSP; required shell checks are blocked/unverified",
-      );
-    }
-    if (state.blocker) {
-      lines.push(
-        `  blocker: ${state.blocker.category}${state.blocker.rowRef ? ` @ ${state.blocker.rowRef}` : ""} — ${state.blocker.reason}`,
-      );
-    }
-    return lines;
-  }
-
-  function applyUserExecutionEvent(
-    ctx: ExtensionContext,
-    event: Parameters<typeof applyExecutionEvent>[1],
-  ): boolean {
-    if (!executionState) {
-      ctx.ui.notify("No active Build execution.", "info");
-      return false;
-    }
-    const applied = applyExecutionEvent(executionState, event);
-    if (!applied.ok) {
-      ctx.ui.notify(`Build execution: ${applied.error}.`, "warning");
-      return false;
-    }
-    executionState = applied.state;
-    auditExecution(event.type, {
-      ...(event.type === "pause" ? { reason: event.reason } : {}),
-    });
-    updateStatus(ctx);
-    persistState();
-    return true;
-  }
-
-  function pauseExecutionByUser(ctx: ExtensionContext, reason = "paused by user"): void {
-    if (!executionState) {
-      ctx.ui.notify("No active Build execution.", "info");
-      return;
-    }
-    applyUserExecutionEvent(ctx, {
-      type: "pause",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      reason,
-      at: Date.now(),
-    });
-    ctx.ui.notify(`Build execution paused: ${reason}. Resume with /build resume.`, "info");
-  }
-
-  function resumeExecutionByUser(ctx: ExtensionContext): void {
-    if (!executionState) {
-      ctx.ui.notify("No active Build execution.", "info");
-      return;
-    }
-    if (executionState.phase !== "paused" && executionState.phase !== "blocked") {
-      ctx.ui.notify(`Build execution is ${executionState.phase}; nothing to resume.`, "info");
-      return;
-    }
-    if (
-      applyUserExecutionEvent(ctx, {
-        type: "resume",
-        executionId: executionState.executionId,
-        epoch: executionState.epoch,
-        at: Date.now(),
-      })
-    ) {
-      ctx.ui.notify(
-        executionState?.shellQuarantine
-          ? "Build execution resumed without shell. Shell remains quarantined; use /shell-guard reset only when you intend a new shell budget."
-          : "Build execution resumed.",
-        "info",
-      );
-    }
-  }
-
-  function stopExecutionByUser(ctx: ExtensionContext): void {
-    if (!executionState) {
-      ctx.ui.notify("No active Build execution.", "info");
-      return;
-    }
-    applyUserExecutionEvent(ctx, {
-      type: "stop",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      reason: "stopped by user",
-      at: Date.now(),
-    });
-    ctx.ui.notify("Build execution stopped.", "info");
-  }
-
-  function clearExecutionShellQuarantine(reason: string): void {
-    if (!executionState?.shellQuarantine) return;
-    const cleared = applyExecutionEvent(executionState, {
-      type: "shell-reset",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      at: Date.now(),
-    });
-    if (cleared.ok) {
-      executionState = cleared.state;
-      try {
-        pi.appendEntry("workflow-execution-shell-reset", {
-          at: Date.now(),
-          executionId: executionState.executionId,
-          reason,
-        });
-      } catch (_e) {
-        void _e;
-      }
-      try {
-        persistState();
-      } catch (_e) {
-        void _e;
-      }
-    }
-  }
-
-  function pauseRestoredExecution(ctx: ExtensionContext): void {
-    const state = executionState;
-    if (!state) return;
-    if (
-      state.phase === "completed" ||
-      state.phase === "stopped" ||
-      state.phase === "paused"
-    ) {
-      return;
-    }
-    const paused = applyExecutionEvent(state, {
-      type: "pause",
-      executionId: state.executionId,
-      epoch: state.epoch,
-      reason: "restored paused after a session boundary; use /build resume",
-      at: Date.now(),
-    });
-    if (paused.ok) {
-      executionState = paused.state;
-      auditExecution("restored-paused", { reason: "session boundary" });
-      try {
-        persistState();
-        updateStatus(ctx);
-      } catch (_e) {
-        void _e;
-      }
-    }
-  }
-
   function reapplyInheritedShellQuarantine(ctx: ExtensionContext): void {
     if (process.env[SHELL_GUARD_QUARANTINE_ENV] !== "1") return;
     try {
@@ -8268,42 +7636,17 @@ export default function workflowExtension(
   }
 
   function reapplyPersistedShellQuarantine(ctx: ExtensionContext): void {
-    const quarantine = executionState?.shellQuarantine;
+    const quarantine = restoredShellQuarantine;
     if (!quarantine) return;
     try {
       ensureShellGuard(ctx).adoptQuarantine({
         reason: quarantine.reason,
-        commandHash: quarantine.commandHash,
+        ...(quarantine.commandHash ? { commandHash: quarantine.commandHash } : {}),
         at: quarantine.at,
       });
     } catch (_e) {
       void _e;
     }
-  }
-
-  function pauseBuildExecution(reason: string, planPath?: string): void {
-    const digest = todos.frozen?.source.digest ?? todos.planDigest ?? "unavailable";
-    if (!executionState) {
-      executionState = armExecution({
-        executionId: `build-${digest.slice(0, 16)}`,
-        owner: "build",
-        source: { kind: "plan", ...(planPath ? { path: planPath } : {}), digest },
-      });
-    }
-    const now = Date.now();
-    const paused = applyExecutionEvent(executionState, {
-      type: "pause",
-      executionId: executionState.executionId,
-      epoch: executionState.epoch,
-      reason,
-      blocker: {
-        category: "verification",
-        reason,
-        at: now,
-      },
-      at: now,
-    });
-    if (paused.ok) executionState = paused.state;
   }
 
   function persistState() {
@@ -8352,13 +7695,13 @@ export default function workflowExtension(
       },
       // Durable list identity/removal authority. Older readers ignore these.
       todoRevision: todos.revision,
-      todoExclusions: [...todos.excludedPlanSteps],
-      todoPlanDigest: todos.planDigest ?? null,
-      todoRecoveryReceipt: todos.recoveryReceiptId ?? null,
-      todoFrozen: todos.frozen ?? null,
-      todoFrozenError: todos.frozenError ?? null,
+      // The run record is the durable orchestration state. Legacy fields
+      // (todoFrozen/todoFrozenError/todoRecoveryReceipt/execution) are no longer
+      // written; an old entry that still carries them is ignored on restore.
       orchestratorRun: orchestratorRun ?? null,
-      execution: executionState ?? null,
+      // The shell quarantine survives a reload through this entry, not through
+      // the removed execution state.
+      shellQuarantine: shellGuardRuntime?.quarantineInfo() ?? null,
     } as any);
     lastPersistedPlanFile = currentPlanFile;
     publishContributions();
@@ -8445,17 +7788,6 @@ export default function workflowExtension(
       toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
     );
     toolsBeforePlanMode = undefined;
-    // Tab-to-Build: load the active plan if nothing is loaded yet so this path
-    // behaves like the handoff/approve path.
-    if (todos.items.length === 0 && currentPlanFile && opts?.fromManagedChild !== true) {
-      const seeded = await seedFrozenBuildFromPlan(currentPlanFile, ctx.cwd);
-      if (!seeded.ok) {
-        ctx.ui.notify(
-          `Build mode: the plan could not be frozen (${seeded.error ?? "unknown error"}); create the TODO list manually.`,
-          "warning",
-        );
-      }
-    }
     if (!opts?.quiet) {
       ctx.ui.notify(
         "Build mode — full access restored. Press Tab (when no suggestion list is open) to cycle: Build → Default → Plan → Orchestrator. Or /plan to switch to Plan.",
@@ -8659,21 +7991,19 @@ export default function workflowExtension(
     opts?: ModeSwitchOptions,
   ): Promise<void> {
     if (blockChildModeSwitch(ctx)) return Promise.resolve();
-    // A live in-process child (or a non-terminal run) owns the session. The
-    // user must pause/abort/stop first; Tab cannot strand a running child.
+    // A live child owns the session, as does a run between rows. A paused,
+    // interrupted, cancelled or completed run with no live child does not:
+    // leaving the mode must not strand a real writer.
     const child = orchestratorChild?.state();
-    const view = orchestratorRuntime?.view();
+    const childLive =
+      child !== undefined &&
+      (child.phase === "starting" ||
+        child.phase === "running" ||
+        child.phase === "paused" ||
+        child.phase === "settling");
     const leaving =
       typeof next === "string" ? next !== "orchestrator" : true;
-    if (
-      leaving &&
-      ((child &&
-        (child.phase === "running" || child.phase === "paused")) ||
-        (view &&
-          (view.phase === "running" ||
-            view.phase === "paused" ||
-            view.phase === "blocked")))
-    ) {
+    if (leaving && (childLive || orchestratorRun?.phase === "running")) {
       try {
         ctx.ui.notify(
           "An Orchestrator run owns this session — /orchestrator-abort or /orchestrator stop first.",
@@ -8731,124 +8061,6 @@ export default function workflowExtension(
   }
   void togglePlanMode;
 
-  /**
-   * Cheap content key for plan-file reconciliation dedupe (resolved path +
-   * length + hash). A byte-identical plan is not re-merged; a `- [x]` tick
-   * changes the content, so tick reconciliation still runs.
-   */
-  function planReconcileKey(absPath: string, text: string): string {
-    let h = 0;
-    for (let i = 0; i < text.length; i++) {
-      h = (h * 31 + text.charCodeAt(i)) | 0;
-    }
-    return `${path.resolve(absPath)}|${text.length}|${h}`;
-  }
-
-  /**
-   * Load plan steps from a plan file and merge them into the todo list.
-   * Same plan file → completion state is preserved (status-aware merge,
-   * agent-added items kept); a different plan → replace.
-   */
-  function loadTodosFromPlan(
-    planPath: string,
-    cwd: string,
-    options?: { restoreExcluded?: boolean },
-  ): { count: number; replaced: boolean; preserved: number; excluded: number; restored: number } {
-    let extracted: TodoItem[] = [];
-    try {
-      const abs = path.isAbsolute(planPath)
-        ? planPath
-        : path.join(cwd, planPath);
-      const md = fs.readFileSync(abs, "utf8");
-      extracted = extractPlanStepsFromMarkdown(md);
-      if (extracted.length === 0) {
-        const synth = synthesizeFromPlanTitle(md);
-        if (synth) extracted = [synth];
-      }
-    } catch (_e) {
-      void _e;
-    }
-    if (extracted.length === 0)
-      return {
-        count: todos.items.length,
-        replaced: false,
-        preserved: 0,
-        excluded: 0,
-        restored: 0,
-      };
-    // Same plan file → status-preserving merge; a different plan replaces the
-    // list. The store owns that rule so plan reconciliation and the tool cannot
-    // drift apart (step 3).
-    return todos.mergeExtracted(extracted, planPath, cwd, options);
-  }
-
-  /**
-   * Freeze the approved plan once at an explicit Build entry. Unlike
-   * `loadTodosFromPlan`, this never re-reads or merges into an existing frozen
-   * execution; the rows are the contract from here on.
-   */
-  async function seedFrozenBuildFromPlan(
-    planPath: string,
-    cwd: string,
-    planText?: string,
-  ): Promise<{ ok: boolean; count: number; replaced: boolean; error?: string }> {
-    if (todos.frozen) {
-      return { ok: true, count: todos.items.length, replaced: false };
-    }
-    let text = planText;
-    let abs = planPath;
-    try {
-      abs = path.isAbsolute(planPath) ? planPath : path.join(cwd, planPath);
-      if (text === undefined) text = fs.readFileSync(abs, "utf8");
-    } catch (error: unknown) {
-      return {
-        ok: false,
-        count: todos.items.length,
-        replaced: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-    if (!text || text.trim().length === 0) {
-      return { ok: false, count: todos.items.length, replaced: false, error: "the plan is empty" };
-    }
-    // Direct Build is a multi-repo entry too: resolve the plan's declared
-    // workspaces against the session root and freeze that binding. A bad
-    // declaration is an error, never a silent primary-root fallback.
-    const resolved = await resolveWorkspaceSet({
-      primaryRoot: cwd,
-      declarations: parseWorkspaceDeclarations(text),
-      resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
-      broadRootReason: (root) => broadGrantRootReason(root, cwd),
-    });
-    if (!resolved.ok) {
-      return { ok: false, count: todos.items.length, replaced: false, error: resolved.error };
-    }
-    const workspaces = resolved.value.roots;
-    const frozen =
-      todos.items.length > 0
-        ? rebindLegacyTodosToPlan({
-            planPath: abs,
-            planText: text,
-            priorItems: todos.items,
-            workspaces,
-            now: Date.now(),
-          })
-        : createFrozenTodosFromPlan({
-            planPath: abs,
-            planText: text,
-            mode: "build",
-            workspaces,
-            now: Date.now(),
-          });
-    if (!frozen.ok) {
-      return { ok: false, count: todos.items.length, replaced: false, error: frozen.error };
-    }
-    const placed = todos.freeze(frozen.snapshot);
-    return placed.ok
-      ? { ok: true, count: todos.items.length, replaced: true }
-      : { ok: false, count: todos.items.length, replaced: false, error: placed.error };
-  }
-
   async function enterBuildModeFromPlan(
     ctx: ExtensionContext,
     planPath: string,
@@ -8904,25 +8116,15 @@ export default function workflowExtension(
         toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
       );
       toolsBeforePlanMode = undefined;
-      // Populate/refresh todos from the plan file (merge preserves progress).
-      const loaded = await seedFrozenBuildFromPlan(planPath, ctx.cwd, opts?.planText);
-      if (loaded.ok) {
-        const armed = armBuildExecution(planPath, opts?.planText);
-        if (!armed.ok) {
-          ctx.ui.notify(`Build mode: ${armed.error}`, "warning");
-          pauseBuildExecution(
-            armed.error ?? "the execution could not be armed",
-            planPath,
-          );
-        }
-      } else {
-        const reason = `the plan could not be frozen (${loaded.error ?? "unknown error"})`;
-        ctx.ui.notify(
-          `Build mode: ${reason}; create the TODO list manually.`,
-          "warning",
-        );
-        pauseBuildExecution(reason, planPath);
-      }
+      // The approved plan is context, not a compiled list: keep any rows the
+      // model already created and queue one plain kickoff. The model reads the
+      // plan, creates its TODO list with workflow_todo, and runs the plan's
+      // `## Verification` before the last row is marked done.
+      requestExecutionKickoff(ctx, {
+        planPath,
+        ...(opts?.planText !== undefined ? { planText: opts.planText } : {}),
+        source: opts?.fromReview === true ? "review" : "build",
+      });
       try {
         await applyModeModel(ctx);
       } catch (_e) {
@@ -8931,9 +8133,7 @@ export default function workflowExtension(
       updateStatus(ctx);
       persistState();
       ctx.ui.notify(
-        loaded.replaced
-          ? `Build mode: ${loaded.count} frozen todos created from the plan.`
-          : `Build mode: ${loaded.count} frozen todos resumed; progress kept.`,
+        "Build mode: the plan is ready. The model creates its TODO list and starts.",
         "info",
       );
       return true;
@@ -9659,13 +8859,6 @@ export default function workflowExtension(
         ...(input.findingCount !== undefined
           ? { findingCount: input.findingCount }
           : {}),
-        ...(typeof input.planText === "string" && input.planText.trim()
-          ? {
-              checkPreview: formatPlanPreview(
-                lintPlan(input.planText, { path: input.planPath }),
-              ),
-            }
-          : {}),
       });
       result = await ctx.ui.custom<QuestionnaireResult | null>(
         (tui, theme, _kb, done) =>
@@ -9829,8 +9022,9 @@ export default function workflowExtension(
   /** One execute handoff: todo list + the Build-starting message. */
   type ExecutionKickoff = {
     planPath: string;
+    planText?: string;
     feedback?: string;
-    source: "plannotator" | "native";
+    source: "plannotator" | "native" | "review" | "build";
   };
 
   /**
@@ -9841,30 +9035,18 @@ export default function workflowExtension(
    */
   let pendingExecutionKickoff: ExecutionKickoff | null = null;
 
-  function executionKickoffMessages(
-    ctx: ExtensionContext,
-    kickoff: ExecutionKickoff,
-  ): { planTodoListMessage: Record<string, unknown>; execMessage: string } {
-    const remainingItems = todos.items.filter(
-      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
-    );
-    const remainingList = formatTodoNumberedList(remainingItems);
-    const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
-    const next = executionState
-      ? selectNextRow(executionRows(), executionState)
-      : undefined;
-    const nextItem = next
-      ? todos.items.find((item) => todoRef(item) === next.ref)
-      : remainingItems[0];
-    const feedbackBlock = kickoff.feedback ? `\n\nFeedback: ${kickoff.feedback}` : "";
-    return {
-      planTodoListMessage: {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
-        display: true,
-      },
-      execMessage: `Execute the plan.\n\nRemaining steps:\n${remainingList || "(no pending steps)"}\n\nStart with: ${nextItem?.text ?? "the first pending step"}${feedbackBlock}${commitDirectiveLine(ctx)}\nAfter completing a step, include a [DONE:<ref>] tag in your response (use the numbers shown above).\nDo not stop for a routine checkpoint or a self-assessed context limit; continue until the approved execution is complete or a genuine blocker remains.`,
-    };
+  /** One plain kickoff: the approved plan is context, not a compiled row list. */
+  function buildPlanKickoffMessage(kickoff: ExecutionKickoff): string {
+    return [
+      "[APPROVED PLAN]",
+      `Plan: ${kickoff.planPath}`,
+      "",
+      "Read the approved plan, create your TODO list with `workflow_todo`, then implement it. Do not edit the plan.",
+      "Run the plan's `## Verification` with ordinary bash before the last row is marked done.",
+      "Do not stop for a routine checkpoint or a self-assessed context limit; continue until the work is complete or a genuine blocker remains.",
+      ...(kickoff.feedback ? ["", `Feedback: ${kickoff.feedback}`] : []),
+      ...(kickoff.planText ? ["", "Plan:", kickoff.planText.slice(0, 40_000)] : []),
+    ].join("\n");
   }
 
   function deliverExecutionKickoff(
@@ -9872,87 +9054,33 @@ export default function workflowExtension(
     kickoff: ExecutionKickoff,
   ): boolean {
     pendingExecutionKickoff = null;
-    const state = executionState;
-    if (!state) {
-      ctx.ui.notify(
-        "Execution was not armed; the plan was not started. Re-approve the plan or restore the execution.",
-        "warning",
-      );
-      return false;
-    }
-    if (
-      isExecutionTerminalState(state) ||
-      state.phase === "paused" ||
-      state.phase === "blocked"
-    ) {
-      ctx.ui.notify(
-        `Execution ${state.executionId} is ${state.phase}; the kickoff was not delivered.`,
-        "warning",
-      );
-      return false;
-    }
-    // Idempotent: a settled callback or a duplicate decision cannot send a
-    // second kickoff for this execution.
-    if (state.kickoff?.status === "sent" || state.kickoff?.status === "acknowledged") {
-      return true;
-    }
     try {
       if (typeof (pi as any).sendMessage !== "function") {
         throw new Error("the host has no sendMessage");
       }
-      const { planTodoListMessage, execMessage } = executionKickoffMessages(ctx, kickoff);
-      (pi as any).sendMessage(planTodoListMessage, { deliverAs: "followUp" });
       (pi as any).sendMessage(
         {
           customType: "workflow-plan-execute",
-          content: execMessage,
+          content: buildPlanKickoffMessage(kickoff),
           display: true,
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-      executionState = markExecutionKickoff(state, "sent", Date.now());
       try {
-        pi.appendEntry("workflow-execution-kickoff", {
-          at: Date.now(),
-          executionId: state.executionId,
-          epoch: state.epoch,
-          status: "sent",
-          planPath: kickoff.planPath,
-        });
         pi.appendEntry("workflow-handoff-result", {
           at: Date.now(),
           choice: "execute",
           source: kickoff.source,
           planPath: kickoff.planPath,
-          executionId: state.executionId,
         });
       } catch (_e) {
         void _e;
       }
-      persistState();
       return true;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      executionState = markExecutionKickoff(state, "failed", Date.now(), message);
-      try {
-        pi.appendEntry("workflow-execution-kickoff", {
-          at: Date.now(),
-          executionId: state.executionId,
-          epoch: state.epoch,
-          status: "failed",
-          planPath: kickoff.planPath,
-          error: message.slice(0, 500),
-        });
-      } catch (_e) {
-        void _e;
-      }
-      pauseBuildExecution(
-        `the execution kickoff could not be delivered: ${message}`,
-        kickoff.planPath,
-      );
-      persistState();
       ctx.ui.notify(
-        `The Build kickoff could not be delivered (${message}); the execution is paused, not running.`,
+        `The Build kickoff could not be delivered (${message}); create the TODO list manually and continue.`,
         "warning",
       );
       return false;
@@ -9963,25 +9091,6 @@ export default function workflowExtension(
     ctx: ExtensionContext,
     kickoff: ExecutionKickoff,
   ): boolean {
-    if (!executionState) {
-      const armed = armBuildExecution(kickoff.planPath);
-      if (!armed.ok) {
-        ctx.ui.notify(`Build execution: ${armed.error}`, "warning");
-        return false;
-      }
-    }
-    const state = executionState!;
-    if (
-      isExecutionTerminalState(state) ||
-      state.phase === "paused" ||
-      state.phase === "blocked"
-    ) {
-      ctx.ui.notify(
-        `Build execution is ${state.phase}; the kickoff was not queued.`,
-        "warning",
-      );
-      return false;
-    }
     pendingExecutionKickoff = kickoff;
     // Unknown hosts are treated as idle (send now); only an explicit false is
     // deferred, so fake/older hosts keep the previous behaviour.
@@ -10527,33 +9636,17 @@ export default function workflowExtension(
 
   try {
     pi.registerCommand("build", {
-      description:
-        "Enable Build mode. Verbs: status, pause [reason], resume, stop. Bare /build switches mode.",
+      description: "Enable Build mode (full access).",
       handler: async (args, ctx) => {
         const text = typeof args === "string" ? args.trim() : "";
-        if (!text) {
-          await switchWorkflowMode("build", ctx as any);
+        if (text) {
+          ctx.ui.notify(
+            "Usage: /build — switches to Build mode. Execution pause/resume/stop verbs were removed.",
+            "info",
+          );
           return;
         }
-        const [verb, ...rest] = text.split(/\s+/);
-        const note = rest.join(" ").trim();
-        if (verb === "status") {
-          ctx.ui.notify(executionStatusLines().join("\n"), "info");
-          return;
-        }
-        if (verb === "pause") {
-          pauseExecutionByUser(ctx as ExtensionContext, note || "paused by user");
-          return;
-        }
-        if (verb === "resume") {
-          resumeExecutionByUser(ctx as ExtensionContext);
-          return;
-        }
-        if (verb === "stop") {
-          stopExecutionByUser(ctx as ExtensionContext);
-          return;
-        }
-        ctx.ui.notify("Usage: /build [status|pause [reason]|resume|stop]", "info");
+        await switchWorkflowMode("build", ctx as any);
       },
     });
   } catch (_e) {
@@ -10594,22 +9687,17 @@ export default function workflowExtension(
             updateStatus(ctx as any);
             return;
           }
-          // `/orchestrator retry` recovers (when proven stale) and dispatches
-          // immediately; it never relies on the operator text alone. Both
-          // status and retry first reattach a saved run after a reload by its
-          // approved plan path (journal only — never compile or freeze again).
+          // `/orchestrator status` and `/orchestrator retry` read the run
+          // record; the session restore already rebuilt it after a reload.
           const wantsStatus = /^status(?:\s|$)/i.test(text);
           const wantsRetry = /^retry(?:\s|$)/i.test(text);
-          if ((wantsStatus || wantsRetry) && !orchestratorRuntime?.view()) {
-            const reattached = await restoreOrchestratorRun(liveCtx);
-            if (!reattached.ok && !reattached.noRun) {
-              ctx.ui.notify(
-                `Saved Orchestrator run could not be reattached: ${reattached.error}. The journal is unchanged; fix the cause and run /orchestrator status again.`,
-                "warning",
-              );
-              updateStatus(ctx as any);
-              return;
-            }
+          if ((wantsStatus || wantsRetry) && !orchestratorRun) {
+            ctx.ui.notify(
+              "No Orchestrator run is bound to this session. Start one with orchestrator_start, or restart from the approved plan.",
+              "warning",
+            );
+            updateStatus(ctx as any);
+            return;
           }
           if (wantsRetry) {
             if (workflowMode !== "orchestrator") {
@@ -10679,270 +9767,6 @@ export default function workflowExtension(
         const result = await operator.run(raw ? `view ${raw}` : "view");
         ctx.ui.notify(result.text, result.ok ? "info" : "warning");
         updateStatus(ctx as any);
-      },
-    });
-    // Durable plan-check amendment: the in-session twin of
-    // scripts/repair-orchestrator-checks.mjs. It shows old -> new, confirms
-    // unless --yes, and re-freezes through the TODO store so
-    // validateFrozenSnapshot runs again and the panel reflects the change.
-    pi.registerCommand("orchestrator-repair-checks", {
-      description:
-        "Inspect or amend the frozen final plan checks: status|--file <manifest.json>|--from-plan [--allow-empty] [--yes].",
-      handler: async (args, ctx) => {
-        const liveCtx = ctx as ExtensionContext;
-        const notify = (message: string, level: "info" | "warning" = "info") =>
-          ctx.ui.notify(message, level);
-        const usage =
-          "Usage: /orchestrator-repair-checks [status] [--file <manifest.json>] [--from-plan] [--allow-empty] [--yes]";
-        const raw = typeof args === "string" ? args.trim() : "";
-        const tokens = raw.split(/\s+/).filter((token) => token.length > 0);
-        let showStatus = tokens.length === 0;
-        let fromPlan = false;
-        let allowEmpty = false;
-        let yes = false;
-        let file: string | undefined;
-        for (let index = 0; index < tokens.length; index += 1) {
-          const token = tokens[index]!;
-          if (token === "help" || token === "--help" || token === "-h") {
-            notify(usage, "info");
-            return;
-          }
-          if (token === "status") {
-            showStatus = true;
-            continue;
-          }
-          if (token === "--from-plan") {
-            fromPlan = true;
-            continue;
-          }
-          if (token === "--allow-empty") {
-            allowEmpty = true;
-            continue;
-          }
-          if (token === "--yes" || token === "-y") {
-            yes = true;
-            continue;
-          }
-          if (token === "--file") {
-            const next = tokens[index + 1];
-            if (!next || next.startsWith("--")) {
-              notify(`--file needs a manifest path.\n${usage}`, "warning");
-              return;
-            }
-            file = next;
-            index += 1;
-            continue;
-          }
-          if (token.startsWith("--file=")) {
-            file = token.slice("--file=".length);
-            if (!file) {
-              notify(`--file needs a manifest path.\n${usage}`, "warning");
-              return;
-            }
-            continue;
-          }
-          notify(`Unknown argument "${token}".\n${usage}`, "warning");
-          return;
-        }
-        if (showStatus && (fromPlan || file !== undefined)) {
-          notify(`status is read-only; omit --file/--from-plan to amend.\n${usage}`, "warning");
-          return;
-        }
-        if (file !== undefined && fromPlan) {
-          notify(`Use either --file or --from-plan, not both.\n${usage}`, "warning");
-          return;
-        }
-
-        try {
-          const runtime = ensureOrchestratorRuntime(liveCtx);
-          if (!runtime.view()) await restoreOrchestratorRun(liveCtx);
-          const view = runtime.view();
-          if (!view) {
-            notify(
-              "No Orchestrator run is bound. Start or restore a run first (/orchestrator start or /orchestrator status).",
-              "warning",
-            );
-            return;
-          }
-          const events = await runtime.journalEvents();
-          const seq =
-            events.ok && events.value.length > 0 ? (events.value.at(-1)?.seq ?? 0) : 0;
-          const accepted = view.state.order.filter(
-            (taskId) => view.state.tasks[taskId]?.state === "accepted",
-          ).length;
-          const currentSpecs = executablePlanCheckSpecs(view.todos);
-          const formatCurrent = (): string =>
-            currentSpecs
-              .map((spec, index) => {
-                const shape = validateCommandShape(spec.command);
-                const target = spec.workspace ? ` [${spec.workspace}]` : "";
-                return `  ${index + 1}. ${shape.ok ? "ok" : "BAD"} ${spec.command}${target}${
-                  shape.ok ? "" : ` — ${shape.error}`
-                }`;
-              })
-              .join("\n");
-
-          if (showStatus) {
-            notify(
-              [
-                `Orchestrator run ${view.runId} — ${view.phase}, seq ${seq}, accepted ${accepted}/${view.state.order.length}`,
-                `Final checks (${currentSpecs.length}):`,
-                formatCurrent() || "  (none)",
-                "Amend with /orchestrator-repair-checks --file <manifest.json> or --from-plan.",
-              ].join("\n"),
-              "info",
-            );
-            return;
-          }
-
-          let specs: Array<{ command: string; workspace?: string; kind?: string }>;
-          let reason: string;
-          let source: string;
-          if (file !== undefined) {
-            const cwd = (liveCtx as any).cwd ?? process.cwd();
-            const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, file);
-            let text: string;
-            try {
-              text = await fs.promises.readFile(resolved, "utf8");
-            } catch (error: unknown) {
-              notify(
-                `Cannot read the manifest ${resolved}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-                "warning",
-              );
-              return;
-            }
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(text);
-            } catch (error: unknown) {
-              notify(
-                `The manifest is not valid JSON: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-                "warning",
-              );
-              return;
-            }
-            const manifest = parseRepairManifest(parsed);
-            if (!manifest.ok) {
-              notify(`Invalid manifest: ${manifest.error}`, "warning");
-              return;
-            }
-            specs = manifest.manifest.specs;
-            reason = manifest.manifest.reason;
-            source = manifest.manifest.source;
-            if (manifest.manifest.allowEmpty) allowEmpty = true;
-          } else {
-            const planPath = currentPlanFile ?? view.todos.source.path;
-            if (!planPath) {
-              notify(
-                "--from-plan needs an approved plan path; use --file <manifest.json> instead.",
-                "warning",
-              );
-              return;
-            }
-            let markdown: string;
-            try {
-              markdown = await fs.promises.readFile(planPath, "utf8");
-            } catch (error: unknown) {
-              notify(
-                `Cannot read the plan ${planPath}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-                "warning",
-              );
-              return;
-            }
-            const extracted = extractPlanChecksWithWorkspaceDetailed(markdown);
-            if (!extracted.ok) {
-              notify(
-                `The plan's Verification section is not executable: ${extracted.error}`,
-                "warning",
-              );
-              return;
-            }
-            specs = extracted.specs;
-            reason = `Recompiled the final checks from the approved plan: ${path.basename(planPath)}.`;
-            source = `plan:${planPath}`;
-            if (extracted.specs.length === 0 && !allowEmpty) {
-              notify(
-                "The plan's Verification section has no executable commands; pass --allow-empty to remove the final checks.",
-                "warning",
-              );
-              return;
-            }
-          }
-
-          const proposedLines = specs
-            .map(
-              (spec, index) =>
-                `  ${index + 1}. ${spec.kind ?? "gate"} ${spec.command}${
-                  spec.workspace ? ` [${spec.workspace}]` : ""
-                }`,
-            )
-            .join("\n");
-          const summary = [
-            `Run ${view.runId}: ${currentSpecs.length} → ${specs.length} final check(s).`,
-            "Current:",
-            formatCurrent() || "  (none)",
-            "Proposed:",
-            proposedLines || "  (none)",
-            `Reason: ${reason}`,
-            `Source: ${source}`,
-          ].join("\n");
-          if (!yes) {
-            const confirmed = await ctx.ui.confirm("Amend the frozen final checks?", summary);
-            if (!confirmed) {
-              notify("Plan-check repair cancelled.", "info");
-              return;
-            }
-          }
-          const repaired = await runtime.repairCheckSpecs({
-            specs,
-            reason,
-            source,
-            allowEmpty,
-          });
-          if (!repaired.ok) {
-            notify(
-              `The plan-check repair was refused (${repaired.code}): ${repaired.error}`,
-              "warning",
-            );
-            return;
-          }
-          const placed = todos.freeze(repaired.value.view.todos);
-          if (!placed.ok) {
-            notify(
-              `The amendment was journaled but the TODO list rejected it: ${placed.error}`,
-              "warning",
-            );
-            return;
-          }
-          persistState();
-          updateStatus(liveCtx);
-          if (repaired.value.duplicate) {
-            notify(
-              `Final checks already match the manifest (event ${repaired.value.eventId}); nothing appended.`,
-              "info",
-            );
-            return;
-          }
-          notify(
-            `Amended ${repaired.value.view.todos.planChecks.length} final check(s) on ${view.runId} (event ${
-              repaired.value.eventId
-            }). Accepted rows are unchanged; run /orchestrator retry when ready.`,
-            "info",
-          );
-        } catch (error: unknown) {
-          notify(
-            `Plan-check repair failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-            "warning",
-          );
-        }
       },
     });
   } catch (_e) {
@@ -11181,7 +10005,6 @@ export default function workflowExtension(
         "pending",
         "add",
         "toggle",
-        "sync",
         "clear",
       ] as const),
       todos: Type.Optional(
@@ -11214,9 +10037,6 @@ export default function workflowExtension(
         ),
       ),
       text: Type.Optional(Type.String({ description: "Todo text (for add)" })),
-      intent: Type.Optional(
-        StringEnum(["update", "replace"] as const),
-      ),
       expectedRevision: Type.Optional(
         Type.Number({
           description:
@@ -11253,11 +10073,7 @@ export default function workflowExtension(
               })
               .join("\n")
           : "(empty)";
-        if (!executionState) return base;
-        const next = selectNextRow(executionRows(), executionState);
-        if (!next) return base;
-        const nextItem = todos.items.find((item) => todoRef(item) === next.ref);
-        return `${base}\nNext execution row: ${next.ref}${nextItem ? ` — ${nextItem.text}` : ""}`;
+        return base;
       };
       const refError = (ref: string, resolved: any) =>
         resolved.ambiguous
@@ -11285,31 +10101,7 @@ export default function workflowExtension(
             text: t.text,
             status: t.status as TodoStatus,
           }));
-          const evidenceMissing = incoming.find(
-            (entry) =>
-              entry.status === "completed" &&
-              entry.ref !== undefined &&
-              executionEvidenceRequired(String(entry.ref)) &&
-              !hasExecutionEvidence(String(entry.ref)),
-          );
-          if (evidenceMissing) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Update refused: row ${evidenceMissing.ref} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${evidenceMissing.ref}"} first.`,
-                },
-              ],
-              details: {
-                action: "update",
-                todos: [...todos.items],
-                nextStep: todos.items.length + 1,
-                error: "evidence-required",
-              } as TodoDetails,
-            };
-          }
           const res = todos.update(incoming, {
-            allowBulkReplace: params.intent === "replace",
             ...(typeof params.expectedRevision === "number"
               ? { expectedRevision: params.expectedRevision }
               : {}),
@@ -11335,10 +10127,6 @@ export default function workflowExtension(
             };
           }
           onTodoWrite();
-          armStandaloneBuildExecution(
-            (currentSessionCtx ?? _ctx) as ExtensionContext,
-            "Build work",
-          );
           const summary = `Updated todos: ${res.kept} kept, ${res.added} added, ${res.removed} removed${res.normalized ? `, ${res.normalized} extra in_progress demoted` : ""}${res.excludedAdded ? `, ${res.excludedAdded} plan step(s) recorded as removed` : ""}. Revision ${res.revision}.`;
           const warningText = res.warnings.length
             ? `\nWarnings:\n${res.warnings.map((w) => `- ${w}`).join("\n")}`
@@ -11396,26 +10184,6 @@ export default function workflowExtension(
           const it = resolved.item;
           const status: TodoStatus =
             params.action === "done" ? "completed" : "pending";
-          if (
-            status === "completed" &&
-            executionEvidenceRequired(todoRef(it)) &&
-            !hasExecutionEvidence(todoRef(it))
-          ) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Row ${todoRef(it)} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${todoRef(it)}"} first; the row was not marked done.`,
-                },
-              ],
-              details: {
-                action: params.action,
-                todos: [...todos.items],
-                nextStep: todos.items.length + 1,
-                error: "evidence-required",
-              } as TodoDetails,
-            };
-          }
           setTodoStatus(it, status);
           try {
             if (currentSessionCtx) {
@@ -11430,7 +10198,7 @@ export default function workflowExtension(
             content: [
               {
                 type: "text",
-                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}${nextExecutionLine()}`,
+                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}`,
               },
             ],
             details: {
@@ -11491,15 +10259,11 @@ export default function workflowExtension(
             void _e;
           }
           onTodoWrite();
-          armStandaloneBuildExecution(
-            (currentSessionCtx ?? _ctx) as ExtensionContext,
-            "Build work",
-          );
           return {
             content: [
               {
                 type: "text",
-                text: `Added ${todoRef(item)}. ${item.text}${nextExecutionLine()}`,
+                text: `Added ${todoRef(item)}. ${item.text}`,
               },
             ],
             details: {
@@ -11542,26 +10306,6 @@ export default function workflowExtension(
           }
           const it = resolved.item;
           const nextStatus = isDone(it) ? "pending" : "completed";
-          if (
-            nextStatus === "completed" &&
-            executionEvidenceRequired(todoRef(it)) &&
-            !hasExecutionEvidence(todoRef(it))
-          ) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Row ${todoRef(it)} has required checks but no runtime evidence. Run workflow_execution {action:"verify", rowRef:"${todoRef(it)}"} first.`,
-                },
-              ],
-              details: {
-                action: "toggle",
-                todos: [...todos.items],
-                nextStep: todos.items.length + 1,
-                error: "evidence-required",
-              } as TodoDetails,
-            };
-          }
           setTodoStatus(it, nextStatus);
           try {
             if (currentSessionCtx) {
@@ -11576,60 +10320,11 @@ export default function workflowExtension(
             content: [
               {
                 type: "text",
-                text: `${todoRef(it)}. ${it.text} toggled to ${it.completed ? "done" : "pending"}${nextExecutionLine()}`,
+                text: `${todoRef(it)}. ${it.text} toggled to ${it.completed ? "done" : "pending"}`,
               },
             ],
             details: {
               action: "toggle",
-              todos: [...todos.items],
-              nextStep: todos.items.length + 1,
-            } as TodoDetails,
-          };
-        }
-        case "sync": {
-          if (!currentPlanFile)
-            return {
-              content: [{ type: "text", text: "Error: no active plan file" }],
-              details: {
-                action: "sync",
-                todos: [...todos.items],
-                nextStep: todos.items.length + 1,
-                error: "no plan file",
-              } as TodoDetails,
-            };
-          const loaded = loadTodosFromPlan(
-            currentPlanFile,
-            (currentSessionCtx as any)?.cwd ?? process.cwd(),
-            { restoreExcluded: true },
-          );
-          try {
-            if (currentSessionCtx) {
-              updateStatus(currentSessionCtx);
-              persistState();
-            }
-          } catch (_e) {
-            void _e;
-          }
-          onTodoWrite();
-          const preservedNote =
-            loaded.preserved > 0
-              ? ` (kept ${loaded.preserved} agent-added)`
-              : "";
-          const excludedNote =
-            loaded.excluded > 0
-              ? ` (${loaded.excluded} previously removed step(s) stay excluded until an explicit sync)`
-              : "";
-          const restoredNote =
-            loaded.restored > 0 ? ` (restored ${loaded.restored} removed step(s))` : "";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Synced ${loaded.count} todos from plan${preservedNote}${restoredNote}${excludedNote}`,
-              },
-            ],
-            details: {
-              action: "sync",
               todos: [...todos.items],
               nextStep: todos.items.length + 1,
             } as TodoDetails,
@@ -14213,218 +12908,63 @@ export default function workflowExtension(
     }
   }
 
-  // ── Build execution control tool ─────────────────────────────────
-  // The model may report progress or a genuine blocker. It cannot pause,
-  // resume, reset the shell guard, or mint completion evidence.
-  pi.registerTool({
-    name: "workflow_execution",
-    label: "Workflow Execution",
-    description:
-      "Report Build execution status, checkpoint non-shell progress, or record a genuine blocker. Actions: status, checkpoint (summary), blocker (category, reason, rowRef, requiredAction). This tool never grants permissions and never resets the shell guard.",
-    promptSnippet: "Report or checkpoint the active Build execution; record a genuine blocker",
-    promptGuidelines: [
-      "workflow_execution: shell quarantine is recoverable — continue with non-shell tools; use action \"blocker\" only when no permitted non-shell action can advance the work.",
-      "workflow_execution: do not claim completion through this tool; completion is runtime-verified from TODO status and checks.",
-    ],
-    parameters: Type.Object({
-      action: StringEnum(["status", "checkpoint", "verify", "blocker"] as const),
-      summary: Type.Optional(Type.String({ description: "Bounded checkpoint summary" })),
-      rowRef: Type.Optional(Type.String({ description: "Current global row ref" })),
-      category: Type.Optional(
-        StringEnum([
-          "permission",
-          "safety",
-          "external",
-          "verification",
-          "no-permitted-action",
-          "unknown",
-        ] as const),
-      ),
-      reason: Type.Optional(Type.String({ description: "Why progress is blocked" })),
-      requiredAction: Type.Optional(
-        Type.String({ description: "The exact user action needed" }),
-      ),
-    }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const ctx = (currentSessionCtx ?? _ctx) as ExtensionContext;
-      if (params.action === "status") {
-        return {
-          content: [{ type: "text", text: executionStatusLines().join("\n") }],
-          details: { action: "status" },
-        };
-      }
-      if (!executionState) {
-        return {
-          content: [{ type: "text", text: "No active Build execution." }],
-          details: { action: params.action, error: "no-execution" },
-        };
-      }
-      const now = Date.now();
-      if (params.action === "verify") {
-        const next = selectNextRow(executionRows(), executionState);
-        const ref = params.rowRef ?? next?.ref;
-        const row = ref ? frozenRowForRef(ref) : undefined;
-        if (!ref || !row) {
-          return {
-            content: [{ type: "text", text: "verify needs a known frozen rowRef." }],
-            details: { action: "verify", error: "row-required" },
-          };
-        }
-        if (row.acceptanceChecks.length === 0) {
-          executionEvidence.set(ref, { signature: "no-executable-checks", at: now });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Row ${ref} has no executable checks; a task-appropriate diff/manual evidence checkpoint is required before completion.`,
-              },
-            ],
-            details: { action: "verify", rowRef: ref, checks: 0 },
-          };
-        }
-        const results: Array<{ command: string; ok: boolean; output: string }> = [];
-        // Every verify check goes through the shared executor: malformed
-        // command bytes fail closed as metadata, a shell-guard refusal is
-        // `policy`, and the workspace root is the row's bound root.
-        const executor = createSessionCheckExecutor(ctx);
-        const set = workspaceSetForRun();
-        const bound = workspaceRootForRow(set, { workspaces: row.workspaces });
-        const outcome = await executor.executeMany(
-          row.acceptanceChecks,
-          {
-            set,
-            ...(bound ? { boundRoot: bound.root } : {}),
-          },
-          ctx?.signal ? { signal: ctx.signal } : undefined,
-        );
-        for (const result of outcome.results) {
-          results.push({
-            command: result.command,
-            ok: result.ok,
-            output: (result.output || result.message).slice(0, 2_000),
-          });
-        }
-        const failed = outcome.results.find((result) => !result.ok);
-        if (failed) {
-          const metadata = failed.failureClass === "metadata";
-          return {
-            content: [
-              {
-                type: "text",
-                text: metadata
-                  ? `Row ${ref} check metadata is invalid: ${failed.message}. Move the prose to Acceptance and put real commands in Checks:/Verify:.`
-                  : `Row ${ref} verification failed: ${failed.command}\n${(
-                      failed.output || failed.message
-                    ).slice(0, 1_500)}`,
-              },
-            ],
-            details: {
-              action: "verify",
-              rowRef: ref,
-              error: metadata
-                ? "invalid-check"
-                : failed.failureClass === "policy"
-                  ? "shell-quarantined"
-                  : "check-failed",
-              failureClass: failed.failureClass,
-              results,
-            },
-          };
-        }
-        executionEvidence.set(ref, {
-          signature: results.map((entry) => entry.command).join("\n"),
-          at: now,
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Row ${ref} verified: ${results.length} check(s) passed.`,
-            },
-          ],
-          details: { action: "verify", rowRef: ref, results },
-        };
-      }
-      if (params.action === "checkpoint") {
-        const applied = applyExecutionEvent(executionState, {
-          type: "progress",
-          at: now,
-          ...(params.summary ? { signature: params.summary.slice(0, 200) } : {}),
-        });
-        if (applied.ok) {
-          executionState = applied.state;
-          persistState();
-          updateStatus(ctx);
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: [`Execution checkpoint recorded.`, ...executionStatusLines()].join("\n"),
-            },
-          ],
-          details: { action: "checkpoint" },
-        };
-      }
-      const reason = params.reason?.trim();
-      const category = (params.category ?? "unknown") as ExecutionBlocker["category"];
-      if (!reason) {
-        return {
-          content: [{ type: "text", text: "blocker requires a reason." }],
-          details: { action: "blocker", error: "reason-required" },
-        };
-      }
-      const applied = applyExecutionEvent(executionState, {
-        type: "block",
-        executionId: executionState.executionId,
-        epoch: executionState.epoch,
-        blocker: {
-          category,
-          reason: reason.slice(0, 1000),
-          ...(params.rowRef ? { rowRef: params.rowRef } : {}),
-          ...(params.requiredAction
-            ? { requiredAction: params.requiredAction.slice(0, 500) }
-            : {}),
-          at: now,
-        },
-        at: now,
-      });
-      if (!applied.ok) {
-        return {
-          content: [{ type: "text", text: `Blocker not recorded: ${applied.error}.` }],
-          details: { action: "blocker", error: applied.code },
-        };
-      }
-      executionState = applied.state;
-      persistState();
-      updateStatus(ctx);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Blocked recorded: ${reason}${params.requiredAction ? `\nRequired action: ${params.requiredAction}` : ""}\n${executionStatusLines().join("\n")}`,
-          },
-        ],
-        details: { action: "blocker", category },
-      };
-    },
-  });
-
   // ── Parent orchestration tools (orchestrator step 16) ────────────
   // Registered in every session so the refusal is truthful, but they are
   // eligible ONLY in Orchestrator mode on a bound run. A managed worker can
   // never use them to gain orchestration authority.
   /**
-   * The one start service: freeze the approved plan (or the agreed standalone
-   * steps), install the frozen list in the session TODO store, persist, and
-   * let the scheduler dispatch row 1. Used by the handoff route and the tool.
+   * The one start service: normalize the model's steps, resolve the declared
+   * roots, record the run and its TODO rows, persist, and let the parent
+   * dispatch row 1. Used by the tool and the discussion-steps entry.
    */
+  /**
+   * Assign a stable alias to every model-supplied root and refuse duplicates.
+   * An omitted id is synthesized: `W` when the path is the session root,
+   * otherwise the first free letter of A..H. `W` is never given to another
+   * root, because the resolver reserves it for the session root.
+   */
+  function normalizeWorkspaceDeclarations(
+    input: readonly { id?: string; path: string }[] | undefined,
+  ): WorkspaceDeclaration[] {
+    const primary = path.resolve(orchestratorRoot());
+    const used = new Set<string>();
+    const declarations: WorkspaceDeclaration[] = [];
+    for (const entry of input ?? []) {
+      const declaredPath = String(entry.path ?? "").trim();
+      if (!declaredPath) continue;
+      const explicit = String(entry.id ?? "").trim();
+      let id = explicit;
+      if (id) {
+        if (!/^[A-Za-z][A-Za-z0-9_-]{0,23}$/.test(id)) {
+          throw new Error(
+            `invalid workspace id "${id}"; use a short alias such as A, B or W`,
+          );
+        }
+        if (used.has(id.toLowerCase())) {
+          throw new Error(`duplicate workspace id "${id}"; each root needs its own alias`);
+        }
+      } else {
+        const resolved = path.resolve(primary, declaredPath);
+        id =
+          resolved.toLowerCase() === primary.toLowerCase() && !used.has("w")
+            ? "W"
+            : (["A", "B", "C", "D", "E", "F", "G", "H"].find(
+                (alias) => !used.has(alias.toLowerCase()),
+              ) ?? "");
+        if (!id) throw new Error("at most 8 workspace roots are supported");
+      }
+      used.add(id.toLowerCase());
+      declarations.push({ id, path: declaredPath });
+    }
+    return declarations;
+  }
+
   async function startOrchestratorRun(owner: ExtensionContext, input: {
     planPath?: string;
     planText?: string;
     title?: string;
-    steps?: string[];
-    workspaces?: Array<{ id?: string; path: string }>;
+    steps?: readonly OrchestratorRunStep[];
+    workspaces?: readonly { id?: string; path: string }[];
   }): Promise<
     { ok: true; text: string; details: Record<string, unknown> } |
     { ok: false; code: string; text: string }
@@ -14444,8 +12984,16 @@ export default function workflowExtension(
       };
     }
     const steps = (input.steps ?? [])
-      .map((step) => String(step ?? "").replace(/\s+/g, " ").trim())
-      .filter((step) => step.length > 0);
+      .map((step) =>
+        typeof step === "string"
+          ? { text: step }
+          : { ...step, text: typeof step?.text === "string" ? step.text : "" },
+      )
+      .map((step) => ({
+        ...step,
+        text: String(step.text ?? "").replace(/\s+/g, " ").trim(),
+      }))
+      .filter((step) => step.text.length > 0);
     if (steps.length === 0) {
       return {
         ok: false,
@@ -14469,15 +13017,41 @@ export default function workflowExtension(
         };
       }
     }
-    orchestratorRun = createOrchestratorRun({
-      ...(input.title !== undefined ? { title: input.title } : {}),
-      ...(planPath !== undefined ? { planPath } : {}),
-      steps,
-    });
+    try {
+      const declarations = normalizeWorkspaceDeclarations(input.workspaces);
+      const resolved = await resolveWorkspaceSet({
+        primaryRoot: orchestratorRoot(),
+        ...(declarations.length > 0 ? { overrides: declarations } : {}),
+        resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
+        broadRootReason: (root) => broadGrantRootReason(root, orchestratorRoot()),
+      });
+      if (!resolved.ok) {
+        return { ok: false, code: "workspace", text: resolved.error };
+      }
+      const workspaces = resolved.value.roots.map((root) => ({
+        id: root.id,
+        root: root.root,
+        kind: root.kind,
+        displayPath: root.displayPath,
+        primary: root.primary,
+      }));
+      orchestratorRun = createOrchestratorRun({
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(planPath !== undefined ? { planPath } : {}),
+        steps,
+        workspaces,
+      });
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        code: "invalid",
+        text: error instanceof Error ? error.message : String(error),
+      };
+    }
     todos.replace(
-      steps.map((text, index) => ({
+      steps.map((step, index) => ({
         step: index + 1,
-        text,
+        text: step.text,
         completed: false,
       })),
     );
@@ -14574,6 +13148,67 @@ export default function workflowExtension(
     if (!owner) {
       return { ok: false, code: "unavailable", text: "No live parent session." };
     }
+    // Resolve the child root: an explicit cwd may name a declared workspace id
+    // or an absolute path inside a declared root; otherwise the row's stored
+    // workspace decides. A multi-root run with no row workspace fails closed
+    // instead of silently running in the primary repository.
+    const declaredIds = run.workspaces?.map((workspace) => workspace.id).join(", ");
+    const requested = input.cwd?.trim();
+    let cwd: string | undefined;
+    let workspaceId: string | undefined;
+    if (requested) {
+      const alias = run.workspaces?.find(
+        (workspace) => workspace.id.toLowerCase() === requested.toLowerCase(),
+      );
+      if (alias) {
+        cwd = alias.root;
+        workspaceId = alias.id;
+      } else if (path.isAbsolute(requested)) {
+        const containing = run.workspaces?.find((workspace) =>
+          isInsideWorkspaceRoot(requested, workspace.root, false),
+        );
+        if (!containing) {
+          return {
+            ok: false,
+            code: "workspace",
+            text: `cwd ${requested} is outside the declared roots${declaredIds ? ` (${declaredIds})` : ""}.`,
+          };
+        }
+        cwd = containing.root;
+        workspaceId = containing.id;
+      } else {
+        return {
+          ok: false,
+          code: "workspace",
+          text: `Unknown workspace "${requested}"; declared workspaces: ${declaredIds || "none"}.`,
+        };
+      }
+    } else if (row.workspaceId) {
+      const bound = run.workspaces?.find(
+        (workspace) => workspace.id === row.workspaceId,
+      );
+      if (bound) {
+        cwd = bound.root;
+        workspaceId = bound.id;
+      } else {
+        return {
+          ok: false,
+          code: "workspace",
+          text: `Row ${row.ref} names workspace "${row.workspaceId}", which this run does not declare.`,
+        };
+      }
+    } else if (run.workspaces && run.workspaces.length > 1) {
+      return {
+        ok: false,
+        code: "workspace",
+        text: `Row ${row.ref} names no workspace and the run declares ${declaredIds}. Split the work into one row per root, or pass cwd.`,
+      };
+    } else {
+      cwd = row.cwd ?? run.workspaces?.[0]?.root ?? orchestratorRoot();
+      workspaceId = run.workspaces?.[0]?.id;
+    }
+    const workspace =
+      workspaceId && cwd ? { id: workspaceId, root: cwd } : undefined;
     const controller = ensureOrchestratorChildController(owner);
     const attemptId = `row-${row.ref}-attempt-${Date.now().toString(36)}`;
     const sessionId = `orch-child-${attemptId}`;
@@ -14585,6 +13220,8 @@ export default function workflowExtension(
       ref: row.ref,
       total,
       sessionId,
+      ...(cwd ? { cwd } : {}),
+      ...(workspace ? { workspace } : {}),
     });
     if (!prepared.ok) {
       return {
@@ -14600,6 +13237,8 @@ export default function workflowExtension(
       ref: row.ref,
       total,
       sessionId,
+      ...(cwd ? { cwd } : {}),
+      ...(workspace ? { workspace } : {}),
     });
     if (!started.ok) {
       orchestratorPendingInstruction = undefined;
@@ -14613,6 +13252,8 @@ export default function workflowExtension(
       rowRef: row.ref,
       instruction: instructions,
       childSessionId: sessionId,
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(cwd ? { cwd } : {}),
     });
     orchestratorPendingInstruction = undefined;
     todos.setStatus(row.ref, "in_progress");
@@ -14620,17 +13261,39 @@ export default function workflowExtension(
     updateStatus(owner);
     return {
       ok: true,
-      text: `Dispatched row ${row.ref}/${total} to an in-process Build child. The child owns verification; its report will wake you.`,
-      details: { runId: run.runId, rowRef: row.ref, attemptId, sessionId },
+      text: `Dispatched row ${row.ref}/${total} to an in-process Build child${cwd ? ` in ${cwd}` : ""}. The child owns verification; its report will wake you.`,
+      details: { runId: run.runId, rowRef: row.ref, attemptId, sessionId, cwd },
     };
   }
 
+  /** Re-dispatch one row with its stored instruction (operator retry/resume). */
+  async function retryOrchestratorRow(
+    rowRef?: string,
+  ): Promise<{ ok: boolean; text: string }> {
+    const run = orchestratorRun;
+    if (!run) return { ok: false, text: "No Orchestrator run is bound." };
+    const ref =
+      rowRef ??
+      run.currentRef ??
+      nextPendingRow(run, (candidate) => completedRunRefs().has(candidate))?.ref;
+    const row = ref ? runRow(run, ref) : undefined;
+    if (!row) {
+      return {
+        ok: false,
+        text: ref ? `Unknown row ${ref}.` : "There is no row to retry.",
+      };
+    }
+    const dispatched = await dispatchOrchestratorRow({
+      rowRef: row.ref,
+      instructions: row.instruction ?? row.text,
+    });
+    return { ok: dispatched.ok, text: dispatched.text };
+  }
+
   const parentTools = createParentToolRuntime({
-    runtime: () => orchestratorRuntime,
     run: () => orchestratorRun,
     statusText: () => orchestratorStatusText(),
     dispatch: async (input) => dispatchOrchestratorRow(input),
-    epoch: () => orchestrationEpoch,
     startEligible: () => {
       if (workflowMode !== "orchestrator") {
         return "Orchestrator start is available in Orchestrator mode only. Enter it with /orchestrator; no /build switch is needed.";
@@ -14641,7 +13304,7 @@ export default function workflowExtension(
       if (workflowMode !== "orchestrator") {
         return "Orchestration tools are available in Orchestrator mode only. Enter it with /orchestrator.";
       }
-      if (!orchestratorRuntime && !orchestratorRun) {
+      if (!orchestratorRun) {
         return "No run is bound to this session yet. Call orchestrator_start with the approved plan or the explicitly agreed steps.";
       }
       return undefined;
@@ -14656,12 +13319,6 @@ export default function workflowExtension(
         };
       }
       return startOrchestratorRun(owner, input);
-    },
-    dispatchNext: async (taskId) => {
-      const dispatched = await dispatchNextOrchestratorTask(taskId);
-      return dispatched.ok
-        ? { ok: true, text: dispatched.text, details: dispatched.details }
-        : { ok: false, code: dispatched.code, text: dispatched.text };
     },
   });
   parentTools.register({
@@ -14829,8 +13486,7 @@ export default function workflowExtension(
               signal,
               subagentFolderEnv(job.cwd ?? cwd),
               shellGuardLimitsFor(ctx as any).config,
-              executionState?.shellQuarantine !== undefined ||
-                shellGuardRuntime?.isStopped() === true,
+              shellGuardRuntime?.isStopped() === true,
               activeSubagents,
               extensionSelfPath(),
             );
@@ -15397,7 +14053,7 @@ export default function workflowExtension(
             typeof event.text === "string" ? event.text : "",
             {
               childPhase: liveChild?.phase,
-              hasRun: orchestratorRuntime?.view() !== undefined,
+              hasRun: orchestratorRun !== undefined,
             },
           );
     if (orchestratorDecision.action === "refuse") {
@@ -15412,7 +14068,7 @@ export default function workflowExtension(
       if (delivery.ok) {
         try {
           pi.appendEntry(ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY, {
-            runId: orchestratorRuntime?.view()?.runId ?? "",
+            runId: orchestratorRun?.runId ?? "",
             taskId: liveChild?.taskId ?? "",
             ref: liveChild?.ref ?? "",
             total: liveChild?.total ?? 0,
@@ -15446,7 +14102,6 @@ export default function workflowExtension(
     ) {
       try {
         ensureShellGuard(_ctx).reset("new-user-request");
-        clearExecutionShellQuarantine("new-user-request");
       } catch (_e) {
         void _e;
       }
@@ -15725,6 +14380,8 @@ export default function workflowExtension(
     // over a newer explicit choice.
     let entryDefaultModel: PersistedModelDefault | undefined;
     let profileModel: PersistedModelDefault | undefined;
+    /** True when an old entry still carries the removed freeze/execution shape. */
+    let legacyRunEntrySeen = false;
     try {
       const entries = ctx.sessionManager.getBranch();
       for (const e of entries as any[]) {
@@ -15740,43 +14397,40 @@ export default function workflowExtension(
             }
             if (decoded) workflowMode = decoded.mode;
             syncLegacyFlags();
-            const hasFrozenPayload =
-              d.todoFrozen !== undefined && d.todoFrozen !== null;
-            // A later legacy entry without a frozen payload must never erase
-            // the rows of an already-restored frozen execution.
-            if (Array.isArray(d.todos) && !todos.frozen && !hasFrozenPayload) {
+            if (Array.isArray(d.todos)) {
               todos.items = ensureTodoLabels(d.todos);
             }
-            // Restore durable list identity/removal authority before any
-            // reconciliation can run, so a removed step stays removed.
+            // Restore the plain mutable list and its revision. Legacy freeze,
+            // exclusion, digest and recovery fields are deliberately ignored:
+            // old runs are not resumed.
             todos.restore({
               ...(typeof d.todoRevision === "number" ? { revision: d.todoRevision } : {}),
-              ...(Array.isArray(d.todoExclusions)
-                ? { excludedPlanSteps: d.todoExclusions }
-                : {}),
-              ...(typeof d.todoPlanDigest === "string"
-                ? { planDigest: d.todoPlanDigest }
-                : {}),
-              ...(typeof d.todoRecoveryReceipt === "string"
-                ? { recoveryReceiptId: d.todoRecoveryReceipt }
-                : {}),
-              ...(d.todoFrozen !== undefined && d.todoFrozen !== null
-                ? { frozen: d.todoFrozen }
-                : {}),
-              ...(typeof d.todoFrozenError === "string"
-                ? { frozenError: d.todoFrozenError }
-                : {}),
             });
             if (d.orchestratorRun !== undefined) {
               orchestratorRun =
                 restoreOrchestratorRunRecord(d.orchestratorRun) ?? orchestratorRun;
             }
             if (
-              d.execution &&
-              typeof d.execution === "object" &&
-              (d.execution as ExecutionState).version === 1
+              (d.todoFrozen !== undefined && d.todoFrozen !== null) ||
+              (d.execution !== undefined && d.execution !== null)
             ) {
-              executionState = d.execution as ExecutionState;
+              legacyRunEntrySeen = true;
+            }
+            if (d.shellQuarantine && typeof d.shellQuarantine === "object") {
+              const q = d.shellQuarantine as {
+                reason?: unknown;
+                commandHash?: unknown;
+                at?: unknown;
+              };
+              if (typeof q.reason === "string" && q.reason) {
+                restoredShellQuarantine = {
+                  reason: q.reason,
+                  ...(typeof q.commandHash === "string"
+                    ? { commandHash: q.commandHash }
+                    : {}),
+                  at: typeof q.at === "number" ? q.at : Date.now(),
+                };
+              }
             }
             // Entries written before this feature have no `todoPanel`; they
             // must not erase a value restored from an earlier entry.
@@ -15952,24 +14606,33 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
-    // Rebind a legacy mutable list to the full approved plan before any
-    // continuation decision. This preserves every global ref and never
-    // dispatches work by itself.
-    migrateLegacyBuildOnRestore(ctx as ExtensionContext);
-    // A restored execution is never running. Persisted history alone must not
-    // start provider requests, edits or child launches.
-    pauseRestoredExecution(ctx as ExtensionContext);
-    // The shell guard's own session reset must not clear a persisted
-    // execution quarantine. Re-adopt it after the restore loop.
+    // The shell guard's own session reset must not clear the persisted
+    // quarantine. Re-adopt it after the restore loop.
     reapplyPersistedShellQuarantine(ctx as ExtensionContext);
-    // A reload rebinds a run that already has a journal; it never dispatches.
-    // A running row waits for the explicit probe/retry path.
-    if (
-      workflowMode === "orchestrator" &&
-      !orchestratorRuntime?.view() &&
-      todos.frozen
-    ) {
-      await restoreOrchestratorRun(ctx as ExtensionContext);
+    // A reload cannot keep an in-process child. The stored run record is the
+    // only restore source; a `running` phase becomes `interrupted` so the
+    // footer is honest and /orchestrator retry can dispatch a fresh child.
+    if (orchestratorRun?.phase === "running") {
+      orchestratorRun = markRunInterrupted(orchestratorRun);
+      persistState();
+      try {
+        (ctx as any).ui?.notify?.(
+          "The in-process Build child did not survive the reload; /orchestrator retry starts a fresh one.",
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
+    if (legacyRunEntrySeen && !orchestratorRun) {
+      try {
+        (ctx as any).ui?.notify?.(
+          "This session carries an old Orchestrator run snapshot, which is no longer resumed. Restart from the approved plan.",
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
     }
     // Persisted default model: a side-effect-free read. Precedence is resolved
     // once, after the profile seeding below, so the profile cannot silently
@@ -16321,7 +14984,6 @@ export default function workflowExtension(
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.review, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.todos, undefined);
     ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.orchestrator, undefined);
-    ctx.ui.setStatus(WORKFLOW_STATUS_KEYS.execution, undefined);
     ctx.ui.setWidget("workflow-todos", undefined);
     // The Terminal review line is a live surface; a quit/reload must not wait
     // for teardown to clear it (teardown later drops currentSessionCtx).
@@ -16358,8 +15020,6 @@ export default function workflowExtension(
     // reconstruct after rewind
     todos.items = [];
     todos.planPath = undefined;
-    todos.frozen = undefined;
-    todos.frozenError = undefined;
     btwNotes = [];
     btwDelivered.clear();
     // A rewind is a branch boundary: the panel choice belongs to the branch.
@@ -16375,13 +15035,12 @@ export default function workflowExtension(
     // A rewind must not preserve a /commit exemption across branches.
     commitAuthorization = null;
     pendingCommitFlow = null;
+    let legacyRunEntrySeen = false;
     try {
       const branch = ctx.sessionManager.getBranch();
       for (const e of branch as any[]) {
         if (e.type === "custom" && e.customType === "workflow") {
-          const hasFrozenPayload =
-            e.data?.todoFrozen !== undefined && e.data?.todoFrozen !== null;
-          if (Array.isArray(e.data?.todos) && !todos.frozen && !hasFrozenPayload) {
+          if (Array.isArray(e.data?.todos)) {
             todos.items = ensureTodoLabels(e.data.todos);
           }
           if (Array.isArray(e.data?.todos)) {
@@ -16389,34 +15048,34 @@ export default function workflowExtension(
               ...(typeof e.data.todoRevision === "number"
                 ? { revision: e.data.todoRevision }
                 : {}),
-              ...(Array.isArray(e.data.todoExclusions)
-                ? { excludedPlanSteps: e.data.todoExclusions }
-                : {}),
-              ...(typeof e.data.todoPlanDigest === "string"
-                ? { planDigest: e.data.todoPlanDigest }
-                : {}),
-              ...(typeof e.data.todoRecoveryReceipt === "string"
-                ? { recoveryReceiptId: e.data.todoRecoveryReceipt }
-                : {}),
-              ...(e.data.todoFrozen !== undefined && e.data.todoFrozen !== null
-                ? { frozen: e.data.todoFrozen }
-                : {}),
-              ...(typeof e.data.todoFrozenError === "string"
-                ? { frozenError: e.data.todoFrozenError }
-                : {}),
             });
             if (e.data.orchestratorRun !== undefined) {
               orchestratorRun =
                 restoreOrchestratorRunRecord(e.data.orchestratorRun) ?? orchestratorRun;
             }
+            if (
+              (e.data.todoFrozen !== undefined && e.data.todoFrozen !== null) ||
+              (e.data.execution !== undefined && e.data.execution !== null)
+            ) {
+              legacyRunEntrySeen = true;
+            }
+            if (e.data.shellQuarantine && typeof e.data.shellQuarantine === "object") {
+              const q = e.data.shellQuarantine as {
+                reason?: unknown;
+                commandHash?: unknown;
+                at?: unknown;
+              };
+              if (typeof q.reason === "string" && q.reason) {
+                restoredShellQuarantine = {
+                  reason: q.reason,
+                  ...(typeof q.commandHash === "string"
+                    ? { commandHash: q.commandHash }
+                    : {}),
+                  at: typeof q.at === "number" ? q.at : Date.now(),
+                };
+              }
+            }
             if (e.data.planFile) todos.planPath = e.data.planFile;
-          }
-          if (
-            e.data?.execution &&
-            typeof e.data.execution === "object" &&
-            (e.data.execution as ExecutionState).version === 1
-          ) {
-            executionState = e.data.execution as ExecutionState;
           }
           if (e.data?.todoPanel && typeof e.data.todoPanel === "object") {
             const panel = readPersistedTodoPanel(e.data);
@@ -16434,7 +15093,6 @@ export default function workflowExtension(
           e.message?.role === "toolResult" &&
           e.message.toolName === "workflow_todo" &&
           Array.isArray(e.message.details?.todos) &&
-          !todos.frozen &&
           (e.message.details?.owner === undefined || e.message.details.owner === "ordinary")
         ) {
           todos.items = ensureTodoLabels(e.message.details.todos);
@@ -16448,8 +15106,29 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
-    pauseRestoredExecution(ctx as ExtensionContext);
     reapplyPersistedShellQuarantine(ctx as ExtensionContext);
+    if (orchestratorRun?.phase === "running") {
+      orchestratorRun = markRunInterrupted(orchestratorRun);
+      persistState();
+      try {
+        (ctx as any).ui?.notify?.(
+          "The in-process Build child did not survive the rewind; /orchestrator retry starts a fresh one.",
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
+    if (legacyRunEntrySeen && !orchestratorRun) {
+      try {
+        (ctx as any).ui?.notify?.(
+          "This branch carries an old Orchestrator run snapshot, which is no longer resumed. Restart from the approved plan.",
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
     updateStatus(ctx as any);
   });
 
@@ -16866,42 +15545,6 @@ export default function workflowExtension(
         `Commit policy 'ask': the user declined \`git ${hit}\`. Do not retry — ` +
         "leave the changes uncommitted for the user.",
     };
-  }
-
-  /**
-   * Policy-aware commit directive appended to the plan-execute handoff
-   * message. Empty string when the policy cannot be read (a config hiccup
-   * never blocks the handoff itself).
-   */
-  function commitDirectiveLine(ctx: any): string {
-    try {
-      const cwd = ctx?.cwd ?? process.cwd();
-      const mode = readCommitPolicyConfig(cwd, getAgentDir(), {
-        trusted: ctx?.isProjectTrusted?.() === true,
-      }).config.mode;
-      switch (mode) {
-        case "never":
-          return (
-            "\n\nCommit policy is 'never' (workflow.commitPolicy): do NOT run `git add`, `git commit`, or `git push`. " +
-            "Complete all steps and leave every change uncommitted for user review — the user commits manually or via /commit."
-          );
-        case "ask":
-          return (
-            "\n\nCommit policy is 'ask' (workflow.commitPolicy): you may commit after each completed step " +
-            "(`git add` + `git commit` with a concise conventional message); each `git commit`/`git push` will prompt the user for approval."
-          );
-        case "allow":
-          return (
-            "\n\nCommit policy is 'allow' (workflow.commitPolicy): do NOT run `git add`, `git commit`, or `git push` yourself — " +
-            "after each completed step the extension automatically makes exactly ONE commit containing the changes so far. " +
-            "Just finish a step, mark it done via workflow_todo, and move to the next step."
-          );
-        default:
-          return "";
-      }
-    } catch {
-      return "";
-    }
   }
 
   /**
@@ -17991,6 +16634,22 @@ export default function workflowExtension(
 
   pi.on("tool_call", async (event, ctx) => {
     const cwd = (ctx as ExtensionContext).cwd;
+    // ── Parent/child worktree exclusion ── Only one writer per worktree: the
+    // parent may inspect while a Build child starts/runs/settles, but it may
+    // not mutate the same root. The managed child is exempt, and a settled or
+    // paused child releases the parent. Uncertain shell commands are refused.
+    if (inProcessChildContext === undefined) {
+      const exclusion = parentMutationRefusal({
+        parent: true,
+        hasRun: orchestratorRun !== undefined,
+        childPhase: orchestratorChild?.state().phase,
+        toolName: event.toolName,
+        command: (event.input as any)?.command,
+      });
+      if (exclusion.refuse) {
+        return { block: true, reason: exclusion.reason } as any;
+      }
+    }
     // ── Managed worker readiness ── A worker reads its assignment first; a
     // mutation or shell call before acknowledgement is refused with a reason,
     // not silently allowed. Read-only inspection and its own TODOs stay open.
@@ -18429,13 +17088,10 @@ export default function workflowExtension(
     try {
       const guard = ensureShellGuard(ctx as ExtensionContext);
       const patch = guard.observeResult(event as any) as any;
-      noteExecutionShellQuarantine((event as any)?.input?.command);
-      noteToolFailureForExecution(event);
-      if (
-        (event as any)?.toolName === "edit" ||
-        (event as any)?.toolName === "write"
-      ) {
-        if ((event as any)?.isError !== true) clearExecutionEvidence();
+      const quarantine = guard.quarantineInfo?.();
+      if (quarantine && quarantine.reason !== lastPersistedQuarantine) {
+        lastPersistedQuarantine = quarantine.reason;
+        persistState();
       }
       return patch;
     } catch (_e) {
@@ -18449,7 +17105,6 @@ export default function workflowExtension(
   pi.on("tool_execution_end", async (event, ctx) => {
     try {
       ensureShellGuard(ctx as ExtensionContext).observeEnd(event as any);
-      noteExecutionShellQuarantine();
     } catch (_e) {
       void _e;
     }
@@ -18555,135 +17210,6 @@ export default function workflowExtension(
     }
   });
 
-  pi.on("agent_before_settle", async (event, boundaryCtx) => {
-    const state = executionState;
-    if (!state) return undefined;
-    if (workflowMode !== "build") return undefined;
-    if (event.outcome !== "completed") return undefined;
-    if (
-      state.phase === "paused" ||
-      state.phase === "blocked" ||
-      state.phase === "stopped" ||
-      state.phase === "completed"
-    ) {
-      return undefined;
-    }
-    if (state.kickoff?.status !== "acknowledged") return undefined;
-    if (awaitingDecision || pendingHandoffDecision || overlayDepth > 0) return undefined;
-    if (reviewRoundInFlight() || reviewTurnOwns(reviewTurn)) return undefined;
-    const pending = (event.context as any)?.pendingMessages;
-    if (Array.isArray(pending) && pending.length > 0) return undefined;
-    if (typeof (boundaryCtx as any)?.hasPendingMessages === "function" &&
-        (boundaryCtx as any).hasPendingMessages() === true) {
-      return undefined;
-    }
-    const boundaryMessages =
-      (event.context as any)?.llmMessages ??
-      (event.context as any)?.contextMessages ??
-      [];
-    const lastAssistant = [...(Array.isArray(boundaryMessages) ? boundaryMessages : [])]
-      .reverse()
-      .find((message: any) => message?.role === "assistant") as any;
-    if (
-      lastAssistant?.stopReason === "error" ||
-      lastAssistant?.stopReason === "aborted"
-    ) {
-      return undefined;
-    }
-    if (todos.items.length === 0 || !todos.frozen) return undefined;
-    const outcome = evaluateExecutionOutcome(state, executionRows());
-    if (outcome.kind === "complete" || outcome.kind === "complete-with-exclusions") {
-      return undefined;
-    }
-    if (outcome.kind === "paused" || outcome.kind === "stopped" || outcome.kind === "blocked") {
-      return undefined;
-    }
-    const already = (event.entries ?? []).some(
-      (entry: any) =>
-        entry?.type === "custom_message" &&
-        entry?.customType === "workflow-autorun" &&
-        entry?.details?.executionId === state.executionId &&
-        entry?.details?.epoch === state.epoch,
-    );
-    if (already) return undefined;
-    // A shell-quarantined row is still the next row we can make non-shell
-    // progress on. Only a real blocker (state.phase === "blocked") stops us.
-    const next = selectNextRow(executionRows(), state);
-    if (!next) return undefined;
-    const budget = noteExecutionBoundary();
-    if (budget.pause) {
-      const paused = applyExecutionEvent(executionState!, {
-        type: "pause",
-        executionId: executionState!.executionId,
-        epoch: executionState!.epoch,
-        reason: budget.reason ?? "no meaningful progress",
-        at: Date.now(),
-      });
-      if (paused.ok) executionState = paused.state;
-      try {
-        persistState();
-      } catch (_e) {
-        void _e;
-      }
-      try {
-        (boundaryCtx as any)?.ui?.notify?.(
-          `Build execution paused: ${budget.reason ?? "no meaningful progress"}. Resume with /build resume.`,
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
-      }
-      return {
-        entries: [
-          ...(event.entries ?? []),
-          {
-            type: "custom_message",
-            customType: "workflow-autorun-paused",
-            content: `Build execution paused after repeated barren boundaries: ${budget.reason ?? "no meaningful progress"}. No work was marked complete. Resume with /build resume; use workflow_execution status for evidence.`,
-            display: true,
-          },
-        ],
-        continue: false,
-      };
-    }
-    const nextItem = todos.items.find((item) => todoRef(item) === next.ref);
-    const remaining = todos.items.filter(
-      (item) => !isDone(item) && itemStatus(item) !== "cancelled",
-    ).length;
-    const content = state.shellQuarantine
-      ? [
-          `[EXECUTION RECOVERY — SHELL QUARANTINED]`,
-          `Execution ${state.executionId}, epoch ${state.epoch}. Do not call bash, powershell, review_bash, a child shell, or any verification adapter.`,
-          `Continue with non-shell tools: read, grep, find, ls, edit, write, and LSP diagnostics.`,
-          `Work on the non-shell parts of ref ${next.ref} or another independent pending row. Do not mark a shell-dependent row complete.`,
-          `Remaining rows: ${remaining}. If no permitted action can advance, report a structured blocker instead of waiting for the user.`,
-        ].join("\n")
-      : [
-          `[EXECUTION CONTINUE]`,
-          `Execution ${state.executionId}, epoch ${state.epoch}. The approved plan is not complete.`,
-          `Next ref ${next.ref}${nextItem ? `: ${nextItem.text}` : ""}. Remaining rows: ${remaining}.`,
-          `Continue implementing and verifying. Do not stop for a routine checkpoint or a self-assessed context limit. Mark progress immediately; never mark a row complete without its required evidence.`,
-        ].join("\n");
-    return {
-      entries: [
-        ...(event.entries ?? []),
-        {
-          type: "custom_message",
-          customType: "workflow-autorun",
-          content,
-          display: false,
-          details: {
-            executionId: state.executionId,
-            epoch: state.epoch,
-            rowRef: next.ref,
-            shellQuarantined: state.shellQuarantine !== undefined,
-          },
-        },
-      ],
-      continue: true,
-    };
-  });
-
   pi.on("agent_settled", async (_event, settledCtx) => {
     // The run is settled and the agent is idle now: release a direct-Build
     // kickoff that was queued while the chooser was still inside `agent_end`.
@@ -18777,32 +17303,6 @@ export default function workflowExtension(
   // Inject plan/build context + btw notes
   pi.on("before_agent_start", async (event, ctx) => {
     currentSessionCtx = ctx as any;
-    // A custom workflow kickoff is the first observable start acknowledgement.
-    // It does not by itself prove work advanced, but it distinguishes a
-    // delivered execution from a send that was swallowed.
-    if (
-      (event as any).messageType === "custom" &&
-      (event as any).message?.customType === "workflow-plan-execute" &&
-      executionState &&
-      executionState.kickoff?.status === "sent"
-    ) {
-      executionState = markExecutionKickoff(executionState, "acknowledged", Date.now());
-      try {
-        pi.appendEntry("workflow-execution-kickoff", {
-          at: Date.now(),
-          executionId: executionState.executionId,
-          epoch: executionState.epoch,
-          status: "acknowledged",
-        });
-      } catch (_e) {
-        void _e;
-      }
-      try {
-        persistState();
-      } catch (_e) {
-        void _e;
-      }
-    }
     // A new user prompt supersedes a queued direct-Build kickoff.
     if ((event as { messageType?: string }).messageType === "user") {
       pendingExecutionKickoff = null;
@@ -18917,12 +17417,12 @@ export default function workflowExtension(
     // so the model inferred a Plan identity from the read-only policy. This
     // message names the mission, the work-entry tool and the delegation rule.
     if (workflowMode === "orchestrator") {
-      const view = orchestratorRuntime?.view();
-      const accepted = view
-        ? view.state.order.filter((id) => view.state.tasks[id]?.state === "accepted")
-            .length
+      const run = orchestratorRun;
+      const doneRefs = completedRunRefs();
+      const done = run
+        ? run.rows.filter((row) => doneRefs.has(row.ref)).length
         : 0;
-      const total = view?.state.order.length ?? 0;
+      const total = run?.rows.length ?? 0;
       const pendingBtw = takePendingBtwNotes();
       const notes = pendingBtw.length
         ? `\n\n[BTW notes from user (address these)]:\n${pendingBtw
@@ -18930,12 +17430,12 @@ export default function workflowExtension(
             .join("\n")}`
         : "";
       const mission = buildOrchestratorMission({
-        phase: (view?.phase ?? "unbound") as OrchestratorPhase,
-        ...(view
+        phase: run?.phase ?? "unbound",
+        ...(run
           ? {
-              runId: view.runId,
-              sourceLabel: view.plan?.path ?? view.todos.source.path ?? "standalone steps",
-              taskCounts: { accepted, total },
+              runId: run.runId,
+              sourceLabel: run.planPath ?? "standalone steps",
+              taskCounts: { done, total },
             }
           : {}),
       });
@@ -18989,7 +17489,6 @@ export default function workflowExtension(
     const filtered = (event.messages as any[]).filter((m: any) => {
       if (m.customType === "workflow-build-context") return false;
       if (m.customType === "workflow-todo-context") return false;
-      if (m.customType === "workflow-execution-context") return false;
       if (m.customType === "workflow-plan-context") return isPlan;
       if (m.customType === ORCHESTRATOR_CONTEXT_ENTRY) return isOrchestrator;
       if (isPlan) return true;
@@ -19003,15 +17502,6 @@ export default function workflowExtension(
         );
       return true;
     });
-    if (executionState && workflowMode === "build") {
-      filtered.push({
-        role: "custom",
-        customType: "workflow-execution-context",
-        content: executionContextBlock(),
-        display: false,
-        timestamp: Date.now(),
-      });
-    }
     // Throttled passive reminder (Claude Code cadence) whenever a todo list
     // exists — any mode. Unresolved refs from the previous turn bypass the
     // throttle once so the model can learn the right numbers.
@@ -19052,30 +17542,6 @@ export default function workflowExtension(
     if (!isAssistantMessage(event.message as AgentMessage)) return;
     const text = getTextContent(event.message as AssistantMessage);
     const result = markCompletedRefs(text, todos.items);
-    // A [DONE:ref] tag is a claim, not evidence. Revert any newly completed
-    // row whose required checks have no runtime evidence.
-    let reverted = 0;
-    for (const item of todos.items) {
-      const ref = todoRef(item);
-      if (
-        isDone(item) &&
-        executionEvidenceRequired(ref) &&
-        !hasExecutionEvidence(ref)
-      ) {
-        setTodoStatus(item, "pending");
-        reverted += 1;
-      }
-    }
-    if (reverted > 0) {
-      try {
-        currentSessionCtx?.ui?.notify?.(
-          `${reverted} completion tag(s) were ignored: required checks have no runtime evidence. Run workflow_execution {action:"verify"} first.`,
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
-      }
-    }
     // Fallback per-step commit for steps completed via [DONE:ref] tags in the
     // response text (the workflow_todo path already committed at its
     // tool_result; the committed-ref set makes this a no-op then).
@@ -19111,7 +17577,6 @@ export default function workflowExtension(
             "pending",
             "add",
             "toggle",
-            "sync",
             "clear",
           ].includes(r.details?.action),
       );
@@ -19580,21 +18045,23 @@ export default function workflowExtension(
   ): Promise<void> {
     const routing = pendingHandoffDecision;
     if (!routing || routing.state !== "routing") return;
-    let prepared = false;
+    let delivered = false;
     try {
       if (workflowMode !== "orchestrator") {
         await switchWorkflowMode("orchestrator", ctx as any);
       }
-      const started = await startOrchestratorRun(ctx, {
-        planPath: routing.planPath,
-        planText,
-      });
-      prepared = started.ok;
-      ctx.ui.notify(started.text, started.ok ? "info" : "warning");
+      currentPlanFile = routing.planPath;
+      delivered = sendOrchestratorStartKickoff(routing.planPath, planText);
+      ctx.ui.notify(
+        delivered
+          ? "Plan approved. The model reads it and calls orchestrator_start with one row per step."
+          : "The approved plan was recorded, but the start kickoff was not delivered. Call orchestrator_start directly.",
+        delivered ? "info" : "warning",
+      );
     } catch (error: unknown) {
       await finishHandoffRoute(ctx, routing, {
         route: "orchestrator-start",
-        failure: `Orchestrator start failed: ${
+        failure: `Orchestrator entry failed: ${
           error instanceof Error ? error.message : String(error)
         }`,
         uncertain: true,
@@ -19603,7 +18070,9 @@ export default function workflowExtension(
     }
     await finishHandoffRoute(ctx, routing, {
       route: "orchestrator-start",
-      ...(prepared ? {} : { failure: "Orchestrator preparation was not started" }),
+      ...(delivered
+        ? {}
+        : { failure: "the Orchestrator start kickoff was not delivered" }),
     });
   }
 
@@ -19705,11 +18174,6 @@ export default function workflowExtension(
   function orchestratorRoot(): string {
     const cwd = (currentSessionCtx as any)?.cwd;
     return typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
-  }
-
-  function orchestratorWorkspaceKey(): string {
-    const root = path.resolve(orchestratorRoot()).replace(/\\/g, "/");
-    return process.platform === "win32" ? root.toLowerCase() : root;
   }
 
   function sessionRefFor(): string {
@@ -19973,73 +18437,6 @@ export default function workflowExtension(
    * paths since the pre-work baseline. The attempt baseline is never replaced,
    * so a repair round is still attributable.
    */
-  function workspaceSetForRun(): WorkspaceSet {
-    const frozen = orchestratorRuntime?.view()?.todos.workspaces;
-    if (frozen && frozen.length > 0) {
-      const primary = frozen.find((workspace) => workspace.primary) ?? frozen[0]!;
-      return {
-        schemaVersion: 1,
-        primaryId: primary.id,
-        roots: frozen.map((workspace) => ({ ...workspace })),
-      };
-    }
-    const root = path.resolve(orchestratorRoot());
-    return {
-      schemaVersion: 1,
-      primaryId: "W",
-      roots: [
-        {
-          id: "W",
-          key: `git:${orchestratorWorkspaceKey()}`,
-          root,
-          kind: "git",
-          displayPath: orchestratorWorkspaceKey(),
-          primary: true,
-        },
-      ],
-    };
-  }
-
-  async function diffOrchestratorWorkspace(
-    _taskId: string,
-    expectedFiles: readonly string[],
-    _workspaceIds: readonly string[],
-  ): Promise<
-    { ok: true; diff: WorkspaceSetDiff } | { ok: false; error: string }
-  > {
-    const attempt = orchestratorBaseline;
-    if (!attempt) return { ok: false, error: "no attempt baseline is bound" };
-    void expectedFiles;
-    const selected = attempt.baseline.entries.map((entry) => entry.workspaceId);
-    const captured = await captureWorkspaceSetBaseline({
-      set: attempt.set,
-      port: createLiveBaselinePort(),
-      now: Date.now(),
-      workspaceIds: selected,
-    });
-    if (!captured.ok) return { ok: false, error: captured.error };
-    const gitDiffPathsByWorkspace: Record<string, string[]> = {};
-    for (const before of attempt.baseline.entries) {
-      const after = captured.value.entries.find(
-        (entry) => entry.workspaceId === before.workspaceId,
-      );
-      if (!after || !before.baseline.head || !after.baseline.head) continue;
-      const range = readGitDiffPaths({
-        runGit: runGitSync,
-        root: after.baseline.root,
-        fromHead: before.baseline.head,
-        toHead: after.baseline.head,
-      });
-      if (!range.ok) return range;
-      gitDiffPathsByWorkspace[before.workspaceId] = range.paths;
-    }
-    const diff = diffWorkspaceSet(attempt.baseline, captured.value, {
-      gitDiffPathsByWorkspace,
-    });
-    return diff.ok ? { ok: true, diff: diff.value } : { ok: false, error: diff.error };
-  }
-
-  /** Build the automatic verify/accept/advance engine once per composition. */
   function ensureOrchestratorChildController(
     ctx: ExtensionContext,
   ): OrchestratorChildController {
@@ -20071,6 +18468,19 @@ export default function workflowExtension(
       const run = orchestratorRun;
       return { run, row: run ? runRow(run, input.ref) : undefined };
     };
+    /** The child-facing workspace: one root, with its primary flag resolved. */
+    const childWorkspace = (
+      run: OrchestratorRun,
+      workspace: { id: string; root: string } | undefined,
+    ): { id: string; root: string; primary: boolean } | undefined => {
+      if (!workspace) return undefined;
+      const primaryId = run.workspaces?.find((entry) => entry.primary)?.id;
+      return {
+        id: workspace.id,
+        root: workspace.root,
+        primary: workspace.id === primaryId,
+      };
+    };
     orchestratorChild = createOrchestratorChildController({
       desiredModel: () => builderModelPlan(),
       timeoutMs: orchestratorLimitsFor(ctx).config.childTimeoutMs,
@@ -20096,9 +18506,12 @@ export default function workflowExtension(
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
+            ...(childWorkspace(run, input.workspace)
+              ? { workspace: childWorkspace(run, input.workspace) }
+              : {}),
             createdAt: Date.now(),
           },
-          cwd: orchestratorRoot(),
+          cwd: input.cwd ?? orchestratorRoot(),
           agentDir,
           modelRef: {
             provider: plan.provider,
@@ -20133,20 +18546,10 @@ export default function workflowExtension(
           orchestratorPendingInstruction ??
           row.instruction ??
           "Implement this row, run its verification, and report back.";
-        // The child kickoff still carries the legacy row fields; this plain
-        // adapter supplies empty lists so the prompt focuses on the text and
-        // the parent's instruction.
-        const frozenRow = {
-          id: `row-${row.ref}`,
-          ref: row.ref,
-          text: `${row.text}\n\n## Parent instructions\n${instruction}`,
-          source: "steps",
-          status: "pending",
-          acceptanceChecks: [],
-          acceptanceCriteria: [],
-          expectedFiles: [],
-          workspaces: [],
-        } as any;
+        const declared = workspaceForRow(run, row);
+        const workspace =
+          input.workspace ??
+          (declared ? { id: declared.id, root: declared.root } : undefined);
         return buildOrchestratorChildKickoff({
           context: {
             version: ORCHESTRATOR_CHILD_VERSION,
@@ -20158,9 +18561,17 @@ export default function workflowExtension(
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
+            ...(childWorkspace(run, workspace)
+              ? { workspace: childWorkspace(run, workspace) }
+              : {}),
             createdAt: Date.now(),
           },
-          row: frozenRow,
+          row: {
+            ref: row.ref,
+            text: row.text,
+            instruction,
+            ...(workspace ? { workspace } : {}),
+          },
           ...(input.repair ? { repair: input.repair } : {}),
         });
       },
@@ -20257,7 +18668,7 @@ export default function workflowExtension(
       "",
       report.slice(0, 8_000),
       "",
-      "Review the report. If it is successful, mark the row done with workflow_todo and call orchestration_dispatch for the next row. If it is blocked, inspect the root cause, amend the row instruction and re-dispatch the same row.",
+      "Review the report. If the row is complete, mark it done with `workflow_todo` and call `orchestrator_dispatch` for the next row. If it is blocked, inspect the root cause, amend the row instruction and re-dispatch it with `orchestrator_retry` or `orchestrator_dispatch`. Run the plan's `## Verification` once before the last row is marked done.",
     ].join("\n");
     try {
       void (pi as any).sendMessage?.(
@@ -20271,103 +18682,6 @@ export default function workflowExtension(
     } catch {
       /* display-only */
     }
-  }
-
-  /** Dispatch the next pending frozen row into the in-process Build child. */
-  async function dispatchNextOrchestratorTask(preferredTaskId?: string): Promise<
-    | { ok: true; text: string; details: Record<string, unknown> }
-    | { ok: false; code: string; text: string }
-  > {
-    const runtime = orchestratorRuntime;
-    const view = runtime?.view();
-    const preferred =
-      preferredTaskId &&
-      view?.state.tasks[preferredTaskId]?.state === "pending"
-        ? preferredTaskId
-        : undefined;
-    const taskId = preferred ?? view?.nextTaskId;
-    if (!runtime || !view || !taskId) {
-      return { ok: false, code: "idle", text: "No dependency-ready frozen row is pending." };
-    }
-    const row = rowForTask(view.state, taskId);
-    if (!row) {
-      return { ok: false, code: "state", text: "The frozen row is missing." };
-    }
-    const owner = currentSessionCtx;
-    if (!owner) {
-      return { ok: false, code: "unavailable", text: "No live parent session." };
-    }
-    const attemptId = `${taskId}-attempt-${Date.now().toString(36)}`;
-    const sessionId = `orch-child-${attemptId}`;
-    const controller = ensureOrchestratorChildController(owner);
-    // Full child preflight (model, provider auth, extension load) BEFORE any
-    // durable transition: a failure leaves the row pending and retryable.
-    const prepared = await controller.prepare({
-      taskId,
-      attemptId,
-      ref: row.ref,
-      total: view.todos.rows.length,
-      sessionId,
-    });
-    if (!prepared.ok) {
-      return {
-        ok: false,
-        code: "preflight",
-        text: `The Build child could not start: ${prepared.error}. Nothing was journaled; fix the Builder model/auth and retry.`,
-      };
-    }
-    const workspaceSet = workspaceSetForRun();
-    const workspaceIds =
-      row.workspaces && row.workspaces.length > 0
-        ? row.workspaces
-        : workspaceSet.roots.map((workspace) => workspace.id);
-    const captured = await captureOrchestratorBaseline(
-      attemptId,
-      workspaceSet,
-      workspaceIds,
-    );
-    if (!captured.ok) {
-      controller.discardPrepared();
-      return {
-        ok: false,
-        code: "baseline",
-        text: `The workspace baseline could not be captured: ${captured.error}. The row remains pending; fix the workspace and retry.`,
-      };
-    }
-    const started = await runtime.applyEvent({
-      type: "task.start",
-      runId: view.runId,
-      now: Date.now(),
-      taskId,
-      attemptId,
-      sessionId,
-    });
-    if (!started.ok) {
-      controller.discardPrepared();
-      return {
-        ok: false,
-        code: "journal",
-        text: `The dispatch intent could not be journaled: ${started.error}`,
-      };
-    }
-    const run = await controller.start({
-      taskId,
-      attemptId,
-      ref: row.ref,
-      total: view.todos.rows.length,
-      sessionId,
-    });
-    return run.ok
-      ? {
-          ok: true,
-          text: `Dispatched ${taskId} to an in-process Build child (${row.ref}/${view.todos.rows.length}); the parent verifies on settle.`,
-          details: { runId: view.runId, taskId, attemptId },
-        }
-      : {
-          ok: false,
-          code: "child",
-          text: `The in-process Build child could not start: ${run.error}. /orchestrator retry after inspecting.`,
-        };
   }
 
   /**
@@ -20387,199 +18701,7 @@ export default function workflowExtension(
     return { ok: result.ok, stdout: result.stdout, stderr: result.stderr };
   }
 
-  function createLiveBaselinePort(): ReturnType<typeof createGitBaselinePort> {
-    return createGitBaselinePort({ runGit: runGitSync });
-  }
-
-  async function captureOrchestratorBaseline(
-    attemptId: string,
-    set: WorkspaceSet,
-    workspaceIds: readonly string[],
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (orchestratorBaseline?.attemptId === attemptId) return { ok: true };
-    const captured = await captureWorkspaceSetBaseline({
-      set,
-      port: createLiveBaselinePort(),
-      now: Date.now(),
-      workspaceIds,
-    });
-    if (!captured.ok) {
-      orchestratorBaseline = undefined;
-      return captured;
-    }
-    orchestratorBaseline = { attemptId, set, baseline: captured.value };
-    return { ok: true };
-  }
-
-  /** Shell guard/quarantine gate shared by every check surface. */
-  function checkGuardDecision(): {
-    blocked: boolean;
-    reason?: string;
-    failureClass?: "policy";
-  } {
-    if (shellGuardRuntime?.isStopped() || executionState?.shellQuarantine) {
-      return {
-        blocked: true,
-        reason:
-          "shell is quarantined; this verification command was refused instead of bypassing the guard",
-        failureClass: "policy",
-      };
-    }
-    return { blocked: false };
-  }
-
-  /**
-   * The one executor every row/final/verify check goes through. The host tool
-   * transport is preferred (shell guard, role policy, process-tree timeout and
-   * cancellation apply); the headless transport re-applies the same validation,
-   * deadline and output bounds, so it is never a silent bypass.
-   */
-  function createSessionCheckExecutor(ctx?: any) {
-    const live = ctx ?? currentSessionCtx;
-    const transport =
-      typeof live?.executeTool === "function"
-        ? createHostCheckTransport({ executeTool: live.executeTool.bind(live) })
-        : createHeadlessCheckTransport();
-    return createCheckExecutor({
-      transport,
-      // Re-read per call so a `/shell-guard limits` change applies immediately.
-      // A check deadline is the SMALLEST of the orchestrator setting, the shell
-      // guard's configured maximum and the hard cap; the setting can tighten a
-      // wait but never widen the guard.
-      limits: () => {
-        const shell = shellGuardLimitsFor(live).config;
-        const orchestrator = orchestratorLimitsFor(live).config;
-        return {
-          maxTimeoutSeconds: effectiveVerificationTimeoutSeconds(
-            orchestrator,
-            shell.maxTimeoutSeconds,
-          ),
-        };
-      },
-      guard: checkGuardDecision,
-      workspaceSet: () => workspaceSetForRun(),
-      now: () => Date.now(),
-    });
-  }
-
-  /**
-   * The executable final-gate identity of the snapshot this session would run:
-   * the bound run's frozen list when a run exists, else the direct-Build freeze.
-   */
-  function currentFinalGateHash(): { hash: string; executionId: string } | undefined {
-    const view = orchestratorRuntime?.view();
-    const frozen = view?.todos ?? todos.frozen;
-    if (!frozen) return undefined;
-    return {
-      hash: computeFinalGateSpecHash({
-        checks: finalGateCheckSpecs(frozen),
-        workspaces: frozen.workspaces,
-      }),
-      executionId: frozen.executionId,
-    };
-  }
-
-  /**
-   * A passing final gate is reused, never re-run for the same executable spec.
-   * A bound run answers from its journal (the authoritative marker); a direct
-   * Build has no journal, so its pass is remembered for this session.
-   */
-  async function finalGateAlreadyPassed(): Promise<boolean> {
-    const current = currentFinalGateHash();
-    if (!current) return false;
-    const runtime = orchestratorRuntime;
-    const view = runtime?.view();
-    if (runtime && view) {
-      // Another execution's frozen list in this session must not inherit this
-      // run's pass: only compare markers for the same frozen execution.
-      if (todos.frozen && todos.frozen.executionId !== current.executionId) {
-        return finalGatePasses.has(current.hash);
-      }
-      const status = await runtime.finalGateStatus();
-      return status.ok && status.value.satisfied;
-    }
-    return finalGatePasses.has(current.hash);
-  }
-
-  /**
-   * Durable evidence for the gate outcome. A bound run always journals it (a
-   * passing marker is required before completion); a direct Build remembers a
-   * pass in memory because it has no journal to write.
-   */
-  async function rememberFinalGate(
-    outcome: {
-      ok: boolean;
-      results?: CheckExecutionResult[];
-      failureClass?: CheckExecutionResult["failureClass"];
-      failure?: string;
-    },
-  ): Promise<{ ok: boolean; error?: string }> {
-    const runtime = orchestratorRuntime;
-    const view = runtime?.view();
-    if (runtime && view) {
-      const revisions: Record<string, string> = {};
-      for (const entry of orchestratorBaseline?.baseline.entries ?? []) {
-        revisions[entry.workspaceId] = entry.baseline.head || "head";
-      }
-      const recorded = await runtime.recordFinalGate({
-        ok: outcome.ok,
-        ...(outcome.results === undefined ? {} : { results: outcome.results }),
-        workspaceRevisions: revisions,
-        ...(outcome.failureClass === undefined
-          ? {}
-          : { failureClass: outcome.failureClass }),
-        ...(outcome.failure === undefined ? {} : { failure: outcome.failure }),
-      });
-      return recorded.ok ? { ok: true } : { ok: false, error: recorded.error };
-    }
-    const current = currentFinalGateHash();
-    if (current && outcome.ok) finalGatePasses.set(current.hash, Date.now());
-    return { ok: true };
-  }
-
-  /** Run the plan-level Verification commands once, in their workspace roots. */
-  async function runFinalPlanChecks(): Promise<{
-    ok: boolean;
-    failure?: string;
-    repairable?: boolean;
-    failureClass?: CheckExecutionResult["failureClass"];
-    results?: CheckExecutionResult[];
-  }> {
-    const view = orchestratorRuntime?.view();
-    const frozen = view?.todos ?? todos.frozen;
-    const set = view ? workspaceSetForRun() : undefined;
-    const specs = executablePlanCheckSpecs(frozen);
-    const validation = validatePlanCheckSpecs(specs, set?.roots);
-    if (!validation.ok) {
-      return {
-        ok: false,
-        failure: `final plan check metadata invalid: ${validation.error}`,
-        failureClass: "metadata",
-        repairable: false,
-      };
-    }
-    const executor = createSessionCheckExecutor(currentSessionCtx);
-    const outcome = await executor.executeMany(
-      specs,
-      set ? { set } : undefined,
-      currentSessionCtx?.signal ? { signal: currentSessionCtx.signal } : undefined,
-    );
-    const failed = outcome.results.find((result) => !result.ok);
-    if (!failed) return { ok: true, results: outcome.results };
-    return {
-      ok: false,
-      failure: `${failed.failureClass === "metadata" ? "final plan check metadata invalid" : "final plan check failed"}: ${failed.command.slice(0, 200)}: ${
-        failed.message.slice(0, 500) || "non-zero exit"
-      }`,
-      failureClass: failed.failureClass,
-      // A metadata/policy/environment failure must block, not repair.
-      repairable: failed.repairable,
-      results: outcome.results,
-    };
-  }
-
   function resetOrchestratorComposition(): void {
-    orchestratorBaseline = undefined;
     // A rebind/shutdown must not leave a repaint interval behind: it would
     // write into a session that no longer exists.
     try {
@@ -20625,11 +18747,44 @@ export default function workflowExtension(
    * mode switch. Nothing is dispatched here.
    */
   /** Freeze the approved plan (or the agreed steps) and dispatch row 1. */
+  /**
+   * One model kickoff for an approved plan. The extension no longer creates a
+   * run without steps: it records the plan and asks the model to read it and
+   * call orchestrator_start with one row per step and the declared workspaces.
+   */
+  function sendOrchestratorStartKickoff(
+    planPath: string,
+    planText?: string,
+  ): boolean {
+    const send = (pi as any).sendMessage;
+    if (typeof send !== "function") return false;
+    const content = [
+      "[ORCHESTRATOR START]",
+      `The approved plan is ${planPath}.`,
+      "Read it, then call orchestrator_start with one step per plan row and the workspaces it declares. A step names its workspace only when it targets a non-primary root.",
+      "Do not edit the plan. Then dispatch row 1 with orchestrator_dispatch.",
+      ...(planText ? ["", "Plan:", planText.slice(0, 20_000)] : []),
+    ].join("\n");
+    try {
+      void send(
+        {
+          customType: "workflow-orchestrator-start",
+          content,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function startOrchestratorWork(
     ctx: ExtensionContext,
     rest: string,
   ): Promise<{ ok: boolean; text: string }> {
-    if (orchestratorRuntime?.view()) {
+    if (orchestratorRun) {
       return {
         ok: false,
         text: "A run is already bound; use /orchestrator status, then retry after fixing the blocker.",
@@ -20655,144 +18810,18 @@ export default function workflowExtension(
       });
       return { ok: started.ok, text: started.text };
     }
-    const started = await startOrchestratorRun(ctx, {
-      planPath: path.resolve(orchestratorRoot(), rest),
-    });
-    return { ok: started.ok, text: started.text };
-  }
-
-  function ensureOrchestratorRuntime(ctx: ExtensionContext): OrchestratorRuntime {
-    if (orchestratorRuntime) return orchestratorRuntime;
-    const io = createNodeJournalIo();
-    const runsRoot = path.join(getAgentDir(), "orchestrator", "runs");
-    orchestratorRuntime = createOrchestratorRuntime({
-      createJournal: (runId) =>
-        createRunJournal({ dir: path.join(runsRoot, runId), runId, io }),
-      listRunIds: async () => {
-        try {
-          const entries = await fs.promises.readdir(runsRoot, { withFileTypes: true });
-          return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-        } catch (_e) {
-          void _e;
-          return [];
-        }
-      },
-      readPlan: async (planPath) => await fs.promises.readFile(planPath, "utf8"),
-      notify: (message, level) => ctx.ui.notify(message, level),
-      appendEntry: (type, data) => pi.appendEntry(type, data),
-    });
-    return orchestratorRuntime;
-  }
-
-  /**
-   * Rebind the deterministic run for the current plan after a reload. This
-   * never dispatches and never compiles or freezes a plan again: it binds the
-   * saved journal by its approved plan path (or journaled source path), so a
-   * restore failure is reported precisely instead of leaving the session
-   * silently unbound.
-   */
-  async function restoreOrchestratorRun(
-    ctx: ExtensionContext,
-  ): Promise<{ ok: true } | { ok: false; error: string; noRun: boolean }> {
-    if (orchestratorRuntime?.view()) return { ok: true };
-    const planPath =
-      currentPlanFile ??
-      todos.planPath ??
-      (todos.frozen?.source.kind === "plan"
-        ? todos.frozen.source.path
-        : undefined);
-    if (!planPath) {
-      return {
-        ok: false,
-        error: "no approved plan path is recorded for this session",
-        // Nothing was saved to reattach; this is the ordinary "no run yet"
-        // case, not a swallowed restore failure.
-        noRun: true,
-      };
-    }
-    // Rebind the plan target to the saved run's approved plan. This is the
-    // path persisted with the freeze, not a newly compiled plan.
-    if (!currentPlanFile) currentPlanFile = planPath;
-    const runtime = ensureOrchestratorRuntime(ctx);
-    // An unreadable plan file must not strand an intact journal: omit the text
-    // and let the runtime rebind by the journaled source path.
-    let planText: string | undefined;
-    try {
-      planText = await fs.promises.readFile(planPath, "utf8");
-    } catch (_e) {
-      void _e;
-      planText = undefined;
-    }
-    const restored = await runtime.restoreFromPlan({
-      planPath,
-      ...(planText === undefined ? {} : { planText }),
-    });
-    if (!restored.ok) {
-      orchestratorRestoreError = `${restored.code}: ${restored.error}`;
-      // No journal simply means this plan never started a run; that is not a
-      // failure and must not warn on every ordinary reload.
-      const noRun = /no run journal exists for this plan/i.test(restored.error);
-      if (!noRun) {
-        try {
-          ctx.ui.notify(
-            `Orchestrator run was not restored: ${orchestratorRestoreError}. The saved journal is unchanged; /orchestrator status retries the approved plan reattach.`,
-            "warning",
-          );
-        } catch (_e) {
-          void _e;
-        }
-      }
-      return { ok: false, error: orchestratorRestoreError, noRun };
-    }
-    orchestratorRestoreError = undefined;
-    const placed = todos.freeze(restored.value.frozen);
-    if (!placed.ok) {
-      orchestratorRestoreError = `the restored run's TODO list could not be adopted: ${placed.error}`;
-      try {
-        ctx.ui.notify(
-          `Orchestrator run ${restored.value.runId} was restored, but its frozen TODO list could not be adopted: ${placed.error}.`,
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
-      }
-    }
-    // A reload cannot keep an in-process child. A `running` row is blocked
-    // instead of replayed or silently restarted; the run pauses so the user
-    // decides whether to retry with a fresh child.
-    const view = runtime.view();
-    const running = view?.state.order.find(
-      (id) => view.state.tasks[id]?.state === "running",
-    );
-    if (view && running) {
-      await runtime.applyEvent({
-        type: "task.block",
-        runId: view.runId,
-        now: Date.now(),
-        taskId: running,
-        reason: "the in-process Build child did not survive the reload",
-      });
-      const afterBlock = runtime.view();
-      if (afterBlock && afterBlock.phase !== "paused") {
-        await runtime.applyEvent({
-          type: "run.transition",
-          runId: afterBlock.runId,
-          now: Date.now(),
-          to: "paused",
-        });
-      }
-      try {
-        ctx.ui.notify(
-          `Orchestrator run ${view.runId} restored: ${running} was running when the session reloaded. It is blocked so nothing replayed; /orchestrator retry starts a fresh child.`,
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
-      }
-    }
-    if (placed.ok) persistState();
-    updateStatus(ctx);
-    return { ok: true };
+    // A plan path is not a step list: record it and hand the row extraction to
+    // the model instead of creating an empty run.
+    const planPath = path.resolve(orchestratorRoot(), rest);
+    currentPlanFile = planPath;
+    persistState();
+    const delivered = sendOrchestratorStartKickoff(planPath);
+    return {
+      ok: delivered,
+      text: delivered
+        ? `Plan ${planPath} recorded. The model will read it and call orchestrator_start with one row per step.`
+        : `Plan ${planPath} recorded, but the start kickoff was not delivered. Call orchestrator_start directly with the plan's steps.`,
+    };
   }
 
   async function ensureOrchestratorOperator(
@@ -20800,8 +18829,13 @@ export default function workflowExtension(
   ): Promise<ReturnType<typeof createOperatorRuntime>> {
     if (orchestratorOperator) return orchestratorOperator;
     orchestratorOperator = createOperatorRuntime({
-      runtime: () => orchestratorRuntime,
-      now: () => Date.now(),
+      run: () => orchestratorRun,
+      todos: () =>
+        todos.snapshot().items.map((item) => ({
+          ref: item.ref ?? String(item.step),
+          text: item.text,
+          completed: item.status === "completed" || item.completed === true,
+        })),
       child: () => {
         const state = orchestratorChild?.state();
         if (!state || state.phase === "idle" || state.phase === "disposed") {
@@ -20855,25 +18889,13 @@ export default function workflowExtension(
         updateStatusIfBound();
         persistState();
       },
-      diff: async (taskId) => {
-        const view = orchestratorRuntime?.view();
-        const row = view ? rowForTask(view.state, taskId) : undefined;
-        const measured = await diffOrchestratorWorkspace(
-          taskId,
-          row?.expectedFiles ?? [],
-          row?.workspaces ?? [],
-        );
-        return measured.ok
-          ? {
-              committedPaths: measured.diff.committedPaths,
-              dirtyPaths: measured.diff.dirtyPaths,
-            }
-          : undefined;
+      setPhase: (phase) => {
+        if (!orchestratorRun) return;
+        orchestratorRun = setRunPhase(orchestratorRun, phase);
+        persistState();
+        updateStatusIfBound();
       },
-      dispatchRow: async (taskId) => {
-        const dispatched = await dispatchNextOrchestratorTask(taskId);
-        return { ok: dispatched.ok, text: dispatched.text };
-      },
+      retry: (rowRef) => retryOrchestratorRow(rowRef),
     });
     void ctx;
     return orchestratorOperator;
@@ -21269,8 +19291,6 @@ export default function workflowExtension(
       (event.toolName === "write" || event.toolName === "edit") &&
       !event.isError
     ) {
-      // Any source mutation invalidates runtime row evidence.
-      clearExecutionEvidence();
       const input = (event.input ?? {}) as any;
       const p = input.path || input.file_path || "";
       if (!p) return;
@@ -21474,41 +19494,6 @@ export default function workflowExtension(
           return;
         }
       }
-      // Plan-file reconciliation (all modes): a `- [x]` tick in the plan file
-      // counts as progress even if the model never called the tool. Merging is
-      // status-aware (never un-completes); agent-added items survive.
-      try {
-        const planCandidate = todos.planPath ?? currentPlanFile;
-        if (!todos.frozen && planCandidate && todos.items.length > 0) {
-          const abs = path.isAbsolute(planCandidate)
-            ? planCandidate
-            : path.join((ctx as any).cwd, planCandidate);
-          if (fs.existsSync(abs)) {
-            const planText = fs.readFileSync(abs, "utf8");
-            const key = planReconcileKey(abs, planText);
-            if (key !== lastReconcileKey) {
-              lastReconcileKey = key;
-              const planExtracted = extractPlanStepsFromMarkdown(planText);
-              if (planExtracted.length > 0) {
-                const before = todos.items.filter((t) => isDone(t)).length;
-                const merged = mergeTodoItems(todos.items, planExtracted, {
-                  excludedPlanStepIds: todos.excludedPlanSteps,
-                });
-                todos.items = merged.items;
-                todos.revision += 1;
-                const after = todos.items.filter((t) => isDone(t)).length;
-                if (after > before || merged.preserved > 0) {
-                  updateStatus(ctx as any);
-                  persistState();
-                }
-                if (after > before) onTodoWrite();
-              }
-            }
-          }
-        }
-      } catch (_e) {
-        void _e;
-      }
       // Stale notice (any mode): the run mutated files but recorded no todo
       // progress. No forced turns — surface it once (30 s dedupe) + ⚠ marker.
       try {
@@ -21543,97 +19528,23 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
-      // Build completion. A green card is a verified terminal claim, never a
-      // summary or an all-cancelled list.
+      // Build completion: every non-cancelled TODO row is done. There is no
+      // final gate here — the model runs the plan's `## Verification` as an
+      // ordinary command, and the card reflects only TODO state.
       if (workflowMode === "build" && todos.items.length > 0) {
-        const allCompleted = todos.items.every((item) => isDone(item));
-        const outcome = executionState
-          ? evaluateExecutionOutcome(executionState, executionRows())
-          : allCompleted
-            ? ({ kind: "complete", completedRefs: todos.items.map((i) => todoRef(i)) } as const)
-            : undefined;
-        const verified =
-          outcome?.kind === "complete" ||
-          outcome?.kind === "complete-with-exclusions";
-        if (
-          verified &&
-          (executionState || (todos.frozen?.planChecks.length ?? 0) > 0)
-        ) {
-          // The same executable spec must not be gated twice: the advance
-          // path journals a marker, and this branch reuses it instead of
-          // re-running the frozen commands (the incident's second call path).
-          const alreadyPassed = await finalGateAlreadyPassed();
-          const final: Awaited<ReturnType<typeof runFinalPlanChecks>> = alreadyPassed
-            ? { ok: true }
-            : await runFinalPlanChecks();
-          if (!final.ok) {
-            // A failing marker is audit evidence; the block below stands even
-            // when it cannot be written.
-            await rememberFinalGate({
-              ok: false,
-              ...(final.results === undefined ? {} : { results: final.results }),
-              ...(final.failureClass === undefined
-                ? {}
-                : { failureClass: final.failureClass }),
-              ...(final.failure === undefined ? {} : { failure: final.failure }),
-            });
-            if (executionState) {
-              const blocked = applyExecutionEvent(executionState, {
-                type: "block",
-                executionId: executionState.executionId,
-                epoch: executionState.epoch,
-                blocker: {
-                  category: "verification",
-                  reason: `final plan check failed: ${final.failure ?? "unknown"}`,
-                  at: Date.now(),
-                },
-                at: Date.now(),
-              });
-              if (blocked.ok) executionState = blocked.state;
-            }
-            persistState();
-            updateStatus(ctx as any);
-            ctx.ui.notify(
-              `Build not complete: final plan check failed (${final.failure ?? "unknown"}). The run is blocked, not green.`,
-              "warning",
-            );
-            return;
-          }
-          // Completion is a verified terminal claim: a bound orchestrator run
-          // requires this durable marker, and a direct Build remembers the pass
-          // so the other call path cannot re-run the same checks.
-          const recorded = await rememberFinalGate({
-            ok: true,
-            ...(final.results === undefined ? {} : { results: final.results }),
-          });
-          if (!recorded.ok) {
-            persistState();
-            updateStatus(ctx as any);
-            ctx.ui.notify(
-              `Build not complete: the final gate passed but its marker could not be journaled (${recorded.error}). The run is not green.`,
-              "warning",
-            );
-            return;
-          }
-          if (executionState) {
-            executionState = {
-              ...executionState,
-              phase: "completed",
-              updatedAt: Date.now(),
-            };
-          }
-          persistState();
-        }
-        if (verified) {
+        const remaining = todos.items.filter(
+          (item) => !isDone(item) && itemStatus(item) !== "cancelled",
+        ).length;
+        const doneCount = todos.items.filter((item) => isDone(item)).length;
+        if (remaining === 0 && doneCount > 0) {
           const signature = todoCompletionSignature(todos.items);
           if (signature !== todos.completedSignature) {
             todos.completedSignature = signature;
-            const excluded = outcome?.kind === "complete-with-exclusions";
             try {
               (pi as any).sendMessage?.(
                 {
                   customType: "workflow-complete",
-                  content: `${excluded ? "**Build Complete with exclusions!**" : "**Build Complete! ✓**"}\n\n${todos.items.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
+                  content: `**Build Complete! \u2713**\n\n${todos.items.map((t) => `~~${todoRef(t)}. ${t.text}~~`).join("\n")}`,
                   display: true,
                 },
                 { triggerTurn: false },
@@ -21645,14 +19556,8 @@ export default function workflowExtension(
           todoStale = false;
           updateStatus(ctx as any);
           persistState();
-        } else {
-          if (todos.completedSignature !== null) todos.completedSignature = null;
-          if (executionState?.shellQuarantine && allCompleted) {
-            ctx.ui.notify(
-              "Build remains blocked/unverified: shell is quarantined and a required final check could not run. No completion card was emitted.",
-              "warning",
-            );
-          }
+        } else if (todos.completedSignature !== null) {
+          todos.completedSignature = null;
         }
         return;
       }
@@ -21671,66 +19576,19 @@ export default function workflowExtension(
       const planCandidate: string | undefined =
         planWritePathThisRun ?? undefined;
       if (!planCandidate) return; // the per-run gate above should have caught this
-      let planExtracted: TodoItem[] = [];
       let planAbs: string | undefined;
-      let planTextForReconcile = "";
-      if (planCandidate) {
-        try {
-          const abs = path.isAbsolute(planCandidate)
-            ? planCandidate
-            : path.join((ctx as any).cwd, planCandidate);
-          const planText = fs.readFileSync(abs, "utf8");
-          planAbs = abs;
-          planTextForReconcile = planText;
-          planExtracted = extractPlanStepsFromMarkdown(planText);
-        } catch (_e) {
-          void _e;
-        }
+      try {
+        const abs = path.isAbsolute(planCandidate)
+          ? planCandidate
+          : path.join((ctx as any).cwd, planCandidate);
+        if (fs.existsSync(abs)) planAbs = abs;
+      } catch (_e) {
+        void _e;
       }
-      const planKey =
-        planAbs && planTextForReconcile
-          ? planReconcileKey(planAbs, planTextForReconcile)
-          : undefined;
-      const samePlan = (() => {
-        try {
-          return (
-            !!todos.planPath &&
-            !!planCandidate &&
-            path.resolve(todos.planPath) === path.resolve(planCandidate)
-          );
-        } catch {
-          return todos.planPath === planCandidate;
-        }
-      })();
-      if (planExtracted.length > 0) {
-        if (samePlan) {
-          // Skip when the earlier all-modes reconciliation already merged this
-          // exact plan content; a `- [x]` tick changes the key and re-merges.
-          if (!(planKey && planKey === lastReconcileKey)) {
-            if (planKey) lastReconcileKey = planKey;
-            todos.items = mergeTodoItems(todos.items, planExtracted, {
-              excludedPlanStepIds: todos.excludedPlanSteps,
-            }).items;
-          }
-        } else {
-          todos.items = ensureTodoLabels(planExtracted);
-          if (planCandidate) todos.planPath = planCandidate;
-        }
-      } else if (!samePlan) {
-        // A new plan file with no parsable steps must not inherit the previous
-        // task's todos; the synthesis block below fills a single title step.
-        todos.items = [];
-        if (planCandidate) todos.planPath = planCandidate;
-      } else if (todos.items.length === 0 && lastAssistant) {
-        try {
-          const chat = extractTodoItems(
-            getTextContent(lastAssistant as AssistantMessage),
-          );
-          if (chat.length > 0) todos.items = ensureTodoLabels(chat);
-        } catch (_e) {
-          void _e;
-        }
-      }
+      // No plan parsing or merging here: the model owns the TODO list and no
+      // code reads plan markdown to complete or replace rows. The synthesis
+      // block below still creates one visible step when the list is empty.
+      todos.planPath = planCandidate;
       // No session-branch recovery: only this run's plan write is eligible.
       // If still zero but the run's plan file exists, synthesize a single todo
       // from its title so the handoff still appears.
@@ -21850,22 +19708,9 @@ export default function workflowExtension(
       // the numbered todo steps before any prompt renders.
       const applyGatedResult = (finalText: string, authorPlan: string) => {
         if (planHash(finalText) === planHash(authorPlan)) return;
+        // The reviewer only updates the rendered plan text. The model owns the
+        // TODO list; nothing parses or merges plan markdown here.
         planTextForRender = finalText;
-        try {
-          const steps = extractPlanStepsFromMarkdown(finalText);
-          if (steps.length > 0) {
-            todos.items =
-              todos.items.length > 0
-                ? mergeTodoItems(todos.items, steps, {
-                    excludedPlanStepIds: todos.excludedPlanSteps,
-                  }).items
-                : ensureTodoLabels(steps);
-            updateStatus(ctx as any);
-            persistState();
-          }
-        } catch (_e) {
-          void _e;
-        }
       };
       const reviewThisCycle = reviewEnabled() || manualReviewCycle;
       // True only when the reviewer block below actually ran. The handoff

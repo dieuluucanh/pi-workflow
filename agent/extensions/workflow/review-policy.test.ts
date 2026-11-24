@@ -17,7 +17,7 @@ import {
   executionOwnsSession,
   type ReviewerAdmissionInput,
 } from "./review-policy.ts";
-import { RUN_PHASES, type RunPhase } from "./orchestrator-types.ts";
+import type { OrchestratorRunPhase } from "./orchestrator-run.ts";
 
 const PLAN_AUTO: ReviewerAdmissionInput = {
   trigger: "auto",
@@ -134,7 +134,7 @@ test("review policy: executing child and run phases own the session", () => {
   for (const childPhase of ["idle", "disposed"] as const) {
     assert.equal(executionOwnsSession({ childPhase }), false);
   }
-  for (const runPhase of ["ready", "completed", "failed", "cancelled"] as const) {
+  for (const runPhase of ["idle", "paused", "interrupted", "completed", "cancelled"] as const) {
     assert.equal(executionOwnsSession({ runPhase }), false);
   }
 });
@@ -159,22 +159,19 @@ test("mode transition: leaving Orchestrator while a run executes is refused", ()
       assert.equal(res.ok, false, `${target}/${childPhase}`);
     }
   }
-  // Terminal/ready runs release the session.
-  for (const runPhase of ["ready", "completed", "failed", "cancelled"] as const) {
+  // Terminal/paused runs release the session.
+  for (const runPhase of ["idle", "paused", "interrupted", "completed", "cancelled"] as const) {
     assert.deepEqual(
       admitModeTransition({
         target: "plan",
         currentMode: "orchestrator",
-        runPhase: runPhase as RunPhase,
+        runPhase: runPhase as OrchestratorRunPhase,
       }),
       { ok: true },
     );
   }
-  // Untouched terminal phases are a complete set check against the engine.
-  assert.deepEqual(
-    [...RUN_PHASES].sort(),
-    ["blocked", "cancelled", "completed", "failed", "paused", "ready", "running"],
-  );
+  // Only a live dispatch owns the session between rows.
+  assert.deepEqual([...EXECUTING_RUN_PHASES], ["running"]);
 });
 
 test("mode transition: children cannot switch; managed bootstrap is exempt", () => {

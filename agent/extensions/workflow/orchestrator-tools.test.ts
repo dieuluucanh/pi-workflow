@@ -1,125 +1,98 @@
 /**
- * Parent tool surface tests (Orchestrator simplification, steps 10/20).
+ * Parent tool descriptor tests.
  *
- * The model sees three tools (start, status, retry). Verification, acceptance
- * and repair are automatic and have no model-facing tool.
+ * The model sees exactly four tools (start, dispatch, status, retry). There is
+ * no acceptance tool: the parent marks a row done through workflow_todo.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_STEPS,
   ORCHESTRATOR_TOOL_NAMES,
   ORCHESTRATOR_TOOLS,
-  handleOrchestratorTool,
+  TOOLS_SCHEMA_VERSION,
 } from "./orchestrator-tools.ts";
-import { applyRunEvent, createRunState, type RunState } from "./orchestrator-state.ts";
-import { createFrozenTodosFromSteps } from "./todo-snapshot.ts";
+import { normalizeToolSteps } from "./orchestrator-tool-runtime.ts";
 
-function state(): RunState {
-  const frozen = createFrozenTodosFromSteps({
-    title: "tools",
-    steps: ["first", "second"],
-    mode: "orchestrator",
-    now: 1,
-  });
-  assert.equal(frozen.ok, true);
-  if (!frozen.ok) throw new Error((frozen as { error: string }).error);
-  const created = createRunState({ runId: "run-1", todos: frozen.snapshot, now: 1_000 });
-  assert.equal(created.ok, true);
-  if (!created.ok) throw new Error((created as { error: string }).error);
-  return created.state;
-}
-
-function running(): RunState {
-  const base = state();
-  const started = applyRunEvent(base, {
-    type: "task.start",
-    runId: "run-1",
-    expectedRevision: base.revision,
-    now: 1_001,
-    taskId: "task-1",
-    attemptId: "a1",
-    sessionId: "s-1",
-  });
-  assert.equal(started.ok, true);
-  if (!started.ok) throw new Error((started as { error: string }).error);
-  return started.state;
-}
-
-function candidate(): RunState {
-  const base = running();
-  const reported = applyRunEvent(base, {
-    type: "task.report",
-    runId: "run-1",
-    expectedRevision: base.revision,
-    now: 1_002,
-    taskId: "task-1",
-    reportId: "report-1",
-  });
-  assert.equal(reported.ok, true);
-  if (!reported.ok) throw new Error((reported as { error: string }).error);
-  return reported.state;
-}
-
-const ctx = (currentState: RunState, evidence?: Map<string, { taskId: string; evidenceId: string; workspaceRevision: string }>) => ({
-  state: currentState,
-  now: 2,
-  epoch: 1,
-  currentEpoch: 1,
-  ...(evidence === undefined ? {} : { evidence }),
-});
-
-test("the model-facing surface is start, dispatch, status and retry", () => {
+test("the parent tool surface is exactly the four model tools", () => {
   assert.deepEqual([...ORCHESTRATOR_TOOL_NAMES], [
     "orchestrator_start",
     "orchestrator_dispatch",
     "orchestrator_status",
     "orchestrator_retry",
   ]);
-  assert.equal(ORCHESTRATOR_TOOLS.length, 4);
-  assert.equal(
-    ORCHESTRATOR_TOOLS.some((spec) =>
-      /propose|prepare|preview|verify|accept|repair/.test(spec.name),
-    ),
-    false,
+  assert.deepEqual(
+    ORCHESTRATOR_TOOLS.map((tool) => tool.name),
+    [...ORCHESTRATOR_TOOL_NAMES],
   );
+  assert.equal(TOOLS_SCHEMA_VERSION, 2);
 });
 
-test("status reports phase, counts and the next frozen row", () => {
-  const result = handleOrchestratorTool("orchestrator_status", {}, ctx(candidate()));
-  assert.equal(result.ok, true);
-  if (!result.ok) return;
-  assert.equal(result.receipt.kind, "status");
-  assert.match(result.receipt.summary, /ready|running/);
-  assert.equal(result.receipt.counts?.total, 2);
-  assert.equal(result.receipt.nextTaskId, "task-2");
-  assert.equal(result.receipt.rows?.length, 2);
+test("every descriptor is bounded, closed and has a description", () => {
+  for (const tool of ORCHESTRATOR_TOOLS) {
+    assert.equal(tool.bounded, true, tool.name);
+    assert.ok(tool.description.trim().length > 0, tool.name);
+    assert.equal(tool.parameters.type, "object", tool.name);
+    assert.equal(tool.parameters.additionalProperties, false, tool.name);
+    assert.ok(!/frozen row|acceptance checks|expected files/i.test(tool.description), tool.name);
+  }
 });
 
-test("retry only applies to a blocked or repaired row", () => {
-  const idle = handleOrchestratorTool("orchestrator_retry", {}, ctx(candidate()));
-  assert.equal(idle.ok, false);
-
-  const base = state();
-  const blocked = applyRunEvent(base, {
-    type: "task.block",
-    runId: "run-1",
-    expectedRevision: base.revision,
-    now: 1_003,
-    taskId: "task-1",
-    reason: "check failed",
-  });
-  assert.equal(blocked.ok, true);
-  if (!blocked.ok) return;
-  const retry = handleOrchestratorTool("orchestrator_retry", {}, ctx(blocked.state));
-  assert.equal(retry.ok, true);
-  if (!retry.ok) return;
-  assert.equal(retry.event?.type, "task.retry");
-  assert.equal(retry.receipt.taskId, "task-1");
+test("start advertises workspaces and the string-or-object step union", () => {
+  const start = ORCHESTRATOR_TOOLS.find((tool) => tool.name === "orchestrator_start");
+  assert.ok(start);
+  const steps = start.parameters.properties.steps as {
+    items: { oneOf: Array<{ type: string; properties?: Record<string, unknown> }> };
+  };
+  assert.deepEqual(
+    steps.items.oneOf.map((entry) => entry.type),
+    ["string", "object"],
+  );
+  assert.ok(steps.items.oneOf[1]?.properties?.text);
+  assert.ok(steps.items.oneOf[1]?.properties?.workspace);
+  const workspaces = start.parameters.properties.workspaces as {
+    items: { required: string[] };
+  };
+  assert.deepEqual(workspaces.items.required, ["path"]);
+  assert.match(String(start.description), /one step per plan row/i);
 });
 
-test("start is handled by the extension service, never the pure tool layer", () => {
-  const result = handleOrchestratorTool("orchestrator_start", {}, ctx(state()));
-  assert.equal(result.ok, false);
+test("dispatch advertises rowRef, instructions and a declared cwd", () => {
+  const dispatch = ORCHESTRATOR_TOOLS.find((tool) => tool.name === "orchestrator_dispatch");
+  assert.ok(dispatch);
+  const cwd = dispatch.parameters.properties.cwd as { description: string };
+  assert.match(cwd.description, /declared workspace id or an absolute root/i);
+  assert.deepEqual(dispatch.parameters.required, ["instructions"]);
+});
+
+test("retry names a row and its stored instruction, never a frozen task", () => {
+  const retry = ORCHESTRATOR_TOOLS.find((tool) => tool.name === "orchestrator_retry");
+  assert.ok(retry);
+  assert.ok(retry.parameters.properties.rowRef);
+  assert.equal(retry.parameters.properties.taskId, undefined);
+  assert.match(retry.description, /stored instruction/i);
+  assert.doesNotMatch(retry.description, /frozen/i);
+});
+
+test("normalizeToolSteps accepts strings and {text, workspace}", () => {
+  assert.deepEqual(
+    normalizeToolSteps([
+      "  First   step ",
+      { text: "Second step", workspace: " B " },
+      { text: "   " },
+      "   ",
+      42,
+      null,
+    ]),
+    ["First step", { text: "Second step", workspace: "B" }],
+  );
+  assert.equal(normalizeToolSteps("nope"), undefined);
+  assert.equal(normalizeToolSteps([]), undefined);
+});
+
+test("normalizeToolSteps bounds a large step list", () => {
+  const many = Array.from({ length: MAX_STEPS + 5 }, (_, index) => `step ${index}`);
+  assert.equal(normalizeToolSteps(many)?.length, MAX_STEPS);
 });

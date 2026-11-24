@@ -7,7 +7,7 @@
  * time, so this module is intentionally one small, dependency-free contract.
  *
  * Implementations:
- *   - production: `orchestrator-adapters.ts` (`createNodeClock`)
+ *   - production: `workspace-node.ts` (`createNodeWorkspaceResolver`)
  *   - tests:      `test-support-ports.ts` (`makeFakeClock`)
  */
 
@@ -18,10 +18,13 @@
  * `Date.now()`/bare `setTimeout()` in decision code would make timeout tests
  * slow and non-deterministic.
  */
+/** Opaque timer handle: a Node timer object or a numeric fake-clock id. */
+export type ClockTimeoutHandle = number | NodeJS.Timeout;
+
 export interface ClockPort {
   /** Milliseconds since the Unix epoch. */
   now(): number;
   /** Runs `callback` once after `ms`; returns an opaque handle. */
-  setTimeout(callback: () => void, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
+  setTimeout(callback: () => void, ms: number): ClockTimeoutHandle;
+  clearTimeout(handle: ClockTimeoutHandle): void;
 }

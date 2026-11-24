@@ -1,236 +1,168 @@
 /**
- * Parent tool adapter behavior.
+ * Parent tool adapter tests.
  *
- * The surface is start/status/retry. Acceptance is automatic, so these tests
- * pin: start delegates, status is read-only, retry re-queues the exact row and
- * dispatches it through the in-process child dispatcher, and a dispatch failure
- * is reported honestly.
+ * These pin the thin layer between the four descriptors and the extension
+ * services: input normalization, the stored-instruction retry, and the
+ * eligibility refusals. No SDK or terminal is involved.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  TOOL_ADAPTER_SCHEMA_VERSION,
   createParentToolRuntime,
   type ParentToolPorts,
 } from "./orchestrator-tool-runtime.ts";
 import {
-  applyRunEvent,
-  createRunState,
-  type RunEvent,
-  type RunState,
-} from "./orchestrator-state.ts";
-import { createFrozenTodosFromSteps } from "./todo-snapshot.ts";
-import type { OrchestratorRuntime, RuntimeView } from "./orchestrator-runtime.ts";
-import type { JournalEvent, JournalEventType } from "./orchestrator-store.ts";
+  createOrchestratorRun,
+  recordDispatch,
+  type OrchestratorRun,
+} from "./orchestrator-run.ts";
 
-function frozen() {
-  const built = createFrozenTodosFromSteps({
-    title: "dispatch",
+function boundRun(): OrchestratorRun {
+  const created = createOrchestratorRun({
+    title: "tools",
     steps: ["first", "second"],
-    mode: "orchestrator",
     now: 1,
   });
-  assert.equal(built.ok, true);
-  if (!built.ok) throw new Error((built as { error: string }).error);
-  return built.snapshot;
+  const dispatched = recordDispatch(created, {
+    rowRef: "1",
+    instruction: "Do the first thing, then report.",
+  });
+  void dispatched;
+  return created;
 }
 
-function fakeRuntime(initial?: RunState) {
-  const created = createRunState({ runId: "run-1", todos: frozen(), now: 1_000 });
-  assert.equal(created.ok, true);
-  if (!created.ok) throw new Error((created as { error: string }).error);
-  let state = initial ?? created.state;
-  const events: string[] = [];
-  const applyEvent = async (
-    event: Parameters<OrchestratorRuntime["applyEvent"]>[0],
-  ) => {
-    const result = applyRunEvent(state, {
-      ...(event as RunEvent),
-      expectedRevision: state.revision,
-    } as RunEvent);
-    if (!result.ok) return { ok: false, code: "state" as const, error: result.error };
-    state = result.state;
-    events.push(event.type);
-    return { ok: true as const, value: { revision: state.revision, view: view() } };
-  };
-  const view = (): RuntimeView => ({
-    runId: state.runId,
-    phase: state.phase,
-    todos: state.todos,
-    ...(state.plan === undefined ? {} : { plan: state.plan }),
-    ...(state.order.find((id) => state.tasks[id]?.state === "pending") === undefined
-      ? {}
-      : {
-          nextTaskId: state.order.find(
-            (id) => state.tasks[id]?.state === "pending",
-          ),
-        }),
-    state,
-  });
-  const runtime = {
-    view,
-    applyEvent,
-    appendJournal: async (type: JournalEventType) => {
-      events.push(type);
-      return { ok: true as const, value: undefined };
+function harness(overrides: Partial<ParentToolPorts> = {}) {
+  const calls: Record<string, unknown> = {};
+  const run = boundRun();
+  const ports: ParentToolPorts = {
+    run: () => run,
+    statusText: () => "run idle",
+    dispatch: async (input) => {
+      calls.dispatch = input;
+      return { ok: true, text: `dispatched ${input.rowRef ?? "?"}`, details: {} };
     },
-    journalEvents: async () => ({
-      ok: true as const,
-      value: [] as JournalEvent[],
-    }),
-    restore: async () => ({ ok: true as const, value: view() }),
-    startFromPlan: async () => ({
-      ok: false as const,
-      code: "state" as const,
-      error: "unused",
-    }),
-    startFromSteps: async () => ({
-      ok: false as const,
-      code: "state" as const,
-      error: "unused",
-    }),
-    restoreFromPlan: async () => ({
-      ok: false as const,
-      code: "state" as const,
-      error: "unused",
-    }),
-    cancel: async () => ({ ok: true as const, value: { view: view() } }),
-    complete: async () => ({ ok: true as const, value: { view: view() } }),
-  } as unknown as OrchestratorRuntime;
-  return { runtime, events, getState: () => state };
-}
-
-function ports(options: {
-  runtime: OrchestratorRuntime;
-  dispatchNext?: ParentToolPorts["dispatchNext"];
-  start?: ParentToolPorts["start"];
-}): ParentToolPorts {
-  return {
-    runtime: () => options.runtime,
-    epoch: () => 1,
-    now: () => 2_000,
-    ...(options.start === undefined ? {} : { start: options.start }),
-    ...(options.dispatchNext === undefined
-      ? {}
-      : { dispatchNext: options.dispatchNext }),
+    start: async (input) => {
+      calls.start = input;
+      return { ok: true, text: "started", details: { rows: input.steps?.length ?? 0 } };
+    },
+    ...overrides,
   };
+  return { runtime: createParentToolRuntime(ports), calls, run };
 }
 
-test("start delegates to the extension start service", async () => {
-  const fake = fakeRuntime();
-  const calls: Array<Record<string, unknown>> = [];
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: fake.runtime,
-      start: async (input) => {
-        calls.push({ ...input });
-        return { ok: true, text: "started", details: { runId: "run-1" } };
-      },
-    }),
-  );
-  const outcome = await tools.call("orchestrator_start", {
-    title: "standalone",
-    steps: ["one"],
+test("the adapter schema version tracks the changed surface", () => {
+  assert.equal(TOOL_ADAPTER_SCHEMA_VERSION, 3);
+});
+
+test("start forwards the step union and workspace declarations", async () => {
+  const { runtime, calls } = harness();
+  const result = await runtime.call("orchestrator_start", {
+    title: "Two repos",
+    planPath: ".pi/plans/x.md",
+    steps: ["Root step", { text: "Other step", workspace: "B" }, "  "],
+    workspaces: [{ id: "B", path: "C:/repo/other" }, { path: "./" }, { path: " " }],
   });
-  assert.equal(outcome.ok, true);
-  assert.deepEqual(calls, [{ title: "standalone", steps: ["one"] }]);
-  assert.equal(fake.events.length, 0, "start does not apply a raw reducer event");
-});
-
-test("status is read-only and reports the next row", async () => {
-  const fake = fakeRuntime();
-  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
-  const outcome = await tools.call("orchestrator_status", {});
-  assert.equal(outcome.ok, true);
-  assert.match(outcome.text, /ready/);
-  assert.equal((outcome.details as { nextTaskId?: string }).nextTaskId, "task-1");
-  assert.equal(fake.events.length, 0);
-});
-
-test("retry re-queues the blocked row and dispatches it immediately", async () => {
-  const fake = fakeRuntime();
-  const blocked = applyRunEvent(fake.getState(), {
-    type: "task.block",
-    runId: "run-1",
-    expectedRevision: fake.getState().revision,
-    now: 1_100,
-    taskId: "task-1",
-    reason: "check failed",
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.start, {
+    title: "Two repos",
+    planPath: ".pi/plans/x.md",
+    steps: ["Root step", { text: "Other step", workspace: "B" }],
+    workspaces: [{ id: "B", path: "C:/repo/other" }, { path: "./" }],
   });
-  assert.equal(blocked.ok, true);
-  if (!blocked.ok) return;
-  const next = fakeRuntime(blocked.state);
-  const dispatched: string[] = [];
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: next.runtime,
-      dispatchNext: async (taskId) => {
-        dispatched.push(taskId);
-        return { ok: true, text: "child started", details: {} };
-      },
-    }),
-  );
-  const outcome = await tools.call("orchestrator_retry", {});
-  assert.equal(outcome.ok, true);
-  assert.deepEqual(dispatched, ["task-1"]);
-  assert.equal(next.getState().tasks["task-1"]!.state, "pending");
-  assert.deepEqual(next.events, ["task.retry"]);
 });
 
-test("retry refuses when no row is blocked or repaired", async () => {
-  const fake = fakeRuntime();
-  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
-  const outcome = await tools.call("orchestrator_retry", {});
-  assert.equal(outcome.ok, false);
-  assert.match(outcome.text, /no blocked or repaired row/i);
-  assert.equal(fake.events.length, 0);
+test("start is refused when starting is unavailable", async () => {
+  const { runtime, calls } = harness({ startEligible: () => "enter Orchestrator mode first" });
+  const result = await runtime.call("orchestrator_start", { steps: ["one"] });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.text, /enter Orchestrator mode first/);
+  assert.equal(calls.start, undefined);
 });
 
-test("retry reports a failed dispatch without hiding the re-queue", async () => {
-  const fake = fakeRuntime();
-  const blocked = applyRunEvent(fake.getState(), {
-    type: "task.block",
-    runId: "run-1",
-    expectedRevision: fake.getState().revision,
-    now: 1_100,
-    taskId: "task-1",
-    reason: "check failed",
+test("status reads the run record text and needs no child", async () => {
+  const { runtime } = harness({ statusText: () => "run idle · 0/2 rows done" });
+  const result = await runtime.call("orchestrator_status", {});
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.match(result.text, /0\/2 rows done/);
+  assert.deepEqual(result.details, {});
+});
+
+test("status is refused when this session may not orchestrate", async () => {
+  const { runtime } = harness({ eligible: () => "Orchestration tools are available in Orchestrator mode only." });
+  const result = await runtime.call("orchestrator_status", {});
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.text, /Orchestrator mode only/);
+});
+
+test("dispatch requires instructions and forwards them with the row", async () => {
+  const { runtime, calls } = harness();
+  const missing = await runtime.call("orchestrator_dispatch", {});
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.code, "invalid");
+
+  const result = await runtime.call("orchestrator_dispatch", {
+    rowRef: "2",
+    instructions: "Implement row two.",
+    cwd: "B",
   });
-  assert.equal(blocked.ok, true);
-  if (!blocked.ok) return;
-  const next = fakeRuntime(blocked.state);
-  const tools = createParentToolRuntime(
-    ports({
-      runtime: next.runtime,
-      dispatchNext: async () => ({
-        ok: false,
-        code: "child",
-        text: "no Builder model",
-      }),
-    }),
-  );
-  const outcome = await tools.call("orchestrator_retry", {});
-  assert.equal(outcome.ok, false);
-  assert.equal((outcome as { code: string }).code, "child");
-  assert.match(outcome.text, /no Builder model/);
-  assert.equal(next.getState().tasks["task-1"]!.state, "pending");
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.dispatch, {
+    rowRef: "2",
+    instructions: "Implement row two.",
+    cwd: "B",
+  });
 });
 
-test("register exposes start, dispatch, status and retry", async () => {
-  const fake = fakeRuntime();
-  const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
-  const names: string[] = [];
-  const registered = tools.register({
+test("retry re-dispatches the current row with its stored instruction", async () => {
+  const run = recordDispatch(boundRun(), {
+    rowRef: "1",
+    instruction: "Stored instruction for row one.",
+  });
+  const { runtime, calls } = harness({ run: () => run });
+  const result = await runtime.call("orchestrator_retry", {});
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.dispatch, {
+    rowRef: "1",
+    instructions: "Stored instruction for row one.",
+  });
+});
+
+test("retry of a named row falls back to the row text when no instruction is stored", async () => {
+  const { runtime, calls } = harness();
+  const result = await runtime.call("orchestrator_retry", { rowRef: "2" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.dispatch, { rowRef: "2", instructions: "second" });
+});
+
+test("retry accepts the legacy task-<ref> form and an explicit instruction", async () => {
+  const { runtime, calls } = harness();
+  const result = await runtime.call("orchestrator_retry", {
+    taskId: "task-2",
+    instructions: "Amended instruction.",
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.dispatch, { rowRef: "2", instructions: "Amended instruction." });
+});
+
+test("registration exposes exactly the four descriptors", () => {
+  const { runtime } = harness();
+  const registered: string[] = [];
+  const outcome = runtime.register({
     registerTool: (definition) => {
-      names.push(definition.name);
+      registered.push(definition.name);
+      assert.equal(definition.parameters.type, "object");
     },
   });
-  assert.deepEqual(registered.registered, [
+  assert.deepEqual(registered, [
     "orchestrator_start",
-    "orchestrator_status",
     "orchestrator_dispatch",
+    "orchestrator_status",
     "orchestrator_retry",
   ]);
-  assert.deepEqual(names, registered.registered);
+  assert.deepEqual(outcome.registered, registered);
+  assert.equal(outcome.refused, null);
 });

@@ -29,18 +29,24 @@ External packages listed in `agent/settings.json` auto-install on first trusted 
 
 ### Orchestrator (experimental)
 
-`@dieulc/workflow` also contains the opt-in Orchestrator engine: a durable run
-journal, one cooperative workspace writer, normal visible Build child sessions,
-evidence-backed parent acceptance, scoped repair, context rollover, a final
-integration gate and parent-only commits. Generic Desktop contributions and
-related-session hosting are exercised by two unrelated fixture extensions — no
-Workflow names are needed in the host.
+`@dieulc/workflow` also contains the opt-in Orchestrator dispatcher: the parent
+reads the approved plan, binds one row per step with `orchestrator_start`
+(including the declared repository roots), and dispatches one in-process Build
+child per row with that row’s root as `cwd`. The child owns its TODO list and
+verification; the parent trusts its report, marks the row done with
+`workflow_todo` and dispatches the next. A blocked report wakes the parent to
+inspect and amend the instruction. Verification is ordinary bash whose real
+output is visible — there is no journal, frozen snapshot, diff gate, repair
+round, final gate or `workflow_execution` tool. A reload restores the run
+record as `interrupted`; old runs are not resumed.
 
 Mode entry alone never launches work, existing Plan → Review → Build remains the
 default, and a managed child can never auto-commit, push or accept its own work.
-The engine is **experimental and not yet wired into a live orchestration loop**;
-see [`docs/orchestrator-live-acceptance.md`](docs/orchestrator-live-acceptance.md)
-for the automated evidence and the live signoff that has **not** been run.
+The dispatcher is **experimental**: real provider turns and visible-terminal
+acceptance still need a human run (see
+[`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md) and
+the verification record in
+[`docs/verification-2026-11-24-legacy-engine-deletion.md`](docs/verification-2026-11-24-legacy-engine-deletion.md)).
 
 > This repo root is **not** a Pi package and is not published (`"private": true`). Install the extensions individually, or clone the repo for the dotfiles.
 
@@ -64,7 +70,7 @@ Revocation stops future disclosure — it cannot recall provider data already
 sent. A conflict is never overwritten; the original draft stays recoverable.
 Pi Desktop can bundle a pinned Workflow artifact with explicit
 override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
-checkout. Tested against Workflow **0.13.0** + Pi SDK **1.5.0**; semantic quality
+checkout. Tested against Workflow **0.14.0** + Pi SDK **1.5.0**; semantic quality
 and live desktop/Terminal acceptance remain human-verified, not inferred from
 unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
 and the Pi Desktop
@@ -82,7 +88,7 @@ pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
 # pinned, for reproducible installs
-pi install npm:@dieulc/workflow@0.13.0
+pi install npm:@dieulc/workflow@0.14.0
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
