@@ -141,9 +141,12 @@ short Plan → Review → Build work keeps its current behavior.
 - **Command-only child interaction.** `/orchestrator-pause|resume|abort|view`
   (and the `/orchestrator` verbs) control the child. `/orchestrator-view`
   switches BOTH the pinned panel (parent roadmap ↔ the child's local TODO list)
-  and the footer's child line: `child`/`auto` show the child's live model,
-  context %, tokens and elapsed time, `parent` shows the run/next row plus a
-  compact child hint. It never changes prompt routing.
+  and the footer's child line: `child`/`auto` show `child <phase> · <model> ·
+  ctx <n>% (used/window) · ↑in ↓out · mm:ss`, `parent` shows the run/next row
+  plus a counter-free `child <phase>` hint. The row pointer and the child's own
+  todo counter belong to the pinned TODO pane, so neither line repeats them;
+  `/orchestrator status|view` still names the row in its multi-line report. It
+  never changes prompt routing.
 - **Frozen final-check repair.** A malformed frozen `planChecks` list can be
   amended without rewriting the journal: `/orchestrator-repair-checks` shows the
   current → proposed checks, confirms, and appends one durable
@@ -153,10 +156,16 @@ short Plan → Review → Build work keeps its current behavior.
   `scripts/repair-orchestrator-checks.mjs` does the same out of session with
   `--dry-run`/`--apply --yes` and `--expect-seq`/`--expect-accepted` fences.
 - **Working/Paused on the composer itself.** The composer's top border shows the
-  in-process Builder's activity in Parent, Child AND Auto views: `Working ·
-  Builder n/m · <tool>` with `ESC or /orchestrator-pause to pause ·
-  /orchestrator-abort to stop`, then `Paused · … · /orchestrator-resume to
-  continue`. Esc pauses only while the child owns the composer; every repeat
+  in-process Builder's activity in Parent, Child AND Auto views: `Working · ESC
+  or /orchestrator-pause to pause · /orchestrator-abort to stop`, then
+  `Paused · /orchestrator-resume to continue · /orchestrator-abort to stop`,
+  `Pausing…`, `Verifying`, `Starting…` and `Waiting · answer the dialog`. The
+  border carries the phase and the controls **only**: the latest tool/command and
+  the `Builder n/m` row pointer are deliberately absent, because a tool label can
+  be 100 characters long and used to push the state out of the border. Progress
+  stays in the pinned TODO pane, tool lines stay in the transcript band, and
+  model/context/tokens/elapsed stay in the footer. Esc pauses only while the
+  child owns the composer; every repeat
   press while pausing/paused/verifying is consumed, so it can never become an
   abort. A completion menu and a focused dialog keep their own Esc. A foreign
   editor gets the same line as a fallback widget without the Esc hint.

@@ -29,6 +29,16 @@ import {
   planHash,
 } from "./review.ts";
 import { todoListKey } from "./todo-panel.ts";
+import { createNodeJournalIo } from "./orchestrator-adapters.ts";
+import {
+  buildCheckSpecRepair,
+  checkSpecRepairEventId,
+} from "./orchestrator-check-repair.ts";
+import { createRunJournal } from "./orchestrator-store.ts";
+import {
+  createFrozenTodosFromSteps,
+  type FrozenTodoSnapshot,
+} from "./todo-snapshot.ts";
 import type { TodoItem } from "./utils.ts";
 import {
   ORIGINAL_PLAN,
@@ -6814,16 +6824,22 @@ test("OC1: Parent and Child views share the Working border; Esc only pauses", as
     assert.ok(editor, "the Workflow editor owns the composer");
     const render = (): string => editor.renderTopBorder(160, 0);
 
-    const working = await waitForComposer(render, /Working · Builder 1\/1/);
-    assert.match(working, /Working · Builder 1\/1/);
-    assert.match(working, /ESC or \/orchestrator-pause to pause/);
+    const working = await waitForComposer(
+      render,
+      /Working · ESC or \/orchestrator-pause to pause/,
+    );
+    assert.match(working, /Working · ESC or \/orchestrator-pause to pause/);
     assert.match(working, /\/orchestrator-abort to stop/);
+    // The border names the phase and the controls only: no row progress, no
+    // latest-command echo (the pinned TODO pane and the transcript own those).
+    assert.doesNotMatch(working, /Builder/);
+    assert.doesNotMatch(working, /\d+\/\d+/);
 
     // Parent / Child / Auto are a display toggle, never a different composer.
     await b.pi.commands["orchestrator-view"].handler("child", b.ctx);
-    assert.match(render(), /Working · Builder 1\/1/);
+    assert.match(render(), /Working · ESC or \/orchestrator-pause to pause/);
     await b.pi.commands["orchestrator-view"].handler("parent", b.ctx);
-    assert.match(render(), /Working · Builder 1\/1/);
+    assert.match(render(), /Working · ESC or \/orchestrator-pause to pause/);
 
     let nativeEsc = 0;
     editor.onEscape = () => {
@@ -6835,9 +6851,12 @@ test("OC1: Parent and Child views share the Working border; Esc only pauses", as
     editor.handleInput("\x1b");
     editor.handleInput("\x1b");
     editor.handleInput("\x1b");
-    const paused = await waitForComposer(render, /Paused · Builder 1\/1/);
-    assert.match(paused, /Paused · Builder 1\/1/);
-    assert.match(paused, /\/orchestrator-resume to continue/);
+    const paused = await waitForComposer(
+      render,
+      /Paused · \/orchestrator-resume to continue/,
+    );
+    assert.match(paused, /Paused · \/orchestrator-resume to continue/);
+    assert.match(paused, /\/orchestrator-abort to stop/);
     assert.equal(nativeEsc, 0, "Esc never reached the host abort handler");
     assert.equal(b.aborts(), 0, "the parent turn was not aborted");
     assert.equal(child.created[0]?.disposeCalls, 0, "the warm child was kept");
@@ -6847,6 +6866,57 @@ test("OC1: Parent and Child views share the Working border; Esc only pauses", as
     assert.equal(render(), afterBurst, "repeat Esc is inert while paused");
     assert.equal(nativeEsc, 0);
     assert.equal(child.created[0]?.disposeCalls, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OC3: a long tool command never reaches the border; the footer keeps telemetry", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oc3.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    const editor = b.createEditor() as any;
+    assert.ok(editor, "the Workflow editor owns the composer");
+    const render = (): string => editor.renderTopBorder(160, 0);
+    const session = child.created[0];
+    assert.ok(session, "the child was created");
+    // Publish child stats, then the exact shape that used to dominate the
+    // border: a bash command with a long argument list.
+    session.emit({ type: "entry_appended" });
+    session.emit({
+      type: "tool_execution_start",
+      toolCallId: "c-long",
+      toolName: "bash",
+      args: { command: "npm test -- --watch --runInBand --reporter=verbose" },
+    });
+
+    const working = await waitForComposer(
+      render,
+      /Working · ESC or \/orchestrator-pause to pause/,
+    );
+    for (const needle of ["npm", "--watch", "--runInBand", "Builder"]) {
+      assert.equal(working.includes(needle), false, `border leaked ${needle}`);
+    }
+    assert.doesNotMatch(working, /\d+\/\d+/);
+
+    // The footer keeps what the border no longer shows, and still has no
+    // progress counters (the pinned TODO pane owns them).
+    const footer = latestStatus(b.statusCalls, "workflow-orchestrator") ?? "";
+    assert.match(footer, /^child running · /);
+    assert.match(footer, /ctx 15%/);
+    assert.doesNotMatch(footer, /todos/);
+    assert.doesNotMatch(footer, /child 1\/1/);
+
+    // The transcript still records the tool call itself.
+    const bandText = b.pi.entries
+      .filter((entry) => entry.type === "workflow-orchestrator-child-transcript")
+      .map((entry) => JSON.stringify(entry.data))
+      .join("\n");
+    assert.match(bandText, /npm test -- --watch --runInBand/);
   } finally {
     await b.cleanup();
   }
@@ -6874,9 +6944,12 @@ test("OC2: a foreign editor gets the fallback line; shutdown clears it", async (
     );
     const last = activityCalls.at(-1);
     assert.ok(Array.isArray(last?.value), "the fallback widget was mounted");
-    assert.match(String((last!.value as string[])[0]), /Working · Builder 1\/1/);
+    const fallback = String((last!.value as string[])[0]);
+    assert.match(fallback, /Working · \/orchestrator-pause to pause/);
+    assert.match(fallback, /\/orchestrator-abort to stop/);
+    assert.doesNotMatch(fallback, /Builder|\d+\/\d+/);
     // Without the focused editor there must be no false Esc promise.
-    assert.doesNotMatch(String((last!.value as string[])[0]), /ESC/);
+    assert.doesNotMatch(fallback, /ESC/);
 
     await b.cleanup();
     cleaned = true;
@@ -7085,6 +7158,188 @@ test("RC5: repair refuses a running run and an invalid manifest", async () => {
 
     await b.pi.commands["orchestrator-repair-checks"].handler("--bogus", b.ctx);
     assert.match(lastRepairNotice(b), /Unknown argument "--bogus"/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── Host reload/reattach regression (2026-11-21 MISA incident) ───────
+
+const HOST_INCIDENT_CHECKS = [
+  "pnpm dev:preflight`, followed by controlled `npm run dev` smoke on the repaired local demo.",
+  "pnpm typecheck`, `pnpm lint`, `pnpm format:check`, `pnpm test`, golden comparisons at the repository's exact tolerance.",
+  "pnpm check` (the existing 19-gate chain), plus `check:docs-reference`, `check:docs-glossary` and focused generated-snapshot checks where applicable.",
+  "pnpm db:test:invariants`, `pnpm db:test:ledger-tamper`, `pnpm db:verify-ledger` and migration/backfill/restore rehearsal on disposable databases only.",
+  "pnpm docs:build` and `pnpm check:release` as diagnostics: report pending release/human gates honestly.",
+];
+
+const HOST_SIX_GATES = [
+  "pnpm typecheck",
+  "pnpm lint",
+  "pnpm format:check",
+  "pnpm check:docs-reference",
+  "pnpm check:docs-glossary",
+  "pnpm check",
+];
+
+function hostIncidentSnapshot(root: string): FrozenTodoSnapshot {
+  const frozen = createFrozenTodosFromSteps({
+    title: "Host reload incident",
+    steps: ["Only frozen row"],
+    mode: "orchestrator",
+    workspaces: [
+      {
+        id: "W",
+        key: `git:${root.replace(/\\/g, "/").toLowerCase()}`,
+        root,
+        kind: "git",
+        displayPath: root,
+        primary: true,
+      },
+    ],
+  });
+  assert.equal(frozen.ok, true, frozen.ok ? "" : frozen.error);
+  if (!frozen.ok) throw new Error("unreachable");
+  return {
+    ...frozen.snapshot,
+    planChecks: [...HOST_INCIDENT_CHECKS],
+    planCheckSpecs: HOST_INCIDENT_CHECKS.map((command) => ({ command })),
+  };
+}
+
+async function seedHostRun(
+  agentDir: string,
+  runId: string,
+  planPath: string,
+  snapshot: FrozenTodoSnapshot,
+  stale: boolean,
+): Promise<void> {
+  const io = createNodeJournalIo();
+  const journal = createRunJournal({
+    dir: path.join(agentDir, "orchestrator", "runs", runId),
+    runId,
+    io,
+  });
+  let at = 100;
+  const append = async (type: string, payload: unknown, eventId: string) => {
+    const appended = await journal.append({
+      type: type as never,
+      payload,
+      eventId,
+      at: (at += 1),
+    });
+    assert.equal(appended.ok, true, appended.ok ? "" : appended.error);
+  };
+  await append(
+    "run.created",
+    {
+      sourcePath: planPath,
+      digest: snapshot.source.digest,
+      title: snapshot.source.title,
+      mode: snapshot.mode,
+      plan: { path: planPath, title: snapshot.source.title, digest: snapshot.source.digest },
+      rowCount: snapshot.rows.length,
+    },
+    `created-${runId}`,
+  );
+  await append(
+    "todos.frozen",
+    {
+      executionId: snapshot.executionId,
+      digest: snapshot.source.digest,
+      snapshot,
+    },
+    `frozen-${runId}`,
+  );
+  const built = buildCheckSpecRepair({
+    executionId: snapshot.executionId,
+    snapshot,
+    specs: HOST_SIX_GATES.map((command) => ({ command, workspace: "W" })),
+    reason: "replace the five malformed prose checks with the six approved gates",
+    source: "host reload regression",
+    approvedAt: 1_795_501_506_477,
+  });
+  assert.equal(built.ok, true, built.ok ? "" : built.error);
+  if (!built.ok) throw new Error("unreachable");
+  const payload = stale
+    ? { ...built.value, previous: { planChecks: ["pnpm test"], planCheckSpecs: [] } }
+    : built.value;
+  await append(
+    "run.control",
+    payload,
+    stale ? "repair-stale" : checkSpecRepairEventId(built.value),
+  );
+}
+
+function hostReloadContext(
+  b: Awaited<ReturnType<typeof boot>>,
+  planPath: string,
+  snapshot: FrozenTodoSnapshot,
+) {
+  return makeFakeCtx({
+    cwd: b.cwd,
+    hasUI: true,
+    branch: [
+      {
+        type: "custom",
+        customType: "workflow",
+        data: {
+          mode: "orchestrator",
+          enabled: false,
+          executing: false,
+          todos: [],
+          planFile: planPath,
+          todoFrozen: snapshot,
+        },
+      },
+    ],
+  });
+}
+
+test("OR-R1: a reload reattaches the saved v1 run by approved plan path (host path)", async () => {
+  const b = await boot({ hasUI: true, executionMode: "orchestrator" });
+  try {
+    const plan = placePlan(b.cwd, "or-r1.md");
+    const snapshot = hostIncidentSnapshot(b.cwd);
+    const runId = "run-or-r1-incident";
+    await seedHostRun(b.agentDir, runId, plan.abs, snapshot, false);
+    const reload = hostReloadContext(b, plan.abs, snapshot);
+    await b.pi.emit("session_start", { reason: "reload" }, reload.ctx);
+
+    assert.equal(
+      reload.notifies.some((entry) => /was not restored/.test(entry.message)),
+      false,
+      "the reload must not swallow a restore failure",
+    );
+    await b.pi.commands.orchestrator.handler("status", reload.ctx);
+    const status = String(reload.notifies.at(-1)?.message ?? "");
+    assert.match(status, new RegExp(`run ${runId}`));
+    assert.match(status, /0\/1 accepted|1\/1 accepted/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OR-R2: a swallowed restore failure is reported and status retries precisely", async () => {
+  const b = await boot({ hasUI: true, executionMode: "orchestrator" });
+  try {
+    const plan = placePlan(b.cwd, "or-r2.md");
+    const snapshot = hostIncidentSnapshot(b.cwd);
+    const runId = "run-or-r2-stale";
+    await seedHostRun(b.agentDir, runId, plan.abs, snapshot, true);
+    const reload = hostReloadContext(b, plan.abs, snapshot);
+    await b.pi.emit("session_start", { reason: "reload" }, reload.ctx);
+
+    const restoreWarning = reload.notifies.find((entry) =>
+      /was not restored/.test(entry.message),
+    );
+    assert.ok(restoreWarning, "the precise restore failure is surfaced");
+    assert.match(restoreWarning!.message, /stale_previous|previous checks do not match/);
+
+    await b.pi.commands.orchestrator.handler("status", reload.ctx);
+    const status = String(reload.notifies.at(-1)?.message ?? "");
+    assert.match(status, /could not be reattached/);
+    assert.match(status, /stale_previous|previous checks do not match/);
   } finally {
     await b.cleanup();
   }

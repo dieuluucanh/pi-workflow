@@ -7,6 +7,21 @@
  * pure: it decides text and Esc ownership only. The editor owns rendering and
  * the host wiring owns lifecycle.
  *
+ * What the border may say, and why it is narrow:
+ *
+ *   - the phase word (`Working`, `Paused`, `Verifying`, …) and the controls;
+ *   - NOT the latest tool/command. `lastTool` is a tool name plus an excerpt of
+ *     its key argument (up to 100 chars for `bash`/`edit`), which pushed the
+ *     line to ~190 columns and displaced the state on a normal terminal. The
+ *     tool stream already lives in the child transcript band;
+ *   - NOT the frozen-row counter (`Builder n/m`) or the child's own `n/m
+ *     todos`. The pinned TODO pane owns progress, and the footer
+ *     (`workflow-orchestrator`) owns the telemetry (model, context, tokens,
+ *     elapsed).
+ *
+ * The accepted input type is narrowed to the three fields this projection uses,
+ * so re-introducing either echo requires widening it on purpose.
+ *
  * Every line names the control the user can actually run in that phase. A warm
  * pause is resumed with `/orchestrator-resume`; a disposed child needs
  * `/orchestrator retry`. `/orchestrator-retry` does not exist.
@@ -23,19 +38,16 @@ export interface OrchestratorActivityInput {
   /** Durable run phase, when a run is bound. */
   runPhase?: string;
   blockedReason?: string;
-  /** Live child snapshot; `undefined` when no child owns execution. */
+  /**
+   * Live child snapshot; `undefined` when no child owns execution.
+   *
+   * Deliberately narrow: phase plus the two transient flags the copy needs.
+   * The border must not have access to the tool label or the row counters.
+   */
   child?:
-    | (Pick<
-        OrchestratorChildState,
-        | "phase"
-        | "ref"
-        | "total"
-        | "lastTool"
-        | "taskId"
-        | "attemptId"
-        | "pausePending"
-        | "retrying"
-      > & { lastError?: string })
+    | (Pick<OrchestratorChildState, "phase" | "pausePending" | "retrying"> & {
+        lastError?: string;
+      })
     | undefined;
   /** A forwarded child permission dialog is waiting for the user. */
   awaitingDialog?: boolean;
@@ -63,16 +75,10 @@ export interface OrchestratorActivity {
 
 const PAUSE_CMD = "/orchestrator-pause to pause";
 const PAUSE_HINT_ESC = "ESC or /orchestrator-pause to pause";
+const PAUSE_COMPACT_ESC = "Working · ESC to pause";
+const PAUSE_COMPACT_CMD = "Working · /orchestrator-pause";
 const RESUME_CMD = "/orchestrator-resume to continue";
 const ABORT_CMD = "/orchestrator-abort to stop";
-
-function builderName(
-  child: NonNullable<OrchestratorActivityInput["child"]>,
-): string {
-  return child.ref && child.total
-    ? `Builder ${child.ref}/${child.total}`
-    : "Builder";
-}
 
 function childLive(phase: OrchestratorChildPhase | undefined): boolean {
   return (
@@ -119,37 +125,40 @@ export function orchestratorActivity(
   const phase = child?.phase;
   const escAvailable = input.escAvailable === true;
   const pauseHint = escAvailable ? PAUSE_HINT_ESC : PAUSE_CMD;
+  const pauseCompact = escAvailable ? PAUSE_COMPACT_ESC : PAUSE_COMPACT_CMD;
 
   if (child && childLive(phase)) {
-    const name = builderName(child);
     if (phase === "starting") {
       return {
-        line: `Starting ${name}… · ${pauseHint} · ${ABORT_CMD}`,
-        compact: `Starting ${name}…`,
+        line: `Starting… · ${pauseHint} · ${ABORT_CMD}`,
+        compact: "Starting…",
         busy: true,
         paused: false,
         esc: orchestratorEscAction(input),
       };
     }
     if (phase === "running") {
-      const retry = child.retrying === true;
       if (input.awaitingDialog === true) {
         return {
-          line: `Waiting · ${name} · answer the dialog · ${ABORT_CMD}`,
-          compact: `Waiting · ${name}`,
+          line: `Waiting · answer the dialog · ${ABORT_CMD}`,
+          compact: "Waiting · answer the dialog",
           busy: true,
           paused: false,
           esc: "swallow",
         };
       }
-      const detail = retry
-        ? "retrying…"
-        : child.lastTool
-          ? child.lastTool
-          : "";
+      if (child.retrying === true) {
+        return {
+          line: `Working · retrying… · ${pauseHint} · ${ABORT_CMD}`,
+          compact: "Working · retrying…",
+          busy: true,
+          paused: false,
+          esc: "pause",
+        };
+      }
       return {
-        line: `Working · ${name}${detail ? ` · ${detail}` : ""} · ${pauseHint} · ${ABORT_CMD}`,
-        compact: `Working · ${name}${detail ? ` · ${detail}` : ""}`,
+        line: `Working · ${pauseHint} · ${ABORT_CMD}`,
+        compact: pauseCompact,
         busy: true,
         paused: false,
         esc: "pause",
@@ -158,16 +167,16 @@ export function orchestratorActivity(
     if (phase === "paused") {
       if (child.pausePending === true) {
         return {
-          line: `Pausing ${name}… · ${ABORT_CMD}`,
-          compact: `Pausing ${name}…`,
+          line: `Pausing… · ${ABORT_CMD}`,
+          compact: "Pausing…",
           busy: false,
           paused: false,
           esc: "swallow",
         };
       }
       return {
-        line: `Paused · ${name} · ${RESUME_CMD} · ${ABORT_CMD}`,
-        compact: `Paused · ${name}`,
+        line: `Paused · ${RESUME_CMD} · ${ABORT_CMD}`,
+        compact: "Paused · /orchestrator-resume",
         busy: false,
         paused: true,
         esc: "swallow",
@@ -175,8 +184,8 @@ export function orchestratorActivity(
     }
     // settling / verifying
     return {
-      line: `Verifying · ${name} · ${ABORT_CMD}`,
-      compact: `Verifying · ${name}`,
+      line: `Verifying · ${ABORT_CMD}`,
+      compact: "Verifying",
       busy: false,
       paused: false,
       esc: "swallow",

@@ -49,7 +49,9 @@ import {
   type FinalGatePayload,
 } from "./final-gate.ts";
 import {
+  FROZEN_V1_SCHEMA_VERSION,
   frozenExecutionToTodoSnapshot,
+  frozenSnapshotVersionOf,
   readFrozenSnapshot,
   type FrozenExecutionSnapshot,
 } from "./frozen-snapshot.ts";
@@ -577,10 +579,44 @@ export function createOrchestratorRuntime(
           `the run journal has no frozen TODO snapshot (seq ${frozenEvent.seq})`,
         );
       }
+      // Amendment replay is a *historical* boundary, not an executable one.
+      //
+      // A v1 snapshot stores its plan checks as opaque bytes. Upcasting first
+      // would quarantine the malformed historical checks and present the next
+      // amendment with an empty predecessor, so a valid amendment recorded
+      // against the frozen list looks stale and the run becomes unbound. Apply
+      // the recorded amendments to the stored bytes as data (never executed),
+      // then let the one reader derive the executable snapshot from the
+      // amended list. The raw journal line is never rewritten.
+      const storedSnapshot = frozenPayload.snapshot;
+      let snapshotForRead: unknown = storedSnapshot;
+      let amendmentsAppliedToStoredData = false;
+      if (frozenSnapshotVersionOf(storedSnapshot) === FROZEN_V1_SCHEMA_VERSION) {
+        for (const event of events) {
+          const payload = event.payload;
+          if (!isRecord(payload)) continue;
+          if (event.type !== "run.control") continue;
+          if (payload.action !== CHECK_SPEC_REPAIR_ACTION) continue;
+          // SAFETY: `applyCheckSpecRepair` validates the payload and only
+          // reads executionId/rows/workspaces/planChecks from the snapshot.
+          const amended = applyCheckSpecRepair(
+            snapshotForRead as unknown as FrozenTodoSnapshot,
+            payload,
+          );
+          if (!amended.ok) {
+            return fail(
+              "state",
+              `journal replay failed at ${event.type} seq ${event.seq}: ${amended.error}`,
+            );
+          }
+          snapshotForRead = amended.value.snapshot;
+          amendmentsAppliedToStoredData = true;
+        }
+      }
       // Read v1 or v2 through the one reader: new journals store the compiled
       // v2 artifact, an existing v1 journal upcasts in memory, and a malformed
       // historical check is quarantined rather than executed.
-      const read = readFrozenSnapshot(frozenPayload.snapshot);
+      const read = readFrozenSnapshot(snapshotForRead);
       if (!read.ok) {
         return fail(
           "journal",
@@ -637,6 +673,11 @@ export function createOrchestratorRuntime(
         const payload = event.payload;
         if (!isRecord(payload)) continue;
         if (event.type === "run.control" && payload.action === CHECK_SPEC_REPAIR_ACTION) {
+          // A v1 amendment was already replayed against the stored (historical)
+          // check list above and is reflected in `read`. Re-applying it against
+          // the derived executable view would compare against a different
+          // predecessor, so the loop leaves it alone.
+          if (amendmentsAppliedToStoredData) continue;
           const amended = applyCheckSpecRepair(state.todos, payload);
           if (!amended.ok) {
             return fail(

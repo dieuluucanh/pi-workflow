@@ -37,7 +37,7 @@ test("child status: idle and disposed render nothing", () => {
   assert.equal(formatOrchestratorChildStatus(state({ phase: "disposed" })), "");
 });
 
-test("child status: carries identity, model, stats, elapsed and todos", () => {
+test("child status: carries phase, model, stats and elapsed without counters", () => {
   const line = formatOrchestratorChildStatus(
     state({
       stats: {
@@ -63,8 +63,10 @@ test("child status: carries identity, model, stats, elapsed and todos", () => {
   );
   assert.equal(
     line,
-    "child 2/7 running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 2/5 todos",
+    "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
   );
+  assert.doesNotMatch(line, /\d+\/\d+/, "no row pointer");
+  assert.doesNotMatch(line, /todos/, "no child todo counter");
   assert.equal(line.includes("\n"), false);
 });
 
@@ -73,17 +75,34 @@ test("child status: a paused child freezes elapsed at pausedAt", () => {
     state({ phase: "paused", pausedAt: 61_000 }),
     999_000,
   );
-  assert.equal(line, "child 2/7 paused · open/muse-spark · 01:00");
+  assert.equal(line, "child paused · open/muse-spark · 01:00");
+});
+
+test("child status: a pause still settling says pausing, not paused", () => {
+  assert.equal(
+    formatOrchestratorChildStatus(
+      state({ phase: "paused", pausePending: true, pausedAt: 61_000 }),
+      999_000,
+    ),
+    "child pausing · open/muse-spark · 01:00",
+  );
+});
+
+test("child status: a provider retry says retrying, not running", () => {
+  assert.equal(
+    formatOrchestratorChildStatus(state({ retrying: true }), 84_000),
+    "child retrying · open/muse-spark · 01:23",
+  );
 });
 
 test("child status: settling is reported as verifying", () => {
   assert.equal(
     formatOrchestratorChildStatus(state({ phase: "settling", startedAt: 0 }), 5_000),
-    "child 2/7 verifying · open/muse-spark · 00:05",
+    "child verifying · open/muse-spark · 00:05",
   );
 });
 
-test("child status: without stats it keeps the historical shape", () => {
+test("child status: without stats it keeps the model and nothing invented", () => {
   assert.equal(
     formatOrchestratorChildStatus(
       state({
@@ -91,7 +110,7 @@ test("child status: without stats it keeps the historical shape", () => {
         todos: [{ step: 1, text: "a", completed: true }],
       }),
     ),
-    "child 2/7 running · open/muse-spark · 1/1 todos",
+    "child running · open/muse-spark",
   );
 });
 

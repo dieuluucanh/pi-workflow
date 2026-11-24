@@ -304,10 +304,7 @@ import {
   captureWorkspaceSetBaseline,
   diffWorkspaceSet,
   parseWorkspaceDeclarations,
-  primaryWorkspace,
-  resolveWorkspaceAlias,
   resolveWorkspaceSet,
-  scopeCommandToWorkspace,
   workspaceRootForRow,
   type WorkspaceSet,
   type WorkspaceSetBaseline,
@@ -1049,6 +1046,12 @@ export default function workflowExtension(
   let orchestrationEpoch = 1;
   /** Operator command surface; never launches children. */
   let orchestratorOperator: ReturnType<typeof createOperatorRuntime> | undefined;
+  /**
+   * Precise reason the last reload could not reattach a saved run. Kept so
+   * `/orchestrator status` and `retry` can report the real failure instead of
+   * pretending no run ever existed.
+   */
+  let orchestratorRestoreError: string | undefined;
   let orchestratorBaseline:
     | {
         attemptId: string;
@@ -2043,6 +2046,10 @@ export default function workflowExtension(
           ref: string;
           total: number;
           phase: string;
+          /** A pause request is still settling (the line says `pausing`). */
+          pausePending?: boolean;
+          /** Provider backoff is active (the line says `retrying`). */
+          retrying?: boolean;
           /** Launch/live model label, kept for older readers. */
           model?: string;
           modelRef?: { provider: string; id: string; thinking?: string };
@@ -2080,6 +2087,12 @@ export default function workflowExtension(
               ref: child.ref ?? "?",
               total: child.total ?? view.state.order.length,
               phase: child.phase,
+              ...(child.pausePending === undefined
+                ? {}
+                : { pausePending: child.pausePending }),
+              ...(child.retrying === undefined
+                ? {}
+                : { retrying: child.retrying }),
               ...(child.modelLabel ? { model: child.modelLabel } : {}),
               ...(child.stats?.model ? { modelRef: child.stats.model } : {}),
               ...(child.stats ? { stats: child.stats } : {}),
@@ -10600,8 +10613,23 @@ export default function workflowExtension(
             return;
           }
           // `/orchestrator retry` recovers (when proven stale) and dispatches
-          // immediately; it never relies on the operator text alone.
-          if (/^retry(?:\s|$)/i.test(text)) {
+          // immediately; it never relies on the operator text alone. Both
+          // status and retry first reattach a saved run after a reload by its
+          // approved plan path (journal only — never compile or freeze again).
+          const wantsStatus = /^status(?:\s|$)/i.test(text);
+          const wantsRetry = /^retry(?:\s|$)/i.test(text);
+          if ((wantsStatus || wantsRetry) && !orchestratorRuntime?.view()) {
+            const reattached = await restoreOrchestratorRun(liveCtx);
+            if (!reattached.ok && !reattached.noRun) {
+              ctx.ui.notify(
+                `Saved Orchestrator run could not be reattached: ${reattached.error}. The journal is unchanged; fix the cause and run /orchestrator status again.`,
+                "warning",
+              );
+              updateStatus(ctx as any);
+              return;
+            }
+          }
+          if (wantsRetry) {
             if (workflowMode !== "orchestrator") {
               await switchWorkflowMode("orchestrator", ctx as any);
             }
@@ -16012,8 +16040,7 @@ ${dispatched.text}`,
     // A running row waits for the explicit probe/retry path.
     if (
       workflowMode === "orchestrator" &&
-      currentPlanFile &&
-      !orchestratorRuntime &&
+      !orchestratorRuntime?.view() &&
       todos.frozen
     ) {
       await restoreOrchestratorRun(ctx as ExtensionContext);
@@ -20870,12 +20897,33 @@ ${dispatched.text}`,
 
   /**
    * Rebind the deterministic run for the current plan after a reload. This
-   * never dispatches: a `running` row is recovered only by the explicit probe.
+   * never dispatches and never compiles or freezes a plan again: it binds the
+   * saved journal by its approved plan path (or journaled source path), so a
+   * restore failure is reported precisely instead of leaving the session
+   * silently unbound.
    */
-  async function restoreOrchestratorRun(ctx: ExtensionContext): Promise<void> {
-    if (orchestratorRuntime?.view()) return;
-    const planPath = currentPlanFile;
-    if (!planPath) return;
+  async function restoreOrchestratorRun(
+    ctx: ExtensionContext,
+  ): Promise<{ ok: true } | { ok: false; error: string; noRun: boolean }> {
+    if (orchestratorRuntime?.view()) return { ok: true };
+    const planPath =
+      currentPlanFile ??
+      todos.planPath ??
+      (todos.frozen?.source.kind === "plan"
+        ? todos.frozen.source.path
+        : undefined);
+    if (!planPath) {
+      return {
+        ok: false,
+        error: "no approved plan path is recorded for this session",
+        // Nothing was saved to reattach; this is the ordinary "no run yet"
+        // case, not a swallowed restore failure.
+        noRun: true,
+      };
+    }
+    // Rebind the plan target to the saved run's approved plan. This is the
+    // path persisted with the freeze, not a newly compiled plan.
+    if (!currentPlanFile) currentPlanFile = planPath;
     const runtime = ensureOrchestratorRuntime(ctx);
     // An unreadable plan file must not strand an intact journal: omit the text
     // and let the runtime rebind by the journaled source path.
@@ -20890,8 +20938,36 @@ ${dispatched.text}`,
       planPath,
       ...(planText === undefined ? {} : { planText }),
     });
-    if (!restored.ok) return;
+    if (!restored.ok) {
+      orchestratorRestoreError = `${restored.code}: ${restored.error}`;
+      // No journal simply means this plan never started a run; that is not a
+      // failure and must not warn on every ordinary reload.
+      const noRun = /no run journal exists for this plan/i.test(restored.error);
+      if (!noRun) {
+        try {
+          ctx.ui.notify(
+            `Orchestrator run was not restored: ${orchestratorRestoreError}. The saved journal is unchanged; /orchestrator status retries the approved plan reattach.`,
+            "warning",
+          );
+        } catch (_e) {
+          void _e;
+        }
+      }
+      return { ok: false, error: orchestratorRestoreError, noRun };
+    }
+    orchestratorRestoreError = undefined;
     const placed = todos.freeze(restored.value.frozen);
+    if (!placed.ok) {
+      orchestratorRestoreError = `the restored run's TODO list could not be adopted: ${placed.error}`;
+      try {
+        ctx.ui.notify(
+          `Orchestrator run ${restored.value.runId} was restored, but its frozen TODO list could not be adopted: ${placed.error}.`,
+          "warning",
+        );
+      } catch (_e) {
+        void _e;
+      }
+    }
     // A reload cannot keep an in-process child. A `running` row is blocked
     // instead of replayed or silently restarted; the run pauses so the user
     // decides whether to retry with a fresh child.
@@ -20927,6 +21003,7 @@ ${dispatched.text}`,
     }
     if (placed.ok) persistState();
     updateStatus(ctx);
+    return { ok: true };
   }
 
   async function ensureOrchestratorOperator(
@@ -20943,6 +21020,10 @@ ${dispatched.text}`,
         }
         return {
           phase: state.phase,
+          ...(state.pausePending === undefined
+            ? {}
+            : { pausePending: state.pausePending }),
+          ...(state.retrying === undefined ? {} : { retrying: state.retrying }),
           ...(state.ref ? { ref: state.ref } : {}),
           ...(state.total === undefined ? {} : { total: state.total }),
           ...(state.modelLabel ? { modelLabel: state.modelLabel } : {}),

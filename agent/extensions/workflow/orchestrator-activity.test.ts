@@ -2,8 +2,17 @@
  * Orchestrator composer projection tests.
  *
  * These are pure: no editor, no child session, no provider. They pin the exact
- * command spellings and, most importantly, the Esc matrix: a repeated press
- * while pausing/paused/verifying is consumed and never becomes an abort.
+ * border copy and command spellings and, most importantly, the Esc matrix: a
+ * repeated press while pausing/paused/verifying is consumed and never becomes
+ * an abort.
+ *
+ * The border is deliberately narrow in what it may say: the phase word plus the
+ * controls. Progress belongs to the pinned TODO pane (`Builder n/m`, `n/m
+ * todos`), telemetry belongs to the footer (`child running · model · ctx …`) and
+ * the tool stream belongs to the transcript band. A `lastTool` echoed here made
+ * the line up to ~190 columns wide and pushed the actual state out of the
+ * border, so the negative assertions below are as important as the positive
+ * ones.
  */
 
 import { test } from "node:test";
@@ -22,6 +31,13 @@ function input(
   return { runPhase: "running", child, ...over };
 }
 
+/** The widest line the border may ever render, in visible columns. */
+const MAX_LINE = 96;
+/** The narrow-terminal fallback must stay useful on a ~30-column border. */
+const MAX_COMPACT = 30;
+/** Recovery copy keeps its command guidance, so it gets a slightly wider bound. */
+const MAX_RECOVERY_COMPACT = 40;
+
 test("no run and no child has no composer activity", () => {
   assert.equal(orchestratorActivity({}), undefined);
   assert.equal(orchestratorActivity({ runPhase: "ready" }), undefined);
@@ -35,45 +51,54 @@ test("no run and no child has no composer activity", () => {
   );
 });
 
-test("starting shows the child identity and real pause/abort commands", () => {
+test("starting shows only the phase and the real pause/abort commands", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "starting",
-      ref: "2",
-      total: 7,
-      taskId: "task-2",
-      attemptId: "attempt-1",
-      todos: [],
-    } as never),
+    input(
+      {
+        phase: "starting",
+        ref: "2",
+        total: 7,
+        taskId: "task-2",
+        attemptId: "attempt-1",
+        todos: [],
+      } as never,
+      { escAvailable: true },
+    ),
   );
   assert.ok(activity);
   assert.equal(activity.busy, true);
   assert.equal(activity.esc, "pause");
-  assert.match(activity.line, /Starting Builder 2\/7/);
-  assert.match(activity.line, /\/orchestrator-pause/);
-  assert.match(activity.line, /\/orchestrator-abort/);
+  assert.equal(
+    activity.line,
+    "Starting… · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+  );
+  assert.equal(activity.compact, "Starting…");
   assert.doesNotMatch(activity.line, /orchestrator-retry/);
 });
 
-test("running names Working, the tool and the controls", () => {
+test("running names the phase and the controls, never the tool", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "running",
-      ref: "3",
-      total: 8,
-      lastTool: "bash npm test",
-      taskId: "task-3",
-      attemptId: "attempt-2",
-      todos: [],
-    } as never, { escAvailable: true }),
+    input(
+      {
+        phase: "running",
+        ref: "3",
+        total: 8,
+        lastTool: "bash npm test",
+        taskId: "task-3",
+        attemptId: "attempt-2",
+        todos: [],
+      } as never,
+      { escAvailable: true },
+    ),
   );
   assert.ok(activity);
   assert.equal(activity.busy, true);
   assert.equal(activity.esc, "pause");
-  assert.match(activity.line, /^Working · Builder 3\/8 · bash npm test/);
-  assert.match(activity.line, /ESC or \/orchestrator-pause to pause/);
-  assert.match(activity.line, /\/orchestrator-abort to stop/);
-  assert.equal(activity.compact, "Working · Builder 3/8 · bash npm test");
+  assert.equal(
+    activity.line,
+    "Working · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+  );
+  assert.equal(activity.compact, "Working · ESC to pause");
 });
 
 test("a wider host without the editor route omits the ESC hint", () => {
@@ -88,7 +113,10 @@ test("a wider host without the editor route omits the ESC hint", () => {
   assert.ok(activity);
   assert.equal(activity.esc, "pause");
   assert.doesNotMatch(activity.line, /ESC/);
-  assert.match(activity.line, /\/orchestrator-pause to pause/);
+  assert.equal(
+    activity.line,
+    "Working · /orchestrator-pause to pause · /orchestrator-abort to stop",
+  );
 });
 
 test("provider retry is still Working, not a failure", () => {
@@ -103,76 +131,98 @@ test("provider retry is still Working, not a failure", () => {
   );
   assert.ok(activity);
   assert.equal(activity.busy, true);
-  assert.match(activity.line, /retrying…/);
+  assert.equal(
+    activity.line,
+    "Working · retrying… · /orchestrator-pause to pause · /orchestrator-abort to stop",
+  );
+  assert.equal(activity.compact, "Working · retrying…");
   assert.doesNotMatch(activity.line, /blocked|failed/i);
 });
 
 test("a forwarded dialog is waiting, not Working with an Esc pause", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "running",
-      ref: "4",
-      total: 9,
-      todos: [],
-    } as never, { awaitingDialog: true, escAvailable: true }),
+    input(
+      {
+        phase: "running",
+        ref: "4",
+        total: 9,
+        todos: [],
+      } as never,
+      { awaitingDialog: true, escAvailable: true },
+    ),
   );
   assert.ok(activity);
-  assert.match(activity.line, /Waiting · Builder 4\/9/);
+  assert.equal(
+    activity.line,
+    "Waiting · answer the dialog · /orchestrator-abort to stop",
+  );
+  assert.equal(activity.compact, "Waiting · answer the dialog");
   assert.equal(activity.esc, "swallow");
   assert.doesNotMatch(activity.line, /ESC/);
 });
 
 test("a warm pause advertises resume and consumes Esc", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "paused",
-      ref: "2",
-      total: 5,
-      todos: [],
-    } as never, { escAvailable: true }),
+    input(
+      {
+        phase: "paused",
+        ref: "2",
+        total: 5,
+        todos: [],
+      } as never,
+      { escAvailable: true },
+    ),
   );
   assert.ok(activity);
   assert.equal(activity.paused, true);
   assert.equal(activity.busy, false);
   assert.equal(activity.esc, "swallow");
-  assert.match(activity.line, /^Paused · Builder 2\/5/);
-  assert.match(activity.line, /\/orchestrator-resume to continue/);
-  assert.match(activity.line, /\/orchestrator-abort to stop/);
+  assert.equal(
+    activity.line,
+    "Paused · /orchestrator-resume to continue · /orchestrator-abort to stop",
+  );
+  assert.equal(activity.compact, "Paused · /orchestrator-resume");
   assert.doesNotMatch(activity.line, /ESC/);
-  assert.equal(activity.compact, "Paused · Builder 2/5");
 });
 
 test("a pause still settling is Pausing, never a second pause", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "paused",
-      ref: "2",
-      total: 5,
-      pausePending: true,
-      todos: [],
-    } as never, { escAvailable: true }),
+    input(
+      {
+        phase: "paused",
+        ref: "2",
+        total: 5,
+        pausePending: true,
+        todos: [],
+      } as never,
+      { escAvailable: true },
+    ),
   );
   assert.ok(activity);
   assert.equal(activity.paused, false);
   assert.equal(activity.busy, false);
   assert.equal(activity.esc, "swallow");
-  assert.match(activity.line, /^Pausing Builder 2\/5…/);
+  assert.equal(activity.line, "Pausing… · /orchestrator-abort to stop");
+  assert.equal(activity.compact, "Pausing…");
   assert.doesNotMatch(activity.line, /ESC/);
 });
 
 test("verifying is guidance-only and consumes Esc", () => {
   const activity = orchestratorActivity(
-    input({
-      phase: "settling",
-      ref: "5",
-      total: 6,
-      todos: [],
-    } as never, { escAvailable: true }),
+    input(
+      {
+        phase: "settling",
+        ref: "5",
+        total: 6,
+        todos: [],
+      } as never,
+      { escAvailable: true },
+    ),
   );
   assert.ok(activity);
   assert.equal(activity.esc, "swallow");
-  assert.match(activity.line, /^Verifying · Builder 5\/6/);
-  assert.match(activity.line, /\/orchestrator-abort to stop/);
+  assert.equal(activity.line, "Verifying · /orchestrator-abort to stop");
+  assert.equal(activity.compact, "Verifying");
   assert.doesNotMatch(activity.line, /orchestrator-pause|ESC/);
 });
 
@@ -247,4 +297,82 @@ test("repeated Esc decisions never produce abort/resume", () => {
     );
   }
   assert.deepEqual([...seen], ["swallow"]);
+});
+
+// ── Border content guards (the reported defect) ──────────────────────
+
+test("no border line can echo the last tool, command or row counter", () => {
+  const leaky = {
+    phase: "running",
+    ref: "3",
+    total: 19,
+    taskId: "task-3",
+    attemptId: "attempt-2",
+    // The exact shape that made the border ~190 columns wide.
+    lastTool: "bash: npm test -- --watch --runInBand",
+    todos: [],
+  } as never;
+
+  for (const escAvailable of [true, false]) {
+    const activity = orchestratorActivity(input(leaky, { escAvailable }));
+    assert.ok(activity);
+    for (const text of [activity.line, activity.compact]) {
+      assert.doesNotMatch(text, /Builder/, text);
+      assert.doesNotMatch(text, /\d+\s*\/\s*\d+/, text);
+      assert.doesNotMatch(
+        text,
+        /bash|npm|--watch|--runInBand|task-3/,
+        `no tool echo: ${text}`,
+      );
+      assert.doesNotMatch(text, /todos?/, `no todo counter: ${text}`);
+    }
+  }
+});
+
+test("every border line stays inside its width budget", () => {
+  const children = [
+    { phase: "starting" },
+    { phase: "running" },
+    { phase: "running", retrying: true },
+    { phase: "paused" },
+    { phase: "paused", pausePending: true },
+    { phase: "settling" },
+  ];
+  for (const child of children) {
+    for (const escAvailable of [true, false]) {
+      const activity = orchestratorActivity(
+        input({ ...child, ref: "3", total: 19, todos: [] } as never, {
+          escAvailable,
+        }),
+      );
+      assert.ok(activity, JSON.stringify(child));
+      assert.ok(
+        activity.line.length <= MAX_LINE,
+        `${activity.line.length} > ${MAX_LINE}: ${activity.line}`,
+      );
+      assert.ok(
+        activity.compact.length <= MAX_COMPACT,
+        `${activity.compact.length} > ${MAX_COMPACT}: ${activity.compact}`,
+      );
+      assert.doesNotMatch(activity.line, /[\r\n\t]/, "one clean line");
+    }
+  }
+
+  const dialog = orchestratorActivity(
+    input({ phase: "running", todos: [] } as never, { awaitingDialog: true }),
+  );
+  assert.ok(dialog);
+  assert.ok(dialog.line.length <= MAX_LINE);
+  assert.ok(dialog.compact.length <= MAX_COMPACT);
+
+  // Recovery guidance keeps its command spellings, so it is bounded separately.
+  const blocked = orchestratorActivity({
+    runPhase: "blocked",
+    blockedReason: "check failed",
+  });
+  assert.ok(blocked);
+  assert.ok(blocked.compact.length <= MAX_RECOVERY_COMPACT);
+  const runPaused = orchestratorActivity({ runPhase: "paused" });
+  assert.ok(runPaused);
+  assert.ok(runPaused.compact.length <= MAX_RECOVERY_COMPACT);
 });

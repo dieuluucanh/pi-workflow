@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 
 import {
   childModelLabel,
+  childPhaseWord,
   formatChildModel,
   formatChildPanelHeader,
   formatChildProgress,
@@ -159,8 +160,8 @@ test("child-stats: the model label truncates in the middle, keeping the provider
   );
 });
 
-test("child-stats: the shared status line carries identity, model and stats", () => {
-  const line = formatChildStatusLine({
+test("child-stats: the footer line keeps telemetry and drops the counters", () => {
+  const input = {
     ref: "2",
     total: 7,
     phase: "running",
@@ -178,14 +179,23 @@ test("child-stats: the shared status line carries identity, model and stats", ()
     elapsedMs: 83_000,
     todoDone: 3,
     todoTotal: 5,
-  });
+  };
+  const line = formatChildStatusLine(input);
   assert.equal(
     line,
-    "child 2/7 running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 3/5 todos",
+    "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
   );
+  assert.doesNotMatch(line, /\d+\/\d+/, "no row pointer");
+  assert.doesNotMatch(line, /todos/, "no child todo counter");
   assert.equal(line.includes("\n"), false, "always exactly one line");
 
-  // No stats yet: the historical shape survives (prefix + model + todos).
+  // The multi-line operator report opts back into the historical shape.
+  assert.equal(
+    formatChildStatusLine(input, { showRow: true, showTodoCount: true }),
+    "child 2/7 running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 3/5 todos",
+  );
+
+  // No stats yet: the model only, then nothing but the phase.
   assert.equal(
     formatChildStatusLine({
       ref: "2",
@@ -195,14 +205,42 @@ test("child-stats: the shared status line carries identity, model and stats", ()
       todoDone: 1,
       todoTotal: 2,
     }),
-    "child 2/7 running · open/m · 1/2 todos",
+    "child running · open/m",
   );
-
-  // Nothing known at all still names the child truthfully.
   assert.equal(formatChildStatusLine({ phase: "starting" }), "child starting");
   assert.equal(
     formatChildStatusLine({ ref: "1", total: 1, phase: "paused" }),
-    "child 1/1 paused",
+    "child paused",
+  );
+});
+
+test("child-stats: one phase word for every surface", () => {
+  assert.equal(childPhaseWord({ phase: "starting" }), "starting");
+  assert.equal(childPhaseWord({ phase: "running" }), "running");
+  assert.equal(
+    childPhaseWord({ phase: "running", retrying: true }),
+    "retrying",
+  );
+  assert.equal(childPhaseWord({ phase: "paused" }), "paused");
+  assert.equal(
+    childPhaseWord({ phase: "paused", pausePending: true }),
+    "pausing",
+  );
+  assert.equal(childPhaseWord({ phase: "settling" }), "verifying");
+  assert.equal(childPhaseWord({}), "starting", "absent phase is not a lie");
+
+  // The word reaches the line, never the raw controller phase.
+  assert.equal(
+    formatChildStatusLine({ phase: "settling", model: { provider: "a", id: "b" } }),
+    "child verifying · a/b",
+  );
+  assert.equal(
+    formatChildStatusLine({ phase: "paused", pausePending: true }),
+    "child pausing",
+  );
+  assert.equal(
+    formatChildStatusLine({ phase: "running", retrying: true }),
+    "child retrying",
   );
 });
 

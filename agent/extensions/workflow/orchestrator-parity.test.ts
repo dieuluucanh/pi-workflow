@@ -339,16 +339,19 @@ test("child visibility is a bounded display projection with no context injection
     phase: "running",
     ref: "2",
     total: 3,
+    modelLabel: "builder/model",
     lastTool: "edit",
     todos: [
       { step: 1, text: "a", completed: true },
       { step: 2, text: "b", completed: false },
     ],
   });
-  assert.equal(running, "child 2/3 · edit · 1/2 todos");
+  // The row pointer, the tool echo and the child's todo counter are the pinned
+  // TODO pane's and the transcript band's job, not this one-line status.
+  assert.equal(running, "child running · builder/model");
   assert.equal(
     formatOrchestratorChildStatus({ phase: "paused", ref: "1", total: 2, todos: [] }),
-    "⏸ child 1/2 paused",
+    "child paused",
   );
 
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };

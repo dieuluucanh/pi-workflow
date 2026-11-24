@@ -192,6 +192,10 @@ export interface ChildStatusInput {
   ref?: string;
   total?: number;
   phase?: string;
+  /** A pause request is still settling: the phase word is `pausing`. */
+  pausePending?: boolean;
+  /** A provider retry/backoff is active: the phase word is `retrying`. */
+  retrying?: boolean;
   stats?: ChildRuntimeStats;
   model?: ChildModelRef;
   /** Task-local todo counters (the child's own list). */
@@ -202,25 +206,86 @@ export interface ChildStatusInput {
   elapsedMs?: number;
 }
 
-function identityBits(input: ChildStatusInput): string[] {
+/**
+ * What a status line is allowed to include beyond the phase word.
+ *
+ * One-row surfaces (the footer segment, the host contribution row, the
+ * Desktop status) default to BOTH `false`: the pinned TODO pane owns progress
+ * and the child's own counters, and the row has no columns to spare. The
+ * multi-line `/orchestrator status` report opts into both, because naming the
+ * frozen row there is useful and nothing is competing for the width.
+ */
+export interface ChildStatusOptions {
+  /** Include the frozen-row pointer (`child 2/7 running`). */
+  showRow?: boolean;
+  /** Include the child's own `n/m todos` counter. */
+  showTodoCount?: boolean;
+}
+
+/**
+ * The one phase word every surface renders.
+ *
+ * `settling` is what the controller calls verification, and the composer
+ * border already said `Verifying` while the footer said `settling`. A pause
+ * that is still settling is `pausing`, not `paused`. `retrying` names provider
+ * backoff instead of pretending the child is running.
+ *
+ * (`waiting` — a forwarded permission dialog — is composer-only: the dialog is
+ * a transient composer condition, not a child phase the footer can observe.)
+ */
+export function childPhaseWord(input: {
+  phase?: string;
+  pausePending?: boolean;
+  retrying?: boolean;
+}): string {
+  const phase =
+    typeof input.phase === "string" && input.phase.length > 0
+      ? input.phase
+      : "starting";
+  if (phase === "settling") return "verifying";
+  if (phase === "paused") {
+    return input.pausePending === true ? "pausing" : "paused";
+  }
+  if (phase === "running" && input.retrying === true) return "retrying";
+  return phase;
+}
+
+function identityBits(
+  input: ChildStatusInput,
+  options: ChildStatusOptions | undefined,
+): string[] {
+  const phase = childPhaseWord(input);
+  if (options?.showRow !== true) return [`child ${phase}`];
   const ref =
     typeof input.ref === "string" && input.ref.length > 0 ? input.ref : "?";
   const total = isFiniteNumber(input.total) ? input.total : 0;
-  const phase = input.phase ? input.phase : "starting";
   return total > 0 ? [`child ${ref}/${total} ${phase}`] : [`child ${phase}`];
 }
 
 /**
- * The one-line child status shared by the footer status, the child band detail
- * and the operator text.
+ * The one-line child status shared by the footer status, the child band detail,
+ * the host contribution row and the operator text.
  *
- * With stats the line is:
- *   `child 2/7 running · provider/id · ctx 43% (86k/200k) · ↑12k ↓3k · 01:23 · 3/5 todos`
- * Without stats it degrades to the historical shape:
- *   `child 2/7 running · provider/id · 3/5 todos`
+ * One-row surfaces (no options) never carry the row pointer or the child's todo
+ * counter — the pinned TODO pane owns progress, so the row is free for the
+ * telemetry the composer border no longer shows:
+ *
+ *   `child running · provider/id · ctx 43% (86k/200k) · ↑12k ↓3k · 01:23`
+ *
+ * Without stats it degrades to the model only, then to the phase alone:
+ *
+ *   `child running · provider/id`
+ *   `child running`
+ *
+ * The multi-line operator report opts into the historical shape:
+ *
+ *   `child 2/7 running · provider/id · ctx … · 01:23 · 3/5 todos`
  */
-export function formatChildStatusLine(input: ChildStatusInput): string {
-  const bits = identityBits(input);
+export function formatChildStatusLine(
+  input: ChildStatusInput,
+  options?: ChildStatusOptions,
+): string {
+  const bits = identityBits(input, options);
   const model = formatChildModel(input.model ?? input.stats?.model);
   if (model) bits.push(model);
   const context = formatContextUsage(input.stats?.context, { long: true });
@@ -230,6 +295,7 @@ export function formatChildStatusLine(input: ChildStatusInput): string {
   const elapsed = formatElapsed(input.elapsedMs);
   if (elapsed) bits.push(elapsed);
   if (
+    options?.showTodoCount === true &&
     typeof input.todoTotal === "number" &&
     input.todoTotal > 0
   ) {

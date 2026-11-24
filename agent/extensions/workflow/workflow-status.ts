@@ -13,7 +13,12 @@
  */
 
 import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
-import { formatChildStatusLine, modelRefFromLabel, sanitizeStatLine } from "./child-stats.ts";
+import {
+  childPhaseWord,
+  formatChildStatusLine,
+  modelRefFromLabel,
+  sanitizeStatLine,
+} from "./child-stats.ts";
 
 export const WORKFLOW_STATUS_KEYS = {
   mode: "workflow",
@@ -67,6 +72,13 @@ export interface WorkflowStatusInput {
       ref: string;
       total: number;
       phase: string;
+      /**
+       * A pause request is still settling. The line says `pausing`, never a
+       * premature `paused`.
+       */
+      pausePending?: boolean;
+      /** Provider backoff: the line says `retrying`, not `running`. */
+      retrying?: boolean;
       /** Launch/live model label (`provider/id`), kept for older readers. */
       model?: string;
       /** The structured model ref, when the child can report one. */
@@ -99,13 +111,15 @@ export interface WorkflowStatusSegments {
 /**
  * The Orchestrator footer segment. View-aware on purpose:
  *
- *   - `parent`  → the run's own state (phase/next) plus a compact child hint;
- *   - `child` / live `auto` → the full child line with the model, context,
- *     tokens and elapsed time that the native footer cannot show;
+ *   - `parent`  → the run's own state (phase/next) plus a one-glance child
+ *     phase hint (`child running`), never a row counter;
+ *   - `child` / live `auto` → the child's own telemetry line (model, context,
+ *     tokens, elapsed) that the composer border deliberately does not show;
  *   - no child → the run line (historical behaviour).
  *
- * Always exactly one line: the child formatter sanitizes control characters,
- * and the blocked reason is clipped.
+ * Progress (`Builder n/m`, `n/m todos`) belongs to the pinned TODO pane, so it
+ * never appears here. Always exactly one line: the child formatter sanitizes
+ * control characters, and the blocked reason is clipped.
  */
 export function buildOrchestrationSegment(
   orchestration: WorkflowStatusInput["orchestration"],
@@ -131,19 +145,19 @@ export function buildOrchestrationSegment(
   // and `child` show the child's own telemetry (the whole point of the toggle).
   const showChild = live && (view === "child" || view === "auto");
   if (!showChild) {
-    const hint = `child ${child.ref}/${child.total} ${child.phase}`;
+    const hint = `child ${childPhaseWord(child)}`;
     return [runLine, hint, blocked].filter(Boolean).join(" · ");
   }
   const model =
     child.modelRef ?? (child.model ? modelRefFromLabel(child.model) : undefined);
   const line = formatChildStatusLine({
-    ref: child.ref,
-    total: child.total,
     phase: child.phase,
+    ...(child.pausePending === undefined
+      ? {}
+      : { pausePending: child.pausePending }),
+    ...(child.retrying === undefined ? {} : { retrying: child.retrying }),
     ...(model ? { model } : {}),
     ...(child.stats ? { stats: child.stats } : {}),
-    ...(child.todoDone === undefined ? {} : { todoDone: child.todoDone }),
-    ...(child.todoTotal === undefined ? {} : { todoTotal: child.todoTotal }),
     ...(child.elapsedMs === undefined ? {} : { elapsedMs: child.elapsedMs }),
   });
   return [line, blocked].filter(Boolean).join(" · ");

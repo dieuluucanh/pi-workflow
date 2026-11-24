@@ -282,7 +282,7 @@ test("handoff stages are named accurately and a recommendation never executes", 
   assert.doesNotMatch(both.mode, /handoff pending/);
 });
 
-test("the orchestrator segment names the live child and its local todos", () => {
+test("the orchestrator segment names the live child without row progress", () => {
   const segments = buildWorkflowStatusSegments({
     mode: "orchestrator",
     done: 1,
@@ -301,10 +301,9 @@ test("the orchestrator segment names the live child and its local todos", () => 
       view: "child",
     },
   });
-  assert.equal(
-    segments.orchestrator,
-    "child 2/7 running · builder/model · 3/5 todos",
-  );
+  assert.equal(segments.orchestrator, "child running · builder/model");
+  assert.doesNotMatch(segments.orchestrator, /\d+\/\d+/, "no row pointer");
+  assert.doesNotMatch(segments.orchestrator, /todos/, "no child todo counter");
 });
 
 test("the orchestrator segment falls back to the run row without a child", () => {
@@ -352,8 +351,8 @@ test("the orchestrator segment is view-aware: parent shows the run, child shows 
   });
   assert.equal(
     parent.orchestrator,
-    "run running · next task-2 · child 2/7 running",
-    "parent view stays about the run",
+    "run running · next task-2 · child running",
+    "parent view stays about the run and points at the row by id",
   );
 
   const childView = buildWorkflowStatusSegments({
@@ -362,8 +361,8 @@ test("the orchestrator segment is view-aware: parent shows the run, child shows 
   });
   assert.equal(
     childView.orchestrator,
-    "child 2/7 running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 3/5 todos",
-    "child view carries the child's own telemetry",
+    "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
+    "child view carries the child's own telemetry and no counters",
   );
 
   const auto = buildWorkflowStatusSegments({
@@ -372,7 +371,7 @@ test("the orchestrator segment is view-aware: parent shows the run, child shows 
   });
   assert.equal(auto.orchestrator, childView.orchestrator, "auto follows a live child");
 
-  // No stats yet: the historical shape survives (prefix + model + todos).
+  // No stats yet: the model survives, the counters still do not.
   const bare = buildWorkflowStatusSegments({
     ...base,
     orchestration: {
@@ -388,10 +387,7 @@ test("the orchestrator segment is view-aware: parent shows the run, child shows 
       view: "child",
     },
   });
-  assert.equal(
-    bare.orchestrator,
-    "child 2/7 running · builder/model · 3/5 todos",
-  );
+  assert.equal(bare.orchestrator, "child running · builder/model");
 
   // A pause still names the child; elapsed is frozen by the caller.
   const paused = buildWorkflowStatusSegments({
@@ -402,8 +398,43 @@ test("the orchestrator segment is view-aware: parent shows the run, child shows 
       view: "child",
     },
   });
-  assert.match(paused.orchestrator, /^child 2\/7 paused · /);
+  assert.match(paused.orchestrator, /^child paused · /);
   assert.match(paused.orchestrator, /02:00/);
+  assert.doesNotMatch(paused.orchestrator, /\d+\/\d+/);
+});
+
+test("the orchestrator child line shares one phase word with the composer", () => {
+  const base = {
+    mode: "orchestrator" as const,
+    done: 1,
+    total: 3,
+    commitMode: "never",
+  };
+  const child = { ref: "2", total: 7, phase: "running", model: "a/b" };
+  const segment = (over: Record<string, unknown>) =>
+    buildWorkflowStatusSegments({
+      ...base,
+      orchestration: {
+        phase: "running",
+        child: { ...child, ...over } as never,
+        view: "child",
+      },
+    }).orchestrator;
+
+  assert.match(segment({ phase: "settling" }), /^child verifying/);
+  assert.match(segment({ phase: "paused", pausePending: true }), /^child pausing/);
+  assert.match(segment({ pausePending: false, phase: "paused" }), /^child paused/);
+  assert.match(segment({ retrying: true }), /^child retrying/);
+  // The parent hint uses the same word.
+  const parentHint = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "running",
+      child: { ...child, phase: "settling" },
+      view: "parent",
+    },
+  });
+  assert.match(parentHint.orchestrator, /· child verifying$/);
 });
 
 test("the orchestrator segment is always exactly one line", () => {

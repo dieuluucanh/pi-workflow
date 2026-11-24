@@ -57,6 +57,10 @@ export function parseOperatorArgs(raw: string): ParsedOperator {
 
 export interface OperatorChildSnapshot {
   phase: string;
+  /** A pause request is still settling (the report says `pausing`). */
+  pausePending?: boolean;
+  /** Provider backoff is active (the report says `retrying`). */
+  retrying?: boolean;
   ref?: string;
   total?: number;
   modelLabel?: string;
@@ -107,16 +111,26 @@ function childLine(child: OperatorChildSnapshot | undefined): string | undefined
   const model =
     child.modelRef ??
     (child.modelLabel ? modelRefFromLabel(child.modelLabel) : undefined);
-  const line = formatChildStatusLine({
-    ...(child.ref ? { ref: child.ref } : {}),
-    ...(child.total === undefined ? {} : { total: child.total }),
-    phase: child.phase,
-    ...(model ? { model } : {}),
-    ...(child.stats ? { stats: child.stats } : {}),
-    ...(child.elapsedMs === undefined ? {} : { elapsedMs: child.elapsedMs }),
-    todoDone: child.todos.filter((item) => item.completed).length,
-    todoTotal: child.todos.length,
-  });
+  // Unlike the one-row footer and the composer border, this is a multi-line
+  // report: naming the frozen row and the child's own todo progress is useful
+  // and nothing is competing for the width.
+  const line = formatChildStatusLine(
+    {
+      ...(child.ref ? { ref: child.ref } : {}),
+      ...(child.total === undefined ? {} : { total: child.total }),
+      phase: child.phase,
+      ...(child.pausePending === undefined
+        ? {}
+        : { pausePending: child.pausePending }),
+      ...(child.retrying === undefined ? {} : { retrying: child.retrying }),
+      ...(model ? { model } : {}),
+      ...(child.stats ? { stats: child.stats } : {}),
+      ...(child.elapsedMs === undefined ? {} : { elapsedMs: child.elapsedMs }),
+      todoDone: child.todos.filter((item) => item.completed).length,
+      todoTotal: child.todos.length,
+    },
+    { showRow: true, showTodoCount: true },
+  );
   const error = child.lastError
     ? ` · error: ${sanitizeStatLine(child.lastError).slice(0, 200)}`
     : "";

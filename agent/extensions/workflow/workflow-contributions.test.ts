@@ -386,9 +386,10 @@ test("orchestrator child rows expose pause/resume/abort and the view toggle", ()
     },
   });
   const byId = new Map(contributions.map((entry) => [entry.id, entry]));
-  assert.match(
+  assert.equal(
     String((byId.get("orchestrator-child") as { text?: string })?.text),
-    /child 2\/7 · running · builder\/model · 1\/2 todos/,
+    "child running · builder/model",
+    "the host row matches the footer: no row pointer, no child todo counter",
   );
   for (const id of ["orchestrator-view", "orchestrator-pause", "orchestrator-abort"]) {
     assert.ok(byId.has(id), id);
@@ -430,13 +431,13 @@ test("the orchestrator child row is view-aware and carries child stats", () => {
 
   assert.equal(
     textFor("child"),
-    "child 2/7 · running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23 · 1/2 todos",
+    "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
   );
   assert.equal(textFor("auto"), textFor("child"), "auto follows a live child");
   assert.equal(
     textFor("parent"),
-    "child 2/7 · running · open/muse-spark · 1/2 todos",
-    "parent view keeps the compact hint",
+    "child running",
+    "parent view keeps a counter-free phase hint",
   );
   for (const view of ["child", "parent", "auto"] as const) {
     assert.equal(/[\r\n\t]/.test(textFor(view)), false, `${view} is one line`);

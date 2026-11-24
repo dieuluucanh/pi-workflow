@@ -10,6 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
   WorkflowTabEditor,
@@ -138,8 +139,8 @@ function activity(
   over: Partial<WorkflowEditorActivity> = {},
 ): WorkflowEditorActivity {
   return {
-    line: "Working · Builder 2/7 · bash npm test · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
-    compact: "Working · Builder 2/7 · bash npm test",
+    line: "Working · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+    compact: "Working · ESC to pause",
     busy: true,
     paused: false,
     esc: "pause",
@@ -163,35 +164,62 @@ test("composer border delegates to the host when no child owns it", () => {
   );
 });
 
-test("composer border shows Working and the real controls", () => {
+test("composer border shows the phase and the real controls", () => {
   const editor = makeHookEditor({ activity: () => activity() });
   const line = (editor as any).renderTopBorder(120, 0);
-  assert.match(line, /Working · Builder 2\/7/);
-  assert.match(line, /ESC or \/orchestrator-pause to pause/);
+  assert.match(line, /Working · ESC or \/orchestrator-pause to pause/);
   assert.match(line, /\/orchestrator-abort to stop/);
 });
 
 test("narrow terminals fall back to the hint-free compact line", () => {
   const editor = makeHookEditor({ activity: () => activity() });
   const line = (editor as any).renderTopBorder(42, 0);
-  assert.match(line, /Working · Builder 2\/7/);
-  assert.doesNotMatch(line, /ESC/);
+  assert.match(line, /Working/);
+  assert.match(line, /ESC to pause/);
+  assert.doesNotMatch(line, /\/orchestrator-abort/);
+});
+
+test("the border never echoes a tool, a command or the row counter", () => {
+  // The projection cannot even carry those values any more (see
+  // `orchestrator-activity.test.ts`), so this pins the editor side: whatever
+  // the projection text is, no command fragment may reach the border.
+  const editor = makeHookEditor({ activity: () => activity() });
+  for (const width of [24, 40, 72, 120, 200]) {
+    const line = (editor as any).renderTopBorder(width, 0);
+    assert.match(line, /Working/, `phase survives width ${width}`);
+    assert.doesNotMatch(line, /Builder/, `width ${width}`);
+    assert.doesNotMatch(line, /\d+\/\d+/, `width ${width}`);
+    assert.doesNotMatch(line, /bash|npm|--watch/, `width ${width}`);
+    assert.ok(
+      visibleWidth(line) <= width,
+      `width ${width}: ${visibleWidth(line)} rendered`,
+    );
+  }
+});
+
+test("an overflowing border keeps the phase word intact", () => {
+  const editor = makeHookEditor({ activity: () => activity() });
+  // Below the compact line's own width the frame is dropped and the status is
+  // truncated, but the state must still be readable.
+  const line = (editor as any).renderTopBorder(16, 0);
+  assert.match(line, /Working/);
+  assert.ok(visibleWidth(line) <= 16);
 });
 
 test("a warm pause renders the paused line with resume", () => {
   const editor = makeHookEditor({
     activity: () =>
       activity({
-        line: "Paused · Builder 2/7 · /orchestrator-resume to continue · /orchestrator-abort to stop",
-        compact: "Paused · Builder 2/7",
+        line: "Paused · /orchestrator-resume to continue · /orchestrator-abort to stop",
+        compact: "Paused · /orchestrator-resume",
         busy: false,
         paused: true,
         esc: "swallow",
       }),
   });
   const line = (editor as any).renderTopBorder(120, 0);
-  assert.match(line, /Paused · Builder 2\/7/);
-  assert.match(line, /\/orchestrator-resume/);
+  assert.match(line, /Paused · \/orchestrator-resume to continue/);
+  assert.match(line, /\/orchestrator-abort to stop/);
 });
 
 function escapeTestEditor(action: WorkflowEditorActivity["esc"]) {

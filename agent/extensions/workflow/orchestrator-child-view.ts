@@ -116,8 +116,11 @@ export function registerOrchestratorChildRenderers(
  * Footer/status text; one bounded, truthful line.
  *
  * Shares `formatChildStatusLine`, so the footer, the pinned panel, the operator
- * text and the host contributions can never disagree about the child's model,
- * context or todos.
+ * text and the host contributions can never disagree about the child's phase,
+ * model, context or todos. No options: this is a one-row surface, so the row
+ * pointer and the child's own todo counter stay out of it (the pinned TODO pane
+ * owns progress). `childPhaseWord` owns `settling → verifying` and
+ * `paused + pausePending → pausing`.
  */
 export function formatOrchestratorChildStatus(
   state: OrchestratorChildState | undefined,
@@ -126,7 +129,6 @@ export function formatOrchestratorChildStatus(
   if (!state || state.phase === "idle" || state.phase === "disposed") {
     return "";
   }
-  const phase = state.phase === "settling" ? "verifying" : state.phase;
   const model =
     state.stats?.model ?? modelRefFromLabel(state.modelLabel);
   const elapsedMs =
@@ -134,14 +136,14 @@ export function formatOrchestratorChildStatus(
       ? undefined
       : Math.max(0, (state.pausedAt ?? now) - state.startedAt);
   return formatChildStatusLine({
-    ...(state.ref ? { ref: state.ref } : {}),
-    ...(state.total === undefined ? {} : { total: state.total }),
-    phase,
+    phase: state.phase,
+    ...(state.pausePending === undefined
+      ? {}
+      : { pausePending: state.pausePending }),
+    ...(state.retrying === undefined ? {} : { retrying: state.retrying }),
     ...(model ? { model } : {}),
     ...(state.stats ? { stats: state.stats } : {}),
     ...(elapsedMs === undefined ? {} : { elapsedMs }),
-    todoDone: state.todos.filter((item) => item.completed).length,
-    todoTotal: state.todos.length,
   });
 }
 

@@ -384,6 +384,57 @@ test("inspect reports the row, child and changed files", async () => {
   assert.match(result.text, /write the test/);
 });
 
+test("status names the frozen row and the child's todos (the report stays rich)", async () => {
+  const h = harness({
+    child: () => ({
+      phase: "running",
+      ref: "2",
+      total: 7,
+      modelLabel: "open/muse-spark",
+      stats: {
+        tokens: {
+          input: 12_000,
+          output: 3_000,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 15_000,
+        },
+        context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
+      },
+      elapsedMs: 83_000,
+      todos: [
+        { text: "a", completed: true },
+        { text: "b", completed: false },
+      ],
+    }),
+  });
+  const result = await h.operator.run("status");
+  assert.equal(result.ok, true);
+  assert.match(
+    result.text,
+    /child 2\/7 running · open\/muse-spark · ctx 43% \(86k\/200k\) · ↑12k ↓3\.0k · 01:23 · 1\/2 todos/,
+    "the multi-line report keeps the row pointer and the child's todo count",
+  );
+});
+
+test("the operator report uses the shared phase word", async () => {
+  const lineFor = async (child: Record<string, unknown>) => {
+    const h = harness({
+      child: () => ({ ref: "2", total: 7, todos: [], ...child }) as never,
+    });
+    const result = await h.operator.run("status");
+    return result.text.split("\n").find((line) => line.startsWith("child ")) ?? "";
+  };
+
+  assert.match(await lineFor({ phase: "settling" }), /^child 2\/7 verifying/);
+  assert.match(
+    await lineFor({ phase: "paused", pausePending: true }),
+    /^child 2\/7 pausing/,
+  );
+  assert.match(await lineFor({ phase: "paused" }), /^child 2\/7 paused/);
+  assert.match(await lineFor({ phase: "running", retrying: true }), /^child 2\/7 retrying/);
+});
+
 test("each operator alias resolves to the same verb", () => {
   for (const verb of ["pause", "resume", "abort", "view", "retry", "inspect", "say", "stop", "cancel"]) {
     assert.equal(parseOperatorArgs(verb).verb, verb);
