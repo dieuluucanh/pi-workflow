@@ -427,7 +427,6 @@ test("the compiler is the only plan parser: adapters keep no section/step logic"
     { file: "plan-checks.ts", uses: /from "\.\/plan-compiler\.ts"/ },
     { file: "todo-service.ts", uses: /extractPlanStepsFromMarkdown\s*\(/ },
     { file: "legacy-recovery.ts", uses: /createFrozenTodosFromPlan\s*\(/ },
-    { file: "review-tools.ts", uses: /reviewPlanSubmissionProblems\s*\(/ },
   ];
   const duplicateParsers = [
     /function\s+parseStepsFromLines\b/,

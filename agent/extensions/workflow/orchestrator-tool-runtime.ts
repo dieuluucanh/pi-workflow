@@ -2,10 +2,10 @@
  * Workflow Extension — parent tool adapters.
  *
  * `orchestrator-tools.ts` decides; this module turns a decision into a durable
- * effect. The surface is deliberately small: start, status, retry.
+ * effect. The surface is deliberately small: start, dispatch, status and retry.
  *
  * Acceptance is no longer a tool call. A settled child is verified, accepted
- * and followed by the next row inside `orchestrator-advance.ts`. The model only
+ * and followed by the next row inside the parent report loop. The model only
  * recovers a blocked row (retry) or explains a blocker/completion.
  */
 
@@ -16,12 +16,26 @@ import {
   type ToolContext,
 } from "./orchestrator-tools.ts";
 import type { OrchestratorRuntime } from "./orchestrator-runtime.ts";
+import type { OrchestratorRun } from "./orchestrator-run.ts";
 
 export const TOOL_ADAPTER_SCHEMA_VERSION = 2 as const;
 export const MAX_TOOL_TEXT = 2_000;
 
 export interface ParentToolPorts {
   runtime: () => OrchestratorRuntime | undefined;
+  /** The model-driven run record, when the new engine is active. */
+  run?: () => OrchestratorRun | undefined;
+  /** Dispatch one row with the parent's complete instruction. */
+  dispatch?: (input: {
+    rowRef?: string;
+    instructions: string;
+    cwd?: string;
+  }) => Promise<
+    | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  >;
+  /** Render the current run and its last child reports. */
+  statusText?: () => string;
   epoch: () => number;
   now?: () => number;
   /** Why this session may not orchestrate right now. */
@@ -156,6 +170,57 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
         return started.ok
           ? { ok: true, tool: name, text: started.text, details: started.details }
           : { ok: false, tool: name, code: started.code, text: started.text };
+      }
+
+      if (name === "orchestrator_status" && ports.statusText) {
+        const blocked = ports.eligible?.();
+        if (blocked) return { ok: false, tool: name, code: "unavailable", text: blocked };
+        return { ok: true, tool: name, text: ports.statusText(), details: {} };
+      }
+
+      if (
+        (name === "orchestrator_dispatch" || name === "orchestrator_retry") &&
+        ports.dispatch
+      ) {
+        const blocked = ports.eligible?.();
+        if (blocked) return { ok: false, tool: name, code: "unavailable", text: blocked };
+        const run = ports.run?.();
+        let rowRef =
+          typeof input.rowRef === "string" ? input.rowRef.trim() : undefined;
+        if (!rowRef && typeof input.taskId === "string") {
+          rowRef =
+            input.taskId.replace(/^task-/, "").replace(/^row-/, "").trim() ||
+            undefined;
+        }
+        if (name === "orchestrator_retry" && !rowRef) rowRef = run?.currentRef;
+        const stored = run?.rows.find((row) => row.ref === rowRef);
+        const instructions =
+          typeof input.instructions === "string" && input.instructions.trim()
+            ? input.instructions.trim()
+            : name === "orchestrator_retry"
+              ? (stored?.instruction ?? stored?.text ?? "")
+              : "";
+        if (!instructions) {
+          return {
+            ok: false,
+            tool: name,
+            code: "invalid",
+            text:
+              name === "orchestrator_dispatch"
+                ? "orchestrator_dispatch requires a complete `instructions` string for the row."
+                : "No stored instruction or row text is available to retry; pass `instructions`.",
+          };
+        }
+        const dispatched = await ports.dispatch({
+          ...(rowRef ? { rowRef } : {}),
+          instructions,
+          ...(typeof input.cwd === "string" && input.cwd.trim()
+            ? { cwd: input.cwd.trim() }
+            : {}),
+        });
+        return dispatched.ok
+          ? { ok: true, tool: name, text: dispatched.text, details: dispatched.details }
+          : { ok: false, tool: name, code: dispatched.code, text: dispatched.text };
       }
 
       const blocked = ports.eligible?.();

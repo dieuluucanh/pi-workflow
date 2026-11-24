@@ -35,12 +35,12 @@ export const EXECUTING_CHILD_PHASES: readonly OrchestratorChildPhase[] = [
   "settling",
 ];
 
-/** Frozen-run phases in which the run owns the session (no child required). */
-export const EXECUTING_RUN_PHASES: readonly RunPhase[] = [
-  "running",
-  "paused",
-  "blocked",
-];
+/**
+ * Frozen-run phases in which the run owns the session (no child required).
+ * A paused/blocked run is idle from the user's point of view: they may leave
+ * the mode or start a review. Only a live dispatch owns the session.
+ */
+export const EXECUTING_RUN_PHASES: readonly RunPhase[] = ["running"];
 
 export interface ExecutionOwnershipInput {
   childPhase?: OrchestratorChildPhase;

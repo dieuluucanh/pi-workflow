@@ -171,6 +171,23 @@ test("permissions: builder bypasses the gate entirely", () => {
   assert.equal(ROLE_POLICIES.builder.canWrite, true);
 });
 
+test("permissions: orchestrator has the same authority as builder", () => {
+  assert.equal(policyForRole("orchestrator").commandClass, "full");
+  assert.equal(policyForRole("orchestrator").canWrite, true);
+  for (const command of [
+    "rm -rf /",
+    "git push --force",
+    "npm install",
+    "sed -i 's/a/b/' file",
+  ]) {
+    assert.equal(
+      isCommandAllowedForRole("orchestrator", command),
+      true,
+      command,
+    );
+  }
+});
+
 test("permissions: empty/whitespace commands fail closed for restricted roles", () => {
   assert.equal(allowed("planner", ""), false);
   assert.equal(allowed("planner", "   "), false);

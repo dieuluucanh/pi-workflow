@@ -42,15 +42,21 @@ test("review policy: manual and resume bypass only the automatic flag", () => {
     { ok: true },
     "resume works with automatic off",
   );
-  // ...but ownership still applies.
+  // ...but a live dispatch still owns the session. A paused run is idle from
+  // the user's point of view and must not block a review round.
   for (const trigger of ["manual", "resume"] as const) {
     const refused = admitReviewer({
       trigger,
       mode: "plan",
-      runPhase: "paused",
+      runPhase: "running",
     });
     assert.equal(refused.ok, false);
     if (!refused.ok) assert.equal(refused.code, "executing-run");
+    assert.deepEqual(
+      admitReviewer({ trigger, mode: "plan", runPhase: "paused" }),
+      { ok: true },
+      "an idle/paused run does not own the session",
+    );
   }
 });
 

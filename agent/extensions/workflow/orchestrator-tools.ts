@@ -2,7 +2,7 @@
  * Workflow Extension — parent orchestration tools.
  *
  * The model sees exactly three tools: start, status and retry. Verification,
- * acceptance and repair are automatic: `orchestrator-advance.ts` decides from
+ * acceptance and repair are automatic: the parent report loop decides from
  * the child's settle, the row checks and the attributable diff. There is no
  * model-facing dispatch and no model-supplied evidence.
  *
@@ -21,6 +21,7 @@ export const MAX_STEPS = 200;
 
 export const ORCHESTRATOR_TOOL_NAMES = [
   "orchestrator_start",
+  "orchestrator_dispatch",
   "orchestrator_status",
   "orchestrator_retry",
 ] as const;
@@ -43,7 +44,7 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
     name: "orchestrator_start",
     description:
-      "Start an Orchestrator run: freeze the approved plan or the explicitly agreed standalone steps into one TODO row per step, then dispatch the first in-process Build child (no new window or tab). Call only after the user agrees; never ask for a separate execution approval.",
+      "Bind the approved plan or the agreed steps as mutable TODO rows, then wait for the parent to dispatch row by row. Pass one step per plan row in `steps`; the model reads the plan, the extension does not compile it. Call only after the user agrees.",
     parameters: {
       type: "object",
       properties: {
@@ -81,8 +82,35 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
     name: "orchestrator_status",
     description:
-      "Read the frozen run projection: phase, row states, the next row, the active child and any blocker. Read-only.",
+      "Read the current run: rows, TODO status, the active child phase and the last child report. Read-only.",
     parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    bounded: true,
+  },
+  {
+    name: "orchestrator_dispatch",
+    description:
+      "Dispatch one run row to an in-process Build child with a comprehensive instruction derived from the plan. Omit rowRef to take the first pending row. The child owns its TODO list and verification; its report wakes the parent. Do not auto-accept anything.",
+    parameters: {
+      type: "object",
+      properties: {
+        rowRef: {
+          type: "string",
+          description: "Row ref (1..N). Omit to dispatch the first pending row.",
+        },
+        instructions: {
+          type: "string",
+          description:
+            "The parent's complete instruction for this row: the plan step, its verification/gate, and any correction from a previous attempt.",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Optional workspace root for this row. Defaults to the session root.",
+        },
+      },
+      required: ["instructions"],
+      additionalProperties: false,
+    },
     bounded: true,
   },
   {

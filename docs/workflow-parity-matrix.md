@@ -1,3 +1,9 @@
+> **Superseded (2026-11-24).** The frozen plan contract and the automatic
+> acceptance engine described below were removed. Current flow: a normal
+> markdown plan, optional append-only review, then Direct Build or the
+> model-driven Orchestrator dispatcher. Old runs are not resumed. See the
+> README section "2026-11-24 — model-driven Orchestrator".
+
 # Workflow ↔ Pi Desktop parity inventory (frozen baseline)
 
 **Plan:** `.pi/plans/2026-11-22-prompt-refinement-workflow-parity.md`, rows 1 and 37

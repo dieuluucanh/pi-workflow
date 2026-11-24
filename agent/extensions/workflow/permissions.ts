@@ -76,18 +76,17 @@ export const ROLE_POLICIES: Record<WorkflowRole, RolePolicy> = {
     description: "read-only commands only",
   },
   /**
-   * The Orchestrator parent inspects and verifies; it never edits project
-   * sources. This is a DISTINCT identity from `planner`: sharing the planner
-   * role made every refusal say "Plan mode" and recommend `/build`, which is
-   * how the parent lost its mission. The command class is the same read-only
-   * plus verify limit; the difference is the identity and the remedy text.
+   * The Orchestrator parent has the same authority as the Builder. Delegation
+   * to a managed Build child is a prompt convention, not a permission cage:
+   * the parent may inspect, edit, verify and dispatch. Keeping a distinct
+   * identity lets refusal copy name the orchestration mission instead of
+   * claiming the session is in Plan mode.
    */
   orchestrator: {
     role: "orchestrator",
-    commandClass: "verify",
-    canWrite: false,
-    description:
-      "inspection plus test/lint/typecheck; project changes are delegated to managed Build children",
+    commandClass: "full",
+    canWrite: true,
+    description: "unrestricted (Build-equivalent; delegation is a convention)",
   },
   builder: {
     role: "builder",
@@ -1450,7 +1449,7 @@ export function describeCommandPolicy(command: unknown): string[] {
   });
 
   lines.push("Role verdicts:");
-  for (const role of ["planner", "reviewer", "explorer"] as const) {
+  for (const role of ["planner", "reviewer", "explorer", "orchestrator"] as const) {
     const refusal = explainCommandRefusal(role, raw);
     lines.push(
       refusal

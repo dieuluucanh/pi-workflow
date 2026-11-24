@@ -217,7 +217,7 @@ test("retry reports a failed dispatch without hiding the re-queue", async () => 
   assert.equal(next.getState().tasks["task-1"]!.state, "pending");
 });
 
-test("register exposes exactly start, status and retry", async () => {
+test("register exposes start, dispatch, status and retry", async () => {
   const fake = fakeRuntime();
   const tools = createParentToolRuntime(ports({ runtime: fake.runtime }));
   const names: string[] = [];
@@ -229,6 +229,7 @@ test("register exposes exactly start, status and retry", async () => {
   assert.deepEqual(registered.registered, [
     "orchestrator_start",
     "orchestrator_status",
+    "orchestrator_dispatch",
     "orchestrator_retry",
   ]);
   assert.deepEqual(names, registered.registered);

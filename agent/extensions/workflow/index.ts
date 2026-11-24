@@ -285,6 +285,15 @@ import {
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
 import { createOrchestratorRuntime, type OrchestratorRuntime } from "./orchestrator-runtime.ts";
+import {
+  createOrchestratorRun,
+  nextPendingRow,
+  recordDispatch,
+  recordReport,
+  restoreOrchestratorRun as restoreOrchestratorRunRecord,
+  runRow,
+  type OrchestratorRun,
+} from "./orchestrator-run.ts";
 import { parseRepairManifest } from "./orchestrator-repair-manifest.ts";
 import { createParentToolRuntime } from "./orchestrator-tool-runtime.ts";
 import { rowForTask } from "./orchestrator-state.ts";
@@ -330,17 +339,12 @@ import {
 import { orchestratorActivity } from "./orchestrator-activity.ts";
 import { createChildUiBridge, type ChildUiBridge } from "./orchestrator-child-ui.ts";
 import {
-  createOrchestratorAdvance,
-  type OrchestratorAdvance,
-} from "./orchestrator-advance.ts";
-import {
   ORCHESTRATOR_CHILD_BAND_ENTRY,
   ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY,
   formatOrchestratorChildProgress,
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
 import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
-import { parentRoadmapTodos, todoMutationDecision } from "./orchestrator-todo-runtime.ts";
 import {
   applyExecutionEvent,
   armExecution,
@@ -607,7 +611,7 @@ import {
   readOrchestratorLimits,
 } from "./orchestrator-config.ts";
 import { validateCommandShape, validatePlanCheckSpecs, extractPlanChecksWithWorkspaceDetailed } from "./plan-checks.ts";
-import { formatPlanLintReport, formatPlanPreview, lintPlan, planFreezeGate } from "./plan-lint.ts";
+import { formatPlanPreview, lintPlan } from "./plan-lint.ts";
 import {
   createCheckExecutor,
   createHeadlessCheckTransport,
@@ -1021,10 +1025,12 @@ export default function workflowExtension(
   const todos = createTodoStore("ordinary");
   /** Parent orchestration runtime (step 15); created per approved run. */
   let orchestratorRuntime: OrchestratorRuntime | undefined;
+  /** Model-driven run record: the plan path, rows, instructions and reports. */
+  let orchestratorRun: OrchestratorRun | undefined;
+  /** The parent's instruction for the row currently being dispatched. */
+  let orchestratorPendingInstruction: string | undefined;
   /** In-process Build child for the current row (no window/tab). */
   let orchestratorChild: OrchestratorChildController | undefined;
-  /** Automatic verify/accept/advance engine; owns acceptance evidence. */
-  let orchestratorAdvance: OrchestratorAdvance | undefined;
   let orchestratorChildView: "auto" | "parent" | "child" = "auto";
   /** One repaint clock for the child's elapsed time; created on first need. */
   let orchestratorStatsClock: StatsClock | undefined;
@@ -7711,7 +7717,10 @@ export default function workflowExtension(
   }
 
   function executionEvidenceRequired(ref: string): boolean {
-    return (frozenRowForRef(ref)?.acceptanceChecks.length ?? 0) > 0;
+    void ref;
+    // No parent-side check evidence: the child owns verification and the
+    // parent trusts its report. Completion is a model decision, not a gate.
+    return false;
   }
 
   function hasExecutionEvidence(ref: string): boolean {
@@ -8348,6 +8357,7 @@ export default function workflowExtension(
       todoRecoveryReceipt: todos.recoveryReceiptId ?? null,
       todoFrozen: todos.frozen ?? null,
       todoFrozenError: todos.frozenError ?? null,
+      orchestratorRun: orchestratorRun ?? null,
       execution: executionState ?? null,
     } as any);
     lastPersistedPlanFile = currentPlanFile;
@@ -10489,31 +10499,9 @@ export default function workflowExtension(
   try {
     pi.registerCommand("plan", {
       description:
-        "Enable Plan mode (read-only, idempotent). /plan lint [path] compiles the plan and prints rows, checks and diagnostics.",
+        "Enable Plan mode (read-only, idempotent). The plan is normal markdown; no lint step is required.",
       handler: async (args, ctx) => {
-        const text = typeof args === "string" ? args.trim() : "";
-        if (text === "lint" || text.startsWith("lint ")) {
-          const target = resolveReviewTarget(ctx, text.slice(4).trim() || undefined);
-          if (target.kind === "no-plan") {
-            ctx.ui.notify(
-              `No plan file found — write .pi/plans/${getUtcDatePrefix()}-<slug>.md first.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
-              "info",
-            );
-            return;
-          }
-          if (target.kind === "error") {
-            ctx.ui.notify(target.message, "warning");
-            return;
-          }
-          const result = lintPlan(target.target.text, {
-            path: target.target.display,
-          });
-          ctx.ui.notify(
-            formatPlanLintReport(result),
-            result.ok ? "info" : "warning",
-          );
-          return;
-        }
+        void args;
         await switchWorkflowMode("plan", ctx as any);
       },
     });
@@ -10527,31 +10515,9 @@ export default function workflowExtension(
   try {
     pi.registerCommand("workflow", {
       description:
-        "Enable Plan mode (alias for /plan). /workflow lint [path] compiles the plan and prints rows, checks and diagnostics.",
+        "Enable Plan mode (alias for /plan). The plan is normal markdown; no lint step is required.",
       handler: async (args, ctx) => {
-        const text = typeof args === "string" ? args.trim() : "";
-        if (text === "lint" || text.startsWith("lint ")) {
-          const target = resolveReviewTarget(ctx, text.slice(4).trim() || undefined);
-          if (target.kind === "no-plan") {
-            ctx.ui.notify(
-              `No plan file found — write .pi/plans/${getUtcDatePrefix()}-<slug>.md first.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
-              "info",
-            );
-            return;
-          }
-          if (target.kind === "error") {
-            ctx.ui.notify(target.message, "warning");
-            return;
-          }
-          const result = lintPlan(target.target.text, {
-            path: target.target.display,
-          });
-          ctx.ui.notify(
-            formatPlanLintReport(result),
-            result.ok ? "info" : "warning",
-          );
-          return;
-        }
+        void args;
         await switchWorkflowMode("plan", ctx as any);
       },
     });
@@ -11273,74 +11239,9 @@ export default function workflowExtension(
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      // Step 21: while a coordinated run owns this session, the list IS the
-      // parent projection of accepted coverage. A checkbox, `[DONE]`, or a
-      // child completion can never move it.
-      const projectParentTodoDetails = (
-        projection: ReturnType<typeof parentRoadmapTodos>,
-      ): TodoItem[] =>
-        projection.items.map((item) => ({
-          step: item.ref,
-          text: item.text,
-          completed: item.status === "completed",
-          status: item.status,
-          ref: String(item.ref),
-          label: String(item.ref),
-        }));
-      const parentView =
-        workflowMode === "orchestrator" && orchestratorRuntime
-          ? orchestratorRuntime.view()
-          : undefined;
-      if (parentView) {
-        const projection = parentRoadmapTodos(parentView.state);
-        const decision = todoMutationDecision("parent", params.action as never);
-        const rows = projection.items.length
-          ? projection.items
-              .map(
-                (item) =>
-                  `${item.ref}. [${item.status}] ${item.text}${
-                    item.acceptedCoverage ? " (accepted)" : ""
-                  }`,
-              )
-              .join("\n")
-          : "(no tasks proposed yet)";
-        const counts = `${projection.counts.accepted} accepted · ${projection.counts.pending} pending · ${projection.counts.blocked} blocked · ${projection.counts.cancelled} cancelled`;
-        if (!decision.allowed) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `${decision.reason ?? "The parent roadmap is display-only."}
-
-${counts}
-${rows}`,
-              },
-            ],
-            details: {
-              action: params.action,
-              owner: "parent",
-              todos: projectParentTodoDetails(projection),
-              nextStep: projection.items.length + 1,
-            } as TodoDetails,
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Parent roadmap projection (accepted coverage only) — run ${projection.runId}
-${counts}${projection.complete ? " · COMPLETE" : ""}
-${rows}`,
-            },
-          ],
-          details: {
-            action: "list",
-            owner: "parent",
-            todos: projectParentTodoDetails(projection),
-            nextStep: projection.items.length + 1,
-          } as TodoDetails,
-        };
-      }
+      // Step 21 is gone: an Orchestrator list is a normal mutable Build list.
+      // The parent owns the roadmap and may add, edit, reorder or complete rows.
+      void _ctx;
       const renderList = (items: TodoItem[]) => {
         const base = items.length
           ? `Steps are numbered GLOBALLY 1..${items.length}:
@@ -14316,68 +14217,6 @@ ${rows}`,
   // The model may report progress or a genuine blocker. It cannot pause,
   // resume, reset the shell guard, or mint completion evidence.
   pi.registerTool({
-    name: "plan_validate",
-    label: "Plan Validate",
-    description:
-      "Compile a plan and report rows, gate/diagnostic/manual check counts, the exact final commands, workspaces, timeouts and every warning/error with a line number. Read-only: never freezes, writes or executes. Use before approval and after editing a plan.",
-    promptSnippet: "Lint the current plan before approval (rows, checks, diagnostics)",
-    promptGuidelines: [
-      "plan_validate: run this after writing or editing the plan, before asking the user to approve it.",
-      "plan_validate: an error means the plan cannot be frozen — fix the reported line and re-run.",
-      "plan_validate: a plan with zero final gate checks is unverifiable and requires the user's explicit acknowledgement.",
-    ],
-    parameters: Type.Object({
-      path: Type.Optional(
-        Type.String({
-          description:
-            "Plan file under .pi/plans/ (relative or absolute). Omit to lint the current session plan.",
-        }),
-      ),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      const target = resolveReviewTarget(ctx, params.path);
-      if (target.kind === "no-plan") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `plan_validate: no plan file found.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
-            },
-          ],
-          details: { ok: false, error: "no-plan" },
-        };
-      }
-      if (target.kind === "error") {
-        return {
-          content: [{ type: "text", text: `plan_validate: ${target.message}` }],
-          details: { ok: false, error: "unresolved" },
-        };
-      }
-      const result = lintPlan(target.target.text, {
-        path: target.target.display,
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatPlanLintReport(result),
-          },
-        ],
-        details: {
-          ok: result.ok,
-          rows: result.assessment.rows,
-          gates: result.assessment.gate,
-          diagnostics: result.assessment.diagnostic,
-          manual: result.assessment.manual,
-          needsAcknowledgement: result.assessment.needsAcknowledgement,
-          errors: result.diagnostics.filter((d) => d.severity === "error").length,
-          warnings: result.diagnostics.filter((d) => d.severity === "warning").length,
-        },
-      };
-    },
-  });
-
-  pi.registerTool({
     name: "workflow_execution",
     label: "Workflow Execution",
     description:
@@ -14597,129 +14436,200 @@ ${rows}`,
         text: "Orchestrator start is available in Orchestrator mode only. Enter it with /orchestrator.",
       };
     }
-    const existing = orchestratorRuntime?.view();
-    if (existing) {
+    if (orchestratorRun) {
       return {
         ok: false,
         code: "state",
-        text: `Run ${existing.runId} is already active. Use orchestrator_status; stop it before starting another frozen list.`,
+        text: `Run ${orchestratorRun.runId} is already active. Use orchestrator_status; stop it before starting another run.`,
       };
     }
-    const runtime = ensureOrchestratorRuntime(owner);
-    let started: Awaited<ReturnType<typeof runtime.startFromPlan>>;
+    const steps = (input.steps ?? [])
+      .map((step) => String(step ?? "").replace(/\s+/g, " ").trim())
+      .filter((step) => step.length > 0);
+    if (steps.length === 0) {
+      return {
+        ok: false,
+        code: "invalid",
+        text:
+          "Read the approved plan and pass one step per row as `steps`. The plan is a normal markdown document; the model extracts the rows, the extension does not compile it.",
+      };
+    }
+    let planPath: string | undefined;
     if (typeof input.planPath === "string" && input.planPath.trim().length > 0) {
-      const abs = path.isAbsolute(input.planPath)
+      planPath = path.isAbsolute(input.planPath)
         ? input.planPath
         : path.resolve(orchestratorRoot(), input.planPath);
-      let text = input.planText;
-      if (text === undefined) {
-        try {
-          text = await fs.promises.readFile(abs, "utf8");
-        } catch (error: unknown) {
-          return {
-            ok: false,
-            code: "missing",
-            text: `The plan could not be read: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        }
-      }
-      const resolved = await resolveWorkspaceSet({
-        primaryRoot: orchestratorRoot(),
-        declarations: parseWorkspaceDeclarations(text),
-        overrides: (input.workspaces ?? []).map((entry, index) => ({
-          id:
-            entry.id ??
-            (entry.path === orchestratorRoot() ? "W" : `R${index + 1}`),
-          path: entry.path,
-        })),
-        resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
-        broadRootReason: (root) => broadGrantRootReason(root, orchestratorRoot()),
-      });
-      if (!resolved.ok) {
-        return { ok: false, code: "invalid", text: resolved.error };
-      }
-      started = await runtime.startFromPlan({
-        planPath: abs,
-        planText: text,
-        workspaces: resolved.value.roots,
-      });
-    } else {
-      const steps = (input.steps ?? [])
-        .map((step) => step.replace(/\s+/g, " ").trim())
-        .filter((step) => step.length > 0);
-      if (steps.length === 0) {
+      try {
+        await fs.promises.access(planPath);
+      } catch (error: unknown) {
         return {
           ok: false,
-          code: "invalid",
-          text: "Provide an approved planPath or at least one explicitly agreed step.",
+          code: "missing",
+          text: `The plan could not be read: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
-      const resolved = await resolveWorkspaceSet({
-        primaryRoot: orchestratorRoot(),
-        overrides: (input.workspaces ?? []).map((entry, index) => ({
-          id:
-            entry.id ??
-            (entry.path === orchestratorRoot() ? "W" : `R${index + 1}`),
-          path: entry.path,
-        })),
-        resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
-        broadRootReason: (root) => broadGrantRootReason(root, orchestratorRoot()),
-      });
-      if (!resolved.ok) {
-        return { ok: false, code: "invalid", text: resolved.error };
-      }
-      started = await runtime.startFromSteps({
-        title: input.title?.trim() || "Orchestrator work",
-        steps,
-        workspaces: resolved.value.roots,
-        sourcePath: path.join(
-          getAgentDir(),
-          "orchestrator",
-          "sources",
-          `standalone-${Date.now()}.md`,
-        ),
-      });
     }
-    if (!started.ok) {
-      return { ok: false, code: started.code, text: started.error };
-    }
-    const placed = todos.freeze(started.value.frozen);
-    if (!placed.ok) {
-      return {
-        ok: false,
-        code: "state",
-        text: `The run started but its frozen TODO list could not be installed: ${placed.error}`,
-      };
-    }
-    currentPlanFile =
-      input.planPath === undefined ? currentPlanFile : path.resolve(orchestratorRoot(), input.planPath);
+    orchestratorRun = createOrchestratorRun({
+      ...(input.title !== undefined ? { title: input.title } : {}),
+      ...(planPath !== undefined ? { planPath } : {}),
+      steps,
+    });
+    todos.replace(
+      steps.map((text, index) => ({
+        step: index + 1,
+        text,
+        completed: false,
+      })),
+    );
+    if (planPath !== undefined) currentPlanFile = planPath;
     persistState();
     updateStatus(owner);
-    const view = started.value.view;
-    const dispatched = await dispatchNextOrchestratorTask();
-    if (!dispatched.ok) {
-      return {
-        ok: false,
-        code: dispatched.code,
-        text: `Run ${view.runId} was frozen with ${view.todos.rows.length} step(s), but the first child could not start: ${dispatched.text}`,
-      };
-    }
     return {
       ok: true,
-      text: `Orchestrator run ${view.runId} started with ${view.todos.rows.length} frozen step(s) across ${(view.todos.workspaces ?? []).length || 1} workspace(s).
-${dispatched.text}`,
+      text: `Orchestrator run ${orchestratorRun.runId} created with ${steps.length} row(s). Read the plan, then call orchestrator_dispatch with the row instruction.`,
       details: {
-        runId: view.runId,
-        taskCount: view.todos.rows.length,
-        ...(view.nextTaskId ? { nextTaskId: view.nextTaskId } : {}),
-        dispatched: true,
-        ...dispatched.details,
+        runId: orchestratorRun.runId,
+        taskCount: steps.length,
       },
+    };
+  }
+
+  function orchestratorStatusText(): string {
+    const run = orchestratorRun;
+    if (!run) {
+      return "No Orchestrator run is bound to this session. Call orchestrator_start with the plan's steps.";
+    }
+    const lines = [
+      `Run ${run.runId} · ${run.phase} · ${run.title}`,
+      ...(run.planPath ? [`Plan: ${run.planPath}`] : []),
+    ];
+    for (const row of run.rows) {
+      const item = todos.items.find((candidate) => todoRef(candidate) === row.ref);
+      lines.push(`${row.ref}. [${item?.status ?? "pending"}] ${row.text}`);
+      if (row.lastReport) {
+        lines.push(
+          `   report: ${row.lastReport.replace(/\s+/g, " ").slice(0, 400)}`,
+        );
+      }
+    }
+    const child = orchestratorChild?.state();
+    lines.push(
+      `Child: ${child?.phase ?? "idle"}${child?.modelLabel ? ` · ${child.modelLabel}` : ""}`,
+    );
+    return lines.join("\n");
+  }
+
+  async function dispatchOrchestratorRow(input: {
+    rowRef?: string;
+    instructions: string;
+    cwd?: string;
+  }): Promise<
+    | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  > {
+    const run = orchestratorRun;
+    if (!run) {
+      return {
+        ok: false,
+        code: "unavailable",
+        text: "No Orchestrator run is bound. Call orchestrator_start first.",
+      };
+    }
+    const phase = orchestratorChild?.state().phase;
+    if (
+      phase === "starting" ||
+      phase === "running" ||
+      phase === "settling" ||
+      phase === "paused"
+    ) {
+      return {
+        ok: false,
+        code: "busy",
+        text: `A child is already ${phase}. Wait for its report, or pause/abort it first.`,
+      };
+    }
+    const completed = (ref: string) =>
+      todos.items.find((item) => todoRef(item) === ref)?.completed === true;
+    const rowRef = input.rowRef?.trim() || nextPendingRow(run, completed)?.ref;
+    if (!rowRef) {
+      return {
+        ok: false,
+        code: "done",
+        text: "Every row is completed. Run the plan's final verification if it has one.",
+      };
+    }
+    const row = runRow(run, rowRef);
+    if (!row) {
+      return { ok: false, code: "invalid", text: `Unknown row ${rowRef}.` };
+    }
+    const instructions = input.instructions.trim();
+    if (!instructions) {
+      return {
+        ok: false,
+        code: "invalid",
+        text: "A complete `instructions` string is required.",
+      };
+    }
+    const owner = currentSessionCtx;
+    if (!owner) {
+      return { ok: false, code: "unavailable", text: "No live parent session." };
+    }
+    const controller = ensureOrchestratorChildController(owner);
+    const attemptId = `row-${row.ref}-attempt-${Date.now().toString(36)}`;
+    const sessionId = `orch-child-${attemptId}`;
+    const taskId = `row-${row.ref}`;
+    const total = run.rows.length;
+    const prepared = await controller.prepare({
+      taskId,
+      attemptId,
+      ref: row.ref,
+      total,
+      sessionId,
+    });
+    if (!prepared.ok) {
+      return {
+        ok: false,
+        code: "preflight",
+        text: `The Build child could not start: ${prepared.error}. Nothing changed.`,
+      };
+    }
+    orchestratorPendingInstruction = instructions;
+    const started = await controller.start({
+      taskId,
+      attemptId,
+      ref: row.ref,
+      total,
+      sessionId,
+    });
+    if (!started.ok) {
+      orchestratorPendingInstruction = undefined;
+      return {
+        ok: false,
+        code: "child",
+        text: `The Build child could not start: ${started.error}.`,
+      };
+    }
+    orchestratorRun = recordDispatch(run, {
+      rowRef: row.ref,
+      instruction: instructions,
+      childSessionId: sessionId,
+    });
+    orchestratorPendingInstruction = undefined;
+    todos.setStatus(row.ref, "in_progress");
+    persistState();
+    updateStatus(owner);
+    return {
+      ok: true,
+      text: `Dispatched row ${row.ref}/${total} to an in-process Build child. The child owns verification; its report will wake you.`,
+      details: { runId: run.runId, rowRef: row.ref, attemptId, sessionId },
     };
   }
 
   const parentTools = createParentToolRuntime({
     runtime: () => orchestratorRuntime,
+    run: () => orchestratorRun,
+    statusText: () => orchestratorStatusText(),
+    dispatch: async (input) => dispatchOrchestratorRow(input),
     epoch: () => orchestrationEpoch,
     startEligible: () => {
       if (workflowMode !== "orchestrator") {
@@ -14731,7 +14641,7 @@ ${dispatched.text}`,
       if (workflowMode !== "orchestrator") {
         return "Orchestration tools are available in Orchestrator mode only. Enter it with /orchestrator.";
       }
-      if (!orchestratorRuntime) {
+      if (!orchestratorRuntime && !orchestratorRun) {
         return "No run is bound to this session yet. Call orchestrator_start with the approved plan or the explicitly agreed steps.";
       }
       return undefined;
@@ -15857,6 +15767,10 @@ ${dispatched.text}`,
                 ? { frozenError: d.todoFrozenError }
                 : {}),
             });
+            if (d.orchestratorRun !== undefined) {
+              orchestratorRun =
+                restoreOrchestratorRunRecord(d.orchestratorRun) ?? orchestratorRun;
+            }
             if (
               d.execution &&
               typeof d.execution === "object" &&
@@ -16491,6 +16405,10 @@ ${dispatched.text}`,
                 ? { frozenError: e.data.todoFrozenError }
                 : {}),
             });
+            if (e.data.orchestratorRun !== undefined) {
+              orchestratorRun =
+                restoreOrchestratorRunRecord(e.data.orchestratorRun) ?? orchestratorRun;
+            }
             if (e.data.planFile) todos.planPath = e.data.planFile;
           }
           if (
@@ -18094,10 +18012,7 @@ ${dispatched.text}`,
     if (restricted && event.toolName === "powershell") {
       return {
         block: true,
-        reason:
-          gateRole === "orchestrator"
-            ? "orchestrator role: the powershell tool is blocked. The Orchestrator parent inspects and verifies only; project changes are delegated to a managed Build child."
-            : `${gateRole} role: the powershell tool is blocked (use bash with allowlisted read-only/verify commands, or /build for unrestricted access).`,
+        reason: `${gateRole} role: the powershell tool is blocked (use bash with allowlisted read-only/verify commands, or /build for unrestricted access).`,
       } as any;
     }
 
@@ -18133,15 +18048,9 @@ ${dispatched.text}`,
           gateRole === "planner" && refusal.kind === "forbidden-syntax"
             ? ' Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.'
             : "";
-        let hint: string;
-        if (gateRole === "orchestrator") {
-          hint =
-            " The Orchestrator parent must not mutate the workspace itself: prepare the work, propose a breakdown, and dispatch a managed Build child.";
-        } else {
-          hint = refusal.suggestion
-            ? ` ${refusal.suggestion}`
-            : " Use /build or Tab for unrestricted access.";
-        }
+        const hint = refusal.suggestion
+          ? ` ${refusal.suggestion}`
+          : " Use /build or Tab for unrestricted access.";
         return {
           block: true,
           reason: `${gateRole} role: command blocked (${gatePolicy?.description ?? "restricted"}) — ${refusal.detail}.${hint}${planHint}\nCommand: ${cmd}`,
@@ -18162,17 +18071,11 @@ ${dispatched.text}`,
     }
     if (
       (event.toolName === "edit" || event.toolName === "write") &&
-      (workflowMode === "plan" || workflowMode === "orchestrator")
+      workflowMode === "plan"
     ) {
       const p =
         (event.input as any).path || (event.input as any).file_path || "";
       if (!isPlanWritePath(p, cwd)) {
-        if (workflowMode === "orchestrator") {
-          return {
-            block: true,
-            reason: `Orchestrator parent: ${event.toolName} is blocked. The parent inspects and verifies; it does not edit project sources. Prepare the work and dispatch a managed Build child (orchestrator_prepare → orchestrator_propose_tasks → approval → orchestrator_dispatch). Do not switch to /build for orchestration work.`,
-          } as any;
-        }
         return {
           block: true,
           reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /build or Tab to switch to Build mode.`,
@@ -19054,14 +18957,14 @@ ${dispatched.text}`,
       // findings, or transcript (requirement: Plan cannot see Review's context).
       // Automatic review only — manual `/review` bypasses via "manual" trigger.
       const reviewNote = reviewEnabled()
-        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and may rewrite it before you see it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required revisions to the plan file. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
         : "";
       return {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File redirects (> and >>) to real files, installs, sed/awk, mkdir outside .pi/plans and the powershell tool stay blocked — but 2>/dev/null and 2>&1 are allowed. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification. Per-step metadata lines: label, Checks:, Files:, Workspaces:, Acceptance: (prose only).\n- Executable checks: only a fenced one-command-per-line bash block in ## Verification or a whole-bullet code span runs, e.g. \`\`\`bash\npnpm test\n\`\`\`. An optional fenced \`\`\`checks block adds kind (gate|diagnostic|manual), timeoutMs, workspace and expectedExitCode. \`Acceptance:\` is evidence and is NEVER executed. Never mix a command with prose in one bullet — the plan is refused with a line number. Do not put backticks around only part of a command. Limits: 12 checks per row/final gate, 20 Files entries, 8 workspaces, 4000 chars per command. A plan with zero \`gate\` final checks is unverifiable and needs the user's explicit acknowledgement before freeze. Run \`/plan lint\` (or the plan_validate tool) after writing/editing to preview exactly what will run.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write a plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars. A normal, readable markdown document is enough. Recommended: # Plan: <title>, ## Context, ## Steps (a numbered list, one executable step per row), optional ## Verification (commands to run at the end). No special schema, no checks block, no minimum gate count.\n- The plan is a document, not a contract. The executor reads it and creates the TODO rows; an indented heading or a differently numbered list is still a valid plan.\n- If the plan declares a final verification, put the commands in ## Verification as a fenced block; the parent runs them after the last row.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -19407,41 +19310,9 @@ ${dispatched.text}`,
       autoSelect?: boolean;
     },
   ): Promise<boolean> {
-    // Pre-approval gate (Phase B, step 10): compile the plan the user is
-    // approving before it can be frozen. A plan that does not compile is
-    // refused; a compilable plan with no final `gate` check needs an explicit
-    // acknowledgement instead of freezing silently.
-    let gateText =
-      typeof input.planText === "string" ? input.planText : "";
-    if (!gateText.trim()) {
-      try {
-        gateText = fs.readFileSync(input.decision.planPath, "utf8");
-      } catch (_e) {
-        void _e;
-      }
-    }
-    if (gateText.trim()) {
-      const lint = lintPlan(gateText, { path: input.decision.planPath });
-      const gate = planFreezeGate(lint);
-      if (!gate.ok) {
-        if (gate.needsAcknowledgement && (ctx as any).hasUI === true) {
-          const confirmed = await ctx.ui.confirm(
-            "Freeze an unverifiable plan?",
-            `${formatPlanPreview(lint)}\n\n${gate.error}\n\nFreeze this plan anyway?`,
-          );
-          if (!confirmed) {
-            ctx.ui.notify(
-              "Plan not approved — add a final gate check (a fenced command block or a checks: block) and approve again.",
-              "warning",
-            );
-            return false;
-          }
-        } else {
-          ctx.ui.notify(`Plan not approved — ${gate.error}.`, "warning");
-          return false;
-        }
-      }
-    }
+    // Approval is the user's decision, not a schema check. The plan is a
+    // normal markdown document; the executor reads it and creates the TODO
+    // rows. No compile, no gate count and no acknowledgement prompt here.
     const approved = approveHandoffPlan(input.decision, {
       now: Date.now(),
       via: input.via,
@@ -19861,41 +19732,6 @@ ${dispatched.text}`,
   }
 
   /** Mirror runtime ownership into the single panel TODO store. */
-  function syncOrchestratorTodos(): void {
-    const view = orchestratorRuntime?.view();
-    if (!view || todos.items.length === 0) return;
-    const byRef = new Map<string, string>();
-    for (const taskId of view.state.order) {
-      const row = rowForTask(view.state, taskId);
-      if (!row) continue;
-      const state = view.state.tasks[taskId]?.state;
-      byRef.set(
-        row.ref,
-        state === "accepted"
-          ? "completed"
-          : state === "running" || state === "candidate" || state === "needs_fix"
-            ? "in_progress"
-            : "pending",
-      );
-    }
-    if (byRef.size === 0) return;
-    const updates = todos.items.map((item) => ({
-      id: item.id,
-      ref: todoRef(item),
-      text: item.text,
-      status: (byRef.get(todoRef(item)) ?? itemStatus(item)) as TodoStatus,
-    }));
-    const applied = todos.update(updates);
-    if (!applied.refused) {
-      try {
-        updateStatusIfBound();
-        persistState();
-      } catch (_e) {
-        void _e;
-      }
-    }
-  }
-
   function builderModelPlan():
     | { provider: string; id: string; thinking?: string }
     | undefined {
@@ -20204,98 +20040,6 @@ ${dispatched.text}`,
   }
 
   /** Build the automatic verify/accept/advance engine once per composition. */
-  function ensureOrchestratorAdvance(): OrchestratorAdvance {
-    if (orchestratorAdvance) return orchestratorAdvance;
-    orchestratorAdvance = createOrchestratorAdvance({
-      runtime: () => orchestratorRuntime,
-      child: () => orchestratorChild,
-      diff: (taskId, expectedFiles, workspaceIds) =>
-        diffOrchestratorWorkspace(taskId, expectedFiles, workspaceIds),
-      runRowChecks: async (commands, workspaceRoot, changedRoots) => {
-        // Every row check goes through the shared executor: malformed command
-        // bytes fail closed as metadata and never reach a shell, and the
-        // failure class decides whether a repair round is allowed. Changed
-        // roots travel with the hint so a multi-repo row that names no
-        // workspace either resolves the one changed root or fails closed.
-        const executor = createSessionCheckExecutor(currentSessionCtx);
-        const outcome = await executor.executeMany(
-          commands,
-          {
-            ...(workspaceRoot === undefined ? {} : { boundRoot: workspaceRoot }),
-            ...(changedRoots === undefined ? {} : { changedRoots }),
-          },
-          currentSessionCtx?.signal ? { signal: currentSessionCtx.signal } : undefined,
-        );
-        const results = outcome.results.map((result) => ({
-          command: result.command.slice(0, 200),
-          ok: result.ok,
-          output: (result.output || result.message).slice(0, 2_000),
-        }));
-        if (outcome.ok) return { ok: true, results };
-        const failed = outcome.results.find((result) => !result.ok);
-        return {
-          ok: false,
-          results,
-          failure: `${failed?.failureClass === "metadata" ? "row check metadata invalid" : "row check failed"}: ${(failed?.command ?? "").slice(0, 200)}${
-            failed?.message ? ` — ${failed.message.slice(0, 500)}` : ""
-          }`,
-          // Only `test`/`timeout` may repair; metadata/policy/environment block
-          // and a manual result can never be auto-accepted. The class chooses
-          // the concrete fix the block message shows.
-          ...(failed?.failureClass === undefined
-            ? {}
-            : { failureClass: failed.failureClass }),
-          repairable: failed?.repairable ?? false,
-        };
-      },
-      runFinalChecks: () => runFinalPlanChecks(),
-      dispatchNext: async () => {
-        const dispatched = await dispatchNextOrchestratorTask();
-        return { ok: dispatched.ok, text: dispatched.text };
-      },
-      notify: (message, level) => {
-        try {
-          currentSessionCtx?.ui.notify(message, level ?? "info");
-        } catch {
-          /* display-only */
-        }
-      },
-      contextMessage: (message) => {
-        try {
-          void (pi as any).sendMessage?.(
-            {
-              customType: "workflow-orchestrator-context",
-              content: message,
-              display: false,
-            },
-            { triggerTurn: false, deliverAs: "followUp" },
-          );
-        } catch {
-          /* display-only */
-        }
-      },
-      triggerTurn: (message) => {
-        try {
-          void (pi as any).sendMessage?.(
-            {
-              customType: "workflow-orchestrator-advance",
-              content: message,
-              display: true,
-            },
-            { triggerTurn: true, deliverAs: "followUp" },
-          );
-        } catch {
-          /* display-only */
-        }
-      },
-      onTodosChanged: () => {
-        syncOrchestratorTodos();
-        updateStatusIfBound();
-      },
-    });
-    return orchestratorAdvance;
-  }
-
   function ensureOrchestratorChildController(
     ctx: ExtensionContext,
   ): OrchestratorChildController {
@@ -20318,17 +20062,21 @@ ${dispatched.text}`,
       },
     );
     let lastBandPhase: string | undefined;
+    const runContext = (input: {
+      ref: string;
+      total: number;
+      taskId: string;
+      attemptId: string;
+    }): { run: OrchestratorRun | undefined; row: ReturnType<typeof runRow> } => {
+      const run = orchestratorRun;
+      return { run, row: run ? runRow(run, input.ref) : undefined };
+    };
     orchestratorChild = createOrchestratorChildController({
-      // The controller reconciles a prepared child (and a resume) against this,
-      // so a profile switch that races child creation is still honoured.
       desiredModel: () => builderModelPlan(),
-      // A reduced `workflow.orchestrator.childTimeoutMs` is enforced, not
-      // ignored; the frozen default is only used when no setting is present.
       timeoutMs: orchestratorLimitsFor(ctx).config.childTimeoutMs,
       create: async (input) => {
-        const view = orchestratorRuntime?.view();
-        const row = view ? rowForTask(view.state, input.taskId) : undefined;
-        if (!view || !row) return { ok: false, error: "the frozen row is missing" };
+        const { run, row } = runContext(input);
+        if (!run || !row) return { ok: false, error: "the run row is missing" };
         const plan = builderModelPlan();
         if (!plan) {
           return {
@@ -20337,25 +20085,10 @@ ${dispatched.text}`,
               "no Builder model is configured — set /role set builder <provider/model> or choose a profile",
           };
         }
-        const workspaceSet = workspaceSetForRun();
-        const workspaceRoot = workspaceRootForRow(workspaceSet, row);
-        const cwd = workspaceRoot?.root ?? orchestratorRoot();
-        const workspaceContext = workspaceRoot
-          ? {
-              id: workspaceRoot.id,
-              root: workspaceRoot.root,
-              primary: workspaceRoot.primary,
-              roots: workspaceSet.roots.map((workspace) => ({
-                id: workspace.id,
-                root: workspace.root,
-                primary: workspace.primary,
-              })),
-            }
-          : undefined;
         const built = await createChild({
           context: {
             version: ORCHESTRATOR_CHILD_VERSION,
-            runId: view.runId,
+            runId: run.runId,
             taskId: input.taskId,
             attemptId: input.attemptId,
             ref: input.ref,
@@ -20363,10 +20096,9 @@ ${dispatched.text}`,
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
-            ...(workspaceContext === undefined ? {} : { workspace: workspaceContext }),
             createdAt: Date.now(),
           },
-          cwd,
+          cwd: orchestratorRoot(),
           agentDir,
           modelRef: {
             provider: plan.provider,
@@ -20395,27 +20127,30 @@ ${dispatched.text}`,
           : { ok: false, error: built.error ?? "child creation failed" };
       },
       buildPrompt: (input) => {
-        const view = orchestratorRuntime?.view();
-        const row = view ? rowForTask(view.state, input.taskId) : undefined;
-        if (!view || !row) return "Work on the assigned frozen row.";
-        const workspaceSet = workspaceSetForRun();
-        const workspaceRoot = workspaceRootForRow(workspaceSet, row);
-        const workspaceContext = workspaceRoot
-          ? {
-              id: workspaceRoot.id,
-              root: workspaceRoot.root,
-              primary: workspaceRoot.primary,
-              roots: workspaceSet.roots.map((workspace) => ({
-                id: workspace.id,
-                root: workspace.root,
-                primary: workspace.primary,
-              })),
-            }
-          : undefined;
+        const { run, row } = runContext(input);
+        if (!run || !row) return "Work on the assigned run row.";
+        const instruction =
+          orchestratorPendingInstruction ??
+          row.instruction ??
+          "Implement this row, run its verification, and report back.";
+        // The child kickoff still carries the legacy row fields; this plain
+        // adapter supplies empty lists so the prompt focuses on the text and
+        // the parent's instruction.
+        const frozenRow = {
+          id: `row-${row.ref}`,
+          ref: row.ref,
+          text: `${row.text}\n\n## Parent instructions\n${instruction}`,
+          source: "steps",
+          status: "pending",
+          acceptanceChecks: [],
+          acceptanceCriteria: [],
+          expectedFiles: [],
+          workspaces: [],
+        } as any;
         return buildOrchestratorChildKickoff({
           context: {
             version: ORCHESTRATOR_CHILD_VERSION,
-            runId: view.runId,
+            runId: run.runId,
             taskId: input.taskId,
             attemptId: input.attemptId,
             ref: input.ref,
@@ -20423,10 +20158,9 @@ ${dispatched.text}`,
             parentSessionRef: sessionRefFor(),
             mode: "build",
             mayOrchestrate: false,
-            ...(workspaceContext === undefined ? {} : { workspace: workspaceContext }),
             createdAt: Date.now(),
           },
-          row,
+          row: frozenRow,
           ...(input.repair ? { repair: input.repair } : {}),
         });
       },
@@ -20434,7 +20168,7 @@ ${dispatched.text}`,
         const state = orchestratorChild?.state();
         try {
           pi.appendEntry(ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY, {
-            runId: orchestratorRuntime?.view()?.runId ?? "",
+            runId: orchestratorRun?.runId ?? "",
             taskId: state?.taskId ?? "",
             ref: state?.ref ?? "",
             total: state?.total ?? 0,
@@ -20458,7 +20192,7 @@ ${dispatched.text}`,
           ) {
             lastBandPhase = phase;
             pi.appendEntry(ORCHESTRATOR_CHILD_BAND_ENTRY, {
-              runId: orchestratorRuntime?.view()?.runId ?? "",
+              runId: orchestratorRun?.runId ?? "",
               taskId: state.taskId,
               ref: state.ref ?? "?",
               total: state.total ?? 0,
@@ -20479,19 +20213,64 @@ ${dispatched.text}`,
         }
       },
       onSettled: async (settled) => {
-        await ensureOrchestratorAdvance().settled(settled);
+        const run = orchestratorRun;
+        const ref = orchestratorChild?.state().ref ?? run?.currentRef;
+        if (run && ref) {
+          orchestratorRun = recordReport(run, {
+            rowRef: ref,
+            report: settled.summary,
+          });
+          persistState();
+          wakeParentWithReport(ref, settled.summary);
+        }
         updateStatusIfBound();
       },
-      onError: async ({ taskId, error }) => {
-        await ensureOrchestratorAdvance().failed({ taskId, attemptId: orchestratorChild?.state().attemptId ?? "", error });
+      onError: async ({ error }) => {
+        const run = orchestratorRun;
+        const ref = orchestratorChild?.state().ref ?? run?.currentRef;
+        if (run && ref) {
+          const report = `Child failed: ${error}`;
+          orchestratorRun = recordReport(run, { rowRef: ref, report });
+          persistState();
+          wakeParentWithReport(ref, report);
+        }
         updateStatusIfBound();
       },
-      onAborted: async ({ taskId, reason }) => {
-        await ensureOrchestratorAdvance().aborted({ taskId, attemptId: orchestratorChild?.state().attemptId ?? "", reason });
+      onAborted: async ({ reason }) => {
+        const run = orchestratorRun;
+        const ref = orchestratorChild?.state().ref ?? run?.currentRef;
+        if (run && ref) {
+          const report = `Child aborted: ${reason}`;
+          orchestratorRun = recordReport(run, { rowRef: ref, report });
+          persistState();
+          wakeParentWithReport(ref, report);
+        }
         updateStatusIfBound();
       },
     });
     return orchestratorChild;
+  }
+
+  function wakeParentWithReport(ref: string, report: string): void {
+    const text = [
+      `[ORCHESTRATOR CHILD REPORT — row ${ref}]`,
+      "",
+      report.slice(0, 8_000),
+      "",
+      "Review the report. If it is successful, mark the row done with workflow_todo and call orchestration_dispatch for the next row. If it is blocked, inspect the root cause, amend the row instruction and re-dispatch the same row.",
+    ].join("\n");
+    try {
+      void (pi as any).sendMessage?.(
+        {
+          customType: "workflow-orchestrator-report",
+          content: text,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch {
+      /* display-only */
+    }
   }
 
   /** Dispatch the next pending frozen row into the in-process Build child. */
@@ -20801,7 +20580,6 @@ ${dispatched.text}`,
 
   function resetOrchestratorComposition(): void {
     orchestratorBaseline = undefined;
-    orchestratorAdvance = undefined;
     // A rebind/shutdown must not leave a repaint interval behind: it would
     // write into a session that no longer exists.
     try {

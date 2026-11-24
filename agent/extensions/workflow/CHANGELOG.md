@@ -1,5 +1,32 @@
 ## Unreleased
 
+### Breaking — model-driven Orchestrator and append-only review (2026-11-24)
+
+- **Orchestrator has Build permissions.** `ROLE_POLICIES.orchestrator` is now
+  `commandClass: "full"`, `canWrite: true`; the mode keeps `edit`/`write` and no
+  longer refuses bash/powershell. Delegation to a child is a prompt convention,
+  not a permission cage. An idle/paused run no longer blocks a mode switch.
+- **The plan contract is removed.** `plan_validate`, `/plan lint`, `/workflow lint`,
+  the freeze gate, the zero-gate acknowledgement, `plan-compiler`/`plan-spec`
+  validation on approval and the executable-check schema are gone. A plan is a
+  normal markdown document; the model extracts the TODO rows.
+- **Review appends, never rewrites.** `review_submit_plan` is replaced by
+  `review_submit` (findings, verdict, summary, revisions). The harness appends a
+  `## Reviewer Revisions (round N)` section and preserves the original body.
+  The chunked `review_plan_begin`/`chunk`/`finalize` write path is not registered.
+- **No frozen run.** The TODO list is mutable in every mode. Run metadata is a
+  session-entry record (plan path, rows, instructions, last child report); the
+  NDJSON journal, both frozen schemas, the diff gate, row-check execution, repair
+  rounds and the final-gate marker are removed. Old runs are not resumed.
+- **The parent dispatches; the child verifies.** `orchestrator_start` binds the
+  model-supplied steps; `orchestrator_dispatch` starts one in-process Build child
+  per row. A successful child report wakes the parent, which marks the row done
+  and dispatches the next. A blocker wakes the parent to inspect and amend the
+  instruction; the parent does not fix code and does not re-run the child's checks.
+- **Removed tooling:** `migration-scan`, `scripts/migration-report.mjs`,
+  `orchestrator-advance`, `orchestrator-todo-runtime`. The migration/integration
+  docs are historical and marked superseded.
+
 - **Notifier ownership: only reviewer notices carry `Review Mode:`.** A single helper,
   `notifyReview()`, had doubled as the generic Workflow notifier and as the
   reviewer-branded one, so an Orchestrator pause could surface

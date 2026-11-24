@@ -2,10 +2,38 @@
 
 Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, subagent explore, todos and shadow-checkpoint rewind for Pi.
 
+## 2026-11-24 — model-driven Orchestrator
+
+The frozen plan contract and the automatic acceptance engine are removed. The
+current flow is:
+
+1. **Plan Mode** writes a normal markdown plan. No schema, no executable-check
+   block, no `plan_validate`, no freeze gate.
+2. **Review (optional)** submits findings and required revisions. The harness
+   appends one `## Reviewer Revisions` section; it never rewrites the plan body.
+3. **Approve**, then choose **Direct Build** or **Orchestrator**.
+4. The approved plan is immutable by prompt convention. Build and Orchestrator
+   implement it; neither edits it.
+5. **Orchestrator** reads the plan, seeds a mutable TODO list, and dispatches
+   one in-process Build child per row with a complete instruction. The child
+   owns its local TODO list, runs the step's verification/gates, fixes in-scope
+   failures, and reports success or an out-of-scope blocker.
+6. The parent trusts a successful report, marks the row done, and dispatches the
+   next row. On a blocker it inspects the root cause, amends the instruction and
+   re-dispatches. The parent does not fix code itself and does not re-run the
+   child's checks.
+
+Removed: `plan_validate`, `/plan lint`, `/workflow lint`, the freeze gate, the
+frozen v1/v2 snapshots, the NDJSON run journal, the diff gate, per-row check
+execution, repair rounds, the final-gate marker, `migration-scan` and the
+migration-report script. Old runs are not resumed; restart from the approved
+plan. The Orchestrator parent now has the same permissions as Build; delegation
+is a prompt convention, not a mechanical cage.
+
 ## Features
 
 - **Plan / Build duality** — `Plan` tool gating (`edit`/`write` blocked in plan), `Build` restores full tools; **Tab** completes the highlighted suggestion while a list is open and otherwise cycles Default → Plan → Orchestrator → Build (`Ctrl+Alt+P` always cycles; a managed worker omits Orchestrator), `--workflow-plan` flag. Hosts that render generic contributions (Pi Desktop) get one current-mode control bound to the same cycle through `/workflow-cycle`.
-- **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, rewrites it, streams its work into the main transcript, and hands the result to the configured presenter (`/handoff`: Plannotator, or the workflow's native questionnaire). If Plannotator is unavailable or answers with an error, the handoff falls back to the native questionnaire (the plan is printed into the transcript, the choices are pinned at the bottom). Off by default; see [Review Mode](#review-mode) below.
+- **Review Mode** — an independent reviewer agent that runs **after** Plan Mode finishes (sequential — never in parallel), in its own in-process session. It audits the plan, appends its findings and required revisions as a `## Reviewer Revisions` section, streams its work into the main transcript, and hands the result to the configured presenter (`/handoff`: Plannotator, or the workflow's native questionnaire). If Plannotator is unavailable or answers with an error, the handoff falls back to the native questionnaire (the plan is printed into the transcript, the choices are pinned at the bottom). Off by default; see [Review Mode](#review-mode) below.
 - **Questionnaire** — 1–4 questions with headers/options, dedup freeform aliases, and an inline `↳ Your answer:` editor. Rendered as a bounded bottom-sheet overlay: a short question and the choices stay pinned, while a long question or the optional `context` body (e.g. a proposed commit message) scrolls with the wheel, `PgUp`/`PgDn` or `Ctrl+U`/`Ctrl+D`. The freeform editor takes the pane while typing.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
 - **Todos** — plan-faithful todo list (global step refs + statuses + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/update/done/pending/add/toggle/sync/clear`) with industry-style wholesale `update` (send the COMPLETE list; omitted items are removed) plus idempotent `done`/`pending`, lenient `[DONE:<ref>]` markers, throttled Claude-Code-style reminders, a tool-result footer, and a stale ⚠ notice — but **no forced turns and no heuristic auto-completion** (reference: Claude Code / OpenCode / Codex practice). A pinned panel shows the active list, collapses to one summary line when every step settles, and is controlled by `/todos show|expand|collapse|hide|auto` or `Ctrl+Alt+O` (terminal Pi). In Pi Desktop the native Todo bar above the panel exposes the same verbs and the desktop chord is `Ctrl+Alt+L` (Sessions keeps `Ctrl+Alt+O`). The display choice is sticky for the current plan across Build edits and Review re-syncs; a different plan returns to automatic.
@@ -15,7 +43,7 @@ Plan↔Build mode with an independent **Review Mode** reviewer, questionnaire, s
 - **Write permission** — a user-controlled `allow`/`ask`/`never` permission for file writes in **Default** mode, the mode that is otherwise ungated. `/write-policy` sets it; see [Write permission](#write-permission) below.
 - **Shell guard** — finite native deadlines for every shell surface (120 s default, 900 s ceiling), a pre-launch refusal for provably empty interpreter-stdin heredocs, and a request-scoped recovery budget: one changed approach, then stop. Covers main `bash`/`powershell`, explorer subprocesses and the isolated reviewer's `review_bash`; never times out human dialogs. See [Shell guard](#shell-guard).
 - **Model profiles** — named combinations of role models (`profiles.ts`, `~/.pi/agent/profiles.json` v1). Create a profile per provider or per budget, switch with `/profile` — activation is session-scoped, so two concurrent sessions can run different profiles. With no profile active the roles.json flow applies unchanged. See [Model Profiles](#model-profiles).
-- **Orchestrator (experimental)** — opt-in long-roadmap execution engine: task-only execution TODOs, durable run journal, visible normal Build children, parent-owned verification/acceptance, bounded repair and rollover, and parent-only commits. Mode entry never launches work; the ordinary Plan → Review → Build flow is unchanged. See [Orchestrator](#orchestrator-experimental) below.
+- **Orchestrator (experimental)** — opt-in model-driven dispatcher: the parent reads the plan, seeds mutable TODO rows, dispatches one in-process Build child per row with a complete instruction, trusts a successful child report, and re-instructions on a blocker. No frozen snapshot, no diff gate, no parent-side checks. The parent has Build permissions; delegation is a prompt convention. See [Orchestrator](#orchestrator-experimental) below.
 - **Prompt refinement (`/prompt`)** — rewrite a drafted request in an isolated child session and hand the candidate back to the *composer* — never send it, never run it. `/prompt <draft>` is the Terminal entry; a Desktop host arms the same runtime through the typed `composer-transform-v1` capability (a one-shot composer control, not slash concatenation). `/prompt-model` gives it an independent model, Default-mode inheritance is the fallback, and the main session model, roles and profiles are never touched. Refinement is bounded (inspect → ask → compose → submit), policy-safe, cancellable and recoverable. See [Prompt refinement](#prompt-refinement) below.
 
 ## Install

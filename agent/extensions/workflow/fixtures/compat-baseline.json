@@ -8,10 +8,10 @@
   },
   "registeredTools": [
     "explore",
+    "orchestrator_dispatch",
     "orchestrator_retry",
     "orchestrator_start",
     "orchestrator_status",
-    "plan_validate",
     "questionnaire",
     "workflow_execution",
     "workflow_todo"
@@ -26,8 +26,7 @@
     "ls",
     "explore",
     "questionnaire",
-    "workflow_todo",
-    "plan_validate"
+    "workflow_todo"
   ],
   "buildActiveTools": [
     "read",
@@ -39,8 +38,7 @@
     "ls",
     "explore",
     "questionnaire",
-    "workflow_todo",
-    "plan_validate"
+    "workflow_todo"
   ],
   "commands": [
     "btw",

@@ -248,12 +248,18 @@ export function buildPass1Prompt(input: {
   chunkChars?: number;
 }): string {
   const chunkChars = input.chunkChars ?? 0;
-  const chunked = chunkChars > 0 && input.planText.length > chunkChars * 2;
+  // Append-only review: the reviewer never submits a replacement plan body, so
+  // chunked rewrite submission is not used. Keep the field for callers that
+  // still pass it; it is deliberately ignored.
+  const chunked = false;
+  void chunkChars;
   const parts: string[] = [
     `[REVIEW MODE — PASS 1 of ${input.verify ? 2 : 1} — round ${input.round}/${input.totalRounds}]`,
     "",
-    "Audit the plan below against this repository, then rewrite it and submit the",
-    "result with `review_submit_plan`, then call `review_pass_done`.",
+    "Audit the plan below against this repository. Do NOT rewrite it: submit",
+    "your findings and required revisions with `review_submit`, then call",
+    "`review_pass_done`. The harness appends one Reviewer Revisions section to",
+    "the plan; the original body is preserved.",
     "",
     "## Your review guidance (authoritative)",
     "",
@@ -317,8 +323,8 @@ export function buildPass1Prompt(input: {
     "",
     "A provider may close this stream before you finish. If the harness retries",
     "this review on another model, start again from the plan below; do not assume",
-    "the previous model's transcript is available. Submit the complete rewrite as",
-    "soon as it is ready — do not hold it back to add more polish.",
+    "the previous model's transcript is available. Submit your findings and",
+    "required revisions as soon as they are ready.",
   );
 
   if (chunked) {
@@ -336,7 +342,7 @@ export function buildPass1Prompt(input: {
       "3. `review_plan_finalize` with your findings, verdict and summary. Nothing is",
       "   written before this call succeeds.",
       "",
-      "Do not call `review_submit_plan` with a full `planMarkdown` in this round, and",
+      "Do not call `review_submit` with a full `planMarkdown` in this round, and",
       "do not repeat earlier chunks. Split on heading boundaries where possible.",
     );
   }
@@ -345,7 +351,7 @@ export function buildPass1Prompt(input: {
     "",
     "## Required output",
     "",
-    ...(chunked
+        ...(chunked
       ? [
           "1. `review_plan_begin`, then `review_plan_chunk` for every part of the",
           "   COMPLETE revised plan (readable markdown, original structure preserved,",
@@ -354,8 +360,8 @@ export function buildPass1Prompt(input: {
           "3. `review_pass_done` with the same findings.",
         ]
       : [
-          "1. `review_submit_plan` with the COMPLETE revised plan (readable markdown,",
-          "   original structure preserved, no `Review changes` section — it is generated).",
+          "1. `review_submit` with your findings, verdict, summary and required",
+          "   revisions. Do not send a replacement plan body.",
           "2. `review_pass_done` with your verdict and the same findings.",
         ]),
     "",
@@ -488,7 +494,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     if (config().chunkedSubmit === "off") {
       return {
         ok: false,
-        error: "chunked submission is off; pass the complete plan to review_submit_plan",
+        error: "chunked submission is off; pass the complete plan to review_submit",
       };
     }
     planAssembler = {
@@ -942,6 +948,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
             planPath: () => deps.planPath(),
             originalPlan: () => deps.readPlan(),
             modelLabel: () => session?.modelLabel ?? "reviewer",
+            round: () => state?.round ?? 1,
             submit: async (payload) => {
               const planPath = deps.planPath();
               if (!planPath) return { ok: false, error: "no plan path" };
@@ -1552,7 +1559,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         }
         lastFailure = `the reviewer finished without submitting a plan on ${attemptLabel(
           attempt,
-        )} — it has no write path unless review_submit_plan succeeds`;
+        )} — it has no write path unless review_submit succeeds`;
         if (budgetExpired) lastFailure += " — provider recovery budget expired";
         if (canFallback) continue;
         return fail(lastFailure, originalPlan);

@@ -15,7 +15,7 @@
  *   byte-for-byte the behaviour that existed before this module.
  * - Review Mode runs in its OWN in-process session (own context, own model,
  *   own system prompt). It reads Plan Mode's context but never the reverse.
- * - Review Mode is read-only except for one write path: `review_submit_plan`
+ * - Review Mode is read-only except for one write path: `review_submit`
  *   (implemented in the parent, not in the child).
  * - This module holds the pure, I/O-light parts (config, prompt, state,
  *   validation, rendering) so they can be unit-tested without a Pi runtime.
@@ -743,7 +743,7 @@ export const DEFAULT_REVIEW_PROMPT = [
   "",
   "- You may READ anything: files, git history, docs, tests, prior plans.",
   "- You may NOT write code or modify any file. The ONLY write you may perform is",
-  "  submitting the revised plan through `review_submit_plan`.",
+  "  submitting the revised plan through `review_submit`.",
   "- Never invent files, APIs, or conventions. Verify with read/grep/find/ls first.",
   "- If the plan is already sound, say so and submit it unchanged rather than",
   "  inventing findings to look useful.",
@@ -1195,7 +1195,7 @@ export type ReviewResumePlanChoice = "fresh" | "warm";
  * Decide whether a paused review can still be resumed as-is.
  *
  * The plan *file* is not a reliable witness on its own: the reviewer writes its
- * rewrite to that same file during the round (`review_submit_plan`), so after a
+ * rewrite to that same file during the round (`review_submit`), so after a
  * pause during pass 2 the file no longer matches the text the round started
  * with. Comparing against the hash captured at pause time means only a change
  * made **after** the pause — an author edit — starts a fresh round.
@@ -1414,7 +1414,7 @@ export function applySubmittedPlan(
  *
  * Both waits are edge-tolerant: whichever happens first (the tool call or the
  * await) wins, and a wait that starts after the event resolves immediately.
- * That matters because a fast reviewer can call `review_submit_plan` and
+ * That matters because a fast reviewer can call `review_submit` and
  * `review_pass_done` in the same turn, before the orchestrator awaits.
  *
  * Every wait is bounded by an AbortSignal and, when a positive timeout is
@@ -2324,7 +2324,7 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
         first ? ` — ${first}` : ""
       }`;
     }
-  } else if (name === "review_submit_plan") {
+  } else if (name === "review_submit") {
     const verdict = str(a.verdict) ?? "revise";
     const findings = Array.isArray(a.findings) ? a.findings.length : 0;
     detail = `verdict ${verdict} · ${findings} finding${
@@ -2576,7 +2576,7 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "You are READ-ONLY. You cannot edit files, run mutating shell commands, install",
   "anything, or build. You may run test/lint/typecheck commands. Your single write",
-  "action is submitting the revised plan through the `review_submit_plan` tool.",
+  "action is submitting the revised plan through the `review_submit` tool.",
   "",
   "## Tools",
   "",
@@ -2592,7 +2592,7 @@ export const REVIEW_SYSTEM_PROMPT = [
   "  tests or linters — but never assert that something passes unless you ran it.",
   "- `review_explore` — delegate focused read-only reconnaissance to subagents",
   "  (rarely needed: the pass-1 prompt already carries Plan Mode's recon).",
-  "- `review_submit_plan` — submit the final rewritten plan. This is the ONLY way",
+  "- `review_submit` — submit the final rewritten plan. This is the ONLY way",
   "  your work reaches the user. A review that never submits is a failed review.",
   "- `review_pass_done` — end the current pass with a verdict and your findings.",
   "",
@@ -2605,7 +2605,7 @@ export const REVIEW_SYSTEM_PROMPT = [
   "3. Record every issue as a finding: severity 1-10, confidence 0-100, a category, a",
   "   file/line anchor when you have one, a one-line summary, and a rationale.",
   "4. Rewrite the plan so it is correct and framework-aligned, then submit it with",
-  "   `review_submit_plan`.",
+  "   `review_submit`.",
   "5. End the pass with `review_pass_done`.",
   "",
   "You may run test/lint/typecheck commands, but not builds. Never assert that",
@@ -2631,7 +2631,7 @@ export const REVIEW_SYSTEM_PROMPT = [
  * (`dist/core/sdk.js`: `allowedToolNames = options.tools ?? ...`, then
  * `dist/core/agent-session.js`: `allCustomTools = [...].filter(tool =>
  * isAllowedTool(tool.definition.name))`). Passing only these names silently
- * drops `review_submit_plan`, i.e. the reviewer loses its only write path.
+ * drops `review_submit`, i.e. the reviewer loses its only write path.
  * Always build the session's allowlist with `reviewToolAllowlist()`.
  */
 export const REVIEW_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -2771,7 +2771,7 @@ export async function createReviewSession(
     missingModelError: (modelLabel) =>
       `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
     describeToolMismatch: (mismatch) =>
-      `reviewer tools are not active: ${mismatch.missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan${
+      `reviewer tools are not active: ${mismatch.missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit${
         mismatch.unexpected.length > 0
           ? ` (unexpected: ${mismatch.unexpected.join(", ")})`
           : ""

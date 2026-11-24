@@ -204,16 +204,17 @@ export function createTodoStore(owner: TodoListOwner = "ordinary"): TodoStore {
     },
 
     freeze(snapshot) {
+      // The frozen run model is being removed. A freeze call now only installs
+      // the initial rows; the list stays fully mutable like any Build list.
       const checked = validateFrozenSnapshot(snapshot);
       if (!checked.ok) {
         store.frozenError = checked.error;
         return checked;
       }
-      store.frozen = checked.snapshot;
+      store.frozen = undefined;
       store.frozenError = undefined;
       store.items = frozenRowsToTodoItems(checked.snapshot);
       store.planPath = checked.snapshot.source.path;
-      store.planDigest = checked.snapshot.source.digest;
       store.revision += 1;
       return { ok: true, snapshot: checked.snapshot };
     },

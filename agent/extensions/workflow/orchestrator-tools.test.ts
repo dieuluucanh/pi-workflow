@@ -70,16 +70,17 @@ const ctx = (currentState: RunState, evidence?: Map<string, { taskId: string; ev
   ...(evidence === undefined ? {} : { evidence }),
 });
 
-test("the model-facing surface is exactly start, status and retry", () => {
+test("the model-facing surface is start, dispatch, status and retry", () => {
   assert.deepEqual([...ORCHESTRATOR_TOOL_NAMES], [
     "orchestrator_start",
+    "orchestrator_dispatch",
     "orchestrator_status",
     "orchestrator_retry",
   ]);
-  assert.equal(ORCHESTRATOR_TOOLS.length, 3);
+  assert.equal(ORCHESTRATOR_TOOLS.length, 4);
   assert.equal(
     ORCHESTRATOR_TOOLS.some((spec) =>
-      /propose|prepare|dispatch|preview|verify|accept|repair/.test(spec.name),
+      /propose|prepare|preview|verify|accept|repair/.test(spec.name),
     ),
     false,
   );

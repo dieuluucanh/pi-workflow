@@ -266,7 +266,7 @@ test("store: snapshot round-trips and a partial restore keeps present fields", (
   assert.deepEqual(restored.items.map((entry) => entry.text), ["two"]);
 });
 
-test("store: a later legacy restore cannot erase a frozen list", async () => {
+test("store: a freeze installs rows but the list stays mutable", async () => {
   const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
   const frozen = createFrozenTodosFromPlan({
     planPath: "C:/work/.pi/plans/frozen.md",
@@ -278,9 +278,10 @@ test("store: a later legacy restore cannot erase a frozen list", async () => {
   if (!frozen.ok) return;
   const store = createTodoStore();
   assert.equal(store.freeze(frozen.snapshot).ok, true);
-  store.restore({ items: [item(9, "legacy replacement")] });
-  assert.ok(store.frozen);
+  assert.equal(store.frozen, undefined, "no frozen state is installed");
   assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
+  store.restore({ items: [item(9, "legacy replacement")] });
+  assert.deepEqual(store.items.map((entry) => entry.text), ["legacy replacement"]);
   assert.equal(store.planPath, "C:/work/.pi/plans/frozen.md");
 });
 
@@ -293,7 +294,7 @@ test("store: ownership is explicit and enforced", () => {
   assert.throws(() => assertListOwner(worker, "ordinary"), /owner mismatch/);
 });
 
-test("store: a frozen list allows status-only updates and refuses structure", async () => {
+test("store: a seeded list accepts structural edits", async () => {
   const { createFrozenTodosFromPlan } = await import("./todo-snapshot.ts");
   const frozen = createFrozenTodosFromPlan({
     planPath: "C:/work/.pi/plans/frozen.md",
@@ -308,49 +309,24 @@ test("store: a frozen list allows status-only updates and refuses structure", as
   const ids = store.items.map((entry) => entry.id);
   assert.ok(ids[0] && ids[1]);
 
-  const partial = store.update([{ ref: "1", text: "One", status: "in_progress" }]);
-  assert.match(partial.refused ?? "", /complete status update/);
-  assert.equal(store.items[0]?.status, "pending");
-
-  const reorder = store.update([
+  const status = store.update([
+    { id: ids[0], text: "One", status: "in_progress" },
     { id: ids[1], text: "Two", status: "pending" },
-    { id: ids[0], text: "One", status: "pending" },
   ]);
-  assert.match(reorder.refused ?? "", /cannot reorder/);
+  assert.equal(status.refused, undefined);
+  assert.equal(store.items[0]?.status, "in_progress");
 
   const rename = store.update([
-    { id: ids[0], text: "One renamed" },
-    { id: ids[1], text: "Two" },
+    { id: ids[0], text: "One renamed", status: "in_progress" },
+    { id: ids[1], text: "Two", status: "pending" },
   ]);
-  assert.match(rename.refused ?? "", /cannot change row text/);
+  assert.equal(rename.refused, undefined);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["One renamed", "Two"]);
 
-  const ok = store.update([
-    { id: ids[0], text: "One", status: "in_progress" },
-    { id: ids[1], text: "Two" },
-  ]);
-  assert.equal(ok.refused, undefined);
-  assert.equal(store.items[0]?.status, "in_progress");
-  assert.equal(store.items[1]?.status, "pending");
-  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
-
-  const beforeAdd = store.items.length;
   store.add({ text: "Injected" });
+  assert.ok(store.items.some((entry) => entry.text === "Injected"));
   store.clear();
+  assert.equal(store.items.length, 0);
   store.replace([{ step: 1, text: "Replaced", completed: false }]);
-  assert.equal(store.items.length, beforeAdd);
-  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
-
-  const applied = store.loadFromPlanMarkdown({
-    markdown: "# Plan: Other\n\n## Plan Steps\n\n1. Other\n",
-    planPath: "C:/other.md",
-    cwd: "C:/",
-  });
-  assert.equal(applied.replaced, false);
-  assert.deepEqual(store.items.map((entry) => entry.text), ["One", "Two"]);
-
-  const restored = createTodoStore();
-  restored.restore(store.snapshot());
-  assert.ok(restored.frozen);
-  assert.equal(restored.items[0]?.status, "in_progress");
-  assert.deepEqual(restored.items.map((entry) => entry.id), ids);
+  assert.deepEqual(store.items.map((entry) => entry.text), ["Replaced"]);
 });

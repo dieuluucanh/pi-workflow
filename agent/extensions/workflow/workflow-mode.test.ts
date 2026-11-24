@@ -21,9 +21,22 @@ import {
   isWorkflowMode,
   modeLabel,
   planModeTools,
+  orchestratorModeTools,
   roleForMode,
   type WorkflowMode,
 } from "./workflow-mode.ts";
+
+test("tools: Orchestrator has the Build tool set plus the parent tools", () => {
+  const active = ["read", "bash", "write", "edit", "third_party_tool"];
+  const orchestrator = orchestratorModeTools(active);
+  for (const tool of ["edit", "write", "bash", "read", "workflow_todo"]) {
+    assert.ok(orchestrator.includes(tool), `${tool} must stay active`);
+  }
+  for (const tool of ["orchestrator_start", "orchestrator_status"]) {
+    assert.ok(orchestrator.includes(tool), `${tool} must be active`);
+  }
+  assert.ok(orchestrator.includes("third_party_tool"));
+});
 
 test("tools: Plan keeps the gated tools active and owns the workflow set", () => {
   const active = ["read", "bash", "write", "edit", "third_party_tool"];
@@ -40,7 +53,6 @@ test("tools: Plan keeps the gated tools active and owns the workflow set", () =>
     "explore",
     "questionnaire",
     "workflow_todo",
-    "plan_validate",
   ]);
   // edit/write stay active so the tool_call gate can explain the refusal.
   assert.ok(plan.includes("edit"));

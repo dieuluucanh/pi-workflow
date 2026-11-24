@@ -51,14 +51,12 @@ export const PLAN_MODE_TOOLS = [
   "explore",
   "questionnaire",
   "workflow_todo",
-  "plan_validate",
 ] as const;
 
 /**
- * Tools Orchestrator keeps active. It is a parent/verification mode: the same
- * read-only exploration set as Plan, with project edits gated, PLUS the parent
- * orchestration tools. Preparation must be exposed before a run is bound, so
- * these are part of the mode's tool policy rather than merely registered.
+ * Tools Orchestrator keeps active. The parent has full Build permissions —
+ * edit/write/bash are available because delegation is a prompt convention, not
+ * a permission cage — PLUS the parent orchestration tools.
  */
 export const ORCHESTRATOR_MODE_TOOLS = [
   ...PLAN_MODE_TOOLS,
@@ -93,11 +91,11 @@ export function planModeTools(active: readonly string[]): string[] {
   ]);
 }
 
-/** Active tools for Orchestrator: inspect/verify plus parent orchestration. */
+/** Active tools for Orchestrator: the full Build set plus the parent tools. */
 export function orchestratorModeTools(active: readonly string[]): string[] {
   return unique([
-    ...active.filter((name) => !PLAN_DISABLED_TOOLS.has(name)),
     ...ORCHESTRATOR_MODE_TOOLS,
+    ...active.filter((name) => !MANAGED_TOOLS.has(name)),
   ]);
 }
 

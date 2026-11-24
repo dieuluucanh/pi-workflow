@@ -1,3 +1,9 @@
+> **Superseded (2026-11-24).** The frozen plan contract and the automatic
+> acceptance engine described below were removed. Current flow: a normal
+> markdown plan, optional append-only review, then Direct Build or the
+> model-driven Orchestrator dispatcher. Old runs are not resumed. See the
+> README section "2026-11-24 — model-driven Orchestrator".
+
 # Plan format, executable checks and the plan-execution contract
 
 This is the canonical reference for authoring a plan that the Workflow
