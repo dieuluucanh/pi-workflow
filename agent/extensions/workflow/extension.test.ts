@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import workflowExtension from "./index.ts";
+import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
 import {
   REVIEW_HANDOFF_LINE,
   REVIEW_PAUSED_LINE,
@@ -103,6 +104,13 @@ interface BootOptions {
   child?: FakeOrchestratorChildFactory;
   /** `ctx.isProjectTrusted()`; defaults to true in the fake host. */
   projectTrusted?: boolean;
+  /**
+   * SDK object handed to the Review bootstrap loader. Defaults to the healthy
+   * fake SDK; pass `{}` to model a genuinely incompatible host.
+   */
+  reviewSdk?: unknown;
+  /** `ctx.sessionManager.getSessionId()` (child teardown registry key). */
+  sessionId?: string;
 }
 
 async function boot(over: BootOptions = {}) {
@@ -223,8 +231,14 @@ async function boot(over: BootOptions = {}) {
     });
   }
   const childFactory = over.child ?? makeFakeOrchestratorChildFactory();
+  // Counts Reviewer SDK bootstrap attempts only: the Orchestrator child is
+  // injected as `childFactory`, so it never routes through this loader.
+  let reviewerSdkLoads = 0;
   await workflowExtension(pi as never, {
-    loadSdk: async () => sdk as never,
+    loadSdk: async () => {
+      reviewerSdkLoads += 1;
+      return (over.reviewSdk ?? sdk) as never;
+    },
     createOrchestratorChild: childFactory.factory as never,
     selfExtensionPath: "/fake/workflow/index.ts",
     // The fake host has no Plannotator listener unless `plannotator: true`, so
@@ -247,6 +261,7 @@ async function boot(over: BootOptions = {}) {
     workingMessages,
     workingVisible,
     setIdle,
+    setPendingMessages,
     confirms,
     selects,
     customs,
@@ -277,6 +292,7 @@ async function boot(over: BootOptions = {}) {
     ...(over.projectTrusted === undefined
       ? {}
       : { projectTrusted: over.projectTrusted }),
+    ...(over.sessionId === undefined ? {} : { sessionId: over.sessionId }),
   });
   await pi.emit("session_start", { reason: over.startReason ?? "startup" }, ctx);
   const cleanup = async () => {
@@ -307,6 +323,7 @@ async function boot(over: BootOptions = {}) {
     workingMessages,
     workingVisible,
     setIdle,
+    setPendingMessages,
     confirms,
     selects,
     capture,
@@ -316,6 +333,7 @@ async function boot(over: BootOptions = {}) {
     plannotatorRequests,
     reviewStatusRequests,
     child: childFactory,
+    reviewerSdkLoads: () => reviewerSdkLoads,
     cleanup,
   };
 }
@@ -580,6 +598,7 @@ test("D: bare /review with no plan lists recent plans and the path syntax", asyn
   const b = await boot();
   try {
     const plan = placePlan(b.cwd, "recent.md");
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx);
     assert.ok(
       notified(b.notifies, "No plan file found"),
@@ -603,6 +622,7 @@ test("E: /review <path> works with no recorded write", async () => {
   const b = await boot();
   try {
     const plan = placePlan(b.cwd);
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
     assert.equal(b.capture.prompts.length, 1);
     assertRewritten(plan.abs);
@@ -614,6 +634,7 @@ test("E: /review <path> works with no recorded write", async () => {
 test("F: /review say with no round stays in chat", async () => {
   const b = await boot();
   try {
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, "say hello");
     assert.ok(notified(b.notifies, "No review round running"));
     assert.equal(b.capture.prompts.length, 0);
@@ -989,6 +1010,7 @@ test("I: /tree re-derives the plan and drops one from another branch", async () 
   const b = await boot();
   try {
     const plan = placePlan(b.cwd);
+    await switchToPlan(b.pi, b.ctx);
     await writeResult(b.pi, b.ctx, plan.rel);
     await runReview(b.pi, b.ctx);
     assert.equal(b.capture.prompts.length, 1);
@@ -1347,12 +1369,13 @@ test("S1: manual /review opens the browser handoff in Plan mode", async () => {
   }
 });
 
-test("S2: a manual handoff approval enters Build from Default mode", async () => {
+test("S2: a manual handoff approval enters Build from Plan mode", async () => {
   const b = await boot({ hasUI: true, plannotator: true, customAnswers: [executionAnswer("build")] });
   try {
     await freshPrompt(b.pi, b.ctx);
     const plan = placePlan(b.cwd, "manual-default.md");
     await writeResult(b.pi, b.ctx, plan.rel);
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx);
     assert.equal(b.plannotatorRequests.length, 1);
 
@@ -1376,12 +1399,13 @@ test("S2: a manual handoff approval enters Build from Default mode", async () =>
   }
 });
 
-test("S3: a manual Deny outside Plan switches to Plan and sends feedback", async () => {
+test("S3: a manual Deny in Plan sends feedback and stays in Plan", async () => {
   const b = await boot({ hasUI: true, plannotator: true, customAnswers: [executionAnswer("build")] });
   try {
     await freshPrompt(b.pi, b.ctx);
     const plan = placePlan(b.cwd, "manual-deny.md");
     await writeResult(b.pi, b.ctx, plan.rel);
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx);
     assert.equal(b.plannotatorRequests.length, 1);
 
@@ -1715,6 +1739,7 @@ test("T: manual /review locks prompts/modes and Approve enters Build", async () 
   const b = await boot({ enabled: false, hasUI: true, plannotator: true, customAnswers: [executionAnswer("build")] });
   try {
     const plan = placePlan(b.cwd, "manual-default.md");
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
     assert.equal(b.plannotatorRequests.length, 1, "manual review handed off");
     assert.ok(
@@ -1739,7 +1764,7 @@ test("T: manual /review locks prompts/modes and Approve enters Build", async () 
     );
     assert.deepEqual(allowed[0], { action: "continue" });
 
-    await b.pi.commands.plan.handler("", b.ctx);
+    await b.pi.commands.build.handler("", b.ctx);
     assert.ok(notified(b.notifies, "mode switching is locked"));
 
     b.pi.events.emit("plannotator:review-result", {
@@ -1766,6 +1791,7 @@ test("U: manual /review feedback switches to Plan", async () => {
   const b = await boot({ enabled: false, hasUI: true, plannotator: true, customAnswers: [executionAnswer("build")] });
   try {
     const plan = placePlan(b.cwd, "manual-feedback.md");
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
     b.pi.events.emit("plannotator:review-result", {
       reviewId: "review-1",
@@ -1794,6 +1820,7 @@ test("U: manual /review feedback switches to Plan", async () => {
 test("V: /review with no plan warns and never enters Review", async () => {
   const b = await boot({ hasUI: true, plannotator: true, customAnswers: [executionAnswer("build")] });
   try {
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx);
     assert.ok(notified(b.notifies, "No plan file found"));
     assert.equal(b.plannotatorRequests.length, 0, "no handoff opened");
@@ -1829,6 +1856,7 @@ test("T1: a terminal manual /review paints the live composer widget while idle",
   });
   try {
     const plan = placePlan(b.cwd, "terminal-widget.md");
+    await switchToPlan(b.pi, b.ctx);
     const running = runReview(b.pi, b.ctx, plan.rel);
     await waitForPrompts(b.capture, 1);
     const lines = renderReviewWidget(b.widgetCalls);
@@ -1885,6 +1913,7 @@ test("T2: a Desktop-shaped host gets the status line but no widget", async () =>
   });
   try {
     const plan = placePlan(b.cwd, "desktop-widget.md");
+    await switchToPlan(b.pi, b.ctx);
     const running = runReview(b.pi, b.ctx, plan.rel);
     await waitForPrompts(b.capture, 1);
     assert.deepEqual(
@@ -1968,6 +1997,7 @@ test("T4: pause/resume moves the terminal widget between forms", async () => {
   });
   try {
     const plan = placePlan(b.cwd, "terminal-pause.md");
+    await switchToPlan(b.pi, b.ctx);
     const running = runReview(b.pi, b.ctx, plan.rel);
     await waitForPrompts(b.capture, 1);
     await b.pi.commands["review-pause"].handler("", b.ctx);
@@ -2027,6 +2057,7 @@ test("T5: /review-abort moves the terminal widget to the handoff line", async ()
   });
   try {
     const plan = placePlan(b.cwd, "terminal-abort.md");
+    await switchToPlan(b.pi, b.ctx);
     const running = runReview(b.pi, b.ctx, plan.rel);
     await waitForPrompts(b.capture, 1);
     assert.ok(renderReviewWidget(b.widgetCalls).length > 0);
@@ -2420,6 +2451,7 @@ test("HF6: a manual /review falls back natively when Plannotator errors", async 
   });
   try {
     const plan = placePlan(b.cwd, "hf6-manual.md");
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
     assert.equal(b.customs.length, 1, "the native questionnaire opened");
     assert.ok(notified(b.notifies, "Plannotator handoff unavailable"));
@@ -3327,6 +3359,7 @@ test("HD11: a manual /review honours handoff=native", async () => {
   });
   try {
     const plan = placePlan(b.cwd, "hd11-manual-native.md");
+    await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
 
     assert.equal(b.plannotatorRequests.length, 0, "no browser request");
@@ -5649,6 +5682,760 @@ test("RV2: /review-status reports the idle state without starting a reviewer", a
     assert.equal(b.pi.sent.length, 0);
     // No reviewer tools were swapped into the session.
     assert.equal(b.pi.timeline.filter((entry) => entry.kind === "tools").length, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── RO: Reviewer ownership is Plan-only ──────────────────────────────
+//
+// Regression for the Orchestrator/Build "reviewer unavailable" warning. The
+// Reviewer is a Plan artifact: neither an ordinary Build turn, an Orchestrator
+// parent, nor an in-process Build child may bootstrap one. These assertions
+// count SDK LOADS and session CREATES, not just review prompts, because the bug
+// was a speculative prefetch that could allocate a session without ever running
+// a round.
+
+/** A real Orchestrator child identity entry (same shape the child writes). */
+function childContextEntry(ref = "1", total = 2): unknown {
+  return {
+    type: "custom",
+    customType: "workflow-orchestrator-child",
+    data: {
+      version: 1,
+      runId: "run-reviewer-ownership",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      ref,
+      total,
+      parentSessionRef: "parent-session",
+      mode: "build",
+      mayOrchestrate: false,
+      createdAt: 1,
+    },
+  };
+}
+
+/** Let the fire-and-forget prefetch (and any await chain) settle. */
+async function settleTick(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
+function reviewerNotices(b: { notifies: Array<{ message: string }> }): string[] {
+  return b.notifies
+    .map((n) => n.message)
+    .filter((m) => /reviewer|review mode:/i.test(m));
+}
+
+function assertNoReviewerStart(
+  b: { reviewerSdkLoads: () => number; capture: { createCalls: number } },
+  label: string,
+): void {
+  assert.equal(b.reviewerSdkLoads(), 0, `${label}: no reviewer SDK load`);
+  assert.equal(b.capture.createCalls, 0, `${label}: no reviewer session`);
+}
+
+test("RO1: Default mode agent_end never boots a reviewer", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "default");
+    assert.deepEqual(reviewerNotices(b), [], "no reviewer warning");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO2: Build mode with no todos never boots a reviewer", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await b.pi.commands.build.handler("", b.ctx);
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "build/empty");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO3: Build mode with incomplete todos never boots a reviewer", async () => {
+  const b = await boot({
+    enabled: true,
+    branch: workflowBranch(seededTodos([{ text: "One" }, { text: "Two" }])),
+  });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "build/incomplete");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO4: Build mode with every todo complete never boots a reviewer", async () => {
+  const b = await boot({ enabled: true, branch: workflowBranch(SETTLED_TODOS) });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "build/complete");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO5: idle Orchestrator agent_end never boots a reviewer", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await b.pi.commands.orchestrator.handler("", b.ctx);
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "orchestrator/idle");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO6: a running Orchestrator run never boots a reviewer", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({
+    enabled: true,
+    hasUI: true,
+    executionMode: "orchestrator",
+    child,
+  });
+  try {
+    const plan = placePlan(b.cwd, "ro6.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    await settleTick();
+    assert.equal(child.startCount, 1, "the row was dispatched");
+    const view = await b.pi.tools.orchestrator_status.execute("ro6-before", {});
+    assert.match(JSON.stringify(view), /"summary":"running/, "the run owns the session");
+
+    const before = b.reviewerSdkLoads();
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), before, "no reviewer SDK load");
+    assert.equal(b.capture.createCalls, 0, "no reviewer session");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO7: a marked in-process Build child never boots a reviewer", async () => {
+  const b = await boot({ enabled: true, branch: [childContextEntry()] });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assertNoReviewerStart(b, "child");
+    assert.deepEqual(reviewerNotices(b), []);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO8: an incompatible reviewer SDK in a forbidden mode stays silent", async () => {
+  const b = await boot({ enabled: true, reviewSdk: {} });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), 0, "the reviewer SDK is never loaded");
+    assert.equal(b.capture.createCalls, 0);
+    assert.deepEqual(
+      reviewerNotices(b),
+      [],
+      "no 'reviewer unavailable' warning leaks into execution",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO9: automatic review waits for the terminal attempt (no retry/queued run)", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "ro9.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+
+    // 1. A retryable attempt: the SDK will retry, so no review yet.
+    await b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel), willRetry: true },
+      b.ctx,
+    );
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), 0, "retry attempt does not review");
+
+    // 2. A run with queued messages/continuation left: still not terminal.
+    b.setPendingMessages(true);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), 0, "queued continuation does not review");
+
+    // 3. The terminal attempt (retry flag gone, queue drained) reviews once.
+    b.setPendingMessages(false);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    assert.equal(b.reviewerSdkLoads(), 1, "the final attempt reviews once");
+    assert.equal(b.capture.createCalls, 1, "one reviewer session");
+    assert.equal(b.capture.prompts.length, 1, "one review pass");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO10: repeated agent_end does not boot a second reviewer", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "ro10.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+
+    const messages = runMessages(plan.rel);
+    await b.pi.emit("agent_end", { messages }, b.ctx);
+    await b.pi.emit("agent_end", { messages }, b.ctx);
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 1, "one SDK load");
+    assert.equal(b.capture.createCalls, 1, "one reviewer session");
+    assert.equal(b.capture.prompts.length, 1, "the plan is reviewed once");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO11: a superseded Plan cycle never reviews after the switch", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await freshPrompt(b.pi, b.ctx);
+    await switchToPlan(b.pi, b.ctx);
+    const plan = placePlan(b.cwd, "ro11.md");
+    await writeResult(b.pi, b.ctx, plan.rel);
+
+    // Non-terminal attempt, then the user leaves Plan (Build supersedes).
+    await b.pi.emit(
+      "agent_end",
+      { messages: runMessages(plan.rel), willRetry: true },
+      b.ctx,
+    );
+    await b.pi.commands.build.handler("", b.ctx);
+    await b.pi.emit("agent_end", { messages: runMessages(plan.rel) }, b.ctx);
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 0, "no reviewer after the supersession");
+    assert.equal(b.capture.createCalls, 0, "no reviewer session");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO12: manual /review outside Plan refuses without switching or booting", async () => {
+  for (const mode of ["default", "build", "orchestrator"] as const) {
+    const b = await boot({ enabled: true });
+    try {
+      if (mode === "build") await b.pi.commands.build.handler("", b.ctx);
+      if (mode === "orchestrator") {
+        await b.pi.commands.orchestrator.handler("", b.ctx);
+      }
+      const plan = placePlan(b.cwd, `ro12-${mode}.md`);
+
+      await runReview(b.pi, b.ctx, plan.rel);
+      await settleTick();
+
+      assert.ok(
+        notified(b.notifies, "Review is available in Plan mode only"),
+        `${mode}: the refusal names the Plan-only contract`,
+      );
+      assert.ok(
+        !notified(b.notifies, "Plan mode enabled"),
+        `${mode}: no implicit mode switch`,
+      );
+      assert.equal(b.reviewerSdkLoads(), 0, `${mode}: no reviewer SDK load`);
+      assert.equal(b.capture.createCalls, 0, `${mode}: no reviewer session`);
+      assert.ok(
+        !b.statusCalls.some(
+          (call) =>
+            call.key === "workflow-review" &&
+            typeof call.value === "string" &&
+            /Reviewing plan|review · awaiting/.test(call.value),
+        ),
+        `${mode}: no active review line was painted`,
+      );
+    } finally {
+      await b.cleanup();
+    }
+  }
+});
+
+test("RO13: /review-resume outside Plan refuses before pause handling", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await b.pi.commands.build.handler("", b.ctx);
+    await b.pi.commands["review-resume"].handler("", b.ctx);
+    await settleTick();
+
+    assert.ok(
+      notified(b.notifies, "Review is available in Plan mode only"),
+      "the refusal is actionable",
+    );
+    assert.equal(b.reviewerSdkLoads(), 0, "no reviewer SDK load");
+    assert.equal(b.capture.createCalls, 0, "no reviewer session");
+    assert.ok(
+      !notified(b.notifies, "Nothing to resume"),
+      "the refusal precedes the pause-state handling",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RO14: status and abort stay available in execution and boot nothing", async () => {
+  const b = await boot({ enabled: true });
+  try {
+    await b.pi.commands.build.handler("", b.ctx);
+    await b.pi.commands["review-status"].handler("", b.ctx);
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 0, "cleanup never loads the SDK");
+    assert.equal(b.capture.createCalls, 0, "cleanup never creates a session");
+    assert.ok(
+      b.notifies.length > 0,
+      "status/abort still report a result in a forbidden mode",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── MT: execution ownership at the final mode boundary ────────────────
+
+/** Boot an Orchestrator run that is still running (child never settles). */
+async function bootRunningOrchestrator(prefix: string) {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({
+    enabled: true,
+    hasUI: true,
+    executionMode: "orchestrator",
+    child,
+  });
+  const plan = placePlan(b.cwd, `${prefix}.md`);
+  fs.writeFileSync(plan.abs, orchestratorPlan(["Only row"]));
+  await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+  await settleTick();
+  return { b, child, plan };
+}
+
+test("MT1: Tab/cycle cannot leave Orchestrator while the run executes", async () => {
+  const { b } = await bootRunningOrchestrator("mt1");
+  try {
+    const toolsBefore = b.pi.getActiveTools();
+    await b.pi.commands["workflow-cycle"].handler("", b.ctx);
+    await settleTick();
+
+    assert.ok(
+      notified(b.notifies, "Orchestrator run owns this session"),
+      "the ownership refusal is reported",
+    );
+    const view = await b.pi.tools.orchestrator_status.execute("mt1-status", {});
+    assert.match(
+      JSON.stringify(view),
+      /"summary":"running/,
+      "the frozen run still owns the session",
+    );
+    assert.deepEqual(b.pi.getActiveTools(), toolsBefore, "no tool swap");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("MT2: the host plan-mode toggle cannot enter Plan mid-run", async () => {
+  const { b } = await bootRunningOrchestrator("mt2");
+  try {
+    b.pi.events.emit("pi-code:plan-mode", { active: true });
+    await settleTick();
+    await settleTick();
+
+    const view = await b.pi.tools.orchestrator_status.execute("mt2-status", {});
+    assert.match(JSON.stringify(view), /"summary":"running/);
+    assert.ok(
+      notified(b.notifies, "Orchestrator run owns this session"),
+      "the host toggle is refused by the shared gate",
+    );
+    assert.equal(b.capture.createCalls, 0, "no reviewer was booted");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("MT3: a paused run with no live child still blocks leaving Orchestrator", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({
+    enabled: true,
+    hasUI: true,
+    executionMode: "orchestrator",
+    child,
+  });
+  try {
+    const plan = placePlan(b.cwd, "mt3.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["Only row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    await settleTick();
+    await b.pi.commands["orchestrator-pause"].handler("", b.ctx);
+    await settleTick();
+
+    const toolsBefore = b.pi.getActiveTools();
+    await b.pi.commands.plan.handler("", b.ctx);
+    await settleTick();
+
+    assert.ok(
+      notified(b.notifies, "Orchestrator run owns this session"),
+      "a paused run is still an executing owner",
+    );
+    assert.deepEqual(b.pi.getActiveTools(), toolsBefore, "no tool swap");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("MT4: an Orchestrator child refuses every mode entrypoint", async () => {
+  const b = await boot({ branch: [childContextEntry()] });
+  try {
+    const toolsBefore = b.pi.getActiveTools();
+    for (const command of ["plan", "build", "default", "orchestrator"] as const) {
+      await b.pi.commands[command].handler("", b.ctx);
+    }
+    await b.pi.commands["workflow-cycle"].handler("", b.ctx);
+    await settleTick();
+
+    assert.ok(
+      notified(b.notifies, "Mode changes are disabled"),
+      "the child contract is reported",
+    );
+    assert.deepEqual(b.pi.getActiveTools(), toolsBefore, "no tool swap in the child");
+    assert.equal(b.capture.createCalls, 0, "the child booted no reviewer");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── SW: child identity and cleanup ───────────────────────────────────
+
+test("SW1: a child marker overrides stale Plan/manual review metadata", async () => {
+  const staleParentState = {
+    type: "custom",
+    customType: "workflow",
+    data: {
+      mode: "plan",
+      enabled: true,
+      executing: false,
+      // Persisted parent-only fields: they must not grant a child a Reviewer.
+      manualReviewCycle: true,
+      todos: seededTodos([{ text: "Child row" }]),
+    },
+  };
+  const b = await boot({
+    enabled: true,
+    hasUI: true,
+    sessionId: "child-sw1",
+    branch: [staleParentState, childContextEntry()],
+  });
+  try {
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 0, "no reviewer SDK load");
+    assert.equal(b.capture.createCalls, 0, "no reviewer session");
+    assert.deepEqual(reviewerNotices(b), []);
+    const status = latestStatus(b.statusCalls, "workflow");
+    void status;
+    // A child boots in Build: no Plan tool-swap was ever applied, and the
+    // validated identity wins over the stale persisted Plan entry.
+    assert.equal(
+      b.pi.timeline.filter((entry) => entry.kind === "tools").length,
+      0,
+      "the validated child identity never entered Plan",
+    );
+    assert.ok(
+      renderTodoWidget(b.widgetCalls).some((line) => line.includes("Child row")),
+      "the child's declared row survives identity enforcement",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("SW2: child teardown runs without session_shutdown and is idempotent", async () => {
+  const b = await boot({
+    enabled: true,
+    sessionId: "child-sw2",
+    branch: [childContextEntry()],
+  });
+  try {
+    const cleanup = orchestratorChildTeardowns.take("child-sw2");
+    assert.equal(typeof cleanup, "function", "the child registered cleanup");
+    // `onDispose` calls this without emitting session_shutdown.
+    cleanup?.();
+    cleanup?.();
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 0, "cleanup never boots a reviewer");
+    assert.equal(b.capture.createCalls, 0);
+    assert.equal(
+      orchestratorChildTeardowns.take("child-sw2"),
+      undefined,
+      "cleanup is consumed exactly once",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("SW3: a child refuses review and mode controls locally", async () => {
+  const b = await boot({
+    enabled: true,
+    sessionId: "child-sw3",
+    branch: [childContextEntry()],
+  });
+  try {
+    await b.pi.commands["review"].handler("", b.ctx);
+    await b.pi.commands["review-resume"].handler("", b.ctx);
+    await b.pi.commands.build.handler("", b.ctx);
+    await settleTick();
+
+    assert.ok(
+      notified(b.notifies, "Orchestrator Build child"),
+      "the child-local review refusal is explicit",
+    );
+    assert.equal(b.reviewerSdkLoads(), 0, "no reviewer SDK load");
+    assert.equal(b.capture.createCalls, 0, "no reviewer session");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+// ── OER: the Orchestrator path has no Reviewer dependency ────────────
+// Every case uses an INCOMPATIBLE reviewer loader (`reviewSdk: {}`). Any
+// accidental Reviewer bootstrap would therefore fail loudly and be visible in
+// the reviewer counters/warnings instead of silently doing nothing.
+
+test("OER1: a two-row run completes with a poisoned reviewer loader", async () => {
+  let projectCwd = "";
+  let writes = 0;
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: true,
+    onPrompt: () => {
+      writes += 1;
+      fs.writeFileSync(
+        path.join(projectCwd, `oer1-${writes}.txt`),
+        `work ${writes}`,
+      );
+    },
+  });
+  const b = await boot({
+    hasUI: true,
+    executionMode: "orchestrator",
+    child,
+    reviewSdk: {},
+  });
+  projectCwd = b.cwd;
+  try {
+    const plan = placePlan(b.cwd, "oer1.md");
+    fs.writeFileSync(
+      plan.abs,
+      orchestratorPlan(["Write the first file", "Write the second file"]),
+    );
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    // Reviewer trace: zero, for SDK load, session create and user-visible warning.
+    assert.equal(b.reviewerSdkLoads(), 0, "execution never loads the reviewer SDK");
+    assert.equal(b.capture.createCalls, 0, "execution never creates a reviewer");
+    assert.deepEqual(reviewerNotices(b), [], "no reviewer warning in execution");
+
+    // Builder trace: exactly one child per row, each prompted once, disposed once.
+    assert.equal(b.child.created.length, 2, "one child per frozen row");
+    for (const [index, session] of b.child.created.entries()) {
+      assert.equal(session.promptCalls, 1, `child ${index + 1} prompted once`);
+      assert.equal(session.disposeCalls, 1, `child ${index + 1} disposed once`);
+    }
+    const status = JSON.stringify(
+      await b.pi.tools.orchestrator_status.execute("oer1-status", {}),
+    );
+    assert.match(status, /"accepted":2/);
+    assert.match(status, /"summary":"completed/);
+
+    // A late parent settle must not resurrect a reviewer either.
+    await b.pi.emit("agent_end", { messages: [] }, b.ctx);
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), 0, "late settle adds no reviewer");
+    assert.equal(b.capture.createCalls, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OER2: reviewer activity stops at approval; execution adds none", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: true });
+  const b = await boot({
+    enabled: true,
+    hasUI: true,
+    plannotator: true,
+    executionMode: "orchestrator",
+    customAnswers: [executionAnswer("orchestrator")],
+    child,
+  });
+  try {
+    const plan = placePlan(b.cwd, "oer2.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await switchToPlan(b.pi, b.ctx);
+    await writeResult(b.pi, b.ctx, plan.rel);
+    await runReview(b.pi, b.ctx);
+
+    const loadsAfterReview = b.reviewerSdkLoads();
+    const createsAfterReview = b.capture.createCalls;
+    assert.ok(loadsAfterReview >= 1, "the Plan review actually ran");
+
+    // Approve the reviewed plan into Orchestrator; the child settles.
+    b.pi.events.emit("plannotator:review-result", {
+      reviewId: "review-1",
+      approved: true,
+    });
+    await waitFor(() => b.child.startCount >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    assert.equal(
+      b.reviewerSdkLoads(),
+      loadsAfterReview,
+      "approval and execution add no reviewer SDK load",
+    );
+    assert.equal(
+      b.capture.createCalls,
+      createsAfterReview,
+      "approval and execution add no reviewer session",
+    );
+    assert.ok(b.child.startCount >= 1, "the orchestrator started a Builder");
+    // Nothing review-shaped may leak into execution.
+    const finalReviewLine = latestStatus(b.statusCalls, "workflow-review");
+    assert.ok(
+      !(
+        typeof finalReviewLine === "string" &&
+        /Reviewing plan|review · awaiting/.test(finalReviewLine)
+      ),
+      "no active review line leaks into execution",
+    );
+    const finalModeLine = latestStatus(b.statusCalls, "workflow");
+    assert.ok(
+      !(
+        typeof finalModeLine === "string" &&
+        /modes locked/.test(finalModeLine)
+      ),
+      "no review lock leaks into execution",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("LR1: a restored legacy handoff is reportable/abortable without a reviewer", async () => {
+  const branch: unknown[] = [];
+  const b = await boot({ branch, enabled: true, hasUI: true, plannotator: true });
+  try {
+    const plan = placePlan(b.cwd, "legacy-handoff.md");
+    branch.push({
+      type: "custom",
+      customType: "workflow",
+      data: {
+        mode: "build",
+        enabled: true,
+        executing: false,
+        awaitingDecision: true,
+        awaitingDecisionAt: Date.now(),
+        lastReviewId: "legacy-review",
+        pendingHandoffPlanPath: plan.abs,
+        pendingHandoffPlanHash: planHash(ORIGINAL_PLAN),
+        pendingHandoffSource: "manual",
+        pendingHandoffCycleId: 0,
+        planHandoffPhase: "pending",
+        pendingHandoffReviewOwned: true,
+        todos: [],
+      },
+    });
+    await b.pi.emit("session_start", { reason: "resume" }, b.ctx);
+    await settleTick();
+
+    assert.equal(b.reviewerSdkLoads(), 0, "restore boots no reviewer");
+    await b.pi.commands["review-status"].handler("", b.ctx);
+    assert.ok(
+      notified(b.notifies, "handoff"),
+      "status reports the restored handoff",
+    );
+    await b.pi.commands["review-abort"].handler("", b.ctx);
+    await settleTick();
+    assert.equal(b.reviewerSdkLoads(), 0, "abort boots no reviewer");
+    assert.equal(b.capture.createCalls, 0, "abort creates no reviewer");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OER3: failed row checks repair/block with no reviewer activity", async () => {
+  let projectCwd = "";
+  let writes = 0;
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: true,
+    onPrompt: () => {
+      writes += 1;
+      fs.writeFileSync(path.join(projectCwd, `oer3-${writes}.txt`), "x");
+    },
+  });
+  const b = await boot({
+    hasUI: true,
+    executionMode: "orchestrator",
+    child,
+    reviewSdk: {},
+  });
+  projectCwd = b.cwd;
+  try {
+    const plan = placePlan(b.cwd, "oer3.md");
+    fs.writeFileSync(
+      plan.abs,
+      [
+        "# Plan: Repair without review",
+        "",
+        "## Plan Steps",
+        "",
+        "1. Always fails",
+        "   Acceptance:",
+        '   - node -e "process.exit(1)"',
+        "",
+      ].join("\n"),
+    );
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    let status = "";
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      status = JSON.stringify(
+        await b.pi.tools.orchestrator_status.execute("oer3-status", {}),
+      );
+      if (/"phase":"paused"/.test(status) || /"blocked":1/.test(status)) break;
+    }
+
+    assert.match(status, /"blocked":1/, "the failing row is blocked, not accepted");
+    assert.match(status, /"summary":"paused/, "the run pauses on the blocker");
+    assert.equal(b.reviewerSdkLoads(), 0, "repair never reviews");
+    assert.equal(b.capture.createCalls, 0, "repair never creates a reviewer");
+    assert.equal(b.child.created.length, 1, "the warm child was reused");
   } finally {
     await b.cleanup();
   }

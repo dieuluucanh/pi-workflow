@@ -1,5 +1,45 @@
 ## Unreleased
 
+- **Reviewer ownership is Plan-only; no speculative Reviewer in Orchestrator/Build.**
+  Fixed two independent defects behind the execution-time `Review Mode: reviewer
+  unavailable …` warning:
+  - The `agent_end` handoff ran an unconditional reviewer **prefetch** before the
+    Plan-only return, so an Orchestrator parent turn and every in-process Build
+    child (which loads this extension) booted a reviewer session without a plan
+    review. The prefetch is removed; a Reviewer session is created only on
+    demand by an admitted Plan round.
+  - The isolated-session SDK probe rejected class constructors, falsely
+    reporting `ModelRuntime.create` / `SessionManager.inMemory` /
+    `SettingsManager.inMemory` as missing. Function/class carriers with callable
+    statics now pass; genuinely missing APIs still fail closed with the exact
+    names (no ambient or file-backed fallback).
+
+  New `review-policy.ts` is the single admission answer: a review round requires
+  a parent Plan session, no executing Orchestrator owner (child
+  `starting/running/paused/settling` or run `running/paused/blocked`, including
+  between-row windows), and — for automatic review — Review Mode on **plus** a
+  current Plan submission. `/review` and `/review-resume` are **Plan mode
+  only**; outside Plan they refuse with `/plan` guidance without switching
+  modes, while `/review-status`, `/review-pause` and `/review-abort` remain
+  available for recovery. Automatic review binds to the terminal `agent_end`:
+  retry/compaction/queued continuations do not review an incomplete plan.
+
+  The same ownership predicate now gates every mode transition at the point it
+  executes (commands, Tab/composer cycling, the `pi-code:plan-mode` host toggle,
+  approval-to-Build and legacy refine paths), and a validated child identity
+  cannot be overridden by restored Plan/manual metadata. Reviewer startup is
+  generation-guarded: teardown during a cold bootstrap disposes the late session
+  exactly once, and a stale start can neither install nor clear a newer one.
+  Child teardown (which runs without `session_shutdown`) releases review
+  ownership defensively.
+
+  Orchestrator row acceptance is unchanged and remains mechanical: diff gate,
+  acceptance checks, `task.verify` evidence and final plan checks. No LLM
+  review gate was added; a failed check still repairs/blocks exactly as before.
+  Tests: `review-policy.test.ts`, `extension.test.ts` (`RO*`, `MT*`, `SW*`,
+  `OER*`, `LR1`), `review.test.ts` (`lifetime:*`), plus the corrected
+  `isolated-session.test.ts` SDK-export contract. No version bump.
+
 - Documentation for the prompt-refinement feature set (parity plan step 41):
   the package README now documents the `/prompt` and `/prompt-refine` commands,
   the bounded inspect→ask→compose→submit operation, context/provider privacy

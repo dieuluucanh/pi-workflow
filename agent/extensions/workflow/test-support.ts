@@ -165,6 +165,12 @@ export interface FakeCapture {
   /** How many times the child's `abort()` was called. */
   aborts: number;
   unsubscribeCount: number;
+  /** How many `createAgentSession` calls this SDK double served. */
+  createCalls: number;
+  /** How many times the wrapped session's `dispose()` ran. */
+  disposeCount: number;
+  /** How many times `subscribe()` was requested on the wrapped session. */
+  subscribeCalls: number;
   /** Emit an arbitrary child-session event (provider-error scripts use this). */
   emit: (event: unknown) => void;
 }
@@ -224,6 +230,9 @@ export function fakeSdk(script: {
     activeTools: [],
     aborts: 0,
     unsubscribeCount: 0,
+    createCalls: 0,
+    disposeCount: 0,
+    subscribeCalls: 0,
     emit: () => {},
   };
   const sdk = {
@@ -249,6 +258,7 @@ export function fakeSdk(script: {
       customTools?: Array<{ name: string }>;
     }) => {
       if (script.shouldThrowOnCreate) throw new Error("session create failed");
+      capture.createCalls += 1;
       capture.toolAllowlist = [...(opts.tools ?? [])];
       for (const t of opts.customTools ?? []) {
         capture.tools[t.name] = t as never;
@@ -284,6 +294,7 @@ export function fakeSdk(script: {
             return streaming;
           },
           subscribe: (listener: (event: unknown) => void) => {
+            capture.subscribeCalls += 1;
             capture.unsubscribeCount += 1;
             listeners.push(listener);
             return () => {
@@ -370,6 +381,11 @@ export function fakeSdk(script: {
           },
           getActiveToolNames: () => capture.activeTools.slice(),
           bindExtensions: async () => {},
+          dispose: () => {
+            capture.disposeCount += 1;
+            streaming = false;
+            listeners.length = 0;
+          },
         },
       };
     },
@@ -732,6 +748,10 @@ export interface FakeCtxOptions {
    * review runs inside `agent_end`). Defaults to true.
    */
   idle?: boolean;
+  /** `ctx.hasPendingMessages()` at boot (queued continuation guard). */
+  pendingMessages?: boolean;
+  /** `ctx.sessionManager.getSessionId()` (child teardown registry key). */
+  sessionId?: string;
 }
 
 export function makeFakeCtx(over: FakeCtxOptions) {
@@ -756,12 +776,15 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   const workingMessages: Array<string | undefined> = [];
   const workingVisible: boolean[] = [];
   let aborts = 0;
+  // Models a run that still has queued messages / a pending continuation.
+  let pendingMessages = over.pendingMessages === true;
   const ctx = {
     cwd: over.cwd,
     mode: "tui",
     hasUI: over.hasUI === true,
     signal: over.signal,
     isIdle: () => idle,
+    hasPendingMessages: () => pendingMessages,
     abort: () => {
       aborts += 1;
     },
@@ -771,6 +794,7 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     },
     settings: over.settings ?? {},
     sessionManager: {
+      getSessionId: () => over.sessionId ?? "fake-session",
       getBranch: () => over.branch ?? [],
       buildContextEntries: () => over.branch ?? [],
       getLeafEntry: () => (over.branch ?? []).at(-1),
@@ -842,6 +866,10 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     /** Flip `ctx.isIdle()` for a test that needs an active run. */
     setIdle(value: boolean) {
       idle = value;
+    },
+    /** Flip `ctx.hasPendingMessages()` for a queued-continuation test. */
+    setPendingMessages(value: boolean) {
+      pendingMessages = value;
     },
     /** Count `ctx.abort()` calls (shell guard trips). */
     aborts: () => aborts,
@@ -933,6 +961,10 @@ export interface FakeOrchestratorChildSession {
   settle(summary?: string): void;
   /** Test control: a full prompt → tool events → settle. */
   settleOnPrompt: boolean;
+  /** How many `prompt()` calls the session received. */
+  promptCalls: number;
+  /** How many `dispose()` calls the session received. */
+  disposeCalls: number;
 }
 
 export interface FakeOrchestratorChildOptions {
@@ -959,13 +991,17 @@ export interface FakeOrchestratorChildFactory {
     | { ok: false; error: string }
   >;
   created: FakeOrchestratorChildSession[];
+  /** How many factory (child create) attempts were served. */
+  startCount: number;
 }
 
 export function makeFakeOrchestratorChildFactory(
   options: FakeOrchestratorChildOptions = {},
 ): FakeOrchestratorChildFactory {
   const created: FakeOrchestratorChildSession[] = [];
+  let startCount = 0;
   const factory: FakeOrchestratorChildFactory["factory"] = async (input) => {
+    startCount += 1;
     if (options.failCreate) return { ok: false, error: options.failCreate };
     const listeners: Array<(event: unknown) => void> = [];
     let streaming = false;
@@ -987,6 +1023,7 @@ export function makeFakeOrchestratorChildFactory(
       },
       async prompt(text) {
         if (disposed) return;
+        session.promptCalls += 1;
         if (options.onPrompt) await options.onPrompt(text, session);
         streaming = true;
         emit({
@@ -1011,6 +1048,7 @@ export function makeFakeOrchestratorChildFactory(
         return streaming;
       },
       dispose() {
+        session.disposeCalls += 1;
         disposed = true;
         streaming = false;
         listeners.length = 0;
@@ -1052,9 +1090,17 @@ export function makeFakeOrchestratorChildFactory(
         emit({ type: "agent_settled" });
       },
       settleOnPrompt: options.settleOnPrompt === true,
+      promptCalls: 0,
+      disposeCalls: 0,
     };
     created.push(session);
     return { ok: true, child: session, modelLabel };
   };
-  return { factory, created };
+  return {
+    factory,
+    created,
+    get startCount() {
+      return startCount;
+    },
+  };
 }

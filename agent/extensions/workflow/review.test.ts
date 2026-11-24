@@ -5666,3 +5666,124 @@ test("runtime: a reviewer shell-guard trip stops the round without provider fall
     "the fallback is named",
   );
 });
+
+// ── Lifetime: teardown / supersession during a cold bootstrap ────────
+
+/** Defer the SDK's `createAgentSession` until the test releases it. */
+function deferCreateSession(sdk: unknown): {
+  release: () => Promise<void>;
+  created: () => number;
+} {
+  const target = sdk as {
+    createAgentSession: (options: unknown) => Promise<unknown>;
+  };
+  const original = target.createAgentSession.bind(target);
+  const gates: Array<() => void> = [];
+  let count = 0;
+  target.createAgentSession = async (options: unknown) => {
+    count += 1;
+    await new Promise<void>((resolve) => gates.push(resolve));
+    return original(options);
+  };
+  return {
+    release: async () => {
+      const next = gates.shift();
+      if (next) next();
+      await Promise.resolve();
+      await Promise.resolve();
+    },
+    created: () => count,
+  };
+}
+
+/** Poll until the deferred create has been entered `expected` times. */
+async function waitForCreate(read: () => number, expected: number): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (read() >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(
+    `timed out waiting for ${expected} deferred creates (saw ${read()})`,
+  );
+}
+
+test("lifetime: teardown during a deferred bootstrap disposes the late session once", async () => {
+  const { capture, sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const deferred = deferCreateSession(sdk);
+  const { deps, logs } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+
+  const started = rt.ensureStarted();
+  // Wait until the SDK is actually inside createAgentSession, THEN tear down:
+  // this is the window where a late session used to be installed forever.
+  await waitForCreate(deferred.created, 1);
+  await rt.teardown();
+  await deferred.release();
+
+  assert.equal(await started, false, "a stale bootstrap never reports success");
+  assert.equal(deferred.created(), 1, "the SDK did create a child");
+  assert.equal(capture.createCalls, 1);
+  assert.equal(capture.disposeCount, 1, "the late child is disposed exactly once");
+  assert.equal(capture.subscribeCalls, 0, "no listener was installed");
+  assert.equal(capture.prompts.length, 0, "no late prompt");
+  assert.equal(rt.isAlive(), false, "no session was retained");
+  assert.ok(
+    !logs.some((line) => /reviewer tools active|no time limit configured/.test(line)),
+    "stale startup logs are suppressed",
+  );
+});
+
+test("lifetime: a stale startup cannot clear a newer startup", async () => {
+  const { sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const deferred = deferCreateSession(sdk);
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+
+  const first = rt.ensureStarted();
+  await waitForCreate(deferred.created, 1);
+  await rt.teardown();
+  const second = rt.ensureStarted();
+  await waitForCreate(deferred.created, 2);
+
+  await deferred.release(); // resolve the STALE bootstrap
+  assert.equal(await first, false, "the stale start fails");
+  await deferred.release(); // resolve the CURRENT bootstrap
+  assert.equal(await second, true, "the newer start still installs its session");
+  assert.equal(rt.isAlive(), true);
+  assert.equal(
+    await rt.ensureStarted(),
+    true,
+    "a later call reuses the live session instead of the stale promise",
+  );
+  await rt.teardown();
+});
+
+test("lifetime: abort during a deferred bootstrap stops before any prompt", async () => {
+  const { capture, sdk } = fakeSdk({ pass1: submitThenFinish(REWRITTEN_PLAN) });
+  const deferred = deferCreateSession(sdk);
+  const { deps } = runtimeDeps(sdk);
+  const rt = createReviewRuntime(deps as never);
+
+  const controller = new AbortController();
+  const round = rt.runRound({
+    planText: ORIGINAL_PLAN,
+    planPath: ".pi/plans/2026-09-18-csv.md",
+    round: 1,
+    signal: controller.signal,
+  });
+  // Cancel while the child is still booting; the round must not prompt.
+  await waitForCreate(deferred.created, 1);
+  controller.abort();
+  await deferred.release();
+
+  const result = await round;
+  assert.equal(result.reason, "aborted");
+  assert.equal(capture.prompts.length, 0, "no pass prompt was sent");
+  // Abort is a PAUSE: the warm session is kept for /review-resume, exactly
+  // once, and released by teardown.
+  assert.equal(rt.isAlive(), true, "the paused session stays warm");
+  assert.equal(capture.subscribeCalls, 1, "exactly one listener");
+  await rt.teardown();
+  assert.equal(capture.disposeCount, 1, "teardown releases it once");
+  assert.equal(rt.isAlive(), false);
+});

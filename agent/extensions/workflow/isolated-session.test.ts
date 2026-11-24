@@ -729,3 +729,180 @@ test("isolatedProviderAuthFailureMessage: names the provider and the escape hatc
   assert.match(message, /\/login custom/);
   assert.match(message, /\/agent\/models\.json/);
 });
+
+test("isolated session: class-shaped SDK exports are accepted (production shape)", () => {
+  // The real Pi SDK exports these as CLASSES. A static-method check must not
+  // treat a constructor as "not an object" and report its statics as missing.
+  class ModelRuntime {
+    static async create() {
+      return {};
+    }
+  }
+  class SessionManager {
+    static inMemory() {
+      return {};
+    }
+  }
+  class SettingsManager {
+    static inMemory() {
+      return {};
+    }
+  }
+  assert.deepEqual(
+    missingIsolatedSessionSdkExports({
+      ModelRuntime,
+      DefaultResourceLoader: class {},
+      SessionManager,
+      SettingsManager,
+      createAgentSession: () => {},
+    }),
+    [],
+    "class constructors with the required statics satisfy the probe",
+  );
+
+  // A function carrier with the statics attached is equally valid.
+  const fnCarrier = Object.assign(function carrier() {}, {
+    inMemory: () => ({}),
+  });
+  assert.deepEqual(
+    missingIsolatedSessionSdkExports({
+      ModelRuntime: Object.assign(function rt() {}, { create: async () => ({}) }),
+      DefaultResourceLoader: class {},
+      SessionManager: fnCarrier,
+      SettingsManager: Object.assign(function sm() {}, {
+        inMemory: () => ({}),
+      }),
+      createAgentSession: () => {},
+    }),
+    [],
+  );
+
+  // A non-callable static is a genuine failure, named precisely.
+  assert.deepEqual(
+    missingIsolatedSessionSdkExports({
+      ModelRuntime: class {
+        static create = 42;
+      },
+      DefaultResourceLoader: class {},
+      SessionManager: { inMemory: () => ({}) },
+      SettingsManager: { inMemory: () => ({}) },
+      createAgentSession: () => {},
+    }),
+    ["ModelRuntime.create"],
+  );
+});
+
+test("isolated session: the installed Pi SDK satisfies the export contract (import only)", async () => {
+  const sdk = await import("@earendil-works/pi-coding-agent");
+  // Import-only: never constructs a ModelRuntime, SettingsManager or session.
+  assert.deepEqual(
+    missingIsolatedSessionSdkExports(sdk),
+    [],
+    "the real named-export namespace must satisfy the probe",
+  );
+});
+
+test("isolated session: each required export is reported individually", () => {
+  const complete = {
+    ModelRuntime: class {
+      static async create() {
+        return {};
+      }
+    },
+    DefaultResourceLoader: class {},
+    SessionManager: class {
+      static inMemory() {
+        return {};
+      }
+    },
+    SettingsManager: class {
+      static inMemory() {
+        return {};
+      }
+    },
+    createAgentSession: () => {},
+  } as Record<string, unknown>;
+  assert.deepEqual(missingIsolatedSessionSdkExports(complete), []);
+
+  const cases: Array<[string, string]> = [
+    ["ModelRuntime", "ModelRuntime.create"],
+    ["DefaultResourceLoader", "DefaultResourceLoader"],
+    ["SessionManager", "SessionManager.inMemory"],
+    ["SettingsManager", "SettingsManager.inMemory"],
+    ["createAgentSession", "createAgentSession"],
+  ];
+  for (const [key, name] of cases) {
+    const partial = { ...complete };
+    delete partial[key];
+    assert.deepEqual(
+      missingIsolatedSessionSdkExports(partial),
+      [name],
+      `only ${name} is reported when ${key} is absent`,
+    );
+  }
+
+  // Junk holders are total, never throwing, and report every export.
+  for (const junk of [null, undefined, "sdk", 42, true]) {
+    assert.deepEqual(missingIsolatedSessionSdkExports(junk), [
+      "ModelRuntime.create",
+      "DefaultResourceLoader",
+      "SessionManager.inMemory",
+      "SettingsManager.inMemory",
+      "createAgentSession",
+    ]);
+  }
+});
+
+test("isolated session: a missing export fails before any runtime or session is built", async () => {
+  const { sdk, captured } = makeSdk({ activeTools: TOOLS });
+  const missingCreate = { ...sdk, DefaultResourceLoader: undefined };
+  const res = await createIsolatedSession(
+    baseOptions({ loadSdk: async () => missingCreate }),
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.error ?? "", /DefaultResourceLoader/);
+  assert.equal(captured.createCalls, 0, "no session was created");
+  assert.equal(captured.fileSettingsCalls, 0, "no file-backed settings were read");
+  assert.equal(
+    captured.loaderOptions,
+    undefined,
+    "no resource loader was constructed",
+  );
+});
+
+test("refinement wrapper: shared bootstrap keeps in-memory settings and exact tools", async () => {
+  const { sdk, captured } = makeSdk({
+    activeTools: ["read", "grep"],
+  });
+  const res = await createIsolatedSession(
+    baseOptions({
+      label: "refinement session",
+      sessionIdPrefix: "refine",
+      tools: ["read", "grep"],
+      customTools: [],
+      loadSdk: async () => sdk,
+    }),
+  );
+  assert.equal(res.ok, true, res.error);
+  assert.equal(
+    captured.fileSettingsCalls,
+    0,
+    "refinement never falls back to file-backed settings",
+  );
+  assert.deepEqual(captured.settingsInput, {});
+  const opts = captured.sessionOptions as Record<string, unknown>;
+  assert.deepEqual(opts.tools, ["read", "grep"], "exact tool allowlist");
+  assert.equal(
+    (captured.loaderOptions as Record<string, unknown>).noExtensions,
+    true,
+  );
+  assert.equal(
+    (captured.loaderOptions as Record<string, unknown>).noSkills,
+    true,
+  );
+  assert.equal(
+    (captured.loaderOptions as Record<string, unknown>).noContextFiles,
+    true,
+    "refinement keeps ambient context off by default",
+  );
+});

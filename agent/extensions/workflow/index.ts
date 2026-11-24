@@ -267,7 +267,7 @@ import {
   createFrozenTodosFromSteps,
 } from "./todo-snapshot.ts";
 import { rebindLegacyTodosToPlan } from "./legacy-recovery.ts";
-import { classifyToolMutation, resolveRolePolicy } from "./policy-runtime.ts";
+import { resolveRolePolicy } from "./policy-runtime.ts";
 import { createContributionPublisher } from "./host-contributions-publisher.ts";
 import {
   buildWorkflowContributions,
@@ -290,19 +290,15 @@ import {
   createNodeWorkspaceResolver,
   readGitDiffPaths,
 } from "./orchestrator-adapters.ts";
-import { captureBaseline, diffSinceBaseline, type WorkspaceBaseline } from "./orchestrator-workspace.ts";
 import {
   captureWorkspaceSetBaseline,
   diffWorkspaceSet,
-  hasAttributableChangeInSet,
   parseWorkspaceDeclarations,
   primaryWorkspace,
   resolveWorkspaceAlias,
   resolveWorkspaceSet,
   scopeCommandToWorkspace,
-  workspaceCheckRoot,
   workspaceRootForRow,
-  type FrozenWorkspace,
   type WorkspaceSet,
   type WorkspaceSetBaseline,
   type WorkspaceSetDiff,
@@ -495,7 +491,6 @@ import {
 } from "./composer-transform-adapter.ts";
 import {
   createRefinementRuntime,
-  type RefinementRuntimeEvent,
 } from "./prompt-refinement-runtime.ts";
 import type {
   RefinerAskOutcome,
@@ -577,6 +572,13 @@ import {
   shouldHandoffManualResult,
   type ReviewHandoffSource,
 } from "./review-handoff.ts";
+import {
+  admitModeTransition,
+  admitReviewer,
+  executionOwnsSession,
+  type ModeTransitionAdmission,
+  type ReviewerAdmission,
+} from "./review-policy.ts";
 import { seedPromptHistory, WorkflowTabEditor } from "./tab-editor.ts";
 import {
   createShellGuardRuntime,
@@ -2831,6 +2833,91 @@ export default function workflowExtension(
   }
 
   /**
+   * Live ownership facts for the shared Reviewer policy. The in-process Build
+   * child and the frozen Orchestrator run are independent owners; either one
+   * (including a paused/blocked run with no live child) forbids a Reviewer.
+   */
+  function reviewOwnershipFacts(): {
+    childPhase?: Parameters<typeof admitReviewer>[0]["childPhase"];
+    runPhase?: Parameters<typeof admitReviewer>[0]["runPhase"];
+  } {
+    const childPhase = orchestratorChild?.state().phase;
+    let runPhase: Parameters<typeof admitReviewer>[0]["runPhase"];
+    try {
+      runPhase = orchestratorRuntime?.view()?.phase;
+    } catch (_e) {
+      void _e;
+    }
+    return {
+      ...(childPhase === undefined ? {} : { childPhase }),
+      ...(runPhase === undefined ? {} : { runPhase }),
+    };
+  }
+
+  /**
+   * The single admission answer for every Reviewer entrypoint (automatic
+   * handoff, `/review`, `/review-resume`). Configuration-on is reported
+   * separately from permission-to-run: this predicate is permission.
+   */
+  function admitReviewerNow(input: {
+    trigger: Parameters<typeof admitReviewer>[0]["trigger"];
+    hasCurrentPlanSubmission?: boolean;
+    staleOwner?: boolean;
+  }): ReviewerAdmission {    return admitReviewer({
+      trigger: input.trigger,
+      mode: workflowMode,
+      isOrchestratorChild: inProcessChildContext !== undefined,
+      autoReviewEnabled: reviewEnabled(),
+      ...(input.hasCurrentPlanSubmission === undefined
+        ? {}
+        : { hasCurrentPlanSubmission: input.hasCurrentPlanSubmission }),
+      ...(input.staleOwner === undefined
+        ? {}
+        : { staleOwner: input.staleOwner }),
+      ...reviewOwnershipFacts(),
+    });
+  }
+
+  /** True when an Orchestrator execution owns the session (shared predicate). */
+  function executionOwnsThisSession(): boolean {
+    return executionOwnsSession(reviewOwnershipFacts());
+  }
+
+  /**
+   * Final mode-transition gate. Runs INSIDE the setters, so a queued request
+   * or a host event cannot bypass a run that started after it was accepted.
+   * A validated `fromReview` release does not override an unrelated live run.
+   */
+  function admitModeTransitionNow(
+    target: WorkflowMode,
+    opts?: ModeSwitchOptions,
+  ): ModeTransitionAdmission {
+    return admitModeTransition({
+      target,
+      currentMode: workflowMode,
+      isOrchestratorChild: inProcessChildContext !== undefined,
+      ...(opts?.fromManagedChild === true ? { fromManagedChild: true } : {}),
+      ...reviewOwnershipFacts(),
+    });
+  }
+
+  /** Refuse a mode transition with one notice; true when refused. */
+  function blockModeTransitionByOwnership(
+    ctx: ExtensionContext,
+    target: WorkflowMode,
+    opts?: ModeSwitchOptions,
+  ): boolean {
+    const admission = admitModeTransitionNow(target, opts);
+    if (admission.ok) return false;
+    try {
+      ctx.ui.notify(admission.reason, "warning");
+    } catch (_e) {
+      void _e;
+    }
+    return true;
+  }
+
+  /**
    * Config for a MANUAL one-shot review: the saved rounds/passes/verify/
    * budget/timeout/model as-is, ignoring only the `enabled` flag.
    * Returns undefined solely when settings are unreadable.
@@ -3427,9 +3514,33 @@ export default function workflowExtension(
     signal?: AbortSignal;
     /** `/review-resume` is continuing a paused round (band + run label). */
     resumed?: boolean;
+    /** Which gate admitted this round; defaults to an explicit manual start. */
+    trigger?: ReviewTrigger;
   }): Promise<ReviewExecutionResult> {
     const { planText, round, previousFindings, ctx, signal, resumed } = opts;
+    const trigger: ReviewTrigger = opts.trigger ?? "manual";
     const hash = planHash(planText);
+    // Re-check admission immediately before the lazy runtime is created. The
+    // caller may have awaited (a target read, a pause snapshot, a modal), so a
+    // run that started, a mode that changed, or a superseded cycle must not
+    // still reach `ensureReviewRuntime()`.
+    const admission = admitReviewerNow({
+      trigger,
+      ...(trigger === "auto"
+        ? {
+            hasCurrentPlanSubmission:
+              planWrittenThisRun && planWrittenInPlanModeThisRun,
+          }
+        : {}),
+    });
+    if (!admission.ok) {
+      return {
+        planText,
+        outcome: "skipped",
+        reason: admission.reason,
+        paused: false,
+      };
+    }
     // The round owns this controller. Pause/abort abort it directly, which also
     // covers the cold-start window before `runRound` creates its own runtime
     // controller. The host signal is only *forwarded* to it (never used
@@ -3634,6 +3745,27 @@ export default function workflowExtension(
   ): Promise<ReviewExecutionResult> {
     const hash = planHash(planText);
     const cfg = reviewConfigNow()?.config ?? DEFAULT_REVIEW_MODE_CONFIG;
+    // One admission gate for every trigger. It runs before the enabled check,
+    // target work or any UI/runtime allocation: an Orchestrator/Build child, a
+    // live run, or a non-Plan session can never reach a Reviewer.
+    const admission = admitReviewerNow({
+      trigger,
+      ...(trigger === "auto"
+        ? {
+            hasCurrentPlanSubmission:
+              planWrittenThisRun && planWrittenInPlanModeThisRun,
+          }
+        : {}),
+    });
+    if (!admission.ok) {
+      if (trigger !== "auto") notifyReview(admission.reason, "warning");
+      return {
+        planText,
+        outcome: "skipped",
+        reason: admission.reason,
+        paused: false,
+      };
+    }
     if (trigger === "auto" && !cfg.enabled) {
       return {
         planText,
@@ -3762,6 +3894,7 @@ export default function workflowExtension(
         previousFindings: reviewPreviousFindings,
         ctx,
         signal,
+        trigger,
       });
     } catch (e: any) {
       // executeReviewRound never throws; belt-and-braces so the handoff
@@ -3962,6 +4095,39 @@ export default function workflowExtension(
    * they are not guarded. Clearing the review state releases the derived
    * mode-switch lock (plan 2026-10-25).
    */
+  /**
+   * Defense in depth for an in-process Orchestrator Build child.
+   *
+   * The child is a second Workflow factory instance in the same process, and
+   * `AgentSession.dispose()` does NOT emit `session_shutdown` (see
+   * `in-process-child.ts`), so the parent's registered teardown calls this
+   * directly. It is synchronous and idempotent: review ownership is dropped
+   * first, then any allocated Reviewer session is released best-effort with a
+   * handled rejection (never an unhandled one).
+   */
+  function releaseChildReviewOwnership(): void {
+    try {
+      activeReview?.controller.abort();
+    } catch (_e) {
+      void _e;
+    }
+    const rt = reviewRuntime;
+    reviewRuntime = undefined;
+    reviewState = undefined;
+    activeReview = undefined;
+    pausedReview = undefined;
+    reviewPreviousFindings = undefined;
+    reviewRound = 0;
+    manualReviewCycle = false;
+    reviewGatePhase = "idle";
+    reviewGateCycleId = 0;
+    if (rt) {
+      void Promise.resolve()
+        .then(() => rt.teardown())
+        .catch(() => undefined);
+    }
+  }
+
   async function teardownReview(
     opts: { keepHandoff?: boolean } = {},
   ): Promise<void> {
@@ -4275,7 +4441,7 @@ export default function workflowExtension(
 
       if (enable) {
         ctx.ui.notify(
-          `Review Mode ENABLED (${scopeLabel}) — after Plan Mode finishes, an independent reviewer audits the plan and hands it to Plannotator or the native questionnaire (see /handoff).\nTip: /review runs a one-shot review any time, even with Review Mode off.\nSettings: ${settingsLabel}`,
+          `Review Mode ENABLED (${scopeLabel}) — after Plan Mode finishes, an independent reviewer audits a submitted plan and hands it to Plannotator or the native questionnaire (see /handoff). Configuration ON is not a trigger: review is Plan-only and never runs during Build/Orchestrator execution.\nTip: /review runs a one-shot review in Plan mode, even with Review Mode off.\nSettings: ${settingsLabel}`,
           "info",
         );
         updateStatus(ctx as any);
@@ -4295,7 +4461,7 @@ export default function workflowExtension(
           hadPendingHandoff
             ? "The pending plan handoff is still open as a plain decision — use /handoff fallback for the native sheet.\n"
             : ""
-        }Tip: /review still runs a one-shot review any time.\nSettings: ${settingsLabel}`,
+        }Tip: /review still runs a one-shot review in Plan mode.\nSettings: ${settingsLabel}`,
         "info",
       );
       updateStatus(ctx as any);
@@ -5012,7 +5178,6 @@ export default function workflowExtension(
         const ctx = request.host.ctx as any;
         const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd();
         const agentDir = getAgentDir();
-        const trusted = ctx?.isProjectTrusted?.() === true;
         const sdk = deps.loadSdk
           ? await deps.loadSdk()
           : await import("@earendil-works/pi-coding-agent");
@@ -6023,7 +6188,7 @@ export default function workflowExtension(
           [
             reviewEnabled()
               ? "Review Mode is enabled but no review has run yet."
-              : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} /review runs a one-shot review.`,
+              : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} Manual review is Plan mode only: /plan, then /review. Review never runs during Build/Orchestrator execution; row verification is mechanical, not a review.`,
             ...reviewTurnStatusLines(),
             pendingHandoffStatusLine(),
             reviewModeLockStatusLine(lockKind),
@@ -6067,9 +6232,31 @@ export default function workflowExtension(
     },
   });
 
+  /**
+   * Refuse an explicit manual review start/resume without touching mode,
+   * settings, the plan target, the pause snapshot or the review turn. A
+   * refusal is never an implicit restart or handoff.
+   */
+  function notifyManualReviewRefusal(
+    ctx: ExtensionContext,
+    admission: Extract<ReviewerAdmission, { ok: false }>,
+  ): void {
+    let message = admission.reason;
+    if (admission.code === "not-plan" && currentPausedReview() !== undefined) {
+      // A paused review keeps modes locked; name the escape path explicitly.
+      message +=
+        "\nA paused review keeps modes locked — /review-abort to discard it, then /plan and /review again.";
+    }
+    try {
+      ctx.ui.notify(message, "warning");
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   pi.registerCommand("review", {
     description:
-      "Run a one-shot Review round now: /review [path] works whether Review Mode is on or off (mode stays OFF); /review say <msg> talks to the in-flight reviewer",
+      "Run a one-shot Review round now: /review [path] is Plan mode only (works whether Review Mode is on or off; mode stays OFF); /review say <msg> talks to the in-flight reviewer",
     getArgumentCompletions: (prefix: string) => {
       const cwd = (currentSessionCtx as any)?.cwd ?? process.cwd();
       const items = [
@@ -6092,6 +6279,13 @@ export default function workflowExtension(
     },
     handler: async (args, ctx) => {
       if (blockWhileChildActive(ctx, "/review")) return;
+      // The Reviewer is a Plan artifact. Refuse BEFORE the target read, the
+      // review turn or any SDK work; never switch modes implicitly.
+      const admission = admitReviewerNow({ trigger: "manual" });
+      if (!admission.ok) {
+        notifyManualReviewRefusal(ctx, admission);
+        return;
+      }
       // Explicit reviewer steering (plan 2026-10-23, step 3): the only path
       // that delivers user text into an in-flight review round. Plain chat
       // stays with the plan agent (see the `input` handler).
@@ -6281,8 +6475,16 @@ export default function workflowExtension(
 
   pi.registerCommand("review-resume", {
     description:
-      "Resume a paused Review round on the warm reviewer session",
+      "Resume a paused Review round on the warm reviewer session (Plan mode only)",
     handler: async (_args, ctx) => {
+      // Plan-only, before the pause snapshot is read or the review turn/gate
+      // is mutated: a refused resume must leave a legacy pause intact and
+      // must never allocate a Reviewer.
+      const admission = admitReviewerNow({ trigger: "resume" });
+      if (!admission.ok) {
+        notifyManualReviewRefusal(ctx, admission);
+        return;
+      }
       // Manual control: resume works whether or not Review Mode is on.
       // Gate only on paused-session state below — no `enabled` check here.
       const paused = currentPausedReview();
@@ -7856,6 +8058,9 @@ export default function workflowExtension(
     // `fromReview` because it is the exit, not a competing mode switch.
     if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
     if (opts?.fromReview === true && reviewRoundInFlight()) return;
+    // Execution ownership is enforced HERE, not only before the transition was
+    // queued: a run that started meanwhile still owns the session.
+    if (blockModeTransitionByOwnership(ctx, "plan", opts)) return;
     // Leaving Default mode: remember its model so it can be restored on return.
     if (workflowMode === null) captureDefaultModel(ctx, "plan");
     workflowMode = "plan";
@@ -7906,6 +8111,7 @@ export default function workflowExtension(
     }
     // Refuse before assigning the mode / swapping tools / suspending review.
     if (blockModeSwitchDuringReview(ctx)) return;
+    if (blockModeTransitionByOwnership(ctx, "build", opts)) return;
     // Leaving Default mode (e.g. /build from default): remember its model.
     if (workflowMode === null) captureDefaultModel(ctx, "build");
     workflowMode = "build";
@@ -7975,6 +8181,7 @@ export default function workflowExtension(
     // competing mode switch: the caller owns the `transition` state exactly as
     // it does for `enterBuildModeFromPlan`.
     if (opts?.fromReview !== true && blockModeSwitchDuringReview(ctx)) return;
+    if (blockModeTransitionByOwnership(ctx, "orchestrator", opts)) return;
     if (workflowMode === null) captureDefaultModel(ctx, "orchestrator");
     workflowMode = "orchestrator";
     syncLegacyFlags();
@@ -8010,6 +8217,7 @@ export default function workflowExtension(
     }
     // Refuse before clearing the mode, restoring tools or touching the model.
     if (blockModeSwitchDuringReview(ctx)) return;
+    if (blockModeTransitionByOwnership(ctx, null, opts)) return;
     workflowMode = null;
     syncLegacyFlags();
     // Restore original tools
@@ -8318,6 +8526,15 @@ export default function workflowExtension(
         return false;
       }
     } else if (blockModeSwitchDuringReview(ctx)) {
+      return false;
+    }
+    // Approval must never override an unrelated executing Orchestrator owner,
+    // even when it carries a validated review handoff.
+    if (
+      blockModeTransitionByOwnership(ctx, "build", {
+        ...(opts?.fromReview === true ? { fromReview: true } : {}),
+      })
+    ) {
       return false;
     }
     // Fail-safe: `true` promises "mode, tools and model are all Build". A throw
@@ -9475,6 +9692,16 @@ export default function workflowExtension(
     // A manual `/review` handoff may be approved from Default/Build; an
     // automatic handoff only exists in Plan mode.
     if (workflowMode !== "plan" && pendingHandoffSource !== "manual") return;
+    // ...but an executing Orchestrator run owns the session. A legacy manual
+    // decision (browser tab, saved record) must never start a second route
+    // into Build while rows are being verified.
+    if (executionOwnsThisSession()) {
+      notifyReview(
+        "An Orchestrator run owns this session — finish, pause or abort it before approving another handoff.",
+        "warning",
+      );
+      return;
+    }
     // A stale browser approve while a reviewer round/pause runs must not clear
     // the pending decision or send execute. The handoff itself is deliberately
     // NOT part of this predicate: it is the decision being consumed here.
@@ -14671,7 +14898,6 @@ ${dispatched.text}`,
     // In-process Orchestrator child identity first: it decides the mode and
     // suppresses every parent-only surface (contributions, handoff, review).
     inProcessChildContext = undefined;
-    let legacyChildDemoted = false;
     try {
       const early = (ctx.sessionManager.getBranch() as unknown[]) ?? [];
       const childRead = readOrchestratorChildContext(early as never);
@@ -14679,6 +14905,12 @@ ${dispatched.text}`,
         inProcessChildContext = childRead.context;
         workflowMode = "build";
         syncLegacyFlags();
+        // The validated child marker is AUTHORITATIVE: any Plan/manual-review
+        // fields restored above belong to the parent and cannot make this
+        // session a Reviewer owner. Review ownership is dropped before any
+        // teardown is registered, so a stale pause/turn can never survive.
+        releaseChildReviewOwnership();
+        clearPendingHandoffDecision();
         const childSessionId =
           typeof (ctx.sessionManager as any).getSessionId === "function"
             ? String((ctx.sessionManager as any).getSessionId())
@@ -14688,6 +14920,9 @@ ${dispatched.text}`,
           // id. The registry is bounded and TTL'd; another session (or a
           // resource-inspector load) can never take or replace it.
           orchestratorChildTeardowns.register(childSessionId, () => {
+            // Review resources first (a child may never own a Reviewer), then
+            // the read-only exploration subprocesses.
+            releaseChildReviewOwnership();
             for (const proc of [...activeSubagents]) {
               try {
                 proc.kill("SIGTERM");
@@ -14699,7 +14934,6 @@ ${dispatched.text}`,
           });
         }
       } else if (hasLegacyManagedHistory(early as never)) {
-        legacyChildDemoted = true;
         workflowMode = "build";
         syncLegacyFlags();
         ctx.ui.notify(
@@ -19817,6 +20051,14 @@ ${dispatched.text}`,
       );
       return;
     }
+    // A legacy manual decision does not override a live Orchestrator owner.
+    if (executionOwnsThisSession()) {
+      ctx.ui.notify(
+        "An Orchestrator run owns this session — finish, pause or abort it before approving another handoff.",
+        "warning",
+      );
+      return;
+    }
     const planText = verifiedPlanText(ctx, decision);
     if (planText === undefined) return;
     retireBrowserCorrelation("approved by command");
@@ -20230,6 +20472,24 @@ ${dispatched.text}`,
       // increments `reviewCycleId`; every later continuation must stop instead
       // of rendering or applying a superseded plan.
       const handoffCycle = reviewCycleId;
+      // Final-boundary guard. `agent_end` fires per low-level attempt: a
+      // retryable failure, an automatic compaction retry, queued messages or an
+      // `agent_before_settle` continuation can all follow it. Reviewing or
+      // handing off here would audit an incomplete plan. Each of those paths
+      // starts another run (and another `agent_end`), so the terminal attempt
+      // owns the handoff; a host that never re-emits `agent_end` degrades to the
+      // explicit `/review` command rather than a speculative round.
+      if ((event as any)?.willRetry === true) return;
+      try {
+        if (
+          typeof (ctx as any).hasPendingMessages === "function" &&
+          (ctx as any).hasPendingMessages() === true
+        ) {
+          return;
+        }
+      } catch (_e) {
+        void _e;
+      }
       // Per-run handoff gate (plan 2026-10-25 follow-up): a Plan-mode run
       // that wrote no plan this run must not reconcile, review, or hand off
       // an older plan. This runs before the reviewer prefetch so a new task
@@ -20301,18 +20561,6 @@ ${dispatched.text}`,
             clearPendingHandoffDecision();
           }
           return;
-        }
-      }
-      // Step 10 — prefetch: boot the reviewer session while the branch scan
-      // and todo reconciliation below run, so the SDK import and provider
-      // seeding overlap handoff work instead of blocking the review kickoff.
-      // Idempotent and never throws; gated on Review Mode being enabled.
-      // Automatic review only — manual `/review` boots the runtime on demand.
-      if (reviewEnabled()) {
-        try {
-          void ensureReviewRuntime().ensureStarted();
-        } catch (_e) {
-          void _e;
         }
       }
       // Plan-file reconciliation (all modes): a `- [x]` tick in the plan file
@@ -20681,8 +20929,17 @@ ${dispatched.text}`,
       // presenter must not treat a plain automatic handoff as review-owned.
       let reviewedThisHandoff = false;
       if (planTextForRender && reviewThisCycle) {
-        reviewedThisHandoff = true;
-        const authorPlan: string = planTextForRender;
+        // Admission BEFORE the review turn/UI is taken. A mode change or a run
+        // that started while this handoff was computing must not acquire a
+        // review lock or boot a session; the plan is handed off as-is instead.
+        const gateAdmission = admitReviewerNow({
+          trigger: manualReviewCycle ? "manual" : "auto",
+          hasCurrentPlanSubmission:
+            planWrittenThisRun && planWrittenInPlanModeThisRun,
+        });
+        if (gateAdmission.ok) {
+          reviewedThisHandoff = true;
+          const authorPlan: string = planTextForRender;
         reviewHandoffGate.reset();
         reviewGatePhase = "auditing";
         reviewGateCycleId = handoffCycle;
@@ -20697,6 +20954,18 @@ ${dispatched.text}`,
             manualReviewCycle ? "manual" : "auto",
           );
           if (handoffCycle !== reviewCycleId) {
+            endReviewTurn();
+            return;
+          }
+          // Revalidate ownership/mode/submission after the awaited round: a run
+          // may have started, or the mode/cycle may have moved. The round's
+          // result is never applied to a session that no longer owns it.
+          const afterAdmission = admitReviewerNow({
+            trigger: manualReviewCycle ? "manual" : "auto",
+            hasCurrentPlanSubmission:
+              planWrittenThisRun && planWrittenInPlanModeThisRun,
+          });
+          if (!afterAdmission.ok) {
             endReviewTurn();
             return;
           }
@@ -20784,6 +21053,9 @@ ${dispatched.text}`,
         if (handoffCycle !== reviewCycleId) {
           endReviewTurn();
           return;
+        }
+        } else {
+          notifyReview(gateAdmission.reason, "info");
         }
       }
       // Headless: one presenter, one durable pending decision. Nothing executes
@@ -21056,35 +21328,15 @@ ${dispatched.text}`,
           typeof state.active === "boolean" &&
           state.active !== isPlan
         ) {
-          if (state.active) {
-            workflowMode = "plan";
-            syncLegacyFlags();
-            if (toolsBeforePlanMode === undefined)
-              toolsBeforePlanMode = pi.getActiveTools();
-            try {
-              pi.setActiveTools(planModeTools(toolsBeforePlanMode));
-            } catch (_e) {
-              void _e;
-            }
-          } else {
-            workflowMode = "build";
-            syncLegacyFlags();
-            try {
-              pi.setActiveTools(
-                toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
-              );
-            } catch (_e) {
-              void _e;
-            }
-            toolsBeforePlanMode = undefined;
-          }
-          // Leaving Plan starts a new cycle; entering Plan preserves a plan
-          // written earlier in this run (see setPlanMode).
-          if (!state.active) resetPlanRunProvenance();
-          clearPendingHandoffDecision();
-          // Find a ctx to update status — use a no-op if none
-          // Status will be refreshed on next session_start/turn anyway
-          persistState();
+          // Route through the serialized controller instead of assigning the
+          // mode directly: the setters re-check review/child/run ownership when
+          // the transition actually executes, so a host toggle cannot bypass a
+          // live Orchestrator run.
+          const hostCtx = currentSessionCtx as ExtensionContext | null;
+          if (!hostCtx) return;
+          void switchWorkflowMode(state.active ? "plan" : "build", hostCtx, {
+            quiet: true,
+          });
         }
       });
       detachExternalPlanModeBridge = () => {

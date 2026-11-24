@@ -399,6 +399,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let transcript: Transcript | undefined;
   let gate: ReviewRoundGate = createReviewRoundGate();
   let starting: Promise<EnsureSessionResult> | undefined;
+  /**
+   * Runtime lifetime. Teardown/dispose increments this SYNCHRONOUSLY, before
+   * its first await, so an SDK bootstrap that resolves later can detect that
+   * its owner is gone and dispose the late session instead of installing it.
+   */
+  let lifetime = 0;
   let abortController: AbortController | undefined;
   /** `provider/id/thinking` the live session was created with (step 10). */
   let sessionModelKey: string | undefined;
@@ -765,6 +771,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
   /** Release the child session and its round state (step 10). Never throws. */
   async function disposeSession(options: { keepRoundController?: boolean } = {}): Promise<void> {
+    // Invalidate any in-flight startup FIRST, synchronously: the bootstrap may
+    // still be awaiting the SDK or `createAgentSession`. Clearing `starting`
+    // lets a later, valid lifetime boot again; the stale promise is left to
+    // observe the generation change and dispose its own late session.
+    lifetime += 1;
+    starting = undefined;
     try {
       if (options.keepRoundController !== true) abortController?.abort();
       noteExpectedAbort();
@@ -827,13 +839,26 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
     }
     if (starting) return starting;
-    starting = (async (): Promise<EnsureSessionResult> => {
+    // Capture the lifetime BEFORE the first await. A teardown/reload that runs
+    // while the bootstrap is suspended makes every later step stale.
+    const generation = lifetime;
+    const stale = (): boolean => generation !== lifetime;
+    let settleStart!: (result: EnsureSessionResult) => void;
+    const thisStart = new Promise<EnsureSessionResult>((resolve) => {
+      settleStart = resolve;
+    });
+    // Publish the in-flight promise BEFORE the body runs, so a synchronous
+    // failure clears `starting` instead of caching an already-settled promise.
+    starting = thisStart;
+    void ((async (): Promise<EnsureSessionResult> => {
       const cfg = config();
       if (!modelRef) {
-        deps.log(
-          "no reviewer model configured — run /role set reviewer <provider/model>",
-          "warning",
-        );
+        if (!stale()) {
+          deps.log(
+            "no reviewer model configured — run /role set reviewer <provider/model>",
+            "warning",
+          );
+        }
         return { ok: false, created: false };
       }
       try {
@@ -843,6 +868,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const sdk = await (
           deps.loadSdk ?? (() => import("@earendil-works/pi-coding-agent"))
         )();
+        // Teardown/reload while the SDK was loading: no tool build, no child.
+        if (stale()) return { ok: false, created: false };
 
         const built = createReviewTools(sdk, {
           cwd: deps.cwd,
@@ -960,6 +987,17 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const created: CreateReviewSessionResult =
           await createReviewSession(createOptions);
 
+        if (stale()) {
+          // The owner was torn down while the SDK created the child. Dispose it
+          // exactly once: nobody else holds a reference to it.
+          try {
+            created.session?.dispose();
+          } catch {
+            /* ignore */
+          }
+          return { ok: false, created: false };
+        }
+
         if (!created.ok || !created.session) {
           deps.log(
             `reviewer unavailable: ${created.error ?? "unknown error"} — the plan will be handed over unreviewed.`,
@@ -1067,16 +1105,27 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         });
         return { ok: true, created: true };
       } catch (e: unknown) {
-        deps.log(
-          `failed to start: ${e instanceof Error ? e.message : String(e)}`,
-          "warning",
-        );
+        if (!stale()) {
+          deps.log(
+            `failed to start: ${e instanceof Error ? e.message : String(e)}`,
+            "warning",
+          );
+        }
         return { ok: false, created: false };
-      } finally {
-        starting = undefined;
       }
-    })();
-    return starting;
+    })()).then(
+      (result) => {
+        // Only the CURRENT generation may clear the shared promise, so a stale
+        // startup can never clobber a newer one.
+        if (starting === thisStart) starting = undefined;
+        settleStart(result);
+      },
+      () => {
+        if (starting === thisStart) starting = undefined;
+        settleStart({ ok: false, created: false });
+      },
+    );
+    return thisStart;
   }
 
   /** Public shape: idempotent, creates the reviewer session if it is not alive. */
@@ -1297,6 +1346,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         if (!start.ok || !session) {
           lastFailure = `reviewer session unavailable for ${attemptLabel(attempt)}`;
           continue;
+        }
+        // Cancellation/teardown that landed while the session was booting must
+        // stop the round HERE, before any prompt, pass or state publication.
+        if (rc.signal.aborted) {
+          await abortChild();
+          if (!state) {
+            state = createReviewState({
+              planHash: hash,
+              planPath: input.planPath,
+              modelLabel: attemptLabel(attempt),
+              round: input.round,
+              now: started,
+            });
+          }
+          state.phase = "aborted";
+          return {
+            ok: false,
+            fallback: true,
+            planText: state.rewrittenPlan ?? originalPlan,
+            planHash: hash,
+            state,
+            reason: "aborted",
+          };
         }
         const created = start.created;
         const child = session;
