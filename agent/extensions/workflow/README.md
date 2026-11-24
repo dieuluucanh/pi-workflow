@@ -38,7 +38,7 @@ is a prompt convention, not a mechanical cage.
 - **Explore (subagents)** — parallel `pi --mode json` subagents (`max 8`, concurrency 4), `session_shutdown` kill, `activeSubagents`
 - **Todos** — plan-faithful todo list (global step refs + statuses + phase groups) that persists across Plan/Build/Default modes. `workflow_todo` (`list/update/done/pending/add/toggle/clear`) with industry-style wholesale `update` (send the COMPLETE list; omitted items are removed) plus idempotent `done`/`pending`, lenient `[DONE:<ref>]` markers, throttled Claude-Code-style reminders, a tool-result footer, and a stale ⚠ notice — but **no forced turns and no heuristic auto-completion** (reference: Claude Code / OpenCode / Codex practice). A pinned panel shows the active list, collapses to one summary line when every step settles, and is controlled by `/todos show|expand|collapse|hide|auto` or `Ctrl+Alt+O` (terminal Pi). In Pi Desktop the native Todo bar above the panel exposes the same verbs and the desktop chord is `Ctrl+Alt+L` (Sessions keeps `Ctrl+Alt+O`). The display choice is sticky for the current plan across Build edits and Review re-syncs; a different plan returns to automatic.
 - **Rewind** — shadow bare-repo checkpoints per cwd (`agent/checkpoints/checkpoint-<slug>.git`), `isDirty` + `createSafetySnapshot` + `restoreCode`
-- **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, with a native handoff fallback (the plan is printed into the transcript as a durable entry; a bottom-sheet questionnaire offers Approve / Feedback / Skip). `workflow.handoff` + `/handoff` choose between `auto` (default), `native` (never open the browser) and `plannotator` (always try, native fallback). **Approving the plan and choosing where it runs are two separate decisions:** the configured presenter asks about the PLAN first, and only an approval opens the execution chooser (Orchestrator or direct Build). `getUtcDatePrefix` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<slug>.md`
+- **Plannotator bridge** — `plannotator:request/review-result/plan-approved` events, with a native handoff fallback (the plan is printed into the transcript as a durable entry; a bottom-sheet questionnaire offers Approve / Feedback / Skip). `workflow.handoff` + `/handoff` choose between `auto` (default), `native` (never open the browser) and `plannotator` (always try, native fallback). **Approving the plan and choosing where it runs are two separate decisions:** the configured presenter asks about the PLAN first, and only an approval opens the execution chooser (Orchestrator or direct Build). `getUtcPlanStamp` / `normalizePlanPath` for `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md`
 - **Model roles** — Planner/Explorer/Builder roles with one model + thinking level each (`roles.ts`, `~/.pi/agent/roles.json` v2). `/plan` switches to the planner model, `/build` to the builder model, `explore` subagents use the explorer model. `/role` opens a tabbed picker (scoped models first, `Ctrl+O` for all). The thinking list follows the selected model's `thinkingLevelMap`; unsupported stored levels are clamped on save/activation with a warning.
 - **Write permission** — a user-controlled `allow`/`ask`/`never` permission for file writes in **Default** mode, the mode that is otherwise ungated. `/write-policy` sets it; see [Write permission](#write-permission) below.
 - **Shell guard** — finite native deadlines for every shell surface (120 s default, 900 s ceiling), a pre-launch refusal for provably empty interpreter-stdin heredocs, and a request-scoped recovery budget: one changed approach, then stop. Covers main `bash`/`powershell`, explorer subprocesses and the isolated reviewer's `review_bash`; never times out human dialogs. See [Shell guard](#shell-guard).
@@ -261,7 +261,11 @@ plan, previews executable checks or gates the approval on a check list:
 ### Plan format
 
 A plan is a normal markdown document, usually
-`.pi/plans/<UTC-date>-<slug>.md`:
+`.pi/plans/<UTC-date>-<UTC-time>-<slug>.md` (for example
+`.pi/plans/2026-11-24-2130-export-endpoint.md`). The UTC `HHmm` time makes
+same-day plans sort by creation time. Legacy date-only names
+(`.pi/plans/<UTC-date>-<slug>.md`) remain valid and are **never renamed**: an
+existing plan is written in place, and only a new file gets a prefix.
 
 ```markdown
 # Plan: Add the export endpoint
@@ -456,7 +460,7 @@ Plan Mode and Review Mode share one role-based command policy (`permissions.ts`)
 | `review_plan_begin` | Starts a **chunked** rewrite: resets the per-round assembler and states the per-chunk size limit |
 | `review_plan_chunk` | Appends one ordered chunk of the rewrite (`index` 1, 2, 3, …). Out-of-order, repeated or oversized chunks are refused with the index that is expected next |
 | `review_plan_finalize` | Turns the accepted chunks into the plan. Refuses an incomplete assembly; goes through the same `review_submit_plan` funnel, so the plan is written exactly once |
-| `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<slug>.md`. Also the one-shot path for short plans |
+| `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md` (an existing plan keeps its name). Also the one-shot path for short plans |
 | `review_pass_done` | Ends a pass with a verdict (refused if nothing was submitted) |
 
 The policy classifies commands into three classes and maps them to roles:

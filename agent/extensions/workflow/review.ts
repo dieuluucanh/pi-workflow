@@ -25,7 +25,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-  getUtcDatePrefix,
   isPlanWritePath,
   normalizePlanPath,
   planHash,
@@ -1315,7 +1314,7 @@ export interface ApplySubmittedPlanOptions {
 export interface ApplySubmittedPlanResult {
   ok: boolean;
   path: string;
-  /** True when the date prefix was corrected to today (UTC). */
+  /** True when the UTC date-time prefix was filled/corrected. */
   corrected: boolean;
   error?: string;
 }
@@ -1324,9 +1323,10 @@ export interface ApplySubmittedPlanResult {
  * Steps 12-13: write the reviewed plan over Plan Mode's plan file and record it.
  *
  * Step 12 — the reviewer adjusts the SAME file Plan Mode wrote. It never picks
- * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<slug>.md`
+ * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md`
  * convention, so the plan the user reviews in Plannotator is the plan history
- * they already have. A defense-in-depth guard refuses any path outside
+ * they already have. An existing plan keeps its name; only a NEW file gets the
+ * date-time prefix. A defense-in-depth guard refuses any path outside
  * `.pi/plans/`, so even a compromised reviewer tool call cannot write elsewhere.
  *
  * Step 13 — appends a `workflow-review-submitted` entry (not part of the LLM
@@ -1338,8 +1338,8 @@ export interface ApplySubmittedPlanResult {
 export function applySubmittedPlan(
   options: ApplySubmittedPlanOptions,
 ): ApplySubmittedPlanResult {
-  const today = getUtcDatePrefix();
-  const normalized = normalizePlanPath(options.planPath, options.cwd, today);
+  const now = new Date();
+  const normalized = normalizePlanPath(options.planPath, options.cwd, now);
   const relOrAbs = normalized.path;
 
   // Defense in depth: Review Mode may only ever write inside .pi/plans/.
@@ -1385,6 +1385,8 @@ export function applySubmittedPlan(
         category: f.category,
         disposition: f.disposition,
       })),
+      // Kept for compatibility with existing audit readers: it means the
+      // UTC date-time prefix was filled/corrected, not only the date.
       correctedDatePrefix: normalized.corrected,
     });
   } catch {

@@ -1003,40 +1003,158 @@ export function findLatestPlanWriteInBranch(
 
 // ── Plan date helpers (UTC) ──────────────────────────────────────
 
-/** Return YYYY-MM-DD in UTC for the given date (default: now). Uses toISOString slice, deterministic across locales. */
+/**
+ * Return YYYY-MM-DD in UTC for the given date (default: now). Uses the
+ * toISOString slice, so it is deterministic across locales.
+ *
+ * Plan FILENAMES use `getUtcPlanStamp`/`getUtcDateTimePrefix` — they carry a
+ * UTC time so same-day plans sort by creation time. This date-only helper is
+ * kept for callers that only need the day (and for legacy plan names).
+ */
 export function getUtcDatePrefix(d: Date = new Date()): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** The `.pi/plans/` filename stamp: date, time and their combined prefix. */
+export interface UtcPlanStamp {
+  /** `YYYY-MM-DD` (UTC). */
+  date: string;
+  /** `HHmm` (UTC, zero-padded, minute resolution). */
+  time: string;
+  /** `${date}-${time}` — the plan filename prefix. */
+  prefix: string;
+}
+
+/**
+ * The UTC date-time stamp used by `.pi/plans/<prefix>-<slug>.md`.
+ *
+ * Minute resolution is deliberate: a filename identifies a plan, not an event.
+ * An invalid `Date` yields empty fields instead of throwing, so a bad clock
+ * can never corrupt a plan path (`toISOString` would throw a RangeError).
+ */
+export function getUtcPlanStamp(d: Date = new Date()): UtcPlanStamp {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
+    return { date: "", time: "", prefix: "" };
+  }
+  const iso = d.toISOString(); // 2026-11-24T21:30:59.999Z
+  const date = iso.slice(0, 10);
+  const time = `${iso.slice(11, 13)}${iso.slice(14, 16)}`;
+  return { date, time, prefix: `${date}-${time}` };
+}
+
+/** The `YYYY-MM-DD-HHmm` (UTC) prefix for a new plan filename. */
+export function getUtcDateTimePrefix(d: Date = new Date()): string {
+  return getUtcPlanStamp(d).prefix;
+}
+
+/** Split a plan path into its directory prefix and basename (both separators). */
+function splitPlanBasename(p: string): { dir: string; base: string } {
+  const normalizedSep = p.replace(/\\/g, "/");
+  const lastSlash = normalizedSep.lastIndexOf("/");
+  return {
+    dir: lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "",
+    base: lastSlash >= 0 ? p.slice(lastSlash + 1) : p,
+  };
+}
+
+const PLAN_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})-(.+)$/;
+const PLAN_DATE_TIME_PREFIX = /^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})-(.+)$/;
+
+/**
+ * Apply the `.pi/plans/<UTC-date>-<HHmm>-<slug>.md` convention to one path.
+ *
+ * Policy (deliberate — see `docs/plan-format.md`):
+ *
+ * - Only paths under `.pi/plans/` are touched; everything else is returned as
+ *   supplied and no filesystem probe happens.
+ * - An EXISTING file is never renamed or moved. Legacy date-only names
+ *   (`YYYY-MM-DD-<slug>.md`) therefore keep working forever, and journals,
+ *   review entries and docs never point at a path that no longer exists.
+ * - A NEW path gets the current UTC stamp: a same-day date-time prefix is
+ *   preserved (a long turn keeps its start time), a stale date-time prefix and
+ *   a legacy date-only prefix are replaced in place, and an undated name is
+ *   prefixed. The slug (everything after a valid date-time/date prefix) is
+ *   always preserved.
+ * - An invalid `Date` (or `opts.exists` throwing) leaves the path untouched:
+ *   uncertainty never renames a plan.
+ *
+ * Returns `{ path, corrected, original }`; `original` is exactly what the
+ * caller passed in.
+ */
 export function normalizePlanPath(
   p: string,
   cwd: string,
-  today: string,
+  clock: Date = new Date(),
+  options?: { exists?: (absolutePath: string) => boolean },
 ): { path: string; corrected: boolean; original: string } {
   const original = p;
+  const unchanged = { path: p, corrected: false, original };
   // Only touch paths that are under .pi/plans
-  if (!isPlanWritePath(p, cwd)) return { path: p, corrected: false, original };
-  // Split dir + basename (handle both / and \ separators)
-  const normalizedSep = p.replace(/\\/g, "/");
-  const lastSlash = normalizedSep.lastIndexOf("/");
-  const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
-  const base = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
-  if (!base) return { path: p, corrected: false, original };
-  const m = base.match(/^(\d{4}-\d{2}-\d{2})-(.+)$/);
-  if (m) {
-    const currentDate = m[1];
-    const rest = m[2];
-    if (currentDate === today) return { path: p, corrected: false, original };
-    // Validate that today looks like YYYY-MM-DD to avoid corrupting on invalid today
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
-      return { path: p, corrected: false, original };
-    const correctedBase = `${today}-${rest}`;
-    return { path: `${dir}${correctedBase}`, corrected: true, original };
+  if (!isPlanWritePath(p, cwd)) return unchanged;
+  const { dir, base } = splitPlanBasename(p);
+  if (!base) return unchanged;
+
+  const stamp = getUtcPlanStamp(clock);
+  if (!stamp.prefix) return unchanged;
+
+  // An existing plan is never renamed: a probe that throws counts as existing.
+  const exists = options?.exists ?? fs.existsSync;
+  const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+  try {
+    if (exists(abs)) return unchanged;
+  } catch {
+    return unchanged;
   }
-  // No date prefix — prepend today-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
-    return { path: p, corrected: false, original };
-  return { path: `${dir}${today}-${base}`, corrected: true, original };
+
+  const dateTime = base.match(PLAN_DATE_TIME_PREFIX);
+  if (dateTime) {
+    const [, date, hh, mm, rest] = dateTime;
+    if (Number(hh) < 24 && Number(mm) < 60) {
+      if (date === stamp.date) return unchanged;
+      return {
+        path: `${dir}${stamp.prefix}-${rest}`,
+        corrected: true,
+        original,
+      };
+    }
+    // Out-of-range time digits are not a time prefix; treat it as legacy
+    // date-only below, where `HHmm-<slug>` simply stays part of the slug.
+  }
+
+  const legacy = base.match(PLAN_DATE_PREFIX);
+  if (legacy) {
+    const [, date, rest] = legacy;
+    if (date === stamp.date) return unchanged;
+    return { path: `${dir}${stamp.prefix}-${rest}`, corrected: true, original };
+  }
+
+  // No date prefix — prepend the date-time stamp.
+  return { path: `${dir}${stamp.prefix}-${base}`, corrected: true, original };
+}
+
+/**
+ * Look up the same plan under TODAY's UTC date.
+ *
+ * Used by `/review <path>` so a mistyped date still finds the file the
+ * extension wrote. It replaces only the leading `YYYY-MM-DD` and preserves the
+ * time and slug (`2026-11-20-2130-foo.md` → `2026-11-24-2130-foo.md`), and it
+ * never writes or renames anything. `undefined` means "not a dated plan name".
+ */
+export function dateCorrectedPlanPath(
+  p: string,
+  cwd: string,
+  clock: Date = new Date(),
+): string | undefined {
+  if (!isPlanWritePath(p, cwd)) return undefined;
+  const { dir, base } = splitPlanBasename(p);
+  if (!base) return undefined;
+  const today = getUtcPlanStamp(clock).date;
+  if (!today) return undefined;
+  const m = base.match(PLAN_DATE_PREFIX);
+  if (!m) return undefined;
+  const [, date, rest] = m;
+  if (date === today) return p;
+  return `${dir}${today}-${rest}`;
 }
 
 // ── Rewind checkpoint helpers (pure, no FS/git) ─────────────────────

@@ -16,7 +16,11 @@ Nothing has to be edited. A plan is a normal markdown document:
 - a plan with indented headings, no verification section or prose-only
   verification is approved normally;
 - `## Verification` commands are run by the model as ordinary bash, not by a
-  check executor.
+  check executor;
+- a plan filename may be the legacy date-only
+  `.pi/plans/<date>-<slug>.md` or the current date-time
+  `.pi/plans/<date>-<HHmm>-<slug>.md` (UTC). Existing plans are never renamed,
+  so **no migration is required** — new plans just carry the time.
 
 If you kept plans that relied on the compiler's section exclusion, the only
 thing to check is that the human steps are under `## Steps`/`## Plan Steps`.

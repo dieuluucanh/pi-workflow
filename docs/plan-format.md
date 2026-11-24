@@ -7,9 +7,30 @@
 
 ## Where a plan lives
 
-`.pi/plans/<UTC-date>-<slug>.md`, where `<date>` is `YYYY-MM-DD` (UTC) and
-`<slug>` is kebab-case, at most 40 characters (for example
-`.pi/plans/2026-11-24-export-endpoint.md`).
+`.pi/plans/<UTC-date>-<UTC-time>-<slug>.md`, where `<date>` is `YYYY-MM-DD`
+(UTC), `<time>` is `HHmm` (UTC, minute resolution) and `<slug>` is kebab-case,
+at most 40 characters (for example
+`.pi/plans/2026-11-24-2130-export-endpoint.md`).
+
+The time prefix gives same-day plans their creation order: a plain sort of the
+directory lists them chronologically. Two plans with the same slug in the same
+UTC minute map to the same file — the filename identifies a plan, not an
+event, so distinct plans need distinct slugs.
+
+**Existing files are never renamed.** A plan written before this convention —
+`.pi/plans/<UTC-date>-<slug>.md` (for example
+`.pi/plans/2026-11-20-export-endpoint.md`) — keeps that name forever, because
+review entries, handoffs and links point at it. The rule is:
+
+- an **existing** plan file → its path is left exactly as supplied;
+- a **new** file → the extension fills or corrects the prefix
+  (`utils.ts: getUtcPlanStamp` / `normalizePlanPath`). A same-day date-time
+  prefix keeps its start time, a stale date-time or legacy date-only prefix is
+  replaced, and an undated name is prefixed.
+
+One ambiguity is accepted: a legacy slug that begins with four digits
+(`2026-11-20-1234-fix.md`) is indistinguishable from a date-time name. It can
+only affect a **new** path, and an existing file is never touched.
 
 ## Canonical headings
 

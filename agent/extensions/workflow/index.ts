@@ -59,7 +59,9 @@ import {
   findLatestPlanWriteInBranch,
   choosePlanPath,
   shouldHandoffPlan,
-  getUtcDatePrefix,
+  getUtcDateTimePrefix,
+  getUtcPlanStamp,
+  dateCorrectedPlanPath,
   normalizePlanPath,
   isUserInteractionEntry,
   getHeaderText,
@@ -6565,15 +6567,22 @@ export default function workflowExtension(
         const abs = path.isAbsolute(explicit)
           ? explicit
           : path.join(cwd, explicit);
-        // Mirror the write-path auto-correction: a mistyped UTC date prefix
-        // should resolve to the file the extension actually wrote.
-        const normalized = normalizePlanPath(abs, cwd, getUtcDatePrefix());
+        // Mirror the write-path naming policy: a mistyped date prefix should
+        // still resolve to the file the extension actually wrote. Try the
+        // literal path, the normalized new-plan name, then today's date on the
+        // same time/slug. Nothing here renames an existing file, so a legacy
+        // date-only plan is found by its literal path first.
+        const now = new Date();
+        const candidates: Array<string | undefined> = [
+          abs,
+          normalizePlanPath(abs, cwd, now).path,
+          dateCorrectedPlanPath(abs, cwd, now),
+        ];
         explicit =
-          normalized.corrected &&
-          fs.existsSync(normalized.path) &&
-          !fs.existsSync(abs)
-            ? normalized.path
-            : abs;
+          candidates.find(
+            (candidate): candidate is string =>
+              typeof candidate === "string" && fs.existsSync(candidate),
+          ) ?? abs;
       }
       const resolution = resolveReviewTarget(ctx, explicit);
       if (resolution.kind === "no-plan") {
@@ -16705,7 +16714,7 @@ export default function workflowExtension(
       if (refusal) {
         const planHint =
           gateRole === "planner" && refusal.kind === "forbidden-syntax"
-            ? ' Use write({path: ".pi/plans/<date>-<slug>.md"}) for plans — not bash >.'
+            ? ' Use write({path: ".pi/plans/<date>-<HHmm>-<slug>.md"}) for plans — not bash >.'
             : "";
         const hint = refusal.suggestion
           ? ` ${refusal.suggestion}`
@@ -16737,33 +16746,40 @@ export default function workflowExtension(
       if (!isPlanWritePath(p, cwd)) {
         return {
           block: true,
-          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDatePrefix()}-<slug>.md", content: "..."})). Use /build or Tab to switch to Build mode.`,
+          reason: `Plan mode: ${event.toolName} blocked. Only writes to .pi/plans/ allowed (use write({path: ".pi/plans/${getUtcDateTimePrefix()}-<slug>.md", content: "..."})). Use /build or Tab to switch to Build mode.`,
         } as any;
       }
       const planDenial = planWriteDenial(p, ctx, cwd);
       if (planDenial) return planDenial as any;
-      // Silent auto-correct: enforce UTC date prefix so LLM hallucinations don't create wrong-dated files
+      // Silent auto-correct of the UTC date-time prefix so LLM hallucinations
+      // don't create wrong-dated files. Only a NEW file is stamped: an
+      // existing plan is never renamed (journals, review entries and docs keep
+      // pointing at a path that still exists).
       try {
-        const today = getUtcDatePrefix();
-        const norm = normalizePlanPath(p, cwd, today);
+        const now = new Date();
+        const stamp = getUtcPlanStamp(now);
+        const norm = normalizePlanPath(p, cwd, now);
         if (norm.corrected) {
           const input: any = event.input as any;
           if (input.path) input.path = norm.path;
           if (input.file_path) input.file_path = norm.path;
           try {
             (ctx as any).ui?.notify?.(
-              `Plan path auto-corrected ${norm.original} → ${norm.path} (UTC ${today})`,
+              `Plan path auto-corrected ${norm.original} → ${norm.path} (UTC ${stamp.prefix})`,
               "warning",
             );
           } catch (_e) {
             void _e;
           }
           try {
+            // `today`/`time` are the split stamp: the date-only field stays for
+            // older readers, `time` is new.
             pi.appendEntry("workflow-plan-path-corrected", {
               original: norm.original,
               corrected: norm.path,
               at: Date.now(),
-              today,
+              today: stamp.date,
+              time: stamp.time,
             });
           } catch (_e) {
             void _e;
@@ -17452,7 +17468,8 @@ export default function workflowExtension(
       const btwBlock = pendingBtw.length
         ? `\n\n[BTW notes from user (address these)]:\n${pendingBtw.map((n) => `- ${n}`).join("\n")}`
         : "";
-      const today = getUtcDatePrefix();
+      const stamp = getUtcPlanStamp();
+      const today = stamp.date;
       // One neutral line only: Plan Mode must NOT see the reviewer's prompt,
       // findings, or transcript (requirement: Plan cannot see Review's context).
       // Automatic review only — manual `/review` bypasses via "manual" trigger.
@@ -17462,9 +17479,9 @@ export default function workflowExtension(
       return {
         message: {
           customType: "workflow-plan-context",
-          content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
+          content: `[PLAN MODE ACTIVE — Today is ${today} (UTC), current time ${stamp.time}. Use ${stamp.prefix} as the date-time prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${stamp.prefix}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File redirects (> and >>) to real files, installs, sed/awk, mkdir outside .pi/plans and the powershell tool stay blocked — but 2>/dev/null and 2>&1 are allowed. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write a plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars. A normal, readable markdown document is enough. Recommended: # Plan: <title>, ## Context, ## Steps (a numbered list, one executable step per row), optional ## Verification (commands to run at the end). No special schema, no checks block, no minimum gate count.\n- The plan is a document, not a contract. The executor reads it and creates the TODO rows; an indented heading or a differently numbered list is still a valid plan.\n- If the plan declares a final verification, put the commands in ## Verification as a fenced block; the parent runs them after the last row.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write a plan to .pi/plans/<date>-<HHmm>-<slug>.md where <date> is today (UTC, ${today}), <HHmm> is the current UTC time (${stamp.time}), and <slug> is kebab-case ≤40 chars. A normal, readable markdown document is enough. Recommended: # Plan: <title>, ## Context, ## Steps (a numbered list, one executable step per row), optional ## Verification (commands to run at the end). No special schema, no checks block, no minimum gate count.\n- The date-time prefix is for a NEW plan only: if this session already wrote a plan file, reuse that exact path — the extension never renames an existing plan, and re-stamping the same slug in a later minute would create a second file.\n- The plan is a document, not a contract. The executor reads it and creates the TODO rows; an indented heading or a differently numbered list is still a valid plan.\n- If the plan declares a final verification, put the commands in ## Verification as a fenced block; the parent runs them after the last row.\n- If you need to verify the timestamp, run: bash {command: "date -u +%Y-%m-%d-%H%M"} (UTC) — do not guess it. The extension fills or corrects the prefix on a new file only; an existing plan keeps its name.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -19886,7 +19903,7 @@ export default function workflowExtension(
         // Never silent: no plan text found — diagnose and stay in plan mode
         try {
           ctx.ui.notify(
-            `Plan handoff: no plan text found (file missing and no assistant draft) — staying in plan mode. Use write to .pi/plans/${getUtcDatePrefix()}-<slug>.md`,
+            `Plan handoff: no plan text found (file missing and no assistant draft) — staying in plan mode. Use write to .pi/plans/${getUtcDateTimePrefix()}-<slug>.md`,
             "warning",
           );
         } catch (_e) {

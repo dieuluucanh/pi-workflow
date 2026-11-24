@@ -1,5 +1,22 @@
 ## Unreleased
 
+### Changed — plan filenames carry a UTC time prefix (2026-11-24)
+
+New plans are written to `.pi/plans/YYYY-MM-DD-HHmm-<slug>.md` (UTC `HHmm`), so
+same-day plans sort by creation time instead of by slug. The write gate, the
+Plan Mode prompt, the explicit `/review <path>` resolution and the reviewer's
+write path all use `getUtcPlanStamp` / `normalizePlanPath`;
+`dateCorrectedPlanPath` lets `/review` find a plan whose date was mistyped.
+
+- **Legacy date-only names keep working and are never renamed.** An existing
+  `.pi/plans/YYYY-MM-DD-<slug>.md` file is written in place; only a NEW file
+  gets a prefix. No migration is needed.
+- **Same minute + same slug is the same plan.** Distinct plans need distinct
+  slugs (the filename identifies a plan, not an event).
+- New tests: `plan-naming.test.ts` covers the stamp (day boundaries, zero
+  padding, invalid clock), every `normalizePlanPath` branch, the `/review`
+  lookup, the write gate, `applySubmittedPlan`, and the Plan Mode prompt.
+
 ### Breaking — legacy engine deletion (2026-11-24 sweep, v0.14.0)
 
 This sweep finishes the 2026-11-24 refactor: the old engine is now actually
