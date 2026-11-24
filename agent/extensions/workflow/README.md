@@ -640,6 +640,8 @@ These are **display-only custom entries** (`pi.appendEntry` + `pi.registerEntryR
 
 **Run narration.** The run-start line is emitted by the harness at the moment it sends the prompt, so a resume cannot masquerade as a fresh start: `reviewer started` (a reviewer session was created), `reviewer resumed` (a paused round continues on the warm session), `reviewer continuing` (a later round reuses the session), `reviewer restarting — new reviewer session` (a reviewer-model switch forced a reboot) and `reviewer verifying — pass 2`. A run ends with `reviewer run ended`. An abort **Review Mode requested itself** (pass complete, pause, teardown) is silent; an unexpected abort shows only that neutral line; `reviewer run ended on a provider error: …` is reserved for a real provider or transport failure.
 
+**Notice ownership.** Only notices emitted by the reviewer or a review-owned turn carry the `Review Mode:` prefix; an Orchestrator/child, handoff/Plannotator or plan-lifecycle notice is always neutral, so pausing a Build child reads `Paused · Builder …` rather than `Review Mode: Paused · Builder …`.
+
 #### Where your next message goes
 
 Review is an **exclusive turn** while a real reviewer owns it (`running`, `paused`, a **review-owned** `handoff`, `transition`): prompts are locked. Only `/review…` controls, `/handoff` (including `/handoff fallback`), `/model`, `/thinking`, `/profile` and `/role` pass the input gate; anything else is refused with a notice instead of becoming a queued turn. A **plain plan handoff** (Review Mode off) is not a review turn: modes and prompts stay free, and a prompt or mode switch supersedes it. When no review owns the turn, input follows the **active mode**, decided automatically — there is nothing to focus or toggle:

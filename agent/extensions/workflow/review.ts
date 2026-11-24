@@ -1176,6 +1176,11 @@ export function reviewRunLabel(input: {
  * a few sources carried their own `Review Mode: `/`Review Mode ` prefix. Blindly
  * interpolating produced `Review Mode: Review Mode: …`. Idempotent by design:
  * anything already starting with `Review Mode` is returned unchanged.
+ *
+ * Ownership: this is the prefix owner for the *reviewer* notifier only
+ * (`notifyReview` in `index.ts`). Do not apply it to non-reviewer messages —
+ * Orchestrator/child, handoff/Plannotator and plan-lifecycle notices go through
+ * the neutral `notifyWorkflow` helper and must never be branded `Review Mode:`.
  */
 export function reviewNoticeText(message: string): string {
   const text = String(message ?? "").trim();

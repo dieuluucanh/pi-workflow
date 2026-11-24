@@ -83,7 +83,7 @@ export interface WorkflowEditorHooks {
   activity?: () => WorkflowEditorActivity | undefined;
   /**
    * Called synchronously for a consumed Esc press. `pause` asks the host to
-   * pause the child; `swallow` is a no-op besides an optional reminder.
+   * pause the child; `swallow` is a silent no-op.
    */
   onEscConsumed?: (action: "pause" | "swallow") => void;
 }

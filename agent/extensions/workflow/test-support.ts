@@ -1438,7 +1438,10 @@ function buildFakeOrchestratorSession(
         id,
         ...(nextThinking ? { thinking: nextThinking } : {}),
       };
-      return { ok: true };
+      // `SwitchChildModelResult` promises the applied model, and the controller
+      // publishes its label from it. Returning a bare `{ ok: true }` made every
+      // live switch look like a failure (the error surfaced only as a warning).
+      return { ok: true, model: { ...current } };
     },
     stats() {
       return buildFakeChildStats(options, current);

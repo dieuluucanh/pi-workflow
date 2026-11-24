@@ -408,6 +408,20 @@ function notified(notifies: Array<{ message: string }>, text: string): boolean {
   return notifies.some((n) => n.message.includes(text));
 }
 
+/** The notice exists AND it is not review-branded (R1/D2). */
+function neutralNotice(
+  notifies: Array<{ message: string }>,
+  text: string,
+): { message: string } {
+  const hit = notifies.find((n) => n.message.includes(text));
+  assert.ok(hit, `expected a "${text}" notice`);
+  assert.ok(
+    !hit.message.startsWith("Review Mode"),
+    `"${text}" must not be review-branded (got "${hit.message}")`,
+  );
+  return hit;
+}
+
 /** Visible text of one sent message (the fake stores the message OBJECT). */
 function sentText(entry: { content?: unknown }): string {
   const content = entry?.content;
@@ -986,7 +1000,18 @@ test("L: a new prompt abandons a paused gated review and clears its status/lock"
       ),
       "a paused gated review withholds the handoff",
     );
-    assert.ok(notified(b.notifies, "Review paused"));
+    const pausedNotice = b.notifies.find((n) =>
+      n.message.includes("Review paused"),
+    );
+    assert.ok(pausedNotice, "the user is told the review paused");
+    // R3: the review-pause notice belongs to the reviewer, so it must still
+    // carry the `Review Mode:` prefix — moving it to `notifyWorkflow` cannot
+    // pass silently.
+    assert.match(
+      pausedNotice.message,
+      /^Review Mode: Review paused/,
+      "the review-pause notice stays review-branded",
+    );
 
     const before = b.statuses.length;
     await freshPrompt(b.pi, b.ctx);
@@ -2363,10 +2388,9 @@ test("HF1: a Plannotator error falls back to the native handoff", async () => {
       ),
       "skip sent no execute turn",
     );
-    assert.ok(
-      notified(b.notifies, "Plannotator handoff unavailable"),
-      "the failure is announced",
-    );
+    // HF1 runs a real review round (Review Mode defaults on), so the negative
+    // check must target this handoff notice rather than the whole array.
+    neutralNotice(b.notifies, "Plannotator handoff unavailable");
     await b.pi.commands["review-abort"].handler("", b.ctx);
     assert.ok(notified(b.notifies, "Nothing to abort"), "the turn is closed");
   } finally {
@@ -2529,7 +2553,9 @@ test("HF6: a manual /review falls back natively when Plannotator errors", async 
     await switchToPlan(b.pi, b.ctx);
     await runReview(b.pi, b.ctx, plan.rel);
     assert.equal(b.customs.length, 1, "the native questionnaire opened");
-    assert.ok(notified(b.notifies, "Plannotator handoff unavailable"));
+    // Targeted: the whole-array negative check would trip on the reviewer's own
+    // branded notices (this test disables Review Mode, but keep the scope clear).
+    neutralNotice(b.notifies, "Plannotator handoff unavailable");
     assert.ok(
       b.pi.entries.some((e: any) => e.type === "workflow-handoff-plan"),
       "the plan was printed into the transcript",
@@ -2716,6 +2742,14 @@ test("HD2: auto + no host goes native immediately, without a warning", async () 
       !notified(b.notifies, "Plannotator handoff unavailable"),
       "an intentional native handoff is not a failure",
     );
+    // R3 positive control: this test runs a REAL review round, so reviewer
+    // notices must still carry the `Review Mode:` prefix. Moving review
+    // notices onto the neutral helper would fail here instead of passing
+    // silently (a negative check cannot prove the prefix survives).
+    assert.ok(
+      b.notifies.some((n) => /^Review Mode: submitted the plan/.test(n.message)),
+      "reviewer notices stay review-branded",
+    );
     assert.ok(
       !b.pi.entries.some(
         (e: any) => e.type === "workflow-handoff-plannotator-failed",
@@ -2794,10 +2828,7 @@ test("HD4: handoff=plannotator forces the attempt and falls back", async () => {
       "the attempt was forced even without a detected host",
     );
     assert.equal(b.customs.length, 1, "the native fallback opened");
-    assert.ok(
-      notified(b.notifies, "Plannotator handoff unavailable"),
-      "the forced-mode failure is announced",
-    );
+    neutralNotice(b.notifies, "Plannotator handoff unavailable");
     assert.ok(
       b.pi.entries.some(
         (e: any) => e.type === "workflow-handoff-plannotator-failed",
@@ -5219,6 +5250,16 @@ test("OE3: prose is forwarded to a running child and never starts a parent turn"
       delivered.some((text) => text.includes("please also add a test")),
       "the child received the prose verbatim",
     );
+    // D5: no review round can run in an Orchestrator session, so the whole
+    // notice array must be neutral — no reviewer branding anywhere.
+    const branded = b.notifies.filter((n) =>
+      n.message.startsWith("Review Mode"),
+    );
+    assert.deepEqual(
+      branded.map((n) => n.message),
+      [],
+      "an Orchestrator run never emits a review-branded notice",
+    );
   } finally {
     await b.cleanup();
   }
@@ -5387,6 +5428,8 @@ test("OE6: /profile use switches a RUNNING Build child in both views", async () 
         thinking: "high",
       });
       assert.equal(live.disposeCalls, 0, "the live child is never recreated");
+      // R1/D2: a live Builder switch is a lifecycle notice, not reviewer output.
+      neutralNotice(b.notifies, "Live Builder →");
       const status = await b.pi.tools.orchestrator_status.execute("oe6", {});
       assert.match(JSON.stringify(status), /"running":1/);
     } finally {
@@ -5466,6 +5509,10 @@ test("OE8: a refused live switch warns and keeps the child running", async () =>
     );
     assert.ok(warning, "the refusal is surfaced honestly");
     assert.match(String(warning.message), /next child will use it/);
+    assert.ok(
+      !String(warning.message).startsWith("Review Mode"),
+      `the refusal must not be review-branded (got "${warning.message}")`,
+    );
     const status = await b.pi.tools.orchestrator_status.execute("oe8", {});
     assert.match(JSON.stringify(status), /"running":1/);
   } finally {
@@ -5522,6 +5569,82 @@ test("OE10: /role set builder switches the live child too", async () => {
       { provider: "open", id: "muse", thinking: "high" },
     ]);
     assert.equal(live.disposeCalls, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OE11: prose while the child is paused is queued, announced neutrally, and delivered on resume", async () => {
+  const delivered: string[] = [];
+  const child = makeFakeOrchestratorChildFactory({
+    settleOnPrompt: false,
+    onPrompt: (text) => {
+      delivered.push(text);
+    },
+  });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oe11.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    const live = child.created[0]!;
+
+    const editor = b.createEditor() as any;
+    assert.ok(editor, "the Workflow editor owns the composer");
+    const render = (): string => editor.renderTopBorder(160, 0);
+
+    await b.pi.commands["orchestrator-pause"].handler("", b.ctx);
+    // Race guard: `orchestratorInputDecision` queues only for
+    // `childPhase === "paused"`, so wait for the composer border instead of
+    // assuming the pause already landed (it would otherwise forward/refuse).
+    const paused = await waitForComposer(
+      render,
+      /Paused · \/orchestrator-resume to continue/,
+    );
+    assert.match(paused, /Paused · \/orchestrator-resume to continue/);
+
+    const sentBefore = b.pi.sent.length;
+    const promptsBefore = live.promptCalls;
+    await b.pi.emit(
+      "input",
+      {
+        text: "also cover the empty plan",
+        source: "user",
+        streamingBehavior: undefined,
+      },
+      b.ctx,
+    );
+
+    assert.equal(
+      b.pi.sent.length,
+      sentBefore,
+      "the parent model was not prompted",
+    );
+    assert.equal(
+      live.promptCalls,
+      promptsBefore,
+      "a paused child receives nothing until resume",
+    );
+    // R1/D2: queueing is an Orchestrator lifecycle notice, never review output.
+    neutralNotice(b.notifies, "Message queued for the paused child");
+    assert.ok(
+      !delivered.some((text) => text.includes("also cover the empty plan")),
+      "the note is held, not forwarded to the paused child",
+    );
+
+    await b.pi.commands["orchestrator-resume"].handler("", b.ctx);
+    await waitFor(() =>
+      delivered.some((text) => text.includes("also cover the empty plan")),
+    );
+    assert.ok(
+      delivered.some((text) => text.includes("also cover the empty plan")),
+      "resume delivers the queued note",
+    );
+    assert.equal(
+      live.promptCalls,
+      promptsBefore + 1,
+      "resume prompts the warm child exactly once",
+    );
   } finally {
     await b.cleanup();
   }
@@ -6848,6 +6971,9 @@ test("OC1: Parent and Child views share the Working border; Esc only pauses", as
     editor.isShowingAutocomplete = () => false;
 
     // A burst of Esc: the first pauses, the rest are consumed. None may abort.
+    // Snapshot the notices first: repeat Esc must add no transcript row at all
+    // (D3), so `notifies` may not grow, let alone grow with a review row.
+    const noticesBeforeEsc = b.notifies.length;
     editor.handleInput("\x1b");
     editor.handleInput("\x1b");
     editor.handleInput("\x1b");
@@ -6862,8 +6988,23 @@ test("OC1: Parent and Child views share the Working border; Esc only pauses", as
     assert.equal(child.created[0]?.disposeCalls, 0, "the warm child was kept");
 
     const afterBurst = render();
+    const notifiesAtPause = b.notifies.length;
     for (let i = 0; i < 4; i += 1) editor.handleInput("\x1b");
     assert.equal(render(), afterBurst, "repeat Esc is inert while paused");
+    assert.equal(
+      b.notifies.length,
+      notifiesAtPause,
+      "repeat Esc adds no notification",
+    );
+    const pausedNotices = b.notifies.slice(noticesBeforeEsc);
+    assert.ok(
+      !pausedNotices.some((n) => /^Review Mode:/.test(n.message)),
+      "an Orchestrator pause must never emit a review-branded notice",
+    );
+    assert.ok(
+      !pausedNotices.some((n) => n.message.includes("Paused · Builder")),
+      "the border, not a notice, carries the paused hint",
+    );
     assert.equal(nativeEsc, 0);
     assert.equal(child.created[0]?.disposeCalls, 0);
   } finally {

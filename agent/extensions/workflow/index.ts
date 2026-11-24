@@ -1039,7 +1039,6 @@ export default function workflowExtension(
   let orchestratorWorkingMessageOwned = false;
   /** One deterministic pause request at a time; repeated Esc is a no-op. */
   let orchestratorPauseInFlight = false;
-  let lastOrchestratorPauseReminderAt = 0;
   /** Set only inside the child session; suppresses parent-only surfaces. */
   let inProcessChildContext: OrchestratorChildContext | undefined;
   /** Incremented on every session/run rebind so stale tool calls are refused. */
@@ -2197,15 +2196,6 @@ export default function workflowExtension(
     }
   }
 
-  /** At most one reminder per 2s while a paused/verifying child eats Esc. */
-  function remindOrchestratorPaused(): void {
-    const at = Date.now();
-    if (at - lastOrchestratorPauseReminderAt < 2_000) return;
-    lastOrchestratorPauseReminderAt = at;
-    const activity = composerActivity();
-    if (activity) notifyReview(activity.line, "info");
-  }
-
   /**
    * The focused editor's Esc route. Repeated presses are ignored while the
    * first pause is still in flight; the controller is idempotent as well, and
@@ -2215,20 +2205,17 @@ export default function workflowExtension(
     const child = orchestratorChild;
     const ctx = currentSessionCtx;
     if (!child || !ctx) return;
-    if (orchestratorPauseInFlight) {
-      remindOrchestratorPaused();
-      return;
-    }
+    if (orchestratorPauseInFlight) return;
     orchestratorPauseInFlight = true;
     try {
       const operator = await ensureOrchestratorOperator(ctx);
       const result = await operator.run("pause");
       if (!result.ok && !/already paused/i.test(result.text)) {
-        notifyReview(result.text, "info");
+        notifyWorkflow(result.text, "info");
       }
       updateStatusIfBound();
     } catch (error: unknown) {
-      notifyReview(
+      notifyWorkflow(
         `The Builder could not be paused: ${
           error instanceof Error ? error.message : String(error)
         }`,
@@ -3225,6 +3212,16 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * Reviewer-only notice: prefixes through `reviewNoticeText()`, so the message
+   * always renders as `Review Mode: …`.
+   *
+   * Scope rule: this helper belongs to the independent reviewer and the
+   * review-owned turn. Orchestrator/child, handoff/Plannotator and
+   * plan-lifecycle notices are not reviewer output — they must use
+   * `notifyWorkflow`, or their rows get branded `Review Mode:` by accident
+   * (the reported `Review Mode: Paused · Builder 3/19 · …`).
+   */
   function notifyReview(
     message: string,
     level: "info" | "warning" | "error" = "info",
@@ -3233,6 +3230,25 @@ export default function workflowExtension(
       // One prefix owner: callers speak in sentences, and the few sources that
       // still carry their own `Review Mode:` prefix are not doubled.
       currentSessionCtx?.ui.notify(reviewNoticeText(message), level);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Neutral Workflow notice: Plan/Build/Orchestrator/handoff lifecycle.
+   * Never carries the `Review Mode:` prefix. Use `notifyReview` only for
+   * messages emitted by the independent reviewer or review-owned turn.
+   *
+   * Same best-effort contract as `notifyReview`: a notify can never surface an
+   * extension error to the host.
+   */
+  function notifyWorkflow(
+    message: string,
+    level: "info" | "warning" | "error" = "info",
+  ): void {
+    try {
+      currentSessionCtx?.ui.notify(message, level);
     } catch (_e) {
       void _e;
     }
@@ -8972,7 +8988,7 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
-      notifyReview(
+      notifyWorkflow(
         "Plan opened in browser for review. Approve or annotate there.",
         "info",
       );
@@ -9190,7 +9206,7 @@ export default function workflowExtension(
     } catch (_e) {
       void _e;
     }
-    notifyReview(`Plannotator handoff unavailable — ${response.reason}.`, "warning");
+    notifyWorkflow(`Plannotator handoff unavailable — ${response.reason}.`, "warning");
     return { ok: false, reason: response.reason };
   }
 
@@ -9273,7 +9289,7 @@ export default function workflowExtension(
         planHandoffPhase = "idle";
         endReviewTurn();
         record("awaiting-execution", { decisionId: restored.decisionId });
-        notifyReview(
+        notifyWorkflow(
           `Plan approved (${restored.decisionId}) — execution was not selected. Nothing has run. Resume with /handoff continue ${restored.decisionId}.`,
           "info",
         );
@@ -9339,7 +9355,7 @@ export default function workflowExtension(
             ? { reviewUrl: pendingHandoffReviewUrl }
             : {}),
         });
-        notifyReview(
+        notifyWorkflow(
           `Browser review still open${pendingHandoffReviewUrl ? `: ${pendingHandoffReviewUrl}` : ""} — approve or annotate there.`,
           "info",
         );
@@ -9399,7 +9415,7 @@ export default function workflowExtension(
         reviewId: lastReviewId ?? "",
         mode: handoffConfigNow().config.mode,
       });
-      notifyReview(
+      notifyWorkflow(
         `Previous browser review could not be recovered — ${decision.reason}.`,
         "warning",
       );
@@ -9442,7 +9458,7 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
-      notifyReview(
+      notifyWorkflow(
         "Review feedback — switched to Plan mode for the revision.",
         "info",
       );
@@ -10014,7 +10030,7 @@ export default function workflowExtension(
     // decision (browser tab, saved record) must never start a second route
     // into Build while rows are being verified.
     if (executionOwnsThisSession()) {
-      notifyReview(
+      notifyWorkflow(
         "An Orchestrator run owns this session — finish, pause or abort it before approving another handoff.",
         "warning",
       );
@@ -10332,7 +10348,7 @@ export default function workflowExtension(
           event?.feedback,
           event?.cwd,
         ).catch((e: unknown) => {
-          notifyReview(
+          notifyWorkflow(
             `Plan approval failed: ${e instanceof Error ? e.message : String(e)}`,
             "error",
           );
@@ -10367,7 +10383,7 @@ export default function workflowExtension(
               event.feedback,
               (getActiveCtx() as any)?.cwd,
             ).catch((e: unknown) => {
-              notifyReview(
+              notifyWorkflow(
                 `Plan approval failed: ${e instanceof Error ? e.message : String(e)}`,
                 "error",
               );
@@ -10440,7 +10456,7 @@ export default function workflowExtension(
           }
           void presentClosedHandoff(ctx as any, planPath, planText).catch(
             (e: unknown) => {
-              notifyReview(
+              notifyWorkflow(
                 `Plan handoff after review close failed: ${e instanceof Error ? e.message : String(e)}`,
                 "warning",
               );
@@ -15475,7 +15491,7 @@ ${dispatched.text}`,
             },
           );
     if (orchestratorDecision.action === "refuse") {
-      notifyReview(orchestratorDecision.notice, "warning");
+      notifyWorkflow(orchestratorDecision.notice, "warning");
       return { action: "handled" } as any;
     }
     if (
@@ -15498,14 +15514,14 @@ ${dispatched.text}`,
           /* display-only */
         }
         if (delivery.queued) {
-          notifyReview(
+          notifyWorkflow(
             "Message queued for the paused child — /orchestrator-resume delivers it.",
             "info",
           );
         }
         return { action: "handled" } as any;
       }
-      notifyReview(
+      notifyWorkflow(
         `The child could not receive the message: ${delivery.error ?? "unknown"}`,
         "warning",
       );
@@ -15575,11 +15591,7 @@ ${dispatched.text}`,
         editor = new WorkflowTabEditor(tui, theme, kb, {
           activity: () => composerActivity(),
           onEscConsumed: (action) => {
-            if (action === "pause") {
-              void pauseOrchestratorFromComposer();
-            } else {
-              remindOrchestratorPaused();
-            }
+            if (action === "pause") void pauseOrchestratorFromComposer();
           },
         });
         workflowEditor = editor;
@@ -19311,7 +19323,7 @@ ${dispatched.text}`,
         : { legacy: true as const }),
     });
     if (!created.ok) {
-      notifyReview(`Handoff routing unavailable: ${created.error}`, "warning");
+      notifyWorkflow(`Handoff routing unavailable: ${created.error}`, "warning");
       pendingHandoffDecision = undefined;
       return undefined;
     }
@@ -19918,7 +19930,7 @@ ${dispatched.text}`,
     }
     if (state.phase === "settling") {
       if (!opts?.quiet) {
-        notifyReview(
+        notifyWorkflow(
           "The Build child is already finishing; the next child will use the updated model.",
           "info",
         );
@@ -19928,7 +19940,7 @@ ${dispatched.text}`,
     const plan = builderModelPlan();
     if (!plan) {
       if (!opts?.quiet) {
-        notifyReview(
+        notifyWorkflow(
           "No Builder model is configured — the live child keeps its current model.",
           "warning",
         );
@@ -19956,7 +19968,7 @@ ${dispatched.text}`,
         const label = model
           ? `${model.provider}/${model.id}${model.thinking ? ` (${model.thinking})` : ""}`
           : `${plan.provider}/${plan.id}`;
-        notifyReview(
+        notifyWorkflow(
           `Live Builder → ${label}. The next child uses the same ${opts?.reason ?? "model"} selection.`,
           "info",
         );
@@ -19964,7 +19976,7 @@ ${dispatched.text}`,
       return { applied: true, changed: result.changed };
     }
     if (!opts?.quiet) {
-      notifyReview(
+      notifyWorkflow(
         `Live Builder keeps ${state.modelLabel ?? "its current model"} — switching to ${plan.provider}/${plan.id} failed (${result.error ?? "unknown error"}). The next child will use it.`,
         "warning",
       );
@@ -20808,7 +20820,6 @@ ${dispatched.text}`,
     // old ticker, widget, working message or Esc route pointing at a dead run.
     orchestratorDialogActive = false;
     orchestratorPauseInFlight = false;
-    lastOrchestratorPauseReminderAt = 0;
     try {
       workflowEditor?.disposeStatus();
     } catch (_e) {
@@ -21429,7 +21440,7 @@ ${dispatched.text}`,
       if (abandonedDecision) {
         supersedeHandoffDecision(abandonedDecision, Date.now(), reason);
       }
-      notifyReview(`Plan handoff superseded — ${reason}.`, "info");
+      notifyWorkflow(`Plan handoff superseded — ${reason}.`, "info");
       try {
         pi.appendEntry("workflow-handoff-superseded", {
           reason,
@@ -22468,7 +22479,7 @@ ${dispatched.text}`,
         // A child session must never mirror an external plan-mode toggle: it
         // would re-apply the standard tool list and break the child contract.
         if (inProcessChildContext) {
-          notifyReview(
+          notifyWorkflow(
             "This is an Orchestrator Build child — external plan-mode changes are ignored.",
             "info",
           );
