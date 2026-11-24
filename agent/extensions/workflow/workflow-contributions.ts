@@ -494,13 +494,21 @@ export function buildWorkflowContributions(
       });
     }
     if (childLive) {
-      // Prompts still reach the parent; the extension forwards them to the
-      // child (steer). Say so instead of locking the composer.
+      // Truthful prompt routing: running prose is forwarded, paused prose is
+      // queued for resume, and a starting/verifying child cannot accept one.
+      const hint =
+        child?.phase === "paused"
+          ? "paused — prompts are queued; /orchestrator-resume delivers them"
+          : child?.phase === "starting"
+            ? "child is starting — wait for Working before sending a note"
+            : child?.phase === "settling"
+              ? "child is verifying — wait for the next row"
+              : "prompts are forwarded to the Build child";
       out.push({
         id: "orchestrator-input-hint",
         kind: "status",
         slot: "status",
-        text: "prompts are forwarded to the Build child",
+        text: hint,
         tone: "neutral",
         order: 47,
       });

@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import type { WorkflowTabEditor } from "./tab-editor.ts";
 
 // ── Plan fixtures ────────────────────────────────────────────────────
 
@@ -912,7 +913,6 @@ export interface FakeCtxOptions {
   /** `ctx.sessionManager.getSessionId()` (child teardown registry key). */
   sessionId?: string;
 }
-
 export function makeFakeCtx(over: FakeCtxOptions) {
   const notifies: Array<{ message: string; level?: string }> = [];
   /** `ctx.navigateTree` calls (rewind moves the conversation branch). */
@@ -929,6 +929,32 @@ export function makeFakeCtx(over: FakeCtxOptions) {
   const selects: Array<{ title: string; options: unknown[] }> = [];
   /** One entry per `ctx.ui.custom` call (the native handoff modal). */
   const customs: Array<{ options?: unknown }> = [];
+  /** Every factory passed to `ui.setEditorComponent` (last one is active). */
+  const editorFactories: Array<
+    (tui: unknown, theme: unknown, keybindings: unknown) => unknown
+  > = [];
+  /** Editor instances created by tests through the captured factory. */
+  const editors: unknown[] = [];
+  const fakeTui = {
+    requestRender() {
+      /* no-op */
+    },
+  };
+  const fakeKeybindings = {
+    matches(data: string, keybinding: string): boolean {
+      return keybinding === "tui.input.tab" && data === "\t";
+    },
+    getKeys(keybinding: string): string[] {
+      return keybinding === "tui.input.tab" ? ["tab"] : [];
+    },
+  };
+  const fakeTheme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+    strikethrough: (text: string) => text,
+    borderColor: (text: string) => text,
+    selectList: {},
+  };
   // A test can flip this to model a run that is still active (automatic
   // review) versus an idle session (manual `/review`).
   let idle = over.idle !== false;
@@ -1003,15 +1029,19 @@ export function makeFakeCtx(over: FakeCtxOptions) {
       setWorkingVisible(visible: boolean) {
         workingVisible.push(visible);
       },
-      setEditorComponent() {},
+      setEditorComponent(
+        factory?: (tui: unknown, theme: unknown, keybindings: unknown) => unknown,
+      ) {
+        if (typeof factory === "function") editorFactories.push(factory);
+        else editorFactories.length = 0;
+      },
+      getEditorComponent() {
+        return editorFactories.at(-1);
+      },
       getEditorText() {
         return "";
       },
-      theme: {
-        fg: (_color: string, text: string) => text,
-        bold: (text: string) => text,
-        strikethrough: (text: string) => text,
-      },
+      theme: fakeTheme,
     },
   };
   return {
@@ -1037,6 +1067,15 @@ export function makeFakeCtx(over: FakeCtxOptions) {
     selects,
     customs,
     navigations,
+    editorFactories,
+    /** Instantiate the active editor factory the way the host would. */
+    createEditor(): WorkflowTabEditor | undefined {
+      const factory = editorFactories.at(-1);
+      if (!factory) return undefined;
+      const editor = factory(fakeTui, fakeTheme, fakeKeybindings);
+      void editors;
+      return editor as WorkflowTabEditor;
+    },
   };
 }
 
@@ -1120,6 +1159,10 @@ export interface FakeOrchestratorChildSession {
   emit(event: unknown): void;
   /** Test control: emit a summary, todo list and settle. */
   settle(summary?: string): void;
+  /** Test control: resolve a `holdPrompt` prompt. */
+  finishPrompt(): void;
+  /** Test control: resolve a `holdAbort` abort. */
+  releaseAbort(): void;
   /** Test control: a full prompt → tool events → settle. */
   settleOnPrompt: boolean;
   /** How many `prompt()` calls the session received. */
@@ -1172,6 +1215,13 @@ export interface FakeOrchestratorChildOptions {
   setModelError?: unknown;
   /** Emit an assistant `message_end` with usage from `settle()`. */
   usageOnSettle?: boolean;
+  /**
+   * Hold `prompt()` until the test calls `session.finishPrompt()`. Models a
+   * Builder that is still thinking so pause/resume races are deterministic.
+   */
+  holdPrompt?: boolean;
+  /** Hold `abort()` until the test calls `session.releaseAbort()`. */
+  holdAbort?: boolean;
 }
 
 export interface FakeOrchestratorChildFactory {
@@ -1281,6 +1331,8 @@ function buildFakeOrchestratorSession(
   const listeners: Array<(event: unknown) => void> = [];
   let streaming = false;
   let disposed = false;
+  let promptResolve: (() => void) | undefined;
+  let abortResolve: (() => void) | undefined;
   const launchModel =
     options.modelRef ??
     (input.modelRef
@@ -1315,6 +1367,11 @@ function buildFakeOrchestratorSession(
         args: { path: "README.md" },
       });
       emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "read" });
+      if (options.holdPrompt === true) {
+        await new Promise<void>((resolve) => {
+          promptResolve = resolve;
+        });
+      }
       if (options.settleOnPrompt === true) {
         streaming = false;
         session.settle();
@@ -1324,6 +1381,11 @@ function buildFakeOrchestratorSession(
       await session.prompt(text);
     },
     async abort() {
+      if (options.holdAbort === true) {
+        await new Promise<void>((resolve) => {
+          abortResolve = resolve;
+        });
+      }
       streaming = false;
     },
     isStreaming() {
@@ -1339,6 +1401,16 @@ function buildFakeOrchestratorSession(
     settle(summary) {
       streaming = false;
       emitFakeSettle(options, emit, summary);
+    },
+    finishPrompt() {
+      const resolve = promptResolve;
+      promptResolve = undefined;
+      resolve?.();
+    },
+    releaseAbort() {
+      const resolve = abortResolve;
+      abortResolve = undefined;
+      resolve?.();
     },
     settleOnPrompt: options.settleOnPrompt === true,
     promptCalls: 0,

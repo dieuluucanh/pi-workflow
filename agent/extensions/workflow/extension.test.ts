@@ -269,6 +269,8 @@ async function boot(over: BootOptions = {}) {
     customs,
     navigations,
     aborts,
+    editorFactories,
+    createEditor,
   } = makeFakeCtx({
     cwd,
     hasUI: over.hasUI === true,
@@ -332,6 +334,8 @@ async function boot(over: BootOptions = {}) {
     customs,
     navigations,
     aborts,
+    editorFactories,
+    createEditor,
     plannotatorRequests,
     reviewStatusRequests,
     child: childFactory,
@@ -6779,5 +6783,108 @@ test("OER3: failed row checks repair/block with no reviewer activity", async () 
     assert.equal(b.child.created.length, 1, "the warm child was reused");
   } finally {
     await b.cleanup();
+  }
+});
+
+// ── Orchestrator composer (Working/Paused border + pause-only Esc) ───
+
+async function waitForComposer(
+  read: () => string,
+  match: RegExp,
+  attempts = 100,
+): Promise<string> {
+  let text = "";
+  for (let i = 0; i < attempts; i += 1) {
+    text = read();
+    if (match.test(text)) return text;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return text;
+}
+
+test("OC1: Parent and Child views share the Working border; Esc only pauses", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "oc1.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    const editor = b.createEditor() as any;
+    assert.ok(editor, "the Workflow editor owns the composer");
+    const render = (): string => editor.renderTopBorder(160, 0);
+
+    const working = await waitForComposer(render, /Working · Builder 1\/1/);
+    assert.match(working, /Working · Builder 1\/1/);
+    assert.match(working, /ESC or \/orchestrator-pause to pause/);
+    assert.match(working, /\/orchestrator-abort to stop/);
+
+    // Parent / Child / Auto are a display toggle, never a different composer.
+    await b.pi.commands["orchestrator-view"].handler("child", b.ctx);
+    assert.match(render(), /Working · Builder 1\/1/);
+    await b.pi.commands["orchestrator-view"].handler("parent", b.ctx);
+    assert.match(render(), /Working · Builder 1\/1/);
+
+    let nativeEsc = 0;
+    editor.onEscape = () => {
+      nativeEsc += 1;
+    };
+    editor.isShowingAutocomplete = () => false;
+
+    // A burst of Esc: the first pauses, the rest are consumed. None may abort.
+    editor.handleInput("\x1b");
+    editor.handleInput("\x1b");
+    editor.handleInput("\x1b");
+    const paused = await waitForComposer(render, /Paused · Builder 1\/1/);
+    assert.match(paused, /Paused · Builder 1\/1/);
+    assert.match(paused, /\/orchestrator-resume to continue/);
+    assert.equal(nativeEsc, 0, "Esc never reached the host abort handler");
+    assert.equal(b.aborts(), 0, "the parent turn was not aborted");
+    assert.equal(child.created[0]?.disposeCalls, 0, "the warm child was kept");
+
+    const afterBurst = render();
+    for (let i = 0; i < 4; i += 1) editor.handleInput("\x1b");
+    assert.equal(render(), afterBurst, "repeat Esc is inert while paused");
+    assert.equal(nativeEsc, 0);
+    assert.equal(child.created[0]?.disposeCalls, 0);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("OC2: a foreign editor gets the fallback line; shutdown clears it", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  let cleaned = false;
+  try {
+    // Model another extension's editor, then rebind so Workflow must stand down.
+    b.ctx.ui.setEditorComponent(() => ({
+      render: () => [],
+      invalidate: () => {},
+      handleInput: () => {},
+    }));
+    await b.pi.emit("session_start", { reason: "startup" }, b.ctx);
+
+    const plan = placePlan(b.cwd, "oc2.md");
+    fs.writeFileSync(plan.abs, orchestratorPlan(["One row"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+
+    const activityCalls = b.widgetCalls.filter(
+      (entry) => entry.key === "workflow-orchestrator-activity",
+    );
+    const last = activityCalls.at(-1);
+    assert.ok(Array.isArray(last?.value), "the fallback widget was mounted");
+    assert.match(String((last!.value as string[])[0]), /Working · Builder 1\/1/);
+    // Without the focused editor there must be no false Esc promise.
+    assert.doesNotMatch(String((last!.value as string[])[0]), /ESC/);
+
+    await b.cleanup();
+    cleaned = true;
+    const cleared = b.widgetCalls
+      .filter((entry) => entry.key === "workflow-orchestrator-activity")
+      .at(-1);
+    assert.equal(cleared?.value, undefined, "shutdown unmounts the fallback");
+  } finally {
+    if (!cleaned) await b.cleanup();
   }
 });

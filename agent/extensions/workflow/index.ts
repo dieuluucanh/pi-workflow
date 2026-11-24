@@ -329,6 +329,7 @@ import {
   createOrchestratorChildController,
   type OrchestratorChildController,
 } from "./orchestrator-child-controller.ts";
+import { orchestratorActivity } from "./orchestrator-activity.ts";
 import { createChildUiBridge, type ChildUiBridge } from "./orchestrator-child-ui.ts";
 import {
   createOrchestratorAdvance,
@@ -338,7 +339,6 @@ import {
   ORCHESTRATOR_CHILD_BAND_ENTRY,
   ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY,
   formatOrchestratorChildProgress,
-  formatOrchestratorChildStatus,
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
 import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
@@ -1013,6 +1013,17 @@ export default function workflowExtension(
   /** One repaint clock for the child's elapsed time; created on first need. */
   let orchestratorStatsClock: StatsClock | undefined;
   let orchestratorChildUi: ChildUiBridge | undefined;
+  /** The installed Workflow editor (host-owned instance, if any). */
+  let workflowEditor: WorkflowTabEditor | undefined;
+  /** A forwarded child dialog is open; the composer says Waiting. */
+  let orchestratorDialogActive = false;
+  /** Last applied compatibility fallback text; null = never applied. */
+  let orchestratorFallbackApplied: string | null = null;
+  /** True when Orchestrator owns the host working message (Desktop path). */
+  let orchestratorWorkingMessageOwned = false;
+  /** One deterministic pause request at a time; repeated Esc is a no-op. */
+  let orchestratorPauseInFlight = false;
+  let lastOrchestratorPauseReminderAt = 0;
   /** Set only inside the child session; suppresses parent-only surfaces. */
   let inProcessChildContext: OrchestratorChildContext | undefined;
   /** Incremented on every session/run rebind so stale tool calls are refused. */
@@ -2107,6 +2118,125 @@ export default function workflowExtension(
     }
   }
 
+  const ORCHESTRATOR_ACTIVITY_WIDGET = "workflow-orchestrator-activity";
+
+  /**
+   * One composer projection for Parent, Child and Auto views.
+   *
+   * The view only swaps the pinned TODO panel; it must never hide or rename the
+   * live child activity, because both views share one composer.
+   */
+  function composerActivity(): ReturnType<typeof orchestratorActivity> {
+    try {
+      const view = orchestratorRuntime?.view();
+      const child = orchestratorChild?.state();
+      const childLive =
+        child !== undefined &&
+        child.phase !== "idle" &&
+        child.phase !== "disposed";
+      return orchestratorActivity({
+        ...(view ? { runPhase: view.phase } : {}),
+        ...(view?.state?.blockedReason
+          ? { blockedReason: view.state.blockedReason }
+          : {}),
+        ...(childLive ? { child } : {}),
+        awaitingDialog: orchestratorDialogActive,
+        escAvailable: workflowEditor !== undefined,
+      });
+    } catch (_e) {
+      void _e;
+      return undefined;
+    }
+  }
+
+  /** At most one reminder per 2s while a paused/verifying child eats Esc. */
+  function remindOrchestratorPaused(): void {
+    const at = Date.now();
+    if (at - lastOrchestratorPauseReminderAt < 2_000) return;
+    lastOrchestratorPauseReminderAt = at;
+    const activity = composerActivity();
+    if (activity) notifyReview(activity.line, "info");
+  }
+
+  /**
+   * The focused editor's Esc route. Repeated presses are ignored while the
+   * first pause is still in flight; the controller is idempotent as well, and
+   * neither layer ever escalates a pause into an abort.
+   */
+  async function pauseOrchestratorFromComposer(): Promise<void> {
+    const child = orchestratorChild;
+    const ctx = currentSessionCtx;
+    if (!child || !ctx) return;
+    if (orchestratorPauseInFlight) {
+      remindOrchestratorPaused();
+      return;
+    }
+    orchestratorPauseInFlight = true;
+    try {
+      const operator = await ensureOrchestratorOperator(ctx);
+      const result = await operator.run("pause");
+      if (!result.ok && !/already paused/i.test(result.text)) {
+        notifyReview(result.text, "info");
+      }
+      updateStatusIfBound();
+    } catch (error: unknown) {
+      notifyReview(
+        `The Builder could not be paused: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        "warning",
+      );
+    } finally {
+      orchestratorPauseInFlight = false;
+    }
+  }
+
+  /**
+   * Paint the shared composer. The editor border is primary; the above-editor
+   * widget is a compatibility fallback only when the Workflow editor is not
+   * installed. Desktop gets an idle extension working message, never a
+   * Terminal-only widget. No surface is mounted when no child/run owns it.
+   */
+  function syncOrchestratorComposer(ctx: ExtensionContext): void {
+    try {
+      const activity = composerActivity();
+      try {
+        workflowEditor?.refreshStatus();
+      } catch (_e) {
+        void _e;
+      }
+
+      const fallbackText =
+        reviewWidgetHost() && !workflowEditor && activity ? activity.line : "";
+      if (fallbackText !== orchestratorFallbackApplied) {
+        orchestratorFallbackApplied = fallbackText;
+        setWorkflowWidget(
+          ctx.ui,
+          ORCHESTRATOR_ACTIVITY_WIDGET,
+          fallbackText ? [fallbackText] : [],
+          { placement: "aboveEditor" },
+        );
+      }
+
+      const ui = (ctx as any).ui;
+      const hasUI = (ctx as any).hasUI === true;
+      const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+      const desktopPath =
+        !reviewWidgetHost() && hasUI && idle && reviewTurn === "idle";
+      if (desktopPath && activity?.busy) {
+        // Message only: `setWorkingVisible(true)` can replace a live native
+        // retry/compaction indicator, so it is not used as a liveness hack.
+        ui?.setWorkingMessage?.(activity.line);
+        orchestratorWorkingMessageOwned = true;
+      } else if (orchestratorWorkingMessageOwned) {
+        ui?.setWorkingMessage?.(undefined);
+        orchestratorWorkingMessageOwned = false;
+      }
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function updateStatus(ctx: ExtensionContext) {
     // Profile prefix (⚡ name) when one is active, then the role label.
     const profileLabel = activeProfileLabel();
@@ -2241,6 +2371,9 @@ export default function workflowExtension(
     publishContributions();
     // View/phase changed: arm or disarm the elapsed-time repaint clock.
     syncOrchestratorClock(ctx);
+    // The composer is the primary Working/Paused surface; repaint it from the
+    // same status pass so the footer and border can never disagree.
+    syncOrchestratorComposer(ctx);
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -10382,42 +10515,29 @@ export default function workflowExtension(
     pi.registerCommand("orchestrator-pause", {
       description: "Pause the in-process Build child (warm session kept).",
       handler: async (_args, ctx) => {
-        const child = orchestratorChild;
-        const view = orchestratorRuntime?.view();
-        if (!child || !view) return ctx.ui.notify("No Orchestrator child is active.", "info");
-        const paused = await child.pause();
-        if (paused && view.phase !== "paused") {
-          await orchestratorRuntime!.applyEvent({ type: "run.transition", runId: view.runId, now: Date.now(), to: "paused" });
-        }
-        ctx.ui.notify(paused ? "Child paused. /orchestrator-resume continues it." : "Nothing to pause.", paused ? "info" : "warning");
+        // One implementation: the operator owns the child pause, the durable
+        // run transition, reconciliation and the user-facing text.
+        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
+        const result = await operator.run("pause");
+        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
         updateStatus(ctx as any);
       },
     });
     pi.registerCommand("orchestrator-resume", {
       description: "Resume a paused in-process Build child.",
       handler: async (_args, ctx) => {
-        const child = orchestratorChild;
-        const view = orchestratorRuntime?.view();
-        if (!child || !view) return ctx.ui.notify("No Orchestrator child is active.", "info");
-        if (view.phase === "paused") {
-          await orchestratorRuntime!.applyEvent({ type: "run.transition", runId: view.runId, now: Date.now(), to: "running" });
-        }
-        const resumed = await child.resume();
-        ctx.ui.notify(resumed ? "Child resumed." : "The child could not be resumed.", resumed ? "info" : "warning");
+        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
+        const result = await operator.run("resume");
+        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
         updateStatus(ctx as any);
       },
     });
     pi.registerCommand("orchestrator-abort", {
       description: "Abort the in-process Build child and pause the run.",
       handler: async (_args, ctx) => {
-        const child = orchestratorChild;
-        if (!child) return ctx.ui.notify("No Orchestrator child is active.", "info");
-        await child.abort("user abort");
-        const after = orchestratorRuntime?.view();
-        if (after && after.phase === "blocked") {
-          await orchestratorRuntime!.applyEvent({ type: "run.transition", runId: after.runId, now: Date.now(), to: "paused" });
-        }
-        ctx.ui.notify("Child aborted. The row is retryable; /orchestrator retry starts a fresh child.", "warning");
+        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
+        const result = await operator.run("abort");
+        ctx.ui.notify(result.text, result.ok ? "warning" : "warning");
         updateStatus(ctx as any);
       },
     });
@@ -10425,9 +10545,9 @@ export default function workflowExtension(
       description: "Show the current Orchestrator child view: child|parent|auto.",
       handler: async (args, ctx) => {
         const raw = typeof args === "string" ? args.trim().toLowerCase() : "";
-        if (raw === "child" || raw === "parent" || raw === "auto") orchestratorChildView = raw;
-        const status = formatOrchestratorChildStatus(orchestratorChild?.state());
-        ctx.ui.notify(`Orchestrator view: ${orchestratorChildView}\n${status || "No child is active."}`, "info");
+        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
+        const result = await operator.run(raw ? `view ${raw}` : "view");
+        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
         updateStatus(ctx as any);
       },
     });
@@ -14962,7 +15082,17 @@ ${dispatched.text}`,
 
       ui.setEditorComponent((tui: any, theme: any, kb: any) => {
         keybindings = kb;
-        editor = new WorkflowTabEditor(tui, theme, kb);
+        editor = new WorkflowTabEditor(tui, theme, kb, {
+          activity: () => composerActivity(),
+          onEscConsumed: (action) => {
+            if (action === "pause") {
+              void pauseOrchestratorFromComposer();
+            } else {
+              remindOrchestratorPaused();
+            }
+          },
+        });
+        workflowEditor = editor;
         return editor;
       });
 
@@ -19627,10 +19757,19 @@ ${dispatched.text}`,
     const selfPath =
       deps.selfExtensionPath ?? fileURLToPath(import.meta.url);
     const createChild = deps.createOrchestratorChild ?? createOrchestratorBuildChild;
-    orchestratorChildUi = createChildUiBridge((ctx as any).ui, {
-      ref: "1",
-      total: 1,
-    });
+    orchestratorChildUi = createChildUiBridge(
+      (ctx as any).ui,
+      {
+        ref: "1",
+        total: 1,
+      },
+      {
+        onDialogActivity: (active) => {
+          orchestratorDialogActive = active;
+          updateStatusIfBound();
+        },
+      },
+    );
     let lastBandPhase: string | undefined;
     orchestratorChild = createOrchestratorChildController({
       // The controller reconciles a prepared child (and a resume) against this,
@@ -20101,6 +20240,29 @@ ${dispatched.text}`,
       void _e;
     }
     orchestratorChildUi = undefined;
+    // Composer ownership is session-scoped as well: a rebind must not leave an
+    // old ticker, widget, working message or Esc route pointing at a dead run.
+    orchestratorDialogActive = false;
+    orchestratorPauseInFlight = false;
+    lastOrchestratorPauseReminderAt = 0;
+    try {
+      workflowEditor?.disposeStatus();
+    } catch (_e) {
+      void _e;
+    }
+    workflowEditor = undefined;
+    orchestratorFallbackApplied = null;
+    try {
+      if (currentSessionCtx) {
+        setWorkflowWidget(currentSessionCtx.ui, ORCHESTRATOR_ACTIVITY_WIDGET, []);
+        if (orchestratorWorkingMessageOwned) {
+          (currentSessionCtx as any).ui?.setWorkingMessage?.(undefined);
+        }
+      }
+    } catch (_e) {
+      void _e;
+    }
+    orchestratorWorkingMessageOwned = false;
   }
 
   /**

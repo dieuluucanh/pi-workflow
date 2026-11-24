@@ -46,7 +46,11 @@ test("prose while the child runs is forwarded", () => {
   );
   assert.deepEqual(
     orchestratorInputDecision("start now", { childPhase: "starting", hasRun: true }),
-    { action: "forward" },
+    {
+      action: "refuse",
+      notice:
+        "The Build child is starting. Wait until the composer shows Working, then send the note again.",
+    },
   );
 });
 

@@ -36,6 +36,10 @@ export interface OrchestratorChildState {
   startedAt?: number;
   /** Set while paused, so elapsed time freezes instead of draining. */
   pausedAt?: number;
+  /** A pause request is still settling; the child is warm but not idle yet. */
+  pausePending?: boolean;
+  /** A provider retry/backoff is active; the run has not failed. */
+  retrying?: boolean;
   lastTool?: string;
   todos: TodoItem[];
   lastError?: string;
@@ -207,12 +211,23 @@ export function createOrchestratorChildController(
   let child: InProcessChildSession | undefined;
   let unsubscribe: (() => void) | undefined;
   let generation = 0;
-  let expectedAbort: "pause" | "abort" | "stop" | undefined;
+  let expectedAbort: "abort" | "stop" | undefined;
   let settledOnce = false;
   let toolCalls = 0;
   let summary = "";
   let startedAt = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Pause ownership for the current invocation. It deliberately survives the
+   * SDK's `agent_settled` event and the awaited prompt's catch, so an
+   * intentional pause can never be misclassified as a child failure.
+   */
+  let pauseState: "none" | "requested" | "settled" = "none";
+  let pauseWaiters: Array<(settled: boolean) => void> = [];
+  /** Remaining ACTIVE execution budget; paused wall time is excluded. */
+  let remainingMs = timeoutMs;
+  let deadlineStartedAt: number | undefined;
+  let deadlineGen = -1;
   let queuedNote: string | undefined;
   let prepared:
     | {
@@ -360,6 +375,72 @@ export function createOrchestratorChildController(
       clearTimeout(timer);
       timer = undefined;
     }
+    deadlineStartedAt = undefined;
+  };
+
+  /** Release a warm resume waiting for the pause to finish settling. */
+  const resolvePause = (): void => {
+    const waiters = pauseWaiters.splice(0);
+    for (const waiter of waiters) {
+      try {
+        waiter(true);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  const failWaiters = (): void => {
+    const waiters = pauseWaiters.splice(0);
+    for (const waiter of waiters) {
+      try {
+        waiter(false);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  const PAUSE_SETTLE_TIMEOUT_MS = 5_000;
+
+  /**
+   * Wait (bounded) for an in-flight pause to finish. Resume must never prompt a
+   * session that is still aborting: that would be steered into the dying run.
+   */
+  const waitForPauseSettlement = async (): Promise<boolean> => {
+    if (pauseState === "none" || pauseState === "settled") return true;
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (value: boolean): void => {
+        if (done) return;
+        done = true;
+        resolve(value);
+      };
+      pauseWaiters.push((settled) => finish(settled));
+      const timeout = setTimeout(() => finish(false), PAUSE_SETTLE_TIMEOUT_MS);
+      // SAFETY: Node's Timeout exposes `unref()`; a DOM-style numeric handle
+      // from a non-Node host does not, so the call is optional.
+      (timeout as unknown as { unref?: () => void }).unref?.();
+    });
+  };
+
+  /**
+   * Freeze the execution deadline while paused. The remaining budget is kept,
+   * so repeated pause/resume neither expires a warm child nor resets the
+   * execution budget indefinitely.
+   */
+  const suspendDeadline = (): void => {
+    if (
+      timer !== undefined &&
+      deadlineStartedAt !== undefined &&
+      deadlineGen === generation
+    ) {
+      remainingMs = Math.max(
+        1_000,
+        remainingMs - Math.max(0, now() - deadlineStartedAt),
+      );
+    }
+    clearTimer();
   };
 
   /**
@@ -370,8 +451,19 @@ export function createOrchestratorChildController(
    * after the last row). The child's own streaming keeps the loop alive while
    * there is real work.
    */
-  const armDeadline = (callback: () => void): void => {
-    timer = setTimeout(callback, timeoutMs);
+  const armDeadline = (gen: number): void => {
+    clearTimer();
+    if (remainingMs <= 0) return;
+    deadlineStartedAt = now();
+    deadlineGen = gen;
+    timer = setTimeout(() => {
+      if (gen !== generation || settledOnce) return;
+      if (state.phase === "paused") return;
+      expectedAbort = "abort";
+      void child?.abort();
+      release();
+      fail(`the child did not finish within ${Math.round(timeoutMs / 1000)}s`);
+    }, remainingMs);
     // SAFETY: Node's Timeout carries `unref()`; the DOM-style numeric handle a
     // non-Node host may return does not, and the optional call keeps it safe.
     const handle = timer as unknown as { unref?: () => void };
@@ -422,7 +514,7 @@ export function createOrchestratorChildController(
     if (settledOnce) return;
     settledOnce = true;
     clearTimer();
-    publish({ phase: "settling" });
+    publish({ phase: "settling", pausePending: false, retrying: false });
     const taskId = state.taskId ?? "";
     const attemptId = state.attemptId ?? "";
     void Promise.resolve(
@@ -474,6 +566,16 @@ export function createOrchestratorChildController(
       }
       return;
     }
+    if (type === "agent_start") {
+      publish({ retrying: false });
+      // The SDK resets an abort requested before its run became active. A
+      // pause that landed in that window is reapplied here, once, so the warm
+      // child stops instead of running the whole row after looking paused.
+      if (state.phase === "paused") {
+        void child.abort();
+      }
+      return;
+    }
     if (type === "agent_end") {
       const text = assistantText(event.messages);
       if (text) summary = text;
@@ -488,6 +590,15 @@ export function createOrchestratorChildController(
     }
     if (type === "agent_settled") {
       refreshStats();
+      if (pauseState !== "none") {
+        // A requested pause owns settlement: keep the warm child, do not settle
+        // the row, and release resume exactly once. This also covers a settle
+        // that arrives before the awaited `abort()` resolves.
+        pauseState = "settled";
+        publish({ pausePending: false, retrying: false });
+        resolvePause();
+        return;
+      }
       if (expectedAbort !== undefined) {
         expectedAbort = undefined;
         return;
@@ -497,6 +608,7 @@ export function createOrchestratorChildController(
     }
     if (type === "auto_retry_start") {
       const message = typeof event.errorMessage === "string" ? event.errorMessage : "";
+      publish({ retrying: true });
       ops([
         {
           op: "new",
@@ -508,7 +620,9 @@ export function createOrchestratorChildController(
       ]);
       return;
     }
-    if (type === "auto_retry_end" && event.success === false) {
+    if (type === "auto_retry_end") {
+      publish({ retrying: false });
+      if (event.success !== false) return;
       const detail =
         typeof event.finalError === "string" ? event.finalError : "";
       if (!settledOnce) {
@@ -602,6 +716,9 @@ export function createOrchestratorChildController(
       const gen = generation;
       settledOnce = false;
       expectedAbort = undefined;
+      pauseState = "none";
+      resolvePause();
+      remainingMs = timeoutMs;
       toolCalls = 0;
       summary = "";
       queuedNote = undefined;
@@ -682,22 +799,33 @@ export function createOrchestratorChildController(
       const actualLabel = actual
         ? `${actual.provider}/${actual.id}`
         : modelLabel;
+      if (pauseState !== "none") {
+        // Pause landed while the session was being created/adopted. Keep the
+        // warm child, never prompt, and never arm a deadline.
+        publish({
+          phase: "paused",
+          pausedAt: now(),
+          pausePending: false,
+          ...(actualLabel ? { modelLabel: actualLabel } : {}),
+          ...(actual?.thinking ? { thinking: actual.thinking } : {}),
+          sessionId: child.sessionId,
+        });
+        pauseState = "settled";
+        resolvePause();
+        return { ok: true };
+      }
       publish({
         phase: "running",
         ...(actualLabel ? { modelLabel: actualLabel } : {}),
         ...(actual?.thinking ? { thinking: actual.thinking } : {}),
         sessionId: child.sessionId,
         pausedAt: undefined,
+        pausePending: false,
+        retrying: false,
       });
       refreshStats();
       unsubscribe = child.subscribe(onEvent);
-      armDeadline(() => {
-        if (gen !== generation || settledOnce) return;
-        expectedAbort = "abort";
-        void child?.abort();
-        release();
-        fail(`the child did not finish within ${Math.round(timeoutMs / 1000)}s`);
-      });
+      armDeadline(gen);
       try {
         await child.prompt(
           ports.buildPrompt({
@@ -710,6 +838,9 @@ export function createOrchestratorChildController(
         );
       } catch (error: unknown) {
         if (gen !== generation) return { ok: false, error: "superseded" };
+        // An intentional pause aborts the SDK run; its prompt rejection is not
+        // a child failure and must not dispose the warm session.
+        if (pauseState !== "none") return { ok: true };
         if (expectedAbort !== undefined) return { ok: false, error: "aborted" };
         const text = error instanceof Error ? error.message : String(error);
         expectedAbort = "abort";
@@ -721,14 +852,35 @@ export function createOrchestratorChildController(
     },
 
     async pause() {
-      if (state.phase !== "running" || !child) return false;      expectedAbort = "pause";
+      // Idempotent by contract: a second Esc can never issue a second abort or
+      // escalate into a destructive stop.
+      if (pauseState !== "none") return false;
+      if (state.phase !== "starting" && state.phase !== "running") return false;
+      if (!child && state.phase === "running") return false;
+      const gen = generation;
+      pauseState = "requested";
+      suspendDeadline();
       // Freeze elapsed on pause: a warm child must not accumulate wall time.
-      publish({ phase: "paused", pausedAt: now() });
-      try {
-        await child.abort();
-      } catch {
-        /* ignore */
+      publish({
+        phase: "paused",
+        pausedAt: now(),
+        pausePending: true,
+        retrying: false,
+      });
+      const target = child;
+      if (target) {
+        try {
+          await target.abort();
+        } catch {
+          /* ignore */
+        }
       }
+      if (gen !== generation) return true;
+      // `agent_settled` may already have completed the pause; this is the
+      // fallback for a host that resolves abort without that event.
+      pauseState = "settled";
+      publish({ pausePending: false });
+      resolvePause();
       return true;
     },
 
@@ -741,24 +893,25 @@ export function createOrchestratorChildController(
       const ref = state.ref;
       const total = state.total;
       if (!taskId || !attemptId || !ref || total === undefined) return false;
-      clearTimer();
-      settledOnce = false;
+      if (!(await waitForPauseSettlement())) return false;
+      if (!child || (state.phase !== "settling" && state.phase !== "paused")) {
+        return false;
+      }
+      const gen = generation;
+      pauseState = "none";
       expectedAbort = undefined;
+      settledOnce = false;
       summary = "";
-      publish({ phase: "running", pausedAt: undefined });
-      armDeadline(() => {
-        if (settledOnce) return;
-        expectedAbort = "abort";
-        void child?.abort();
-        release();
-        fail(`the child did not finish within ${Math.round(timeoutMs / 1000)}s`);
-      });
+      publish({ phase: "running", pausedAt: undefined, pausePending: false, retrying: false });
+      armDeadline(gen);
       try {
         await child.prompt(
           ports.buildPrompt({ taskId, attemptId, ref, total, repair }),
         );
         return true;
       } catch (error: unknown) {
+        if (pauseState !== "none") return true;
+        if (gen !== generation) return false;
         const message = error instanceof Error ? error.message : String(error);
         fail(`the child could not be re-prompted: ${message}`);
         return false;
@@ -766,6 +919,10 @@ export function createOrchestratorChildController(
     },
 
     async resume(note?: string) {
+      if (state.phase !== "paused" || !child) return false;
+      // Never prompt a session that is still aborting: that would steer the
+      // continuation into the dying run instead of starting a real one.
+      if (!(await waitForPauseSettlement())) return false;
       if (state.phase !== "paused" || !child) return false;
       const text =
         note?.trim() ||
@@ -780,32 +937,42 @@ export function createOrchestratorChildController(
         await ensureDesiredModel(child);
       });
       if (state.phase !== "paused" || !child) return false;
+      const gen = generation;
+      pauseState = "none";
       expectedAbort = undefined;
       settledOnce = false;
-      publish({ phase: "running", pausedAt: undefined });
-      try {
-        await child.prompt(text);
-        return true;
-      } catch (error: unknown) {
+      summary = "";
+      publish({ phase: "running", pausedAt: undefined, pausePending: false, retrying: false });
+      armDeadline(gen);
+      // Resume is a SHORT admission: controls (including a new pause) must not
+      // wait for the whole run to finish. Completion/failure still arrives via
+      // the event stream and the attempt-scoped rejection handler below.
+      const launched = child.prompt(text);
+      void launched.catch((error: unknown) => {
+        if (gen !== generation) return;
+        if (pauseState !== "none") return;
+        if (expectedAbort !== undefined) return;
         const message = error instanceof Error ? error.message : String(error);
         fail(`the child could not resume: ${message}`);
-        return false;
-      }
+      });
+      return true;
     },
 
     async abort(reason) {
       generation += 1;
       expectedAbort = "abort";
+      pauseState = "none";
       const taskId = state.taskId ?? "";
       const attemptId = state.attemptId ?? "";
       clearTimer();
+      failWaiters();
       try {
         await child?.abort();
       } catch {
         /* ignore */
       }
       release();
-      publish({ phase: "disposed" });
+      publish({ phase: "disposed", pausePending: false, retrying: false });
       if (taskId && attemptId) {
         try {
           await ports.onAborted?.({ taskId, attemptId, reason });
@@ -818,9 +985,11 @@ export function createOrchestratorChildController(
     async dispose() {
       generation += 1;
       expectedAbort = "abort";
+      pauseState = "none";
       clearTimer();
+      failWaiters();
       release();
-      publish({ phase: "disposed" });
+      publish({ phase: "disposed", pausePending: false, retrying: false });
     },
 
     async deliver(text) {

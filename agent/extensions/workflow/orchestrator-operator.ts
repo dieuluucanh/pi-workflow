@@ -143,6 +143,7 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
           "Usage: /orchestrator [status|start [path]|pause|resume|abort|stop|retry|inspect [taskId]|view [child|parent|auto]|say <text>|cancel]",
           "Bare /orchestrator enters the mode. Start freezes the approved plan into one TODO row per step and runs the first in-process Build child; there is no second breakdown approval.",
           "Aliases: /orchestrator-pause, /orchestrator-resume, /orchestrator-abort, /orchestrator-view.",
+          "While a Builder owns the composer: Esc (or /orchestrator-pause) pauses; /orchestrator-resume continues; /orchestrator-abort stops. Repeated Esc never aborts.",
         ].join("\n"),
       });
 
@@ -204,9 +205,17 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "pause": {
-          if (view.phase === "paused") return fail("The run is already paused.");
-          if (view.phase === "completed" || view.phase === "cancelled" || view.phase === "failed") {
+          if (
+            view.phase === "completed" ||
+            view.phase === "cancelled" ||
+            view.phase === "failed"
+          ) {
             return fail(`The run is ${view.phase}; it cannot be paused.`);
+          }
+          // Reconcile a durable "paused" whose child is still running (a
+          // transition raced the pause). A truly paused run stays idempotent.
+          if (view.phase === "paused" && (!child || child.phase !== "running")) {
+            return fail("The run is already paused.");
           }
           const paused = await ports.pauseChild?.();
           if (!paused) {
@@ -216,31 +225,62 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
                 : "No live child to pause; the warm session is already gone.",
             );
           }
-          const transitioned = await owner.applyEvent({
-            type: "run.transition",
-            runId: view.runId,
-            now: now(),
-            to: "paused",
-          });
-          return transitioned.ok
-            ? { ok: true, verb: parsed.verb, text: "Run paused. The warm child can be resumed; no new row is dispatched." }
-            : fail(`The child is paused, but the run could not record it: ${transitioned.error}`);
+          if (view.phase !== "paused") {
+            const transitioned = await owner.applyEvent({
+              type: "run.transition",
+              runId: view.runId,
+              now: now(),
+              to: "paused",
+            });
+            if (!transitioned.ok) {
+              return fail(
+                `The child is paused, but the run could not record it: ${transitioned.error}`,
+              );
+            }
+          }
+          return {
+            ok: true,
+            verb: parsed.verb,
+            text: "Run paused. The warm child can be resumed; no new row is dispatched.",
+          };
         }
 
         case "resume": {
           if (child && (child.phase === "paused" || child.phase === "settling")) {
-            if (view.phase === "paused") {
-              await owner.applyEvent({
+            const moved = view.phase === "paused";
+            if (moved) {
+              const transitioned = await owner.applyEvent({
                 type: "run.transition",
                 runId: view.runId,
                 now: now(),
                 to: "running",
               });
+              if (!transitioned.ok) {
+                return fail(`Cannot resume ${view.runId}: ${transitioned.error}`);
+              }
             }
+            // Admission is bounded and short: it starts the prompt, it does not
+            // wait for the whole resumed row (a new Esc must stay responsive).
             const resumed = await ports.resumeChild?.(parsed.rest || undefined);
-            return resumed
-              ? { ok: true, verb: parsed.verb, text: "Child resumed." }
-              : fail("The child could not be resumed; /orchestrator retry starts a fresh one.");
+            if (!resumed) {
+              if (moved) {
+                const back = await owner.applyEvent({
+                  type: "run.transition",
+                  runId: view.runId,
+                  now: now(),
+                  to: "paused",
+                });
+                return fail(
+                  back.ok
+                    ? "The child could not be resumed; the run was returned to paused."
+                    : "The child could not be resumed and the run phase needs /orchestrator status.",
+                );
+              }
+              return fail(
+                "The child could not be resumed; /orchestrator retry starts a fresh one.",
+              );
+            }
+            return { ok: true, verb: parsed.verb, text: "Child resumed." };
           }
           // No warm child: recover a blocked/repaired row with a fresh child.
           const target =
@@ -448,8 +488,17 @@ export function orchestratorInputDecision(
   const value = typeof text === "string" ? text.trim() : "";
   if (value.length === 0) return { action: "allow" };
   if (value.startsWith("/")) return { action: "allow" };
-  if (state.childPhase === "running" || state.childPhase === "starting") {
+  if (state.childPhase === "running") {
     return { action: "forward" };
+  }
+  if (state.childPhase === "starting") {
+    // The controller cannot deliver into a session that is still being
+    // created; saying "forwarded" would be a lie and drop the prompt.
+    return {
+      action: "refuse",
+      notice:
+        "The Build child is starting. Wait until the composer shows Working, then send the note again.",
+    };
   }
   if (state.childPhase === "paused") return { action: "queue" };
   if (state.hasRun) {

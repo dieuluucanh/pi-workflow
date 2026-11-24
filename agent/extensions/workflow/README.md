@@ -135,6 +135,15 @@ short Plan → Review → Build work keeps its current behavior.
   and the footer's child line: `child`/`auto` show the child's live model,
   context %, tokens and elapsed time, `parent` shows the run/next row plus a
   compact child hint. It never changes prompt routing.
+- **Working/Paused on the composer itself.** The composer's top border shows the
+  in-process Builder's activity in Parent, Child AND Auto views: `Working ·
+  Builder n/m · <tool>` with `ESC or /orchestrator-pause to pause ·
+  /orchestrator-abort to stop`, then `Paused · … · /orchestrator-resume to
+  continue`. Esc pauses only while the child owns the composer; every repeat
+  press while pausing/paused/verifying is consumed, so it can never become an
+  abort. A completion menu and a focused dialog keep their own Esc. A foreign
+  editor gets the same line as a fallback widget without the Esc hint.
+  Paused prose is queued, not delivered; the footer/contribution hint says so.
 - **Reload loses the child, not the run.** A `running` row restored after a
   reload is blocked with a concrete reason and the run pauses; nothing is
   replayed. Retry starts a fresh child. Old managed-worker child sessions open

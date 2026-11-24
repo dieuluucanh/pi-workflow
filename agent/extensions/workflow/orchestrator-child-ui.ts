@@ -15,9 +15,20 @@ export interface ChildUiLabel {
   total: number;
 }
 
+export interface ChildUiBridgeOptions {
+  /**
+   * Called when the first forwarded dialog opens and when the last closes.
+   * Lets the parent composer show Waiting instead of Working, without
+   * forwarding any child chrome write.
+   */
+  onDialogActivity?: (active: boolean) => void;
+}
+
 export interface ChildUiBridge {
   /** True while the bridge may still forward dialogs. */
   readonly alive: boolean;
+  /** Forwarded dialogs currently open (serialized, so 0 or 1 in practice). */
+  readonly activeDialogs: number;
   dispose(): void;
   /** The object handed to `bindExtensions({ uiContext })`. */
   readonly uiContext: Record<string, unknown>;
@@ -36,10 +47,33 @@ function prefix(label: ChildUiLabel, text: string): string {
 export function createChildUiBridge(
   parentUi: unknown,
   label: ChildUiLabel,
+  options: ChildUiBridgeOptions = {},
 ): ChildUiBridge {
   const ui = (parentUi ?? {}) as Record<string, AnyFn | undefined>;
   let alive = true;
   let queue: Promise<unknown> = Promise.resolve();
+  let dialogDepth = 0;
+  let dialogActive = false;
+
+  const publishDialogActivity = (active: boolean): void => {
+    if (active === dialogActive) return;
+    dialogActive = active;
+    try {
+      options.onDialogActivity?.(active);
+    } catch {
+      /* display-only */
+    }
+  };
+
+  const dialogStart = (): void => {
+    dialogDepth += 1;
+    if (dialogDepth === 1) publishDialogActivity(true);
+  };
+
+  const dialogEnd = (): void => {
+    dialogDepth = Math.max(0, dialogDepth - 1);
+    if (dialogDepth === 0) publishDialogActivity(false);
+  };
 
   const has = (name: string): boolean => typeof ui[name] === "function";
 
@@ -47,10 +81,13 @@ export function createChildUiBridge(
   const serial = <T>(run: () => Promise<T>, deny: T): Promise<T> => {
     const next = queue.then(async () => {
       if (!alive) return deny;
+      dialogStart();
       try {
         return await run();
       } catch {
         return deny;
+      } finally {
+        dialogEnd();
       }
     });
     queue = next.then(
@@ -128,8 +165,15 @@ export function createChildUiBridge(
     get alive() {
       return alive;
     },
+    get activeDialogs() {
+      return dialogDepth;
+    },
     dispose() {
       alive = false;
+      if (dialogDepth !== 0) {
+        dialogDepth = 0;
+        publishDialogActivity(false);
+      }
     },
     uiContext,
   };

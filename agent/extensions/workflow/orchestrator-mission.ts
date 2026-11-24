@@ -72,7 +72,7 @@ function nextLine(state: OrchestratorMissionState): string {
     return "Next action: wait for the user's answer; do not dispatch or claim completion.";
   }
   if (state.phase === "paused") {
-    return "Next action: /orchestrator-resume continues the warm child, or /orchestrator-retry starts a fresh one.";
+    return "Next action: /orchestrator-resume continues the warm child, or /orchestrator retry starts a fresh one.";
   }
   if (state.phase === "blocked") {
     return "Next action: explain the blocker with orchestrator_status, then /orchestrator retry when the user agrees.";

@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import {
   createOrchestratorChildController,
   type ChildSettledInput,
+  type CreateChildInput,
   type OrchestratorChildOp,
   type OrchestratorChildState,
 } from "./orchestrator-child-controller.ts";
@@ -428,4 +429,276 @@ test("controller: stats are not republished when nothing changed", async () => {
     0,
     "an unchanged stats snapshot is not republished",
   );
+});
+
+// ── Pause/resume safety (deferred child, repeated Esc) ───────────────
+
+interface DeferredChild {
+  sessionId: string;
+  modelLabel: string;
+  promptCalls: number;
+  abortCalls: number;
+  disposeCalls: number;
+  subscribe(listener: (event: unknown) => void): () => void;
+  prompt(text: string): Promise<void>;
+  followUp(text: string): Promise<void>;
+  abort(): Promise<void>;
+  isStreaming(): boolean;
+  dispose(): void;
+  emit(event: unknown): void;
+  finishPrompt(): void;
+  releaseAbort(): void;
+  rejectPrompt(error: Error): void;
+}
+
+function makeDeferredChild(holdAbort = false): DeferredChild {
+  const listeners = new Set<(event: unknown) => void>();
+  let promptResolve: (() => void) | undefined;
+  let promptReject: ((error: Error) => void) | undefined;
+  let abortResolve: (() => void) | undefined;
+  let disposed = false;
+  const child: DeferredChild = {
+    sessionId: "fake-session",
+    modelLabel: "builder/fake",
+    promptCalls: 0,
+    abortCalls: 0,
+    disposeCalls: 0,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    prompt() {
+      child.promptCalls += 1;
+      return new Promise<void>((resolve, reject) => {
+        promptResolve = resolve;
+        promptReject = reject;
+      });
+    },
+    async followUp() {
+      await child.prompt("");
+    },
+    abort() {
+      child.abortCalls += 1;
+      if (!holdAbort) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        abortResolve = resolve;
+      });
+    },
+    isStreaming() {
+      return !disposed;
+    },
+    dispose() {
+      child.disposeCalls += 1;
+      disposed = true;
+      listeners.clear();
+    },
+    emit(event) {
+      for (const listener of [...listeners]) listener(event);
+    },
+    finishPrompt() {
+      const resolve = promptResolve;
+      promptResolve = undefined;
+      resolve?.();
+    },
+    releaseAbort() {
+      const resolve = abortResolve;
+      abortResolve = undefined;
+      resolve?.();
+    },
+    rejectPrompt(error) {
+      const reject = promptReject;
+      promptReject = undefined;
+      reject?.(error);
+    },
+  };
+  return child;
+}
+
+function makeDeferredHarness(options: { timeoutMs?: number; createDeferred?: boolean; holdAbort?: boolean } = {}) {
+  const child = makeDeferredChild(options.holdAbort === true);
+  const states: OrchestratorChildState[] = [];
+  const errors: string[] = [];
+  const aborted: string[] = [];
+  let settled = 0;
+  let create: ((value: { ok: true; child: DeferredChild; modelLabel: string }) => void) | undefined;
+  const controller = createOrchestratorChildController({
+    create: (_input: CreateChildInput) => {
+      if (options.createDeferred === true) {
+        return new Promise((resolve) => {
+          create = resolve as never;
+        });
+      }
+      return Promise.resolve({ ok: true, child, modelLabel: child.modelLabel });
+    },
+    buildPrompt: () => "do the row",
+    onState: (state) => states.push(state),
+    onError: ({ error }) => {
+      errors.push(error);
+    },
+    onAborted: ({ reason }) => {
+      aborted.push(reason);
+    },
+    onSettled: () => {
+      settled += 1;
+    },
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
+  return {
+    controller,
+    child,
+    states,
+    errors,
+    aborted,
+    settled: () => settled,
+    resolveCreate() {
+      create?.({ ok: true, child, modelLabel: child.modelLabel });
+    },
+  };
+}
+
+async function waitForDeferred(predicate: () => boolean, label: string): Promise<void> {
+  for (let i = 0; i < 200; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+const deferredStartInput: CreateChildInput = {
+  sessionId: "session-1",
+  taskId: "task-1",
+  attemptId: "attempt-1",
+  ref: "1",
+  total: 3,
+};
+
+test("repeated pause aborts once and keeps the warm child", async () => {
+  const h = makeDeferredHarness();
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+
+  const first = h.controller.pause();
+  const second = await h.controller.pause();
+  assert.equal(second, false, "a pause already owns the invocation");
+  assert.equal(await first, true);
+  assert.equal(h.child.abortCalls, 1);
+  assert.equal(h.child.disposeCalls, 0);
+  assert.equal(h.controller.state().phase, "paused");
+  assert.equal(h.controller.state().pausePending, false);
+
+  // A late settlement from the paused run must not settle the row.
+  h.child.emit({ type: "agent_settled" });
+  assert.equal(h.settled(), 0);
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.aborted, []);
+  assert.equal(h.child.disposeCalls, 0);
+  h.child.finishPrompt();
+  await running;
+});
+
+test("a paused child is not failed by the old execution deadline", async () => {
+  const h = makeDeferredHarness({ timeoutMs: 60 });
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+  await h.controller.pause();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(h.controller.state().phase, "paused");
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.child.disposeCalls, 0);
+  h.child.finishPrompt();
+  await running;
+});
+
+test("a pause during child creation never prompts or leaks the session", async () => {
+  const h = makeDeferredHarness({ createDeferred: true });
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "starting", "starting");
+  assert.equal(await h.controller.pause(), true);
+  h.resolveCreate();
+  await running;
+  assert.equal(h.child.promptCalls, 0);
+  assert.equal(h.child.disposeCalls, 0);
+  assert.equal(h.controller.state().phase, "paused");
+});
+
+test("a paused prompt rejection is not reported as a child failure", async () => {
+  const h = makeDeferredHarness();
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+  await h.controller.pause();
+  h.child.rejectPrompt(new Error("aborted by pause"));
+  const result = await running;
+  assert.equal(result.ok, true);
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.child.disposeCalls, 0);
+});
+
+test("resume is a short admission and waits for pause settlement", async () => {
+  const h = makeDeferredHarness({ holdAbort: true });
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+
+  const pausing = h.controller.pause();
+  await waitForDeferred(() => h.controller.state().phase === "paused", "paused");
+  const resuming = h.controller.resume();
+  // The resume must not prompt before the abort settles.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(h.child.promptCalls, 1);
+
+  h.child.releaseAbort();
+  await pausing;
+  assert.equal(await resuming, true);
+  assert.equal(h.child.promptCalls, 2, "resume started exactly one new prompt");
+  assert.equal(h.controller.state().phase, "running");
+  assert.equal(h.child.disposeCalls, 0);
+
+  // Admission returns while the resumed prompt is still pending.
+  h.child.emit({ type: "agent_settled" });
+  assert.equal(h.settled(), 1);
+  // The original (pre-pause) prompt intentionally stays pending: the fake
+  // abort does not reject it, exactly like an SDK abort that settles the run.
+  void running;
+});
+
+test("a resumed child can be paused again without escalating", async () => {
+  const h = makeDeferredHarness();
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+  await h.controller.pause();
+  h.child.emit({ type: "agent_settled" });
+  assert.equal(await h.controller.resume(), true);
+  await waitForDeferred(() => h.controller.state().phase === "running", "resumed");
+
+  assert.equal(await h.controller.pause(), true);
+  assert.equal(h.child.abortCalls, 2);
+  assert.equal(h.child.disposeCalls, 0);
+  assert.deepEqual(h.aborted, []);
+  void running;
+});
+
+test("a provider retry is visible without failing the row", async () => {
+  const h = makeDeferredHarness();
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+  h.child.emit({ type: "auto_retry_start", errorMessage: "429" });
+  assert.equal(h.controller.state().retrying, true);
+  assert.equal(h.controller.state().phase, "running");
+  h.child.emit({ type: "auto_retry_end", success: true });
+  assert.equal(h.controller.state().retrying, false);
+  assert.deepEqual(h.errors, []);
+  h.child.finishPrompt();
+  await running;
+});
+
+test("an explicit abort still reports the destructive callback once", async () => {
+  const h = makeDeferredHarness();
+  const running = h.controller.start(deferredStartInput);
+  await waitForDeferred(() => h.controller.state().phase === "running", "running");
+  await h.controller.abort("user abort");
+  assert.equal(h.child.abortCalls, 1);
+  assert.equal(h.child.disposeCalls, 1);
+  assert.deepEqual(h.aborted, ["user abort"]);
+  assert.equal(h.controller.state().phase, "disposed");
+  h.child.finishPrompt();
+  await running;
 });
