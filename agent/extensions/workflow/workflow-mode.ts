@@ -51,6 +51,7 @@ export const PLAN_MODE_TOOLS = [
   "explore",
   "questionnaire",
   "workflow_todo",
+  "plan_validate",
 ] as const;
 
 /**

@@ -28,6 +28,11 @@ import {
   type WorkspaceSetDiff,
 } from "./orchestrator-workspace-set.ts";
 import type { OrchestratorChildState } from "./orchestrator-child-controller.ts";
+import {
+  isRepairableFailure,
+  type CheckExecutionResult,
+  type CheckFailureClass,
+} from "./check-executor.ts";
 import type { FrozenTodoRow } from "./todo-snapshot.ts";
 
 export const ADVANCE_SCHEMA_VERSION = 1 as const;
@@ -36,6 +41,34 @@ export interface AdvanceRowCheckResult {
   command: string;
   ok: boolean;
   output: string;
+}
+
+/**
+ * A check failure classified at the execution boundary. `repairable` is
+ * optional so every existing implementation keeps its meaning: absent means a
+ * real test failure, which the child may repair. `repairable: false` marks a
+ * plan-metadata failure (a malformed command, an unknown workspace alias) that
+ * no child re-prompt can fix.
+ */
+export interface AdvanceRowChecksResult {
+  ok: boolean;
+  results: AdvanceRowCheckResult[];
+  failure?: string;
+  /**
+   * The executor's classification. Absent `repairable`/`failureClass` keeps
+   * the historical meaning: a real test failure the child may repair.
+   */
+  failureClass?: CheckFailureClass;
+  repairable?: boolean;
+}
+
+export interface AdvanceFinalChecksResult {
+  ok: boolean;
+  failure?: string;
+  failureClass?: CheckFailureClass;
+  repairable?: boolean;
+  /** Bounded executor evidence; journaled in the `final_gate` marker. */
+  results?: CheckExecutionResult[];
 }
 
 /** The subset of the child controller this engine drives. */
@@ -78,8 +111,10 @@ export interface AdvancePorts {
   runRowChecks(
     commands: readonly string[],
     workspaceRoot?: string,
-  ): Promise<{ ok: boolean; results: AdvanceRowCheckResult[]; failure?: string }>;
-  runFinalChecks(): Promise<{ ok: boolean; failure?: string }>;
+    /** Roots the diff observed as changed; >1 without an explicit row root is ambiguous. */
+    changedRoots?: readonly string[],
+  ): Promise<AdvanceRowChecksResult>;
+  runFinalChecks(): Promise<AdvanceFinalChecksResult>;
   dispatchNext(): Promise<{ ok: boolean; text: string }>;
   notify(message: string, level?: "info" | "warning"): void;
   /** Non-triggering context message; never starts a parent turn. */
@@ -104,6 +139,55 @@ export interface AdvanceOutcome {
 }
 
 const EVIDENCE_PREFIX = "evidence";
+
+/**
+ * Metadata failures are not the child's to fix: the command bytes themselves
+ * are wrong, so a repair round would only burn budget. The block message names
+ * the concrete fix instead.
+ */
+export const METADATA_REPAIR_HINT = [
+  "This is a plan-metadata failure, not a code failure.",
+  "Fix the plan check so each check is exactly one executable command — no prose,",
+  "backticks, surrounding whitespace or mixed command-and-prose bullets — then",
+  "repair the frozen check list (or re-freeze the plan) and retry the row.",
+].join(" ");
+
+/**
+ * One concrete fix per failure class. Only `test`/`timeout` are the child's to
+ * repair; everything else is a contract/configuration problem, so re-prompting
+ * the child would burn a repair round on something it cannot change.
+ */
+export const CHECK_FAILURE_HINTS: Record<Exclude<CheckFailureClass, "none">, string> = {
+  test: "The check failed: fix the code and finish the row again.",
+  timeout: "The check exceeded its deadline: narrow it or fix the hang, then finish the row again.",
+  metadata: METADATA_REPAIR_HINT,
+  policy:
+    "This is a shell-policy refusal, not a code failure. The command never ran: re-enable the shell (or fix the role/permission policy), then retry the row; a repair round cannot change a policy.",
+  environment:
+    "This is an environment failure, not a code failure: a tool, timeout, git baseline or workspace root the check needs is unavailable or bound wrong. Fix the environment (or the workflow.orchestrator limits), then retry the row; a repair round cannot fix configuration.",
+  manual:
+    "This is a manual check: a human must attest the result. It is never executed automatically and cannot be auto-accepted; record the attestation and retry, or amend the check into a gate that can run.",
+};
+
+/** Concrete, class-specific guidance for an unrepairable check failure. */
+export function checkFailureHint(failureClass: CheckFailureClass | undefined): string {
+  if (!failureClass || failureClass === "none") return METADATA_REPAIR_HINT;
+  return CHECK_FAILURE_HINTS[failureClass];
+}
+
+/**
+ * The one repair decision. An explicit `repairable` wins (Phase-A callers); a
+ * bare `failureClass` is classified by the shared taxonomy; absent both keeps
+ * the pre-taxonomy meaning (a genuine test failure).
+ */
+export function checkResultRepairable(result: {
+  repairable?: boolean;
+  failureClass?: CheckFailureClass;
+}): boolean {
+  if (typeof result.repairable === "boolean") return result.repairable;
+  if (result.failureClass !== undefined) return isRepairableFailure(result.failureClass);
+  return true;
+}
 
 function bounded(value: string, max = 2_000): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
@@ -200,6 +284,24 @@ export function createOrchestratorAdvance(
     if (wake) ports.triggerTurn?.(text);
     ports.onTodosChanged?.();
     return { ok: false, action: "blocked", text };
+  };
+
+  /** Block on the first settle; never journal `task.needsFix` or re-enter. */
+  const unrepairableBlock = (
+    runtime: OrchestratorRuntime,
+    view: RuntimeView,
+    taskId: string,
+    reason: string,
+    failureClass?: CheckFailureClass,
+  ): Promise<AdvanceOutcome> => {
+    evidence.delete(taskId);
+    return block(
+      runtime,
+      view,
+      taskId,
+      `${reason} ${checkFailureHint(failureClass)}`,
+      true,
+    );
   };
 
   const repaired = async (
@@ -406,10 +508,26 @@ export function createOrchestratorAdvance(
       const changed = diff.entries.filter((entry) => entry.diff.changed);
       const checkRoot =
         explicitRoot ?? (changed.length === 1 ? changed[0]!.root : undefined);
-      const checks = await ports.runRowChecks(row.acceptanceChecks, checkRoot);
+      const checks = await ports.runRowChecks(
+        row.acceptanceChecks,
+        checkRoot,
+        changed.map((entry) => entry.root),
+      );
       checkResults = checks.results;
       if (!checks.ok) {
         const failure = checks.failure ?? "a row check failed";
+        // Only `test`/`timeout` may start a repair round. A metadata, policy,
+        // environment or manual result blocks with its own concrete fix; a
+        // manual check can never be auto-accepted.
+        if (!checkResultRepairable(checks)) {
+          return unrepairableBlock(
+            runtime,
+            current,
+            event.taskId,
+            failure,
+            checks.failureClass,
+          );
+        }
         return repaired(runtime, current, event.taskId, failure, event.summary);
       }
     }
@@ -441,14 +559,65 @@ export function createOrchestratorAdvance(
       (id) => id !== event.taskId && beforeAccept.state.tasks[id]?.state !== "accepted",
     );
     if (remaining.length === 0) {
-      const finalChecks = await ports.runFinalChecks();
+      // One durable verdict per executable spec: a passing marker is reused
+      // instead of re-running the gate (the Build-completion branch reads the
+      // same marker), and a changed spec hash can never inherit an old pass.
+      const status = await runtime.finalGateStatus();
+      if (!status.ok) {
+        return block(
+          runtime,
+          beforeAccept,
+          event.taskId,
+          `the final gate could not be read: ${status.error}`,
+          true,
+        );
+      }
+      const reused = status.value.satisfied;
+      const finalChecks: AdvanceFinalChecksResult = reused
+        ? { ok: true }
+        : await ports.runFinalChecks();
+      const workspaceRevisions = Object.fromEntries(
+        diff.entries.map((entry) => [entry.workspaceId, entry.diff.workspaceRevision]),
+      );
+      if (!reused) {
+        const recorded = await runtime.recordFinalGate({
+          ok: finalChecks.ok,
+          ...(finalChecks.results === undefined ? {} : { results: finalChecks.results }),
+          workspaceRevisions,
+          ...(finalChecks.failureClass === undefined
+            ? {}
+            : { failureClass: finalChecks.failureClass }),
+          ...(finalChecks.failure === undefined ? {} : { failure: finalChecks.failure }),
+        });
+        if (finalChecks.ok && !recorded.ok) {
+          return block(
+            runtime,
+            beforeAccept,
+            event.taskId,
+            `the final gate passed but its marker could not be journaled: ${recorded.error}`,
+            true,
+          );
+        }
+        // A failing marker is audit evidence; the repair/block decision below
+        // stands even when it could not be written.
+      }
       if (!finalChecks.ok) {
+        const failure = `final plan check failed: ${finalChecks.failure ?? "unknown"}`;
+        if (!checkResultRepairable(finalChecks)) {
+          return unrepairableBlock(
+            runtime,
+            beforeAccept,
+            event.taskId,
+            failure,
+            finalChecks.failureClass,
+          );
+        }
         evidence.delete(event.taskId);
         return repaired(
           runtime,
           beforeAccept,
           event.taskId,
-          `final plan check failed: ${finalChecks.failure ?? "unknown"}`,
+          failure,
           event.summary,
         );
       }

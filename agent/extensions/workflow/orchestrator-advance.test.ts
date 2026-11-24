@@ -21,6 +21,8 @@ import type {
 } from "./orchestrator-store.ts";
 import {
   buildRepairPrompt,
+  checkFailureHint,
+  checkResultRepairable,
   createOrchestratorAdvance,
   type AdvanceChild,
   type AdvancePorts,
@@ -339,6 +341,149 @@ test("a failing row check journals needsFix and re-enters running on the warm ch
   assert.equal(view.state.tasks["task-1"]?.sessionId, "session-1");
 });
 
+test("a non-repairable row metadata failure blocks on the first settle", async () => {
+  const h = harness({
+    rowChecks: async (commands) =>
+      ({
+        ok: false,
+        results: commands.map((command) => ({
+          command,
+          ok: false,
+          output: "invalid metadata",
+        })),
+        failure: "row check metadata invalid: prose Acceptance is not a command",
+        repairable: false,
+      }) as Awaited<ReturnType<AdvancePorts["runRowChecks"]>>,
+  });
+  const started = await h.runtime.startFromPlan({
+    planPath: "/tmp/advance.md",
+    planText: PLAN,
+  });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime);
+
+  const outcome = await h.advance.settled(settle());
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /plan-metadata failure/);
+  assert.match(outcome.text, /repair the frozen check list/);
+  assert.equal(h.calls.reentered.length, 0, "metadata failures never re-enter the child");
+  assert.equal(h.calls.started.length, 0, "metadata failures never start a fresh child");
+  assert.equal(
+    h.memory.events.filter((event) => event.type === "task.needs_fix").length,
+    0,
+    "a metadata failure must not journal task.needs_fix",
+  );
+  const view = h.runtime.view()!;
+  assert.equal(view.state.tasks["task-1"]?.state, "blocked");
+  assert.equal(view.state.tasks["task-1"]?.repairRounds, 0);
+});
+
+test("several changed roots and no row workspace block as ambiguous, never the primary root", async () => {
+  let seenRoot: string | undefined;
+  let seenChanged: readonly string[] | undefined;
+  const twoRootDiff: WorkspaceSetDiff = {
+    changed: true,
+    entries: [
+      {
+        workspaceId: "W",
+        root: "C:/work/W",
+        diff: {
+          changed: true,
+          committedPaths: [],
+          dirtyPaths: ["a.ts"],
+          attributionConflicts: [],
+          workspaceRevision: "rev-1",
+        },
+      },
+      {
+        workspaceId: "ERP",
+        root: "C:/work/ERP",
+        diff: {
+          changed: true,
+          committedPaths: [],
+          dirtyPaths: ["b.ts"],
+          attributionConflicts: [],
+          workspaceRevision: "rev-2",
+        },
+      },
+    ],
+    committedPaths: [],
+    dirtyPaths: ["a.ts", "b.ts"],
+    attributionConflicts: [],
+    workspaceRevision: "rev-2",
+  };
+  const h = harness({
+    diff: twoRootDiff,
+    rowChecks: async (_commands, root, changedRoots) => {
+      seenRoot = root;
+      seenChanged = changedRoots;
+      return {
+        ok: false,
+        results: [],
+        failure: "row check metadata invalid: ambiguous check workspace",
+        failureClass: "metadata",
+        repairable: false,
+      } as Awaited<ReturnType<AdvancePorts["runRowChecks"]>>;
+    },
+  });
+  const started = await h.runtime.startFromPlan({
+    planPath: "/tmp/advance.md",
+    planText: PLAN,
+  });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime);
+
+  const outcome = await h.advance.settled(settle());
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /plan-metadata failure/);
+  // Both changed roots travel with the hint; no primary-root default is sent.
+  assert.equal(seenRoot, undefined);
+  assert.deepEqual(seenChanged, ["C:/work/W", "C:/work/ERP"]);
+  assert.equal(h.calls.reentered.length, 0);
+  assert.equal(
+    h.memory.events.filter((event) => event.type === "task.needs_fix").length,
+    0,
+  );
+  assert.equal(h.runtime.view()!.state.tasks["task-1"]?.repairRounds, 0);
+});
+
+test("a non-repairable final-check metadata failure blocks the last row without a repair round", async () => {
+  const h = harness({
+    plan: NO_OP_PLAN,
+    finalChecks: async () =>
+      ({
+        ok: false,
+        failure: "final plan check metadata invalid: mixed command and prose",
+        repairable: false,
+      }) as Awaited<ReturnType<AdvancePorts["runFinalChecks"]>>,
+  });
+  const started = await h.runtime.startFromPlan({
+    planPath: "/tmp/noop.md",
+    planText: NO_OP_PLAN,
+  });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime, "task-1", "attempt-1", "session-1");
+  const firstRow = await h.advance.settled(settle("task-1", "attempt-1"));
+  assert.equal(firstRow.action, "accepted");
+  await bindTask(h.runtime, "task-2", "attempt-2", "session-2");
+
+  const outcome = await h.advance.settled(settle("task-2", "attempt-2"));
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /plan-metadata failure/);
+  assert.equal(h.calls.reentered.length, 0, "metadata failures never re-enter the child");
+  assert.equal(
+    h.memory.events.filter((event) => event.type === "task.needs_fix").length,
+    0,
+    "a metadata failure must not journal task.needs_fix",
+  );
+  const view = h.runtime.view()!;
+  assert.equal(view.state.tasks["task-2"]?.state, "blocked");
+  assert.equal(view.state.tasks["task-2"]?.repairRounds, 0);
+});
+
 test("a gone child is replaced with the same attempt identity", async () => {
   const h = harness({
     rowChecks: async () => ({ ok: false, results: [], failure: "nope" }),
@@ -500,4 +645,142 @@ test("buildRepairPrompt carries the failure, the summary and the round bound", (
   assert.match(text, /Repair round 2\/2/);
   assert.match(text, /row check failed/);
   assert.match(text, /I touched a\.ts/);
+});
+
+// ── Failure taxonomy and the journaled final gate ────────────────────
+
+test("the taxonomy decides repair: only test/timeout may re-enter the child", async () => {
+  assert.equal(checkResultRepairable({}), true, "legacy default stays repairable");
+  assert.equal(checkResultRepairable({ failureClass: "test" }), true);
+  assert.equal(checkResultRepairable({ failureClass: "timeout" }), true);
+  for (const failureClass of ["metadata", "policy", "environment", "manual"] as const) {
+    assert.equal(checkResultRepairable({ failureClass }), false, failureClass);
+  }
+  assert.equal(checkResultRepairable({ repairable: false, failureClass: "test" }), false);
+  assert.match(checkFailureHint("policy"), /shell-policy refusal/);
+  assert.match(checkFailureHint("environment"), /environment failure/);
+  assert.match(checkFailureHint("manual"), /manual check/);
+  assert.match(checkFailureHint("metadata"), /plan-metadata failure/);
+});
+
+test("a policy refusal blocks with its own fix and no repair round", async () => {
+  const h = harness({
+    rowChecks: async () =>
+      ({
+        ok: false,
+        results: [],
+        failure: "row check failed: npm test",
+        failureClass: "policy",
+        repairable: false,
+      }) as Awaited<ReturnType<AdvancePorts["runRowChecks"]>>,
+  });
+  const started = await h.runtime.startFromPlan({ planPath: "/tmp/advance.md", planText: PLAN });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime);
+
+  const outcome = await h.advance.settled(settle());
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /shell-policy refusal/);
+  assert.match(outcome.text, /cannot change a policy/);
+  assert.equal(h.calls.reentered.length, 0);
+  assert.equal(
+    h.memory.events.filter((event) => event.type === "task.needs_fix").length,
+    0,
+  );
+  assert.equal(h.runtime.view()!.state.tasks["task-1"]?.repairRounds, 0);
+});
+
+test("a manual check can never be auto-accepted", async () => {
+  const h = harness({
+    rowChecks: async () =>
+      ({
+        ok: false,
+        results: [],
+        failure: "row check failed: human attestation",
+        failureClass: "manual",
+        repairable: false,
+      }) as Awaited<ReturnType<AdvancePorts["runRowChecks"]>>,
+  });
+  const started = await h.runtime.startFromPlan({ planPath: "/tmp/advance.md", planText: PLAN });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime);
+
+  const outcome = await h.advance.settled(settle());
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /manual check/);
+  assert.match(outcome.text, /cannot be auto-accepted/);
+  const task = h.runtime.view()!.state.tasks["task-1"];
+  assert.equal(task?.state, "blocked");
+  assert.equal(task?.repairRounds, 0);
+});
+
+test("an environment failure on the final gate blocks instead of repairing", async () => {
+  const h = harness({
+    plan: NO_OP_PLAN,
+    finalChecks: async () =>
+      ({
+        ok: false,
+        failure: "final plan check failed: git baseline timed out",
+        failureClass: "environment",
+        repairable: false,
+      }) as Awaited<ReturnType<AdvancePorts["runFinalChecks"]>>,
+  });
+  const started = await h.runtime.startFromPlan({ planPath: "/tmp/noop.md", planText: NO_OP_PLAN });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime, "task-1", "attempt-1", "session-1");
+  assert.equal((await h.advance.settled(settle("task-1", "attempt-1"))).action, "accepted");
+  await bindTask(h.runtime, "task-2", "attempt-2", "session-2");
+
+  const outcome = await h.advance.settled(settle("task-2", "attempt-2"));
+
+  assert.equal(outcome.action, "blocked");
+  assert.match(outcome.text, /environment failure/);
+  assert.equal(h.calls.reentered.length, 0);
+  assert.equal(h.runtime.view()!.state.tasks["task-2"]?.repairRounds, 0);
+});
+
+test("a passing final gate is journaled, reused and lets the run complete once", async () => {
+  let finalRuns = 0;
+  const h = harness({
+    plan: NO_OP_PLAN,
+    finalChecks: async () => {
+      finalRuns += 1;
+      return { ok: true };
+    },
+  });
+  const started = await h.runtime.startFromPlan({ planPath: "/tmp/noop.md", planText: NO_OP_PLAN });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime, "task-1", "attempt-1", "session-1");
+  assert.equal((await h.advance.settled(settle("task-1", "attempt-1"))).action, "accepted");
+
+  // Another call path already ran and recorded the same executable spec.
+  const recorded = await h.runtime.recordFinalGate({ ok: true });
+  assert.equal(recorded.ok, true);
+  await bindTask(h.runtime, "task-2", "attempt-2", "session-2");
+
+  const outcome = await h.advance.settled(settle("task-2", "attempt-2"));
+
+  assert.equal(outcome.action, "completed");
+  assert.equal(finalRuns, 0, "the journaled pass is reused instead of re-run");
+  assert.equal(h.memory.events.filter((event) => event.type === "final_gate").length, 1);
+  assert.equal(h.memory.events.filter((event) => event.type === "run.completed").length, 1);
+});
+
+test("the first successful gate is journaled before completion", async () => {
+  const h = harness();
+  const started = await h.runtime.startFromPlan({ planPath: "/tmp/noop.md", planText: NO_OP_PLAN });
+  assert.equal(started.ok, true);
+  await bindTask(h.runtime, "task-1", "attempt-1", "session-1");
+  assert.equal((await h.advance.settled(settle("task-1", "attempt-1"))).action, "accepted");
+  await bindTask(h.runtime, "task-2", "attempt-2", "session-2");
+
+  const outcome = await h.advance.settled(settle("task-2", "attempt-2"));
+
+  assert.equal(outcome.action, "completed");
+  const gateEvent = h.memory.events.find((event) => event.type === "final_gate");
+  assert.ok(gateEvent, "the passing gate was journaled");
+  const status = await h.runtime.finalGateStatus();
+  assert.equal(status.ok && status.value.satisfied, true);
 });

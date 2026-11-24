@@ -139,11 +139,62 @@ export function taskIdForRef(ref: string): TaskId {
   return `task-${ref}`;
 }
 
+/**
+ * Seed a task from the frozen row's own status.
+ *
+ * A frozen snapshot is the row authority, so restoring it must not resurrect a
+ * row that was already finished or abandoned as `pending` (that would re-run
+ * completed work and reopen a cancelled row). `in_progress` deliberately maps
+ * to `pending`: a reload has no live child, so the row is recoverable work, not
+ * a running task. Cancelled rows have no reducer state of their own, so they
+ * surface as `blocked` with an explicit reason and stay out of the pending
+ * queue until an operator retries or decides otherwise.
+ */
+function seededTask(
+  taskId: TaskId,
+  status: FrozenTodoRow["status"],
+  now: number,
+): TaskRecord {
+  if (status === "completed") {
+    return {
+      taskId,
+      state: "accepted",
+      repairRounds: 0,
+      acceptedAt: now,
+      updatedAt: now,
+    };
+  }
+  if (status === "cancelled") {
+    return {
+      taskId,
+      state: "blocked",
+      repairRounds: 0,
+      blockedReason: "cancelled in the frozen snapshot",
+      updatedAt: now,
+    };
+  }
+  return {
+    taskId,
+    state: "pending",
+    repairRounds: 0,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Map every frozen row status onto its task state for a NEW run state.
+ *
+ * `honorRowStatus` defaults to `true` so a state built directly from a frozen
+ * snapshot reconciles immediately. Journal replay passes `false`: it must start
+ * from all-pending tasks so the historical events replay in their original
+ * order, then call `reconcileRunStateWithFrozenStatus` once afterwards.
+ */
 export function createRunState(input: {
   runId: RunId;
   todos: FrozenTodoSnapshot;
   plan?: RunPlanRef;
   now: number;
+  honorRowStatus?: boolean;
 }): StateResult {
   if (typeof input.runId !== "string" || input.runId.length === 0) {
     return fail("invalid_state", "runId is required");
@@ -151,17 +202,17 @@ export function createRunState(input: {
   if (!input.todos || !Array.isArray(input.todos.rows) || input.todos.rows.length === 0) {
     return fail("invalid_state", "a frozen TODO snapshot with at least one row is required");
   }
+  const honorRowStatus = input.honorRowStatus !== false;
   const tasks: Record<TaskId, TaskRecord> = {};
   const order: TaskId[] = [];
   for (const row of input.todos.rows) {
     const taskId = taskIdForRef(row.ref);
     if (tasks[taskId]) return fail("invalid_state", `duplicate frozen ref ${row.ref}`);
-    tasks[taskId] = {
+    tasks[taskId] = seededTask(
       taskId,
-      state: "pending",
-      repairRounds: 0,
-      updatedAt: input.now,
-    };
+      honorRowStatus ? row.status : "pending",
+      input.now,
+    );
     order.push(taskId);
   }
   return {
@@ -179,6 +230,33 @@ export function createRunState(input: {
       updatedAt: input.now,
     },
   };
+}
+
+/**
+ * Reconcile still-pending tasks with the frozen row status after a replay.
+ *
+ * Only `pending` tasks move: a journal event that already accepted, blocked or
+ * retried a row is newer history than the initial freeze, so it wins. This is
+ * the post-replay half of `createRunState({ honorRowStatus: false })`.
+ */
+export function reconcileRunStateWithFrozenStatus(
+  state: RunState,
+  now: number,
+): RunState {
+  let changed = false;
+  const tasks: Record<TaskId, TaskRecord> = { ...state.tasks };
+  for (const taskId of state.order) {
+    const task = tasks[taskId];
+    if (!task || task.state !== "pending") continue;
+    const index = state.order.indexOf(taskId);
+    const row = state.todos.rows[index];
+    if (!row) continue;
+    const seeded = seededTask(taskId, row.status, now);
+    if (seeded.state === "pending") continue;
+    tasks[taskId] = seeded;
+    changed = true;
+  }
+  return changed ? { ...state, tasks, updatedAt: now } : state;
 }
 
 /** The frozen row a task owns; the task record never duplicates its text. */

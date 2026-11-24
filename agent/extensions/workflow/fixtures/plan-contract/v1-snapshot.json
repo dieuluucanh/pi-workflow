@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "executionId": "todo-exec-upcast-fixture",
+  "mode": "orchestrator",
+  "source": {
+    "kind": "plan",
+    "path": "C:/repo/.pi/plans/upcast.md",
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "title": "Upcast fixture"
+  },
+  "rows": [
+    {
+      "id": "row-1",
+      "ref": "1",
+      "text": "Wire it up",
+      "label": "1",
+      "source": "plan",
+      "planStepId": "step-1",
+      "acceptanceChecks": [
+        "npm test",
+        "the wiring is documented"
+      ],
+      "expectedFiles": [
+        "src/wire.ts"
+      ],
+      "status": "pending",
+      "sourceLine": 5
+    }
+  ],
+  "planChecks": [
+    "pnpm dev:preflight`, followed by controlled `npm run dev` smoke on the repaired local demo.",
+    "pnpm typecheck`, `pnpm lint`, `pnpm format:check`, `pnpm test`, golden comparisons at the repository's exact tolerance."
+  ],
+  "planCheckSpecs": [
+    {
+      "command": "pnpm dev:preflight`, followed by controlled `npm run dev` smoke on the repaired local demo."
+    },
+    {
+      "command": "pnpm typecheck`, `pnpm lint`, `pnpm format:check`, `pnpm test`, golden comparisons at the repository's exact tolerance."
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "W",
+      "key": "plain:C:/work",
+      "root": "C:/work",
+      "kind": "plain",
+      "displayPath": "C:/work",
+      "primary": true
+    }
+  ],
+  "createdAt": 1700000000000
+}

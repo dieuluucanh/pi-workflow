@@ -85,6 +85,44 @@ test("rebind: idempotent and preserves statuses on a second pass", () => {
   );
 });
 
+test("rebind preserves every bound workspace and the frozen check specs", () => {
+  const workspaces = [
+    {
+      id: "W",
+      key: "git:C:/work",
+      root: "C:/work",
+      kind: "git" as const,
+      displayPath: "C:/work",
+      primary: true,
+    },
+    {
+      id: "ERP",
+      key: "git:C:/erp",
+      root: "C:/erp",
+      kind: "git" as const,
+      displayPath: "C:/erp",
+      primary: false,
+    },
+  ];
+  const rebound = rebindLegacyTodosToPlan({
+    planPath: "C:/work/.pi/plans/twenty-two.md",
+    planText: HISTORICAL_22_STEP_PLAN,
+    priorItems: [],
+    workspaces,
+    now: 3,
+  });
+  assert.equal(rebound.ok, true);
+  if (!rebound.ok) return;
+  // A legacy rebind must not drop the multi-repo roots of the session.
+  assert.deepEqual(
+    (rebound.snapshot.workspaces ?? []).map((workspace) => workspace.id),
+    ["W", "ERP"],
+  );
+  // The plan's Verification command is still the frozen executable check.
+  assert.deepEqual(rebound.snapshot.planChecks, ["npm test"]);
+  assert.deepEqual(rebound.snapshot.planCheckSpecs, [{ command: "npm test" }]);
+});
+
 test("rebind: duplicate text without plan identity fails closed", () => {
   const plan = "# Plan: Duplicate\n\n## Plan Steps\n\n1. Same\n2. Same\n";
   const result = rebindLegacyTodosToPlan({

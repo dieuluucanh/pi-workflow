@@ -40,6 +40,7 @@ test("tools: Plan keeps the gated tools active and owns the workflow set", () =>
     "explore",
     "questionnaire",
     "workflow_todo",
+    "plan_validate",
   ]);
   // edit/write stay active so the tool_call gate can explain the refusal.
   assert.ok(plan.includes("edit"));

@@ -13,6 +13,8 @@ import {
   type FrozenTodoResult,
   type FrozenTodoRow,
 } from "./todo-snapshot.ts";
+import type { PlanCheckSpec } from "./plan-checks.ts";
+import type { FrozenWorkspace } from "./orchestrator-workspace-set.ts";
 import { itemStatus, todoKey, todoRef, type TodoItem } from "./utils.ts";
 
 export interface LegacyRebindInput {
@@ -21,6 +23,10 @@ export interface LegacyRebindInput {
   priorItems: readonly TodoItem[];
   now?: number;
   executionId?: string;
+  /** Bound roots from the session/handoff; must not be dropped on rebind. */
+  workspaces?: readonly FrozenWorkspace[];
+  /** Compiled check specs; a caller override must match the compiler. */
+  planCheckSpecs?: readonly PlanCheckSpec[];
 }
 
 function rowStatus(item: TodoItem): FrozenTodoRow["status"] {
@@ -64,6 +70,10 @@ export function rebindLegacyTodosToPlan(
     ...(input.executionId === undefined
       ? {}
       : { executionId: input.executionId }),
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+    ...(input.planCheckSpecs === undefined
+      ? {}
+      : { planCheckSpecs: input.planCheckSpecs }),
   });
   if (!created.ok) return created;
 
@@ -104,5 +114,16 @@ export function rebindLegacyTodosToPlan(
   return {
     ok: true,
     snapshot: { ...created.snapshot, rows },
+    ...(created.execution === undefined
+      ? {}
+      : {
+          execution: {
+            ...created.execution,
+            rows: created.execution.rows.map((row) => {
+              const rebound = rows.find((candidate) => candidate.id === row.id);
+              return rebound === undefined ? row : { ...row, status: rebound.status };
+            }),
+          },
+        }),
   };
 }

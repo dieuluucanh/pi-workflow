@@ -6,27 +6,36 @@
  * The snapshot is pure data; it owns row identity, order, wording, refs and
  * the row-level check/file metadata. It never reads a plan again.
  *
- * This module deliberately does NOT reuse `parseStepsFromLines`: that parser
- * normalizes, truncates and dedupes by display text, which would make a lost
- * source step permanent once frozen. The extractor below keeps every
- * top-level source occurrence and only ignores nested body content.
+ * This module deliberately does NOT parse Markdown itself: rows and per-row
+ * metadata come from the single compiler (`plan-compiler.ts`), which keeps every
+ * top-level source occurrence (no display dedupe, no truncation).
  */
 
 import { createHash } from "node:crypto";
-import * as path from "node:path";
 
 import {
   MAX_WORKSPACES,
-  isInsideWorkspaceRoot,
   validateWorkspaceSet,
   type FrozenWorkspace,
 } from "./orchestrator-workspace-set.ts";
 import { isWindowsPath } from "./orchestrator-workspace.ts";
 import {
-  extractPlanChecksWithWorkspaceDetailed,
-  extractRowMetadata,
+  buildFrozenExecutionSnapshot,
+  frozenExecutionToTodoSnapshot,
+  type FrozenExecutionRowInput,
+  type FrozenExecutionSnapshot,
+} from "./frozen-snapshot.ts";
+import { compilePlan, formatPlanDiagnostic } from "./plan-compiler.ts";
+import {
+  validatePlanCheckSpecs,
   type PlanCheckSpec,
 } from "./plan-checks.ts";
+import {
+  planCheckId,
+  planSpecHash,
+  type CheckSpec,
+  type PlanSpec,
+} from "./plan-spec.ts";
 import {
   planStepIdFor,
   todoItemId,
@@ -87,7 +96,13 @@ export interface FrozenTodoSnapshot {
 }
 
 export type FrozenTodoResult =
-  | { ok: true; snapshot: FrozenTodoSnapshot }
+  | {
+      ok: true;
+      /** v1 projection for the panel/tools/store (unchanged contract). */
+      snapshot: FrozenTodoSnapshot;
+      /** The compiled v2 artifact that is written to `todos.frozen`. */
+      execution?: FrozenExecutionSnapshot;
+    }
   | { ok: false; error: string };
 
 export interface FrozenTodoBuildInput {
@@ -106,99 +121,6 @@ interface Line {
   fenced: boolean;
 }
 
-const HEADING = /^(#{1,6})\s+(.+?)\s*$/;
-const NUMBERED = /^(\d+(?:\.\d+)*)[.)]\s+(.+?)\s*$/;
-const STEP_HEADING = /^(?:step\s+)?(\d+(?:\.\d+)*)[.):]?\s+(.+?)\s*$/i;
-const BOLD = /^\*\*(.+?)\*\*\s*$/;
-const BOLD_BULLET = /^[-*]\s+\*\*(.+?)\*\*\s*$/;
-const CHECKBOX = /^[-*]\s+\[([ xX])\]\s+(.+?)\s*$/;
-const EXCLUDED_SECTION =
-  /^(context|decisions?|exploration|risks?|verification|non[- ]?goals?|out of scope|notes?|summary)$/i;
-
-function scanLines(markdown: string): Line[] {
-  const lines: Line[] = [];
-  let fence: string | undefined;
-  const raw = markdown.split(/\r?\n/);
-  for (let index = 0; index < raw.length; index += 1) {
-    const text = raw[index] ?? "";
-    const trimmed = text.trimStart();
-    const marker = trimmed.startsWith("```")
-      ? "```"
-      : trimmed.startsWith("~~~")
-        ? "~~~"
-        : undefined;
-    if (marker && fence === undefined) {
-      fence = marker;
-      lines.push({ number: index + 1, text, fenced: true });
-      continue;
-    }
-    if (marker && fence === marker) {
-      fence = undefined;
-      lines.push({ number: index + 1, text, fenced: true });
-      continue;
-    }
-    lines.push({ number: index + 1, text, fenced: fence !== undefined });
-  }
-  return lines;
-}
-
-function headingOf(line: Line): { level: number; title: string } | undefined {
-  if (line.fenced) return undefined;
-  const match = HEADING.exec(line.text);
-  if (!match) return undefined;
-  return { level: match[1]!.length, title: match[2]!.trim() };
-}
-
-function labelOf(text: string): { label?: string; text: string } {
-  const step = STEP_HEADING.exec(text.trim());
-  if (step) return { label: step[1], text: step[2]!.trim() };
-  return { text: text.trim() };
-}
-
-function cleanStepText(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function sectionBounds(lines: Line[]): { start: number; end: number } | "ambiguous" | undefined {
-  const matches = lines
-    .map((line, index) => ({ index, heading: headingOf(line) }))
-    .filter(
-      (entry) =>
-        entry.heading !== undefined &&
-        entry.heading.level >= 2 &&
-        entry.heading.level <= 4 &&
-        /plan\s+steps/i.test(entry.heading.title),
-    );
-  if (matches.length > 1) return "ambiguous";
-  const found = matches[0];
-  if (!found?.heading) return undefined;
-  let end = lines.length;
-  for (let index = found.index + 1; index < lines.length; index += 1) {
-    const heading = headingOf(lines[index]!);
-    if (heading && heading.level <= found.heading.level) {
-      end = index;
-      break;
-    }
-  }
-  return { start: found.index + 1, end };
-}
-
-function excludedFallbackLine(
-  line: Line,
-  stack: Array<{ level: number; title: string }>,
-): boolean {
-  const heading = headingOf(line);
-  if (heading) {
-    while (stack.length > 0 && stack.at(-1)!.level >= heading.level) stack.pop();
-    if (EXCLUDED_SECTION.test(heading.title)) {
-      stack.push({ level: heading.level, title: heading.title });
-      return true;
-    }
-    return stack.length > 0;
-  }
-  return stack.length > 0;
-}
-
 interface RawStep {
   text: string;
   label?: string;
@@ -209,144 +131,6 @@ interface RawStep {
   expectedFiles?: string[];
   workspaces?: string[];
 }
-
-function parsePlanSteps(markdown: string):
-  | { ok: true; rows: RawStep[]; title: string }
-  | { ok: false; error: string } {
-  const lines = scanLines(markdown);
-  const title =
-    lines
-      .map((line) => headingOf(line))
-      .find((heading) => heading?.level === 1)
-      ?.title.replace(/^Plan:\s*/i, "")
-      .trim() || "Plan";
-  const bounds = sectionBounds(lines);
-  if (bounds === "ambiguous") {
-    return { ok: false, error: "the plan has more than one Plan Steps section" };
-  }
-  const relevant =
-    bounds === undefined
-      ? (() => {
-          const kept: Line[] = [];
-          const stack: Array<{ level: number; title: string }> = [];
-          for (const line of lines) {
-            if (!excludedFallbackLine(line, stack)) kept.push(line);
-          }
-          return kept;
-        })()
-      : lines.slice(bounds.start, bounds.end);
-  const body = relevant.filter((line) => !line.fenced);
-  const groupStack: Array<{ level: number; title: string }> = [];
-
-  const pushGroup = (heading: { level: number; title: string }): void => {
-    while (groupStack.length > 0 && groupStack.at(-1)!.level >= heading.level) {
-      groupStack.pop();
-    }
-    groupStack.push(heading);
-  };
-  const group = (): string | undefined =>
-    groupStack.length > 0
-      ? groupStack.map((entry) => entry.title).join(" / ")
-      : undefined;
-
-  const hasExplicit = body.some((line) => {
-    const heading = headingOf(line);
-    if (heading && labelOf(heading.title).label) return true;
-    return BOLD.test(line.text) || BOLD_BULLET.test(line.text);
-  });
-  const hasNumbered = body.some((line) => NUMBERED.test(line.text));
-  const hasCheckbox = body.some((line) => CHECKBOX.test(line.text));
-  const mode = hasExplicit ? "explicit" : hasNumbered ? "numbered" : hasCheckbox ? "checkbox" : undefined;
-  if (mode === undefined) {
-    return { ok: false, error: "the plan has no top-level steps in the Plan Steps section" };
-  }
-
-  const rows: RawStep[] = [];
-  let current: RawStep | undefined;
-  const push = (step: Omit<RawStep, "body">): void => {
-    const next: RawStep = { ...step, body: [] };
-    rows.push(next);
-    current = next;
-  };
-  const bodyLine = (text: string): void => {
-    if (current) current.body.push(text);
-  };
-
-  for (const line of body) {
-    const heading = headingOf(line);
-    if (heading) {
-      if (heading.level === 1 && /^plan:/i.test(heading.title)) continue;
-      const labelled = labelOf(heading.title);
-      if (mode === "explicit" && labelled.label) {
-        push({
-          text: cleanStepText(labelled.text),
-          label: labelled.label,
-          ...(group() === undefined ? {} : { group: group() }),
-          sourceLine: line.number,
-        });
-        continue;
-      }
-      if (!/plan\s+steps/i.test(heading.title)) {
-        pushGroup({ level: heading.level, title: heading.title });
-        current = undefined;
-      }
-      continue;
-    }
-
-    if (mode === "explicit") {
-      const bold = BOLD.exec(line.text) ?? BOLD_BULLET.exec(line.text);
-      if (bold) {
-        const labelled = labelOf(bold[1]!);
-        push({
-          text: cleanStepText(labelled.text),
-          ...(labelled.label === undefined ? {} : { label: labelled.label }),
-          ...(group() === undefined ? {} : { group: group() }),
-          sourceLine: line.number,
-        });
-        continue;
-      }
-      bodyLine(line.text);
-      continue;
-    }
-
-    if (mode === "numbered") {
-      const numberedMatch = NUMBERED.exec(line.text);
-      if (numberedMatch) {
-        push({
-          text: cleanStepText(numberedMatch[2]!),
-          label: numberedMatch[1]!,
-          ...(group() === undefined ? {} : { group: group() }),
-          sourceLine: line.number,
-        });
-        continue;
-      }
-      bodyLine(line.text);
-      continue;
-    }
-
-    const checkbox = CHECKBOX.exec(line.text);
-    if (checkbox) {
-      push({
-        text: cleanStepText(checkbox[2]!),
-        ...(group() === undefined ? {} : { group: group() }),
-        sourceLine: line.number,
-      });
-      continue;
-    }
-    bodyLine(line.text);
-  }
-
-  const withMetadata = rows.map((raw) => {
-    const metadata = extractRowMetadata(raw.body.join("\n"));
-    return { ...raw, ...metadata };
-  });
-  const metadataError = withMetadata.find((row) => row.error)?.error;
-  if (metadataError) {
-    return { ok: false, error: metadataError };
-  }
-  return { ok: true, rows: withMetadata, title };
-}
-
 function digestOf(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -417,70 +201,117 @@ function buildSnapshot(input: {
   };
 }
 
-function aliasesFor(workspaces: readonly FrozenWorkspace[] | undefined): Map<string, FrozenWorkspace> {
-  return new Map((workspaces ?? []).map((workspace) => [workspace.id.toLowerCase(), workspace]));
+/**
+ * Build the compiled v2 artifact and its v1 projection together. The
+ * projection is what the panel, todo store and legacy executor consume today;
+ * the execution is what `todos.frozen` stores.
+ */
+function finishExecution(input: {
+  mode: FrozenTodoMode;
+  executionId?: string;
+  now?: number;
+  spec: PlanSpec;
+  rows: readonly FrozenExecutionRowInput[];
+  checks: readonly CheckSpec[];
+  workspaces?: readonly FrozenWorkspace[];
+  warnings?: readonly string[];
+}): FrozenTodoResult {
+  const now = input.now ?? Date.now();
+  const warnings = [...(input.warnings ?? [])];
+  const built = buildFrozenExecutionSnapshot({
+    executionId:
+      input.executionId ?? `todo-exec-${input.spec.source.digest.slice(0, 12)}-${now}`,
+    mode: input.mode,
+    source: input.spec.source,
+    compilerVersion: input.spec.compiler.version,
+    rows: input.rows,
+    checks: input.checks,
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+    ...(warnings.length === 0 ? {} : { validation: { warnings } }),
+    createdAt: now,
+  });
+  if (!built.ok) return { ok: false, error: built.error };
+  return {
+    ok: true,
+    snapshot: frozenExecutionToTodoSnapshot(built.value),
+    execution: built.value,
+  };
 }
 
-function prepareRowsWithWorkspaces(
-  rows: RawStep[],
-  workspaces: readonly FrozenWorkspace[] | undefined,
-  specs: readonly PlanCheckSpec[],
-): { ok: true; rows: RawStep[]; specs: PlanCheckSpec[] } | { ok: false; error: string } {
-  if (!workspaces || workspaces.length === 0) {
-    return { ok: true, rows, specs: [...specs] };
-  }
-  const aliases = aliasesFor(workspaces);
-  const caseInsensitive = workspaces.some((workspace) => isWindowsPath(workspace.root));
-  const outputRows: RawStep[] = [];
-  for (const row of rows) {
-    const rowWorkspaces = new Set<string>();
-    for (const alias of row.workspaces ?? []) {
-      const found = aliases.get(alias.toLowerCase());
-      if (!found) return { ok: false, error: `row references unknown workspace "${alias}"` };
-      rowWorkspaces.add(found.id);
-    }
-    const expectedFiles: string[] = [];
-    for (const file of row.expectedFiles ?? []) {
-      const normalized = file.trim().replace(/\\/g, "/");
-      if (!normalized) continue;
-      if (path.isAbsolute(normalized)) {
-        const owner = workspaces.find((workspace) =>
-          isInsideWorkspaceRoot(normalized, workspace.root, caseInsensitive),
-        );
-        if (owner) {
-          const relative = path.relative(owner.root, normalized).replace(/\\/g, "/");
-          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
-            rowWorkspaces.add(owner.id);
-            expectedFiles.push(relative);
-            continue;
-          }
-        }
-      }
-      expectedFiles.push(file);
-    }
-    const finalWorkspaces = [...rowWorkspaces];
-    if (finalWorkspaces.length > MAX_WORKSPACES) {
-      return { ok: false, error: `row references more than ${MAX_WORKSPACES} workspaces` };
-    }
-    outputRows.push({
+/** Rows from the compiled spec, with the historical plan-step binding. */
+function executionRowsFromPlan(
+  spec: PlanSpec,
+): FrozenExecutionRowInput[] {
+  const usedPlanIds = new Set<string>();
+  return spec.rows.map((row) => {
+    const label = row.label ?? row.ref;
+    const planStepId = unique(
+      planStepIdFor({ text: row.text, group: row.group, label }),
+      usedPlanIds,
+    );
+    return {
       ...row,
-      expectedFiles,
-      ...(finalWorkspaces.length === 0 ? {} : { workspaces: finalWorkspaces }),
-    });
-  }
-  const outputSpecs: PlanCheckSpec[] = [];
-  for (const spec of specs) {
-    if (!spec.workspace) {
-      outputSpecs.push({ ...spec });
-      continue;
+      source: spec.source.kind,
+      status: "pending",
+      ...(spec.source.kind === "plan" ? { planStepId } : {}),
+    };
+  });
+}
+
+function compiledChecks(
+  spec: PlanSpec,
+  input: { planChecks?: readonly string[]; planCheckSpecs?: readonly PlanCheckSpec[] },
+): { ok: true; checks: CheckSpec[] } | { ok: false; error: string } {
+  const checks = spec.planChecks;
+  if (input.planChecks !== undefined) {
+    const expected = checks.map((check) => check.command);
+    if (
+      expected.length !== input.planChecks.length ||
+      expected.some((command, index) => command !== input.planChecks![index])
+    ) {
+      return {
+        ok: false,
+        error:
+          "the supplied planChecks diverge from the compiled checks; freeze exactly what the compiler produced",
+      };
     }
-    const found = aliases.get(spec.workspace.toLowerCase());
-    if (!found) {
-      return { ok: false, error: `check references unknown workspace "${spec.workspace}"` };
-    }
-    outputSpecs.push({ ...spec, workspace: found.id });
   }
-  return { ok: true, rows: outputRows, specs: outputSpecs };
+  if (input.planCheckSpecs !== undefined) {
+    const same =
+      checks.length === input.planCheckSpecs.length &&
+      checks.every(
+        (check, index) =>
+          check.command === input.planCheckSpecs![index]!.command &&
+          check.workspace === input.planCheckSpecs![index]!.workspace,
+      );
+    if (!same) {
+      return {
+        ok: false,
+        error:
+          "the supplied planCheckSpecs diverge from the compiled checks; freeze exactly what the compiler produced",
+      };
+    }
+  }
+  return { ok: true, checks: [...checks] };
+}
+
+function stepChecks(
+  input: { planChecks?: readonly string[]; planCheckSpecs?: readonly PlanCheckSpec[] },
+): CheckSpec[] {
+  const specs = input.planCheckSpecs;
+  if (specs !== undefined) {
+    return specs.map((spec, index) => ({
+      id: planCheckId(index),
+      command: spec.command,
+      ...(spec.workspace === undefined ? {} : { workspace: spec.workspace }),
+      kind: "gate",
+    }));
+  }
+  return (input.planChecks ?? []).map((command, index) => ({
+    id: planCheckId(index),
+    command,
+    kind: "gate",
+  }));
 }
 
 /**
@@ -501,35 +332,26 @@ export function createFrozenTodosFromPlan(
   if (typeof input.planText !== "string" || input.planText.trim().length === 0) {
     return { ok: false, error: "the plan is empty" };
   }
-  const parsed = parsePlanSteps(input.planText);
-  if (!parsed.ok) return parsed;
-  const extracted = extractPlanChecksWithWorkspaceDetailed(input.planText);
-  if (!extracted.ok) return { ok: false, error: extracted.error };
-  const prepared = prepareRowsWithWorkspaces(
-    parsed.rows,
-    input.workspaces,
-    input.planCheckSpecs ?? extracted.specs,
-  );
-  if (!prepared.ok) return { ok: false, error: prepared.error };
-  return {
-    ok: true,
-    snapshot: buildSnapshot({
-      mode: input.mode,
-      ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
-      ...(input.now === undefined ? {} : { now: input.now }),
-      source: {
-        kind: "plan",
-        path: input.planPath,
-        digest: digestOf(input.planText),
-        title: parsed.title,
-      },
-      rows: prepared.rows,
-      planChecks: prepared.specs.map((spec) => spec.command),
-      planCheckSpecs: prepared.specs,
-      ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
-      ...(input.planChecks === undefined ? {} : { planChecks: input.planChecks }),
-    }),
-  };
+  const compiled = compilePlan(input.planText, {
+    path: input.planPath,
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+  });
+  if (!compiled.ok) return { ok: false, error: compiled.error };
+  const checks = compiledChecks(compiled.spec, input);
+  if (!checks.ok) return checks;
+  const warnings = compiled.diagnostics
+    .filter((diagnostic) => diagnostic.severity === "warning")
+    .map(formatPlanDiagnostic);
+  return finishExecution({
+    mode: input.mode,
+    ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
+    ...(input.now === undefined ? {} : { now: input.now }),
+    spec: compiled.spec,
+    rows: executionRowsFromPlan(compiled.spec),
+    checks: checks.checks,
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+    ...(warnings.length === 0 ? {} : { warnings }),
+  });
 }
 
 /**
@@ -553,31 +375,80 @@ export function createFrozenTodosFromSteps(
   if (steps.length === 0) return { ok: false, error: "at least one step is required" };
   if (steps.length > 200) return { ok: false, error: "the list is too long (max 200 steps)" };
   const payload = JSON.stringify({ title, steps, sourceRef: input.sourceRef ?? null });
-  return {
-    ok: true,
-    snapshot: buildSnapshot({
-      mode: input.mode,
-      ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
-      ...(input.now === undefined ? {} : { now: input.now }),
-      source: {
-        kind: "steps",
-        ...(input.sourceRef === undefined ? {} : { path: input.sourceRef }),
-        digest: digestOf(payload),
-        title,
-      },
-      rows: steps.map((text, index) => ({ text, label: String(index + 1), sourceLine: index + 1, body: [] })),
-      planChecks: input.planCheckSpecs?.map((spec) => spec.command) ?? input.planChecks,
-      ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
-      ...(input.planCheckSpecs === undefined ? {} : { planCheckSpecs: input.planCheckSpecs }),
-    }),
+  if (input.planCheckSpecs !== undefined) {
+    const validated = validatePlanCheckSpecs(input.planCheckSpecs, input.workspaces);
+    if (!validated.ok) {
+      return { ok: false, error: `plan checks are not executable: ${validated.error}` };
+    }
+  }
+  const usedIds = new Set<string>();
+  const rows: FrozenExecutionRowInput[] = steps.map((text, index) => {
+    const label = String(index + 1);
+    return {
+      id: unique(todoItemId({ text, label }), usedIds),
+      ref: label,
+      text,
+      label,
+      checks: [],
+      acceptanceCriteria: [],
+      expectedFiles: [],
+      workspaces: [],
+      sourceLine: index + 1,
+    };
+  });
+  const specRows: PlanSpec["rows"] = rows.map((row) => ({
+    id: row.id,
+    ref: row.ref,
+    text: row.text,
+    label: row.label ?? row.ref,
+    checks: [...row.checks],
+    acceptanceCriteria: [...row.acceptanceCriteria],
+    expectedFiles: [...row.expectedFiles],
+    workspaces: [...row.workspaces],
+    ...(row.sourceLine === undefined ? {} : { sourceLine: row.sourceLine }),
+  }));
+  const specChecks = stepChecks(input);
+  const spec: PlanSpec = {
+    version: 1,
+    source: {
+      kind: "steps",
+      ...(input.sourceRef === undefined ? {} : { path: input.sourceRef }),
+      digest: digestOf(payload),
+      title,
+    },
+    compiler: {
+      version: "steps/list",
+      specHash: planSpecHash({ rows: specRows, planChecks: specChecks }),
+    },
+    rows: specRows,
+    planChecks: specChecks,
+    workspaces: (input.workspaces ?? []).map((workspace) => ({ ...workspace })),
+    diagnostics: [],
   };
+  return finishExecution({
+    mode: input.mode,
+    ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
+    ...(input.now === undefined ? {} : { now: input.now }),
+    spec,
+    rows,
+    checks: spec.planChecks,
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+  });
 }
 
 /**
  * Validate a persisted snapshot. A missing/unsupported shape fails closed; the
  * caller must never infer a frozen list from legacy mutable rows.
+ *
+ * `skipWorkspaceGeometry` keeps a historical run readable: overlap/broad-root
+ * analysis is a start-time binding decision, not a reason to refuse a journal
+ * that already exists on disk. Entry shape and alias references are still
+ * enforced.
  */
-export function validateFrozenSnapshot(value: unknown): FrozenTodoResult {
+export function validateFrozenSnapshot(
+  value: unknown,
+  options: { skipWorkspaceGeometry?: boolean } = {},
+): FrozenTodoResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, error: "the frozen snapshot is not an object" };
   }
@@ -612,12 +483,27 @@ export function validateFrozenSnapshot(value: unknown): FrozenTodoResult {
     if (!Array.isArray(record.workspaces)) {
       return { ok: false, error: "the frozen snapshot has invalid workspaces" };
     }
+    if (record.workspaces.length > MAX_WORKSPACES) {
+      return { ok: false, error: `more than ${MAX_WORKSPACES} workspaces` };
+    }
     const roots = record.workspaces as FrozenWorkspace[];
-    const checked = validateWorkspaceSet({
-      roots,
-      caseInsensitive: roots.some((root) => isWindowsPath(root.root)),
-    });
-    if (!checked.ok) return { ok: false, error: checked.error };
+    for (const [index, root] of roots.entries()) {
+      if (
+        !root ||
+        typeof root !== "object" ||
+        typeof (root as { id?: unknown }).id !== "string" ||
+        typeof (root as { root?: unknown }).root !== "string"
+      ) {
+        return { ok: false, error: `workspace ${index + 1} is invalid` };
+      }
+    }
+    if (!options.skipWorkspaceGeometry) {
+      const checked = validateWorkspaceSet({
+        roots,
+        caseInsensitive: roots.some((root) => isWindowsPath(root.root)),
+      });
+      if (!checked.ok) return { ok: false, error: checked.error };
+    }
     workspaceAliases = new Set(roots.map((root) => root.id.toLowerCase()));
   }
   const ids = new Set<string>();

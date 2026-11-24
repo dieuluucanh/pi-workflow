@@ -25,6 +25,8 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
+import { validateJournalEventSequence } from "./journal-payloads.ts";
+
 export const JOURNAL_VERSION = 1 as const;
 export const SNAPSHOT_VERSION = 1 as const;
 export const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
@@ -57,7 +59,8 @@ export type JournalEventType =
   | "task.blocked"
   | "task.retried"
   | "run.control"
-  | "run.completed";
+  | "run.completed"
+  | "final_gate";
 
 /** Unknown event types are refused, so a future writer cannot be half-read. */
 export const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<JournalEventType>([
@@ -75,6 +78,7 @@ export const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<JournalEventType>(
   "task.retried",
   "run.control",
   "run.completed",
+  "final_gate",
 ]);
 
 export interface JournalEvent {
@@ -302,6 +306,17 @@ export function createRunJournal(options: {
   const readState = async (): Promise<JournalResult<JournalState>> => {
     const replayed = replayJournal(runId, await io.read(journalPath));
     if (!replayed.ok) return replayed;
+    // Replay is byte-level (checksums/order). Payload semantics are checked on
+    // load: an unknown event type or payload version fails closed with its seq,
+    // while the pure replay stays usable for chain verification tools.
+    const sequence = validateJournalEventSequence(replayed.value.state.events);
+    if (!sequence.ok) {
+      return {
+        ok: false,
+        code: sequence.code === "unknown_version" ? "unknown_version" : "invalid",
+        error: sequence.error,
+      };
+    }
     const snapshotText = await io.read(snapshotPath);
     if (snapshotText !== null) {
       try {
@@ -319,6 +334,18 @@ export function createRunJournal(options: {
         const { checksum, ...rest } = snapshot;
         if (sha256(canonical(rest)) !== checksum) {
           return { ok: false, code: "corrupt", error: "snapshot checksum does not match" };
+        }
+        // The journal is authoritative. A cache whose seq/revision no longer
+        // matches the replayed journal is rebuilt instead of trusted, so a
+        // stale cache can never grant an old acceptance count.
+        if (
+          typeof snapshot.seq !== "number" ||
+          typeof snapshot.revision !== "number" ||
+          snapshot.seq !== replayed.value.state.seq ||
+          snapshot.revision !== replayed.value.state.revision
+        ) {
+          await io.mkdir(dir);
+          await writeSnapshot(replayed.value.state);
         }
       } catch {
         return { ok: false, code: "corrupt", error: "snapshot is not valid JSON" };

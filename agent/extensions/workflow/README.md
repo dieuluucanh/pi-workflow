@@ -64,6 +64,15 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/read-policy [status\|allow <path>\|revoke <path>\|shell paths\|strict] [global\|project]` | Read grants, shell analysis mode and the shared folder scope. Sensitive files are always blocked |
 | `/permissions [explain] <command>` | Explain a shell command's verdict without running it: each segment's class, the Plan/Review/Explorer answer and whether the write policy would treat it as a write |
 | `/shell-guard [status]` | Show the effective shell deadlines, their settings source, and this request's failure budget. `/shell-guard limits <default-seconds> <max-seconds> [global\|project]` sets them; `/shell-guard reset` clears a tripped request while idle |
+| `/default` | Switch to Default mode (no workflow gating, full access) |
+| `/workflow-cycle` | Cycle the workflow mode (Default → Plan → Orchestrator → Build); the host-bound equivalent of `Tab`/`Ctrl+Alt+P` |
+| `/orchestrator` | Enter Orchestrator mode, or run an operator command: `status`, `start [path]`, `pause`, `resume`, `stop`, `inspect`, `say`, `retry`, `cancel` |
+| `/orchestrator-pause` | Pause the in-process Build child (warm session kept) |
+| `/orchestrator-resume` | Resume a paused in-process Build child on the warm session |
+| `/orchestrator-abort` | Abort the in-process Build child and pause the run |
+| `/orchestrator-view [child\|parent\|auto]` | Show the current Orchestrator child view in the pinned panel and footer |
+| `/orchestrator-repair-checks [status] [--file <manifest.json>] [--from-plan] [--allow-empty] [--yes]` | Inspect or amend the frozen final plan checks with one append-only `plan-check-specs-repair` event (see [Plan format and executable checks](#plan-format-and-executable-checks)) |
+| `/prompt-refine-companion` | Internal grant-only bootstrap a `composer-transform` host invokes for prompt refinement; not a normal user command |
 
 Mode commands (`/plan`, `/build`, `/default`) and the `Tab` / `Ctrl+Alt+P` shortcuts are refused while a **reviewer round or review-owned handoff** owns the turn — `running`, `paused`, or a handoff produced by `/review`/Review Mode, or applying one (Tab still completes a visible suggestion list); see [Controlling a running review](#controlling-a-running-review). A **plain plan handoff** (Review Mode off) does not lock modes or prompts: switching or typing a new prompt supersedes it, and the plan file stays on disk.
 
@@ -135,6 +144,14 @@ short Plan → Review → Build work keeps its current behavior.
   and the footer's child line: `child`/`auto` show the child's live model,
   context %, tokens and elapsed time, `parent` shows the run/next row plus a
   compact child hint. It never changes prompt routing.
+- **Frozen final-check repair.** A malformed frozen `planChecks` list can be
+  amended without rewriting the journal: `/orchestrator-repair-checks` shows the
+  current → proposed checks, confirms, and appends one durable
+  `plan-check-specs-repair` `run.control` event (rows, statuses, workspaces and
+  the revision fence are untouched). `--file <manifest.json>`, `--from-plan`,
+  `--allow-empty` and `--yes` cover the in-session path;
+  `scripts/repair-orchestrator-checks.mjs` does the same out of session with
+  `--dry-run`/`--apply --yes` and `--expect-seq`/`--expect-accepted` fences.
 - **Working/Paused on the composer itself.** The composer's top border shows the
   in-process Builder's activity in Parent, Child AND Auto views: `Working ·
   Builder n/m · <tool>` with `ESC or /orchestrator-pause to pause ·
@@ -249,6 +266,101 @@ verdicts.
   the host-issued, registration-bound grant, and a host without that seam is
   advertised unsupported.
 
+
+### Plan lint and pre-approval gating
+
+The plan compiler is now the single authority for what a plan will execute, and
+it runs *before* approval instead of at run creation:
+
+- `/plan lint [path]` (also `/workflow lint [path]`) and the `plan_validate`
+  tool compile the current plan and print the row count, gate/diagnostic/manual
+  counts, every exact final and per-row command, its workspace, timeout and
+  expected exit code, and all warnings/errors with a line number. Read-only:
+  they never freeze, write or execute.
+- The handoff sheet shows the same compiled check preview, so approval shows
+  exactly what will run.
+- A plan that does not compile is refused at approval; nothing reaches
+  `run.created`. An ambiguous check (a command mixed with prose, unsupported
+  `checks:` YAML, a duplicate check id inside a `checks:` block) fails with the
+  offending line.
+- A compilable plan with **no final `gate` check** (prose-only verification, or
+  only `diagnostic`/`manual` checks) requires an explicit acknowledgement
+  before it can be frozen. A plan whose `## Verification` is fenced command
+  lines freezes with no extra prompt.
+- Reviewer rewrites are compiled too: a rewrite that introduces an ambiguous
+  check, or silently removes every final gate, is rejected before it replaces
+  the plan on disk.
+
+The authoring surface is unchanged for existing plans: a fenced
+one-command-per-line block in `## Verification` still produces gates, and a
+whole-bullet code span is still one command. `Acceptance:` is always prose
+evidence and is never executed.
+
+### Plan format and executable checks
+
+A plan is `.pi/plans/<UTC-date>-<slug>.md` with `# Plan:`, `## Context`,
+`## Decisions`, `## Exploration Summary`, `## Plan Steps`, `## Risks` and
+`## Verification`. `## Plan Steps` is the only row source; `## Verification`
+is the final gate. A row may carry `Checks:`/`Verify:`, `Files:`,
+`Workspaces:` and `Acceptance:`; `### Phase …` sub-headings inside
+`## Plan Steps` set the row's group (there is no `Label:` metadata line). A
+check becomes executable in exactly three
+ways: a fenced one-command-per-line `bash`/`sh` block (first-class and
+backwards compatible), a whole-bullet code span, or a fenced `checks:` block
+for the typed fields (`id`, `command`, `kind`, `workspace`, `timeoutMs`,
+`expectedExitCode`) in a restricted YAML subset that fails closed with a line
+number on anything it does not understand. `Acceptance:` is evidence, never a
+command; a bullet mixing a command with prose is refused, never executed.
+Limits: 12 checks per row/final gate, 20 files, 8 workspaces, 500 rows, 4000
+chars per command, `timeoutMs` 1–3 600 000, `expectedExitCode` 0–255.
+`kind: gate` (default) gates acceptance, `diagnostic` reports without blocking,
+`manual` is a human attestation and never runs. The full reference is
+[`docs/plan-format.md`](../../../docs/plan-format.md); the canonical skeleton is
+[`docs/plan-template.md`](../../../docs/plan-template.md). Migrating an
+existing plan or run starts with the read-only
+[`scripts/migration-report.mjs`](scripts/migration-report.mjs) inventory.
+
+- **Failure taxonomy.** Every check returns `none`, `test`, `timeout`,
+  `metadata`, `policy`, `environment` or `manual`. Only `test`/`timeout` start a
+  bounded repair round on the warm child; `metadata`/`policy`/`environment`
+  block with a concrete fix, and `manual` cannot auto-accept.
+- **Final-gate marker.** The plan checks run once and are journaled as a
+  `final_gate` event carrying the content hash of exactly what ran, bounded
+  results, a failure class and the workspace revisions. Completion needs a
+  passing record whose hash matches the current snapshot, so a second call path
+  cannot re-run a passed gate and an amended check list needs a new pass. A
+  tampered record is never a pass.
+- **Amending a frozen run.** `/orchestrator-repair-checks`
+  (`status|--file <manifest.json>|--from-plan|--allow-empty|--yes`) or
+  `scripts/repair-orchestrator-checks.mjs`
+  (`--run-dir|--manifest|--dry-run|--apply --yes|--expect-seq|--expect-accepted|--status|--json`)
+  appends ONE `plan-check-specs-repair` `run.control` event. Rows, statuses,
+  workspaces and the revision fence are untouched, an apply is idempotent, and
+  the journal is never hand-edited or re-frozen from changed plan text.
+- **Read-only migration report.** `scripts/migration-report.mjs`
+  (`--runs-dir`, `--plans-dir`, `--plan`, `--json`, `--strict`) inventories
+  existing state without writing: stored snapshot version and read-upcast,
+  malformed/quarantined checks (with the exact bytes that never execute),
+  checks bound to an unbound workspace alias, prose `acceptanceChecks`,
+  a stale `snapshot.json`, and plans that no longer compile. It ends with an
+  explicit repair list; fixing a run stays with the amendment tool above. The
+  live run keeps its v1 bytes and is not migrated to v2.
+- **`workflow.orchestrator` settings.** `childTimeoutMs` (default 2 700 000 ms),
+  `verificationTimeoutSeconds` (900) and `gitTimeoutMs` (60 000) merge project
+  over global over default, are clamped to the 3600 s hard cap, and ignore an
+  invalid value with a diagnostic instead of silently defaulting.
+- **v1 → v2 compatibility.** Journals keep their v1 line framing, checksum and
+  `prev` chain; new frozen snapshots are `schemaVersion: 2` with provenance,
+  typed checks, workspaces and a validation report. A v1 snapshot upcasts in
+  memory, a command-shaped v1 value becomes a typed check, and a malformed v1
+  check is quarantined with its bytes and a repair instruction (never executed,
+  never fatal to loading). Unknown event types, payload versions and future
+  snapshot versions fail closed. Restore uses the journaled snapshot, so a
+  changed or missing plan file cannot lose a run.
+- **Never auto-executed.** `Acceptance:` criteria, `Files:`/`Workspaces:`
+  metadata, `manual` checks, prose-only `## Verification` bullets, and any
+  hand-edited journal/snapshot/frozen list. Only the runtime reports
+  acceptance.
 
 ### Multi-repository workspaces
 

@@ -9,6 +9,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isCommandAllowedForRole } from "./permissions.ts";
+import { planStepIdFor, todoItemId } from "./plan-identity.ts";
+import { compilePlanRows } from "./plan-compiler.ts";
 
 /**
  * Translate shell foreign path syntax to native syntax without changing case.
@@ -214,39 +216,11 @@ export interface TodoItem {
 }
 
 /** FNV-1a over normalized text: deterministic ids without persistence. */
-function stableHash(value: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < value.length; i += 1) {
-    h ^= value.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(36);
-}
+// Row identity lives in `plan-identity.ts` so the compiler and the display
+// adapter share one rule without an import cycle. Re-exported here because
+// `todoItemId`/`planStepIdFor` are part of this module's public surface.
+export { planStepIdFor, todoItemId };
 
-function identityKey(parts: Array<string | undefined>): string {
-  return parts
-    .map((part) =>
-      String(part ?? "")
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
-        .trim(),
-    )
-    .join("|");
-}
-
-/** Stable identity for a row that predates ids (content-based, not positional). */
-export function todoItemId(item: Pick<TodoItem, "text" | "group" | "label">): string {
-  return `todo-${stableHash(identityKey([item.text, item.group, item.label]))}`;
-}
-
-/** Stable plan binding: label + group, falling back to the plan text. */
-export function planStepIdFor(
-  item: Pick<TodoItem, "text" | "group" | "label" | "planStepId">,
-): string {
-  if (item.planStepId) return item.planStepId;
-  const key = identityKey([item.group, item.label]);
-  return `plan-${stableHash(key || item.text)}`;
-}
 
 const TODO_STATUS_RANK: Record<TodoStatus, number> = {
   completed: 3,
@@ -1016,136 +990,14 @@ export function shouldRemind(state: RemindState): boolean {
 export const TURNS_SINCE_WRITE = 3;
 export const TURNS_BETWEEN_REMINDERS = 3;
 
-// ── Plan extraction (section-scoped) ─────────────────────────────
+// ── Plan extraction (single compiler) ────────────────────────────
 
-const EXCLUDED_SECTION_RE =
-  /^(context|decisions?|exploration(\s+summary)?|risks?|verification|notes?|root\s+cause|background|summary|alternatives?|open\s+questions?|references?|appendix)\b/i;
+/**
+ * Step parsing, section exclusion, labels and groups live in
+ * `plan-compiler.ts`. This module is a display/storage adapter over the one
+ * compiler so a chat-text plan and a plan file can never disagree about rows.
+ */
 
-function headingMatch(line: string): { level: number; title: string } | null {
-  const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
-  if (!m) return null;
-  return { level: m[1].length, title: m[2].trim() };
-}
-
-/** Step-shaped heading: `### 1. Title`, `### Step 2: Title`. */
-function stepFromHeading(line: string): { label: string; text: string } | null {
-  const m = line.match(
-    /^(#{3,6})\s*(?:(\d+(?:\.\d+)?)[.)]\s+|Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s+)(.+?)\s*$/i,
-  );
-  if (!m) return null;
-  const label = m[2] ?? m[3];
-  const text = normalizeStepText(m[4] ?? "");
-  if (!label || text.length <= 3) return null;
-  return { label, text };
-}
-
-/** Bold step paragraph: `**Step 1.1: Scaffold**`. */
-function stepFromBold(line: string): { label: string; text: string } | null {
-  const m = line.match(
-    /^\s*\*\*Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s*(.+?)\*\*\s*$/i,
-  );
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { label: m[1], text };
-}
-
-/** Numbered list item: `1. Title`. */
-function stepFromList(line: string): { label: string; text: string } | null {
-  const m = line.match(/^\s*(\d+(?:\.\d+)?)[.)]\s+(.+?)\s*$/);
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { label: m[1], text };
-}
-
-/** Checkbox item: `- [ ] Title` / `- [x] Title`. */
-function stepFromCheckbox(
-  line: string,
-): { text: string; completed: boolean } | null {
-  const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.+?)\s*$/);
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { text, completed: m[1].toLowerCase() === "x" };
-}
-
-function parseStepsFromLines(lines: string[]): TodoItem[] {
-  type RawStep = {
-    label?: string;
-    text: string;
-    completed?: boolean;
-    group?: string;
-  };
-  let usedExplicit = false;
-  for (const line of lines) {
-    if (stepFromHeading(line) || stepFromBold(line)) {
-      usedExplicit = true;
-      break;
-    }
-  }
-  let numberedCount = 0;
-  if (!usedExplicit) {
-    for (const line of lines) if (stepFromList(line)) numberedCount++;
-  }
-  const useNumberedList = !usedExplicit && numberedCount >= 2;
-  const raw: RawStep[] = [];
-  let group: string | undefined;
-  for (const line of lines) {
-    const bold = stepFromBold(line);
-    if (bold) {
-      raw.push({ ...bold, group });
-      continue;
-    }
-    const heading = headingMatch(line);
-    if (heading) {
-      const step = stepFromHeading(line);
-      if (step) {
-        raw.push({ ...step, group });
-        continue;
-      }
-      const title = heading.title;
-      if (heading.level >= 3 && !EXCLUDED_SECTION_RE.test(title)) group = title;
-      continue;
-    }
-    if (useNumberedList) {
-      const list = stepFromList(line);
-      if (list) {
-        raw.push({ ...list, group });
-      }
-    }
-  }
-  if (!usedExplicit && !useNumberedList) {
-    for (const line of lines) {
-      const cb = stepFromCheckbox(line);
-      if (cb) raw.push({ text: cb.text, completed: cb.completed });
-    }
-  }
-  const items: TodoItem[] = raw.map((r, i) => {
-    const label = r.label || String(i + 1);
-    const base = {
-      step: i + 1,
-      text: r.text,
-      completed: !!r.completed,
-      label,
-      group: r.group,
-      source: "plan" as const,
-    };
-    return {
-      ...base,
-      // Plan identity is label+group, so rewording or a plan edit does not
-      // invent a second task and a repeated phase label still disambiguates.
-      planStepId: planStepIdFor(base),
-      id: todoItemId(base),
-    };
-  });
-  const deduped = dedupeTodoItems(items);
-  deduped.forEach((it, i) => {
-    it.step = i + 1;
-    if (!it.label) it.label = String(i + 1);
-  });
-  return deduped;
-}
 
 /**
  * Extract plan steps from a plan markdown file. Section-scoped: only the
@@ -1153,42 +1005,43 @@ function parseStepsFromLines(lines: string[]): TodoItem[] {
  * the document, skipping Context/Decisions/Exploration/Risks/Verification).
  * Labels and phase groups are preserved. Verification is never extracted.
  */
+/**
+ * Extract plan steps from a plan markdown file for display/todo merging.
+ *
+ * The rows come from the single compiler (`plan-compiler.ts`), so the display
+ * list and the frozen list agree on order, labels, groups and ids. Only two
+ * documented display normalisations are applied here: `normalizeStepText`
+ * (chapter: emphasis stripped, 200-char display cap) and the legacy
+ * `dedupeTodoItems` pass (first occurrence wins). Neither changes a frozen row.
+ * A malformed `Checks:` line stays a compiler diagnostic; it must not make a
+ * Build-mode todo list disappear.
+ */
 export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
   if (!md) return [];
-  const lines = md.split(/\r?\n/);
-  let start = -1;
-  let level = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const h = headingMatch(lines[i]);
-    if (!h || h.level < 2 || h.level > 4) continue;
-    if (/plan\s+steps/i.test(h.title)) {
-      start = i + 1;
-      level = h.level;
-      break;
-    }
-  }
-  let section: string[];
-  if (start >= 0) {
-    let end = lines.length;
-    for (let i = start; i < lines.length; i++) {
-      const h = headingMatch(lines[i]);
-      if (h && h.level <= level && !/plan\s+steps/i.test(h.title)) {
-        end = i;
-        break;
-      }
-    }
-    section = lines.slice(start, end);
-  } else {
-    section = [];
-    let skipping = false;
-    for (const line of lines) {
-      const h = headingMatch(line);
-      if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
-      else if (h && skipping) continue;
-      if (!skipping) section.push(line);
-    }
-  }
-  return parseStepsFromLines(section);
+  const compiled = compilePlanRows(md);
+  const items: TodoItem[] = compiled.rows.map((row, index) => {
+    const label = row.label ?? String(index + 1);
+    const text = normalizeStepText(row.text);
+    const base = {
+      step: index + 1,
+      text,
+      completed: compiled.extras.get(row.id)?.completed ?? false,
+      label,
+      ...(row.group === undefined ? {} : { group: row.group }),
+      source: "plan" as const,
+    };
+    return {
+      ...base,
+      planStepId: planStepIdFor(base),
+      id: todoItemId(base),
+    };
+  });
+  const deduped = dedupeTodoItems(items);
+  deduped.forEach((item, index) => {
+    item.step = index + 1;
+    if (!item.label) item.label = String(index + 1);
+  });
+  return deduped;
 }
 
 /**
@@ -1217,16 +1070,10 @@ export function extractTodoItems(message: string): TodoItem[] {
     }
   }
   if (headerIdx === -1) return [];
-  const body = message.slice(headerIdx + headerLen).split(/\r?\n/);
-  const filtered: string[] = [];
-  let skipping = false;
-  for (const line of body) {
-    const h = headingMatch(line);
-    if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
-    else if (h && skipping) continue;
-    if (!skipping) filtered.push(line);
-  }
-  return parseStepsFromLines(filtered);
+  // Everything after the chat plan header is compiled by the single plan
+  // compiler: section exclusion, step shapes, labels and identity are not
+  // re-implemented here.
+  return extractPlanStepsFromMarkdown(message.slice(headerIdx + headerLen));
 }
 
 /** Single placeholder step from a plan title when no steps could be parsed. */

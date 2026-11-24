@@ -691,7 +691,11 @@ export function workspaceRootForRow(
   if (!set) return undefined;
   const first = row.workspaces?.[0];
   if (first) return resolveWorkspaceAlias(set, first);
-  return primaryWorkspace(set);
+  // A row that names no workspace is only unambiguous for a single-root set.
+  // With several bound roots the primary root is a guess, so callers must
+  // resolve from the observed change (or fail closed) instead of silently
+  // running the check in the wrong repository.
+  return set.roots.length <= 1 ? primaryWorkspace(set) : undefined;
 }
 
 export function workspaceCheckRoot(
@@ -703,7 +707,8 @@ export function workspaceCheckRoot(
   if (explicit) return resolveWorkspaceAlias(set, explicit)?.root;
   const changed = diff?.entries.filter((entry) => entry.diff.changed) ?? [];
   if (changed.length === 1) return changed[0]!.root;
-  return primaryWorkspace(set)?.root;
+  // Several changed roots (or none) are ambiguous: no primary-root default.
+  return undefined;
 }
 
 export function scopeCommandToWorkspace(command: string, root?: string): string {

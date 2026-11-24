@@ -35,6 +35,7 @@ import {
     type FolderPolicyConfig,
 } from "./folder-policy.ts";
 import { redactSensitiveText } from "./read-policy-redact.ts";
+import { reviewPlanSubmissionProblems } from "./plan-lint.ts";
 import {
     createInspectionAuthority,
     resolveInspectionAuthority,
@@ -943,6 +944,15 @@ export function createReviewSubmitPlanTool(deps: ReviewSubmitDeps): {
 
             // Step 10 — reject stubs and heading-less blobs before anything is written.
             const problems = validateReviewedPlan(planBody, original);
+            // Step 10 (contract) — a rewrite that introduces an ambiguous check
+            // (prose mixed with a command, unsupported YAML, duplicate gate) or
+            // silently drops every final gate is refused before it replaces the
+            // plan on disk.
+            problems.push(
+                ...reviewPlanSubmissionProblems(original, planBody, {
+                    path: targetPath,
+                }),
+            );
             if (problems.length > 0) {
                 deps.log(
                     `Review submission rejected: ${problems.join("; ")}`,

@@ -22,6 +22,7 @@ import {
   extractPlanChecksDetailed,
   extractRowMetadata,
 } from "./plan-checks.ts";
+import type { FrozenWorkspace } from "./orchestrator-workspace-set.ts";
 
 const PATH = "C:/work/.pi/plans/demo.md";
 
@@ -35,6 +36,57 @@ function plan(markdown: string) {
   if (!result.ok) throw new Error(result.error);
   return result.snapshot;
 }
+
+const MULTI_REPO: FrozenWorkspace[] = [
+  {
+    id: "W",
+    key: "git:C:/work",
+    root: "C:/work",
+    kind: "git",
+    displayPath: "C:/work",
+    primary: true,
+  },
+  {
+    id: "ERP",
+    key: "git:C:/erp",
+    root: "C:/erp",
+    kind: "git",
+    displayPath: "C:/erp",
+    primary: false,
+  },
+];
+
+test("freeze binds every workspace root and keeps the row alias (multi-repo Build)", () => {
+  const result = createFrozenTodosFromPlan({
+    planPath: PATH,
+    planText: [
+      "# Plan: Multi",
+      "",
+      "## Plan Steps",
+      "",
+      "1. Add the ERP module",
+      "   Workspaces: ERP",
+      "   Checks:",
+      "   - pnpm lint",
+      "2. Update the root docs",
+      "   Files:",
+      "   - README.md",
+      "",
+    ].join("\n"),
+    mode: "build",
+    workspaces: MULTI_REPO,
+    now: 1_000,
+  });
+  if (!result.ok) throw new Error(result.error);
+  // Every bound root survives the freeze, not just the primary one.
+  assert.deepEqual(
+    (result.snapshot.workspaces ?? []).map((workspace) => workspace.id),
+    ["W", "ERP"],
+  );
+  assert.deepEqual(result.snapshot.rows[0]?.workspaces, ["ERP"]);
+  assert.equal(result.execution?.rows[0]?.checks[0]?.command, "pnpm lint");
+  assert.deepEqual(result.snapshot.rows[1]?.workspaces ?? [], []);
+});
 
 test("one row per top-level Plan Steps occurrence, in source order", () => {
   const snapshot = plan(

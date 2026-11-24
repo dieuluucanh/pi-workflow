@@ -285,6 +285,7 @@ import {
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
 import { createOrchestratorRuntime, type OrchestratorRuntime } from "./orchestrator-runtime.ts";
+import { parseRepairManifest } from "./orchestrator-repair-manifest.ts";
 import { createParentToolRuntime } from "./orchestrator-tool-runtime.ts";
 import { rowForTask } from "./orchestrator-state.ts";
 import {
@@ -604,6 +605,24 @@ import {
   SHELL_GUARD_LIMITS_ENV,
 } from "./shell-guard-config.ts";
 import { describeShellLimits, type ShellLimits } from "./shell-guard.ts";
+import {
+  effectiveVerificationTimeoutSeconds,
+  readOrchestratorLimits,
+} from "./orchestrator-config.ts";
+import { validateCommandShape, validatePlanCheckSpecs, extractPlanChecksWithWorkspaceDetailed } from "./plan-checks.ts";
+import { formatPlanLintReport, formatPlanPreview, lintPlan, planFreezeGate } from "./plan-lint.ts";
+import {
+  createCheckExecutor,
+  createHeadlessCheckTransport,
+  createHostCheckTransport,
+  runBoundedGitSync,
+  type CheckExecutionResult,
+} from "./check-executor.ts";
+import {
+  computeFinalGateSpecHash,
+  executablePlanCheckSpecs,
+  finalGateCheckSpecs,
+} from "./final-gate.ts";
 
 // ── Plannotator Bridge ───────────────────────────────────────────────
 const PLANNOTATOR_REQUEST = "plannotator:request" as const;
@@ -1037,6 +1056,12 @@ export default function workflowExtension(
         baseline: WorkspaceSetBaseline;
       }
     | undefined;
+  /**
+   * Direct-Build final-gate memory (no run journal exists). Keyed by the
+   * content hash of the executable spec, so the two completion call paths run
+   * one gate per spec instead of executing the same checks twice.
+   */
+  const finalGatePasses = new Map<string, number>();
   /** Last observed session model, used to resolve real budget limits. */
   let lastKnownModel:
     | { provider?: string; id: string; contextWindow: number | null; maxOutputTokens: number | null }
@@ -1213,6 +1238,16 @@ export default function workflowExtension(
       getAgentDir(),
       { trusted: ctx?.isProjectTrusted?.() === true },
     );
+  }
+
+  /**
+   * `workflow.orchestrator` limits. Read through the one module that owns the
+   * settings key, so no other call site parses `settings.json`. Re-read per use
+   * where the value is a live deadline; creation-time values (the child
+   * controller) apply until the session reloads.
+   */
+  function orchestratorLimitsFor(ctx: any) {
+    return readOrchestratorLimits(ctx?.cwd ?? process.cwd(), getAgentDir());
   }
 
   function ensureShellGuard(ctx?: ExtensionContext | null): ShellGuardRuntime {
@@ -7774,7 +7809,18 @@ export default function workflowExtension(
         : path.join((ctx as any)?.cwd ?? process.cwd(), planPath);
       const planText = fs.readFileSync(abs, "utf8");
       const digest = planHash(planText);
-      if (todos.planDigest && todos.planDigest !== digest) {
+      // A restore must never freeze from whatever plan bytes happen to be on
+      // disk. Without a recorded digest there is no proof the plan still
+      // matches this legacy list, so the list stays paused for an explicit
+      // recovery choice instead of being silently re-frozen from mutable text.
+      if (!todos.planDigest) {
+        ctx.ui.notify(
+          `Build recovery: this legacy list has no recorded plan digest, so it cannot prove the plan at ${abs} is unchanged; it was left paused for an explicit recovery choice.`,
+          "warning",
+        );
+        return;
+      }
+      if (todos.planDigest !== digest) {
         ctx.ui.notify(
           `Build recovery: the plan at ${abs} changed since this list was written; keeping the legacy list paused for an explicit recovery choice.`,
           "warning",
@@ -8363,7 +8409,7 @@ export default function workflowExtension(
     // Tab-to-Build: load the active plan if nothing is loaded yet so this path
     // behaves like the handoff/approve path.
     if (todos.items.length === 0 && currentPlanFile && opts?.fromManagedChild !== true) {
-      const seeded = seedFrozenBuildFromPlan(currentPlanFile, ctx.cwd);
+      const seeded = await seedFrozenBuildFromPlan(currentPlanFile, ctx.cwd);
       if (!seeded.ok) {
         ctx.ui.notify(
           `Build mode: the plan could not be frozen (${seeded.error ?? "unknown error"}); create the TODO list manually.`,
@@ -8702,11 +8748,11 @@ export default function workflowExtension(
    * `loadTodosFromPlan`, this never re-reads or merges into an existing frozen
    * execution; the rows are the contract from here on.
    */
-  function seedFrozenBuildFromPlan(
+  async function seedFrozenBuildFromPlan(
     planPath: string,
     cwd: string,
     planText?: string,
-  ): { ok: boolean; count: number; replaced: boolean; error?: string } {
+  ): Promise<{ ok: boolean; count: number; replaced: boolean; error?: string }> {
     if (todos.frozen) {
       return { ok: true, count: todos.items.length, replaced: false };
     }
@@ -8726,18 +8772,33 @@ export default function workflowExtension(
     if (!text || text.trim().length === 0) {
       return { ok: false, count: todos.items.length, replaced: false, error: "the plan is empty" };
     }
+    // Direct Build is a multi-repo entry too: resolve the plan's declared
+    // workspaces against the session root and freeze that binding. A bad
+    // declaration is an error, never a silent primary-root fallback.
+    const resolved = await resolveWorkspaceSet({
+      primaryRoot: cwd,
+      declarations: parseWorkspaceDeclarations(text),
+      resolver: createNodeWorkspaceResolver({ runGit: runGitSync }),
+      broadRootReason: (root) => broadGrantRootReason(root, cwd),
+    });
+    if (!resolved.ok) {
+      return { ok: false, count: todos.items.length, replaced: false, error: resolved.error };
+    }
+    const workspaces = resolved.value.roots;
     const frozen =
       todos.items.length > 0
         ? rebindLegacyTodosToPlan({
             planPath: abs,
             planText: text,
             priorItems: todos.items,
+            workspaces,
             now: Date.now(),
           })
         : createFrozenTodosFromPlan({
             planPath: abs,
             planText: text,
             mode: "build",
+            workspaces,
             now: Date.now(),
           });
     if (!frozen.ok) {
@@ -8805,7 +8866,7 @@ export default function workflowExtension(
       );
       toolsBeforePlanMode = undefined;
       // Populate/refresh todos from the plan file (merge preserves progress).
-      const loaded = seedFrozenBuildFromPlan(planPath, ctx.cwd, opts?.planText);
+      const loaded = await seedFrozenBuildFromPlan(planPath, ctx.cwd, opts?.planText);
       if (loaded.ok) {
         const armed = armBuildExecution(planPath, opts?.planText);
         if (!armed.ok) {
@@ -9558,6 +9619,13 @@ export default function workflowExtension(
         ...(input.verdict !== undefined ? { verdict: input.verdict } : {}),
         ...(input.findingCount !== undefined
           ? { findingCount: input.findingCount }
+          : {}),
+        ...(typeof input.planText === "string" && input.planText.trim()
+          ? {
+              checkPreview: formatPlanPreview(
+                lintPlan(input.planText, { path: input.planPath }),
+              ),
+            }
           : {}),
       });
       result = await ctx.ui.custom<QuestionnaireResult | null>(
@@ -10391,8 +10459,34 @@ export default function workflowExtension(
 
   try {
     pi.registerCommand("plan", {
-      description: "Enable Plan mode (read-only, idempotent)",
-      handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
+      description:
+        "Enable Plan mode (read-only, idempotent). /plan lint [path] compiles the plan and prints rows, checks and diagnostics.",
+      handler: async (args, ctx) => {
+        const text = typeof args === "string" ? args.trim() : "";
+        if (text === "lint" || text.startsWith("lint ")) {
+          const target = resolveReviewTarget(ctx, text.slice(4).trim() || undefined);
+          if (target.kind === "no-plan") {
+            ctx.ui.notify(
+              `No plan file found — write .pi/plans/${getUtcDatePrefix()}-<slug>.md first.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
+              "info",
+            );
+            return;
+          }
+          if (target.kind === "error") {
+            ctx.ui.notify(target.message, "warning");
+            return;
+          }
+          const result = lintPlan(target.target.text, {
+            path: target.target.display,
+          });
+          ctx.ui.notify(
+            formatPlanLintReport(result),
+            result.ok ? "info" : "warning",
+          );
+          return;
+        }
+        await switchWorkflowMode("plan", ctx as any);
+      },
     });
   } catch {
     // pi-code already owns /plan — the /workflow alias below still works.
@@ -10403,8 +10497,34 @@ export default function workflowExtension(
   // /workflow is tolerated the same way as /plan.
   try {
     pi.registerCommand("workflow", {
-      description: "Enable Plan mode (alias for /plan)",
-      handler: async (_args, ctx) => switchWorkflowMode("plan", ctx as any),
+      description:
+        "Enable Plan mode (alias for /plan). /workflow lint [path] compiles the plan and prints rows, checks and diagnostics.",
+      handler: async (args, ctx) => {
+        const text = typeof args === "string" ? args.trim() : "";
+        if (text === "lint" || text.startsWith("lint ")) {
+          const target = resolveReviewTarget(ctx, text.slice(4).trim() || undefined);
+          if (target.kind === "no-plan") {
+            ctx.ui.notify(
+              `No plan file found — write .pi/plans/${getUtcDatePrefix()}-<slug>.md first.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
+              "info",
+            );
+            return;
+          }
+          if (target.kind === "error") {
+            ctx.ui.notify(target.message, "warning");
+            return;
+          }
+          const result = lintPlan(target.target.text, {
+            path: target.target.display,
+          });
+          ctx.ui.notify(
+            formatPlanLintReport(result),
+            result.ok ? "info" : "warning",
+          );
+          return;
+        }
+        await switchWorkflowMode("plan", ctx as any);
+      },
     });
   } catch (_e) {
     void _e;
@@ -10549,6 +10669,270 @@ export default function workflowExtension(
         const result = await operator.run(raw ? `view ${raw}` : "view");
         ctx.ui.notify(result.text, result.ok ? "info" : "warning");
         updateStatus(ctx as any);
+      },
+    });
+    // Durable plan-check amendment: the in-session twin of
+    // scripts/repair-orchestrator-checks.mjs. It shows old -> new, confirms
+    // unless --yes, and re-freezes through the TODO store so
+    // validateFrozenSnapshot runs again and the panel reflects the change.
+    pi.registerCommand("orchestrator-repair-checks", {
+      description:
+        "Inspect or amend the frozen final plan checks: status|--file <manifest.json>|--from-plan [--allow-empty] [--yes].",
+      handler: async (args, ctx) => {
+        const liveCtx = ctx as ExtensionContext;
+        const notify = (message: string, level: "info" | "warning" = "info") =>
+          ctx.ui.notify(message, level);
+        const usage =
+          "Usage: /orchestrator-repair-checks [status] [--file <manifest.json>] [--from-plan] [--allow-empty] [--yes]";
+        const raw = typeof args === "string" ? args.trim() : "";
+        const tokens = raw.split(/\s+/).filter((token) => token.length > 0);
+        let showStatus = tokens.length === 0;
+        let fromPlan = false;
+        let allowEmpty = false;
+        let yes = false;
+        let file: string | undefined;
+        for (let index = 0; index < tokens.length; index += 1) {
+          const token = tokens[index]!;
+          if (token === "help" || token === "--help" || token === "-h") {
+            notify(usage, "info");
+            return;
+          }
+          if (token === "status") {
+            showStatus = true;
+            continue;
+          }
+          if (token === "--from-plan") {
+            fromPlan = true;
+            continue;
+          }
+          if (token === "--allow-empty") {
+            allowEmpty = true;
+            continue;
+          }
+          if (token === "--yes" || token === "-y") {
+            yes = true;
+            continue;
+          }
+          if (token === "--file") {
+            const next = tokens[index + 1];
+            if (!next || next.startsWith("--")) {
+              notify(`--file needs a manifest path.\n${usage}`, "warning");
+              return;
+            }
+            file = next;
+            index += 1;
+            continue;
+          }
+          if (token.startsWith("--file=")) {
+            file = token.slice("--file=".length);
+            if (!file) {
+              notify(`--file needs a manifest path.\n${usage}`, "warning");
+              return;
+            }
+            continue;
+          }
+          notify(`Unknown argument "${token}".\n${usage}`, "warning");
+          return;
+        }
+        if (showStatus && (fromPlan || file !== undefined)) {
+          notify(`status is read-only; omit --file/--from-plan to amend.\n${usage}`, "warning");
+          return;
+        }
+        if (file !== undefined && fromPlan) {
+          notify(`Use either --file or --from-plan, not both.\n${usage}`, "warning");
+          return;
+        }
+
+        try {
+          const runtime = ensureOrchestratorRuntime(liveCtx);
+          if (!runtime.view()) await restoreOrchestratorRun(liveCtx);
+          const view = runtime.view();
+          if (!view) {
+            notify(
+              "No Orchestrator run is bound. Start or restore a run first (/orchestrator start or /orchestrator status).",
+              "warning",
+            );
+            return;
+          }
+          const events = await runtime.journalEvents();
+          const seq =
+            events.ok && events.value.length > 0 ? (events.value.at(-1)?.seq ?? 0) : 0;
+          const accepted = view.state.order.filter(
+            (taskId) => view.state.tasks[taskId]?.state === "accepted",
+          ).length;
+          const currentSpecs = executablePlanCheckSpecs(view.todos);
+          const formatCurrent = (): string =>
+            currentSpecs
+              .map((spec, index) => {
+                const shape = validateCommandShape(spec.command);
+                const target = spec.workspace ? ` [${spec.workspace}]` : "";
+                return `  ${index + 1}. ${shape.ok ? "ok" : "BAD"} ${spec.command}${target}${
+                  shape.ok ? "" : ` — ${shape.error}`
+                }`;
+              })
+              .join("\n");
+
+          if (showStatus) {
+            notify(
+              [
+                `Orchestrator run ${view.runId} — ${view.phase}, seq ${seq}, accepted ${accepted}/${view.state.order.length}`,
+                `Final checks (${currentSpecs.length}):`,
+                formatCurrent() || "  (none)",
+                "Amend with /orchestrator-repair-checks --file <manifest.json> or --from-plan.",
+              ].join("\n"),
+              "info",
+            );
+            return;
+          }
+
+          let specs: Array<{ command: string; workspace?: string; kind?: string }>;
+          let reason: string;
+          let source: string;
+          if (file !== undefined) {
+            const cwd = (liveCtx as any).cwd ?? process.cwd();
+            const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+            let text: string;
+            try {
+              text = await fs.promises.readFile(resolved, "utf8");
+            } catch (error: unknown) {
+              notify(
+                `Cannot read the manifest ${resolved}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+                "warning",
+              );
+              return;
+            }
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(text);
+            } catch (error: unknown) {
+              notify(
+                `The manifest is not valid JSON: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+                "warning",
+              );
+              return;
+            }
+            const manifest = parseRepairManifest(parsed);
+            if (!manifest.ok) {
+              notify(`Invalid manifest: ${manifest.error}`, "warning");
+              return;
+            }
+            specs = manifest.manifest.specs;
+            reason = manifest.manifest.reason;
+            source = manifest.manifest.source;
+            if (manifest.manifest.allowEmpty) allowEmpty = true;
+          } else {
+            const planPath = currentPlanFile ?? view.todos.source.path;
+            if (!planPath) {
+              notify(
+                "--from-plan needs an approved plan path; use --file <manifest.json> instead.",
+                "warning",
+              );
+              return;
+            }
+            let markdown: string;
+            try {
+              markdown = await fs.promises.readFile(planPath, "utf8");
+            } catch (error: unknown) {
+              notify(
+                `Cannot read the plan ${planPath}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+                "warning",
+              );
+              return;
+            }
+            const extracted = extractPlanChecksWithWorkspaceDetailed(markdown);
+            if (!extracted.ok) {
+              notify(
+                `The plan's Verification section is not executable: ${extracted.error}`,
+                "warning",
+              );
+              return;
+            }
+            specs = extracted.specs;
+            reason = `Recompiled the final checks from the approved plan: ${path.basename(planPath)}.`;
+            source = `plan:${planPath}`;
+            if (extracted.specs.length === 0 && !allowEmpty) {
+              notify(
+                "The plan's Verification section has no executable commands; pass --allow-empty to remove the final checks.",
+                "warning",
+              );
+              return;
+            }
+          }
+
+          const proposedLines = specs
+            .map(
+              (spec, index) =>
+                `  ${index + 1}. ${spec.kind ?? "gate"} ${spec.command}${
+                  spec.workspace ? ` [${spec.workspace}]` : ""
+                }`,
+            )
+            .join("\n");
+          const summary = [
+            `Run ${view.runId}: ${currentSpecs.length} → ${specs.length} final check(s).`,
+            "Current:",
+            formatCurrent() || "  (none)",
+            "Proposed:",
+            proposedLines || "  (none)",
+            `Reason: ${reason}`,
+            `Source: ${source}`,
+          ].join("\n");
+          if (!yes) {
+            const confirmed = await ctx.ui.confirm("Amend the frozen final checks?", summary);
+            if (!confirmed) {
+              notify("Plan-check repair cancelled.", "info");
+              return;
+            }
+          }
+          const repaired = await runtime.repairCheckSpecs({
+            specs,
+            reason,
+            source,
+            allowEmpty,
+          });
+          if (!repaired.ok) {
+            notify(
+              `The plan-check repair was refused (${repaired.code}): ${repaired.error}`,
+              "warning",
+            );
+            return;
+          }
+          const placed = todos.freeze(repaired.value.view.todos);
+          if (!placed.ok) {
+            notify(
+              `The amendment was journaled but the TODO list rejected it: ${placed.error}`,
+              "warning",
+            );
+            return;
+          }
+          persistState();
+          updateStatus(liveCtx);
+          if (repaired.value.duplicate) {
+            notify(
+              `Final checks already match the manifest (event ${repaired.value.eventId}); nothing appended.`,
+              "info",
+            );
+            return;
+          }
+          notify(
+            `Amended ${repaired.value.view.todos.planChecks.length} final check(s) on ${view.runId} (event ${
+              repaired.value.eventId
+            }). Accepted rows are unchanged; run /orchestrator retry when ready.`,
+            "info",
+          );
+        } catch (error: unknown) {
+          notify(
+            `Plan-check repair failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            "warning",
+          );
+        }
       },
     });
   } catch (_e) {
@@ -13888,6 +14272,68 @@ ${rows}`,
   // The model may report progress or a genuine blocker. It cannot pause,
   // resume, reset the shell guard, or mint completion evidence.
   pi.registerTool({
+    name: "plan_validate",
+    label: "Plan Validate",
+    description:
+      "Compile a plan and report rows, gate/diagnostic/manual check counts, the exact final commands, workspaces, timeouts and every warning/error with a line number. Read-only: never freezes, writes or executes. Use before approval and after editing a plan.",
+    promptSnippet: "Lint the current plan before approval (rows, checks, diagnostics)",
+    promptGuidelines: [
+      "plan_validate: run this after writing or editing the plan, before asking the user to approve it.",
+      "plan_validate: an error means the plan cannot be frozen — fix the reported line and re-run.",
+      "plan_validate: a plan with zero final gate checks is unverifiable and requires the user's explicit acknowledgement.",
+    ],
+    parameters: Type.Object({
+      path: Type.Optional(
+        Type.String({
+          description:
+            "Plan file under .pi/plans/ (relative or absolute). Omit to lint the current session plan.",
+        }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const target = resolveReviewTarget(ctx, params.path);
+      if (target.kind === "no-plan") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `plan_validate: no plan file found.${target.recent.length ? ` Recent: ${target.recent.join(", ")}` : ""}`,
+            },
+          ],
+          details: { ok: false, error: "no-plan" },
+        };
+      }
+      if (target.kind === "error") {
+        return {
+          content: [{ type: "text", text: `plan_validate: ${target.message}` }],
+          details: { ok: false, error: "unresolved" },
+        };
+      }
+      const result = lintPlan(target.target.text, {
+        path: target.target.display,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatPlanLintReport(result),
+          },
+        ],
+        details: {
+          ok: result.ok,
+          rows: result.assessment.rows,
+          gates: result.assessment.gate,
+          diagnostics: result.assessment.diagnostic,
+          manual: result.assessment.manual,
+          needsAcknowledgement: result.assessment.needsAcknowledgement,
+          errors: result.diagnostics.filter((d) => d.severity === "error").length,
+          warnings: result.diagnostics.filter((d) => d.severity === "warning").length,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "workflow_execution",
     label: "Workflow Execution",
     description:
@@ -13954,36 +14400,52 @@ ${rows}`,
           };
         }
         const results: Array<{ command: string; ok: boolean; output: string }> = [];
-        for (const command of row.acceptanceChecks) {
-          if (executionState.shellQuarantine) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Row ${ref} cannot be verified: shell is quarantined. Continue non-shell work; the row remains blocked/unverified.`,
-                },
-              ],
-              details: { action: "verify", rowRef: ref, error: "shell-quarantined" },
-            };
-          }
-          const outcome = await runVerificationCommand(
-            command,
-            ctx?.signal,
-            ctx,
-          );
-          results.push({ command, ...outcome });
-          if (!outcome.ok) break;
+        // Every verify check goes through the shared executor: malformed
+        // command bytes fail closed as metadata, a shell-guard refusal is
+        // `policy`, and the workspace root is the row's bound root.
+        const executor = createSessionCheckExecutor(ctx);
+        const set = workspaceSetForRun();
+        const bound = workspaceRootForRow(set, { workspaces: row.workspaces });
+        const outcome = await executor.executeMany(
+          row.acceptanceChecks,
+          {
+            set,
+            ...(bound ? { boundRoot: bound.root } : {}),
+          },
+          ctx?.signal ? { signal: ctx.signal } : undefined,
+        );
+        for (const result of outcome.results) {
+          results.push({
+            command: result.command,
+            ok: result.ok,
+            output: (result.output || result.message).slice(0, 2_000),
+          });
         }
-        const failed = results.find((entry) => !entry.ok);
+        const failed = outcome.results.find((result) => !result.ok);
         if (failed) {
+          const metadata = failed.failureClass === "metadata";
           return {
             content: [
               {
                 type: "text",
-                text: `Row ${ref} verification failed: ${failed.command}\n${failed.output.slice(0, 1_500)}`,
+                text: metadata
+                  ? `Row ${ref} check metadata is invalid: ${failed.message}. Move the prose to Acceptance and put real commands in Checks:/Verify:.`
+                  : `Row ${ref} verification failed: ${failed.command}\n${(
+                      failed.output || failed.message
+                    ).slice(0, 1_500)}`,
               },
             ],
-            details: { action: "verify", rowRef: ref, error: "check-failed", results },
+            details: {
+              action: "verify",
+              rowRef: ref,
+              error: metadata
+                ? "invalid-check"
+                : failed.failureClass === "policy"
+                  ? "shell-quarantined"
+                  : "check-failed",
+              failureClass: failed.failureClass,
+              results,
+            },
           };
         }
         executionEvidence.set(ref, {
@@ -18560,7 +19022,7 @@ ${dispatched.text}`,
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC). Use this date as the <date> prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${today}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File redirects (> and >>) to real files, installs, sed/awk, mkdir outside .pi/plans and the powershell tool stay blocked — but 2>/dev/null and 2>&1 are allowed. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write comprehensive plan to .pi/plans/<date>-<slug>.md where <date> is Today (${today}) and <slug> is kebab-case ≤40 chars, with headings: # Plan: <title>, ## Context, ## Decisions, ## Exploration Summary, ## Plan Steps (numbered 1..N), ## Risks, ## Verification. Per-step metadata lines: label, Checks:, Files:, Workspaces:, Acceptance: (prose only).\n- Executable checks: only a fenced one-command-per-line bash block in ## Verification or a whole-bullet code span runs, e.g. \`\`\`bash\npnpm test\n\`\`\`. An optional fenced \`\`\`checks block adds kind (gate|diagnostic|manual), timeoutMs, workspace and expectedExitCode. \`Acceptance:\` is evidence and is NEVER executed. Never mix a command with prose in one bullet — the plan is refused with a line number. Do not put backticks around only part of a command. Limits: 12 checks per row/final gate, 20 Files entries, 8 workspaces, 4000 chars per command. A plan with zero \`gate\` final checks is unverifiable and needs the user's explicit acknowledgement before freeze. Run \`/plan lint\` (or the plan_validate tool) after writing/editing to preview exactly what will run.\n- If you need to verify the date, run: bash {command: "date -u +%F"} (UTC) — do not guess the date. The extension will auto-correct a wrong prefix to ${today}.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -18906,6 +19368,41 @@ ${dispatched.text}`,
       autoSelect?: boolean;
     },
   ): Promise<boolean> {
+    // Pre-approval gate (Phase B, step 10): compile the plan the user is
+    // approving before it can be frozen. A plan that does not compile is
+    // refused; a compilable plan with no final `gate` check needs an explicit
+    // acknowledgement instead of freezing silently.
+    let gateText =
+      typeof input.planText === "string" ? input.planText : "";
+    if (!gateText.trim()) {
+      try {
+        gateText = fs.readFileSync(input.decision.planPath, "utf8");
+      } catch (_e) {
+        void _e;
+      }
+    }
+    if (gateText.trim()) {
+      const lint = lintPlan(gateText, { path: input.decision.planPath });
+      const gate = planFreezeGate(lint);
+      if (!gate.ok) {
+        if (gate.needsAcknowledgement && (ctx as any).hasUI === true) {
+          const confirmed = await ctx.ui.confirm(
+            "Freeze an unverifiable plan?",
+            `${formatPlanPreview(lint)}\n\n${gate.error}\n\nFreeze this plan anyway?`,
+          );
+          if (!confirmed) {
+            ctx.ui.notify(
+              "Plan not approved — add a final gate check (a fenced command block or a checks: block) and approve again.",
+              "warning",
+            );
+            return false;
+          }
+        } else {
+          ctx.ui.notify(`Plan not approved — ${gate.error}.`, "warning");
+          return false;
+        }
+      }
+    }
     const approved = approveHandoffPlan(input.decision, {
       now: Date.now(),
       via: input.via,
@@ -19675,31 +20172,42 @@ ${dispatched.text}`,
       child: () => orchestratorChild,
       diff: (taskId, expectedFiles, workspaceIds) =>
         diffOrchestratorWorkspace(taskId, expectedFiles, workspaceIds),
-      runRowChecks: async (commands, workspaceRoot) => {
-        const results: Array<{ command: string; ok: boolean; output: string }> = [];
-        for (const command of commands) {
-          const outcome = await runVerificationCommand(
-            command,
-            currentSessionCtx?.signal,
-            currentSessionCtx,
-            workspaceRoot,
-          );
-          results.push({
-            command: command.slice(0, 200),
-            ok: outcome.ok,
-            output: outcome.output.slice(0, 2_000),
-          });
-          if (!outcome.ok) {
-            return {
-              ok: false,
-              results,
-              failure: `row check failed: ${command.slice(0, 200)}${
-                outcome.output ? ` — ${outcome.output.slice(0, 500)}` : ""
-              }`,
-            };
-          }
-        }
-        return { ok: true, results };
+      runRowChecks: async (commands, workspaceRoot, changedRoots) => {
+        // Every row check goes through the shared executor: malformed command
+        // bytes fail closed as metadata and never reach a shell, and the
+        // failure class decides whether a repair round is allowed. Changed
+        // roots travel with the hint so a multi-repo row that names no
+        // workspace either resolves the one changed root or fails closed.
+        const executor = createSessionCheckExecutor(currentSessionCtx);
+        const outcome = await executor.executeMany(
+          commands,
+          {
+            ...(workspaceRoot === undefined ? {} : { boundRoot: workspaceRoot }),
+            ...(changedRoots === undefined ? {} : { changedRoots }),
+          },
+          currentSessionCtx?.signal ? { signal: currentSessionCtx.signal } : undefined,
+        );
+        const results = outcome.results.map((result) => ({
+          command: result.command.slice(0, 200),
+          ok: result.ok,
+          output: (result.output || result.message).slice(0, 2_000),
+        }));
+        if (outcome.ok) return { ok: true, results };
+        const failed = outcome.results.find((result) => !result.ok);
+        return {
+          ok: false,
+          results,
+          failure: `${failed?.failureClass === "metadata" ? "row check metadata invalid" : "row check failed"}: ${(failed?.command ?? "").slice(0, 200)}${
+            failed?.message ? ` — ${failed.message.slice(0, 500)}` : ""
+          }`,
+          // Only `test`/`timeout` may repair; metadata/policy/environment block
+          // and a manual result can never be auto-accepted. The class chooses
+          // the concrete fix the block message shows.
+          ...(failed?.failureClass === undefined
+            ? {}
+            : { failureClass: failed.failureClass }),
+          repairable: failed?.repairable ?? false,
+        };
       },
       runFinalChecks: () => runFinalPlanChecks(),
       dispatchNext: async () => {
@@ -19775,6 +20283,9 @@ ${dispatched.text}`,
       // The controller reconciles a prepared child (and a resume) against this,
       // so a profile switch that races child creation is still honoured.
       desiredModel: () => builderModelPlan(),
+      // A reduced `workflow.orchestrator.childTimeoutMs` is enforced, not
+      // ignored; the frozen default is only used when no setting is present.
+      timeoutMs: orchestratorLimitsFor(ctx).config.childTimeoutMs,
       create: async (input) => {
         const view = orchestratorRuntime?.view();
         const row = view ? rowForTask(view.state, input.taskId) : undefined;
@@ -20041,25 +20552,21 @@ ${dispatched.text}`,
         };
   }
 
-  /** Minimal git runner used by the baseline/commit ports. */
+  /**
+   * Minimal git runner used by the baseline/commit ports. It is bounded: a
+   * `spawnSync` without a timeout let a hung git block the diff path forever,
+   * and a timeout is an `environment` problem (never a repairable test).
+   */
   function runGitSync(
     args: string[],
     cwd: string,
   ): { ok: boolean; stdout: string; stderr: string } {
-    try {
-      const result = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
-      return {
-        ok: result.status === 0,
-        stdout: String(result.stdout ?? ""),
-        stderr: String(result.stderr ?? ""),
-      };
-    } catch (error: unknown) {
-      return {
-        ok: false,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-      };
-    }
+    // A hung git is bounded by `workflow.orchestrator.gitTimeoutMs` (read per
+    // invocation, so a settings change applies without a reload).
+    const result = runBoundedGitSync(args, cwd, {
+      timeoutMs: orchestratorLimitsFor(currentSessionCtx).config.gitTimeoutMs,
+    });
+    return { ok: result.ok, stdout: result.stdout, stderr: result.stderr };
   }
 
   function createLiveBaselinePort(): ReturnType<typeof createGitBaselinePort> {
@@ -20086,141 +20593,171 @@ ${dispatched.text}`,
     return { ok: true };
   }
 
-  /** One deterministic row/plan command, bounded and read-only by convention. */
-  async function runVerificationCommand(
-    command: string,
-    signal?: AbortSignal,
-    ctx?: any,
-    root?: string,
-  ): Promise<{ ok: boolean; output: string }> {
+  /** Shell guard/quarantine gate shared by every check surface. */
+  function checkGuardDecision(): {
+    blocked: boolean;
+    reason?: string;
+    failureClass?: "policy";
+  } {
     if (shellGuardRuntime?.isStopped() || executionState?.shellQuarantine) {
       return {
-        ok: false,
-        output:
+        blocked: true,
+        reason:
           "shell is quarantined; this verification command was refused instead of bypassing the guard",
+        failureClass: "policy",
       };
     }
-    // When the host exposes nested tool execution, use the real bash tool so
-    // policy, shell guard, process-tree timeout and cancellation all apply.
-    if (typeof ctx?.executeTool === "function") {
-      try {
-        const nested = await ctx.executeTool(
-          "bash",
-          { command: scopeCommandToWorkspace(command, root), timeout: 120 },
-          { signal },
-        );
-        const output = (Array.isArray(nested?.content) ? nested.content : [])
-          .map((part: any) =>
-            part?.type === "text" ? String(part.text ?? "") : "",
-          )
-          .join("\n")
-          .trim()
-          .slice(0, 2_000);
-        return { ok: nested?.isError !== true, output };
-      } catch (error: unknown) {
+    return { blocked: false };
+  }
+
+  /**
+   * The one executor every row/final/verify check goes through. The host tool
+   * transport is preferred (shell guard, role policy, process-tree timeout and
+   * cancellation apply); the headless transport re-applies the same validation,
+   * deadline and output bounds, so it is never a silent bypass.
+   */
+  function createSessionCheckExecutor(ctx?: any) {
+    const live = ctx ?? currentSessionCtx;
+    const transport =
+      typeof live?.executeTool === "function"
+        ? createHostCheckTransport({ executeTool: live.executeTool.bind(live) })
+        : createHeadlessCheckTransport();
+    return createCheckExecutor({
+      transport,
+      // Re-read per call so a `/shell-guard limits` change applies immediately.
+      // A check deadline is the SMALLEST of the orchestrator setting, the shell
+      // guard's configured maximum and the hard cap; the setting can tighten a
+      // wait but never widen the guard.
+      limits: () => {
+        const shell = shellGuardLimitsFor(live).config;
+        const orchestrator = orchestratorLimitsFor(live).config;
         return {
-          ok: false,
-          output:
-            error instanceof Error ? error.message : String(error),
+          maxTimeoutSeconds: effectiveVerificationTimeoutSeconds(
+            orchestrator,
+            shell.maxTimeoutSeconds,
+          ),
         };
-      }
-    }
-    return new Promise((resolve) => {
-      const child = spawn(command, {
-        shell: true,
-        cwd: root ?? orchestratorRoot(),
-        windowsHide: true,
-      });
-      let stdout = "";
-      let stderr = "";
-      let settled = false;
-      const finish = (ok: boolean, extra = ""): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-        resolve({
-          ok,
-          output: `${stdout}${stderr}${extra}`.trim().slice(0, 2_000),
-        });
-      };
-      const kill = (): void => {
-        try {
-          child.kill("SIGTERM");
-        } catch (_e) {
-          void _e;
-        }
-        setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch (_e) {
-            void _e;
-          }
-        }, 5_000);
-      };
-      const onAbort = (): void => {
-        kill();
-        finish(false, "\nCommand aborted");
-      };
-      const timer = setTimeout(() => {
-        kill();
-        finish(false, "\nCommand timed out after 120 seconds");
-      }, 120_000);
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-      signal?.addEventListener("abort", onAbort, { once: true });
-      child.stdout?.on("data", (data: Buffer) => {
-        stdout += data.toString();
-      });
-      child.stderr?.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-      child.once("error", (error: Error) => {
-        finish(false, `\n${error.message}`);
-      });
-      child.once("close", (code: number | null) => {
-        finish(code === 0, code === null ? "\nCommand terminated" : "");
-      });
+      },
+      guard: checkGuardDecision,
+      workspaceSet: () => workspaceSetForRun(),
+      now: () => Date.now(),
     });
   }
 
+  /**
+   * The executable final-gate identity of the snapshot this session would run:
+   * the bound run's frozen list when a run exists, else the direct-Build freeze.
+   */
+  function currentFinalGateHash(): { hash: string; executionId: string } | undefined {
+    const view = orchestratorRuntime?.view();
+    const frozen = view?.todos ?? todos.frozen;
+    if (!frozen) return undefined;
+    return {
+      hash: computeFinalGateSpecHash({
+        checks: finalGateCheckSpecs(frozen),
+        workspaces: frozen.workspaces,
+      }),
+      executionId: frozen.executionId,
+    };
+  }
+
+  /**
+   * A passing final gate is reused, never re-run for the same executable spec.
+   * A bound run answers from its journal (the authoritative marker); a direct
+   * Build has no journal, so its pass is remembered for this session.
+   */
+  async function finalGateAlreadyPassed(): Promise<boolean> {
+    const current = currentFinalGateHash();
+    if (!current) return false;
+    const runtime = orchestratorRuntime;
+    const view = runtime?.view();
+    if (runtime && view) {
+      // Another execution's frozen list in this session must not inherit this
+      // run's pass: only compare markers for the same frozen execution.
+      if (todos.frozen && todos.frozen.executionId !== current.executionId) {
+        return finalGatePasses.has(current.hash);
+      }
+      const status = await runtime.finalGateStatus();
+      return status.ok && status.value.satisfied;
+    }
+    return finalGatePasses.has(current.hash);
+  }
+
+  /**
+   * Durable evidence for the gate outcome. A bound run always journals it (a
+   * passing marker is required before completion); a direct Build remembers a
+   * pass in memory because it has no journal to write.
+   */
+  async function rememberFinalGate(
+    outcome: {
+      ok: boolean;
+      results?: CheckExecutionResult[];
+      failureClass?: CheckExecutionResult["failureClass"];
+      failure?: string;
+    },
+  ): Promise<{ ok: boolean; error?: string }> {
+    const runtime = orchestratorRuntime;
+    const view = runtime?.view();
+    if (runtime && view) {
+      const revisions: Record<string, string> = {};
+      for (const entry of orchestratorBaseline?.baseline.entries ?? []) {
+        revisions[entry.workspaceId] = entry.baseline.head || "head";
+      }
+      const recorded = await runtime.recordFinalGate({
+        ok: outcome.ok,
+        ...(outcome.results === undefined ? {} : { results: outcome.results }),
+        workspaceRevisions: revisions,
+        ...(outcome.failureClass === undefined
+          ? {}
+          : { failureClass: outcome.failureClass }),
+        ...(outcome.failure === undefined ? {} : { failure: outcome.failure }),
+      });
+      return recorded.ok ? { ok: true } : { ok: false, error: recorded.error };
+    }
+    const current = currentFinalGateHash();
+    if (current && outcome.ok) finalGatePasses.set(current.hash, Date.now());
+    return { ok: true };
+  }
+
   /** Run the plan-level Verification commands once, in their workspace roots. */
-  async function runFinalPlanChecks(): Promise<{ ok: boolean; failure?: string }> {
+  async function runFinalPlanChecks(): Promise<{
+    ok: boolean;
+    failure?: string;
+    repairable?: boolean;
+    failureClass?: CheckExecutionResult["failureClass"];
+    results?: CheckExecutionResult[];
+  }> {
     const view = orchestratorRuntime?.view();
     const frozen = view?.todos ?? todos.frozen;
     const set = view ? workspaceSetForRun() : undefined;
-    const specs: Array<{ command: string; workspace?: string }> =
-      frozen?.planCheckSpecs ??
-      (frozen?.planChecks.map((command) => ({ command })) ?? []);
-    for (const spec of specs ?? []) {
-      let root: string | undefined;
-      if (spec.workspace) {
-        root = resolveWorkspaceAlias(set, spec.workspace)?.root;
-        if (!root) {
-          return {
-            ok: false,
-            failure: `${spec.command.slice(0, 200)}: unknown workspace ${spec.workspace}`,
-          };
-        }
-      } else {
-        root = primaryWorkspace(set)?.root;
-      }
-      const outcome = await runVerificationCommand(
-        spec.command,
-        currentSessionCtx?.signal,
-        currentSessionCtx,
-        root,
-      );
-      if (!outcome.ok) {
-        return {
-          ok: false,
-          failure: `${spec.command.slice(0, 200)}: ${outcome.output.slice(0, 500) || "non-zero exit"}`,
-        };
-      }
+    const specs = executablePlanCheckSpecs(frozen);
+    const validation = validatePlanCheckSpecs(specs, set?.roots);
+    if (!validation.ok) {
+      return {
+        ok: false,
+        failure: `final plan check metadata invalid: ${validation.error}`,
+        failureClass: "metadata",
+        repairable: false,
+      };
     }
-    return { ok: true };
+    const executor = createSessionCheckExecutor(currentSessionCtx);
+    const outcome = await executor.executeMany(
+      specs,
+      set ? { set } : undefined,
+      currentSessionCtx?.signal ? { signal: currentSessionCtx.signal } : undefined,
+    );
+    const failed = outcome.results.find((result) => !result.ok);
+    if (!failed) return { ok: true, results: outcome.results };
+    return {
+      ok: false,
+      failure: `${failed.failureClass === "metadata" ? "final plan check metadata invalid" : "final plan check failed"}: ${failed.command.slice(0, 200)}: ${
+        failed.message.slice(0, 500) || "non-zero exit"
+      }`,
+      failureClass: failed.failureClass,
+      // A metadata/policy/environment failure must block, not repair.
+      repairable: failed.repairable,
+      results: outcome.results,
+    };
   }
 
   function resetOrchestratorComposition(): void {
@@ -20315,6 +20852,15 @@ ${dispatched.text}`,
     orchestratorRuntime = createOrchestratorRuntime({
       createJournal: (runId) =>
         createRunJournal({ dir: path.join(runsRoot, runId), runId, io }),
+      listRunIds: async () => {
+        try {
+          const entries = await fs.promises.readdir(runsRoot, { withFileTypes: true });
+          return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+        } catch (_e) {
+          void _e;
+          return [];
+        }
+      },
       readPlan: async (planPath) => await fs.promises.readFile(planPath, "utf8"),
       notify: (message, level) => ctx.ui.notify(message, level),
       appendEntry: (type, data) => pi.appendEntry(type, data),
@@ -20330,15 +20876,20 @@ ${dispatched.text}`,
     if (orchestratorRuntime?.view()) return;
     const planPath = currentPlanFile;
     if (!planPath) return;
-    let planText: string;
+    const runtime = ensureOrchestratorRuntime(ctx);
+    // An unreadable plan file must not strand an intact journal: omit the text
+    // and let the runtime rebind by the journaled source path.
+    let planText: string | undefined;
     try {
       planText = await fs.promises.readFile(planPath, "utf8");
     } catch (_e) {
       void _e;
-      return;
+      planText = undefined;
     }
-    const runtime = ensureOrchestratorRuntime(ctx);
-    const restored = await runtime.restoreFromPlan({ planPath, planText });
+    const restored = await runtime.restoreFromPlan({
+      planPath,
+      ...(planText === undefined ? {} : { planText }),
+    });
     if (!restored.ok) return;
     const placed = todos.freeze(restored.value.frozen);
     // A reload cannot keep an in-process child. A `running` row is blocked
@@ -21138,8 +21689,24 @@ ${dispatched.text}`,
           verified &&
           (executionState || (todos.frozen?.planChecks.length ?? 0) > 0)
         ) {
-          const final = await runFinalPlanChecks();
+          // The same executable spec must not be gated twice: the advance
+          // path journals a marker, and this branch reuses it instead of
+          // re-running the frozen commands (the incident's second call path).
+          const alreadyPassed = await finalGateAlreadyPassed();
+          const final: Awaited<ReturnType<typeof runFinalPlanChecks>> = alreadyPassed
+            ? { ok: true }
+            : await runFinalPlanChecks();
           if (!final.ok) {
+            // A failing marker is audit evidence; the block below stands even
+            // when it cannot be written.
+            await rememberFinalGate({
+              ok: false,
+              ...(final.results === undefined ? {} : { results: final.results }),
+              ...(final.failureClass === undefined
+                ? {}
+                : { failureClass: final.failureClass }),
+              ...(final.failure === undefined ? {} : { failure: final.failure }),
+            });
             if (executionState) {
               const blocked = applyExecutionEvent(executionState, {
                 type: "block",
@@ -21158,6 +21725,22 @@ ${dispatched.text}`,
             updateStatus(ctx as any);
             ctx.ui.notify(
               `Build not complete: final plan check failed (${final.failure ?? "unknown"}). The run is blocked, not green.`,
+              "warning",
+            );
+            return;
+          }
+          // Completion is a verified terminal claim: a bound orchestrator run
+          // requires this durable marker, and a direct Build remembers the pass
+          // so the other call path cannot re-run the same checks.
+          const recorded = await rememberFinalGate({
+            ok: true,
+            ...(final.results === undefined ? {} : { results: final.results }),
+          });
+          if (!recorded.ok) {
+            persistState();
+            updateStatus(ctx as any);
+            ctx.ui.notify(
+              `Build not complete: the final gate passed but its marker could not be journaled (${recorded.error}). The run is not green.`,
               "warning",
             );
             return;

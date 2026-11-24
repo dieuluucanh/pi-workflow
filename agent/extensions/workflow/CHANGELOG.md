@@ -1,5 +1,98 @@
 ## Unreleased
 
+- **Rollout: read-only migration report, dual-read verification and the honest
+  gate record (row 19).** New `migration-scan.ts` (plus
+  `migration-scan.test.ts`, registered in `files`/`test`) inventories existing
+  state without writing: per run it replays the journal, applies
+  `plan-check-specs-repair` amendments in memory, reports the stored snapshot
+  version and what the reader upcast from, lists malformed/quarantined checks
+  and the exact bytes that will never execute, flags checks bound to an
+  unbound workspace alias, lists prose `acceptanceChecks` as criteria, and
+  detects a stale `snapshot.json`. Per plan it compiles with the same linter as
+  the freeze path and reports rows, gate/diagnostic/manual counts, row checks
+  and line-numbered errors. `scripts/migration-report.mjs` is the read-only
+  filesystem walk (`--runs-dir`, `--plans-dir`, `--plan`, `--json`, `--strict`)
+  and ends with an explicit repair list; it never edits a journal or snapshot.
+  Scanning the live runs root found 6 runs (4 v1, 1 already amended, 2 older
+  runs with no `todos.frozen`) and 134 plans (75 legacy plans still carry
+  prose bullets and do not compile), with no run rewritten. The repaired
+  ERP run still restores at `paused`, seq 76, 14/15 accepted, 6 valid checks
+  and stays v1 on disk (not migrated). Harness gates: `npm test` 2005/2005,
+  `typecheck`, `check:policy` 100/100, `check:read-policy`, and the pack gate
+  (111 files, 1/1 package). ERP static gates: `format:check`,
+  `check:docs-reference` (7 pages), `check:docs-glossary` (52 terms),
+  `typecheck` (91/91), `lint` (49/49) and `check` (20 sub-gates, exit 0).
+  Explicitly not claimed: ERP full `pnpm test`, Playwright, provider sandbox,
+  benchmark, N−1 seeded upgrade, release diagnostics, publish/commit, and
+  task 15's 15/15 (the user's `/orchestrator retry` remains). Outcome recorded
+  in `docs/rollout-2026-11-24-plan-execution-contract.md`; the migration guide
+  gains the read-only first step.
+
+- **Typed plan-execution contract, canonical docs and recovery, end to end
+  (Phase A + Phase B).** Plans are now compiled by one authority
+  (`plan-compiler.ts`) into a typed `PlanSpec`: rows from `## Plan Steps`, typed
+  row/final checks from fenced command blocks, whole-bullet code spans and a
+  restricted `checks:` block (`kind`, `workspace`, `timeoutMs`,
+  `expectedExitCode`), `Acceptance:` kept as non-executable criteria, and
+  line-numbered diagnostics. `/plan lint` / `/workflow lint` / `plan_validate`
+  plus the handoff preview and reviewer gate compile before approval, so an
+  ambiguous or prose-only check is refused instead of frozen; a zero-gate plan
+  needs an explicit acknowledgement. Freeze writes a `schemaVersion: 2`
+  `FrozenExecutionSnapshot` with provenance, typed checks, workspaces and a
+  validation report, while v1 snapshots upcast in memory, malformed v1 checks
+  are quarantined (never executed) and unknown versions fail closed. Journal
+  lines keep their v1 framing/checksum/`prev` chain but every known event type
+  now has a payload validator, unknown event types and payload versions are
+  rejected, and `snapshot.json` seq/revision is cross-checked. Restore reads the
+  journaled snapshot instead of re-freezing from mutable plan text and rebinds
+  by plan path when the digest changed. One `CheckExecutor` (host-tool and
+  headless transports with the same validation, workspace, deadline and output
+  bounds) classifies every failure; only `test`/`timeout` repair, while
+  `metadata`/`policy`/`environment` block with a concrete fix. The final gate is
+  journaled once as a content-addressed `final_gate` record, so a passed gate
+  cannot re-run and an amended list needs a new pass. `workflow.orchestrator`
+  owns `childTimeoutMs`, `verificationTimeoutSeconds` and `gitTimeoutMs`, and a
+  malformed frozen list is repaired by the append-only
+  `plan-check-specs-repair` `run.control` event through
+  `/orchestrator-repair-checks` or `scripts/repair-orchestrator-checks.mjs`.
+  New docs: `docs/plan-format.md` (format, surfaces, limits, failure taxonomy,
+  final-gate marker, amendment, settings, v1→v2 compatibility and what is never
+  auto-executed), `docs/plan-template.md` (canonical skeleton that lints clean)
+  and `docs/plan-migration.md`; the README gains a plan-format section. No
+  `package.json` version bump and no new `## [x.y.z]` section.
+
+- **Plan lint, preview and pre-approval gating.** The compiler is now consulted
+  before approval, not at run creation. `/plan lint [path]` (and `/workflow
+  lint [path]`) plus the read-only `plan_validate` tool print the row count,
+  gate/diagnostic/manual counts, every exact final/per-row command with its
+  workspace, timeout and expected exit code, and line-numbered
+  warnings/errors. The handoff sheet carries the same compiled preview. A plan
+  that does not compile is refused before `run.created`; a plan with zero final
+  `gate` checks needs an explicit acknowledgement, while a fenced-commands
+  `## Verification` freezes with no extra prompt. Reviewer rewrites go through
+  the same gate and cannot introduce an ambiguous check or drop every gate
+  silently. The Plan Mode prompt now documents the executable-check syntax,
+  per-row metadata, limits and the acknowledgement rule. New module
+  `plan-lint.ts` (registered in `package.json` `files` and the `test` script)
+  with `plan-lint.test.ts` coverage; no journal, snapshot or on-disk format
+  changed.
+
+- **Frozen plan-check recovery (Phase A).** `/orchestrator-repair-checks`
+  (`status`, `--file <manifest.json>`, `--from-plan`, `--allow-empty`, `--yes`)
+  and `scripts/repair-orchestrator-checks.mjs` append ONE durable
+  `plan-check-specs-repair` `run.control` amendment instead of rewriting the
+  journal. The current and proposed checks are shown first; the in-session path
+  asks `ui.confirm` unless `--yes` and re-freezes through the TODO store so
+  `validateFrozenSnapshot` re-checks the result and the panel updates. The
+  script defaults to a dry run, requires `--apply --yes`, enforces optional
+  `--expect-seq`/`--expect-accepted` fences, stores the manifest via
+  `journal.putArtifact`, then reopens the run and verifies seq +1, the checksum
+  chain, `snapshot.json`, the replayed specs and the unchanged accepted/task
+  states; a repeated apply is a no-op. The command is pinned in
+  `fixtures/compat-baseline.json`; new coverage: `plan-checks.test.ts` fixtures,
+  `repair-orchestrator-checks.test.ts` temp-run integration and `RC1`–`RC5`
+  command cases.
+
 - **Orchestrator Working/Paused on the composer, with pause-only Esc.** The in-process Build child is a separate session, so the host's native indicator never represented it and the child UI bridge (correctly) no-ops every chrome write. The Workflow editor now projects the child onto the real composer top border in Parent, Child and Auto views: `Working · Builder n/m · <tool>` with `ESC or /orchestrator-pause to pause · /orchestrator-abort to stop`, `Pausing…`, `Paused · /orchestrator-resume to continue`, and `Verifying…`. Esc is handled in the focused editor (not a global listener), so autocomplete and permission dialogs keep their own Esc. Once the child owns execution, EVERY Esc press is consumed: a pause burst cannot reach the host abort, dispose the child, or fail the row; paused/settling presses are inert with a rate-limited reminder. The controller now scopes pause intent across `agent_start`/`agent_settled` and the prompt rejection, suspends the active execution deadline while paused (remaining budget preserved), and resumes only after pause settlement; resume is a short admission so a resumed child can be paused again immediately. `/orchestrator-pause|resume|abort|view` now route through the operator, fixing duplicate/racy transitions and false "forwarded" prose for a starting child. New tests: `orchestrator-activity`, `orchestrator-child-controller`, `orchestrator-child-ui`, composer border/Esc cases in `tab-editor`, and `OC1`/`OC2` end-to-end cases.
 
 - **Live child model switching + child telemetry.** `/profile use` (picker and prompt), `/role set`, and the role picker now switch an ALREADY-RUNNING Orchestrator Build child and Review reviewer in place through the public `AgentSession.setModel` (`persist: false`): the in-flight request finishes on the old model, the next provider request uses the new one, nothing is aborted or restarted, the warm session is kept, and the next child/round always launches on the new model. A switch that races child creation is reconciled before the first prompt (a refused prepared-child switch is replaced by a fresh child); a paused child switches before resume. A refused switch keeps the live session, names both models, and never blocks the row/round. The Orchestrator child no longer persists a programmatic switch as the global default model/thinking. `in-process-child.ts` now exposes `currentModel()`/`stats()`/`setModel()` (feature-detected, never throwing); `child-stats.ts` is the one formatter for model, context %, tokens and elapsed time. `/orchestrator-view` now switches BOTH the pinned panel and the footer's `workflow-orchestrator` line (child view/auto: full child line; parent view: run/next plus a compact child hint), always one bounded row; a single unref'd repaint clock drives elapsed only while a shown child is starting/running and stops on pause/settle/parent-view/reload. The pinned panel header, `/orchestrator status|inspect`, and the host `orchestrator-child` contribution share the same truth (the child row keeps its historical shape and appends stats). New tests: `child-stats`, `orchestrator-stats-clock`, `in-process-child`, `orchestrator-child-controller`, `orchestrator-child-view`, plus `OE5`–`OE10`/`RE1` end-to-end cases.

@@ -35,6 +35,20 @@ import workflowExtension from "./index.ts";
 import { BUILT_IN_ROLES, defaultRoleConfig, ROLE_CONFIG_VERSION } from "./roles.ts";
 import { PROFILE_ROLES } from "./profiles.ts";
 import { WORKFLOW_STATUS_KEYS } from "./workflow-status.ts";
+import { PLAN_COMPILER_VERSION, compilePlan } from "./plan-compiler.ts";
+import {
+  CHECK_KINDS,
+  MAX_ACCEPTANCE_CRITERIA,
+  MAX_CHECKS,
+  MAX_CHECK_TIMEOUT_MS,
+  MAX_FILES,
+  MAX_PLAN_ROWS,
+  MAX_TEXT,
+  MAX_WORKSPACES,
+  PLAN_SPEC_VERSION,
+} from "./plan-spec.ts";
+import { FROZEN_EXECUTION_SCHEMA_VERSION } from "./frozen-snapshot.ts";
+import { JOURNAL_VERSION, SNAPSHOT_VERSION } from "./orchestrator-store.ts";
 import {
   fakeSdk,
   latestStatus,
@@ -57,6 +71,26 @@ interface Baseline {
   roles: { builtIn: string[]; configVersion: number; profileRoles: string[] };
   statusKeys: Record<string, string>;
   widgetKeys: string[];
+  planContract: {
+    compilerVersion: string;
+    planSpecVersion: number;
+    frozenSchemaVersion: number;
+    journalVersion: number;
+    snapshotVersion: number;
+    checkKinds: string[];
+    limits: {
+      maxRows: number;
+      maxChecks: number;
+      maxAcceptanceCriteria: number;
+      maxFiles: number;
+      maxWorkspaces: number;
+      maxText: number;
+      maxCheckTimeoutMs: number;
+    };
+    goldenFixture: string;
+    goldenSpecHash: string;
+    goldenPlanChecks: string[];
+  };
 }
 
 function readBaseline(): Baseline {
@@ -196,6 +230,49 @@ test("compat baseline: host-consumed status and widget keys are stable", () => {
     "workflow-review-status",
     "workflow-todos",
   ]);
+});
+
+test("compat baseline: the plan compiler/checkpoint contract is pinned", () => {
+  const baseline = readBaseline().planContract;
+  assert.equal(baseline.compilerVersion, PLAN_COMPILER_VERSION);
+  assert.equal(baseline.planSpecVersion, PLAN_SPEC_VERSION);
+  assert.equal(baseline.frozenSchemaVersion, FROZEN_EXECUTION_SCHEMA_VERSION);
+  assert.equal(baseline.journalVersion, JOURNAL_VERSION);
+  assert.equal(baseline.snapshotVersion, SNAPSHOT_VERSION);
+  assert.deepEqual(baseline.checkKinds, [...CHECK_KINDS]);
+  assert.deepEqual(baseline.limits, {
+    maxRows: MAX_PLAN_ROWS,
+    maxChecks: MAX_CHECKS,
+    maxAcceptanceCriteria: MAX_ACCEPTANCE_CRITERIA,
+    maxFiles: MAX_FILES,
+    maxWorkspaces: MAX_WORKSPACES,
+    maxText: MAX_TEXT,
+    maxCheckTimeoutMs: MAX_CHECK_TIMEOUT_MS,
+  });
+});
+
+test("compat baseline: the golden plan still compiles to the pinned gate list", () => {
+  const baseline = readBaseline().planContract;
+  const markdown = fs.readFileSync(path.join(HERE, baseline.goldenFixture), "utf8");
+  const workspace = {
+    id: "W",
+    key: "plain:C:/work",
+    root: "C:/work",
+    kind: "plain" as const,
+    displayPath: "C:/work",
+    primary: true,
+  };
+  const compiled = compilePlan(markdown, {
+    path: "C:/work/.pi/plans/fenced-commands.md",
+    workspaces: [workspace],
+  });
+  assert.equal(compiled.ok, true, compiled.ok ? "" : compiled.error);
+  if (!compiled.ok) return;
+  assert.equal(compiled.spec.compiler.specHash, baseline.goldenSpecHash);
+  assert.deepEqual(
+    compiled.spec.planChecks.map((check) => check.command),
+    baseline.goldenPlanChecks,
+  );
 });
 
 test("compat baseline: session startup sets the status keys and stays idempotent", async () => {

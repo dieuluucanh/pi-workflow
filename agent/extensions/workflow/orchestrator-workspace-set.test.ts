@@ -395,7 +395,7 @@ test("capture selects row roots and fails the whole set on one root", async () =
   assert.match(failed.ok ? "" : failed.error, /D|unreadable/);
 });
 
-test("row cwd and check root follow explicit, single-changed, then primary", () => {
+test("row cwd and check root follow explicit, single-changed, then fail closed", () => {
   const before = setBaseline(
     baseline(W, "git:c:/work/w", "w1"),
     baseline(D, "git:c:/work/d", "d1"),
@@ -408,10 +408,30 @@ test("row cwd and check root follow explicit, single-changed, then primary", () 
   assert.equal(diff.ok, true);
   if (!diff.ok) return;
   assert.equal(workspaceRootForRow(set(), { workspaces: ["D"] })?.root, D);
-  assert.equal(workspaceRootForRow(set(), {})?.root, W);
+  // Two bound roots and no row workspace is ambiguous: never guess the primary.
+  assert.equal(workspaceRootForRow(set(), {}), undefined);
+  const single: WorkspaceSet = {
+    ...set(),
+    roots: set().roots.filter((root) => root.primary),
+  };
+  assert.equal(workspaceRootForRow(single, {})?.root, W);
   assert.equal(workspaceCheckRoot(set(), { workspaces: ["D"] }, diff.value), D);
   assert.equal(workspaceCheckRoot(set(), {}, diff.value), D);
-  assert.equal(workspaceCheckRoot(set(), {}, { ...diff.value, entries: diff.value.entries.map((entry) => ({ ...entry, diff: { ...entry.diff, changed: true } })) }), W);
+  // Several changed roots are ambiguous too: no primary-root default.
+  assert.equal(
+    workspaceCheckRoot(
+      set(),
+      {},
+      {
+        ...diff.value,
+        entries: diff.value.entries.map((entry) => ({
+          ...entry,
+          diff: { ...entry.diff, changed: true },
+        })),
+      },
+    ),
+    undefined,
+  );
   assert.equal(workspaceCheckRoot(undefined, {}, undefined), undefined);
 });
 

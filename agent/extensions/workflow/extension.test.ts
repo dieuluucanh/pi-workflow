@@ -6888,3 +6888,204 @@ test("OC2: a foreign editor gets the fallback line; shutdown clears it", async (
     if (!cleaned) await b.cleanup();
   }
 });
+
+// ── RC: /orchestrator-repair-checks (Phase A recovery command) ────────
+
+function repairPlan(steps: string[], checks: string[]): string {
+  return [
+    "# Plan: Repair checks",
+    "",
+    "## Plan Steps",
+    "",
+    ...steps.map((step, index) => `${index + 1}. ${step}`),
+    "",
+    "## Verification",
+    "",
+    "```bash",
+    ...checks,
+    "```",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Boot an Orchestrator run with frozen final checks, then abort the live child
+ * so the run is `paused` with a blocked (not running) row — the only state in
+ * which a final-check amendment is allowed.
+ */
+async function bootRepairableRun(
+  prefix: string,
+  checks: string[],
+  over: BootOptions = {},
+) {
+  const child =
+    over.child ?? makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({
+    hasUI: true,
+    executionMode: "orchestrator",
+    ...over,
+    child,
+  });
+  const plan = placePlan(b.cwd, `${prefix}.md`);
+  fs.writeFileSync(plan.abs, repairPlan(["Only row"], checks));
+  await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+  await settleTick();
+  await b.pi.commands["orchestrator-abort"].handler("", b.ctx);
+  await settleTick();
+  return { b, plan, child };
+}
+
+function lastRepairNotice(b: { notifies: Array<{ message: string }> }): string {
+  return String(b.notifies.at(-1)?.message ?? "");
+}
+
+test("RC1: /orchestrator-repair-checks help and status are read-only", async () => {
+  const { b } = await bootRepairableRun("rc1", ["pnpm typecheck", "pnpm lint"]);
+  try {
+    await b.pi.commands["orchestrator-repair-checks"].handler("help", b.ctx);
+    assert.match(lastRepairNotice(b), /Usage: \/orchestrator-repair-checks/);
+
+    await b.pi.commands["orchestrator-repair-checks"].handler("", b.ctx);
+    const status = lastRepairNotice(b);
+    assert.match(status, /Orchestrator run run-/);
+    assert.match(status, /— paused/);
+    assert.match(status, /Final checks \(2\)/);
+    assert.match(status, /ok pnpm typecheck/);
+    assert.match(status, /ok pnpm lint/);
+    assert.equal(b.confirms.length, 0, "status never asks for confirmation");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RC2: --file shows old -> new, confirms, then amends and re-freezes", async () => {
+  const { b } = await bootRepairableRun("rc2", ["pnpm typecheck"]);
+  try {
+    const manifest = path.join(b.cwd, "repair-manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({
+        reason: "Use the real gate instead of the stale check.",
+        source: "RC2 test",
+        commands: ["pnpm test"],
+      }),
+      "utf8",
+    );
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      `--file ${manifest}`,
+      b.ctx,
+    );
+    assert.equal(b.confirms.length, 1, "the default path asks first");
+    const prompt = b.confirms[0]!.message;
+    assert.match(prompt, /Current:/);
+    assert.match(prompt, /ok pnpm typecheck/);
+    assert.match(prompt, /Proposed:/);
+    assert.match(prompt, /gate pnpm test/);
+    assert.match(prompt, /Reason: Use the real gate/);
+    assert.match(lastRepairNotice(b), /Amended 1 final check\(s\)/);
+
+    await b.pi.commands["orchestrator-repair-checks"].handler("status", b.ctx);
+    assert.match(lastRepairNotice(b), /Final checks \(1\)/);
+    assert.match(lastRepairNotice(b), /ok pnpm test/);
+    assert.doesNotMatch(lastRepairNotice(b), /pnpm typecheck/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RC3: a declined confirmation leaves the frozen checks untouched", async () => {
+  const { b } = await bootRepairableRun("rc3", ["pnpm typecheck"], {
+    confirmAnswer: false,
+  });
+  try {
+    const manifest = path.join(b.cwd, "repair-manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ reason: "declined", source: "RC3", commands: ["pnpm test"] }),
+      "utf8",
+    );
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      `--file ${manifest}`,
+      b.ctx,
+    );
+    assert.equal(b.confirms.length, 1);
+    assert.match(lastRepairNotice(b), /cancelled/);
+    await b.pi.commands["orchestrator-repair-checks"].handler("status", b.ctx);
+    assert.match(lastRepairNotice(b), /ok pnpm typecheck/);
+    assert.doesNotMatch(lastRepairNotice(b), /pnpm test/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RC4: --yes skips the confirmation and --from-plan recompiles the plan", async () => {
+  const { b, plan } = await bootRepairableRun("rc4", ["pnpm typecheck"]);
+  try {
+    const manifest = path.join(b.cwd, "repair-manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ reason: "yes", source: "RC4", commands: ["pnpm lint"] }),
+      "utf8",
+    );
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      `--file ${manifest} --yes`,
+      b.ctx,
+    );
+    assert.equal(b.confirms.length, 0, "--yes never asks");
+    assert.match(lastRepairNotice(b), /Amended 1 final check\(s\)/);
+
+    // The plan is the authoring surface: rewriting Verification and using
+    // --from-plan proposes the new commands (the frozen copy is what changed).
+    fs.writeFileSync(plan.abs, repairPlan(["Only row"], ["pnpm test", "pnpm format:check"]));
+    await b.pi.commands["orchestrator-repair-checks"].handler("--from-plan --yes", b.ctx);
+    assert.match(lastRepairNotice(b), /Amended 2 final check\(s\)/);
+    await b.pi.commands["orchestrator-repair-checks"].handler("status", b.ctx);
+    assert.match(lastRepairNotice(b), /Final checks \(2\)/);
+    assert.match(lastRepairNotice(b), /ok pnpm test/);
+    assert.match(lastRepairNotice(b), /ok pnpm format:check/);
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("RC5: repair refuses a running run and an invalid manifest", async () => {
+  const child = makeFakeOrchestratorChildFactory({ settleOnPrompt: false });
+  const b = await boot({ hasUI: true, executionMode: "orchestrator", child });
+  try {
+    const plan = placePlan(b.cwd, "rc5.md");
+    fs.writeFileSync(plan.abs, repairPlan(["Only row"], ["pnpm typecheck"]));
+    await b.pi.commands.orchestrator.handler(`start ${plan.abs}`, b.ctx);
+    await settleTick();
+
+    const manifest = path.join(b.cwd, "repair-manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ reason: "running", source: "RC5", commands: ["pnpm test"] }),
+      "utf8",
+    );
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      `--file ${manifest} --yes`,
+      b.ctx,
+    );
+    assert.match(lastRepairNotice(b), /cannot amend|live child/);
+
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      "--file does-not-exist.json --yes",
+      b.ctx,
+    );
+    assert.match(lastRepairNotice(b), /Cannot read the manifest/);
+
+    const bad = path.join(b.cwd, "bad-manifest.json");
+    fs.writeFileSync(bad, JSON.stringify({ reason: "x", source: "y" }), "utf8");
+    await b.pi.commands["orchestrator-repair-checks"].handler(
+      `--file ${bad} --yes`,
+      b.ctx,
+    );
+    assert.match(lastRepairNotice(b), /Invalid manifest: manifest needs commands/);
+
+    await b.pi.commands["orchestrator-repair-checks"].handler("--bogus", b.ctx);
+    assert.match(lastRepairNotice(b), /Unknown argument "--bogus"/);
+  } finally {
+    await b.cleanup();
+  }
+});

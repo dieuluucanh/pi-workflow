@@ -14,6 +14,7 @@ import {
   applyRunEvent,
   createRunState,
   nextPendingTask,
+  reconcileRunStateWithFrozenStatus,
   rowForTask,
   taskCounts,
   taskIdForRef,
@@ -64,6 +65,50 @@ test("create: an empty or corrupt snapshot fails closed", () => {
     now: 1,
   });
   assert.equal(empty.ok, false);
+});
+
+test("a frozen row status is reconciled instead of resurrected as pending", () => {
+  const snapshot = frozen(4);
+  const statuses = ["completed", "cancelled", "in_progress", "pending"] as const;
+  const rows = snapshot.rows.map((row, index) => ({ ...row, status: statuses[index]! }));
+  const todos = { ...snapshot, rows };
+
+  const seeded = createRunState({ runId: "run-status", todos, now: 10 });
+  assert.equal(seeded.ok, true);
+  if (!seeded.ok) return;
+  assert.equal(seeded.state.tasks["task-1"]!.state, "accepted");
+  assert.equal(seeded.state.tasks["task-1"]!.acceptedAt, 10);
+  assert.equal(seeded.state.tasks["task-2"]!.state, "blocked");
+  assert.match(seeded.state.tasks["task-2"]!.blockedReason ?? "", /cancelled/);
+  // A reload has no live child: an in_progress row is recoverable work, not a
+  // running task, and a pending row stays pending.
+  assert.equal(seeded.state.tasks["task-3"]!.state, "pending");
+  assert.equal(seeded.state.tasks["task-4"]!.state, "pending");
+  assert.equal(nextPendingTask(seeded.state), "task-3");
+
+  // Journal replay starts all-pending (so historical events replay) and
+  // reconciles once afterwards. An event that already moved a row wins.
+  const baseline = createRunState({
+    runId: "run-status",
+    todos,
+    now: 10,
+    honorRowStatus: false,
+  });
+  assert.equal(baseline.ok, true);
+  if (!baseline.ok) return;
+  assert.equal(baseline.state.tasks["task-1"]!.state, "pending");
+  const retried = {
+    ...baseline.state,
+    tasks: {
+      ...baseline.state.tasks,
+      "task-2": { ...baseline.state.tasks["task-2"]!, state: "needs_fix" as const },
+    },
+  };
+  const reconciled = reconcileRunStateWithFrozenStatus(retried, 20);
+  assert.equal(reconciled.tasks["task-1"]!.state, "accepted");
+  assert.equal(reconciled.tasks["task-2"]!.state, "needs_fix");
+  assert.equal(reconciled.tasks["task-3"]!.state, "pending");
+  assert.equal(reconciled.updatedAt, 20);
 });
 
 test("happy path: start → report → verify → accept", () => {

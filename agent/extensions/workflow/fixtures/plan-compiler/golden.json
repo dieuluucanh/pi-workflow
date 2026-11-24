@@ -1,0 +1,185 @@
+{
+  "fenced-commands": {
+    "title": "Fenced commands only",
+    "specHash": "02e282d3dc843ec3ddf024722afbb50f46e7aaa237336c3ab5751c32261a1026",
+    "rows": [
+      {
+        "id": "todo-mtlq6g",
+        "ref": "1",
+        "text": "Run the typecheck",
+        "label": "1",
+        "checks": [],
+        "acceptanceCriteria": [],
+        "expectedFiles": [],
+        "workspaces": [],
+        "sourceLine": 11
+      },
+      {
+        "id": "todo-17rm8fd",
+        "ref": "2",
+        "text": "Run the suite",
+        "label": "2",
+        "checks": [],
+        "acceptanceCriteria": [],
+        "expectedFiles": [],
+        "workspaces": [],
+        "sourceLine": 12
+      }
+    ],
+    "planChecks": [
+      {
+        "id": "check-1",
+        "command": "npm run typecheck",
+        "kind": "gate"
+      },
+      {
+        "id": "check-2",
+        "command": "node --test \"suite with spaces.test.ts\"",
+        "kind": "gate",
+        "workspace": "W"
+      },
+      {
+        "id": "check-3",
+        "command": "npm run lint",
+        "kind": "gate"
+      }
+    ],
+    "diagnostics": []
+  },
+  "checks-block": {
+    "title": "Typed checks block",
+    "specHash": "1856163c2020c17dc67ddfc31da1df7af8baf954c3a5d274079dff93bf117380",
+    "rows": [
+      {
+        "id": "todo-unlyl8",
+        "ref": "1",
+        "text": "Add the module",
+        "label": "1",
+        "checks": [
+          {
+            "id": "check-row-1-1",
+            "command": "npm test",
+            "kind": "gate"
+          },
+          {
+            "id": "check-row-1-2",
+            "command": "node --test \"src/a,b;c.test.ts\"",
+            "kind": "gate"
+          },
+          {
+            "id": "row-lint",
+            "command": "npm run lint",
+            "kind": "diagnostic",
+            "timeoutMs": 120000
+          }
+        ],
+        "acceptanceCriteria": [
+          "the module is documented",
+          "the fixture stays prose"
+        ],
+        "expectedFiles": [
+          "src/module.ts",
+          "tests/module.test.ts"
+        ],
+        "workspaces": [
+          "W"
+        ],
+        "sourceLine": 5
+      },
+      {
+        "id": "todo-1u1puxk",
+        "ref": "2",
+        "text": "Wire it up",
+        "label": "2",
+        "checks": [],
+        "acceptanceCriteria": [],
+        "expectedFiles": [],
+        "workspaces": [],
+        "sourceLine": 18
+      }
+    ],
+    "planChecks": [
+      {
+        "id": "typecheck",
+        "command": "pnpm typecheck",
+        "kind": "gate",
+        "workspace": "W"
+      },
+      {
+        "id": "docs",
+        "command": "pnpm check:docs-reference",
+        "kind": "gate",
+        "timeoutMs": 900000
+      },
+      {
+        "id": "check-3",
+        "command": "npm run build",
+        "kind": "gate"
+      }
+    ],
+    "diagnostics": []
+  },
+  "mixed": {
+    "title": "Mixed authoring",
+    "specHash": "56a7118592b06300423b7dc65d9fcf71b12c63aa04a48ff04f8c57794811e9c6",
+    "rows": [
+      {
+        "id": "todo-1vf0gi1",
+        "ref": "1",
+        "text": "Prepare the fixture",
+        "label": "1",
+        "checks": [
+          {
+            "id": "check-row-1-1",
+            "command": "npm run prepare",
+            "kind": "gate"
+          }
+        ],
+        "acceptanceCriteria": [
+          "the fixture explains itself",
+          "it stays prose"
+        ],
+        "expectedFiles": [
+          "fixtures/plan-compiler/mixed.md"
+        ],
+        "workspaces": [
+          "W"
+        ],
+        "sourceLine": 11
+      },
+      {
+        "id": "todo-enct4l",
+        "ref": "2",
+        "text": "Execute it",
+        "label": "2",
+        "checks": [],
+        "acceptanceCriteria": [],
+        "expectedFiles": [],
+        "workspaces": [],
+        "sourceLine": 17
+      }
+    ],
+    "planChecks": [
+      {
+        "id": "check-1",
+        "command": "npm test",
+        "kind": "gate",
+        "workspace": "W"
+      },
+      {
+        "id": "check-2",
+        "command": "npm run lint",
+        "kind": "gate",
+        "workspace": "W"
+      },
+      {
+        "id": "unit",
+        "command": "node --test plan-compiler.test.ts",
+        "kind": "gate",
+        "workspace": "W",
+        "expectedExitCode": 0
+      }
+    ],
+    "diagnostics": []
+  }
+}

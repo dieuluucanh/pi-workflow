@@ -11,6 +11,7 @@
     "orchestrator_retry",
     "orchestrator_start",
     "orchestrator_status",
+    "plan_validate",
     "questionnaire",
     "workflow_execution",
     "workflow_todo"
@@ -25,7 +26,8 @@
     "ls",
     "explore",
     "questionnaire",
-    "workflow_todo"
+    "workflow_todo",
+    "plan_validate"
   ],
   "buildActiveTools": [
     "read",
@@ -37,7 +39,8 @@
     "ls",
     "explore",
     "questionnaire",
-    "workflow_todo"
+    "workflow_todo",
+    "plan_validate"
   ],
   "commands": [
     "btw",
@@ -50,6 +53,7 @@
     "orchestrator",
     "orchestrator-abort",
     "orchestrator-pause",
+    "orchestrator-repair-checks",
     "orchestrator-resume",
     "orchestrator-view",
     "permissions",
@@ -104,5 +108,33 @@
   "widgetKeys": [
     "workflow-review-status",
     "workflow-todos"
-  ]
+  ],
+  "planContract": {
+    "compilerVersion": "plan-compiler/1",
+    "planSpecVersion": 1,
+    "frozenSchemaVersion": 2,
+    "journalVersion": 1,
+    "snapshotVersion": 1,
+    "checkKinds": [
+      "gate",
+      "diagnostic",
+      "manual"
+    ],
+    "limits": {
+      "maxRows": 500,
+      "maxChecks": 12,
+      "maxAcceptanceCriteria": 20,
+      "maxFiles": 20,
+      "maxWorkspaces": 8,
+      "maxText": 4000,
+      "maxCheckTimeoutMs": 3600000
+    },
+    "goldenFixture": "fixtures/plan-compiler/fenced-commands.md",
+    "goldenSpecHash": "02e282d3dc843ec3ddf024722afbb50f46e7aaa237336c3ab5751c32261a1026",
+    "goldenPlanChecks": [
+      "npm run typecheck",
+      "node --test \"suite with spaces.test.ts\"",
+      "npm run lint"
+    ]
+  }
 }
