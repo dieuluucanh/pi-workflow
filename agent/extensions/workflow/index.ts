@@ -2236,14 +2236,19 @@ export default function workflowExtension(
       const ui = (ctx as any).ui;
       const hasUI = (ctx as any).hasUI === true;
       const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+      // Review owns the working message while it runs; never overwrite it.
+      const reviewOwnsTurn = reviewTurn !== "idle";
       const desktopPath =
-        !reviewWidgetHost() && hasUI && idle && reviewTurn === "idle";
-      if (desktopPath && activity?.busy) {
-        // Message only: `setWorkingVisible(true)` can replace a live native
-        // retry/compaction indicator, so it is not used as a liveness hack.
+        !reviewWidgetHost() && hasUI && idle && !reviewOwnsTurn && activity !== undefined;
+      if (desktopPath && activity) {
+        // The host renders this line verbatim, so the live child hints (pause /
+        // abort) and the paused/settling guidance are the surface, not just a
+        // busy spinner. `setWorkingVisible(true)` only rides with a message we
+        // own.
+        ui?.setWorkingVisible?.(true);
         ui?.setWorkingMessage?.(activity.line);
         orchestratorWorkingMessageOwned = true;
-      } else if (orchestratorWorkingMessageOwned) {
+      } else if (orchestratorWorkingMessageOwned && !reviewOwnsTurn) {
         ui?.setWorkingMessage?.(undefined);
         orchestratorWorkingMessageOwned = false;
       }
@@ -7710,15 +7715,38 @@ export default function workflowExtension(
   function publishContributions(): void {
     if (!contributionsPublisher || inProcessChildContext) return;
     try {
+      // A Review/handoff owns the turn: the same lock reason disables the
+      // cycle action and every mode action except the current one.
+      const lockKind = reviewModeLockKindNow();
+      const cycleDisabledReason =
+        lockKind === undefined ? undefined : reviewModeLockNotice(lockKind);
+      // The footer must report the list the pinned panel is actually showing.
+      const childPanel = childPanelActive();
+      const panelItems = childPanel ? childPanelItems() : todos.items;
       const result = contributionsPublisher.set(
         buildWorkflowContributions({
           mode: workflowMode,
-          done: todos.items.filter((item) => isDone(item)).length,
-          total: todos.items.length,
-          stale: todoStale,
+          done: panelItems.filter((item) => isDone(item)).length,
+          total: panelItems.length,
+          stale: childPanel ? false : todoStale,
           // The composer's mode label references this action; never advertise
           // it when the command could not be registered.
           cycleAvailable: modeCycleCommandRegistered,
+          ...(cycleDisabledReason === undefined ? {} : { cycleDisabledReason }),
+          // Resolved registration flags. Plan falls back to `/workflow` when a
+          // foreign owner holds `/plan`.
+          modeCommands: {
+            ...(defaultCommandRegistered ? { default: "default" } : {}),
+            ...(planCommandRegistered
+              ? { plan: "plan" }
+              : workflowCommandRegistered
+                ? { plan: "workflow" }
+                : {}),
+            ...(orchestratorCommandRegistered
+              ? { orchestrator: "orchestrator" }
+              : {}),
+            ...(buildCommandRegistered ? { build: "build" } : {}),
+          },
           reviewPhase: reviewTurn,
           handoffPending: awaitingDecision && reviewTurn === "idle",
           ...(handoffStageForStatus() === undefined
@@ -7728,6 +7756,7 @@ export default function workflowExtension(
           ...(orchestrationStatus() === undefined
             ? {}
             : { orchestration: orchestrationStatus()! }),
+          childPanelActive: childPanel,
           ...(composerContributionInput() === undefined
             ? {}
             : { composer: composerContributionInput()! }),
@@ -8041,6 +8070,12 @@ export default function workflowExtension(
   let modeSessionGeneration = 0;
   /** False when `/workflow-cycle` could not be registered (name taken). */
   let modeCycleCommandRegistered = false;
+  /** Per-mode registration flags; the publisher resolves the real command. */
+  let defaultCommandRegistered = false;
+  let planCommandRegistered = false;
+  let workflowCommandRegistered = false;
+  let buildCommandRegistered = false;
+  let orchestratorCommandRegistered = false;
 
   function enqueueModeTransition<T>(task: () => Promise<T>): Promise<T> {
     const run = modeTransitionTail.then(task, task);
@@ -9737,6 +9772,7 @@ export default function workflowExtension(
         await switchWorkflowMode("plan", ctx as any);
       },
     });
+    planCommandRegistered = true;
   } catch {
     // pi-code already owns /plan — the /workflow alias below still works.
   }
@@ -9753,6 +9789,7 @@ export default function workflowExtension(
         await switchWorkflowMode("plan", ctx as any);
       },
     });
+    workflowCommandRegistered = true;
   } catch (_e) {
     void _e;
   }
@@ -9772,6 +9809,7 @@ export default function workflowExtension(
         await switchWorkflowMode("build", ctx as any);
       },
     });
+    buildCommandRegistered = true;
   } catch (_e) {
     void _e;
   }
@@ -9781,6 +9819,7 @@ export default function workflowExtension(
       description: "Switch to default mode (no workflow, full access)",
       handler: async (_args, ctx) => switchWorkflowMode(null, ctx as any),
     });
+    defaultCommandRegistered = true;
   } catch (_e) {
     void _e;
   }
@@ -9821,6 +9860,7 @@ export default function workflowExtension(
         }
       },
     });
+    orchestratorCommandRegistered = true;
   } catch (_e) {
     void _e;
   }

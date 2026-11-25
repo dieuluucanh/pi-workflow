@@ -195,6 +195,84 @@ Orchestrator no longer requests a Desktop related session or a new tab. The
 host contract for other features; Workflow's own use of them is gone. Pi Desktop
 may still show the Orchestrator status/actions rows published here.
 
+#### Action groups, the mode menu and inline controls
+
+Contribution v1 gained two additive presentation features. Neither changes the
+meaning of an existing row, so a host that predates them keeps rendering the
+rows it already understands.
+
+- **Action groups.** An action may carry
+  `group { id, label, order, placement }`. Identity is `(owner.id, group.id)`;
+  `placement` is the closed enum `inline` (compact bar button) or `menu`
+  (three-dot drop-up); `order` defaults to `0` and `placement` to `inline`. An
+  action without `group` stays on the legacy ungrouped path, and a malformed
+  group or unknown placement fails the envelope instead of being guessed.
+  Workflow publishes `run-controls` (inline, 30), `review-controls` (inline, 30)
+  and `todos` (menu, 40).
+- **`mode-choice`.** The mode menu is its own `kind: "mode-choice"` /
+  `slot: "mode-choice"` row: label, description, tone, order and
+  presentation-only `checked`. It has no `command`, `enabled` or
+  `disabledReason`; the required same-owner `actionRef` names the
+  `kind: "action"` that executes it, exactly like `mode.actionRef`. A dangling,
+  foreign or wrong-kind reference parses but is refused by the resolver — the
+  host never invents command text.
+- **Four mode choices, one glyph identity.** The choices read `Default`,
+  `Plan`, `Orchestrator` and `Build`. The composer mode badge keeps the existing
+  glyph labels `◦ default`, `⏸ plan`, `🧭 orchestrator` and `▶ build`
+  byte-for-byte, so a host menu must not replace them with the clean names. Each
+  `mode-<key>` action resolves to the registered `/default`, `/plan` (or
+  `/workflow` when another owner holds `/plan`), `/orchestrator` or `/build`.
+  The current mode is disabled with `current mode`; a live Review/handoff lock
+  disables every other mode with the lock notice; a command that could not be
+  registered yields a disabled action with a named reason, never a dead button.
+- **TODO menu and `Auto todos`.** The four display verbs are `Auto todos`,
+  `Show todos`, `Collapse todos` and `Hide todos` in the `todos` group; there is
+  no computed `todos-toggle` action. They are withheld while a live child pins
+  the panel (`childPanelActive`), because they would do nothing there. The TODO
+  action set in that view is therefore only `orchestrator-view`: `Show parent
+  todos` while the child panel is active, `Show child todos` otherwise (the
+  child run controls stay in their own `run-controls` group). The progress row
+  counts the list the pinned panel currently shows.
+- **Review controls.** A running round publishes `Pause review` + `Abort
+  review`; a paused round publishes `Resume review` + `Abort review`, both in
+  `review-controls`. The old standalone `review` action (status/resume) is gone;
+  the `workflow-review` status line owns the phase, and the handoff/transition
+  phases publish no controls because the review tab owns the decision. Commands
+  use the current grammar — `/review pause`, `/review resume`, `/review abort` —
+  never the retired hyphenated spellings.
+- **One child status surface.** No `orchestrator-child` status row is published;
+  the `workflow-orchestrator` setStatus line already carries the child
+  telemetry. The child action set is the TODO view toggle plus `Pause child` /
+  `Resume child` / `Abort child` in `run-controls` (the `orchestrator` command
+  uses the verb grammar: `{ name: "orchestrator", args: "pause" }`, and Review
+  uses `{ name: "review", args: "pause" }`).
+- **Working-message ownership.** On a generic-contribution Desktop host the
+  extension writes `setWorkingMessage` only while it owns the turn. The line is
+  the live child hint surface (pause/abort hints and the paused/settling
+  guidance), and `setWorkingVisible(true)` ships only with a message the
+  extension owns. A running, paused or handoff Review suppresses the write
+  entirely, so the reviewer's message is never overwritten; when the extension
+  owns the turn it clears only a message it set, and visibility is not used as
+  a liveness hack over a native retry/compaction indicator.
+
+#### Contribution compatibility
+
+| Capability | 0.13.0 (Desktop's pinned/staged artifact) | 0.14.0 | 0.15.0 (this checkout) |
+| --- | --- | --- | --- |
+| `action.group` / `placement` | absent; extra fields are ignored | absent | published (`inline` + `menu`) |
+| `kind: "mode-choice"` / slot | absent; older host drops the unknown kind | absent | published; four choices, same-owner `actionRef` |
+| Mode and Review commands | hyphenated registrations (`orchestrator-pause`, `review-pause`, …) | verb grammar (`/orchestrator pause`, `/review pause`, …) | verb grammar (unchanged) |
+| Review controls | standalone action/status only | `/review pause\|resume\|abort` status hints | inline Pause/Resume + Abort group |
+| Child status | `orchestrator-child` status row | same | removed; `workflow-orchestrator` line only |
+
+`0.13.0` is the real version in Pi Desktop's `resources/workflow.lock.json` and
+in its staged `resources/extensions/workflow` bundle; it is not shorthand for
+"old". This checkout is **0.15.0** (it was 0.14.0 before this release), and the
+new publisher uses the current verb grammar. The 0.15.0 package has **not** been
+staged into Desktop: the staged bundle remains the 0.13.0 build with hyphenated
+commands and no groups or mode choices. A 0.15.0 host consumes the additions
+additively; a 0.13.0 host keeps the rows it ships with.
+
 #### Composer transform (frozen wire contract)
 
 `composer-transform.ts` freezes the additive `composer-transform-v1`
@@ -416,26 +494,28 @@ Profile config lives in `~/.pi/agent/profiles.json` v1 (user) with optional per-
 
 ## Review Mode
 
-An independent second agent audits the plan before the handoff renders. The handoff waits for the gated round; the reviewed plan (the reviewer writes the plan file mid-round) is what you see, and the todo steps are re-synced to match. The reviewer runs in its own child session, so Plan Mode and Build Mode never see its prompt, findings or transcript.
+An independent second agent audits the plan before the handoff renders. The handoff waits for the gated round; the reviewer appends `## Reviewer Revisions (round N)` to the plan file mid-round while the author's plan body stays unchanged, and that whole document is what you see. The reviewed text is re-synced into the handoff; the model owns the TODO list, and the extension does not parse the appended revisions into new steps. The reviewer runs in its own child session, so Plan Mode and Build Mode never see its prompt, findings or transcript.
 
 **The Reviewer is a Plan artifact.** A review round starts only in a parent Plan session: automatically after a plan submitted in this run (when Review Mode is on), or through an explicit `/review`/`/review resume` in Plan mode. Configuration ON is **not** a trigger, and no reviewer session is pre-warmed speculatively: an ordinary Build turn, an Orchestrator parent turn and every in-process Build child boot **zero** reviewer sessions. Orchestrator row completion is a parent decision from the child report plus `workflow_todo` — it is not a review round and never asks a model to audit a child's work. Outside Plan, a manual start refuses with guidance (`/plan`, then `/review`) and never switches modes implicitly; `/review status`, `/review pause` and `/review abort` stay available for recovery. Automatic review binds to the terminal end of a run: retries, compaction retries, queued messages and continuation boundaries do not review an incomplete plan, and the later terminal attempt owns the handoff.
 
 ```text
 Plan Mode (main session) ──plan file──▶ Review Mode (child session, gated)
-                                              │ rewrites the plan file
+                                              │ appends `## Reviewer Revisions (round N)`
+                                              │ (author's plan body unchanged)
                                               ▼
-                                   handoff renders the reviewed plan
+                                   handoff renders plan + appendices
                                               ▼
-        Plannotator webview ◀── plan file + `## Review changes`
-                │ approve ──▶ Build Mode (review activity suspends, session stays warm)
-                └─ feedback ──▶ Plan Mode revises ──▶ Review re-reviews
+        Plannotator webview ◀── plan file + Reviewer Revisions
+                │ approve ──▶ destination chooser ──▶ Build / Orchestrator
+                │             (review suspends, reviewer session stays warm)
+                └─ feedback ──▶ Plan Mode revises the plan body ──▶ Review re-reviews
 
   Plannotator unavailable/error/closes ──▶ native handoff (no dead end)
         plan entry printed above ──▶ bottom-sheet questionnaire
-        Approve ──▶ Build (verified) ──▶ execute   Feedback ──▶ Plan   Skip ──▶ stay Plan
+        Approve ──▶ chooser ──▶ Build / Orchestrator   Feedback ──▶ Plan   Skip ──▶ stay Plan
 ```
 
-- **Approve** in Plannotator → Build mode; review activity suspends but the reviewer session stays warm for the next round.
+- **Approve** in Plannotator → the destination chooser (direct Build or Orchestrator), not immediate execution; review activity suspends but the reviewer session stays warm for the next round.
 - **Feedback** → Plan revises, Review re-reviews the revision, Plannotator reopens.
 - **A broken Plannotator is never a dead end.** Every handoff path (automatic, `/review`, `/review resume`, a closed browser tab) falls back to the workflow's own questionnaire: the plan is appended to the transcript (scroll up to read it), and `Approve plan (choose execution next)` / `Give feedback (stay in Plan)` / `Skip for now (stay in Plan)` are pinned at the bottom. The fallback keeps the SAME handoff record, so its identity and recommendation survive; a late browser event cannot act on the native decision.
 - **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with direct Build and Orchestrator as equal options, plus *Decide later*. No destination is saved or recommended. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build sends one execute turn in this session; Orchestrator freezes the plan into one TODO row per step and starts the first visible Build child immediately.
@@ -596,7 +676,7 @@ Delivery to the reviewer is best-effort: if it fails, the message stays in the p
 
 ### Controlling a running review
 
-The handoff **waits for the reviewer**: no browser prompt or native choice renders until the gated round lands, fails, or you pause/abort it. The reviewed plan (the reviewer writes the plan file mid-round) becomes the handed-off text, with the todo steps re-synced to match. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
+The handoff **waits for the reviewer**: no browser prompt or native choice renders until the gated round lands, fails, or you pause/abort it. The reviewer appends `## Reviewer Revisions (round N)` to the plan file mid-round without changing the author's plan body; that whole document becomes the handed-off text. The model owns the TODO list — the extension does not parse the appended revisions into steps. A broken reviewer never blocks the plan — the author's draft is handed over with a warning instead.
 
 A handoff opens **only when the current run writes or edits a `.pi/plans/` file while Plan mode is active**. A mid-run switch into Plan counts — the write after the switch is eligible. A plan written before the switch does not auto-handoff: the extension shows `Plan file ready: <path>. Run /review to audit it.` and leaves the plan for the manual command. Switching Build → Plan keeps the previous plan and todos as reference; a fresh prompt also supersedes any pending browser/native handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
 
@@ -903,9 +983,11 @@ these paths.
 | Apply | `setEditorText` with an expected-buffer check | CAS apply on the exact draft revision + idempotent receipt |
 | Old host / old extension | — | Additive fallback: text/status only, `attachmentAware: false` |
 
-**Tested versions.** Workflow 0.13.0 against Pi SDK 1.5.0 (Pi Desktop's exact
-pin). The structured handshake is verified against unmodified SDK 1.5; automated
-suites are listed under [Development](#development) and in W `docs/`.
+**Tested versions.** This checkout is Workflow **0.15.0** against Pi SDK
+**1.5.0** (Pi Desktop's exact pin). Pi Desktop's staged/pinned artifact is the
+published **0.13.0** bundle, which predates the contribution additions above;
+the composer-transform handshake is verified against unmodified SDK 1.5, and
+automated suites are listed under [Development](#development) and in W `docs/`.
 
 ### Honest acceptance limits
 

@@ -168,6 +168,92 @@ export function modeLabel(mode: WorkflowMode): string {
   return "default";
 }
 
+// ── Canonical presentation ───────────────────────────────────────────
+
+/** Stable key for the command that enters a mode. `null` is Default. */
+export type ModePresentationKey = "default" | "plan" | "orchestrator" | "build";
+
+export type ModePresentationTone = "neutral" | "accent" | "info" | "warning";
+
+/**
+ * One row per mode, shared by every presentation surface. The two labels are
+ * deliberately separate:
+ *
+ *   - `composerLabel` is the existing composer/status identity and includes
+ *     the glyph (`⏸ plan`, `▶ build`, `🧭 orchestrator`, `◦ default`). It is
+ *     byte-for-byte the label the composer and footer already render, so a
+ *     host menu must never silently replace it with the clean name.
+ *   - `menuLabel` is the clean `Default`/`Plan`/`Orchestrator`/`Build` name a
+ *     menu or button should show.
+ *
+ * `commands` is a preference list: the first registered name wins. Plan has a
+ * fallback because pi-code may own `/plan` while `/workflow` stays free.
+ */
+export interface ModePresentation {
+  mode: WorkflowMode;
+  key: ModePresentationKey;
+  composerLabel: string;
+  menuLabel: string;
+  tone: ModePresentationTone;
+  /** Position in `MODE_CYCLE_ORDER`, ascending. */
+  order: number;
+  commands: readonly string[];
+  description: string;
+}
+
+/** Canonical presentation, in the same order as `MODE_CYCLE_ORDER`. */
+export const MODE_PRESENTATION: readonly ModePresentation[] = [
+  {
+    mode: null,
+    key: "default",
+    composerLabel: "◦ default",
+    menuLabel: "Default",
+    tone: "neutral",
+    order: 0,
+    commands: ["default"],
+    description: "Switch to Default mode (workflow off)",
+  },
+  {
+    mode: "plan",
+    key: "plan",
+    composerLabel: "⏸ plan",
+    menuLabel: "Plan",
+    tone: "warning",
+    order: 1,
+    commands: ["plan", "workflow"],
+    description: "Switch to Plan mode",
+  },
+  {
+    mode: "orchestrator",
+    key: "orchestrator",
+    composerLabel: "🧭 orchestrator",
+    menuLabel: "Orchestrator",
+    tone: "info",
+    order: 2,
+    commands: ["orchestrator"],
+    description: "Switch to Orchestrator mode",
+  },
+  {
+    mode: "build",
+    key: "build",
+    composerLabel: "▶ build",
+    menuLabel: "Build",
+    tone: "accent",
+    order: 3,
+    commands: ["build"],
+    description: "Switch to Build mode",
+  },
+];
+
+/** The one presentation row for a mode; unknown modes fall back to Default. */
+export function modePresentation(mode: WorkflowMode): ModePresentation {
+  return (
+    MODE_PRESENTATION.find((entry) => entry.mode === mode) ??
+    MODE_PRESENTATION[0]!
+  );
+}
+
+
 // ── Persisted state codec ────────────────────────────────────────────
 
 /**

@@ -10,6 +10,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildWorkflowContributions } from "./workflow-contributions.ts";
+import { buildWorkflowStatusSegments } from "./workflow-status.ts";
+import { MODE_PRESENTATION, modePresentation } from "./workflow-mode.ts";
 import { parseContributionEnvelope } from "./host-contributions.ts";
 import {
   CONTRIBUTION_EVENTS,
@@ -20,13 +22,27 @@ import { makeFakeClock } from "./test-support-ports.ts";
 const envelopeFor = (contributions: ReturnType<typeof buildWorkflowContributions>) =>
   parseContributionEnvelope({
     version: 1,
-    owner: { id: "@dieulc/workflow", version: "0.13.0" },
+    owner: { id: "@dieulc/workflow", version: "0.15.0" },
     sessionId: "session-a",
     epoch: 0,
     revision: 1,
     removed: [],
     contributions,
   });
+
+/** Every mode command registered in a normal session. */
+const MODE_COMMANDS = {
+  default: "default",
+  plan: "plan",
+  orchestrator: "orchestrator",
+  build: "build",
+} as const;
+
+const actionsOf = (contributions: ReturnType<typeof buildWorkflowContributions>) =>
+  contributions.filter((entry) => entry.kind === "action");
+
+const choicesOf = (contributions: ReturnType<typeof buildWorkflowContributions>) =>
+  contributions.filter((entry) => entry.kind === "mode-choice");
 
 test("build: mode badge, progress and one cycle action are valid contributions", () => {
   const contributions = buildWorkflowContributions({
@@ -35,13 +51,16 @@ test("build: mode badge, progress and one cycle action are valid contributions",
     total: 8,
     commitMode: "never",
     writeMode: "allow",
+    modeCommands: MODE_COMMANDS,
   });
   const parsed = envelopeFor(contributions);
   assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
 
   const mode = contributions.find((entry) => entry.id === "mode");
   assert.ok(mode && mode.kind === "mode");
-  assert.match(mode.label, /build/);
+  // The composer identity keeps its glyph; the menu uses the clean label.
+  assert.equal(mode.label, "▶ build");
+  assert.equal(mode.tone, "accent");
   // The label is the control: it references one same-owner action.
   assert.equal(mode.actionRef, "mode-cycle");
 
@@ -55,23 +74,85 @@ test("build: mode badge, progress and one cycle action are valid contributions",
   assert.equal(cycle.enabled, true);
   assert.deepEqual(cycle.command, { name: "workflow-cycle" });
 
-  // The old fixed-target switch buttons are gone, but their commands remain
-  // available for direct use and are not quietly re-published under other ids.
-  for (const legacy of ["mode-plan", "mode-orchestrator", "mode-build"]) {
-    assert.equal(contributions.some((entry) => entry.id === legacy), false, legacy);
+  // One stable action + one presentation choice per mode, in cycle order.
+  assert.deepEqual(
+    actionsOf(contributions).map((entry) => entry.id),
+    [
+      "mode-cycle",
+      "mode-default",
+      "mode-plan",
+      "mode-orchestrator",
+      "mode-build",
+      "todos-auto",
+      "todos-expand",
+      "todos-collapse",
+      "todos-hide",
+    ],
+  );
+  assert.deepEqual(
+    choicesOf(contributions).map((entry) => entry.id),
+    ["mode-choice-default", "mode-choice-plan", "mode-choice-orchestrator", "mode-choice-build"],
+  );
+  assert.deepEqual(
+    choicesOf(contributions).map((entry) => entry.label),
+    ["Default", "Plan", "Orchestrator", "Build"],
+  );
+  assert.deepEqual(
+    choicesOf(contributions).map((entry) =>
+      entry.kind === "mode-choice" ? entry.actionRef : undefined,
+    ),
+    ["mode-default", "mode-plan", "mode-orchestrator", "mode-build"],
+  );
+  assert.deepEqual(
+    choicesOf(contributions).map((entry) =>
+      entry.kind === "mode-choice" ? entry.checked === true : false,
+    ),
+    [false, false, false, true],
+    "only the live mode is checked",
+  );
+  for (const actionId of ["mode-default", "mode-plan", "mode-orchestrator", "mode-build"]) {
+    const action = contributions.find((entry) => entry.id === actionId);
+    assert.ok(action && action.kind === "action", actionId);
+    assert.match(action.description ?? "", /^Switch to /);
   }
+  const current = contributions.find((entry) => entry.id === "mode-build");
+  assert.ok(current && current.kind === "action");
+  assert.equal(current.enabled, false);
+  assert.equal(current.disabledReason, "current mode");
 });
 
 test("build: every base mode exposes the same cycle binding, Default included", () => {
   for (const mode of [null, "plan", "orchestrator", "build"] as const) {
-    const contributions = buildWorkflowContributions({ mode, done: 0, total: 0 });
+    const contributions = buildWorkflowContributions({
+      mode,
+      done: 0,
+      total: 0,
+      modeCommands: MODE_COMMANDS,
+    });
     const badge = contributions.find((entry) => entry.id === "mode");
     assert.ok(badge && badge.kind === "mode", `mode ${String(mode)} has a badge`);
     assert.equal(badge.actionRef, "mode-cycle");
+    assert.equal(badge.label, modePresentation(mode).composerLabel);
     const cycle = contributions.find((entry) => entry.id === "mode-cycle");
     assert.ok(cycle && cycle.kind === "action");
     assert.equal(cycle.enabled, true);
     assert.deepEqual(cycle.command, { name: "workflow-cycle" });
+    // The current mode is checked in the menu and its action refuses with the
+    // one canonical reason; the other three stay executable.
+    const checked = choicesOf(contributions)
+      .filter((entry) => entry.kind === "mode-choice" && entry.checked === true)
+      .map((entry) => entry.id);
+    assert.deepEqual(checked, [`mode-choice-${modePresentation(mode).key}`]);
+    for (const presentation of MODE_PRESENTATION) {
+      const action = contributions.find((entry) => entry.id === `mode-${presentation.key}`);
+      assert.ok(action && action.kind === "action");
+      if (presentation.mode === mode) {
+        assert.equal(action.enabled, false);
+        assert.equal(action.disabledReason, "current mode");
+      } else {
+        assert.equal(action.enabled, true, `${presentation.key} stays enabled`);
+      }
+    }
     assert.equal(envelopeFor(contributions).ok, true);
   }
 });
@@ -93,6 +174,212 @@ test("build: an unavailable cycle command is disabled with a reason, not danglin
   assert.equal(envelopeFor(contributions).ok, true);
 });
 
+test("mode choices: every actionRef names a same-owner action, never a dangling or foreign one", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 0,
+    total: 0,
+    modeCommands: MODE_COMMANDS,
+  });
+  const actionIds = new Set(
+    contributions.filter((entry) => entry.kind === "action").map((entry) => entry.id),
+  );
+  const choices = choicesOf(contributions);
+  assert.equal(choices.length, MODE_PRESENTATION.length);
+  for (const choice of choices) {
+    assert.ok(choice.kind === "mode-choice");
+    assert.equal(choice.slot, "mode-choice");
+    assert.ok(actionIds.has(choice.actionRef), `${choice.id} resolves ${choice.actionRef}`);
+    assert.match(choice.actionRef, /^mode-(default|plan|orchestrator|build)$/);
+    // The choice is presentation data only: the referenced action owns
+    // execution and disabled state.
+    assert.equal("command" in choice, false);
+    assert.equal("enabled" in choice, false);
+    assert.equal("disabledReason" in choice, false);
+  }
+});
+
+test("mode choices: a missing command is disabled with a precise reason", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    modeCommands: { default: "default", orchestrator: "orchestrator" },
+  });
+  const build = contributions.find((entry) => entry.id === "mode-build");
+  assert.ok(build && build.kind === "action");
+  assert.equal(build.enabled, false);
+  assert.equal(build.disabledReason, "/build is not registered in this session");
+  // Plan's fallback is reported precisely when neither name is registered.
+  const plan = contributions.find((entry) => entry.id === "mode-plan");
+  assert.ok(plan && plan.kind === "action");
+  assert.equal(plan.disabledReason, "current mode");
+  const fallback = buildWorkflowContributions({
+    mode: "build",
+    done: 0,
+    total: 0,
+    modeCommands: { default: "default", build: "build", orchestrator: "orchestrator" },
+  });
+  const planFallback = fallback.find((entry) => entry.id === "mode-plan");
+  assert.ok(planFallback && planFallback.kind === "action");
+  assert.equal(
+    planFallback.disabledReason,
+    "neither /plan nor /workflow is registered in this session",
+  );
+});
+
+test("mode choices: Plan resolves /workflow when /plan is owned elsewhere", () => {
+  const contributions = buildWorkflowContributions({
+    mode: null,
+    done: 0,
+    total: 0,
+    modeCommands: {
+      default: "default",
+      plan: "workflow",
+      orchestrator: "orchestrator",
+      build: "build",
+    },
+  });
+  const byId = new Map(contributions.map((entry) => [entry.id, entry]));
+  assert.deepEqual((byId.get("mode-plan") as { command?: unknown }).command, {
+    name: "workflow",
+  });
+  assert.deepEqual((byId.get("mode-default") as { command?: unknown }).command, {
+    name: "default",
+  });
+  assert.deepEqual((byId.get("mode-orchestrator") as { command?: unknown }).command, {
+    name: "orchestrator",
+  });
+  assert.deepEqual((byId.get("mode-build") as { command?: unknown }).command, {
+    name: "build",
+  });
+  // The 0.14.0 verb grammar, never the retired hyphenated spellings.
+  for (const entry of contributions) {
+    if (entry.kind !== "action") continue;
+    assert.doesNotMatch(entry.command.name, /^(?:plan|build|default|orchestrator)-/);
+  }
+});
+
+test("mode choices: a handoff lock disables every non-current action with one reason", () => {
+  const lockReason = "Review decision pending — mode switching is locked.";
+  const contributions = buildWorkflowContributions({
+    mode: "build",
+    done: 0,
+    total: 0,
+    reviewPhase: "handoff",
+    cycleDisabledReason: lockReason,
+    modeCommands: MODE_COMMANDS,
+  });
+  for (const [id, expected] of [
+    ["mode-default", lockReason],
+    ["mode-plan", lockReason],
+    ["mode-orchestrator", lockReason],
+    ["mode-build", "current mode"],
+  ] as const) {
+    const action = contributions.find((entry) => entry.id === id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.enabled, false, id);
+    assert.equal(action.disabledReason, expected, id);
+  }
+});
+
+test("mode choices: composer glyphs are unchanged, menu labels are clean, and the surfaces agree", () => {
+  for (const mode of [null, "plan", "orchestrator", "build"] as const) {
+    const contributions = buildWorkflowContributions({
+      mode,
+      done: 0,
+      total: 0,
+      modeCommands: MODE_COMMANDS,
+    });
+    const presentation = modePresentation(mode);
+    const badge = contributions.find((entry) => entry.id === "mode");
+    assert.ok(badge && badge.kind === "mode");
+    // The composer identity must not be replaced by the clean menu label.
+    assert.equal(badge.label, presentation.composerLabel);
+    assert.equal(badge.tone, presentation.tone);
+    assert.deepEqual(
+      choicesOf(contributions).map((entry) => entry.label),
+      ["Default", "Plan", "Orchestrator", "Build"],
+    );
+    // Label/choice parity: the menu choice and its action cannot drift.
+    for (const row of MODE_PRESENTATION) {
+      const action = contributions.find((entry) => entry.id === `mode-${row.key}`);
+      const choice = contributions.find((entry) => entry.id === `mode-choice-${row.key}`);
+      assert.ok(action && action.kind === "action");
+      assert.ok(choice && choice.kind === "mode-choice");
+      assert.equal(choice.label, action.label);
+      assert.equal(choice.label, row.menuLabel);
+      assert.equal(choice.tone, action.tone);
+      assert.equal(choice.actionRef, action.id);
+    }
+    // Exactly one primary mode row: choices have their own slot and id prefix.
+    const primary = contributions.filter((entry) => entry.slot === "mode");
+    assert.equal(primary.length, 1, "one mode row, never a promoted choice");
+    assert.equal(
+      contributions.filter((entry) => entry.slot === "mode-choice").length,
+      4,
+    );
+  }
+});
+
+test("mode presentation: the footer keeps the same glyph identity", () => {
+  for (const mode of ["plan", "orchestrator", "build"] as const) {
+    const status = buildWorkflowStatusSegments({
+      mode,
+      done: 1,
+      total: 2,
+      commitMode: "ask",
+    });
+    assert.ok(
+      status.mode.startsWith(modePresentation(mode).composerLabel),
+      `${mode} footer keeps ${modePresentation(mode).composerLabel}`,
+    );
+  }
+  const fallback = buildWorkflowStatusSegments({
+    mode: null,
+    done: 1,
+    total: 2,
+    commitMode: "ask",
+  });
+  assert.ok(fallback.mode.startsWith("◦"), "Default keeps the ring glyph");
+});
+
+test("mode choices: publishing the set never dispatches a command", () => {
+  const emitted: Array<{ event: string }> = [];
+  const publisher = createContributionPublisher({
+    owner: { id: "@dieulc/workflow", version: "0.15.0" },
+    sessionId: "session-a",
+    clock: makeFakeClock(),
+    emit: (event) => emitted.push({ event }),
+  });
+  publisher.hello({ contractVersion: 1, kinds: [], slots: [] });
+  publisher.set(
+    buildWorkflowContributions({
+      mode: "build",
+      done: 0,
+      total: 0,
+      modeCommands: MODE_COMMANDS,
+    }),
+  );
+  // Review controls are the same kind of data: publishing them (running and
+  // paused) must not dispatch `/review pause|resume|abort` either.
+  for (const reviewPhase of ["running", "paused"] as const) {
+    publisher.set(
+      buildWorkflowContributions({
+        mode: "plan",
+        done: 0,
+        total: 0,
+        reviewPhase,
+        modeCommands: MODE_COMMANDS,
+      }),
+    );
+  }
+  // Rendering data only: no command/action event may be emitted by a set.
+  for (const entry of emitted) {
+    assert.equal(entry.event, CONTRIBUTION_EVENTS.update);
+  }
+});
+
 test("build: no todo row without a list, and clamping keeps it valid", () => {
   const none = buildWorkflowContributions({ mode: null, done: 0, total: 0 });
   assert.equal(none.some((entry) => entry.id === "todos"), false);
@@ -106,38 +393,156 @@ test("build: no todo row without a list, and clamping keeps it valid", () => {
 });
 
 test("build: a live review owns the badge and exposes its own controls", () => {
+  const lockReason = "Review is running — mode switching is locked.";
   const running = buildWorkflowContributions({
     mode: "plan",
     done: 1,
     total: 4,
     reviewPhase: "running",
+    cycleDisabledReason: lockReason,
+    modeCommands: MODE_COMMANDS,
   });
   const badge = running.find((entry) => entry.id === "mode");
   assert.ok(badge && badge.kind === "mode");
   assert.match(badge.label, /review/);
   const actions = running.filter((entry) => entry.kind === "action").map((entry) => entry.id);
-  assert.deepEqual(actions, ["mode-cycle", "review", "review-stop"]);
+  assert.deepEqual(actions, [
+    "mode-cycle",
+    "review-pause",
+    "review-abort",
+    "mode-default",
+    "mode-plan",
+    "mode-orchestrator",
+    "mode-build",
+  ]);
+  // The old `review`/`review-stop` pair is gone: the footer owns phase detail
+  // and the inline group carries the verbs.
+  assert.equal(running.some((entry) => entry.id === "review"), false);
+  assert.equal(running.some((entry) => entry.id === "review-stop"), false);
+  const reviewControls = {
+    id: "review-controls",
+    label: "Review controls",
+    order: 30,
+    placement: "inline",
+  };
+  for (const [id, label, description, args, tone] of [
+    ["review-pause", "Pause review", "/review pause", "pause", "warning"],
+    ["review-abort", "Abort review", "/review abort", "abort", "warning"],
+  ] as const) {
+    const action = running.find((entry) => entry.id === id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.label, label);
+    assert.equal(action.description, description);
+    assert.equal(action.tone, tone);
+    assert.deepEqual(action.command, { name: "review", args });
+    assert.deepEqual(action.group, reviewControls);
+    assert.equal(action.enabled, true);
+  }
   // The mode control is still present, but it refuses instead of changing mode
   // under the reviewer; the runtime guard re-checks stale requests too.
   assert.equal(badge.actionRef, "mode-cycle");
   const cycle = running.find((entry) => entry.id === "mode-cycle");
   assert.ok(cycle && cycle.kind === "action");
   assert.equal(cycle.enabled, false);
-  assert.match(cycle.disabledReason ?? "", /review/i);
+  assert.equal(cycle.disabledReason, lockReason);
+  // Current mode wins; every other mode action carries the SAME lock reason.
+  const current = running.find((entry) => entry.id === "mode-plan");
+  assert.ok(current && current.kind === "action");
+  assert.equal(current.enabled, false);
+  assert.equal(current.disabledReason, "current mode");
+  for (const id of ["mode-default", "mode-orchestrator", "mode-build"]) {
+    const action = running.find((entry) => entry.id === id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.enabled, false, id);
+    assert.equal(action.disabledReason, lockReason, id);
+  }
+  // Choices stay present and checked, but remain data only.
+  assert.deepEqual(
+    choicesOf(running).map((entry) =>
+      entry.kind === "mode-choice" ? [entry.id, entry.checked === true] : undefined,
+    ),
+    [
+      ["mode-choice-default", false],
+      ["mode-choice-plan", true],
+      ["mode-choice-orchestrator", false],
+      ["mode-choice-build", false],
+    ],
+  );
   assert.equal(envelopeFor(running).ok, true);
 
-  const paused = buildWorkflowContributions({ mode: "plan", done: 0, total: 0, reviewPhase: "paused" });
-  const resume = paused.find((entry) => entry.id === "review");
+  const paused = buildWorkflowContributions({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    reviewPhase: "paused",
+    cycleDisabledReason: lockReason,
+    modeCommands: MODE_COMMANDS,
+  });
+  // The paused bar swaps Pause for Resume, keeping the same inline group and
+  // the shared Abort; there is never a second working-control pair.
+  assert.equal(paused.some((entry) => entry.id === "review-pause"), false);
+  assert.equal(paused.some((entry) => entry.id === "review"), false);
+  assert.equal(paused.some((entry) => entry.id === "review-stop"), false);
+  const resume = paused.find((entry) => entry.id === "review-resume");
   assert.ok(resume && resume.kind === "action");
-  assert.equal(resume.command.name, "review");
-  assert.equal(resume.command.args, "resume");
-  const stop = paused.find((entry) => entry.id === "review-stop");
+  assert.equal(resume.label, "Resume review");
+  assert.equal(resume.description, "/review resume");
+  assert.equal(resume.tone, "info");
+  assert.deepEqual(resume.command, { name: "review", args: "resume" });
+  assert.deepEqual(resume.group, {
+    id: "review-controls",
+    label: "Review controls",
+    order: 30,
+    placement: "inline",
+  });
+  const stop = paused.find((entry) => entry.id === "review-abort");
   assert.ok(stop && stop.kind === "action");
-  assert.equal(stop.command.name, "review");
-  assert.equal(stop.command.args, "abort");
+  assert.equal(stop.label, "Abort review");
+  assert.equal(stop.description, "/review abort");
+  assert.deepEqual(stop.command, { name: "review", args: "abort" });
 
-  // A review turn never advertises Plan/Build switching.
-  assert.equal(paused.some((entry) => entry.id === "mode-build"), false);});
+  // A review turn never advertises an executable Plan/Build switch: the menu
+  // actions exist so Desktop can render the list, but every one is locked.
+  const pausedBuild = paused.find((entry) => entry.id === "mode-build");
+  assert.ok(pausedBuild && pausedBuild.kind === "action");
+  assert.equal(pausedBuild.enabled, false);
+  assert.equal(pausedBuild.disabledReason, lockReason);
+});
+
+test("build: a handoff review publishes no pause/resume/abort controls", () => {
+  const lockReason = "Review decision pending — mode switching is locked.";
+  const handoff = buildWorkflowContributions({
+    mode: "plan",
+    done: 1,
+    total: 2,
+    reviewPhase: "handoff",
+    cycleDisabledReason: lockReason,
+    modeCommands: MODE_COMMANDS,
+  });
+  const ids = handoff.map((entry) => entry.id);
+  for (const id of ["review", "review-stop", "review-pause", "review-resume", "review-abort"]) {
+    assert.equal(ids.includes(id), false, id);
+  }
+  // The decision belongs to the host-provided review tab: the mode row names
+  // it, and the input stays locked so a prompt cannot race the decision.
+  const badge = handoff.find((entry) => entry.id === "mode");
+  assert.ok(badge && badge.kind === "mode");
+  assert.equal(badge.detail, "The plan is waiting for your decision in the review tab.");
+  const input = handoff.find((entry) => entry.id === "input");
+  assert.ok(input && input.kind === "input");
+  assert.equal(input.availability, "locked");
+  assert.equal(input.tone, "warning");
+  assert.equal(
+    input.reason,
+    "A reviewer owns this turn; pause or stop it to prompt the plan agent.",
+  );
+  // The mode cycle stays a disabled action, never an enabled dead button.
+  const cycle = handoff.find((entry) => entry.id === "mode-cycle");
+  assert.ok(cycle && cycle.kind === "action");
+  assert.equal(cycle.enabled, false);
+  assert.equal(cycle.disabledReason, lockReason);
+  assert.equal(envelopeFor(handoff).ok, true);
+});
 
 test("build: a plain handoff stays a Plan sub-state, never Review", () => {
   const contributions = buildWorkflowContributions({
@@ -166,54 +571,121 @@ test("build: policy hints are display-only status", () => {
   assert.match(policy.text, /writes:never/);
 });
 
-test("build: todo display actions include automatic and a state-aware toggle", () => {
+test("build: todo display actions are the Auto todos menu, not a computed toggle", () => {
   const expanded = buildWorkflowContributions({
     mode: "plan",
     done: 2,
     total: 5,
     panelState: "expanded",
+    modeCommands: MODE_COMMANDS,
   });
   const ids = expanded.filter((entry) => entry.kind === "action").map((entry) => entry.id);
   assert.deepEqual(ids, [
     "mode-cycle",
+    "mode-default",
+    "mode-plan",
+    "mode-orchestrator",
+    "mode-build",
     "todos-auto",
     "todos-expand",
     "todos-collapse",
     "todos-hide",
-    "todos-toggle",
   ]);
   const progress = expanded.find((entry) => entry.id === "todos");
   assert.ok(progress && progress.kind === "progress");
   assert.equal(progress.detail, "Expanded");
-  const toggle = expanded.find((entry) => entry.id === "todos-toggle");
-  assert.ok(toggle && toggle.kind === "action");
-  assert.equal(toggle.command.name, "todos");
-  assert.equal(toggle.command.args, "collapse");
-  assert.equal(envelopeFor(expanded).ok, true);
 
-  // A collapsed/hidden panel toggles the other way; no state means expand.
-  for (const [state, args] of [
-    ["collapsed", "expand"],
-    ["hidden", "expand"],
-    [null, "expand"],
-  ] as const) {
-    const view = buildWorkflowContributions({
-      mode: "build",
-      done: 0,
-      total: 2,
-      panelState: state,
+  // The explicit verbs are the menu; the retired computed toggle must stay
+  // withdrawn so the host never renders two ways to expand/collapse.
+  assert.equal(expanded.some((entry) => entry.id === "todos-toggle"), false);
+
+  const byId = new Map(expanded.map((entry) => [entry.id, entry]));
+  const display = [
+    ["todos-auto", "Auto todos", "auto"],
+    ["todos-expand", "Show todos", "expand"],
+    ["todos-collapse", "Collapse todos", "collapse"],
+    ["todos-hide", "Hide todos", "hide"],
+  ] as const;
+  for (const [id, label, args] of display) {
+    const action = byId.get(id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.label, label);
+    assert.deepEqual(action.command, { name: "todos", args });
+    assert.equal(action.enabled, true);
+    assert.deepEqual(action.group, {
+      id: "todos",
+      label: "Todos",
+      order: 40,
+      placement: "menu",
     });
-    const entry = view.find((item) => item.id === "todos-toggle");
-    assert.ok(entry && entry.kind === "action");
-    assert.equal(entry.command.args, args);
-    assert.equal(envelopeFor(view).ok, true);
   }
+  assert.equal(envelopeFor(expanded).ok, true);
+});
+
+test("build: TODO display verbs are parent-panel only", () => {
+  const parent = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    orchestration: {
+      phase: "running",
+      child: { ref: "2", total: 7, phase: "running" },
+      view: "parent",
+    },
+    childPanelActive: false,
+  });
+  const parentIds = parent
+    .filter((entry) => entry.kind === "action")
+    .map((entry) => entry.id);
+  for (const id of ["todos-auto", "todos-expand", "todos-collapse", "todos-hide"]) {
+    assert.ok(parentIds.includes(id), `parent view keeps ${id}`);
+  }
+  const showChild = parent.find((entry) => entry.id === "orchestrator-view");
+  assert.ok(showChild && showChild.kind === "action");
+  assert.equal(showChild.label, "Show child todos");
+  assert.deepEqual(showChild.command, { name: "orchestrator", args: "view child" });
+  assert.deepEqual(showChild.group, {
+    id: "todos",
+    label: "Todos",
+    order: 40,
+    placement: "menu",
+  });
+
+  // Child view pins the panel: only the way back is actionable, and the dead
+  // parent display verbs are omitted instead of rendered as no-ops.
+  const child = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 2,
+    total: 7,
+    orchestration: {
+      phase: "running",
+      child: { ref: "2", total: 7, phase: "running" },
+      view: "auto",
+    },
+    childPanelActive: true,
+  });
+  const childIds = child
+    .filter((entry) => entry.kind === "action")
+    .map((entry) => entry.id);
+  for (const id of ["todos-auto", "todos-expand", "todos-collapse", "todos-hide"]) {
+    assert.equal(childIds.includes(id), false, `child view omits ${id}`);
+  }
+  const showParent = child.find((entry) => entry.id === "orchestrator-view");
+  assert.ok(showParent && showParent.kind === "action");
+  assert.equal(showParent.label, "Show parent todos");
+  assert.deepEqual(showParent.command, { name: "orchestrator", args: "view parent" });
+  assert.deepEqual(showParent.group, {
+    id: "todos",
+    label: "Todos",
+    order: 40,
+    placement: "menu",
+  });
 });
 
 test("extension: publishing the current mapper withdraws the retired switch buttons", () => {
   const emitted: Array<{ event: string; payload?: unknown }> = [];
   const publisher = createContributionPublisher({
-    owner: { id: "@dieulc/workflow", version: "0.13.0" },
+    owner: { id: "@dieulc/workflow", version: "0.15.0" },
     sessionId: "session-a",
     clock: makeFakeClock(),
     emit: (event, payload) => emitted.push({ event, payload }),
@@ -221,7 +693,8 @@ test("extension: publishing the current mapper withdraws the retired switch butt
   publisher.hello({ contractVersion: 1, kinds: [], slots: [] });
 
   // The set a previous build published: a badge plus three fixed-target
-  // buttons. They must be withdrawn explicitly, not left clickable.
+  // buttons with ids this build no longer uses. They must be withdrawn
+  // explicitly, not left clickable.
   publisher.set([
     {
       id: "mode",
@@ -233,7 +706,7 @@ test("extension: publishing the current mapper withdraws the retired switch butt
       actions: [],
     },
     {
-      id: "mode-plan",
+      id: "mode-switch-plan",
       kind: "action",
       slot: "action",
       label: "Plan",
@@ -244,7 +717,7 @@ test("extension: publishing the current mapper withdraws the retired switch butt
       disabledReason: "already in Plan",
     },
     {
-      id: "mode-orchestrator",
+      id: "mode-switch-orchestrator",
       kind: "action",
       slot: "action",
       label: "Orchestrator",
@@ -254,7 +727,7 @@ test("extension: publishing the current mapper withdraws the retired switch butt
       enabled: true,
     },
     {
-      id: "mode-build",
+      id: "mode-switch-build",
       kind: "action",
       slot: "action",
       label: "Build",
@@ -266,7 +739,13 @@ test("extension: publishing the current mapper withdraws the retired switch butt
   ]);
 
   const result = publisher.set(
-    buildWorkflowContributions({ mode: "plan", done: 0, total: 0, cycleAvailable: true }),
+    buildWorkflowContributions({
+      mode: "plan",
+      done: 0,
+      total: 0,
+      cycleAvailable: true,
+      modeCommands: MODE_COMMANDS,
+    }),
   );
   assert.equal(result.ok, true, result.ok ? "" : result.reason);
 
@@ -274,12 +753,27 @@ test("extension: publishing the current mapper withdraws the retired switch butt
     .filter((entry) => entry.event === CONTRIBUTION_EVENTS.update)
     .map((entry) => entry.payload as { removed: string[]; contributions: Array<{ id: string }> });
   const last = updates.at(-1)!;
-  assert.deepEqual([...last.removed].sort(), ["mode-build", "mode-orchestrator", "mode-plan"]);
-  assert.deepEqual(
-    last.contributions.map((entry) => entry.id).sort(),
-    ["input", "mode", "mode-cycle"],
-    "only the badge, its referenced cycle action and the input state remain",
-  );
+  assert.deepEqual([...last.removed].sort(), [
+    "mode-switch-build",
+    "mode-switch-orchestrator",
+    "mode-switch-plan",
+  ]);
+  const liveIds = new Set(last.contributions.map((entry) => entry.id));
+  for (const id of [
+    "mode",
+    "mode-cycle",
+    "mode-default",
+    "mode-plan",
+    "mode-orchestrator",
+    "mode-build",
+    "mode-choice-default",
+    "mode-choice-plan",
+    "mode-choice-orchestrator",
+    "mode-choice-build",
+    "input",
+  ]) {
+    assert.ok(liveIds.has(id), `${id} stays published`);
+  }
   // The publisher validated the envelope before emitting it (`result.ok`), so
   // the host never receives an unparsable set here.
 });
@@ -329,16 +823,24 @@ test("extension: a host hello makes Workflow publish its UI", async () => {
     assert.equal(envelope.owner.id, "@dieulc/workflow");
     const badge = envelope.contributions.find((entry) => entry.kind === "mode");
     assert.ok(badge, "the current mode is published");
-    // The published badge is bound to the same action the composer button runs,
-    // and the retired fixed-target buttons are not part of the live envelope.
+    // The published badge is bound to the same action the composer button runs
+    // and keeps its glyph identity; the menu uses the clean labels.
     assert.equal(badge?.actionRef, "mode-cycle");
     assert.ok(envelope.contributions.some((entry) => entry.id === "mode-cycle"));
-    for (const legacy of ["mode-plan", "mode-orchestrator", "mode-build"]) {
-      assert.equal(
-        envelope.contributions.some((entry) => entry.id === legacy),
-        false,
-        `the live envelope must not re-advertise ${legacy}`,
-      );
+    const byId = new Map(envelope.contributions.map((entry) => [entry.id, entry]));
+    for (const id of ["mode-default", "mode-plan", "mode-orchestrator", "mode-build"]) {
+      const action = byId.get(id) as { kind: string; command?: { name: string } } | undefined;
+      assert.ok(action, `${id} is published`);
+      assert.equal(action?.kind, "action");
+      assert.ok(action?.command?.name);
+    }
+    const current = byId.get("mode-build") as { enabled?: boolean; disabledReason?: string };
+    assert.equal(current.enabled, false);
+    assert.equal(current.disabledReason, "current mode");
+    for (const choice of envelope.contributions.filter((entry) => entry.kind === "mode-choice")) {
+      const action = byId.get(String(choice.actionRef));
+      assert.ok(action, `${choice.id} actionRef resolves in the same owner envelope`);
+      assert.equal(action?.kind, "action");
     }
   } finally {
     await pi.emit("session_shutdown", { reason: "quit" }, made.ctx);
@@ -379,7 +881,7 @@ test("build: no resume action without an approved wait", () => {
   assert.equal(idle.some((entry) => entry.id === "handoff-continue"), false);
 });
 
-test("orchestrator child rows expose pause/resume/abort and the view toggle", () => {
+test("orchestrator child rows: the run controls are one inline group and no child status row duplicates the footer", () => {
   const contributions = buildWorkflowContributions({
     mode: "orchestrator",
     done: 1,
@@ -389,30 +891,41 @@ test("orchestrator child rows expose pause/resume/abort and the view toggle", ()
       child: { ref: "2", total: 7, phase: "running", model: "builder/model", todoDone: 1, todoTotal: 2 },
       view: "child",
     },
+    childPanelActive: true,
   });
   const byId = new Map(contributions.map((entry) => [entry.id, entry]));
-  assert.equal(
-    String((byId.get("orchestrator-child") as { text?: string })?.text),
-    "child running · builder/model",
-    "the host row matches the footer: no row pointer, no child todo counter",
-  );
+  // The existing `workflow-orchestrator` setStatus line owns the telemetry; a
+  // second status row would duplicate it in the Desktop footer.
+  assert.equal(byId.has("orchestrator-child"), false);
   for (const id of ["orchestrator-view", "orchestrator-pause", "orchestrator-abort"]) {
     assert.ok(byId.has(id), id);
   }
+  const runControls = {
+    id: "run-controls",
+    label: "Run controls",
+    order: 30,
+    placement: "inline",
+  };
+  for (const [id, label, description, args] of [
+    ["orchestrator-pause", "Pause child", "/orchestrator pause", "pause"],
+    ["orchestrator-abort", "Abort child", "/orchestrator abort", "abort"],
+  ] as const) {
+    const action = byId.get(id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.label, label);
+    assert.equal(action.description, description);
+    assert.deepEqual(action.command, { name: "orchestrator", args });
+    assert.deepEqual(action.group, runControls);
+  }
+  // The menu group is ordered after the inline run controls.
+  const todosGroup = { id: "todos", label: "Todos", order: 40, placement: "menu" };
+  const view = byId.get("orchestrator-view");
+  assert.ok(view && view.kind === "action");
+  assert.deepEqual(view.group, todosGroup);
+  assert.ok(view.group.order > runControls.order);
   // Every Orchestrator action routes through the one canonical command; the
   // verb rides in `args`, the action ids stay stable for hosts.
-  assert.deepEqual(
-    (byId.get("orchestrator-view") as { command?: unknown }).command,
-    { name: "orchestrator", args: "view parent" },
-  );
-  assert.deepEqual(
-    (byId.get("orchestrator-pause") as { command?: unknown }).command,
-    { name: "orchestrator", args: "pause" },
-  );
-  assert.deepEqual(
-    (byId.get("orchestrator-abort") as { command?: unknown }).command,
-    { name: "orchestrator", args: "abort" },
-  );
+  assert.deepEqual(view.command, { name: "orchestrator", args: "view parent" });
   assert.equal(byId.has("orchestrator-direct-build"), false);
   assert.equal(byId.has("orchestrator-host"), false);
 });
@@ -427,12 +940,21 @@ test("a paused child publishes the canonical resume command and hint", () => {
       child: { ref: "2", total: 7, phase: "paused" },
       view: "parent",
     },
+    childPanelActive: false,
   });
   const byId = new Map(contributions.map((entry) => [entry.id, entry]));
-  assert.deepEqual(
-    (byId.get("orchestrator-resume") as { command?: unknown }).command,
-    { name: "orchestrator", args: "resume" },
-  );
+  const resume = byId.get("orchestrator-resume");
+  assert.ok(resume && resume.kind === "action");
+  assert.equal(resume.label, "Resume child");
+  assert.equal(resume.description, "/orchestrator resume");
+  assert.deepEqual(resume.command, { name: "orchestrator", args: "resume" });
+  assert.deepEqual(resume.group, {
+    id: "run-controls",
+    label: "Run controls",
+    order: 30,
+    placement: "inline",
+  });
+  // The parent panel is live, so the child list is still reachable.
   assert.deepEqual(
     (byId.get("orchestrator-view") as { command?: unknown }).command,
     { name: "orchestrator", args: "view child" },
@@ -443,7 +965,7 @@ test("a paused child publishes the canonical resume command and hint", () => {
   );
 });
 
-test("the orchestrator child row is view-aware and carries child stats", () => {
+test("child telemetry stays in the footer segment, not a duplicate contribution row", () => {
   const child = {
     ref: "2",
     total: 7,
@@ -464,29 +986,32 @@ test("the orchestrator child row is view-aware and carries child stats", () => {
     todoDone: 1,
     todoTotal: 2,
   };
-  const base = { mode: "orchestrator" as const, done: 1, total: 3 };
-  const textFor = (view: "child" | "parent" | "auto") => {
-    const contributions = buildWorkflowContributions({
-      ...base,
-      orchestration: { phase: "running", child, view },
-    });
-    const row = contributions.find((entry) => entry.id === "orchestrator-child");
-    return String((row as { text?: string } | undefined)?.text ?? "");
-  };
-
+  const contributions = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    orchestration: { phase: "running", child, view: "child" },
+    childPanelActive: true,
+  });
   assert.equal(
-    textFor("child"),
+    contributions.some(
+      (entry) => entry.kind === "status" && /^child\s/.test(entry.text),
+    ),
+    false,
+    "no status row duplicates the footer's child telemetry",
+  );
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    commitMode: "never",
+    orchestration: { phase: "running", child, view: "child" },
+  });
+  assert.equal(
+    segments.orchestrator,
     "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
+    "workflow-status.ts keeps building the child telemetry",
   );
-  assert.equal(textFor("auto"), textFor("child"), "auto follows a live child");
-  assert.equal(
-    textFor("parent"),
-    "child running",
-    "parent view keeps a counter-free phase hint",
-  );
-  for (const view of ["child", "parent", "auto"] as const) {
-    assert.equal(/[\r\n\t]/.test(textFor(view)), false, `${view} is one line`);
-  }
 });
 
 // ── Generic composer-transform publication ───────────────────────────
@@ -628,4 +1153,218 @@ test("composer publication is generic: two publishers build the same shape", () 
   }
   assert.equal(a.length, 3);
   assert.equal(b.length, 3);
+});
+
+// ── Desktop working message + active-panel progress ──────────────────
+
+interface ChildHostBoot {
+  pi: ReturnType<typeof import("./test-support.ts").makeFakePi>;
+  ctx: ReturnType<typeof import("./test-support.ts").makeFakeCtx>["ctx"];
+  made: ReturnType<typeof import("./test-support.ts").makeFakeCtx>;
+  fake: ReturnType<typeof import("./test-support.ts").makeFakeOrchestratorChildFactory>;
+  envelopes: Array<{
+    contributions: Array<{ id: string; kind: string; done?: number; total?: number }>;
+  }>;
+  cleanup(): Promise<void>;
+}
+
+async function bootChildHost(
+  options: { todos?: Array<{ text: string; completed?: boolean }> } = {},
+): Promise<ChildHostBoot> {
+  const { default: workflowExtension } = await import("./index.ts");
+  const {
+    fakeSdk,
+    makeFakeCtx,
+    makeFakeOrchestratorChildFactory,
+    makeFakePi,
+    submitThenFinish,
+    tmpProject,
+  } = await import("./test-support.ts");
+  const { cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const pi = makeFakePi({ activeTools: ["read", "write", "edit", "bash"] });
+  const fake = makeFakeOrchestratorChildFactory({
+    holdPrompt: true,
+    ...(options.todos ? { todos: options.todos } : {}),
+  });
+  const { sdk } = fakeSdk({ pass1: submitThenFinish("# Plan: x") });
+  const envelopes: ChildHostBoot["envelopes"] = [];
+  pi.events.on("host-contributions:probe", () => {
+    pi.events.emit("host-contributions:hello", {
+      contractVersion: 1,
+      kinds: [],
+      slots: [],
+    });
+  });
+  pi.events.on("host-contributions:update", (payload: unknown) => {
+    envelopes.push(payload as ChildHostBoot["envelopes"][number]);
+  });
+  await workflowExtension(pi as never, {
+    loadSdk: async () => sdk as never,
+    createOrchestratorChild: fake.factory as never,
+    plannotatorRequestTimeoutMs: 20,
+    plannotatorRecoveryTimeoutMs: 20,
+    // Desktop path: the composer working message is the surface.
+    isTerminalHost: () => false,
+  } as never);
+  const made = makeFakeCtx({ cwd, hasUI: true, branch: [] });
+  await pi.emit("session_start", { reason: "startup" }, made.ctx);
+  return {
+    pi,
+    ctx: made.ctx,
+    made,
+    fake,
+    envelopes,
+    async cleanup() {
+      try {
+        await pi.emit("session_shutdown", { reason: "quit" }, made.ctx);
+      } catch {
+        /* shutdown is best-effort in the fake host */
+      }
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    },
+  };
+}
+
+async function callHostTool(
+  b: ChildHostBoot,
+  name: string,
+  params: Record<string, unknown>,
+): Promise<{ text: string; details: Record<string, unknown> }> {
+  const tool = b.pi.tools[name];
+  assert.ok(tool, `${name} must be registered`);
+  const result = (await tool.execute(
+    `call-${name}`,
+    params,
+    undefined,
+    undefined,
+    b.ctx,
+  )) as {
+    content: Array<{ type: string; text?: string }>;
+    details?: Record<string, unknown>;
+  };
+  return {
+    text: result.content.map((block) => block.text ?? "").join("\n"),
+    details: result.details ?? {},
+  };
+}
+
+async function lifecycleTicks(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+
+test("desktop: the live child hint is published as the working message and cleared on settle", async () => {
+  const b = await bootChildHost();
+  try {
+    await b.pi.commands.orchestrator.handler("", b.ctx);
+    const started = await callHostTool(b, "orchestrator_start", {
+      title: "Working message",
+      steps: ["Row one"],
+    });
+    assert.match(started.text, /created with 1 row/);
+    await callHostTool(b, "orchestrator_dispatch", {
+      rowRef: "1",
+      instructions: "Do row one.",
+    });
+
+    // The bar renders this line verbatim, so the live child must carry the
+    // exact 0.14.0 pause/abort hints.
+    const live = b.made.workingMessages.at(-1);
+    assert.equal(typeof live, "string");
+    assert.match(String(live), /^Working · /);
+    assert.match(String(live), /\/orchestrator pause/);
+    assert.match(String(live), /\/orchestrator abort/);
+    assert.ok(
+      b.made.workingVisible.includes(true),
+      "the message is made visible when this composer owns it",
+    );
+
+    // Paused is a stable child state, not "no activity": the resume hint must
+    // stay on the bar.
+    await b.pi.commands.orchestrator.handler("pause", b.ctx);
+    await lifecycleTicks();
+    const paused = b.made.workingMessages.at(-1);
+    assert.match(String(paused), /^Paused · /);
+    assert.match(String(paused), /\/orchestrator resume/);
+    assert.match(String(paused), /\/orchestrator abort/);
+
+    // Resume before settling: a paused child deliberately keeps the warm
+    // session, so its settlement only completes once it runs again.
+    await b.pi.commands.orchestrator.handler("resume", b.ctx);
+    await lifecycleTicks();
+
+    // A settling/settled child releases the surface; the stale line must go.
+    b.fake.created[0]?.settle("row one done");
+    await lifecycleTicks();
+    assert.equal(
+      b.made.workingMessages.at(-1),
+      undefined,
+      "the working message is cleared when the child settles",
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("desktop: progress counts follow the active child panel", async () => {
+  const b = await bootChildHost({
+    todos: [
+      { text: "child a", completed: true },
+      { text: "child b", completed: false },
+    ],
+  });
+  try {
+    // The parent list has three rows; the child's own list has two.
+    await callHostTool(b, "workflow_todo", {
+      action: "update",
+      todos: [
+        { text: "parent a", status: "completed" },
+        { text: "parent b", status: "pending" },
+        { text: "parent c", status: "pending" },
+      ],
+    });
+    const progressOf = () => {
+      const envelope = b.envelopes.at(-1);
+      assert.ok(envelope, "an envelope was published");
+      const row = envelope!.contributions.find((entry) => entry.id === "todos");
+      assert.ok(row && row.kind === "progress", "the progress row is published");
+      return row!;
+    };
+    // The parent panel is active before dispatch: its three rows drive the
+    // footer count.
+    const parentProgress = progressOf();
+    assert.equal(parentProgress.total, 3);
+    assert.equal(parentProgress.done, 1);
+
+    await b.pi.commands.orchestrator.handler("", b.ctx);
+    await callHostTool(b, "orchestrator_start", {
+      title: "Active panel",
+      steps: ["Row one"],
+    });
+    await callHostTool(b, "orchestrator_dispatch", {
+      rowRef: "1",
+      instructions: "Do row one.",
+    });
+
+    // A live child makes its (still empty) list the active panel: no stale
+    // parent progress row may survive.
+    const liveEnvelope = b.envelopes.at(-1);
+    assert.ok(liveEnvelope, "an envelope was published");
+    assert.equal(
+      liveEnvelope!.contributions.some((entry) => entry.id === "todos"),
+      false,
+      "an empty child list does not publish the parent's three rows",
+    );
+
+    b.fake.created[0]?.settle("row one done");
+    await lifecycleTicks();
+    const after = progressOf();
+    assert.equal(after.total, 2, "the child panel's two rows drive the count");
+    assert.equal(after.done, 1);
+  } finally {
+    await b.cleanup();
+  }
 });

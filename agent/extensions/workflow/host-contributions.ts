@@ -73,6 +73,7 @@ export type ContributionTone = (typeof CONTRIBUTION_TONES)[number];
 
 export const CONTRIBUTION_KINDS = [
   "mode",
+  "mode-choice",
   "progress",
   "status",
   "action",
@@ -84,6 +85,7 @@ export type ContributionKind = (typeof CONTRIBUTION_KINDS)[number];
 
 export const CONTRIBUTION_SLOTS = [
   "mode",
+  "mode-choice",
   "progress",
   "status",
   "action",
@@ -92,6 +94,10 @@ export const CONTRIBUTION_SLOTS = [
   COMPOSER_CONTROL_SLOT,
 ] as const;
 export type ContributionSlot = (typeof CONTRIBUTION_SLOTS)[number];
+
+/** Where an action's owner wants its group rendered. Closed enum. */
+export const ACTION_PLACEMENTS = ["inline", "menu"] as const;
+export type ActionPlacement = (typeof ACTION_PLACEMENTS)[number];
 
 export const INPUT_AVAILABILITY = ["available", "restricted", "locked"] as const;
 export type InputAvailability = (typeof INPUT_AVAILABILITY)[number];
@@ -155,14 +161,53 @@ export interface StatusContribution extends ContributionBase {
   text: string;
 }
 
+/**
+ * Additive v1 action presentation metadata. Group identity is
+ * `(ownerId, group.id)`; `placement` is a closed enum so an unknown placement is
+ * rejected rather than guessed. `order` defaults to 0 and `placement` to
+ * `"inline"`, which keeps an ungrouped legacy action on the old code path.
+ */
+export interface ContributionActionGroup {
+  /** Owner-namespaced group id. */
+  id: string;
+  label: string;
+  /** Presentation order inside the owner; default 0. */
+  order: number;
+  /** `inline` = compact bar button, `menu` = three-dot drop-up. */
+  placement: ActionPlacement;
+}
+
 export interface ActionContribution extends ContributionBase {
   kind: "action";
   slot: "action";
   label: string;
   description?: string;
+  /** Optional additive v1 presentation metadata; absent means legacy ungrouped. */
+  group?: ContributionActionGroup;
   command: { name: string; args?: string };
   enabled: boolean;
   disabledReason?: string;
+}
+
+/**
+ * Additive v1 mode-menu option. It is presentation data only: it carries no
+ * command, `enabled` or `disabledReason` of its own. Execution and disabled
+ * state belong to the same-owner top-level `kind:"action"` named by
+ * `actionRef`, exactly like `ModeContribution.actionRef`.
+ */
+export interface ModeChoiceContribution extends ContributionBase {
+  kind: "mode-choice";
+  slot: "mode-choice";
+  label: string;
+  description?: string;
+  /**
+   * Same-owner top-level `kind:"action"` id. Required on the wire, allowed to
+   * dangle until a later envelope publishes its action: the resolver refuses a
+   * dangling/cross-owner/wrong-kind reference instead of inventing a command.
+   */
+  actionRef: string;
+  /** Presentation state only; the referenced action still owns execution. */
+  checked?: boolean;
 }
 
 export interface InputContribution extends ContributionBase {
@@ -183,6 +228,7 @@ export interface RelatedSessionContribution extends ContributionBase {
 
 export type Contribution =
   | ModeContribution
+  | ModeChoiceContribution
   | ProgressContribution
   | StatusContribution
   | ActionContribution
@@ -266,6 +312,32 @@ function id(value: unknown): string | undefined {
   // Ids are namespaced by the owner; dots/dashes only keeps them safe to use
   // as DOM keys, command arguments and log fields.
   return /^[A-Za-z0-9._-]+$/.test(text) ? text : undefined;
+}
+
+function parseActionGroup(
+  raw: unknown,
+): ContributionResult<ContributionActionGroup | undefined> {
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (!isRecord(raw)) return fail("action group must be an object");
+  const groupId = id(raw.id);
+  if (!groupId) return fail("action group.id is invalid");
+  const label = plainText(raw.label, HOST_CONTRIBUTION_LIMITS.maxLabelChars);
+  if (!label) return fail(`action group ${groupId} needs a label`);
+  let groupOrder = 0;
+  if (raw.order !== undefined) {
+    if (typeof raw.order !== "number" || !Number.isFinite(raw.order)) {
+      return fail(`action group ${groupId} order is invalid`);
+    }
+    groupOrder = raw.order;
+  }
+  let placement: ActionPlacement = "inline";
+  if (raw.placement !== undefined) {
+    if (!(ACTION_PLACEMENTS as readonly unknown[]).includes(raw.placement)) {
+      return fail(`action group ${groupId} placement is invalid`);
+    }
+    placement = raw.placement as ActionPlacement;
+  }
+  return { ok: true, value: { id: groupId, label, order: groupOrder, placement } };
 }
 
 function parseAction(raw: unknown, ownerId: string): ContributionResult<ContributionAction> {
@@ -369,6 +441,31 @@ function parseContribution(raw: unknown, ownerId: string): ContributionResult<Co
         },
       };
     }
+    case "mode-choice": {
+      const label = plainText(raw.label, HOST_CONTRIBUTION_LIMITS.maxLabelChars);
+      if (!label) return fail(`mode-choice ${contributionId} needs a label`);
+      const description = plainText(raw.description, HOST_CONTRIBUTION_LIMITS.maxTextChars, false);
+      if (raw.description !== undefined && description === undefined) {
+        return fail(`mode-choice ${contributionId} description is invalid`);
+      }
+      // Presentation data only. The reference is required and syntactically
+      // validated here; it may still dangle until a later envelope publishes
+      // the action, so resolution (and refusal) happens at read/run time.
+      const actionRef = id(raw.actionRef);
+      if (!actionRef) return fail(`mode-choice ${contributionId} needs a valid actionRef`);
+      return {
+        ok: true,
+        value: {
+          ...base,
+          kind: "mode-choice",
+          slot: "mode-choice",
+          label,
+          ...(description === undefined ? {} : { description }),
+          actionRef,
+          ...(raw.checked === true ? { checked: true } : {}),
+        },
+      };
+    }
     case "progress": {
       const label = plainText(raw.label, HOST_CONTRIBUTION_LIMITS.maxLabelChars);
       if (!label) return fail(`progress ${contributionId} needs a label`);
@@ -430,6 +527,8 @@ function parseContribution(raw: unknown, ownerId: string): ContributionResult<Co
         HOST_CONTRIBUTION_LIMITS.maxTextChars,
         false,
       );
+      const group = parseActionGroup(raw.group);
+      if (!group.ok) return group;
       return {
         ok: true,
         value: {
@@ -438,6 +537,7 @@ function parseContribution(raw: unknown, ownerId: string): ContributionResult<Co
           slot: "action",
           label,
           ...(description === undefined ? {} : { description }),
+          ...(group.value === undefined ? {} : { group: group.value }),
           command: { name: command.name, ...(args === undefined ? {} : { args }) },
           enabled,
           ...(enabled || disabledReason === undefined ? {} : { disabledReason }),

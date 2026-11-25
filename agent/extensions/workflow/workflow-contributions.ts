@@ -10,14 +10,18 @@
  * does not speak the contract gets the publisher's fallback (step 7).
  */
 
-import type { Contribution } from "./host-contributions.ts";
-import type { WorkflowMode } from "./workflow-mode.ts";
-import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
+import type {
+  Contribution,
+  ContributionActionGroup,
+} from "./host-contributions.ts";
 import {
-  childPhaseWord,
-  formatChildStatusLine,
-  modelRefFromLabel,
-} from "./child-stats.ts";
+  MODE_PRESENTATION,
+  modePresentation,
+  type ModePresentation,
+  type ModePresentationKey,
+  type WorkflowMode,
+} from "./workflow-mode.ts";
+import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
 import {
   COMPOSER_CONTROL_KIND,
   COMPOSER_CONTROL_SLOT,
@@ -28,6 +32,34 @@ import {
 } from "./composer-transform.ts";
 
 export const WORKFLOW_OWNER_ID = "@dieulc/workflow";
+
+/** Inline working controls for the live Build child. */
+const RUN_CONTROLS_GROUP: ContributionActionGroup = {
+  id: "run-controls",
+  label: "Run controls",
+  order: 30,
+  placement: "inline",
+};
+
+/**
+ * Inline working controls for a live or paused Review round. The footer/status
+ * line owns the phase detail; these are verbs only, and the handoff phase (a
+ * decision in the review tab) publishes none of them.
+ */
+const REVIEW_CONTROLS_GROUP: ContributionActionGroup = {
+  id: "review-controls",
+  label: "Review controls",
+  order: 30,
+  placement: "inline",
+};
+
+/** The TODO view/display menu; always after the run controls. */
+const TODOS_GROUP: ContributionActionGroup = {
+  id: "todos",
+  label: "Todos",
+  order: 40,
+  placement: "menu",
+};
 
 /** The effective todo-panel presentation, when the extension knows it. */
 export type WorkflowPanelState = "expanded" | "collapsed" | "hidden";
@@ -45,6 +77,13 @@ export interface WorkflowContributionInput {
   cycleAvailable?: boolean;
   /** Why cycling is refused right now (e.g. a Review owns the turn). */
   cycleDisabledReason?: string;
+  /**
+   * The resolved mode command per mode, from the registration flags in
+   * `index.ts`. A missing key means that command is not registered in this
+   * session; the mapper then publishes a disabled action with a precise reason
+   * instead of an enabled button the host cannot run.
+   */
+  modeCommands?: Partial<Record<ModePresentationKey, string>>;
   /** Effective todo-panel state; display-only, never inferred by the host. */
   panelState?: WorkflowPanelState | null;
   /** Live review phase; `idle` means no review row. */
@@ -87,6 +126,12 @@ export interface WorkflowContributionInput {
     /** Which TODO panel the pinned widget shows; display-only. */
     view?: "auto" | "parent" | "child";
   };
+  /**
+   * Whether the child TODO list is the active pinned panel. The host cannot
+   * infer this from `orchestration.view` alone because `auto` follows a live
+   * or settled child. Display-only, exactly like `view`.
+   */
+  childPanelActive?: boolean;
   /**
    * Composer-transform publication state. `undefined` means the host did not
    * negotiate `composer-transform-v1`, so no composer-control is published and
@@ -222,6 +267,59 @@ export function buildWorkflowContributions(
     return "mode-cycle";
   };
 
+  /**
+   * One menu action and one presentation choice per mode. The choice is data
+   * only: it references the same-owner action by id and carries no executable
+   * command or enabled state of its own. The current mode wins with
+   * `"current mode"`; otherwise a refused cycle (Review/handoff) locks every
+   * remaining action with the same reason. A missing command is always
+   * disabled, never an enabled dead button.
+   */
+  const pushModeMenu = (): void => {
+    const missingCommandReason = (presentation: ModePresentation): string => {
+      const names = presentation.commands.map((name) => `/${name}`);
+      return names.length === 1
+        ? `${names[0]} is not registered in this session`
+        : `neither ${names[0]} nor ${names[1]} is registered in this session`;
+    };
+    for (const presentation of MODE_PRESENTATION) {
+      const command = input.modeCommands?.[presentation.key];
+      const reason =
+        input.mode === presentation.mode
+          ? "current mode"
+          : (input.cycleDisabledReason ??
+            (command === undefined ? missingCommandReason(presentation) : undefined));
+      out.push({
+        id: `mode-${presentation.key}`,
+        kind: "action",
+        slot: "action",
+        label: presentation.menuLabel,
+        description: presentation.description,
+        tone: presentation.tone,
+        order: 20 + presentation.order,
+        // Keep the canonical reference even when registration failed: the host
+        // re-validates it, and a disabled action without a command is not a
+        // shape the contract can express.
+        command: { name: command ?? presentation.commands[0]! },
+        enabled: reason === undefined,
+        ...(reason === undefined ? {} : { disabledReason: reason }),
+      });
+    }
+    for (const presentation of MODE_PRESENTATION) {
+      out.push({
+        id: `mode-choice-${presentation.key}`,
+        kind: "mode-choice",
+        slot: "mode-choice",
+        label: presentation.menuLabel,
+        description: presentation.description,
+        tone: presentation.tone,
+        order: presentation.order,
+        actionRef: `mode-${presentation.key}`,
+        ...(input.mode === presentation.mode ? { checked: true } : {}),
+      });
+    }
+  };
+
   if (reviewing) {
     const base =
       phase === "paused"
@@ -244,20 +342,6 @@ export function buildWorkflowContributions(
       actions: [],
     });
     out.push({
-      id: "review",
-      kind: "action",
-      slot: "action",
-      label: phase === "paused" ? "Resume review" : "Review status",
-      tone: "info",
-      order: 20,
-      command: {
-        name: "review",
-        args: phase === "paused" ? "resume" : "status",
-      },
-      enabled: phase !== "handoff",
-      ...(phase === "handoff" ? { disabledReason: "decide in the review tab" } : {}),
-    });
-    out.push({
       id: "input",
       kind: "input",
       slot: "input",
@@ -266,42 +350,49 @@ export function buildWorkflowContributions(
       order: 40,
       reason: "A reviewer owns this turn; pause or stop it to prompt the plan agent.",
     });
+    // One inline group, the same verbs in every phase that accepts them:
+    // running pauses, paused resumes, both abort. Handoff and transition carry
+    // no control because the review tab (host-provided) owns the decision.
     if (phase === "running" || phase === "paused") {
       out.push({
-        id: "review-stop",
+        id: phase === "paused" ? "review-resume" : "review-pause",
         kind: "action",
         slot: "action",
-        label: "Stop review",
-        tone: "warning",
+        label: phase === "paused" ? "Resume review" : "Pause review",
+        description: phase === "paused" ? "/review resume" : "/review pause",
+        tone: phase === "paused" ? "info" : "warning",
         order: 30,
+        group: REVIEW_CONTROLS_GROUP,
+        command: {
+          name: "review",
+          args: phase === "paused" ? "resume" : "pause",
+        },
+        enabled: true,
+      });
+      out.push({
+        id: "review-abort",
+        kind: "action",
+        slot: "action",
+        label: "Abort review",
+        description: "/review abort",
+        tone: "warning",
+        order: 31,
+        group: REVIEW_CONTROLS_GROUP,
         command: { name: "review", args: "abort" },
         enabled: true,
       });
     }
+    pushModeMenu();
     return out;
   }
 
-  const modeLabel =
-    input.mode === "build"
-      ? "▶ build"
-      : input.mode === "plan"
-        ? "⏸ plan"
-        : input.mode === "orchestrator"
-          ? "🧭 orchestrator"
-          : "◦ default";
+  const presentation = modePresentation(input.mode);
   out.push({
     id: "mode",
     kind: "mode",
     slot: "mode",
-    label: modeLabel,
-    tone:
-      input.mode === "build"
-        ? "accent"
-        : input.mode === "plan"
-          ? "warning"
-          : input.mode === "orchestrator"
-            ? "info"
-            : "neutral",
+    label: presentation.composerLabel,
+    tone: presentation.tone,
     order: 0,
     detail:
       input.handoffStage === "approved"
@@ -314,6 +405,8 @@ export function buildWorkflowContributions(
     actionRef: pushCycleAction(input.cycleDisabledReason),
     actions: [],
   });
+
+  pushModeMenu();
 
   out.push({
     id: "input",
@@ -356,9 +449,12 @@ export function buildWorkflowContributions(
     });
   }
 
-  if (total > 0) {
+  // The four display verbs only affect the parent panel. In child view the
+  // extension pins that panel and ignores them, so publishing them would leave
+  // dead menu items.
+  if (total > 0 && input.childPanelActive !== true) {
     const displayActions: Array<[string, string, string]> = [
-      ["todos-auto", "Automatic", "auto"],
+      ["todos-auto", "Auto todos", "auto"],
       ["todos-expand", "Show todos", "expand"],
       ["todos-collapse", "Collapse todos", "collapse"],
       ["todos-hide", "Hide todos", "hide"],
@@ -371,25 +467,11 @@ export function buildWorkflowContributions(
         label,
         tone: "neutral",
         order: 11,
+        group: TODOS_GROUP,
         command: { name: "todos", args },
         enabled: true,
       });
     }
-    // A computed toggle keeps Ctrl+Alt+O equivalent without the host having to
-    // infer the panel's state from markup or status prose.
-    out.push({
-      id: "todos-toggle",
-      kind: "action",
-      slot: "action",
-      label: input.panelState === "expanded" ? "Collapse panel" : "Expand panel",
-      tone: "neutral",
-      order: 12,
-      command: {
-        name: "todos",
-        args: input.panelState === "expanded" ? "collapse" : "expand",
-      },
-      enabled: true,
-    });
   }
 
   if (input.mode === "orchestrator" && input.orchestration) {
@@ -410,47 +492,22 @@ export function buildWorkflowContributions(
       order: 41,
     });
     if (child) {
-      // One formatter for the footer segment and this host row, so the two
-      // cannot disagree about the phase, model, context, tokens or elapsed
-      // time. Progress (the row pointer and the child's own todo counter) is
-      // not repeated: the pinned TODO pane owns it.
-      const view = run.view ?? "auto";
-      const showDetails = view === "child" || view === "auto";
-      const model =
-        child.modelRef ??
-        (child.model ? modelRefFromLabel(child.model) : undefined);
-      const text = showDetails
-        ? formatChildStatusLine({
-            phase: child.phase,
-            ...(child.pausePending === undefined
-              ? {}
-              : { pausePending: child.pausePending }),
-            ...(child.retrying === undefined ? {} : { retrying: child.retrying }),
-            ...(model ? { model } : {}),
-            ...(child.stats ? { stats: child.stats } : {}),
-            ...(child.elapsedMs === undefined
-              ? {}
-              : { elapsedMs: child.elapsedMs }),
-          })
-        : `child ${childPhaseWord(child)}`;
-      out.push({
-        id: "orchestrator-child",
-        kind: "status",
-        slot: "status",
-        text,
-        tone: child.phase === "paused" ? "warning" : "accent",
-        order: 42,
-      });
+      // The Desktop routes status rows to the footer and the existing
+      // `workflow-orchestrator` setStatus line already carries the child
+      // telemetry, so publishing an `orchestrator-child` row here would only
+      // duplicate it.
+      const childPanel = input.childPanelActive === true;
       out.push({
         id: "orchestrator-view",
         kind: "action",
         slot: "action",
-        label: run.view === "child" ? "Show parent todos" : "Show child todos",
+        label: childPanel ? "Show parent todos" : "Show child todos",
         tone: "neutral",
         order: 43,
+        group: TODOS_GROUP,
         command: {
           name: "orchestrator",
-          args: run.view === "child" ? "view parent" : "view child",
+          args: childPanel ? "view parent" : "view child",
         },
         enabled: true,
       });
@@ -460,8 +517,10 @@ export function buildWorkflowContributions(
           kind: "action",
           slot: "action",
           label: "Pause child",
+          description: "/orchestrator pause",
           tone: "warning",
           order: 44,
+          group: RUN_CONTROLS_GROUP,
           command: { name: "orchestrator", args: "pause" },
           enabled: true,
         });
@@ -472,8 +531,10 @@ export function buildWorkflowContributions(
           kind: "action",
           slot: "action",
           label: "Resume child",
+          description: "/orchestrator resume",
           tone: "info",
           order: 44,
+          group: RUN_CONTROLS_GROUP,
           command: { name: "orchestrator", args: "resume" },
           enabled: true,
         });
@@ -483,8 +544,10 @@ export function buildWorkflowContributions(
         kind: "action",
         slot: "action",
         label: "Abort child",
+        description: "/orchestrator abort",
         tone: "warning",
         order: 45,
+        group: RUN_CONTROLS_GROUP,
         command: { name: "orchestrator", args: "abort" },
         enabled: true,
       });

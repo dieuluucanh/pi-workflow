@@ -122,6 +122,11 @@
           "provider": "opencode-go",
           "id": "hy4-flash-free",
           "thinking": "high"
+        },
+        "orchestrator": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "high"
         }
       },
       "defaultModel": {

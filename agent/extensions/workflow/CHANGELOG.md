@@ -1,3 +1,70 @@
+## [0.15.0] - 2026-11-25
+
+### Changed — action groups, the mode menu and inline controls (2026-11-25)
+
+- **Action groups are additive v1 presentation data.** An action may carry
+  `group { id, label, order, placement }`. Identity is `(owner.id, group.id)`,
+  `placement` is the closed enum `inline | menu`, `order` defaults to `0`, and
+  `placement` defaults to `inline`; an ungrouped action keeps the old code path,
+  so an older host renders it exactly as before. Workflow publishes
+  `run-controls` (inline, order 30), `review-controls` (inline, order 30) and
+  `todos` (menu, order 40). Unknown placements and malformed groups fail the
+  envelope rather than being guessed.
+- **`mode-choice` is its own kind and slot.** A choice carries label,
+  description, tone, order and presentation-only `checked`; the required
+  same-owner `actionRef` names the `kind:"action"` that executes it. A choice
+  has no `command`, `enabled` or `disabledReason` of its own. A dangling, foreign
+  or wrong-kind reference parses but is refused by the resolver instead of
+  inventing a command.
+- **Four clean menu labels, one unchanged glyph identity.** The menu publishes
+  `Default`, `Plan`, `Orchestrator` and `Build` choices, while the composer mode
+  badge keeps its existing `◦ default`, `⏸ plan`, `🧭 orchestrator` and
+  `▶ build` labels byte-for-byte. Each choice resolves to a `mode-<key>` action
+  whose command is the registered `/default`, `/plan` (or `/workflow` when
+  `/plan` is held by another owner), `/orchestrator`, or `/build`.
+- **Mode actions are disabled precisely.** The current mode is disabled with
+  `current mode`; a live Review/handoff lock disables every other mode with the
+  lock notice; a mode whose command could not be registered is disabled with a
+  named reason instead of an enabled dead button.
+- **`Auto todos` and the TODO menu.** The display verbs are now `Auto todos`,
+  `Show todos`, `Collapse todos` and `Hide todos` in the `todos` menu group; the
+  computed `todos-toggle` action is removed. The four verbs are not published
+  when a live child pins the panel, and the TODO action set in that view is
+  only the `orchestrator-view` action — `Show parent todos` in child view,
+  `Show child todos` otherwise (the run controls stay in `run-controls`). The
+  progress row counts the list the pinned panel shows.
+- **Review controls are inline.** Running publishes `Pause review` +
+  `Abort review`; paused publishes `Resume review` + `Abort review`, both in
+  `review-controls`. The standalone `review` action (status/resume) is removed;
+  the `workflow-review` status line owns the phase, and handoff/transition
+  publish no controls because the review tab owns the decision. Commands are
+  `/review pause`, `/review resume`, `/review abort` — never the retired
+  hyphenated spellings.
+- **One child status surface.** Workflow no longer publishes an
+  `orchestrator-child` status row; the `workflow-orchestrator` setStatus line
+  remains the single child telemetry surface. The child action set is the TODO
+  view toggle plus `Pause child` / `Resume child` / `Abort child` in
+  `run-controls`.
+- **`setWorkingMessage` ownership is explicit.** On a generic-contribution
+  Desktop host the extension owns the working message only while it owns the
+  turn: the live child line (including pause/abort hints and paused/settling
+  guidance) is written with `setWorkingVisible(true)`, and a running, paused or
+  handoff Review suppresses the write entirely, so the reviewer's message is
+  never overwritten. The extension clears only a message it set, and it never
+  uses visibility as a liveness hack over a native retry/compaction indicator.
+
+### Compatibility
+
+- This checkout is `@dieulc/workflow` **0.15.0**. Pi Desktop's
+  `resources/workflow.lock.json` still pins the published **0.13.0** tarball and
+  its staged bundle is that 0.13.0 build (hyphenated commands, no groups or
+  `mode-choice`). This package has **not** been staged into Desktop.
+- Contribution v1 stays additive: a 0.13.0 host ignores `group` on an action and
+  drops the unknown `mode-choice` kind, keeping its action/status rows. A host
+  rendering 0.15.0 contributions gets groups, choices and inline controls.
+- The 0.14.0 verb grammar is unchanged in 0.15.0: `/orchestrator <verb>` and
+  `/review <verb>`, with no hyphenated aliases.
+
 ## [0.14.0] - 2026-11-25
 
 ### Changed — one command grammar for `/orchestrator` and `/review` (2026-11-25)

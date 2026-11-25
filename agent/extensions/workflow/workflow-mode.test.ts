@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 
 import {
   MODE_CYCLE_ORDER,
+  MODE_PRESENTATION,
   PLAN_MODE_TOOLS,
   NORMAL_MODE_TOOLS,
   buildModeTools,
@@ -20,6 +21,7 @@ import {
   isManagedTool,
   isWorkflowMode,
   modeLabel,
+  modePresentation,
   planModeTools,
   orchestratorModeTools,
   roleForMode,
@@ -135,6 +137,43 @@ test("cycle: Orchestrator is a full member of the ordinary ring", () => {
   assert.equal(cycleMode("orchestrator", -1), "plan");
   assert.equal(cycleMode("plan", 1), "orchestrator");
   assert.equal(cycleMode("build", -1), "orchestrator");
+});
+
+test("presentation: the canonical table keeps composer glyphs and clean menu labels apart", () => {
+  assert.deepEqual(
+    MODE_PRESENTATION.map((entry) => entry.mode),
+    MODE_CYCLE_ORDER,
+    "the table follows the Tab ring",
+  );
+  // These are the labels the composer and footer already render: a menu must
+  // never replace them with the clean names.
+  assert.deepEqual(
+    MODE_PRESENTATION.map((entry) => entry.composerLabel),
+    ["◦ default", "⏸ plan", "🧭 orchestrator", "▶ build"],
+  );
+  assert.deepEqual(
+    MODE_PRESENTATION.map((entry) => entry.menuLabel),
+    ["Default", "Plan", "Orchestrator", "Build"],
+  );
+  assert.deepEqual(
+    MODE_PRESENTATION.map((entry) => entry.tone),
+    ["neutral", "warning", "info", "accent"],
+  );
+  assert.deepEqual(
+    MODE_PRESENTATION.map((entry) => entry.order),
+    [0, 1, 2, 3],
+  );
+  assert.deepEqual(modePresentation("plan").commands, ["plan", "workflow"]);
+  assert.deepEqual(modePresentation("build").commands, ["build"]);
+  assert.equal(modePresentation("orchestrator").commands[0], "orchestrator");
+  assert.equal(modePresentation(null).commands[0], "default");
+  for (const entry of MODE_PRESENTATION) {
+    assert.equal(modePresentation(entry.mode), entry);
+    assert.doesNotMatch(entry.menuLabel, /[⏸▶🧭◦]/u, "menu labels are clean");
+    assert.match(entry.description, /^Switch to /);
+  }
+  // An unknown mode degrades to Default, never an empty row.
+  assert.equal(modePresentation("someday" as WorkflowMode), MODE_PRESENTATION[0]);
 });
 
 test("codec: orchestrator round-trips and older readers see Default flags", () => {

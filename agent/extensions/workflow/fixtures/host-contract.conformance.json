@@ -11,9 +11,7 @@
         "sessionId": "session-a",
         "epoch": 0,
         "revision": 1,
-        "contributions": [
-          { "kind": "status", "id": "build-status", "text": "Building 3/8" }
-        ]
+        "contributions": [{ "kind": "status", "id": "build-status", "text": "Building 3/8" }]
       }
     },
     {
@@ -35,7 +33,12 @@
             "detail": "read-only",
             "actions": [
               { "id": "mode-build", "label": "Build", "command": { "name": "build" } },
-              { "id": "mode-plan", "label": "Plan", "enabled": false, "disabledReason": "already in plan" }
+              {
+                "id": "mode-plan",
+                "label": "Plan",
+                "enabled": false,
+                "disabledReason": "already in plan"
+              }
             ]
           }
         ]
@@ -92,8 +95,209 @@
         "sessionId": "session-a",
         "epoch": 0,
         "revision": 1,
+        "contributions": [{ "kind": "mode", "id": "mode", "label": "Plan", "actionRef": 7 }]
+      }
+    },
+    {
+      "name": "actions carry inline and menu groups plus a legacy ungrouped action",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
         "contributions": [
-          { "kind": "mode", "id": "mode", "label": "Plan", "actionRef": 7 }
+          {
+            "kind": "action",
+            "id": "todos-expand",
+            "label": "Expand todos",
+            "order": 5,
+            "group": {
+              "id": "workflow.todos",
+              "label": "Todos",
+              "order": 10,
+              "placement": "inline"
+            },
+            "command": { "name": "workflow-todos-expand" }
+          },
+          {
+            "kind": "action",
+            "id": "orchestrator-pause",
+            "label": "Pause child",
+            "order": 6,
+            "group": {
+              "id": "workflow.orchestrator",
+              "label": "Orchestrator",
+              "order": 20,
+              "placement": "menu"
+            },
+            "command": { "name": "workflow-orchestrator-pause" }
+          },
+          {
+            "kind": "action",
+            "id": "defaulted-group",
+            "label": "Auto todos",
+            "group": { "id": "workflow.automation", "label": "Automation" },
+            "command": { "name": "workflow-todos-auto" }
+          },
+          {
+            "kind": "action",
+            "id": "legacy-ungrouped",
+            "label": "Legacy action",
+            "command": { "name": "workflow-legacy" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "an action group placement is a closed enum",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "action",
+            "id": "a",
+            "label": "run",
+            "group": {
+              "id": "workflow.todos",
+              "label": "Todos",
+              "order": 0,
+              "placement": "sidebar"
+            },
+            "command": { "name": "run" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "an action group needs an id and a label",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "action",
+            "id": "a",
+            "label": "run",
+            "group": { "id": "workflow.todos", "placement": "menu" },
+            "command": { "name": "run" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "mode choices reference same-owner actions and carry checked state",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode",
+            "id": "mode",
+            "label": "Plan",
+            "tone": "warning",
+            "actionRef": "mode-cycle",
+            "actions": []
+          },
+          {
+            "kind": "action",
+            "id": "mode-cycle",
+            "label": "Cycle mode",
+            "command": { "name": "workflow-cycle" }
+          },
+          {
+            "kind": "action",
+            "id": "mode-plan",
+            "label": "Plan",
+            "command": { "name": "workflow-plan" }
+          },
+          {
+            "kind": "action",
+            "id": "mode-build",
+            "label": "Build",
+            "command": { "name": "workflow-build" }
+          },
+          {
+            "kind": "mode-choice",
+            "id": "choice-plan",
+            "label": "Plan",
+            "description": "Read-only planning",
+            "tone": "warning",
+            "order": 10,
+            "actionRef": "mode-plan",
+            "checked": true
+          },
+          {
+            "kind": "mode-choice",
+            "id": "choice-build",
+            "label": "Build",
+            "order": 20,
+            "actionRef": "mode-build"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a mode-choice needs an actionRef",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "mode-choice", "id": "choice-plan", "label": "Plan" }]
+      }
+    },
+    {
+      "name": "a mode-choice actionRef must be a safe id",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode-choice",
+            "id": "choice-plan",
+            "label": "Plan",
+            "actionRef": "../../bin/sh"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a mode-choice with a dangling actionRef still parses",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode-choice",
+            "id": "choice-deleted",
+            "label": "Deleted",
+            "actionRef": "action-not-published-yet"
+          }
         ]
       }
     },
@@ -108,7 +312,14 @@
         "revision": 2,
         "removed": ["stale-status"],
         "contributions": [
-          { "kind": "progress", "id": "todos", "label": "Todos", "done": 3, "total": 12, "stale": true },
+          {
+            "kind": "progress",
+            "id": "todos",
+            "label": "Todos",
+            "done": 3,
+            "total": 12,
+            "stale": true
+          },
           {
             "kind": "related-session",
             "id": "child-1",
@@ -117,7 +328,12 @@
             "title": "Task 1",
             "focusable": true
           },
-          { "kind": "input", "id": "input", "availability": "restricted", "reason": "Orchestrator verifies before new work" }
+          {
+            "kind": "input",
+            "id": "input",
+            "availability": "restricted",
+            "reason": "Orchestrator verifies before new work"
+          }
         ]
       }
     },

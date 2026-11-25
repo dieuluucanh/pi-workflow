@@ -13,6 +13,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  REVIEW_PAUSED_LINE,
+  REVIEW_RUNNING_LINE,
+} from "./review.ts";
+import {
   createReviewBandGate,
   createReviewEntryComponent,
   createReviewLineBuffer,
@@ -308,6 +312,18 @@ test("registerReviewEntryRenderers: registers every transcript entry type", () =
   ]);
   assert.equal(REVIEW_MODE_ENTRY_TYPE, "workflow-review-mode");
   assert.equal(REVIEW_TRANSCRIPT_ENTRY_TYPE, "workflow-review-transcript");
+});
+
+test("review lines keep the exact 0.14.0 pause/resume/abort hints", () => {
+  // The footer/status line and the controls must never disagree about the
+  // public grammar: `/review pause`, `/review resume`, `/review abort`.
+  assert.ok(REVIEW_RUNNING_LINE.includes("/review pause"));
+  assert.ok(REVIEW_RUNNING_LINE.includes("/review abort"));
+  assert.ok(REVIEW_PAUSED_LINE.includes("/review resume"));
+  assert.ok(REVIEW_PAUSED_LINE.includes("/review abort"));
+  for (const line of [REVIEW_RUNNING_LINE, REVIEW_PAUSED_LINE]) {
+    assert.doesNotMatch(line, /\/review-(?:pause|resume|abort)\b/);
+  }
 });
 
 test("isTerminalPiHost excludes every piped / Desktop host", () => {

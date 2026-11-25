@@ -52,6 +52,7 @@ const BASELINE = JSON.parse(
 /** Every frozen kind maps to exactly one frozen slot. */
 const KIND_SLOT: Record<string, string> = {
   mode: "mode",
+  "mode-choice": "mode-choice",
   progress: "progress",
   status: "status",
   action: "action",
