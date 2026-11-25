@@ -696,7 +696,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
     c.timeoutMs === LEGACY_REVIEW_TIMEOUT_MS
   ) {
     lines.push(
-      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review-mode timeout unlimited removes it`,
+      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review mode timeout unlimited removes it`,
     );
   }
   lines.push(
@@ -704,7 +704,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
     `  runtime        : ${input.runtime}`,
     `  transcript     : streamed into the main Pi transcript`,
     "",
-    "Usage: /review-mode on|off [global|project] | /review-mode status | /review-mode timeout <seconds|unlimited> [global|project] | /review-prompt | /review-status | /review",
+    "Usage: /review mode on|off [global|project] | /review mode status | /review mode timeout <seconds|unlimited> [global|project] | /review prompt | /review status | /review",
   );
   return lines;
 }
@@ -1113,7 +1113,7 @@ export function reviewResumeNotice(result: ReviewExecutionResult): string {
   const reason = result.reason ? ` (${result.reason})` : "";
   switch (result.outcome) {
     case "paused":
-      return "Review paused again — /review-resume to continue, /review-abort to stop.";
+      return "Review paused again — /review resume to continue, /review abort to stop.";
     case "rewritten":
       return "Review finished — plan rewritten and saved.";
     case "unchanged":
@@ -1656,7 +1656,7 @@ export function reviewEscapeAction(input: {
 
 /** Hints shown on the live running line in both hosts. */
 export const REVIEW_RUNNING_HINT =
-  "ESC or /review-pause to pause · /review-abort to stop";
+  "ESC or /review pause to pause · /review abort to stop";
 
 /** Cold-boot and running prefix; the state detail is appended when it lands. */
 export const REVIEW_RUNNING_LINE = `🔍 Reviewing plan… · ${REVIEW_RUNNING_HINT}`;
@@ -1666,11 +1666,11 @@ export const REVIEW_RUNNING_LINE = `🔍 Reviewing plan… · ${REVIEW_RUNNING_H
  * the Terminal widget. One owner so the surfaces cannot drift.
  */
 export const REVIEW_PAUSED_LINE =
-  "⏸ Review paused — /review-resume to continue, /review-abort to stop";
+  "⏸ Review paused — /review resume to continue, /review abort to stop";
 
 /** The reviewer finished; the plan waits for Approve/Revise. */
 export const REVIEW_HANDOFF_LINE =
-  "🔍 review · awaiting decision — /review-abort to skip";
+  "🔍 review · awaiting decision — /review abort to skip";
 
 /** A decision is being applied; the turn is briefly not actionable. */
 export const REVIEW_TRANSITION_LINE = "🔍 review · applying the decision…";
@@ -1929,7 +1929,7 @@ export function reviewInputDecision(
           : "running";
   return {
     action: "block",
-    notice: `Review is ${state} — prompts are locked. /review-pause, /review-resume, /review-abort, /handoff fallback, or change model/profile.`,
+    notice: `Review is ${state} — prompts are locked. /review pause, /review resume, /review abort, /handoff fallback, or change model/profile.`,
   };
 }
 
@@ -2054,15 +2054,15 @@ export function reviewHandoffParks(input: {
 /** One short notice for a blocked mode transition. */
 export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
   if (kind === "paused") {
-    return "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop.";
+    return "Review is paused — mode switching stays locked. /review resume to continue, /review abort to stop.";
   }
   if (kind === "handoff") {
-    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review-abort to hand the plan off now.";
+    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review abort to hand the plan off now.";
   }
   if (kind === "transition") {
     return "Review decision is being applied — mode switching is briefly locked.";
   }
-  return "Review is running — mode switching is locked. ESC or /review-pause to pause, /review-resume to continue, /review-abort to stop.";
+  return "Review is running — mode switching is locked. ESC or /review pause to pause, /review resume to continue, /review abort to stop.";
 }
 
 /** Footer marker appended to the single `"workflow"` status while locked. */

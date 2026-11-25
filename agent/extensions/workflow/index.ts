@@ -299,6 +299,10 @@ import {
   createOperatorRuntime,
   orchestratorInputDecision,
 } from "./orchestrator-operator.ts";
+import {
+  ORCHESTRATOR_DESCRIPTION,
+  orchestratorCompletionItems,
+} from "./orchestrator-command.ts";
 import { resolveModelPlan } from "./orchestrator-model-plan.ts";
 import { createNodeWorkspaceResolver } from "./workspace-node.ts";
 import {
@@ -569,6 +573,18 @@ import {
   type ModeTransitionAdmission,
   type ReviewerAdmission,
 } from "./review-policy.ts";
+import {
+  REVIEW_DEFAULT_FORM,
+  REVIEW_DESCRIPTION,
+  formatReviewHelp,
+  parseReviewInvocation,
+  reviewCompletionItems,
+  reviewVerb,
+  suggestReviewVerb,
+  type ReviewInvocation,
+  type ReviewVerbSpec,
+} from "./review-command.ts";
+import { splitCommandHead } from "./command-text.ts";
 import { seedPromptHistory, WorkflowTabEditor } from "./tab-editor.ts";
 import {
   createShellGuardRuntime,
@@ -1238,11 +1254,6 @@ export default function workflowExtension(
   const checkpoints = new Map<string, string>();
   let currentEntryId: string | undefined;
   let lastPromptHeader: string | undefined;
-  /**
-   * The current user prompt (bounded). Discussion work is captured from this,
-   * so a work request does not need a plan file or a second prompt.
-   */
-  let lastUserPrompt = "";
   const recentRestores = new Set<string>();
 
   // ── Model roles state ──────────────────────────────────────────
@@ -2769,7 +2780,7 @@ export default function workflowExtension(
             lines: [
               {
                 kind: "notice",
-                text: "… review output truncated in the transcript — see /review-status for the full findings",
+                text: "… review output truncated in the transcript — see /review status for the full findings",
               },
             ],
           });
@@ -3563,7 +3574,7 @@ export default function workflowExtension(
           }
           if (action === "swallow") {
             notifyReview(
-              "Review is paused — /review-resume to continue, /review-abort to stop.",
+              "Review is paused — /review resume to continue, /review abort to stop.",
               "info",
             );
             return { consume: true };
@@ -3628,8 +3639,8 @@ export default function workflowExtension(
     // the paused form (see refreshReviewPauseUi).
     notifyReview(
       reason === "esc"
-        ? "Review paused (Escape) — the reviewer session stays warm. /review-resume to continue, /review-abort to stop."
-        : "Review paused — /review-resume to continue, /review-abort to stop.",
+        ? "Review paused (Escape) — the reviewer session stays warm. /review resume to continue, /review abort to stop."
+        : "Review paused — /review resume to continue, /review abort to stop.",
       "info",
     );
     return true;
@@ -3909,7 +3920,7 @@ export default function workflowExtension(
         emitReviewBand({
           mode: "review-done",
           paused: true,
-          reason: "paused — /review-resume to continue, /review-abort to stop",
+          reason: "paused — /review resume to continue, /review abort to stop",
         });
         return {
           planText,
@@ -4509,220 +4520,6 @@ export default function workflowExtension(
       void _e;
     }
   }
-
-  pi.registerCommand("review-mode", {
-    description:
-      "Toggle Review Mode (independent reviewer that audits and rewrites plans): /review-mode on|off|status|timeout",
-    handler: async (args, ctx) => {
-      if (blockWhileChildActive(ctx, "/handoff")) return;
-      const cwd = (ctx as any)?.cwd ?? process.cwd();
-      const agentDir = reviewAgentDir();
-      // Self-sufficient: never render a role that was never loaded from disk.
-      ensureRoleConfig(cwd);
-      notifyRoleConfigFallback(ctx as ExtensionContext);
-      const tokens = String(args || "")
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean);
-      const sub = (tokens[0] || "").toLowerCase();
-      // Scope is any explicit `global`/`project` token after the subcommand.
-      const scopeFor = (
-        fallback: "global" | "project",
-      ): "global" | "project" => {
-        for (const t of tokens.slice(1)) {
-          if (t === "global" || t === "project") return t;
-        }
-        return fallback;
-      };
-
-      if (!sub || sub === "status") {
-        const resolved = readReviewModeConfig(cwd, agentDir);
-        const c = resolved.config;
-        ensureProfilesConfig(cwd);
-        const model = getEffectiveRole(REVIEW_ROLE_NAME)?.model;
-        const lines = formatReviewStatusLines({
-          enabled: c.enabled,
-          config: c,
-          timeoutSource: resolved.sources.timeout,
-          reviewer: model
-            ? {
-                provider: model.provider,
-                id: model.id,
-                thinking: model.thinking,
-              }
-            : undefined,
-          promptSource: resolveReviewPrompt(cwd, agentDir).source,
-          sources: {
-            global: resolved.sources.global,
-            project: resolved.sources.project,
-          },
-          runtime: reviewRuntime?.isRoundActive()
-            ? "reviewing"
-            : reviewRuntime?.isAlive()
-              ? "session active"
-              : "not started",
-        });
-        const explicitEnabled = reviewModeEnabledValues(cwd, agentDir);
-        const shadowed = (["global", "project"] as const)
-          .filter(
-            (scope) =>
-              explicitEnabled[scope] !== undefined &&
-              explicitEnabled[scope] !== c.enabled,
-          )
-          .map((scope) => `${scope} enabled:${explicitEnabled[scope]}`);
-        if (shadowed.length > 0) {
-          lines.push(
-            `  shadowed: ${shadowed.join(", ")} (effective: ${c.enabled})`,
-          );
-        }
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
-      }
-
-      if (sub === "timeout") {
-        const scope = scopeFor("global");
-        const rawValue = tokens
-          .slice(1)
-          .find((t) => t !== "global" && t !== "project");
-        if (rawValue === undefined) {
-          const resolved = readReviewModeConfig(cwd, agentDir);
-          ctx.ui.notify(
-            [
-              `Review Mode timeout: ${formatReviewTimeoutLabel(
-                resolved.config.timeoutMs,
-                resolved.sources.timeout,
-              )}`,
-              "Usage: /review-mode timeout <seconds|unlimited> [global|project]",
-            ].join("\n"),
-            "info",
-          );
-          return;
-        }
-        const parsed = parseReviewTimeoutArg(rawValue);
-        if (!parsed.ok) {
-          ctx.ui.notify(`Invalid timeout: ${parsed.error}`, "warning");
-          return;
-        }
-        const written = writeReviewModeConfig(scope, cwd, agentDir, {
-          timeoutMs: parsed.timeoutMs,
-        });
-        if (!written.ok) {
-          ctx.ui.notify(
-            `Could not write review settings: ${written.error ?? "unknown error"}`,
-            "error",
-          );
-          return;
-        }
-        ctx.ui.notify(
-          `Review Mode timeout → ${formatReviewTimeoutLabel(
-            parsed.timeoutMs,
-            scope,
-          )} (${scope})\nSettings: ${written.path}`,
-          "info",
-        );
-        return;
-      }
-
-      if (sub !== "on" && sub !== "off") {
-        ctx.ui.notify(
-          "Usage: /review-mode on|off [global|project] | status | timeout <seconds|unlimited> [global|project]",
-          "info",
-        );
-        return;
-      }
-
-      const scope = scopeFor("global");
-      const enable = sub === "on";
-      // A running/paused reviewer (or a gated audit) still owns the turn:
-      // /review-abort is the explicit exit. A completed reviewer with a pending
-      // browser handoff is NOT a running round, so disabling is allowed and
-      // downgrades that handoff to a plain one.
-      if (!enable && reviewRoundInFlight()) {
-        ctx.ui.notify(
-          "Review is running or paused — /review-abort first, then /review-mode off.",
-          "info",
-        );
-        return;
-      }
-      if (!enable && handoffModalOpen) {
-        ctx.ui.notify(
-          "A native handoff prompt is open — dismiss it first, then /review-mode off.",
-          "info",
-        );
-        return;
-      }
-      const hadPendingHandoff =
-        awaitingDecision || planHandoffPhase === "pending";
-
-      const explicitBefore = reviewModeEnabledValues(cwd, agentDir);
-      const res = writeReviewModeConfig(scope, cwd, agentDir, {
-        enabled: enable,
-      });
-      if (!res.ok) {
-        ctx.ui.notify(
-          `Could not write review settings: ${res.error ?? "unknown error"}`,
-          "error",
-        );
-        return;
-      }
-      // A project fragment wins field-by-field over global. Make an explicit
-      // on/off request effective when the other scope would otherwise defeat
-      // it, and report both files instead of claiming success silently.
-      const otherScope = scope === "global" ? "project" : "global";
-      const writtenPaths = [res.path];
-      let effectiveEnabled = readReviewModeConfig(cwd, agentDir).config.enabled;
-      if (
-        effectiveEnabled !== enable &&
-        explicitBefore[otherScope] !== undefined
-      ) {
-        const other = writeReviewModeConfig(otherScope, cwd, agentDir, {
-          enabled: enable,
-        });
-        if (other.ok) writtenPaths.push(other.path);
-        effectiveEnabled = readReviewModeConfig(cwd, agentDir).config.enabled;
-      }
-      if (effectiveEnabled !== enable) {
-        ctx.ui.notify(
-          `Review Mode is still ${effectiveEnabled ? "ON" : "OFF"} — ${otherScope} settings override the ${scope} value. Run /review-mode ${
-            enable ? "on" : "off"
-          } ${otherScope} (effective: ${effectiveEnabled}).\nSettings: ${writtenPaths.join(", ")}`,
-          "warning",
-        );
-        updateStatus(ctx as any);
-        return;
-      }
-      const scopeLabel =
-        writtenPaths.length > 1 ? `${scope} + ${otherScope}` : scope;
-      const settingsLabel = writtenPaths.join(", ");
-
-      if (enable) {
-        ctx.ui.notify(
-          `Review Mode ENABLED (${scopeLabel}) — after Plan Mode finishes, an independent reviewer audits a submitted plan and hands it to Plannotator or the native questionnaire (see /handoff). Configuration ON is not a trigger: review is Plan-only and never runs during Build/Orchestrator execution.\nTip: /review runs a one-shot review in Plan mode, even with Review Mode off.\nSettings: ${settingsLabel}`,
-          "info",
-        );
-        updateStatus(ctx as any);
-        return;
-      }
-
-      // Disabling is an explicit review exit (not a mode transition): do not
-      // guard it. A pending handoff is kept as a plain decision so the browser
-      // tab (or /handoff fallback) still works after Review Mode is off.
-      if (hadPendingHandoff) {
-        await disableReviewModeKeepHandoff();
-      } else {
-        await teardownReview();
-      }
-      ctx.ui.notify(
-        `Review Mode disabled (${scopeLabel}) — automatic review off; plan/build flow is back to single-agent.\n${
-          hadPendingHandoff
-            ? "The pending plan handoff is still open as a plain decision — use /handoff fallback for the native sheet.\n"
-            : ""
-        }Tip: /review still runs a one-shot review in Plan mode.\nSettings: ${settingsLabel}`,
-        "info",
-      );
-      updateStatus(ctx as any);
-    },
-  });
 
   // ── /handoff: view/set the plan handoff target (workflow.handoff) ──
   // Available in every mode: it only writes settings JSON. The mode decides
@@ -6372,121 +6169,6 @@ export default function workflowExtension(
       permissionsArgumentCompletions(prefix),
   });
 
-  pi.registerCommand("review-prompt", {
-    description:
-      "Edit the project's additional reviewer guidance — adds to (never replaces) the fixed review criteria",
-    handler: async (args, ctx) => {
-      const cwd = (ctx as any)?.cwd ?? process.cwd();
-      const agentDir = reviewAgentDir();
-      const resolved = resolveReviewPrompt(cwd, agentDir);
-      const scope: "global" | "project" =
-        String(args || "")
-          .trim()
-          .toLowerCase() === "global"
-          ? "global"
-          : "project";
-      if (!(ctx as any)?.hasUI) {
-        ctx.ui.notify(
-          `Reviewer guidance (${resolved.source}):\n\n${resolved.text}`,
-          "info",
-        );
-        return;
-      }
-      const edited = await (ctx as any).ui.editor(
-        `Reviewer guidance (${scope}) — plain markdown`,
-        resolved.text,
-      );
-      if (edited === undefined || edited === null) {
-        ctx.ui.notify("Review prompt unchanged.", "info");
-        return;
-      }
-      const w = writeReviewPrompt(scope, String(edited), cwd, agentDir);
-      ctx.ui.notify(
-        w.ok
-          ? `Reviewer guidance saved (${scope}): ${w.path}`
-          : `Could not save reviewer guidance: ${w.error ?? "unknown error"}`,
-        w.ok ? "info" : "error",
-      );
-    },
-  });
-
-  pi.registerCommand("review-status", {
-    description: "Show Review Mode state, findings and any error",
-    handler: async (_args, ctx) => {
-      const s = reviewState;
-      const lockKind = reviewModeLockKindNow();
-      if (!s) {
-        const paused = currentPausedReview();
-        if (paused) {
-          ctx.ui.notify(
-            [
-              `Review paused at round ${paused.round} (plan hash ${paused.planHash})`,
-              "  /review-resume to continue, /review-abort to stop.",
-              ...reviewTurnStatusLines(),
-              pendingHandoffStatusLine(),
-              reviewModeLockStatusLine(lockKind),
-            ]
-              .filter(Boolean)
-              .join("\n"),
-            "info",
-          );
-          return;
-        }
-        // Live-session-aware: an ad-hoc round may have run (or be warm)
-        // while the persisted flag stays OFF. Saved config still applies.
-        const manualCfg = reviewConfigForManual();
-        const cfgLine =
-          manualCfg !== undefined
-            ? ` Saved config: rounds ${manualCfg.rounds}, passes ${manualCfg.passes}.`
-            : "";
-        ctx.ui.notify(
-          [
-            reviewEnabled()
-              ? "Review Mode is enabled but no review has run yet."
-              : `Review Mode is OFF — automatic review disabled (/review-mode on to enable).${cfgLine} Manual review is Plan mode only: /plan, then /review. Review never runs during Build/Orchestrator execution; row verification is mechanical, not a review.`,
-            ...reviewTurnStatusLines(),
-            pendingHandoffStatusLine(),
-            reviewModeLockStatusLine(lockKind),
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          "info",
-        );
-        return;
-      }
-      const lines = [
-        reviewStateSummary(s),
-        `  phase   : ${s.phase}   round: ${s.round}   pass: ${s.pass}`,
-        `  model   : ${s.modelLabel}`,
-        `  attempt : ${s.recoveryAttempts?.length ? s.recoveryAttempts.join(" → ") : "single model"}`,
-        `  elapsed : ${Math.round(reviewElapsedMs(s) / 1000)}s${
-          s.providerError ? `   provider: ${s.providerError.slice(0, 200)}` : ""
-        }`,
-        `  plan    : ${s.planPath ?? "(unknown)"}  hash ${s.planHash}`,
-        `  explore : ${s.exploreUsed} subagent(s)   tokens≈${s.tokenEstimate ?? "n/a"}`,
-        s.verdict ? `  verdict : ${s.verdict}` : "",
-        s.error ? `  error   : ${s.error}` : "",
-        currentPausedReview()
-          ? `  paused  : round ${currentPausedReview()!.round} — /review-resume to continue, /review-abort to stop`
-          : "",
-        abortedReviewHash
-          ? `  note    : revision ${abortedReviewHash} was aborted — it will not be auto-reviewed until the plan changes`
-          : "",
-        reviewRuntime?.isRoundActive()
-          ? "  live    : round in flight — /role and /profile switches apply to the live reviewer now (and to the next round); /review say <msg> to steer"
-          : "",
-        ...reviewTurnStatusLines(),
-        pendingHandoffStatusLine(),
-        reviewModeLockStatusLine(lockKind),
-        ...s.findings.map(
-          (f) =>
-            `  - [${f.disposition}] sev ${f.severity}/conf ${f.confidence} ${f.summary}`,
-        ),
-      ].filter(Boolean);
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
-
   /**
    * Refuse an explicit manual review start/resume without touching mode,
    * settings, the plan target, the pause snapshot or the review turn. A
@@ -6500,7 +6182,7 @@ export default function workflowExtension(
     if (admission.code === "not-plan" && currentPausedReview() !== undefined) {
       // A paused review keeps modes locked; name the escape path explicitly.
       message +=
-        "\nA paused review keeps modes locked — /review-abort to discard it, then /plan and /review again.";
+        "\nA paused review keeps modes locked — /review abort to discard it, then /plan and /review again.";
     }
     try {
       ctx.ui.notify(message, "warning");
@@ -6509,341 +6191,610 @@ export default function workflowExtension(
     }
   }
 
-  pi.registerCommand("review", {
-    description:
-      "Run a one-shot Review round now: /review [path] is Plan mode only (works whether Review Mode is on or off; mode stays OFF); /review say <msg> talks to the in-flight reviewer",
-    getArgumentCompletions: (prefix: string) => {
-      const cwd = (currentSessionCtx as any)?.cwd ?? process.cwd();
-      const items = [
-        {
-          value: "say",
-          label: "say",
-          description: "Send a message to the in-flight reviewer",
-        },
-        ...listRecentPlanFiles(cwd, 8).map((p) => ({
-          value: p,
-          label: p,
-          description: "Review this plan",
-        })),
-      ];
-      const p = prefix.trim();
-      const filtered = items.filter(
-        (i) => i.value.startsWith(p) || i.label.startsWith(p),
-      );
-      return filtered.length ? filtered : null;
-    },
-    handler: async (args, ctx) => {
-      if (blockWhileChildActive(ctx, "/review")) return;
-      // The Reviewer is a Plan artifact. Refuse BEFORE the target read, the
-      // review turn or any SDK work; never switch modes implicitly.
-      const admission = admitReviewerNow({ trigger: "manual" });
-      if (!admission.ok) {
-        notifyManualReviewRefusal(ctx, admission);
-        return;
-      }
-      // Explicit reviewer steering (plan 2026-10-23, step 3): the only path
-      // that delivers user text into an in-flight review round. Plain chat
-      // stays with the plan agent (see the `input` handler).
-      const raw = (args || "").trim();
-      if (/^say(?:\s|$)/i.test(raw)) {
-        const message = raw.replace(/^say(?:\s|$)/i, "").trim();
-        if (!message) {
-          ctx.ui.notify(
-            "Usage: /review say <message> — send a message to the in-flight reviewer.",
-            "info",
-          );
-          return;
-        }
-        const rt = reviewRuntime;
-        // Liveness-only: steering works during an ad-hoc round too, whether
-        // or not Review Mode is on. No `enabled` check here.
-        if (!rt?.isRoundActive()) {
-          ctx.ui.notify(
-            "No review round running — your message stayed in this chat.",
-            "info",
-          );
-          return;
-        }
-        try {
-          const delivered = await rt.sendUserMessage(message);
-          if (delivered) {
-            pushReviewNote("user", `you → reviewer: ${message}`);
-          } else {
-            ctx.ui.notify(
-              "The reviewer did not accept the message — it stayed in this chat.",
-              "warning",
-            );
-          }
-        } catch (e: any) {
-          ctx.ui.notify(
-            `Could not reach the reviewer (${String(e?.message ?? e)}) — your message stayed in this chat.`,
-            "warning",
-          );
-        }
-        return;
-      }
-      // Manual one-shot review: works whether or not Review Mode is on.
-      // No `enabled` check here — readReviewModeConfig never throws and
-      // runReviewStep("manual") supplies defaults when unreadable.
-      //
-      // The plan is resolved independently of handoff eligibility: a run that
-      // started in Default and switched to Plan, or a plan written before a
-      // mode switch, must still be auditable (plan 2026-10-31).
-      const cwd = (ctx as any)?.cwd ?? process.cwd();
-      let explicit: string | undefined = raw.length
-        ? raw.replace(/^(["'])(.*)\1$/, "$2").trim()
-        : undefined;
-      if (explicit) {
-        const abs = path.isAbsolute(explicit)
-          ? explicit
-          : path.join(cwd, explicit);
-        // Mirror the write-path naming policy: a mistyped date prefix should
-        // still resolve to the file the extension actually wrote. Try the
-        // literal path, the normalized new-plan name, then today's date on the
-        // same time/slug. Nothing here renames an existing file, so a legacy
-        // date-only plan is found by its literal path first.
-        const now = new Date();
-        const candidates: Array<string | undefined> = [
-          abs,
-          normalizePlanPath(abs, cwd, now).path,
-          dateCorrectedPlanPath(abs, cwd, now),
-        ];
-        explicit =
-          candidates.find(
-            (candidate): candidate is string =>
-              typeof candidate === "string" && fs.existsSync(candidate),
-          ) ?? abs;
-      }
-      const resolution = resolveReviewTarget(ctx, explicit);
-      if (resolution.kind === "no-plan") {
-        const recent = resolution.recent;
-        const hint = recent.length
-          ? `\nRecent plans:\n${recent.map((r) => `  /review ${r}`).join("\n")}`
-          : "";
+  /**
+   * `/review status` — the current round (Decision 4: `/review mode status`
+   * answers the configuration question instead). Guard-free by the table.
+   */
+  async function handleReviewStatus(
+    _args: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const s = reviewState;
+    const lockKind = reviewModeLockKindNow();
+    if (!s) {
+      const paused = currentPausedReview();
+      if (paused) {
         ctx.ui.notify(
-          `No plan file found for this session — run /review <path> with a file under .pi/plans/.${hint}`,
+          [
+            `Review paused at round ${paused.round} (plan hash ${paused.planHash})`,
+            "  /review resume to continue, /review abort to stop.",
+            ...reviewTurnStatusLines(),
+            pendingHandoffStatusLine(),
+            reviewModeLockStatusLine(lockKind),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          "info",
+        );
+        return;
+      }
+      // Live-session-aware: an ad-hoc round may have run (or be warm)
+      // while the persisted flag stays OFF. Saved config still applies.
+      const manualCfg = reviewConfigForManual();
+      const cfgLine =
+        manualCfg !== undefined
+          ? ` Saved config: rounds ${manualCfg.rounds}, passes ${manualCfg.passes}.`
+          : "";
+      ctx.ui.notify(
+        [
+          reviewEnabled()
+            ? "Review Mode is enabled but no review has run yet."
+            : `Review Mode is OFF — automatic review disabled (/review mode on to enable).${cfgLine} Manual review is Plan mode only: /plan, then /review. Review never runs during Build/Orchestrator execution; row verification is mechanical, not a review.`,
+          ...reviewTurnStatusLines(),
+          pendingHandoffStatusLine(),
+          reviewModeLockStatusLine(lockKind),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "info",
+      );
+      return;
+    }
+    const lines = [
+      reviewStateSummary(s),
+      `  phase   : ${s.phase}   round: ${s.round}   pass: ${s.pass}`,
+      `  model   : ${s.modelLabel}`,
+      `  attempt : ${s.recoveryAttempts?.length ? s.recoveryAttempts.join(" → ") : "single model"}`,
+      `  elapsed : ${Math.round(reviewElapsedMs(s) / 1000)}s${
+        s.providerError ? `   provider: ${s.providerError.slice(0, 200)}` : ""
+      }`,
+      `  plan    : ${s.planPath ?? "(unknown)"}  hash ${s.planHash}`,
+      `  explore : ${s.exploreUsed} subagent(s)   tokens≈${s.tokenEstimate ?? "n/a"}`,
+      s.verdict ? `  verdict : ${s.verdict}` : "",
+      s.error ? `  error   : ${s.error}` : "",
+      currentPausedReview()
+        ? `  paused  : round ${currentPausedReview()!.round} — /review resume to continue, /review abort to stop`
+        : "",
+      abortedReviewHash
+        ? `  note    : revision ${abortedReviewHash} was aborted — it will not be auto-reviewed until the plan changes`
+        : "",
+      reviewRuntime?.isRoundActive()
+        ? "  live    : round in flight — /role and /profile switches apply to the live reviewer now (and to the next round); /review say <msg> to steer"
+        : "",
+      ...reviewTurnStatusLines(),
+      pendingHandoffStatusLine(),
+      reviewModeLockStatusLine(lockKind),
+      ...s.findings.map(
+        (f) =>
+          `  - [${f.disposition}] sev ${f.severity}/conf ${f.confidence} ${f.summary}`,
+      ),
+    ].filter(Boolean);
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  /**
+   * `/review mode …` — Review Mode configuration (Decision 3: the dispatcher
+   * applies `blockWhileChildActive(ctx, "/review mode")` before this runs).
+   * `parsed.mode` is the strict sub-grammar: subcommand, positional scope and
+   * timeout value, already validated by `parseReviewInvocation`.
+   */
+  async function handleReviewMode(
+    parsed: Extract<ReviewInvocation, { kind: "verb" }>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const agentDir = reviewAgentDir();
+    // Self-sufficient: never render a role that was never loaded from disk.
+    ensureRoleConfig(cwd);
+    notifyRoleConfigFallback(ctx as ExtensionContext);
+    // `mode` with no subcommand asks the status question. The scope is fixed by
+    // position (Decision 5/6) — it is never searched for in the tokens.
+    const mode = parsed.mode ?? { action: "status" as const };
+
+    if (mode.action === "status") {
+      const resolved = readReviewModeConfig(cwd, agentDir);
+      const c = resolved.config;
+      ensureProfilesConfig(cwd);
+      const model = getEffectiveRole(REVIEW_ROLE_NAME)?.model;
+      const lines = formatReviewStatusLines({
+        enabled: c.enabled,
+        config: c,
+        timeoutSource: resolved.sources.timeout,
+        reviewer: model
+          ? {
+              provider: model.provider,
+              id: model.id,
+              thinking: model.thinking,
+            }
+          : undefined,
+        promptSource: resolveReviewPrompt(cwd, agentDir).source,
+        sources: {
+          global: resolved.sources.global,
+          project: resolved.sources.project,
+        },
+        runtime: reviewRuntime?.isRoundActive()
+          ? "reviewing"
+          : reviewRuntime?.isAlive()
+            ? "session active"
+            : "not started",
+      });
+      const explicitEnabled = reviewModeEnabledValues(cwd, agentDir);
+      const shadowed = (["global", "project"] as const)
+        .filter(
+          (scope) =>
+            explicitEnabled[scope] !== undefined &&
+            explicitEnabled[scope] !== c.enabled,
+        )
+        .map((scope) => `${scope} enabled:${explicitEnabled[scope]}`);
+      if (shadowed.length > 0) {
+        lines.push(
+          `  shadowed: ${shadowed.join(", ")} (effective: ${c.enabled})`,
+        );
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+      return;
+    }
+
+    if (mode.action === "timeout") {
+      const scope = mode.scope;
+      const rawValue = mode.value;
+      if (rawValue === undefined) {
+        const resolved = readReviewModeConfig(cwd, agentDir);
+        ctx.ui.notify(
+          [
+            `Review Mode timeout: ${formatReviewTimeoutLabel(
+              resolved.config.timeoutMs,
+              resolved.sources.timeout,
+            )}`,
+            "Usage: /review mode timeout <seconds|unlimited> [global|project]",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      const timeoutArg = parseReviewTimeoutArg(rawValue);
+      if (!timeoutArg.ok) {
+        ctx.ui.notify(`Invalid timeout: ${timeoutArg.error}`, "warning");
+        return;
+      }
+      const written = writeReviewModeConfig(scope, cwd, agentDir, {
+        timeoutMs: timeoutArg.timeoutMs,
+      });
+      if (!written.ok) {
+        ctx.ui.notify(
+          `Could not write review settings: ${written.error ?? "unknown error"}`,
+          "error",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `Review Mode timeout → ${formatReviewTimeoutLabel(
+          timeoutArg.timeoutMs,
+          scope,
+        )} (${scope})\nSettings: ${written.path}`,
+        "info",
+      );
+      return;
+    }
+
+    const scope = mode.scope;
+    const enable = mode.action === "on";
+    // A running/paused reviewer (or a gated audit) still owns the turn:
+    // /review-abort is the explicit exit. A completed reviewer with a pending
+    // browser handoff is NOT a running round, so disabling is allowed and
+    // downgrades that handoff to a plain one.
+    if (!enable && reviewRoundInFlight()) {
+      ctx.ui.notify(
+        "Review is running or paused — /review abort first, then /review mode off.",
+        "info",
+      );
+      return;
+    }
+    if (!enable && handoffModalOpen) {
+      ctx.ui.notify(
+        "A native handoff prompt is open — dismiss it first, then /review mode off.",
+        "info",
+      );
+      return;
+    }
+    const hadPendingHandoff =
+      awaitingDecision || planHandoffPhase === "pending";
+
+    const explicitBefore = reviewModeEnabledValues(cwd, agentDir);
+    const res = writeReviewModeConfig(scope, cwd, agentDir, {
+      enabled: enable,
+    });
+    if (!res.ok) {
+      ctx.ui.notify(
+        `Could not write review settings: ${res.error ?? "unknown error"}`,
+        "error",
+      );
+      return;
+    }
+    // A project fragment wins field-by-field over global. Make an explicit
+    // on/off request effective when the other scope would otherwise defeat
+    // it, and report both files instead of claiming success silently.
+    const otherScope = scope === "global" ? "project" : "global";
+    const writtenPaths = [res.path];
+    let effectiveEnabled = readReviewModeConfig(cwd, agentDir).config.enabled;
+    if (
+      effectiveEnabled !== enable &&
+      explicitBefore[otherScope] !== undefined
+    ) {
+      const other = writeReviewModeConfig(otherScope, cwd, agentDir, {
+        enabled: enable,
+      });
+      if (other.ok) writtenPaths.push(other.path);
+      effectiveEnabled = readReviewModeConfig(cwd, agentDir).config.enabled;
+    }
+    if (effectiveEnabled !== enable) {
+      ctx.ui.notify(
+        `Review Mode is still ${effectiveEnabled ? "ON" : "OFF"} — ${otherScope} settings override the ${scope} value. Run /review mode ${
+          enable ? "on" : "off"
+        } ${otherScope} (effective: ${effectiveEnabled}).\nSettings: ${writtenPaths.join(", ")}`,
+        "warning",
+      );
+      updateStatus(ctx as any);
+      return;
+    }
+    const scopeLabel =
+      writtenPaths.length > 1 ? `${scope} + ${otherScope}` : scope;
+    const settingsLabel = writtenPaths.join(", ");
+
+    if (enable) {
+      ctx.ui.notify(
+        `Review Mode ENABLED (${scopeLabel}) — after Plan Mode finishes, an independent reviewer audits a submitted plan and hands it to Plannotator or the native questionnaire (see /handoff). Configuration ON is not a trigger: review is Plan-only and never runs during Build/Orchestrator execution.\nTip: /review runs a one-shot review in Plan mode, even with Review Mode off.\nSettings: ${settingsLabel}`,
+        "info",
+      );
+      updateStatus(ctx as any);
+      return;
+    }
+
+    // Disabling is an explicit review exit (not a mode transition): do not
+    // guard it. A pending handoff is kept as a plain decision so the browser
+    // tab (or /handoff fallback) still works after Review Mode is off.
+    if (hadPendingHandoff) {
+      await disableReviewModeKeepHandoff();
+    } else {
+      await teardownReview();
+    }
+    ctx.ui.notify(
+      `Review Mode disabled (${scopeLabel}) — automatic review off; plan/build flow is back to single-agent.\n${
+        hadPendingHandoff
+          ? "The pending plan handoff is still open as a plain decision — use /handoff fallback for the native sheet.\n"
+          : ""
+      }Tip: /review still runs a one-shot review in Plan mode.\nSettings: ${settingsLabel}`,
+      "info",
+    );
+    updateStatus(ctx as any);
+  }
+
+  /**
+   * `/review prompt [global]` — edit the project's additional reviewer
+   * guidance. Guard-free: it only reads/writes a markdown file.
+   */
+  async function handleReviewPrompt(
+    parsed: Extract<ReviewInvocation, { kind: "verb" }>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const agentDir = reviewAgentDir();
+    const resolved = resolveReviewPrompt(cwd, agentDir);
+    const scope: "global" | "project" = parsed.scope ?? "project";
+    if (!(ctx as any)?.hasUI) {
+      ctx.ui.notify(
+        `Reviewer guidance (${resolved.source}):\n\n${resolved.text}`,
+        "info",
+      );
+      return;
+    }
+    const edited = await (ctx as any).ui.editor(
+      `Reviewer guidance (${scope}) — plain markdown`,
+      resolved.text,
+    );
+    if (edited === undefined || edited === null) {
+      ctx.ui.notify("Review prompt unchanged.", "info");
+      return;
+    }
+    const w = writeReviewPrompt(scope, String(edited), cwd, agentDir);
+    ctx.ui.notify(
+      w.ok
+        ? `Reviewer guidance saved (${scope}): ${w.path}`
+        : `Could not save reviewer guidance: ${w.error ?? "unknown error"}`,
+      w.ok ? "info" : "error",
+    );
+  }
+
+  /**
+   * The bare `/review` / `/review <path>` form: resolve the plan, abort any
+   * superseded round, then run one manual round. Decision 5 keeps the path
+   * fallback — only an exact verb shadows a plan file.
+   */
+  async function handleReviewRound(
+    parsed: Extract<ReviewInvocation, { kind: "default" }>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    // Manual one-shot review: works whether or not Review Mode is on.
+    // No `enabled` check here — readReviewModeConfig never throws and
+    // runReviewStep("manual") supplies defaults when unreadable.
+    //
+    // The plan is resolved independently of handoff eligibility: a run that
+    // started in Default and switched to Plan, or a plan written before a
+    // mode switch, must still be auditable (plan 2026-10-31).
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    // Decision 5: the path did not resolve, so an alphabetic token within edit
+    // distance 2 of a verb earns a hint. A real plan file (or a token that is
+    // not alphabetic) is never corrected, so this stays silent for paths.
+    const suggestion = suggestReviewVerb(
+      splitCommandHead(parsed.text).head,
+    );
+    const suggestionLine = suggestion ? `\n${suggestion.text}` : "";
+    // Decision 5: the parser already stripped one matching quote pair, so the
+    // remaining text is the path candidate exactly as the user meant it.
+    let explicit: string | undefined = parsed.text.length
+      ? parsed.text
+      : undefined;
+    if (explicit) {
+      const abs = path.isAbsolute(explicit)
+        ? explicit
+        : path.join(cwd, explicit);
+      // Mirror the write-path naming policy: a mistyped date prefix should
+      // still resolve to the file the extension actually wrote. Try the
+      // literal path, the normalized new-plan name, then today's date on the
+      // same time/slug. Nothing here renames an existing file, so a legacy
+      // date-only plan is found by its literal path first.
+      const now = new Date();
+      const candidates: Array<string | undefined> = [
+        abs,
+        normalizePlanPath(abs, cwd, now).path,
+        dateCorrectedPlanPath(abs, cwd, now),
+      ];
+      explicit =
+        candidates.find(
+          (candidate): candidate is string =>
+            typeof candidate === "string" && fs.existsSync(candidate),
+        ) ?? abs;
+    }
+    const resolution = resolveReviewTarget(ctx, explicit);
+    if (resolution.kind === "no-plan") {
+      const recent = resolution.recent;
+      const hint = recent.length
+        ? `\nRecent plans:\n${recent.map((r) => `  /review ${r}`).join("\n")}`
+        : "";
+      ctx.ui.notify(
+        `No plan file found for this session — run /review <path> with a file under .pi/plans/.${suggestionLine}${hint}`,
+        "warning",
+      );
+      return;
+    }
+    if (resolution.kind === "error") {
+      ctx.ui.notify(`${resolution.message}${suggestionLine}`, "warning");
+      return;
+    }
+    const target = resolution.target;
+    // The gated handoff owns the reviewer while it is open: a fresh round
+    // here would race the handoff it is about to render. Steer the running
+    // round with `/review say`, pause with ESC, or stop it with
+    // `/review-abort` instead; resume a paused one with `/review-resume`.
+    // A gate from a superseded cycle must not refuse a fresh manual round.
+    const currentGatePhase =
+      reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
+    if (currentGatePhase !== "idle") {
+      ctx.ui.notify(
+        currentGatePhase === "paused"
+          ? "A handoff review is paused — /review resume to continue it, /review abort to hand off the plan as-is."
+          : "A handoff review is running — /review say <msg> to steer it, ESC to pause, /review abort to hand off the plan as-is.",
+        "info",
+      );
+      return;
+    }
+    // Abort-first (step 6): never run two rounds on one reviewer session.
+    // The superseded round resolves `aborted` and stays silent for its own
+    // revision (quietAbortHash) so only the fresh round announces.
+    if (reviewRuntime?.isRoundActive() || activeReview) {
+      quietAbortHash = activeReview
+        ? planHash(activeReview.planText)
+        : undefined;
+      pausedReview = undefined;
+      try {
+        activeReview?.controller.abort();
+      } catch (_e) {
+        void _e;
+      }
+      try {
+        await reviewRuntime?.abortRound();
+      } catch (_e) {
+        void _e;
+      }
+    }
+    // The reviewer writes through `currentPlanFile`; point it at the file
+    // `/review` actually read before the round starts. A fallback source is
+    // announced so the user can see which plan is being audited.
+    if (target.source !== "run" && target.source !== "explicit") {
+      notifyReview(`Reviewing ${target.display}`, "info");
+    }
+    currentPlanFile = target.abs;
+    lastPlanWritePath = target.abs;
+    notePlanTargetForReviewCycle(target.abs);
+    persistState();
+    lastReviewedPlanHash = undefined; // force a fresh review
+    abortedReviewHash = undefined;
+    pausedReview = undefined;
+    reviewRound = 0;
+    // Manual /review is a Review turn from the first tick: the mode status,
+    // input gate and mode lock must be active before the child boots.
+    beginReviewTurn();
+    const result = await runReviewStep(
+      target.text,
+      ctx as any,
+      (ctx as any).signal as AbortSignal | undefined,
+      "manual",
+    );
+    // The manual path never flips the persisted flag: tell the user when
+    // automatic review is still off so the one-shot is not mistaken for it.
+    const offSuffix = reviewEnabled()
+      ? ""
+      : " (Review Mode stays OFF — /review mode on for automatic review.)";
+    if (
+      (await openHandoffForSettledRound(
+        result,
+        target.abs,
+        ctx as any,
+        offSuffix,
+      )) !== "none"
+    ) {
+      return;
+    }
+    ctx.ui.notify(`${reviewResumeNotice(result)}${offSuffix}`, "info");
+  }
+
+  /**
+   * `/review say <msg>` — the only path that delivers user text into an
+   * in-flight review round. Plain chat stays with the plan agent (see the
+   * `input` handler). Liveness-only: steering works during an ad-hoc round
+   * too, whether or not Review Mode is on. No `enabled` check here.
+   */
+  async function handleReviewSay(
+    parsed: Extract<ReviewInvocation, { kind: "verb" }>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const message = (parsed.text ?? "").trim();
+    if (!message) {
+      ctx.ui.notify(
+        "Usage: /review say <message> — send a message to the in-flight reviewer.",
+        "info",
+      );
+      return;
+    }
+    const rt = reviewRuntime;
+    if (!rt?.isRoundActive()) {
+      ctx.ui.notify(
+        "No review round running — your message stayed in this chat.",
+        "info",
+      );
+      return;
+    }
+    try {
+      const delivered = await rt.sendUserMessage(message);
+      if (delivered) {
+        pushReviewNote("user", `you → reviewer: ${message}`);
+      } else {
+        ctx.ui.notify(
+          "The reviewer did not accept the message — it stayed in this chat.",
           "warning",
         );
-        return;
       }
-      if (resolution.kind === "error") {
-        ctx.ui.notify(resolution.message, "warning");
-        return;
+    } catch (e: any) {
+      ctx.ui.notify(
+        `Could not reach the reviewer (${String(e?.message ?? e)}) — your message stayed in this chat.`,
+        "warning",
+      );
+    }
+  }
+
+  /**
+   * `/review pause` — snapshot the round and keep the reviewer session warm.
+   * Works whether or not Review Mode is on; guard-free by the table.
+   */
+  async function handleReviewPause(
+    _args: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    // Manual control: pause works whether or not Review Mode is on.
+    // Gate only on round ownership below — no `enabled` check here.
+    if (!activeReview) {
+      let notice = "No review round running.";
+      if (currentPausedReview()) {
+        notice =
+          "Review is already paused — /review resume to continue, /review abort to stop.";
+      } else if (awaitingDecision || reviewTurn === "handoff") {
+        notice =
+          "A handoff is waiting — /review abort to hand off now, or answer the handoff prompt.";
+      } else if (reviewTurn !== "idle") {
+        notice = "No review round running — /review abort to clear the review turn.";
       }
-      const target = resolution.target;
-      // The gated handoff owns the reviewer while it is open: a fresh round
-      // here would race the handoff it is about to render. Steer the running
-      // round with `/review say`, pause with ESC, or stop it with
-      // `/review-abort` instead; resume a paused one with `/review-resume`.
-      // A gate from a superseded cycle must not refuse a fresh manual round.
-      const currentGatePhase =
-        reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
-      if (currentGatePhase !== "idle") {
-        ctx.ui.notify(
-          currentGatePhase === "paused"
-            ? "A handoff review is paused — /review-resume to continue it, /review-abort to hand off the plan as-is."
-            : "A handoff review is running — /review say <msg> to steer it, ESC to pause, /review-abort to hand off the plan as-is.",
-          "info",
-        );
-        return;
+      ctx.ui.notify(notice, "info");
+      return;
+    }
+    // Shared with the ESC listener: snapshots once, drops an open handoff
+    // gate to "paused" (it stays open — the handoff still waits), and
+    // notifies. The resolving round emits the paused band.
+    await pauseReviewRound("command");
+  }
+
+  /**
+   * `/review resume [note]` — continue a paused round on the warm session.
+   * Decision 3: the dispatcher applies the `resume` admission first; a refused
+   * resume must leave a legacy pause intact and allocate no Reviewer.
+   */
+  async function handleReviewResume(
+    parsed: Extract<ReviewInvocation, { kind: "verb" }>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    // Manual control: resume works whether or not Review Mode is on.
+    // Gate only on paused-session state below — no `enabled` check here.
+    const paused = currentPausedReview();
+    if (!paused) {
+      let notice = "No paused review — nothing to resume.";
+      if (awaitingDecision || reviewTurn === "handoff") {
+        notice =
+          "Nothing to resume — the review already finished; answer the handoff or /review abort.";
+      } else if (reviewTurn !== "idle") {
+        notice = "Nothing to resume — /review abort to clear the review turn.";
       }
-      // Abort-first (step 6): never run two rounds on one reviewer session.
-      // The superseded round resolves `aborted` and stays silent for its own
-      // revision (quietAbortHash) so only the fresh round announces.
-      if (reviewRuntime?.isRoundActive() || activeReview) {
-        quietAbortHash = activeReview
-          ? planHash(activeReview.planText)
-          : undefined;
-        pausedReview = undefined;
-        try {
-          activeReview?.controller.abort();
-        } catch (_e) {
-          void _e;
-        }
-        try {
-          await reviewRuntime?.abortRound();
-        } catch (_e) {
-          void _e;
-        }
-      }
-      // The reviewer writes through `currentPlanFile`; point it at the file
-      // `/review` actually read before the round starts. A fallback source is
-      // announced so the user can see which plan is being audited.
-      if (target.source !== "run" && target.source !== "explicit") {
-        notifyReview(`Reviewing ${target.display}`, "info");
-      }
-      currentPlanFile = target.abs;
-      lastPlanWritePath = target.abs;
-      notePlanTargetForReviewCycle(target.abs);
-      persistState();
-      lastReviewedPlanHash = undefined; // force a fresh review
-      abortedReviewHash = undefined;
+      ctx.ui.notify(notice, "info");
+      return;
+    }
+    // Round ownership, not just the runtime flag: a round that is still
+    // booting its session is already owned. Never run two rounds on one
+    // reviewer.
+    if (activeReview !== undefined || reviewRuntime?.isRoundActive()) {
+      ctx.ui.notify("A review round is already running.", "warning");
+      return;
+    }
+    // A gated resume is settled by its parked runHandoff; a manual pause
+    // (idle gate) opens its own browser handoff after the round lands.
+    const gatedResume =
+      (reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle") !==
+      "idle";
+    // A resumed gated review is auditing again. Without this, the parked
+    // handoff keeps `reviewGatePhase === "paused"` for the whole round and
+    // the lock/footer report the wrong state (plan 2026-10-25 follow-up).
+    // A manual pause (idle gate) is unchanged; the runtime/activeReview
+    // flags carry that lock.
+    reviewGatePhase = reviewGatePhaseOnResume(reviewGatePhase);
+    setReviewTurn("running");
+    // A stale quiet-abort marker must not silence this explicit resume.
+    quietAbortHash = undefined;
+    // If the plan file moved on while paused, review the new revision fresh
+    // instead of resuming stale text. The reviewer writes its own rewrite to
+    // that file mid-round, so compare against the pause-time snapshot — not
+    // the text the round started with (see `markReviewPaused`).
+    const current = readCurrentPlanText((ctx as any).cwd ?? process.cwd());
+    const resumeChoice = reviewResumePlanChoice({
+      pausedPlanHash: paused.planHash,
+      pausedFileHash: paused.fileHashAtPause,
+      currentFileHash: current !== undefined ? planHash(current) : undefined,
+    });
+    if (current !== undefined && resumeChoice === "fresh") {
       pausedReview = undefined;
+      abortedReviewHash = undefined;
+      notifyReview(
+        "Plan changed since the pause — starting a fresh review round.",
+        "info",
+      );
+      // Fresh revision since the pause: restart the round cycle so the
+      // new plan is not capped by the previous cycle's round count.
       reviewRound = 0;
-      // Manual /review is a Review turn from the first tick: the mode status,
-      // input gate and mode lock must be active before the child boots.
-      beginReviewTurn();
+      // No host signal: this command runs while the parked parent turn may
+      // already be aborted. A fresh round must not inherit that state —
+      // ESC, `/review-pause` and `/review-abort` are its stop paths.
       const result = await runReviewStep(
-        target.text,
+        current,
         ctx as any,
-        (ctx as any).signal as AbortSignal | undefined,
+        undefined,
         "manual",
       );
-      // The manual path never flips the persisted flag: tell the user when
-      // automatic review is still off so the one-shot is not mistaken for it.
-      const offSuffix = reviewEnabled()
-        ? ""
-        : " (Review Mode stays OFF — /review-mode on for automatic review.)";
-      if (
-        (await openHandoffForSettledRound(
-          result,
-          target.abs,
-          ctx as any,
-          offSuffix,
-        )) !== "none"
-      ) {
-        return;
-      }
-      ctx.ui.notify(`${reviewResumeNotice(result)}${offSuffix}`, "info");
-    },
-  });
-
-  pi.registerCommand("review-pause", {
-    description:
-      "Pause the in-flight Review round (keeps the reviewer session warm for /review-resume)",
-    handler: async (_args, ctx) => {
-      // Manual control: pause works whether or not Review Mode is on.
-      // Gate only on round ownership below — no `enabled` check here.
-      if (!activeReview) {
-        let notice = "No review round running.";
-        if (currentPausedReview()) {
-          notice =
-            "Review is already paused — /review-resume to continue, /review-abort to stop.";
-        } else if (awaitingDecision || reviewTurn === "handoff") {
-          notice =
-            "A handoff is waiting — /review-abort to hand off now, or answer the handoff prompt.";
-        } else if (reviewTurn !== "idle") {
-          notice = "No review round running — /review-abort to clear the review turn.";
-        }
-        ctx.ui.notify(notice, "info");
-        return;
-      }
-      // Shared with the ESC listener: snapshots once, drops an open handoff
-      // gate to "paused" (it stays open — the handoff still waits), and
-      // notifies. The resolving round emits the paused band.
-      await pauseReviewRound("command");
-    },
-  });
-
-  pi.registerCommand("review-resume", {
-    description:
-      "Resume a paused Review round on the warm reviewer session (Plan mode only)",
-    handler: async (_args, ctx) => {
-      // Plan-only, before the pause snapshot is read or the review turn/gate
-      // is mutated: a refused resume must leave a legacy pause intact and
-      // must never allocate a Reviewer.
-      const admission = admitReviewerNow({ trigger: "resume" });
-      if (!admission.ok) {
-        notifyManualReviewRefusal(ctx, admission);
-        return;
-      }
-      // Manual control: resume works whether or not Review Mode is on.
-      // Gate only on paused-session state below — no `enabled` check here.
-      const paused = currentPausedReview();
-      if (!paused) {
-        let notice = "No paused review — nothing to resume.";
-        if (awaitingDecision || reviewTurn === "handoff") {
-          notice =
-            "Nothing to resume — the review already finished; answer the handoff or /review-abort.";
-        } else if (reviewTurn !== "idle") {
-          notice = "Nothing to resume — /review-abort to clear the review turn.";
-        }
-        ctx.ui.notify(notice, "info");
-        return;
-      }
-      // Round ownership, not just the runtime flag: a round that is still
-      // booting its session is already owned. Never run two rounds on one
-      // reviewer.
-      if (activeReview !== undefined || reviewRuntime?.isRoundActive()) {
-        ctx.ui.notify("A review round is already running.", "warning");
-        return;
-      }
-      // A gated resume is settled by its parked runHandoff; a manual pause
-      // (idle gate) opens its own browser handoff after the round lands.
-      const gatedResume =
-        (reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle") !==
-        "idle";
-      // A resumed gated review is auditing again. Without this, the parked
-      // handoff keeps `reviewGatePhase === "paused"` for the whole round and
-      // the lock/footer report the wrong state (plan 2026-10-25 follow-up).
-      // A manual pause (idle gate) is unchanged; the runtime/activeReview
-      // flags carry that lock.
-      reviewGatePhase = reviewGatePhaseOnResume(reviewGatePhase);
-      setReviewTurn("running");
-      // A stale quiet-abort marker must not silence this explicit resume.
-      quietAbortHash = undefined;
-      // If the plan file moved on while paused, review the new revision fresh
-      // instead of resuming stale text. The reviewer writes its own rewrite to
-      // that file mid-round, so compare against the pause-time snapshot — not
-      // the text the round started with (see `markReviewPaused`).
-      const current = readCurrentPlanText((ctx as any).cwd ?? process.cwd());
-      const resumeChoice = reviewResumePlanChoice({
-        pausedPlanHash: paused.planHash,
-        pausedFileHash: paused.fileHashAtPause,
-        currentFileHash: current !== undefined ? planHash(current) : undefined,
-      });
-      if (current !== undefined && resumeChoice === "fresh") {
-        pausedReview = undefined;
-        abortedReviewHash = undefined;
-        notifyReview(
-          "Plan changed since the pause — starting a fresh review round.",
-          "info",
-        );
-        // Fresh revision since the pause: restart the round cycle so the
-        // new plan is not capped by the previous cycle's round count.
-        reviewRound = 0;
-        // No host signal: this command runs while the parked parent turn may
-        // already be aborted. A fresh round must not inherit that state —
-        // ESC, `/review-pause` and `/review-abort` are its stop paths.
-        const result = await runReviewStep(
-          current,
-          ctx as any,
-          undefined,
-          "manual",
-        );
-        if (reviewResumeSettles(result)) {
-          settleReviewGate({
-            outcome: reviewResumeGateOutcome(result) ?? "unreviewed",
-            planText: result.planText,
-          });
-        }
-        if (!gatedResume && reviewResumeSettles(result)) {
-          await openHandoffForSettledRound(
-            result,
-            currentPlanFile ?? "",
-            ctx as any,
-          );
-        } else {
-          ctx.ui.notify(reviewResumeNotice(result), "info");
-        }
-        return;
-      }
-      pausedReview = undefined;
-      abortedReviewHash = undefined;
-      reviewRound = paused.round;
-      // Same fresh-controller rule as the fresh-revision branch: a resumed
-      // round is an explicit user action and must never inherit a stale
-      // aborted host signal (that was the 2026-10-25 resume loop).
-      const result = await executeReviewRound({
-        planText: paused.planText,
-        round: paused.round,
-        previousFindings: paused.previousFindings,
-        ctx: ctx as any,
-        signal: undefined,
-        // The transcript must say "resumed", not "started": the round is a
-        // continuation, even though it re-runs pass 1 on the paused text.
-        resumed: true,
-      });
       if (reviewResumeSettles(result)) {
         settleReviewGate({
           outcome: reviewResumeGateOutcome(result) ?? "unreviewed",
@@ -6851,191 +6802,324 @@ export default function workflowExtension(
         });
       }
       if (!gatedResume && reviewResumeSettles(result)) {
-        await openHandoffForSettledRound(result, currentPlanFile ?? "", ctx as any);
+        await openHandoffForSettledRound(
+          result,
+          currentPlanFile ?? "",
+          ctx as any,
+        );
       } else {
         ctx.ui.notify(reviewResumeNotice(result), "info");
       }
-    },
-  });
+      return;
+    }
+    pausedReview = undefined;
+    abortedReviewHash = undefined;
+    reviewRound = paused.round;
+    // Same fresh-controller rule as the fresh-revision branch: a resumed
+    // round is an explicit user action and must never inherit a stale
+    // aborted host signal (that was the 2026-10-25 resume loop).
+    const result = await executeReviewRound({
+      planText: paused.planText,
+      round: paused.round,
+      previousFindings: paused.previousFindings,
+      ctx: ctx as any,
+      signal: undefined,
+      // The transcript must say "resumed", not "started": the round is a
+      // continuation, even though it re-runs pass 1 on the paused text.
+      resumed: true,
+    });
+    if (reviewResumeSettles(result)) {
+      settleReviewGate({
+        outcome: reviewResumeGateOutcome(result) ?? "unreviewed",
+        planText: result.planText,
+      });
+    }
+    if (!gatedResume && reviewResumeSettles(result)) {
+      await openHandoffForSettledRound(result, currentPlanFile ?? "", ctx as any);
+    } else {
+      ctx.ui.notify(reviewResumeNotice(result), "info");
+    }
+  }
 
-  pi.registerCommand("review-abort", {
-    description:
-      "Stop the Review round (or discard a paused one) — the author's plan stands",
-    handler: async (_args, ctx) => {
-      // Explicit review exit: intentionally unguarded by the mode-switch lock.
-      // Strictly local: it never re-opens Plannotator. A pending browser answer
-      // is resolved deterministically so a late tab cannot act afterwards, and
-      // every branch ends with the review turn closed (no residual soft-lock).
-      const rt = reviewRuntime;
-      const active =
-        activeReview !== undefined || rt?.isRoundActive() === true;
-      const paused = currentPausedReview();
-      const gatePhase =
-        reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
-      const reviewOwned =
-        active ||
-        paused !== undefined ||
-        awaitingDecision ||
-        reviewTurn !== "idle" ||
-        gatePhase !== "idle";
-      if (!reviewOwned) {
-        ctx.ui.notify(
-          "Nothing to abort — no review, pause, or handoff is active.",
-          "info",
-        );
-        return;
+  /**
+   * `/review abort` — the explicit, unguarded review exit: stop the round (or
+   * discard a pause) and let the author's plan stand. Never re-opens
+   * Plannotator; every branch closes the review turn.
+   */
+  async function handleReviewAbort(
+    _args: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    // Explicit review exit: intentionally unguarded by the mode-switch lock.
+    // Strictly local: it never re-opens Plannotator. A pending browser answer
+    // is resolved deterministically so a late tab cannot act afterwards, and
+    // every branch ends with the review turn closed (no residual soft-lock).
+    const rt = reviewRuntime;
+    const active =
+      activeReview !== undefined || rt?.isRoundActive() === true;
+    const paused = currentPausedReview();
+    const gatePhase =
+      reviewGateCycleId === reviewCycleId ? reviewGatePhase : "idle";
+    const reviewOwned =
+      active ||
+      paused !== undefined ||
+      awaitingDecision ||
+      reviewTurn !== "idle" ||
+      gatePhase !== "idle";
+    if (!reviewOwned) {
+      ctx.ui.notify(
+        "Nothing to abort — no review, pause, or handoff is active.",
+        "info",
+      );
+      return;
+    }
+    const targetHash =
+      paused?.planHash ??
+      (activeReview ? planHash(activeReview.planText) : undefined);
+    // Text the gate hands off when one is open; the file is authoritative.
+    const abortedText = paused?.planText ?? activeReview?.planText;
+    const planPath =
+      pendingHandoffPlanPath ??
+      currentPlanFile ??
+      planWritePathThisRun ??
+      "";
+    const planTextFromFile = (() => {
+      try {
+        return planPath && fs.existsSync(planPath)
+          ? fs.readFileSync(planPath, "utf8")
+          : undefined;
+      } catch {
+        return undefined;
       }
-      const targetHash =
-        paused?.planHash ??
-        (activeReview ? planHash(activeReview.planText) : undefined);
-      // Text the gate hands off when one is open; the file is authoritative.
-      const abortedText = paused?.planText ?? activeReview?.planText;
-      const planPath =
-        pendingHandoffPlanPath ??
-        currentPlanFile ??
-        planWritePathThisRun ??
-        "";
-      const planTextFromFile = (() => {
-        try {
-          return planPath && fs.existsSync(planPath)
-            ? fs.readFileSync(planPath, "utf8")
-            : undefined;
-        } catch {
-          return undefined;
-        }
-      })();
-      const handoffText = planTextFromFile ?? abortedText ?? "";
-      const handoffSource: ReviewHandoffSource =
-        pendingHandoffSource ?? "manual";
-      // A parked automatic handoff owns its own presentation: settle the gate
-      // and let `runHandoff` render, never present twice.
-      const gated = gatePhase !== "idle" && !reviewHandoffGate.settled();
-      // An aborted revision is not auto-reviewed again until the plan changes.
-      if (targetHash) abortedReviewHash = targetHash;
-      reviewRound = 0;
+    })();
+    const handoffText = planTextFromFile ?? abortedText ?? "";
+    const handoffSource: ReviewHandoffSource =
+      pendingHandoffSource ?? "manual";
+    // A parked automatic handoff owns its own presentation: settle the gate
+    // and let `runHandoff` render, never present twice.
+    const gated = gatePhase !== "idle" && !reviewHandoffGate.settled();
+    // An aborted revision is not auto-reviewed again until the plan changes.
+    if (targetHash) abortedReviewHash = targetHash;
+    reviewRound = 0;
 
-      // 1. Round in flight: the waiting `/review` or `runHandoff` caller owns
-      // the presentation once the round resolves — never present from here.
-      if (active) {
-        // The command announces the abort; the resolving round stays silent
-        // for this revision (quietAbortHash) so the user is told once.
-        if (targetHash) quietAbortHash = targetHash;
-        pausedReview = undefined;
-        try {
-          activeReview?.controller.abort();
-        } catch (_e) {
-          void _e;
-        }
-        try {
-          await rt?.abortRound();
-        } catch (_e) {
-          void _e;
-        }
-        ctx.ui.notify(
-          "Review stopped — the author's plan stands unreviewed.",
-          "info",
-        );
-        setReviewTurn("handoff");
-        if (gated) {
-          settleReviewGate({ outcome: "unreviewed", planText: abortedText });
-        }
-        return;
-      }
-
-      // 2. A parked `runHandoff` owns the presentation: settle its gate so it
-      // renders exactly once, and never open a second modal from here.
-      if (gated) {
-        if (targetHash) quietAbortHash = targetHash;
-        if (paused) {
-          pausedReview = undefined;
-          flushReviewEntries(true);
-          emitReviewBand({ mode: "review-done", reason: "aborted by user" });
-        }
-        clearPendingHandoffDecision();
-        setReviewTurn("handoff");
-        settleReviewGate({ outcome: "unreviewed", planText: abortedText });
-        ctx.ui.notify(
-          paused
-            ? "Paused review discarded — the author's plan stands."
-            : "Review stopped — the author's plan stands.",
-          "info",
-        );
-        return;
-      }
-
-      // 3. A native handoff modal is already open: close the turn and
-      // invalidate the pending answer instead of stacking a second modal.
-      if (handoffModalOpen) {
-        reviewCycleId += 1;
-        await closeReviewTurn({
-          reason: "abort-native-handoff",
-          planText: abortedText,
-        });
-        ctx.ui.notify(
-          `Review aborted — dismiss the open handoff prompt. The plan stays at ${planPath || "(unknown)"}.`,
-          "info",
-        );
-        return;
-      }
-
-      // 4. Paused round: drop the snapshot, close the turn, ask natively.
-      if (paused) {
-        if (targetHash) quietAbortHash = targetHash;
-        pausedReview = undefined;
-        flushReviewEntries(true);
-        emitReviewBand({ mode: "review-done", reason: "aborted by user" });
-        await closeReviewTurn({
-          reason: "abort-paused",
-          planText: abortedText,
-        });
-        ctx.ui.notify(
-          "Paused review discarded — the author's plan stands.",
-          "info",
-        );
-      } else if (awaitingDecision) {
-        // 5. Pending browser decision: resolve the waiter so a late answer
-        // cannot act, then close and ask natively.
-        settlePlanReviewRequest({
-          status: "error",
-          reason: "aborted by user",
-        });
-        await closeReviewTurn({
-          reason: "abort-handoff",
-          planText: abortedText,
-        });
-        ctx.ui.notify("Review skipped — the author's plan stands.", "info");
-      } else {
-        // 6. Residual turn/gate only (a leaked handoff turn): clean it up,
-        // then ask natively.
-        await closeReviewTurn({
-          reason: "abort-residual",
-          planText: abortedText,
-        });
-      }
-
-      if (handoffText && planPath) {
-        await presentPlanHandoff(ctx as any, {
-          planText: handoffText,
-          planPath,
-          source: handoffSource,
-          presentation: "native-only",
-          reason: "aborted",
-          reviewOwned: false,
-        });
-        return;
+    // 1. Round in flight: the waiting `/review` or `runHandoff` caller owns
+    // the presentation once the round resolves — never present from here.
+    if (active) {
+      // The command announces the abort; the resolving round stays silent
+      // for this revision (quietAbortHash) so the user is told once.
+      if (targetHash) quietAbortHash = targetHash;
+      pausedReview = undefined;
+      try {
+        activeReview?.controller.abort();
+      } catch (_e) {
+        void _e;
       }
       try {
-        (ctx as any).ui?.requestRender?.();
+        await rt?.abortRound();
       } catch (_e) {
         void _e;
       }
       ctx.ui.notify(
-        `Review aborted — the plan file is ${planPath || "unavailable"}.`,
+        "Review stopped — the author's plan stands unreviewed.",
         "info",
       );
+      setReviewTurn("handoff");
+      if (gated) {
+        settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+      }
+      return;
+    }
+
+    // 2. A parked `runHandoff` owns the presentation: settle its gate so it
+    // renders exactly once, and never open a second modal from here.
+    if (gated) {
+      if (targetHash) quietAbortHash = targetHash;
+      if (paused) {
+        pausedReview = undefined;
+        flushReviewEntries(true);
+        emitReviewBand({ mode: "review-done", reason: "aborted by user" });
+      }
+      clearPendingHandoffDecision();
+      setReviewTurn("handoff");
+      settleReviewGate({ outcome: "unreviewed", planText: abortedText });
+      ctx.ui.notify(
+        paused
+          ? "Paused review discarded — the author's plan stands."
+          : "Review stopped — the author's plan stands.",
+        "info",
+      );
+      return;
+    }
+
+    // 3. A native handoff modal is already open: close the turn and
+    // invalidate the pending answer instead of stacking a second modal.
+    if (handoffModalOpen) {
+      reviewCycleId += 1;
+      await closeReviewTurn({
+        reason: "abort-native-handoff",
+        planText: abortedText,
+      });
+      ctx.ui.notify(
+        `Review aborted — dismiss the open handoff prompt. The plan stays at ${planPath || "(unknown)"}.`,
+        "info",
+      );
+      return;
+    }
+
+    // 4. Paused round: drop the snapshot, close the turn, ask natively.
+    if (paused) {
+      if (targetHash) quietAbortHash = targetHash;
+      pausedReview = undefined;
+      flushReviewEntries(true);
+      emitReviewBand({ mode: "review-done", reason: "aborted by user" });
+      await closeReviewTurn({
+        reason: "abort-paused",
+        planText: abortedText,
+      });
+      ctx.ui.notify(
+        "Paused review discarded — the author's plan stands.",
+        "info",
+      );
+    } else if (awaitingDecision) {
+      // 5. Pending browser decision: resolve the waiter so a late answer
+      // cannot act, then close and ask natively.
+      settlePlanReviewRequest({
+        status: "error",
+        reason: "aborted by user",
+      });
+      await closeReviewTurn({
+        reason: "abort-handoff",
+        planText: abortedText,
+      });
+      ctx.ui.notify("Review skipped — the author's plan stands.", "info");
+    } else {
+      // 6. Residual turn/gate only (a leaked handoff turn): clean it up,
+      // then ask natively.
+      await closeReviewTurn({
+        reason: "abort-residual",
+        planText: abortedText,
+      });
+    }
+
+    if (handoffText && planPath) {
+      await presentPlanHandoff(ctx as any, {
+        planText: handoffText,
+        planPath,
+        source: handoffSource,
+        presentation: "native-only",
+        reason: "aborted",
+        reviewOwned: false,
+      });
+      return;
+    }
+    try {
+      (ctx as any).ui?.requestRender?.();
+    } catch (_e) {
+      void _e;
+    }
+    ctx.ui.notify(
+      `Review aborted — the plan file is ${planPath || "unavailable"}.`,
+      "info",
+    );
+  }
+
+  /**
+   * `/review help [verb]` — the table, or one verb's usage and guards.
+   */
+  async function handleReviewHelp(
+    _args: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    ctx.ui.notify(formatReviewHelp(_args), "info");
+  }
+
+  /**
+   * Decision 3 guard application for `/review`: the `blockWhileChildActive`
+   * refusal first, then reviewer admission. Returns true when a guard refused
+   * (and already notified), so the dispatcher stops before any effect.
+   */
+  function blockReviewInvocation(
+    ctx: ExtensionContext,
+    spec: Pick<ReviewVerbSpec, "blockWhileChildActive" | "blockLabel" | "admission">,
+  ): boolean {
+    if (
+      spec.blockWhileChildActive &&
+      blockWhileChildActive(ctx, spec.blockLabel ?? "/review")
+    ) {
+      return true;
+    }
+    if (spec.admission !== "none") {
+      const admission = admitReviewerNow({ trigger: spec.admission });
+      if (!admission.ok) {
+        notifyManualReviewRefusal(ctx, admission);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  pi.registerCommand("review", {
+    description: REVIEW_DESCRIPTION,
+    getArgumentCompletions: (prefix: string) => {
+      const cwd = (currentSessionCtx as any)?.cwd ?? process.cwd();
+      return reviewCompletionItems(prefix, {
+        plans: listRecentPlanFiles(cwd, 8),
+      });
+    },
+    handler: async (args, ctx) => {
+      const parsed = parseReviewInvocation(args);
+      if (parsed.kind === "error") {
+        ctx.ui.notify(parsed.text, "warning");
+        return;
+      }
+      if (parsed.kind === "help") {
+        await handleReviewHelp(parsed.verb, ctx as ExtensionContext);
+        return;
+      }
+      // Decision 3: guards are declared in the verb table and applied here, in
+      // table order — `blockWhileChildActive` first, then admission.
+      if (parsed.kind === "default") {
+        if (blockReviewInvocation(ctx, REVIEW_DEFAULT_FORM)) return;
+        await handleReviewRound(parsed, ctx);
+        return;
+      }
+      const spec = reviewVerb(parsed.verb);
+      if (!spec) {
+        ctx.ui.notify(
+          `Unknown Review verb "${parsed.verb}". Run /review help for the verb list.`,
+          "warning",
+        );
+        return;
+      }
+      if (blockReviewInvocation(ctx, spec)) return;
+      switch (parsed.verb) {
+        case "status":
+          await handleReviewStatus(parsed, ctx);
+          return;
+        case "pause":
+          await handleReviewPause(parsed, ctx);
+          return;
+        case "resume":
+          await handleReviewResume(parsed, ctx);
+          return;
+        case "abort":
+          await handleReviewAbort(parsed, ctx);
+          return;
+        case "say":
+          await handleReviewSay(parsed, ctx);
+          return;
+        case "mode":
+          await handleReviewMode(parsed, ctx);
+          return;
+        case "prompt":
+          await handleReviewPrompt(parsed, ctx);
+          return;
+        default:
+          await handleReviewHelp(undefined, ctx as ExtensionContext);
+          return;
+      }
     },
   });
-
 
   // ── Mode → role model alignment (plan=planner, build=builder) ──────
   let lastModeSwitch: {
@@ -8014,7 +8098,7 @@ export default function workflowExtension(
     }
     try {
       ctx.ui.notify(
-        `${label} is unavailable while an Orchestrator Build child is active. Use /orchestrator-pause, /orchestrator-resume, /orchestrator-abort or /orchestrator stop first.`,
+        `${label} is unavailable while an Orchestrator Build child is active. Use /orchestrator pause, /orchestrator resume, /orchestrator abort or /orchestrator stop first.`,
         "warning",
       );
     } catch {
@@ -8045,7 +8129,7 @@ export default function workflowExtension(
     if (leaving && (childLive || orchestratorRun?.phase === "running")) {
       try {
         ctx.ui.notify(
-          "An Orchestrator run owns this session — /orchestrator-abort or /orchestrator stop first.",
+          "An Orchestrator run owns this session — /orchestrator abort or /orchestrator stop first.",
           "warning",
         );
       } catch {
@@ -9703,51 +9787,29 @@ export default function workflowExtension(
 
   try {
     pi.registerCommand("orchestrator", {
-      description:
-        "Enter Orchestrator mode, or run an operator command: status|start [path]|pause|resume|stop|inspect|say|retry|cancel.",
+      description: ORCHESTRATOR_DESCRIPTION,
+      getArgumentCompletions: (prefix: string) => {
+        const cwd = (currentSessionCtx as any)?.cwd ?? process.cwd();
+        return orchestratorCompletionItems(prefix, {
+          plans: listRecentPlanFiles(cwd, 8),
+          rows: orchestratorRun?.rows.map((row) => row.ref) ?? [],
+          ...(orchestratorRun?.currentRef
+            ? { currentRef: orchestratorRun.currentRef }
+            : {}),
+        });
+      },
       handler: async (args, ctx) => {
         const text = typeof args === "string" ? args.trim() : "";
+        // Bare `/orchestrator` is the only way to enter Orchestrator mode;
+        // every verb stays inside the operator and never switches mode.
         if (text.length === 0) {
           await switchWorkflowMode("orchestrator", ctx as any);
           return;
         }
         try {
-          const liveCtx = ctx as ExtensionContext;
-          // `/orchestrator start [path]` freezes the approved plan (or the
-          // explicitly agreed steps) ONCE and lets the scheduler dispatch row 1.
-          const isStart = /^start(?:\s|$)/i.test(text);
-          const startRest = isStart ? text.replace(/^start\s*/i, "").trim() : "";
-          if (isStart) {
-            if (workflowMode !== "orchestrator") {
-              await switchWorkflowMode("orchestrator", ctx as any);
-            }
-            const started = await startOrchestratorWork(liveCtx, startRest);
-            ctx.ui.notify(started.text, started.ok ? "info" : "warning");
-            updateStatus(ctx as any);
-            return;
-          }
-          // `/orchestrator status` and `/orchestrator retry` read the run
-          // record; the session restore already rebuilt it after a reload.
-          const wantsStatus = /^status(?:\s|$)/i.test(text);
-          const wantsRetry = /^retry(?:\s|$)/i.test(text);
-          if ((wantsStatus || wantsRetry) && !orchestratorRun) {
-            ctx.ui.notify(
-              "No Orchestrator run is bound to this session. Start one with orchestrator_start, or restart from the approved plan.",
-              "warning",
-            );
-            updateStatus(ctx as any);
-            return;
-          }
-          if (wantsRetry) {
-            if (workflowMode !== "orchestrator") {
-              await switchWorkflowMode("orchestrator", ctx as any);
-            }
-            const retried = await parentTools.call("orchestrator_retry", {});
-            ctx.ui.notify(retried.text, retried.ok ? "info" : "warning");
-            updateStatus(ctx as any);
-            return;
-          }
-          const operator = await ensureOrchestratorOperator(liveCtx);
+          const operator = await ensureOrchestratorOperator(
+            ctx as ExtensionContext,
+          );
           const result = await operator.run(text);
           ctx.ui.notify(result.text, result.ok ? "info" : "warning");
           updateStatus(ctx as any);
@@ -9767,50 +9829,6 @@ export default function workflowExtension(
   // The Desktop host invokes this companion command with a bounded JSON grant.
   // Only code reachable from this registration sees the token; requests then
   // attach it, so a self-declared owner never authorizes an operation.
-  // Review-style child controls (aliases of the /orchestrator verbs).
-  try {
-    pi.registerCommand("orchestrator-pause", {
-      description: "Pause the in-process Build child (warm session kept).",
-      handler: async (_args, ctx) => {
-        // One implementation: the operator owns the child pause, the durable
-        // run transition, reconciliation and the user-facing text.
-        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
-        const result = await operator.run("pause");
-        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
-        updateStatus(ctx as any);
-      },
-    });
-    pi.registerCommand("orchestrator-resume", {
-      description: "Resume a paused in-process Build child.",
-      handler: async (_args, ctx) => {
-        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
-        const result = await operator.run("resume");
-        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
-        updateStatus(ctx as any);
-      },
-    });
-    pi.registerCommand("orchestrator-abort", {
-      description: "Abort the in-process Build child and pause the run.",
-      handler: async (_args, ctx) => {
-        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
-        const result = await operator.run("abort");
-        ctx.ui.notify(result.text, result.ok ? "warning" : "warning");
-        updateStatus(ctx as any);
-      },
-    });
-    pi.registerCommand("orchestrator-view", {
-      description: "Show the current Orchestrator child view: child|parent|auto.",
-      handler: async (args, ctx) => {
-        const raw = typeof args === "string" ? args.trim().toLowerCase() : "";
-        const operator = await ensureOrchestratorOperator(ctx as ExtensionContext);
-        const result = await operator.run(raw ? `view ${raw}` : "view");
-        ctx.ui.notify(result.text, result.ok ? "info" : "warning");
-        updateStatus(ctx as any);
-      },
-    });
-  } catch (_e) {
-    void _e;
-  }
 
   // ── /commit: AI-assisted commit of staged changes ────────────────
 
@@ -13310,7 +13328,7 @@ export default function workflowExtension(
           ? `The child settled but its report has been pending for ${Math.round(settlingFor / 1000)}s; it is released automatically within ${Math.round(DEFAULT_SETTLE_REPORT_TIMEOUT_MS / 1000)}s. If it stays stuck, call orchestrator_abort.`
           : `A child is already ${phase}. Wait for its report${
               phase === "paused"
-                ? ", or /orchestrator-resume to continue it"
+                ? ", or /orchestrator resume to continue it"
                 : ""
             }. Use orchestrator_abort only if it must be stopped.`,
       };
@@ -14357,7 +14375,7 @@ export default function workflowExtension(
         }
         if (delivery.queued) {
           notifyWorkflow(
-            "Message queued for the paused child — /orchestrator-resume delivers it.",
+            "Message queued for the paused child — /orchestrator resume delivers it.",
             "info",
           );
         }
@@ -17536,7 +17554,7 @@ export default function workflowExtension(
     ) {
       try {
         ctx.ui.notify(
-          "A Build child owns this run — /orchestrator-abort or /orchestrator stop before rewinding.",
+          "A Build child owns this run — /orchestrator abort or /orchestrator stop before rewinding.",
           "warning",
         );
       } catch (_e) {
@@ -17684,7 +17702,6 @@ export default function workflowExtension(
     try {
       const raw = String((event as any).prompt ?? (event as any).text ?? "");
       if (raw.trim()) {
-        lastUserPrompt = raw.trim().slice(0, 20_000);
         const first =
           raw
             .split(/\r?\n/)
@@ -19090,8 +19107,16 @@ export default function workflowExtension(
     }
   }
 
+  /**
+   * Record the approved plan for a model-mediated start.
+   *
+   * This is never a step list and never switches mode: it records the plan and
+   * sends the existing start kickoff, and the model calls `orchestrator_start`
+   * with the rows. A bare `start` uses the plan already bound to the session
+   * (`currentPlanFile`, else the TODO list's `planPath`); anything else is the
+   * plan path the caller passed.
+   */
   async function startOrchestratorWork(
-    ctx: ExtensionContext,
     rest: string,
   ): Promise<{ ok: boolean; text: string }> {
     if (orchestratorRun) {
@@ -19100,29 +19125,18 @@ export default function workflowExtension(
         text: "A run is already bound; use /orchestrator status, then retry after fixing the blocker.",
       };
     }
-    const asked = rest.toLowerCase();
-    const fromDiscussion =
-      rest.length === 0 || asked === "discussion" || asked === "current discussion";
-    if (fromDiscussion) {
-      const steps = lastUserPrompt
-        .split(/\r?\n/)
-        .map((line) => line.replace(/^[-*\d.)\s]+/, "").trim())
-        .filter((line) => line.length > 0);
-      if (steps.length === 0) {
-        return {
-          ok: false,
-          text: "No agreed steps were found. Discuss the work first, or pass an approved plan path: /orchestrator start <path>.",
-        };
-      }
-      const started = await startOrchestratorRun(ctx, {
-        title: "Orchestrator work",
-        steps: steps.slice(0, 50),
-      });
-      return { ok: started.ok, text: started.text };
+    const requested = rest.trim();
+    const boundPlan = currentPlanFile ?? todos.planPath;
+    const target = requested || boundPlan;
+    if (!target) {
+      return {
+        ok: false,
+        text: "No approved plan is bound. Pass one: /orchestrator start <path>.",
+      };
     }
     // A plan path is not a step list: record it and hand the row extraction to
     // the model instead of creating an empty run.
-    const planPath = path.resolve(orchestratorRoot(), rest);
+    const planPath = path.resolve(orchestratorRoot(), target);
     currentPlanFile = planPath;
     persistState();
     const delivered = sendOrchestratorStartKickoff(planPath);
@@ -19140,6 +19154,7 @@ export default function workflowExtension(
     if (orchestratorOperator) return orchestratorOperator;
     orchestratorOperator = createOperatorRuntime({
       run: () => orchestratorRun,
+      mode: () => workflowMode,
       todos: () =>
         todos.snapshot().items.map((item) => ({
           ref: item.ref ?? String(item.step),
@@ -19181,8 +19196,14 @@ export default function workflowExtension(
       pauseChild: async () => (await orchestratorChild?.pause()) === true,
       resumeChild: async (note) =>
         (await orchestratorChild?.resume(note)) === true,
-      abortChild: async (reason) => {
-        await orchestratorChild?.abort(reason);
+      start: (planPath) => startOrchestratorWork(planPath),
+      abort: async (reason) => {
+        const aborted = await abortOrchestratorRow(reason);
+        return {
+          ok: aborted.ok,
+          text: aborted.text,
+          aborted: aborted.details.aborted === true,
+        };
       },
       stopChild: async () => {
         await orchestratorChild?.dispose();
@@ -19275,7 +19296,7 @@ export default function workflowExtension(
     const decision = decisionForCommand(
       ctx,
       rawId,
-      "Usage: /handoff approve <decision-id> — the id is printed with the plan and in /review-status.",
+      "Usage: /handoff approve <decision-id> — the id is printed with the plan and in /review status.",
     );
     if (!decision) return;
     if (decision.state !== "pending") {
@@ -19477,7 +19498,7 @@ export default function workflowExtension(
       !awaitingDecision &&
       gatePhase === "idle";
     if (residual) {
-      lines.push("  residual: /review-abort to clear the review turn");
+      lines.push("  residual: /review abort to clear the review turn");
     }
     return lines;
   }
@@ -19679,8 +19700,8 @@ export default function workflowExtension(
         try {
           ctx.ui.notify(
             reviewGatePhase === "paused"
-              ? "Review paused — /review-resume to continue, /review-abort to hand off the plan as-is."
-              : "Review running — ESC pauses it, /review-abort hands off the plan as-is.",
+              ? "Review paused — /review resume to continue, /review abort to hand off the plan as-is."
+              : "Review running — ESC pauses it, /review abort hands off the plan as-is.",
             "info",
           );
         } catch (_e) {

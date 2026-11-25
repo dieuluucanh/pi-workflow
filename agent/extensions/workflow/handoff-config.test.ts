@@ -315,8 +315,6 @@ test("handoff completions: mode position lists modes and subcommands", () => {
       "auto ",
       "native ",
       "plannotator ",
-      "execution ",
-      "once ",
       "approve ",
       "continue ",
       "execute ",
@@ -363,24 +361,33 @@ test("handoff completions: scope position returns full-argument values", () => {
   assert.equal(handoffArgumentCompletions("native xyz"), null);
 });
 
-test("destination completions: execution takes a destination then a scope; once takes a destination", () => {
+test("destination completions: execute takes a decision id then a destination", () => {
   assert.deepEqual(
-    handoffArgumentCompletions("execution ")?.map((i) => i.value),
-    ["execution orchestrator", "execution build"],
+    handoffArgumentCompletions("execute abc or")?.map((i) => i.value),
+    ["execute abc orchestrator"],
   );
   assert.deepEqual(
-    handoffArgumentCompletions("execution or")?.map((i) => i.value),
-    ["execution orchestrator"],
+    handoffArgumentCompletions("execute abc b")?.map((i) => i.value),
+    ["execute abc build"],
   );
-  assert.deepEqual(
-    handoffArgumentCompletions("execution orchestrator ")?.map((i) => i.value),
-    ["execution orchestrator global", "execution orchestrator project"],
-  );
-  assert.deepEqual(
-    handoffArgumentCompletions("once ")?.map((i) => i.value),
-    ["once orchestrator", "once build"],
-  );
-  assert.equal(handoffArgumentCompletions("once build "), null, "once takes no scope");
   assert.equal(handoffArgumentCompletions("status"), null, "status is complete");
-  assert.equal(handoffArgumentCompletions("execution build extra "), null);
+  assert.equal(handoffArgumentCompletions("execute abc orchestrator"), null);
+});
+
+test("handoff completions: the dead execution/once subcommands are gone", () => {
+  const items = handoffArgumentCompletions("") ?? [];
+  const labels = items.map((i) => i.label);
+  const values = items.map((i) => i.value);
+  for (const dead of ["execution", "once"]) {
+    assert.equal(labels.includes(dead), false, `no ${dead} subcommand label`);
+    assert.equal(values.includes(`${dead} `), false, `no ${dead} subcommand value`);
+  }
+  assert.equal(handoffArgumentCompletions("execution "), null);
+  assert.equal(handoffArgumentCompletions("once "), null);
+  assert.ok(labels.includes("execute"), "execute remains a completion");
+  assert.deepEqual(
+    handoffArgumentCompletions("exec")?.map((i) => i.value),
+    ["execute "],
+    "the exec prefix offers only execute",
+  );
 });

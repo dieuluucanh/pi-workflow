@@ -21,8 +21,8 @@
 >   and then blocks and pauses;
 > - the parent model only handles blockers, status and recovery; user prose is
 >   forwarded to the running child;
-> - `/orchestrator-pause|resume|abort|view` (and the `/orchestrator` verbs)
->   control the child; `/orchestrator-view` switches BOTH the pinned panel and
+> - `/orchestrator pause|resume|abort|view` (and the `/orchestrator` verbs)
+>   control the child; `/orchestrator view` switches BOTH the pinned panel and
 >   the footer's child line (model, context, tokens, elapsed time);
 > - a reload blocks a `running` row and pauses the run; retry starts a fresh
 >   child. Old managed-worker sessions open as ordinary Build.
@@ -329,10 +329,10 @@ sequence, not the visible rendering or provider behavior.
 4. A failing row check triggers a repair prompt; two failures block and pause.
 5. Typing a normal prompt while a child runs shows `you → child`; the child
    receives it; the parent does not start a second turn.
-6. `/orchestrator-pause` stops the turn; `/orchestrator-resume` continues.
-7. `/orchestrator-abort` disposes the child and pauses; retry starts a fresh
+6. `/orchestrator pause` stops the turn; `/orchestrator resume` continues.
+7. `/orchestrator abort` disposes the child and pauses; retry starts a fresh
    child.
-8. `/orchestrator-view child|parent` switches the pinned panel AND the footer's child line (model, context, tokens, elapsed time).
+8. `/orchestrator view child|parent` switches the pinned panel AND the footer's child line (model, context, tokens, elapsed time).
 9. `/profile` and `/role` mid-run switch the live child in place (next provider request); the next child always launches on the new model. A refused switch warns and keeps the child.
 10. `/reload` mid-run leaves the run paused, the row blocked, no child; retry
     works.

@@ -186,7 +186,7 @@ test("formatReviewModeBand: plan=warning, review=accent, done follows the verdic
   );
   // A pause is not a done band.
   const paused = formatReviewModeBand(
-    { mode: "review-done", paused: true, reason: "paused — /review-resume" },
+    { mode: "review-done", paused: true, reason: "paused — /review resume" },
     theme,
   )[0];
   assert.ok(paused.includes("REVIEW PAUSED"));

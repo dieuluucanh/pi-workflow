@@ -39,7 +39,7 @@ export type ParentMutationDecision =
   | { refuse: true; reason: string };
 
 export const PARENT_MUTATION_REFUSAL =
-  "A Build child owns this worktree. Wait for its report, or run /orchestrator-pause or /orchestrator-abort before editing.";
+  "A Build child owns this worktree. Wait for its report, or run /orchestrator pause or /orchestrator abort before editing.";
 
 function refuse(): ParentMutationDecision {
   return { refuse: true, reason: PARENT_MUTATION_REFUSAL };

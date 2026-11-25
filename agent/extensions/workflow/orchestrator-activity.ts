@@ -23,7 +23,7 @@
  * so re-introducing either echo requires widening it on purpose.
  *
  * Every line names the control the user can actually run in that phase. A warm
- * pause is resumed with `/orchestrator-resume`; a disposed child needs
+ * pause is resumed with `/orchestrator resume`; a disposed child needs
  * `/orchestrator retry`. `/orchestrator-retry` does not exist.
  */
 
@@ -73,12 +73,12 @@ export interface OrchestratorActivity {
   esc: OrchestratorEscAction;
 }
 
-const PAUSE_CMD = "/orchestrator-pause to pause";
-const PAUSE_HINT_ESC = "ESC or /orchestrator-pause to pause";
+const PAUSE_CMD = "/orchestrator pause";
+const PAUSE_HINT_ESC = "ESC or /orchestrator pause";
 const PAUSE_COMPACT_ESC = "Working · ESC to pause";
-const PAUSE_COMPACT_CMD = "Working · /orchestrator-pause";
-const RESUME_CMD = "/orchestrator-resume to continue";
-const ABORT_CMD = "/orchestrator-abort to stop";
+const PAUSE_COMPACT_CMD = "Working · /orchestrator pause";
+const RESUME_CMD = "/orchestrator resume to continue";
+const ABORT_CMD = "/orchestrator abort to stop";
 
 function childLive(phase: OrchestratorChildPhase | undefined): boolean {
   return (
@@ -176,7 +176,7 @@ export function orchestratorActivity(
       }
       return {
         line: `Paused · ${RESUME_CMD} · ${ABORT_CMD}`,
-        compact: "Paused · /orchestrator-resume",
+        compact: "Paused · /orchestrator resume",
         busy: false,
         paused: true,
         esc: "swallow",

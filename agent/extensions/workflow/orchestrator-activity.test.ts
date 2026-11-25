@@ -70,7 +70,7 @@ test("starting shows only the phase and the real pause/abort commands", () => {
   assert.equal(activity.esc, "pause");
   assert.equal(
     activity.line,
-    "Starting… · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+    "Starting… · ESC or /orchestrator pause · /orchestrator abort to stop",
   );
   assert.equal(activity.compact, "Starting…");
   assert.doesNotMatch(activity.line, /orchestrator-retry/);
@@ -96,7 +96,7 @@ test("running names the phase and the controls, never the tool", () => {
   assert.equal(activity.esc, "pause");
   assert.equal(
     activity.line,
-    "Working · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+    "Working · ESC or /orchestrator pause · /orchestrator abort to stop",
   );
   assert.equal(activity.compact, "Working · ESC to pause");
 });
@@ -115,7 +115,7 @@ test("a wider host without the editor route omits the ESC hint", () => {
   assert.doesNotMatch(activity.line, /ESC/);
   assert.equal(
     activity.line,
-    "Working · /orchestrator-pause to pause · /orchestrator-abort to stop",
+    "Working · /orchestrator pause · /orchestrator abort to stop",
   );
 });
 
@@ -133,7 +133,7 @@ test("provider retry is still Working, not a failure", () => {
   assert.equal(activity.busy, true);
   assert.equal(
     activity.line,
-    "Working · retrying… · /orchestrator-pause to pause · /orchestrator-abort to stop",
+    "Working · retrying… · /orchestrator pause · /orchestrator abort to stop",
   );
   assert.equal(activity.compact, "Working · retrying…");
   assert.doesNotMatch(activity.line, /blocked|failed/i);
@@ -154,7 +154,7 @@ test("a forwarded dialog is waiting, not Working with an Esc pause", () => {
   assert.ok(activity);
   assert.equal(
     activity.line,
-    "Waiting · answer the dialog · /orchestrator-abort to stop",
+    "Waiting · answer the dialog · /orchestrator abort to stop",
   );
   assert.equal(activity.compact, "Waiting · answer the dialog");
   assert.equal(activity.esc, "swallow");
@@ -179,9 +179,9 @@ test("a warm pause advertises resume and consumes Esc", () => {
   assert.equal(activity.esc, "swallow");
   assert.equal(
     activity.line,
-    "Paused · /orchestrator-resume to continue · /orchestrator-abort to stop",
+    "Paused · /orchestrator resume to continue · /orchestrator abort to stop",
   );
-  assert.equal(activity.compact, "Paused · /orchestrator-resume");
+  assert.equal(activity.compact, "Paused · /orchestrator resume");
   assert.doesNotMatch(activity.line, /ESC/);
 });
 
@@ -202,7 +202,7 @@ test("a pause still settling is Pausing, never a second pause", () => {
   assert.equal(activity.paused, false);
   assert.equal(activity.busy, false);
   assert.equal(activity.esc, "swallow");
-  assert.equal(activity.line, "Pausing… · /orchestrator-abort to stop");
+  assert.equal(activity.line, "Pausing… · /orchestrator abort to stop");
   assert.equal(activity.compact, "Pausing…");
   assert.doesNotMatch(activity.line, /ESC/);
 });
@@ -221,9 +221,9 @@ test("verifying is guidance-only and consumes Esc", () => {
   );
   assert.ok(activity);
   assert.equal(activity.esc, "swallow");
-  assert.equal(activity.line, "Verifying · /orchestrator-abort to stop");
+  assert.equal(activity.line, "Verifying · /orchestrator abort to stop");
   assert.equal(activity.compact, "Verifying");
-  assert.doesNotMatch(activity.line, /orchestrator-pause|ESC/);
+  assert.doesNotMatch(activity.line, /\/orchestrator pause|orchestrator-pause|ESC/);
 });
 
 test("blocked and paused runs without a warm child offer recovery, not Working", () => {

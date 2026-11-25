@@ -49,6 +49,19 @@ test("the mission routes external and in-scope blockers separately", () => {
   assert.doesNotMatch(text, /mark it done"\s*,\s*"If it is blocked/i);
 });
 
+test("the mission teaches the canonical Orchestrator grammar", () => {
+  const text = buildOrchestratorMission({ phase: "paused" });
+  assert.match(
+    text,
+    /\/orchestrator pause, resume, abort, view, inspect\./,
+  );
+  assert.match(text, /\/orchestrator resume continues a warm paused child/);
+  assert.doesNotMatch(
+    text,
+    /\/orchestrator-(?:pause|resume|abort|view)\b/,
+  );
+});
+
 test("row counts are done/total, never accepted", () => {
   const text = buildOrchestratorMission({
     phase: "running",

@@ -21,8 +21,8 @@
 >   and then blocks and pauses;
 > - the parent model only handles blockers, status and recovery; user prose is
 >   forwarded to the running child;
-> - `/orchestrator-pause|resume|abort|view` (and the `/orchestrator` verbs)
->   control the child; `/orchestrator-view` switches BOTH the pinned panel and
+> - `/orchestrator pause|resume|abort|view` (and the `/orchestrator` verbs)
+>   control the child; `/orchestrator view` switches BOTH the pinned panel and
 >   the footer's child line (model, context, tokens, elapsed time);
 > - a reload blocks a `running` row and pauses the run; retry starts a fresh
 >   child. Old managed-worker sessions open as ordinary Build.
@@ -88,7 +88,7 @@ The presenter (`Plannotator` or the native sheet) is always asked about the
 Plan → optional independent Review → configured presenter
      ├─ Feedback → Plan revision → (review) → presenter again
      └─ Approve  → execution chooser
-                     ├─ Orchestrator → prepare breakdown → preview approval → children
+                     ├─ Orchestrator → record the approved plan → model calls orchestrator_start → children
                      ├─ Direct Build → this session's Build → one execute turn
                      └─ Decide later → Plan, approved, nothing started
 ```
@@ -102,28 +102,29 @@ Plan → optional independent Review → configured presenter
 - Headless: `/handoff approve <id>` records the approval, then
   `/handoff execute <id> orchestrator|build` records the destination. Neither
   infers consent from the saved default.
-- Choosing Orchestrator authorizes **preparation only**. The digest-bound
-  `preview-<id>` approval below is still required before any child starts.
+- Choosing Orchestrator records the approval and sends the start kickoff; the
+  model then calls `orchestrator_start` with the rows. There is no separate
+  preparation service and no digest-bound preview approval before a child
+  starts.
 
 ## Entry and work sources
 
-Both the automatic handoff and a direct request use ONE preparation service:
+Both the automatic handoff and a direct request use the same model-driven start:
 
-- **Direct request.** In Orchestrator, ask for the work. The parent calls
-  `orchestrator_prepare`; `/orchestrator start` is also the explicit RESUME
-  command: a bare start restores a bound plan's deterministic run/journal and,
-  if it already has an execution approval, starts the next ready task;
-  `start <path>` prepares an explicit plan. A bare `/orchestrator` remains mode
-  entry.
-- **Current discussion.** With no path, the parent snapshots the objective and
-  the constraints the user stated, plus bullet/numbered lines as requirements.
-  A formal Markdown plan and a separate Plan-mode approval are not required; the
-  execution preview shows the derived requirements before approval.
-- **Explicit plan.** `source:"plan"` / a path captures the exact bytes and
-  digest. An explicitly requested discussion wins over a stale
-  `currentPlanFile`.
-- **Ambiguity.** With no objective, no path and no bound plan, preparation asks
-  for the work instead of silently choosing an old plan or TODO list.
+- **Direct request.** Bare `/orchestrator` enters the mode;
+  `/orchestrator start [path]` records the approved plan and sends the existing
+  start kickoff. Without a path it uses `currentPlanFile ?? todos.planPath` and
+  otherwise refuses with `/orchestrator start <path>`. The model then calls
+  `orchestrator_start` with one step per row (a string, or
+  `{text, workspace}` for a non-primary root) and the workspaces the plan
+  declares.
+- **The model owns the rows.** The extension records the rows and resolves the
+  roots; it does not compile or validate the plan. There is no
+  `orchestrator_prepare` preparation service, no derived-requirements preview
+  and no separate execution-approval step.
+- **Explicit plan.** A path on `start` records that plan file as the run's
+  source; a missing plan refuses instead of silently choosing an old plan or
+  TODO list.
 - **No `/build` detour.** Orchestrator is a distinct role. Its edit/shell
   refusals name delegation as the remedy; `/build` is a deliberate user choice,
   not the response to an ordinary work request.
@@ -132,23 +133,23 @@ Both the automatic handoff and a direct request use ONE preparation service:
 
 ```text
 /orchestrator                       # enter the mode only
-/orchestrator start [path]          # freeze the approved plan / agreed steps and dispatch row 1
-/orchestrator status                # phase, counts, next row, blocker
-/orchestrator retry                 # recover a blocked/stale row and dispatch immediately
-/orchestrator pause|resume|stop|inspect|say <text>|cancel
+/orchestrator start [path]          # record the approved plan and send the start kickoff; the model calls orchestrator_start
+/orchestrator status                # bound run, row progress, live child, next row
+/orchestrator inspect [rowRef]      # one row: root, instruction, last report, child detail
+/orchestrator pause|resume|abort    # control the live child
+/orchestrator retry [rowRef]        # dispatch a row again with its stored instruction
+/orchestrator stop                  # dispose the child and cancel the run record
+/orchestrator say <text>            # message the running or paused child
+/orchestrator view [child|parent|auto]
+/orchestrator help [verb]
 ```
 
-The old `preview`, `approve`, `refine` and `finalize` verbs no longer exist.
-The execution chooser (Build / Orchestrator / Decide later) is the only
-execution decision; there is no saved destination and no recommendation.
-
-The normal UI flow asks for this approval in a dialog right after the breakdown
-validates. **Approve** records the approval and dispatches the next
-dependency-ready task; **Deny** invalidates the preview durably and stays in
-Orchestrator; freeform text asks for a revision. `/orchestrator approve` is the
-headless/automation fallback and also starts the next ready task. The model has
-no approve tool. A stale, duplicate or wrong preview id is refused; an approval
-never carries over to a changed preview.
+The old `preview`, `approve`, `refine`, `finalize` and `cancel` verbs no longer
+exist; `cancel` was renamed to `stop`. Execution is the model's decision, not a
+command: the execution chooser (Build / Orchestrator / Decide later) is the only
+execution decision, and there is no saved destination or recommendation. Once
+Orchestrator is chosen, the model calls `orchestrator_start` with the rows.
+There is no separate preview approval or approval dialog.
 
 ## Migration
 

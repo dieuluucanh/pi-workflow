@@ -410,7 +410,7 @@ export function formatReviewSubmittedEntry(
     out.push(
       theme.fg(
         "muted",
-        `  … +${findings.length - shown.length} more (see /review-status)`,
+        `  … +${findings.length - shown.length} more (see /review status)`,
       ),
     );
   }

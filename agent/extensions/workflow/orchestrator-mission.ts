@@ -51,7 +51,7 @@ function nextLine(state: OrchestratorMissionState): string {
     case "running":
       return "Next action: end your turn; the child's report wakes you (do not poll).";
     case "paused":
-      return "Next action: /orchestrator-resume continues a warm paused child; otherwise orchestrator_retry re-dispatches the row with an amended instruction.";
+      return "Next action: /orchestrator resume continues a warm paused child; otherwise orchestrator_retry re-dispatches the row with an amended instruction.";
     case "interrupted":
       return "Next action: explain the blocker, then orchestrator_retry re-dispatches the stored row instruction with your amendment.";
     case "cancelled":
@@ -100,7 +100,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "",
     "Interaction:",
     "- User prompts while a child runs are forwarded to that child. Do not answer them yourself and do not ask the user to switch modes.",
-    "- The child interaction surface is command-only: /orchestrator-pause, /orchestrator-resume, /orchestrator-abort, /orchestrator-view and /orchestrator inspect.",
+    "- The child interaction surface is command-only: /orchestrator pause, resume, abort, view, inspect.",
     "- /profile and /role switch the live Build child in place; the next child always launches on the same effective model.",
     "",
     "Permissions and limits:",

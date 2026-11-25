@@ -277,7 +277,7 @@ test("two sessions and a resource-inspector load share no refiner/reviewer/subag
 
     // Reviewer state is per instance as well: a status read on B is not a
     // status read on A.
-    await piB.commands["review-status"].handler("", ctxB);
+    await piB.commands["review"].handler("status", ctxB);
     assert.equal(
       madeA.notifies.length,
       aNotifiesBefore + 1,
@@ -305,6 +305,40 @@ test("two sessions and a resource-inspector load share no refiner/reviewer/subag
     assert.equal(orchestratorChildTeardowns.has("child-session-2"), true);
   } finally {
     resetOrchestratorChildTeardownsForTests();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── 2b. `/handoff execution` is not a subcommand ─────────────────────
+
+test("/handoff execution prints the usage that names execute", async () => {
+  const { root, agentDir, cwd } = tempRoots();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const pi = makeFakePi();
+    const made = makeFakeCtx({ cwd, hasUI: false });
+    await workflowExtension(pi as never, { selfExtensionPath: "/fake/index.ts" });
+    await pi.emit("session_start", { reason: "startup" }, made.ctx);
+
+    const before = made.notifies.length;
+    await pi.commands["handoff"].handler("execution", made.ctx);
+    const notices = made.notifies.slice(before);
+    assert.equal(notices.length, 1, "the removed subcommand answers once");
+    const text = notices[0].message;
+    assert.match(
+      text,
+      /\/handoff execute <decision-id>/,
+      "the usage still teaches the real execute verb",
+    );
+    assert.equal(
+      text.includes("/handoff execution"),
+      false,
+      "the usage must not advertise the removed execution subcommand",
+    );
+  } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     fs.rmSync(root, { recursive: true, force: true });

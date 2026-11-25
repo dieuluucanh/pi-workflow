@@ -77,14 +77,14 @@ row-38 work): `format:check`, `typecheck`, `lint`, `build`.
 Anchors are symbol names because line numbers drift. Sources: `agent/extensions/workflow/index.ts`
 (composition root), plus the modules named.
 
-### 2.1 Registered slash commands (30)
+### 2.1 Registered slash commands (20)
 
 | Command | Owning area | Anchor |
 | --- | --- | --- |
-| `/plan`, `/workflow`, `/build`, `/default`, `/orchestrator` | mode entry | `index.ts` command registrations |
+| `/plan`, `/workflow`, `/build`, `/default` | mode entry | `index.ts` command registrations |
 | `/workflow-cycle` | mode cycle (same controller as Tab) | `cycleWorkflowMode` |
-| `/orchestrator-pause`, `/orchestrator-resume`, `/orchestrator-abort`, `/orchestrator-view` | orchestrator child control | `index.ts` |
-| `/review`, `/review-mode`, `/review-prompt`, `/review-status`, `/review-pause`, `/review-resume`, `/review-abort` | Review Mode | `review.ts`, `review-runtime.ts`, `review-ui.ts` |
+| `/orchestrator <verb>` (`start`, `status`, `inspect`, `pause`, `resume`, `abort`, `retry`, `stop`, `say`, `view`, `help`; bare `/orchestrator` enters the mode) | Orchestrator operator and child control | `orchestrator-command.ts`, `orchestrator-operator.ts`, `index.ts` |
+| `/review <verb>` (`status`, `pause`, `resume`, `abort`, `say`, `mode`, `prompt`, `help`; bare `/review` or `/review <path>` runs a round) | Review Mode | `review-command.ts`, `review.ts`, `review-runtime.ts`, `review-ui.ts` |
 | `/handoff` | plan handoff | `handoff-*.ts`, `review-handoff.ts` |
 | `/commit`, `/commit-policy` | commit authority | `commit-policy.ts` |
 | `/write-policy` | write policy | `edit-policy.ts` |
@@ -281,9 +281,9 @@ explicitly labelled NOT RUN), **Class**, **Owning plan step**.
 
 | Field | Detail |
 | --- | --- |
-| Terminal/W | `review.ts` (`createReviewSession`), `review-runtime.ts`, `review-providers.ts`, `review-ui.ts`, `review-tools.ts`, `review-recovery.ts`; commands `/review*`; status `workflow-review` + widget; tests `review.test.ts`, `review-ui.test.ts`, `review-handoff.test.ts`, `provider-retarget.test.ts`. |
+| Terminal/W | `review.ts` (`createReviewSession`), `review-runtime.ts`, `review-providers.ts`, `review-ui.ts`, `review-tools.ts`, `review-recovery.ts`; command `/review <verb>` (bare `/review` or `/review <path>` runs a round); status `workflow-review` + widget; tests `review-command.test.ts`, `review-command-handlers.test.ts`, `review-ui.test.ts`, `review-handoff.test.ts`, `review-policy.test.ts`, `review-prompt.test.ts`, `provider-retarget.test.ts`. |
 | D current | Generic mode/action/progress contributions, `ctx.ui.custom` surface for the review band, per-tab shortcuts; no Workflow adapter. |
-| Evidence | `tests/host/contributions.test.ts`, `tests/host/extension-contract.e2e.test.ts`, `tests/renderer/tui-surface.test.tsx`, `tests/e2e/extension-dialog.spec.ts`. W suite drives the real factory with a fake reviewer SDK/provider: `review.test.ts` (session isolation, prompt precedence, provider errors, pause/resume helpers, status lines), `extension.test.ts` S/R/T/HF/HD groups (pause/resume/abort/status/handoff), plus row 32 `RV1`/`RV2` (`/review-prompt` reads/writes guidance with no turn; `/review-status` on an idle session starts nothing). **Real staged artifact** (row 32): `/review-status`, `/review-pause`, `/review-resume`, `/review-abort`, `/review-prompt` are safe no-ops with no round and start no tools/model. A live independent-provider review run remains row 37. |
+| Evidence | `tests/host/contributions.test.ts`, `tests/host/extension-contract.e2e.test.ts`, `tests/renderer/tui-surface.test.tsx`, `tests/e2e/extension-dialog.spec.ts`. W suite drives the real factory with a fake reviewer SDK/provider: `review-command.test.ts` (verb table, help/completions, default-vs-path, verb shadow, guard table), `review-command-handlers.test.ts` (idle `/review status` and `/review mode status`, `/review pause`/`abort` with no round, `/review prompt` without UI, resume outside Plan refused), `review-ui.test.ts`, `review-handoff.test.ts`, `review-policy.test.ts`, `review-prompt.test.ts`, `provider-retarget.test.ts` and `extension-factory-safety.test.ts` (session isolation). The row 32 `RV1`/`RV2` cases now run through `/review prompt` and `/review status`. **Real staged artifact** (row 32): `/review status`, `/review mode status`, `/review pause`, `/review resume`, `/review abort` and `/review prompt` are safe no-ops with no round and start no tools/model. A live independent-provider review run remains row 37. |
 | Class | **SUPPORTED** (host mechanics + factory/reviewer session) · **UNVERIFIED** (live provider round) |
 | Steps | 32, 37 |
 
@@ -321,7 +321,7 @@ explicitly labelled NOT RUN), **Class**, **Owning plan step**.
 
 | Field | Detail |
 | --- | --- |
-| Terminal/W | `orchestrator-*.ts` (state, store, runtime, tools, child controller/session/ui/view, workspace set, advance, mission, operator, adapters); in-process Build child; tools `orchestrator_start/status/retry`; commands `orchestrator`, `orchestrator-pause|resume|abort|view`; tests `orchestrator-*.test.ts` (state/store/runtime/tools/child-contract/advance/mission/operator/workspace/workspace-set/tool-runtime/adapters). |
+| Terminal/W | `orchestrator-*.ts` (state, store, runtime, tools, child controller/session/ui/view, workspace set, mission, operator, command, adapters); in-process Build child; tools `orchestrator_start/dispatch/status/retry/abort`; command `/orchestrator <verb>` (`start|status|inspect|pause|resume|abort|retry|stop|say|view|help`; bare `/orchestrator` enters the mode) via `orchestrator-command.ts`/`orchestrator-operator.ts`; tests `orchestrator-*.test.ts` (state/store/runtime/tools/child-contract/mission/operator/command/workspace/workspace-set/tool-runtime/adapters). |
 | D current | Generic related-session bridge (`src/shared/related-sessions.ts`, `src/host/related-sessions.ts`) with source-bound ownership, grants, epochs, dedupe; test fixtures `tests/host/extension-contract.e2e.test.ts` + `tests/fixtures/two-extension-contract.json`. |
 | Evidence | W: `orchestrator-*.test.ts` plus `orchestrator-parity.test.ts` and `orchestrator-lifecycle.test.ts` (Builder model/source bootstrap and the empty-provider fallback, exact child tool allowlist excluding `orchestrator_*`/`questionnaire`, duplicate launch refused, stale/superseded launch disposal, provider/host failure without a settle, pause/resume, explicit abort reported once, settle release, display-only child visibility, the policy-blocked-vs-in-scope report contract, and next-row dispatch with no manual abort) and `extension.test.ts` OE1–OE4 (real entrypoint: auto-accept/advance, warm repair then block, prose cascade without a parent turn, abort/retry). D: `tests/host/related-sessions.test.ts` + `tests/main/related-sessions.test.ts` (source-bound owner, host grant/epoch, duplicate request join/replay, timeout/teardown, idempotent create, focus/inspect/interrupt/close) and the real staged artifact in `tests/host/workflow-artifact-parity.test.ts` §“Orchestrator / related-session parity” (mode entry and status dispatch nothing, start without a plan refuses, child controls are inert, `/prompt` shows usage with zero orchestrator calls and zero `session-host:request`). Live provider turn, visible terminal child, separate window/pane, real `/reload` and host kill: **NOT RUN**. |
 | Class | **SUPPORTED** (in-process Orchestrator contract + generic related-session bridge mechanics) · **UNVERIFIED** (live provider/visible-host acceptance) |

@@ -129,7 +129,12 @@ test("build: a live review owns the badge and exposes its own controls", () => {
   const paused = buildWorkflowContributions({ mode: "plan", done: 0, total: 0, reviewPhase: "paused" });
   const resume = paused.find((entry) => entry.id === "review");
   assert.ok(resume && resume.kind === "action");
-  assert.equal(resume.command.name, "review-resume");
+  assert.equal(resume.command.name, "review");
+  assert.equal(resume.command.args, "resume");
+  const stop = paused.find((entry) => entry.id === "review-stop");
+  assert.ok(stop && stop.kind === "action");
+  assert.equal(stop.command.name, "review");
+  assert.equal(stop.command.args, "abort");
 
   // A review turn never advertises Plan/Build switching.
   assert.equal(paused.some((entry) => entry.id === "mode-build"), false);});
@@ -394,8 +399,48 @@ test("orchestrator child rows expose pause/resume/abort and the view toggle", ()
   for (const id of ["orchestrator-view", "orchestrator-pause", "orchestrator-abort"]) {
     assert.ok(byId.has(id), id);
   }
+  // Every Orchestrator action routes through the one canonical command; the
+  // verb rides in `args`, the action ids stay stable for hosts.
+  assert.deepEqual(
+    (byId.get("orchestrator-view") as { command?: unknown }).command,
+    { name: "orchestrator", args: "view parent" },
+  );
+  assert.deepEqual(
+    (byId.get("orchestrator-pause") as { command?: unknown }).command,
+    { name: "orchestrator", args: "pause" },
+  );
+  assert.deepEqual(
+    (byId.get("orchestrator-abort") as { command?: unknown }).command,
+    { name: "orchestrator", args: "abort" },
+  );
   assert.equal(byId.has("orchestrator-direct-build"), false);
   assert.equal(byId.has("orchestrator-host"), false);
+});
+
+test("a paused child publishes the canonical resume command and hint", () => {
+  const contributions = buildWorkflowContributions({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    orchestration: {
+      phase: "running",
+      child: { ref: "2", total: 7, phase: "paused" },
+      view: "parent",
+    },
+  });
+  const byId = new Map(contributions.map((entry) => [entry.id, entry]));
+  assert.deepEqual(
+    (byId.get("orchestrator-resume") as { command?: unknown }).command,
+    { name: "orchestrator", args: "resume" },
+  );
+  assert.deepEqual(
+    (byId.get("orchestrator-view") as { command?: unknown }).command,
+    { name: "orchestrator", args: "view child" },
+  );
+  assert.equal(
+    String((byId.get("orchestrator-input-hint") as { text?: string })?.text),
+    "paused — prompts are queued; /orchestrator resume delivers them",
+  );
 });
 
 test("the orchestrator child row is view-aware and carries child stats", () => {

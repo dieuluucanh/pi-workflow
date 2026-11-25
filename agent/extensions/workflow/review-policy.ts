@@ -194,7 +194,7 @@ export function admitModeTransition(
       ok: false,
       code: "executing-run",
       reason:
-        "An Orchestrator run owns this session — /orchestrator-abort or /orchestrator stop first.",
+        "An Orchestrator run owns this session — /orchestrator abort or /orchestrator stop first.",
     };
   }
   return { ok: true };

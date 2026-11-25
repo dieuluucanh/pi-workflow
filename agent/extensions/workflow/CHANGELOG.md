@@ -1,4 +1,44 @@
-## Unreleased
+## [0.14.0] - 2026-11-25
+
+### Changed — one command grammar for `/orchestrator` and `/review` (2026-11-25)
+
+- **One shape per family.** `/orchestrator <verb>` now owns
+  `start|status|inspect|pause|resume|abort|retry|stop|say|view|help`, and bare
+  `/orchestrator` enters the mode. `/review <verb>` owns
+  `status|pause|resume|abort|say|mode|prompt|help`, while bare `/review` or
+  `/review <path>` still runs a round. Both families get table-driven help and
+  argument completions, case-insensitive verbs, `--help`/`-h`, and
+  "did you mean" suggestions.
+- **Ten hyphenated registrations removed, with no aliases.**
+  `orchestrator-pause`, `orchestrator-resume`, `orchestrator-abort`,
+  `orchestrator-view`, `review-mode`, `review-prompt`, `review-status`,
+  `review-pause`, `review-resume` and `review-abort` are gone. The only
+  migration aid is the error sentence for the removed `cancel` verb: it is now
+  `stop`.
+- **Guards live in the verb tables.** The dispatcher applies mode, run and
+  child requirements in declared order; none is inferred from a handler body.
+  `/review status` and `/review mode status` answer different questions — the
+  round versus configuration — and the help teaches both. The default
+  `/review [path]` form keeps the path fallback: only an exact verb match
+  shadows a plan file, and the help names that caveat.
+- **Dead `/handoff execution|once` completions removed.** The tokens and
+  completion branches are gone, and `handoffArgumentCompletions` is wired to
+  `/handoff`; `/handoff execution` now prints the usage naming `execute`. The
+  live `/handoff execute <decision-id> orchestrator|build` stage-2 path is
+  unchanged.
+- **Review start and abort share one implementation.** The default round and
+  `/review say` use the same dispatcher admission (`blockWhileChildActive`, then
+  `admitReviewerNow`); `resume` uses only the resume admission, and `mode`
+  blocks with the corrected `/review mode` label. `/review abort` is the single
+  explicit exit that stops the round or discards the pause and settles the gate,
+  so no removed registration can drift from it.
+- **The 0.14.0 artifact is the parity target.** Pi Desktop's consumer fixtures
+  use the new grammar, and its lock pins the published `0.14.0` tarball by
+  registry URL plus tag, removing the manual GitHub release-asset step. The W
+  compatibility fixture now lists the two family commands instead of the ten
+  removed names; new coverage lives in `command-text.test.ts`,
+  `orchestrator-command.test.ts`, `review-command.test.ts` and
+  `review-command-handlers.test.ts`.
 
 ### Changed — Review criteria are fixed; reviewer guidance is additive (2026-11-25)
 

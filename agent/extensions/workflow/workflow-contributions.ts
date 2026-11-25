@@ -250,7 +250,10 @@ export function buildWorkflowContributions(
       label: phase === "paused" ? "Resume review" : "Review status",
       tone: "info",
       order: 20,
-      command: { name: phase === "paused" ? "review-resume" : "review-status" },
+      command: {
+        name: "review",
+        args: phase === "paused" ? "resume" : "status",
+      },
       enabled: phase !== "handoff",
       ...(phase === "handoff" ? { disabledReason: "decide in the review tab" } : {}),
     });
@@ -271,7 +274,7 @@ export function buildWorkflowContributions(
         label: "Stop review",
         tone: "warning",
         order: 30,
-        command: { name: "review-abort" },
+        command: { name: "review", args: "abort" },
         enabled: true,
       });
     }
@@ -446,8 +449,8 @@ export function buildWorkflowContributions(
         tone: "neutral",
         order: 43,
         command: {
-          name: "orchestrator-view",
-          args: run.view === "child" ? "parent" : "child",
+          name: "orchestrator",
+          args: run.view === "child" ? "view parent" : "view child",
         },
         enabled: true,
       });
@@ -459,7 +462,7 @@ export function buildWorkflowContributions(
           label: "Pause child",
           tone: "warning",
           order: 44,
-          command: { name: "orchestrator-pause" },
+          command: { name: "orchestrator", args: "pause" },
           enabled: true,
         });
       }
@@ -471,7 +474,7 @@ export function buildWorkflowContributions(
           label: "Resume child",
           tone: "info",
           order: 44,
-          command: { name: "orchestrator-resume" },
+          command: { name: "orchestrator", args: "resume" },
           enabled: true,
         });
       }
@@ -482,7 +485,7 @@ export function buildWorkflowContributions(
         label: "Abort child",
         tone: "warning",
         order: 45,
-        command: { name: "orchestrator-abort" },
+        command: { name: "orchestrator", args: "abort" },
         enabled: true,
       });
     }
@@ -501,7 +504,7 @@ export function buildWorkflowContributions(
       // queued for resume, and a starting/verifying child cannot accept one.
       const hint =
         child?.phase === "paused"
-          ? "paused — prompts are queued; /orchestrator-resume delivers them"
+          ? "paused — prompts are queued; /orchestrator resume delivers them"
           : child?.phase === "starting"
             ? "child is starting — wait for Working before sending a note"
             : child?.phase === "settling"

@@ -1,16 +1,25 @@
 /**
- * Workflow Extension — operator commands.
+ * Workflow Extension — the `/orchestrator` operator (single dispatcher).
  *
- * `/orchestrator` without arguments stays MODE ENTRY (index.ts). This module is
- * the argument surface:
+ * The grammar lives in `orchestrator-command.ts` (verb table, parser, help and
+ * completions, all pure). This module owns the EFFECTS:
  *
- *   status | start [path] | pause | resume | abort | stop | retry |
- *   inspect [rowRef] | view [child|parent|auto] | say <text> | cancel | help
+ *   /orchestrator <verb> [args]   (bare `/orchestrator` enters the mode)
+ *
+ * `run(args)` parses once and dispatches. Decision 3 guards are read from the
+ * table (`requiresMode`, `run`) and applied generically here; each verb's
+ * child/phase checks stay inside its own case so their refusal copy is
+ * unchanged. There is no `cancel` verb (`stop` is the only cancel) and no
+ * aliases — the parser already reports `cancel` as unknown with the `stop`
+ * hint.
  *
  * The run is the session's `OrchestratorRun` record plus one in-process Build
  * child. There is no preview, approve, refine or acceptance verb: the plan
- * approval is the only decision. `start` is a model tool; this module reports
- * and controls an already-bound run.
+ * approval is the only decision. `start` is model-mediated: the port records
+ * the plan and sends the kickoff; the model then calls `orchestrator_start`
+ * with the rows.
+ *
+ * Notification-free: every method returns text and the caller notifies.
  */
 
 import {
@@ -18,42 +27,24 @@ import {
   modelRefFromLabel,
   sanitizeStatLine,
 } from "./child-stats.ts";
+import {
+  formatOrchestratorHelp,
+  MAX_SAY_CHARS,
+  ORCHESTRATOR_VERBS,
+  orchestratorVerb,
+  parseOrchestratorInvocation,
+  type OrchestratorVerbName,
+} from "./orchestrator-command.ts";
 import type { OrchestratorRun, OrchestratorRunPhase } from "./orchestrator-run.ts";
+import type { WorkflowMode } from "./workflow-mode.ts";
 
-export const OPERATOR_SCHEMA_VERSION = 3 as const;
-export const MAX_SAY_CHARS = 2_000;
+/**
+ * Bumped when the operator's public surface changes shape. 4 = schema-driven
+ * grammar (no `cancel`, no aliases, `mode`/`start`/`abort` ports).
+ */
+export const OPERATOR_SCHEMA_VERSION = 4 as const;
 
-export const OPERATOR_VERBS = [
-  "status",
-  "start",
-  "pause",
-  "resume",
-  "abort",
-  "stop",
-  "inspect",
-  "say",
-  "retry",
-  "cancel",
-  "view",
-  "help",
-] as const;
-
-export type OperatorVerb = (typeof OPERATOR_VERBS)[number] | "mode-entry";
-
-export interface ParsedOperator {
-  verb: OperatorVerb;
-  rest: string;
-}
-
-export function parseOperatorArgs(raw: string): ParsedOperator {
-  const text = typeof raw === "string" ? raw.trim() : "";
-  if (text.length === 0) return { verb: "mode-entry", rest: "" };
-  const [head, ...tail] = text.split(/\s+/);
-  const verb = (OPERATOR_VERBS as readonly string[]).includes(head ?? "")
-    ? (head as OperatorVerb)
-    : "help";
-  return { verb, rest: tail.join(" ").trim() };
-}
+export type OperatorVerb = OrchestratorVerbName | "mode-entry";
 
 export interface OperatorChildSnapshot {
   phase: string;
@@ -83,8 +74,17 @@ export interface OperatorTodoRow {
   completed: boolean;
 }
 
+/**
+ * The public contract between the composition root and the dispatcher.
+ *
+ * Every port except `run` is optional so a partially wired host still works.
+ * `mode` returning `undefined` (unwired) is treated as permissive rather than
+ * as "wrong mode"; a wired port is authoritative.
+ */
 export interface OperatorRuntimePorts {
   run: () => OrchestratorRun | undefined;
+  /** The live workflow mode; a wired port gates the mode-required verbs. */
+  mode?: () => WorkflowMode;
   /** The live TODO list; completion decides whether a row is done. */
   todos?: () => OperatorTodoRow[];
   now?: () => number;
@@ -92,7 +92,12 @@ export interface OperatorRuntimePorts {
   child?: () => OperatorChildSnapshot | undefined;
   pauseChild?: () => Promise<boolean>;
   resumeChild?: (note?: string) => Promise<boolean>;
-  abortChild?: (reason: string) => Promise<void>;
+  /** Record the approved plan and send the start kickoff (`""` = bare start). */
+  start?: (path: string) => Promise<{ ok: boolean; text: string }>;
+  /** Abort the live child; `aborted` is false for an idempotent no-op. */
+  abort?: (
+    reason: string,
+  ) => Promise<{ ok: boolean; text: string; aborted: boolean }>;
   stopChild?: () => Promise<void>;
   deliver?: (text: string) => Promise<{ ok: boolean; queued?: boolean; error?: string }>;
   view?: () => OperatorView;
@@ -105,12 +110,25 @@ export interface OperatorRuntimePorts {
 
 export interface OperatorResult {
   ok: boolean;
-  verb: OperatorVerb;
+  /** `error` means the invocation never parsed as a verb. */
+  verb: OperatorVerb | "error";
   text: string;
 }
 
 export interface OperatorRuntime {
   run(args: string): Promise<OperatorResult>;
+}
+
+/** Shared no-run guidance: read-only verbs report it, mutating verbs fail. */
+const NO_RUN_TEXT =
+  "No Orchestrator run is bound yet. Start one with /orchestrator start <path>, or call orchestrator_start with the approved steps. Nothing was launched.";
+
+function modeRefusalText(verb: OrchestratorVerbName): string {
+  return `/orchestrator ${verb} is available in Orchestrator mode only. Enter it with /orchestrator (bare) or Tab; no other switch is needed.`;
+}
+
+function boundRunRefusalText(run: OrchestratorRun): string {
+  return `A run is already bound (${run.runId}); use /orchestrator status to read it, /orchestrator retry to dispatch a row, or /orchestrator stop to cancel it before starting another.`;
 }
 
 function childLine(child: OperatorChildSnapshot | undefined): string | undefined {
@@ -152,47 +170,82 @@ function completedRefs(rows: readonly OperatorTodoRow[]): Set<string> {
 export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRuntime {
   return {
     async run(args: string): Promise<OperatorResult> {
-      const parsed = parseOperatorArgs(args);
-      const run = ports.run();
-      const child = ports.child?.();
-      const fail = (text: string): OperatorResult => ({
+      const parsed = parseOrchestratorInvocation(args);
+      const fail = (verb: OperatorResult["verb"], text: string): OperatorResult => ({
         ok: false,
-        verb: parsed.verb,
+        verb,
         text,
       });
-      const help = (): OperatorResult => ({
-        ok: true,
-        verb: parsed.verb,
-        text: [
-          "Usage: /orchestrator [status|start [path]|pause|resume|abort|stop|retry|inspect [rowRef]|view [child|parent|auto]|say <text>|cancel]",
-          "Bare /orchestrator enters the mode. Start is the model tool orchestrator_start: it records one row per plan step and the parent dispatches them one at a time.",
-          "Aliases: /orchestrator-pause, /orchestrator-resume, /orchestrator-abort, /orchestrator-view.",
-          "While a child owns the composer: Esc (or /orchestrator-pause) pauses; /orchestrator-resume continues; /orchestrator-abort stops. Repeated Esc never aborts.",
-        ].join("\n"),
-      });
 
-      if (parsed.verb === "mode-entry" || parsed.verb === "help") return help();
+      // ── Parse errors, mode entry and help come first, before any state. ──
+      if (parsed.kind === "error") {
+        return { ok: false, verb: "error", text: parsed.text };
+      }
+      if (parsed.kind === "mode-entry") {
+        return { ok: true, verb: "mode-entry", text: formatOrchestratorHelp() };
+      }
+      if (parsed.kind === "help") {
+        return {
+          ok: true,
+          verb: "help",
+          text: formatOrchestratorHelp(parsed.verb),
+        };
+      }
 
-      if (parsed.verb === "view") {
-        const requested = parsed.rest.trim().toLowerCase();
-        if (requested === "child" || requested === "parent" || requested === "auto") {
-          ports.setView?.(requested);
-        } else if (requested.length > 0) {
-          return fail("Usage: /orchestrator view [child|parent|auto]");
+      const verb = parsed.verb;
+      const spec = orchestratorVerb(verb);
+      // The parser only yields table verbs; keep a defensive refusal instead of
+      // trusting that invariant at runtime.
+      if (!spec) {
+        return fail(
+          "error",
+          `Unknown Orchestrator verb "${verb}". Run /orchestrator help for the verb list.`,
+        );
+      }
+
+      const run = ports.run();
+      const child = ports.child?.();
+
+      // ── Decision 3 guards, read from the table (never inferred). ──────
+      // A wired `mode` port is authoritative; an unwired one is permissive so
+      // a partially wired host does not refuse everything.
+      const mode = ports.mode?.();
+      if (spec.requiresMode && mode !== undefined && mode !== "orchestrator") {
+        return fail(verb, modeRefusalText(verb));
+      }
+      if (spec.run === "forbidden" && run) {
+        return fail(verb, boundRunRefusalText(run));
+      }
+
+      // ── `start` runs before the run-bound guard (it CREATES the run). ──
+      if (verb === "start") {
+        if (!ports.start) {
+          return fail(
+            verb,
+            "No Orchestrator start is bound in this session; nothing was launched.",
+          );
         }
+        const started = await ports.start(parsed.path ?? "");
+        return { ok: started.ok, verb, text: started.text };
+      }
+
+      // ── `view` needs no run, so it also comes before the guard. ───────
+      if (verb === "view") {
+        if (parsed.view) ports.setView?.(parsed.view);
         const current = ports.view?.() ?? "auto";
         const line = childLine(child);
         return {
           ok: true,
-          verb: parsed.verb,
+          verb,
           text: `View: ${current}${line ? `\n${line}` : "\nNo child is active."}`,
         };
       }
 
+      // ── No-run guard: `status` still answers, everything else refuses. ──
       if (!run) {
-        return fail(
-          "No Orchestrator run is bound. Call orchestrator_start with the approved steps, or restart from the approved plan. Nothing was launched.",
-        );
+        return verb === "status"
+          ? { ok: true, verb, text: NO_RUN_TEXT }
+          : fail(verb, NO_RUN_TEXT);
       }
 
       const rows = ports.todos?.() ?? [];
@@ -201,9 +254,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
       const total = run.rows.length;
       const next = run.rows.find((row) => !doneRefs.has(row.ref));
       const target = (): string | undefined =>
-        parsed.rest.trim() || run.currentRef || next?.ref;
+        parsed.rowRef || run.currentRef || next?.ref;
 
-      switch (parsed.verb) {
+      switch (verb) {
         case "status": {
           const line = childLine(child);
           const currentRow = run.currentRef
@@ -211,7 +264,7 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
             : undefined;
           return {
             ok: true,
-            verb: parsed.verb,
+            verb,
             text: [
               `run ${run.runId} · ${run.phase}`,
               run.planPath ? `plan ${run.planPath}` : `standalone: ${run.title}`,
@@ -241,30 +294,27 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
           };
         }
 
-        case "start": {
-          return fail(
-            run.rows.length > 0
-              ? `Run ${run.runId} is already bound. Start a new run only after the current one is cancelled or completed; otherwise dispatch the next row or retry the current one.`
-              : `Run ${run.runId} has no rows. Call orchestrator_start with the plan's steps.`,
-          );
-        }
-
         case "pause": {
           if (run.phase === "completed" || run.phase === "cancelled") {
-            return fail(`The run is ${run.phase}; it cannot be paused.`);
+            return fail(verb, `The run is ${run.phase}; it cannot be paused.`);
           }
-          if (child?.phase === "paused") return fail("The run is already paused.");
+          if (child?.phase === "paused") {
+            return fail(verb, "The run is already paused.");
+          }
           if (!child || (child.phase !== "running" && child.phase !== "starting")) {
-            return fail("No live child to pause; the run is already idle.");
+            return fail(verb, "No live child to pause; the run is already idle.");
           }
           const paused = await ports.pauseChild?.();
           if (!paused) {
-            return fail("The child could not be paused; the run was left unchanged.");
+            return fail(
+              verb,
+              "The child could not be paused; the run was left unchanged.",
+            );
           }
           ports.setPhase?.("paused");
           return {
             ok: true,
-            verb: parsed.verb,
+            verb,
             text: "Run paused. The warm child can be resumed; no new row is dispatched.",
           };
         }
@@ -273,28 +323,30 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
           // Only a warm PAUSED child can be resumed. A settled child was
           // released by the settle path, so the fallback starts a fresh one.
           if (child && child.phase === "paused") {
-            const resumed = await ports.resumeChild?.(parsed.rest || undefined);
+            const resumed = await ports.resumeChild?.();
             if (!resumed) {
               return fail(
+                verb,
                 "The child could not be resumed; /orchestrator retry starts a fresh one.",
               );
             }
             ports.setPhase?.("running");
-            return { ok: true, verb: parsed.verb, text: "Child resumed." };
+            return { ok: true, verb, text: "Child resumed." };
           }
           const rowRef = target();
           if (!rowRef) {
-            return fail(`The run is ${run.phase} and every row is done.`);
+            return fail(verb, `The run is ${run.phase} and every row is done.`);
           }
           const retried = await ports.retry?.(rowRef);
           if (retried?.ok) {
             return {
               ok: true,
-              verb: parsed.verb,
+              verb,
               text: `Fresh child started for row ${rowRef}.\n${retried.text}`,
             };
           }
           return fail(
+            verb,
             retried
               ? `Could not start row ${rowRef}: ${retried.text}`
               : `No child dispatcher is bound; row ${rowRef} stays pending.`,
@@ -302,38 +354,41 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "abort": {
-          if (!child) return fail("No Orchestrator child is active.");
-          await ports.abortChild?.("user abort");
-          ports.setPhase?.("paused");
-          return {
-            ok: true,
-            verb: parsed.verb,
-            text: "Child aborted. The row is retryable; /orchestrator retry starts a fresh child.",
-          };
+          if (!child) return fail(verb, "No Orchestrator child is active.");
+          if (!ports.abort) {
+            return fail(
+              verb,
+              "No Orchestrator abort is bound in this session; the child was left running.",
+            );
+          }
+          const aborted = await ports.abort("user abort");
+          // Only a real abort pauses the run; an idempotent no-op leaves the
+          // phase alone (the helper reports `aborted: false`).
+          if (aborted.ok && aborted.aborted) ports.setPhase?.("paused");
+          return { ok: aborted.ok, verb, text: aborted.text };
         }
 
-        case "stop":
-        case "cancel": {
+        case "stop": {
           await ports.stopChild?.();
           ports.setPhase?.("cancelled");
           return {
             ok: true,
-            verb: parsed.verb,
+            verb,
             text: "Run cancelled and the child disposed. Edits and history are preserved.",
           };
         }
 
         case "inspect": {
           const rowRef = target();
-          if (!rowRef) return fail("No row is active; pass a row ref.");
+          if (!rowRef) return fail(verb, "No row is active; pass a row ref.");
           const row = run.rows.find((entry) => entry.ref === rowRef);
-          if (!row) return fail(`Unknown row ${rowRef}.`);
+          if (!row) return fail(verb, `Unknown row ${rowRef}.`);
           const workspace = run.workspaces?.find(
             (entry) => entry.id === row.workspaceId,
           );
           return {
             ok: true,
-            verb: parsed.verb,
+            verb,
             text: [
               `row ${row.ref} · ${run.phase}`,
               `root: ${row.cwd ?? workspace?.root ?? "(session root)"}${workspace ? ` (id ${workspace.id}${workspace.primary ? ", primary" : ""})` : ""}`,
@@ -355,21 +410,35 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "say": {
-          const text = parsed.rest.slice(0, MAX_SAY_CHARS);
-          if (!text) return fail("Usage: /orchestrator say <message for the child>");
+          // The parser already refuses empty and over-long messages, so this
+          // text is delivered byte-for-byte and never sliced.
+          const text = parsed.text ?? "";
+          if (!text) {
+            return fail(verb, "Usage: /orchestrator say <message for the child>");
+          }
+          if (text.length > MAX_SAY_CHARS) {
+            return fail(
+              verb,
+              `The message is ${text.length} characters; the limit is ${MAX_SAY_CHARS}. Nothing was delivered.`,
+            );
+          }
           if (!child) {
             return fail(
+              verb,
               "No Orchestrator child is active; /orchestrator say needs a running or paused child.",
             );
           }
           const delivery = await ports.deliver?.(text);
-          if (!delivery) return fail("No child is bound; the message was not sent.");
+          if (!delivery) return fail(verb, "No child is bound; the message was not sent.");
           if (!delivery.ok) {
-            return fail(`The child could not receive the message: ${delivery.error ?? "unknown"}`);
+            return fail(
+              verb,
+              `The child could not receive the message: ${delivery.error ?? "unknown"}`,
+            );
           }
           return {
             ok: true,
-            verb: parsed.verb,
+            verb,
             text: delivery.queued
               ? `Message queued for the paused child: ${text}`
               : `Message delivered to the child: ${text}`,
@@ -378,23 +447,32 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
 
         case "retry": {
           const rowRef = target();
-          if (!rowRef) return fail("There is no row to retry.");
+          if (!rowRef) return fail(verb, "There is no row to retry.");
           const retried = await ports.retry?.(rowRef);
           return retried?.ok
             ? {
                 ok: true,
-                verb: parsed.verb,
+                verb,
                 text: `Fresh child started for row ${rowRef}.\n${retried.text}`,
               }
             : fail(
+                verb,
                 retried
                   ? `Could not start row ${rowRef}: ${retried.text}`
                   : `No child dispatcher is bound, so row ${rowRef} stays pending.`,
               );
         }
 
-        default:
-          return help();
+        default: {
+          // Unreachable: `start`, `view` and `help` returned above and the
+          // switch covers every remaining table verb. Kept so a future verb
+          // added to the table fails loudly instead of silently doing nothing.
+          const known = ORCHESTRATOR_VERBS.map((entry) => entry.name).join("|");
+          return fail(
+            verb,
+            `Unsupported Orchestrator verb "${verb}". Known verbs: ${known}.`,
+          );
+        }
       }
     },
   };

@@ -21,8 +21,8 @@
 >   and then blocks and pauses;
 > - the parent model only handles blockers, status and recovery; user prose is
 >   forwarded to the running child;
-> - `/orchestrator-pause|resume|abort|view` (and the `/orchestrator` verbs)
->   control the child; `/orchestrator-view` switches BOTH the pinned panel and
+> - `/orchestrator pause|resume|abort|view` (and the `/orchestrator` verbs)
+>   control the child; `/orchestrator view` switches BOTH the pinned panel and
 >   the footer's child line (model, context, tokens, elapsed time);
 > - a reload blocks a `running` row and pauses the run; retry starts a fresh
 >   child. Old managed-worker sessions open as ordinary Build.

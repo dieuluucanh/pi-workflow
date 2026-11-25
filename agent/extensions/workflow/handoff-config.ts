@@ -385,10 +385,6 @@ export const HANDOFF_FALLBACK_TOKEN = "fallback";
 export const HANDOFF_FALLBACK_DESCRIPTION =
   "present the pending plan handoff in the native questionnaire now";
 
-/** `/handoff execution <destination> [scope]`: the saved RECOMMENDATION. */
-export const HANDOFF_EXECUTION_TOKEN = "execution";
-/** `/handoff once <destination>`: this handoff's recommendation; no settings. */
-export const HANDOFF_ONCE_TOKEN = "once";
 /** `/handoff status`: effective presenter, destination and scopes. */
 export const HANDOFF_STATUS_TOKEN = "status";
 /** `/handoff continue <decision-id>`: reopen the execution chooser. */
@@ -409,8 +405,6 @@ export const HANDOFF_EXECUTION_DESCRIPTIONS: Record<ExecutionDestination, string
  *
  * Grammar:
  *   /handoff [auto|native|plannotator] [global|project]
- *   /handoff execution <orchestrator|build> [global|project]
- *   /handoff once <orchestrator|build>
  *   /handoff approve <decision-id>
  *   /handoff continue <decision-id>
  *   /handoff execute <decision-id> <orchestrator|build>
@@ -462,20 +456,6 @@ export function handoffArgumentCompletions(
       label: mode,
       description: describeHandoffMode(mode),
     }));
-    if (HANDOFF_EXECUTION_TOKEN.startsWith(lower)) {
-      items.push({
-        value: `${HANDOFF_EXECUTION_TOKEN} `,
-        label: HANDOFF_EXECUTION_TOKEN,
-        description: "default execution destination for approved plans",
-      });
-    }
-    if (HANDOFF_ONCE_TOKEN.startsWith(lower)) {
-      items.push({
-        value: `${HANDOFF_ONCE_TOKEN} `,
-        label: HANDOFF_ONCE_TOKEN,
-        description: "change this handoff's recommendation only (never executes)",
-      });
-    }
     if (HANDOFF_APPROVE_TOKEN.startsWith(lower)) {
       items.push({
         value: `${HANDOFF_APPROVE_TOKEN} `,
@@ -521,24 +501,6 @@ export function handoffArgumentCompletions(
   const sub = (tokens[0] ?? "").toLowerCase();
   const endsWithWs = /\s$/.test(raw);
   const partial = endsWithWs ? "" : (tokens[tokens.length - 1] ?? "");
-
-  // ── /handoff execution <destination> [scope] ────────────────────────
-  if (sub === HANDOFF_EXECUTION_TOKEN) {
-    if (tokens.length === 1 || (tokens.length === 2 && !endsWithWs)) {
-      return filterScopes(destinationItems(tokens.length === 1 ? "" : partial), partial);
-    }
-    if (tokens.length === 2 && endsWithWs) return filterScopes(scopeItems(""), "");
-    if (tokens.length === 3 && !endsWithWs) return filterScopes(scopeItems(partial), partial);
-    return null;
-  }
-
-  // ── /handoff once <destination> (no scope, no write) ────────────────
-  if (sub === HANDOFF_ONCE_TOKEN) {
-    if (tokens.length === 1 || (tokens.length === 2 && !endsWithWs)) {
-      return filterScopes(destinationItems(tokens.length === 1 ? "" : partial), partial);
-    }
-    return null;
-  }
 
   // ── /handoff execute <decision-id> <destination> ────────────────────
   if (sub === HANDOFF_EXECUTE_TOKEN) {

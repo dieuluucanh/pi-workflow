@@ -27,6 +27,17 @@
  * 2026-11-25 (settle recovery): `orchestrator_abort` is the fifth parent tool,
  * so the pinned registered-tool set changed deliberately. `orchestrator_retry`
  * gained an optional `instructions` field (a property change, not a new tool).
+ *
+ * 2026-11-25 (one command grammar, step 4): `orchestrator-pause|resume|abort|
+ * view` were folded into `/orchestrator <verb>` and deleted with no aliases, so
+ * the pinned command set dropped those four names deliberately. Every effect is
+ * unchanged; only the spelling moved. See CHANGELOG.md.
+ *
+ * 2026-11-25 (one command grammar, step 8): the same fold reached Review.
+ * `review-mode|prompt|status|pause|resume|abort` were folded into
+ * `/review <verb>` and deleted with no aliases, so the pinned command set
+ * dropped those six names deliberately. Every effect and notice channel is
+ * unchanged; only the spelling moved. See CHANGELOG.md.
  */
 
 import { test } from "node:test";

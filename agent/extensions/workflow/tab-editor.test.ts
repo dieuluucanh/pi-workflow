@@ -139,7 +139,7 @@ function activity(
   over: Partial<WorkflowEditorActivity> = {},
 ): WorkflowEditorActivity {
   return {
-    line: "Working · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop",
+    line: "Working · ESC or /orchestrator pause · /orchestrator abort to stop",
     compact: "Working · ESC to pause",
     busy: true,
     paused: false,
@@ -167,8 +167,8 @@ test("composer border delegates to the host when no child owns it", () => {
 test("composer border shows the phase and the real controls", () => {
   const editor = makeHookEditor({ activity: () => activity() });
   const line = (editor as any).renderTopBorder(120, 0);
-  assert.match(line, /Working · ESC or \/orchestrator-pause to pause/);
-  assert.match(line, /\/orchestrator-abort to stop/);
+  assert.match(line, /Working · ESC or \/orchestrator pause/);
+  assert.match(line, /\/orchestrator abort to stop/);
 });
 
 test("narrow terminals fall back to the hint-free compact line", () => {
@@ -176,7 +176,7 @@ test("narrow terminals fall back to the hint-free compact line", () => {
   const line = (editor as any).renderTopBorder(42, 0);
   assert.match(line, /Working/);
   assert.match(line, /ESC to pause/);
-  assert.doesNotMatch(line, /\/orchestrator-abort/);
+  assert.doesNotMatch(line, /\/orchestrator abort/);
 });
 
 test("the border never echoes a tool, a command or the row counter", () => {
@@ -210,16 +210,16 @@ test("a warm pause renders the paused line with resume", () => {
   const editor = makeHookEditor({
     activity: () =>
       activity({
-        line: "Paused · /orchestrator-resume to continue · /orchestrator-abort to stop",
-        compact: "Paused · /orchestrator-resume",
+        line: "Paused · /orchestrator resume to continue · /orchestrator abort to stop",
+        compact: "Paused · /orchestrator resume",
         busy: false,
         paused: true,
         esc: "swallow",
       }),
   });
   const line = (editor as any).renderTopBorder(120, 0);
-  assert.match(line, /Paused · \/orchestrator-resume to continue/);
-  assert.match(line, /\/orchestrator-abort to stop/);
+  assert.match(line, /Paused · \/orchestrator resume to continue/);
+  assert.match(line, /\/orchestrator abort to stop/);
 });
 
 function escapeTestEditor(action: WorkflowEditorActivity["esc"]) {
