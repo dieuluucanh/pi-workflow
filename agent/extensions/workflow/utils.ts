@@ -1311,12 +1311,20 @@ export function isUserInteractionEntry(e: any): boolean {
 // ══════════════════════════════════════════════════════════════════════
 // Review Mode — pure helpers
 //
-// Review Mode (see review.ts) audits Plan Mode's plan and rewrites it. The
+// Review Mode (see review.ts) audits Plan Mode's plan and appends advisory
+// review notes to it (the plan body itself is never rewritten). The
 // helpers below are the deterministic part: they never call a model and never
 // touch the Pi SDK, so they are fully unit-testable.
 // ══════════════════════════════════════════════════════════════════════
-
-/** Markdown heading that separates the human plan from Review Mode's changelog. */
+/**
+ * Legacy Review Mode heading (pre-append-only): it used to separate the human
+ * plan from the reviewer's changelog.
+ *
+ * Current rounds append `## Reviewer Revisions (round N)` instead, so this
+ * heading is no longer emitted by the live path. It stays exported because
+ * `stripReviewAppendix` still removes it from plans written by older versions
+ * (and `appendReviewChangelog` remains available for that legacy shape).
+ */
 export const REVIEW_CHANGELOG_HEADING = "## Review changes";
 /** Markdown heading appended when Review Mode could not clear its findings. */
 export const REVIEW_UNRESOLVED_HEADING = "## Unresolved findings";
@@ -1347,6 +1355,18 @@ export interface ReviewFinding {
   summary: string;
   rationale: string;
   disposition: ReviewDisposition;
+}
+
+/** A required change the reviewer appends to the Reviewer Revisions appendix. */
+export interface ReviewRevision {
+  /** Stable id, `R<n>`. Normalised to submission order when the model omits it. */
+  id: string;
+  /** Plan step number or short reference, e.g. "3" or "Phase 2". */
+  step?: string;
+  /** The concrete revision the author must make. */
+  change: string;
+  /** Finding ids this revision addresses, e.g. ["F1", "F3"]. */
+  findingIds?: string[];
 }
 
 /** Tier for a finding, using severity first and confidence as the gate. */
@@ -1402,6 +1422,31 @@ function oneLine(s: string): string {
   return String(s ?? "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Render the `### Required changes` block of the Reviewer Revisions appendix.
+ *
+ * This is the single source of truth for the format. `renderReviewerRevisions`
+ * (review-tools.ts) calls it and `parseReviewNotes` (this module) parses
+ * exactly this output, so the renderer and parser cannot drift.
+ * Returns "" when there is nothing to list.
+ */
+export function renderRequiredChanges(
+  revisions: ReviewRevision[] | undefined,
+): string {
+  const list = Array.isArray(revisions) ? revisions.filter(Boolean) : [];
+  if (list.length === 0) return "";
+  const lines = ["### Required changes", ""];
+  for (const revision of list) {
+    const step = revision.step ? ` · Step ${revision.step}` : "";
+    const findings =
+      Array.isArray(revision.findingIds) && revision.findingIds.length > 0
+        ? ` _(${revision.findingIds.join(", ")})_`
+        : "";
+    lines.push(`- **${revision.id}${step}:** ${revision.change}${findings}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -1484,6 +1529,196 @@ export function renderReviewChangelog(
 }
 
 /**
+// ── Advisory review notes: parse the appendix ───────────────────────
+
+/** One advisory note parsed from an appendix's `### Required changes` list. */
+export interface ReviewNote {
+  /** Stable id, `R<n>`. Legacy sections without ids get `R1..Rn` positionally. */
+  id: string;
+  /** Plan step reference, when the bullet carried ` · Step <step>`. */
+  step?: string;
+  /** The required change, with the trailing `_(F1, F3)_` fragment removed. */
+  change: string;
+  /** Finding ids from the trailing `_(F1, F3)_` fragment, when present. */
+  findingIds?: string[];
+}
+
+/** Result of {@link parseReviewNotes}. */
+export interface ParsedReviewNotes {
+  /** Notes from the LAST `## Reviewer Revisions (round N)` section only. */
+  notes: ReviewNote[];
+  /** Round number of the section that was read, when the plan has one. */
+  round?: number;
+  /** Top-level numbered plan steps outside the appendix (row alignment count). */
+  stepCount: number;
+}
+
+/**
+ * Appendix headings. `stripReviewAppendix` and `countPlanSteps` share this
+ * list so "outside the appendix" means the same thing in both places.
+ */
+const REVIEW_APPENDIX_HEADING =
+  /^[ \t]*##[ \t]+(?:Reviewer Revisions|Review changes|Unresolved findings)\b/m;
+
+/** `## Reviewer Revisions (round N)` — the last match wins in the parser. */
+const REVIEWER_REVISIONS_HEADING =
+  /^[ \t]*##[ \t]+Reviewer Revisions[ \t]*\(round[ \t]*(\d+)\)[ \t]*$/gim;
+
+/** Optional `### Required changes` sub-heading of the appendix. */
+const REQUIRED_CHANGES_HEADING = /^[ \t]*###[ \t]+Required changes[ \t]*$/im;
+
+/** Any Markdown heading — ends the required-changes list region. */
+const ANY_MARKDOWN_HEADING = /^[ \t]*#{1,6}[ \t]+\S/;
+
+/** Trailing `_(F1, F3)_` fragment rendered by `renderRequiredChanges`. */
+const FINDINGS_FRAGMENT = /[ \t]*_\(([^()]*)\)_[ \t]*$/;
+
+/**
+ * Count the plan's top-level numbered step items, excluding the appendix.
+ *
+ * Heuristic shared with the Orchestrator's note-to-row alignment: cut the
+ * appendix, then count `^\d+\.\s+` items after the LAST `^## ` heading that
+ * matches `/steps?|plan/i` (`## Steps`, `## Plan Steps`, `## Plan`, …). With no
+ * such heading the whole body is counted. Indented (sub-)items never count
+ * because the regex is anchored at column 0. Pure; never throws.
+ */
+export function countPlanSteps(planText: string): number {
+  const text = String(planText ?? "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  if (!text) return 0;
+  const appendix = REVIEW_APPENDIX_HEADING.exec(text);
+  const body = appendix ? text.slice(0, appendix.index) : text;
+  let start = 0;
+  for (const match of body.matchAll(/^##[ \t]+.*$/gm)) {
+    const title = match[0].replace(/^##[ \t]+/, "");
+    if (/steps?|plan/i.test(title)) start = match.index + match[0].length;
+  }
+  const region = body.slice(start);
+  return region.match(/^\d+\.[ \t]+\S/gm)?.length ?? 0;
+}
+
+interface ParsedRequiredChange {
+  id?: string;
+  step?: string;
+  change: string;
+  findingIds?: string[];
+}
+
+/**
+ * Parse one `- **R1 · Step 2:** change _(F1)_` bullet body (the text after
+ * `- `). Grammar: `**R<n>[ · Step <step>][:]** <change>[ _(<f1>, <f3>)_]`.
+ * Legacy bullets (`**Step 3:** change`, `**3:** change`) carry no id; the
+ * caller assigns `R1..Rn` by position within that section. Anything that does
+ * not fit the grammar returns undefined and the caller skips the line.
+ */
+function parseRequiredChangeBullet(body: string): ParsedRequiredChange | undefined {
+  const bold = /^\*\*(.+?)\*\*([\s\S]*)$/.exec(body.trim());
+  if (!bold) return undefined;
+  const head = bold[1].replace(/[ \t]+$/, "");
+  const headCore = head.endsWith(":") ? head.slice(0, -1).trimEnd() : head;
+
+  let id: string | undefined;
+  let step: string | undefined;
+  const withId = /^(R\d+)(?:[ \t]*\u00b7[ \t]*Step[ \t]+(.+))?$/i.exec(headCore);
+  if (withId) {
+    id = withId[1].toUpperCase();
+    step = withId[2]?.trim() || undefined;
+  } else {
+    const legacyStep = /^Step[ \t]+(.+)$/i.exec(headCore);
+    const legacyNumber = /^(\d+)$/.exec(headCore);
+    step = legacyStep?.[1]?.trim() || legacyNumber?.[1];
+    if (!step) return undefined;
+  }
+
+  let change = bold[2].trim();
+  let findingIds: string[] | undefined;
+  const fragment = FINDINGS_FRAGMENT.exec(change);
+  if (fragment) {
+    const ids = fragment[1]
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (ids.length > 0) findingIds = ids;
+    change = change.slice(0, fragment.index).trimEnd();
+  }
+  if (!change) return undefined;
+
+  const parsed: ParsedRequiredChange = { change };
+  if (id) parsed.id = id;
+  if (step) parsed.step = step;
+  if (findingIds) parsed.findingIds = findingIds;
+  return parsed;
+}
+
+/** Next free positional `R<n>` for a legacy (id-less) section. */
+function nextLegacyId(start: number, taken: Set<string>): string {
+  let n = start;
+  while (taken.has(`R${n}`)) n++;
+  return `R${n}`;
+}
+
+/**
+ * Parse the advisory notes out of the plan's Reviewer Revisions appendix.
+ *
+ * Reads only the LAST `## Reviewer Revisions (round N)` section (a plan can
+ * carry one per review round; the newest round wins) and only that section's
+ * `### Required changes` list — the findings changelog and anything outside the
+ * block are ignored. The block ends at the next heading, at the first line
+ * that is neither blank nor a `- ` bullet, or at the end of the section.
+ *
+ * Format: exactly what `renderRequiredChanges` emits, i.e.
+ * `- **R<n>[ · Step <step>][:]** <change>[ _(<f1>, <f3>)_]`. A trailing
+ * findings fragment is stripped from `change` and returned as `findingIds`.
+ *
+ * Legacy sections written before ids existed (`- **Step 3:** change`,
+ * `- **3:** change`) get positional ids `R1..Rn` in bullet order within that
+ * section, skipping ids already claimed by explicit bullets, so old appendices
+ * stay parseable without rewriting the plan body.
+ *
+ * A malformed line is skipped, never thrown. A plan with no appendix (or a
+ * round without required changes) returns `{ notes: [], stepCount }`.
+ */
+export function parseReviewNotes(planText: string): ParsedReviewNotes {
+  const text = String(planText ?? "").replace(/\r\n?/g, "\n");
+  const stepCount = countPlanSteps(text);
+  const headings = [...text.matchAll(REVIEWER_REVISIONS_HEADING)];
+  const last = headings[headings.length - 1];
+  if (!last || last.index === undefined) return { notes: [], stepCount };
+
+  const round = Number(last[1]);
+  const afterHeading = text.slice(last.index + last[0].length);
+  const nextSection = /^[ \t]*##[ \t]+\S[^\n]*$/m.exec(afterHeading);
+  const section = nextSection
+    ? afterHeading.slice(0, nextSection.index)
+    : afterHeading;
+
+  const blockHeading = REQUIRED_CHANGES_HEADING.exec(section);
+  if (!blockHeading) return { notes: [], round, stepCount };
+  const block = section.slice(blockHeading.index + blockHeading[0].length);
+
+  const notes: ReviewNote[] = [];
+  const taken = new Set<string>();
+  for (const line of block.split("\n")) {
+    const bullet = line.trimEnd();
+    if (!bullet.trim()) continue;
+    if (ANY_MARKDOWN_HEADING.test(bullet)) break;
+    if (!bullet.startsWith("- ")) break;
+    const parsed = parseRequiredChangeBullet(bullet.slice(2));
+    if (!parsed) continue;
+    const note: ReviewNote = {
+      id: parsed.id ?? nextLegacyId(notes.length + 1, taken),
+      change: parsed.change,
+    };
+    if (parsed.step) note.step = parsed.step;
+    if (parsed.findingIds) note.findingIds = parsed.findingIds;
+    taken.add(note.id);
+    notes.push(note);
+  }
+  return { notes, round, stepCount };
+}
+
+/**
  * Minimal unified diff between two plan texts (step 9).
  *
  * Pass 2 only checks "did the rewrite drop a requirement", so it gets a
@@ -1557,8 +1792,19 @@ export function classifyReviewLanding(input: {
 }
 
 /**
- * Strip any previously appended Review Mode appendix from a plan.
- * Returns the plan body exactly as the author wrote it.
+ * Strip the Review Mode changelog appendix from a plan.
+ *
+ * Strips exactly two headings (plus a `---` rule immediately before them):
+ * `## Review changes` and `## Unresolved findings`.
+ *
+ * `## Reviewer Revisions (round N)` is deliberately NOT stripped. The revision
+ * appendix is part of the reviewed document, and the review-round guards compare
+ * post-review text, so a new round is a new document by design. Widening this
+ * helper would silently change which plans count as already reviewed; pass-2
+ * resubmission owns that heading separately (`review-tools.stripReviewerRevisions`).
+ *
+ * Returns the text with those two headings removed; the revision appendix, when
+ * present, is preserved exactly.
  */
 export function stripReviewAppendix(planText: string): string {
   const text = String(planText ?? "");
@@ -1589,8 +1835,16 @@ export function appendReviewChangelog(
 }
 
 /**
- * Content hash of a plan body, ignoring any Review Mode appendix so a re-review
- * of the same revision is detected instead of re-triggering forever.
+ * Content hash of a reviewed plan document.
+ *
+ * Goes through `stripReviewAppendix`, so it ignores only `## Review changes` and
+ * `## Unresolved findings`. The `## Reviewer Revisions (round N)` appendix is
+ * intentionally INCLUDED: it is part of the reviewed document, and the
+ * review-round guards (handoff print dedupe, Plannotator stale-tab check,
+ * approval re-read, pause/review `unchanged`) compare the post-review text. A new
+ * round therefore hashes as a new document; identical reviewed text hashes
+ * identically across calls.
+ *
  * FNV-1a over whitespace-normalized text; stable across platforms.
  */
 export function planHash(planText: string): string {
@@ -1740,8 +1994,13 @@ export function pruneContextEntriesForReview(
  * obvious first guess) would reject exactly the reviews that are doing their
  * job. So the bounds only catch catastrophes: a stub (below `minRatio`) or an
  * accidental paste / wholesale plan substitution (above `maxRatio`). Everything
- * in between is the reviewer legitimately doing its work, and every change is
- * still made visible to the user through the `## Review changes` appendix.
+ * in between is the reviewer legitimately doing its work, and every revision is
+ * still made visible to the user through the `## Reviewer Revisions` appendix.
+ *
+ * Dead export: the append-only submission path no longer validates a replacement
+ * body, so nothing calls this. It is kept (and re-exported by review.ts) only so
+ * the removal is a separate, reversible change; `## Review changes` in the
+ * paragraph above is the LEGACY heading that `stripReviewAppendix` still strips.
  */
 export function validateReviewedPlan(
   planMarkdown: unknown,

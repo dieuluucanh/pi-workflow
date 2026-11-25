@@ -21,8 +21,10 @@ import * as path from "node:path";
 
 import {
   DEFAULT_REVIEW_GUIDANCE,
+  DEFAULT_REVIEW_MODE_CONFIG,
   REVIEW_CRITERIA,
   REVIEW_SYSTEM_PROMPT,
+  coerceReviewModeConfig,
   resolveReviewPrompt,
 } from "./review.ts";
 import { buildPass1Prompt, buildPass2Prompt } from "./review-runtime.ts";
@@ -47,6 +49,30 @@ const FINDING = {
   rationale: "A plan step without a route cannot ship.",
   disposition: "accepted" as const,
 };
+
+test("Review settings: legacy chunkedSubmit/chunkChars keys are ignored, not fatal", () => {
+  // Users may still carry the removed chunked-path settings on disk. Reading
+  // them must not throw and must not resurrect the deleted fields.
+  const config = coerceReviewModeConfig({
+    enabled: true,
+    rounds: 2,
+    chunkedSubmit: "off",
+    chunkChars: 0,
+  });
+  assert.equal(config.enabled, true);
+  assert.equal(config.rounds, 2);
+  assert.equal(config.passes, DEFAULT_REVIEW_MODE_CONFIG.passes);
+  assert.ok(!("chunkedSubmit" in config), "chunkedSubmit is not part of the config");
+  assert.ok(!("chunkChars" in config), "chunkChars is not part of the config");
+
+  // Junk legacy values are ignored the same way.
+  const junk = coerceReviewModeConfig({
+    chunkedSubmit: { unexpected: true },
+    chunkChars: "not-a-number",
+  });
+  assert.equal(junk.enabled, DEFAULT_REVIEW_MODE_CONFIG.enabled);
+  assert.ok(!("chunkChars" in junk));
+});
 
 test("REVIEW_CRITERIA has exactly five numbered criteria in priority order", () => {
   const numbered = CRITERIA_TEXT.split("\n").filter((line) =>

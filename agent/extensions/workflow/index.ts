@@ -80,6 +80,7 @@ import {
   pruneContextEntriesForReview,
   buildPlannerContextManifest,
   stripReviewAppendix,
+  parseReviewNotes,
   REVIEW_UNRESOLVED_HEADING,
   type TodoStatus,
   type TodoItem,
@@ -279,6 +280,7 @@ import {
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
 import {
+  bindReviewNotes,
   createOrchestratorRun,
   markRunInterrupted,
   nextPendingRow,
@@ -2428,8 +2430,8 @@ export default function workflowExtension(
         planHash: string;
         /**
          * Hash of the plan *file* when the pause was recorded (refreshed when
-         * the round settles). The reviewer writes its rewrite to that file
-         * mid-round, so comparing the file against `planHash` alone would read
+         * the round settles). The reviewer appends its revisions section to that
+         * file mid-round, so comparing the file against `planHash` alone would read
          * the reviewer's own submission as an author edit on resume.
          * `undefined` when the file was missing/unreadable — fall back to
          * `planHash` (pre-snapshot behaviour).
@@ -3507,7 +3509,8 @@ export default function workflowExtension(
     const hash = planHash(input.planText);
     if (currentPausedReview()?.planHash === hash) return false;
     // Snapshot the file as well as the text: the reviewer may already have
-    // written its rewrite, and that must not look like an author edit later.
+    // appended its revisions section, and that must not look like an author
+    // edit later.
     const currentFile = readCurrentPlanText(reviewCwd());
     pausedReview = {
       planText: input.planText,
@@ -3870,7 +3873,7 @@ export default function workflowExtension(
       });
       flushReviewEntries(true);
       // The pause snapshot was taken while the round was still aborting. A
-      // `review_submit_plan` that landed in that window changed the file after
+      // `review_submit` that landed in that window changed the file after
       // the snapshot, so refresh it: otherwise `/review-resume` would read the
       // reviewer's own late write as an author edit and start a fresh round.
       const pausedNow = currentPausedReview();
@@ -3889,8 +3892,8 @@ export default function workflowExtension(
         lastReviewedPlanHash = res.planHash;
         abortedReviewHash = undefined;
         quietAbortHash = undefined;
-        // A pause that raced a pass-2 completion: the rewrite won (pass 2 is
-        // best-effort — an abort keeps pass 1's plan), so there is nothing
+        // A pause that raced a pass-2 completion: the pass-2 submission won
+        // (pass 2 is best-effort — an abort keeps pass 1's plan), so there is nothing
         // to resume. Drop the stale snapshot — and the gated paused phase —
         // instead of stranding /review-resume and the handoff gate.
         if (pausedHere) {
@@ -6772,8 +6775,8 @@ export default function workflowExtension(
     // A stale quiet-abort marker must not silence this explicit resume.
     quietAbortHash = undefined;
     // If the plan file moved on while paused, review the new revision fresh
-    // instead of resuming stale text. The reviewer writes its own rewrite to
-    // that file mid-round, so compare against the pause-time snapshot — not
+    // instead of resuming stale text. The reviewer appends its own revisions
+    // section to that file mid-round, so compare against the pause-time snapshot — not
     // the text the round started with (see `markReviewPaused`).
     const current = readCurrentPlanText((ctx as any).cwd ?? process.cwd());
     const resumeChoice = reviewResumePlanChoice({
@@ -8257,7 +8260,7 @@ export default function workflowExtension(
       resetPlanRunProvenance();
       clearPendingHandoffDecision();
       // Approve path: Plan mode is off in favour of Build, but the reviewer
-      // session stays warm — a landing review must not rewrite the plan the
+      // session stays warm — a landing review must not append to the plan the
       // user just approved (step 10).
       await suspendReview();
       currentPlanFile = planPath;
@@ -9009,6 +9012,14 @@ export default function workflowExtension(
     overlayDepth += 1;
     handoffModalOpen = true;
     let result: QuestionnaireResult | null = null;
+    // Advisory notes are surfaced as a count only: the plan body is never
+    // amended for them, so there is no diff/apply choice at the handoff.
+    // Parse once here; a skipped or plain handoff passes 0 so the line is
+    // unchanged.
+    const revisionCount =
+      input.reason === "reviewed"
+        ? parseReviewNotes(input.planText).notes.length
+        : 0;
     try {
       const question = buildHandoffQuestion({
         planPath: input.planPath,
@@ -9017,6 +9028,7 @@ export default function workflowExtension(
         ...(input.findingCount !== undefined
           ? { findingCount: input.findingCount }
           : {}),
+        revisionCount,
       });
       result = await ctx.ui.custom<QuestionnaireResult | null>(
         (tui, theme, _kb, done) =>
@@ -13144,12 +13156,13 @@ export default function workflowExtension(
       };
     }
     let planPath: string | undefined;
+    let planText: string | undefined;
     if (typeof input.planPath === "string" && input.planPath.trim().length > 0) {
       planPath = path.isAbsolute(input.planPath)
         ? input.planPath
         : path.resolve(orchestratorRoot(), input.planPath);
       try {
-        await fs.promises.access(planPath);
+        planText = await fs.promises.readFile(planPath, "utf8");
       } catch (error: unknown) {
         return {
           ok: false,
@@ -13176,12 +13189,51 @@ export default function workflowExtension(
         displayPath: root.displayPath,
         primary: root.primary,
       }));
+      const parsedNotes = planText !== undefined ? parseReviewNotes(planText) : undefined;
+      const bindings = parsedNotes
+        ? bindReviewNotes(parsedNotes.notes, parsedNotes.stepCount, steps)
+        : undefined;
       orchestratorRun = createOrchestratorRun({
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(planPath !== undefined ? { planPath } : {}),
         steps,
         workspaces,
+        ...(bindings && bindings.unboundReviewNotes.length > 0
+          ? { unboundReviewNotes: bindings.unboundReviewNotes }
+          : {}),
       });
+      if (bindings) {
+        const notesByRef = new Map(
+          bindings.rows
+            .filter((row) => row.reviewNotes !== undefined && row.reviewNotes.length > 0)
+            .map((row) => [row.ref, row.reviewNotes!] as const),
+        );
+        if (notesByRef.size > 0) {
+          orchestratorRun = {
+            ...orchestratorRun,
+            rows: orchestratorRun.rows.map((row) => {
+              const reviewNotes = notesByRef.get(row.ref);
+              return reviewNotes ? { ...row, reviewNotes } : row;
+            }),
+          };
+        }
+      }
+      // Advisory only: never block a start because notes did not line up.
+      if (parsedNotes && parsedNotes.notes.length > 0 && bindings) {
+        if (!bindings.aligned) {
+          notifyWorkflow(
+            `Plan has ${bindings.planStepCount} numbered steps but the run has ${bindings.rowCount} rows; review notes were left unbound.`,
+            "warning",
+          );
+        } else if (bindings.unboundReviewNotes.length > 0) {
+          notifyWorkflow(
+            `Review notes ${bindings.unboundReviewNotes
+              .map((note) => note.id)
+              .join(", ")} could not be bound to a row; they were left unbound.`,
+            "warning",
+          );
+        }
+      }
     } catch (error: unknown) {
       return {
         ok: false,
@@ -17776,6 +17828,9 @@ export default function workflowExtension(
               runId: run.runId,
               sourceLabel: run.planPath ?? "standalone steps",
               taskCounts: { done, total },
+              // Review-note seam: the builder is pure, so the run's unbound
+              // notes are passed in here and never read inside the builder.
+              unboundReviewNotes: run.unboundReviewNotes,
             }
           : {}),
       });
@@ -17797,8 +17852,10 @@ export default function workflowExtension(
       // One neutral line only: Plan Mode must NOT see the reviewer's prompt,
       // findings, or transcript (requirement: Plan cannot see Review's context).
       // Automatic review only — manual `/review` bypasses via "manual" trigger.
+      // The note says the plan body is not modified: the reviewer's output is an
+      // appended appendix, so the planner's text is what the handoff renders.
       const reviewNote = reviewEnabled()
-        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required revisions to the plan file. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required revisions to the plan file as a review appendix. The plan body is not modified — the reviewer cannot rewrite it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
         : "";
       return {
         message: {
@@ -18911,6 +18968,9 @@ export default function workflowExtension(
             ref: row.ref,
             text: row.text,
             instruction,
+            ...(row.reviewNotes && row.reviewNotes.length > 0
+              ? { reviewNotes: row.reviewNotes }
+              : {}),
             ...(workspace ? { workspace } : {}),
           },
           ...(input.repair ? { repair: input.repair } : {}),
@@ -19125,12 +19185,24 @@ export default function workflowExtension(
   ): boolean {
     const send = (pi as any).sendMessage;
     if (typeof send !== "function") return false;
+    const PLAN_CHARS = 20_000;
+    const planBody = planText ? planText.slice(0, PLAN_CHARS) : "";
+    const planSection = !planText
+      ? []
+      : [
+          "",
+          "The `## Reviewer Revisions` section is advisory: the plan body is authoritative on any conflict.",
+          "Plan:",
+          `${planBody}${
+            planText.length > PLAN_CHARS ? "\n… (truncated)" : ""
+          }`,
+        ];
     const content = [
       "[ORCHESTRATOR START]",
       `The approved plan is ${planPath}.`,
       "Read it, then call orchestrator_start with one step per plan row and the workspaces it declares. A step names its workspace only when it targets a non-primary root.",
       "Do not edit the plan. Then dispatch row 1 with orchestrator_dispatch.",
-      ...(planText ? ["", "Plan:", planText.slice(0, 20_000)] : []),
+      ...planSection,
     ].join("\n");
     try {
       void send(
@@ -19691,7 +19763,7 @@ export default function workflowExtension(
           // handoff. `lastPlanWritePath` alone is session-lifetime stale.
           planWritePathThisRun = abs;
           planWrittenThisRun = true;
-          // The reviewer's `review_submit_plan` writes this path; a manual
+          // The reviewer's `review_submit` writes this path; a manual
           // `/review` must also audit the file the user just wrote.
           currentPlanFile = abs;
           notePlanTargetForReviewCycle(abs);

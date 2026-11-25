@@ -25,6 +25,7 @@ import {
 } from "./isolated-session.ts";
 import { createInProcessChildSession } from "./in-process-child.ts";
 import { createReviewSession, reviewToolAllowlist, REVIEW_BUILTIN_TOOLS } from "./review.ts";
+import { createReviewTools, type ReviewToolDeps } from "./review-tools.ts";
 import { checkProviderAuth } from "./provider-auth.ts";
 
 // ── Fixtures ─────────────────────────────────────────────────────────
@@ -605,7 +606,7 @@ test("Review compatibility: createReviewSession uses the shared isolation defaul
   const captured: { loaderOptions?: Record<string, unknown>; sessionOptions?: Record<string, unknown> } = {};
   const customTools = [
     { name: "review_ask" },
-    { name: "review_submit_plan" },
+    { name: "review_submit" },
   ];
   const expected = reviewToolAllowlist(customTools);
   const sdk = {
@@ -668,6 +669,65 @@ test("Review compatibility: createReviewSession uses the shared isolation defaul
   assert.ok(!expected.includes("write"));
 });
 
+test("Review allowlist: exactly the eight reviewer tools, no review_plan_*", () => {
+  const definition = (name: string) => ({
+    name,
+    label: name,
+    description: "",
+    parameters: {},
+    execute: async () => ({ content: [] }),
+  });
+  const sdk = {
+    createBashToolDefinition: () => definition("bash"),
+    createReadToolDefinition: () => definition("read"),
+    createGrepToolDefinition: () => definition("grep"),
+    createFindToolDefinition: () => definition("find"),
+    createLsToolDefinition: () => definition("ls"),
+  };
+  const deps: ReviewToolDeps = {
+    cwd: "/proj",
+    log: () => {},
+    explore: {
+      budget: () => 1,
+      run: async () => "",
+      onUsed: () => {},
+      log: () => {},
+    },
+    submit: {
+      planPath: () => "/proj/.pi/plans/plan.md",
+      originalPlan: () => "# Plan",
+      modelLabel: () => "reviewer-model",
+      submit: async () => ({ ok: true, path: "/proj/.pi/plans/plan.md" }),
+      log: () => {},
+    },
+    passDone: {
+      hasSubmitted: () => true,
+      onPassDone: () => {},
+      willVerify: () => false,
+      log: () => {},
+    },
+  };
+
+  const built = createReviewTools(sdk as never, deps);
+  const names = built.tools.map((tool) => (tool as { name: string }).name);
+  const expected = [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "review_bash",
+    "review_explore",
+    "review_submit",
+    "review_pass_done",
+  ];
+  assert.deepEqual([...names].sort(), [...expected].sort(), "built tools");
+  assert.deepEqual(reviewToolAllowlist(built.tools), expected, "allowlist");
+  assert.ok(
+    !expected.some((name) => name.startsWith("review_plan_")),
+    "no chunked rewrite tool is exposed",
+  );
+});
+
 test("Review compatibility: a dropped reviewer tool disposes the child", async () => {
   let disposeCount = 0;
   const sdk = {
@@ -698,12 +758,12 @@ test("Review compatibility: a dropped reviewer tool disposes the child", async (
     modelRef: { provider: "p", id: "m", thinking: "high" },
     findModel: () => ({}),
     reviewPrompt: "x",
-    customTools: [{ name: "review_submit_plan" }],
+    customTools: [{ name: "review_submit" }],
     loadSdk: async () => sdk as never,
   });
 
   assert.equal(res.ok, false);
-  assert.match(res.error ?? "", /review_submit_plan/);
+  assert.match(res.error ?? "", /review_submit/);
   assert.equal(disposeCount, 1);
 });
 

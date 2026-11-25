@@ -97,6 +97,12 @@ export interface HandoffQuestionInput {
   reason: HandoffReason;
   verdict?: string;
   findingCount?: number;
+  /**
+   * Advisory notes the reviewer recorded in the plan's last round appendix.
+   * Shown next to the findings count only when positive; the plan body itself
+   * is never amended by them.
+   */
+  revisionCount?: number;
 }
 
 function normalize(value: string): string {
@@ -162,6 +168,14 @@ export function buildHandoffQuestion(
     if (typeof input.findingCount === "number" && input.findingCount >= 0) {
       const plural = input.findingCount === 1 ? "" : "s";
       count = ` · ${input.findingCount} finding${plural}`;
+    }
+    if (
+      typeof input.revisionCount === "number" &&
+      Number.isFinite(input.revisionCount) &&
+      input.revisionCount > 0
+    ) {
+      const plural = input.revisionCount === 1 ? "" : "s";
+      count += ` · ${input.revisionCount} note${plural}`;
     }
     lines.push(`Review: ${input.verdict.trim()}${count}`);
   }

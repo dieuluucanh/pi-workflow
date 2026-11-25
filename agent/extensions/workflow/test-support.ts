@@ -553,16 +553,26 @@ export function fakeSdk(script: {
   return { capture, sdk };
 }
 
+/**
+ * Finish a review pass with the LIVE append-only submission protocol.
+ *
+ * `_plan` is intentionally unused: `review_submit` has no replacement-body
+ * parameter (pinned by `review-append-only.test.ts`) — it appends findings and
+ * required revisions to the plan file instead. Callers keep passing a label for
+ * readability.
+ */
 export const submitThenFinish =
-  (plan: string) =>
+  (_plan: string) =>
   async (c: FakeCapture): Promise<void> => {
-    await c.tools.review_submit_plan.execute(
+    await c.tools.review_submit.execute(
       "1",
       {
-        planMarkdown: plan,
         findings: [HIGH_FINDING],
         verdict: "revise",
-        summary: "aligned",
+        summary: "review submitted",
+        revisions: [
+          { step: "1", change: "Apply the reviewer's required change." },
+        ],
       },
       undefined,
       undefined,
@@ -578,12 +588,11 @@ export const submitThenFinish =
   };
 
 export const submitThenFinishPass2 =
-  (plan: string) =>
+  (_plan: string) =>
   async (c: FakeCapture): Promise<void> => {
-    await c.tools.review_submit_plan.execute(
+    await c.tools.review_submit.execute(
       "3",
       {
-        planMarkdown: plan,
         findings: [],
         verdict: "approve",
         summary: "verified",

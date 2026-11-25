@@ -5,9 +5,9 @@
  *
  *   Plan Mode (main session)  ──plan file──▶  Review Mode (child session)
  *          ▲                                        │
- *          │ feedback                               │ rewrites the plan
+ *          │ feedback                               │ appends advisory notes
  *          │                                        ▼
- *      Plannotator webview  ◀────────────  reviewed plan + change log
+ *      Plannotator webview  ◀─────────  approved plan + reviewer revisions
  *
  * Design rules (see docs/plans/2026-09-18-review-mode-dual-plan.md):
  *
@@ -66,8 +66,6 @@ export const REVIEW_SUBMITTED_ENTRY_TYPE = "workflow-review-submitted";
 
 export type ReviewFallbackOnError = "skip" | "block";
 export type ReviewProviderRecovery = "fallback" | "off";
-export type ReviewChunkedSubmit = "auto" | "off";
-
 /** A reviewer model reference used by the recovery chain or an explicit fallback. */
 export interface ReviewFallbackModel {
   provider: string;
@@ -80,7 +78,7 @@ export interface ReviewModeConfig {
   enabled: boolean;
   /** Max Review↔Plan rounds per user-feedback cycle. */
   rounds: number;
-  /** 1 = review + rewrite only. 2 = review + rewrite, then self-verify. */
+  /** 1 = review + advisory notes only. 2 = review + notes, then self-verify. */
   passes: number;
   /** Run the self-verification pass (only when pass 1 found severity >= 5). */
   verify: boolean;
@@ -96,10 +94,6 @@ export interface ReviewModeConfig {
   providerRetries: number;
   /** Explicit first fallback; the runtime still dedupes and clamps it. */
   fallbackModel?: ReviewFallbackModel;
-  /** Chunked rewrite submission for long plans (default automatic by size). */
-  chunkedSubmit: ReviewChunkedSubmit;
-  /** Max characters per `review_plan_chunk`; also sets the auto threshold. */
-  chunkChars: number;
   /** Overall recovery budget; 0 uses the round deadline. */
   recoveryBudgetMs: number;
   /** Max `review_explore` subagents per review round (cost ceiling). */
@@ -131,8 +125,6 @@ export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   fallbackOnError: "skip",
   providerRecovery: "fallback",
   providerRetries: 1,
-  chunkedSubmit: "auto",
-  chunkChars: 6_000,
   recoveryBudgetMs: 0,
   exploreBudget: 1,
   timeoutMs: 300_000,
@@ -228,8 +220,6 @@ export function buildReviewerAttempts(input: {
 }
 const PROVIDER_RETRIES_MIN = 0;
 const PROVIDER_RETRIES_MAX = 2;
-const CHUNK_CHARS_MIN = 1_000;
-const CHUNK_CHARS_MAX = 20_000;
 const RECOVERY_BUDGET_MIN = 0;
 const RECOVERY_BUDGET_MAX = 3_600_000;
 
@@ -293,10 +283,6 @@ export function coerceReviewModeConfig(
     r.providerRecovery === "off" || r.providerRecovery === "fallback"
       ? r.providerRecovery
       : base.providerRecovery;
-  const chunkedSubmit: ReviewChunkedSubmit =
-    r.chunkedSubmit === "off" || r.chunkedSubmit === "auto"
-      ? r.chunkedSubmit
-      : base.chunkedSubmit;
   const fallbackModel = sanitizeFallbackModel(r.fallbackModel);
   return {
     enabled: asBool(r.enabled, base.enabled),
@@ -312,13 +298,6 @@ export function coerceReviewModeConfig(
       base.providerRetries,
     ),
     ...(fallbackModel ? { fallbackModel } : {}),
-    chunkedSubmit,
-    chunkChars: clampInt(
-      r.chunkChars,
-      CHUNK_CHARS_MIN,
-      CHUNK_CHARS_MAX,
-      base.chunkChars,
-    ),
     recoveryBudgetMs: clampInt(
       r.recoveryBudgetMs,
       RECOVERY_BUDGET_MIN,
@@ -687,9 +666,6 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
           })`
         : ""
     }`,
-    `  chunked submit : ${c.chunkedSubmit}${
-      c.chunkedSubmit === "auto" ? ` (${c.chunkChars} chars/chunk)` : ""
-    }`,
   ];
   if (
     input.timeoutSource !== "default" &&
@@ -873,13 +849,17 @@ export interface ReviewState {
   pass: 1 | 2;
   /** Hash of the plan revision under review (see planHash). */
   planHash: string;
-  /** Plan path being reviewed/rewritten. */
+  /** Plan path being reviewed (the reviewer appends to this file). */
   planPath?: string;
   /** `provider/id` of the reviewer model, for display + provenance. */
   modelLabel: string;
   findings: ReviewFinding[];
   verdict?: ReviewVerdict;
-  /** The rewritten plan, once submitted. */
+  /**
+   * The submitted plan text once submitted: the author's body plus the
+   * `## Reviewer Revisions` appendix. Kept under this name because it is
+   * persisted in review state; the body itself is never rewritten.
+   */
   rewrittenPlan?: string;
   /** Reviewer passes completed in this round. */
   passes: ReviewPassResult[];
@@ -1026,7 +1006,7 @@ export function reviewStateSummary(state: ReviewState | undefined): string {
 /**
  * Outcome of one Plan↔Review round, handed back to the handoff orchestrator.
  *
- * `fallback: true` means "the reviewer did not produce a usable rewrite —
+ * `fallback: true` means "the reviewer did not produce a usable submission —
  * continue with the author's plan" (see config.fallbackOnError).
  */
 export interface ReviewRoundResult {
@@ -1060,8 +1040,14 @@ export type ReviewExecutionOutcome =
 
 /** Result of one `/review`, `/review-resume` or gated handoff execution. */
 export interface ReviewExecutionResult {
-  /** Plan to hand off: the reviewer's rewrite or the author's text. */
+  /** Plan to hand off: the submitted plan text (author body + appendix) or the author's text. */
   planText: string;
+  /**
+   * Which way the round settled. `"rewritten"` is a ROUTING value (it decides
+   * `reviewResumeGateOutcome` and the handoff gate), not a claim that the plan
+   * body changed: a successful append changes the plan text, so it is reached
+   * on every completed round even though the body is untouched.
+   */
   outcome: ReviewExecutionOutcome;
   /** Human-facing reason for paused / aborted / skipped / fallback. */
   reason?: string;
@@ -1097,9 +1083,9 @@ export function reviewResumeSettles(result: ReviewExecutionResult): boolean {
 }
 
 /**
- * Gate outcome for a settled resume. Only a real rewrite counts as reviewed;
- * an unchanged plan, a skip, an abort or a fallback hands off the author's
- * plan. `undefined` means "keep the gate parked" (the round paused again).
+ * Gate outcome for a settled resume. Only a plan that actually changed counts
+ * as reviewed; an unchanged plan, a skip, an abort or a fallback hands off the
+ * author's plan. `undefined` means "keep the gate parked" (the round paused again).
  */
 export function reviewResumeGateOutcome(
   result: ReviewExecutionResult,
@@ -1115,7 +1101,7 @@ export function reviewResumeNotice(result: ReviewExecutionResult): string {
     case "paused":
       return "Review paused again — /review resume to continue, /review abort to stop.";
     case "rewritten":
-      return "Review finished — plan rewritten and saved.";
+      return "Review finished — advisory notes appended.";
     case "unchanged":
       return "Review finished — the reviewer kept the plan as-is.";
     case "aborted":
@@ -1182,10 +1168,10 @@ export type ReviewResumePlanChoice = "fresh" | "warm";
 /**
  * Decide whether a paused review can still be resumed as-is.
  *
- * The plan *file* is not a reliable witness on its own: the reviewer writes its
- * rewrite to that same file during the round (`review_submit`), so after a
- * pause during pass 2 the file no longer matches the text the round started
- * with. Comparing against the hash captured at pause time means only a change
+ * The plan *file* is not a reliable witness on its own: the reviewer appends
+ * its revisions section to that same file during the round (`review_submit`), so
+ * after a pause during pass 2 the file no longer matches the text the round
+ * started with. Comparing against the hash captured at pause time means only a change
  * made **after** the pause — an author edit — starts a fresh round.
  *
  * A missing file (or a snapshot from before this field existed) keeps today's
@@ -1288,7 +1274,7 @@ export interface ApplySubmittedPlanOptions {
   cwd: string;
   /** The plan path Plan Mode chose, absolute or cwd-relative. */
   planPath: string;
-  /** planBody + `## Review changes` appendix (what gets written). */
+  /** planBody + `## Reviewer Revisions` appendix (what gets written). */
   planText: string;
   planBody: string;
   verdict: ReviewVerdict;

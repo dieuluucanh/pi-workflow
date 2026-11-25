@@ -22,6 +22,8 @@ export interface ChildRow {
   ref: string;
   text: string;
   instruction?: string;
+  /** Advisory review notes bound to this row; never requirements or gates. */
+  reviewNotes?: Array<{ id: string; change: string }>;
   workspace?: { id: string; root: string };
 }
 
@@ -223,6 +225,7 @@ export function buildOrchestratorChildSystemPrompt(
     "- Work ONLY on this row. Do not start, resume or manage an Orchestrator run; you are not the coordinator.",
     "- Create your own task-local TODO list with workflow_todo BEFORE the first edit or write. Build mode refuses mutations until that list exists.",
     "- Do not sync or adopt the parent plan's steps. Your list is local to this row.",
+    "- Review notes are advisory: the approved plan is authoritative and wins on conflict.",
     "- Do not ask the user to switch modes or to use /build. You already have full Build tools and policies.",
     "- Do not ask the user questions; if a decision is genuinely ambiguous, choose the safest reasonable assumption and state it in your final summary.",
     "- If a policy forbids a step (for example a commit under `workflow.commitPolicy: never`, or a folder/read/write denial), do not retry it and never mark it completed. Record it as `cancelled` with the policy named in the item text, leave the work uncommitted, and list it under `## Not done` in your final summary.",
@@ -240,8 +243,88 @@ export interface OrchestratorChildKickoffInput {
 
 const MAX_KICKOFF_CHARS = 12_000;
 
+/** Advisory notes are a bounded extra; the hard bound remains the whole kickoff. */
+const MAX_REVIEW_NOTES_BLOCK_CHARS = 2_000;
+const REVIEW_NOTE_FULL_COUNT = 5;
+const REVIEW_NOTE_FULL_CHARS = 400;
+const REVIEW_NOTE_SHORT_CHARS = 120;
+
 function bound(text: string, max = MAX_KICKOFF_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n… (truncated)`;
+}
+
+function clipReviewNote(value: unknown, max: number): string {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+function reviewNoteBullet(note: { id: string; change: string }, max: number): string {
+  return `- ${note.id}: ${clipReviewNote(note.change, max)}`;
+}
+
+/**
+ * Render the advisory review-notes block, or `""` when the row has none.
+ *
+ * The first five notes keep up to 400 characters of change text; later notes
+ * keep their id and up to 120 characters. If that exceeds the 2,000-character
+ * target, the surplus notes collapse into one `… and N more: <ids>` line so an
+ * id is never dropped. Five full 400-character entries can themselves exceed
+ * 2,000, in which case the ids still win and the whole-kickoff bound applies.
+ */
+function buildReviewNotesSection(
+  notes: readonly { id: string; change: string }[] | undefined,
+): string {
+  if (!notes || notes.length === 0) return "";
+  const normalized = notes
+    .map((note) => ({
+      id: String(note.id ?? "").trim(),
+      change: String(note.change ?? ""),
+    }))
+    .filter((note) => note.id.length > 0);
+  if (normalized.length === 0) return "";
+
+  const header = [
+    "## Review notes (advisory)",
+    "The approved plan is authoritative. Apply a note when it is consistent with the row. If a note conflicts with the plan or the row, follow the plan and record the conflict.",
+  ].join("\n");
+  const full = normalized
+    .slice(0, REVIEW_NOTE_FULL_COUNT)
+    .map((note) => reviewNoteBullet(note, REVIEW_NOTE_FULL_CHARS));
+  const rest = normalized.slice(REVIEW_NOTE_FULL_COUNT);
+  if (rest.length === 0) return [header, ...full].join("\n");
+
+  const short = rest.map((note) =>
+    reviewNoteBullet(note, REVIEW_NOTE_SHORT_CHARS),
+  );
+  const withAll = [header, ...full, ...short].join("\n");
+  if (withAll.length <= MAX_REVIEW_NOTES_BLOCK_CHARS) return withAll;
+
+  const candidate = (keep: number): string => {
+    const omitted = rest.slice(keep);
+    const lines = [header, ...full, ...short.slice(0, keep)];
+    if (omitted.length > 0) {
+      lines.push(`… and ${omitted.length} more: ${omitted.map((note) => note.id).join(", ")}`);
+    }
+    return lines.join("\n");
+  };
+  // Keep as many shortened bullets as fit beside the id-only overflow line.
+  // Length grows monotonically with `keep`, so binary search the largest fit.
+  let low = 0;
+  let high = short.length - 1;
+  let best: string | undefined;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const rendered = candidate(middle);
+    if (rendered.length <= MAX_REVIEW_NOTES_BLOCK_CHARS) {
+      best = rendered;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best ?? candidate(0);
 }
 
 /**
@@ -263,6 +346,7 @@ export function buildOrchestratorChildKickoff(
   const instruction = row.instruction?.trim()
     ? ["## Parent instructions", row.instruction.trim(), ""].join("\n")
     : "";
+  const reviewNotes = buildReviewNotesSection(row.reviewNotes);
   const repair = input.repair?.trim()
     ? [
         "",
@@ -284,13 +368,14 @@ export function buildOrchestratorChildKickoff(
       "## Your row",
       row.text,
       "",
+      ...(reviewNotes ? [reviewNotes, ""] : []),
       instruction,
       workspace,
       "## Protocol",
       "1. Create your task-local TODO list now with `workflow_todo` — one item per real sub-step. Mutations are refused until it exists.",
       "2. Work the list in order. Mark a step completed immediately; keep one in progress.",
       "3. Run the verification the row or the plan names, then say exactly what you ran and what it printed.",
-      "4. Stop and answer with a concise summary: what changed, files touched, checks run with their real result, and every step you did NOT complete with the reason (policy or otherwise). The parent branches on it.",
+      "4. Stop and answer with a concise summary: what changed, files touched, checks run with their real result, and every step you did NOT complete with the reason (policy or otherwise). End the summary with a `## Review notes` section listing every note id as `applied`, `not applicable — <why>`, or `conflicts with the plan — followed the plan`. A note whose text was shortened is still acknowledged by id. The parent branches on it.",
       "",
       "When a policy forbids a step, do not retry it and never mark it completed: mark it `cancelled` with the policy named in the item text, leave the work uncommitted, and list it under `## Not done` in your final summary.",
       "",

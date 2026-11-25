@@ -13,7 +13,8 @@
  *                       no rm/mv/cp, no sudo, no installs, no sed/awk, no git
  *                       mutations; test/lint/typecheck runners are allowed)
  *   review_explore      read-only subagents, capped by exploreBudget
- *   review_submit_plan  the single write path: writes the reviewed plan
+ *   review_submit       the single write path: appends the reviewer's findings
+ *                       and required revisions as an advisory appendix
  *   review_pass_done    ends a pass with a verdict (no side effects)
  *
  * Note: the reviewer is NOT given the built-in `bash`, `edit`, or `write`
@@ -23,8 +24,10 @@
 
 import { Type, type TSchema } from "typebox";
 import {
+    renderRequiredChanges,
     renderReviewChangelog,
     type ReviewFinding,
+    type ReviewRevision,
 } from "./utils.ts";
 import { explainCommandRefusal } from "./permissions.ts";
 import { analyzeShellPaths } from "./shell-paths.ts";
@@ -159,7 +162,7 @@ export function createReviewBashTool(
         name: "review_bash",
         label: "Review Bash (read-only)",
         description:
-            "Run a READ-ONLY or VERIFY shell command to inspect and check the repository (git log/diff/status/show-ref, ls, cat, rg, npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo clippy). Mutating commands — file redirects (> and >>), sed/awk, rm, mv, cp, chmod, sudo, package installs/builds, git add/commit/push — are refused by the harness; `2>/dev/null` and `2>&1` are allowed. You cannot write files with this tool; use review_submit_plan to submit the revised plan.",
+            "Run a READ-ONLY or VERIFY shell command to inspect and check the repository (git log/diff/status/show-ref, ls, cat, rg, npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo clippy). Mutating commands — file redirects (> and >>), sed/awk, rm, mv, cp, chmod, sudo, package installs/builds, git add/commit/push — are refused by the harness; `2>/dev/null` and `2>&1` are allowed. You cannot write files with this tool; use review_submit to record your findings and required revisions.",
         parameters: inner.parameters,
         async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
             // SAFETY: Pi invokes ToolDefinition.execute as
@@ -209,7 +212,9 @@ export function createReviewBashTool(
                                 "the allowlist; no rm/mv/cp/mkdir/touch/chmod, no sudo, no package installs",
                                 "or builds, no git add/commit/push/checkout. Do not work around this.",
                                 "",
-                                "If you need to change the plan, call review_submit_plan.",
+                                "If you need to change the plan, call review_submit with your findings",
+                                "and required revisions — it appends an advisory section and leaves the",
+                                "approved plan body untouched.",
                             ]
                                 .filter(Boolean)
                                 .join("\n"),
@@ -554,13 +559,13 @@ export interface ReviewToolDeps {
     };
 }
 
-// ── Steps 9-11: review_submit_plan ───────────────────────────────────
+// ── Steps 9-11: review_submit ───────────────────────────────────────
 
 /** What the reviewer handed in, after validation. */
 export interface ReviewSubmitPayload {
-    /** The reviewer's plan body, without the changelog appendix. */
+    /** The author's plan body, unchanged (no reviewer appendix). */
     planBody: string;
-    /** planBody + the generated `## Review changes` appendix (what gets written). */
+    /** planBody + the generated `## Reviewer Revisions` appendix (what gets written). */
     planText: string;
     findings: ReviewFinding[];
     verdict: ReviewVerdict;
@@ -572,41 +577,22 @@ export interface ReviewSubmitPayload {
 
 export interface ReviewSubmitDeps {
     /**
-     * The plan path Plan Mode computed. Review Mode adjusts that file; it never
-     * invents a new slug (utils.normalizePlanPath owns the naming convention).
+     * The plan path Plan Mode computed. Review Mode appends to that file; it
+     * never invents a new slug (utils.normalizePlanPath owns the convention).
      */
     planPath: () => string | undefined;
-    /** The author's current plan — the validation baseline and changelog base. */
+    /** The author's current plan — the append base (pass 2 strips the prior section). */
     originalPlan: () => string | undefined;
     /** Reviewer model label, recorded in the changelog header. */
     modelLabel: () => string;
     /** Current review round, recorded in the section heading. */
     round?: () => number;
-    /** Persist the reviewed plan and announce it. Owned by the parent. */
+    /** Persist the appended plan text and announce it. Owned by the parent. */
     submit: (
         payload: ReviewSubmitPayload,
     ) => Promise<{ ok: boolean; path?: string; error?: string }>;
-    /** Chunked submission is optional so older callers/tests keep working. */
-    beginPlan?: (totalChunks?: number) => {
-        ok: boolean;
-        error?: string;
-        maxChunkChars?: number;
-    };
-    appendPlanChunk?: (index: number, content: string) => {
-        ok: boolean;
-        error?: string;
-        received?: number;
-        nextIndex?: number;
-        totalChars?: number;
-    };
-    takeAssembledPlan?: () => string | undefined;
-    resetPlan?: () => void;
-    /** Max characters accepted per chunk (default 6000). */
-    maxChunkChars?: number;
     log: (message: string, level?: "info" | "warning" | "error") => void;
 }
-
-const DEFAULT_MAX_CHUNK_CHARS = 6_000;
 
 /**
  * Remove a previously appended `## Reviewer Revisions (round N)` section.
@@ -666,215 +652,20 @@ const FINDING_SCHEMA = Type.Object({
 });
 
 /**
- * `review_plan_begin` — start a chunked rewrite submission.
- *
- * Long plan rewrites can outlive a gateway's stream duration. This resets the
- * assembler; the reviewer then sends ordered chunks and finalises through
- * `review_submit_plan` (with no `planMarkdown`). The single-shot path remains.
- */
-export function createReviewPlanBeginTool(deps: ReviewSubmitDeps): {
-    name: string;
-    label: string;
-    description: string;
-    parameters: TSchema;
-    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
-} {
-    return {
-        name: "review_plan_begin",
-        label: "Begin Chunked Plan",
-        description:
-            "Start submitting the revised plan in ordered chunks. Use this when the plan is too long for one response, then call review_plan_chunk for each part and review_submit_plan (without planMarkdown) to finalise.",
-        parameters: Type.Object({
-            totalChunks: Type.Optional(
-                Type.Number({
-                    description:
-                        "How many chunks you intend to send. Optional; helps the harness report progress.",
-                }),
-            ),
-        }),
-        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
-            // SAFETY: Pi calls every tool `execute(toolCallId, params, …)`,
-            // so index 1 is the model-supplied params object. This tool's
-            // schema declares `totalChunks`, which is narrowed below before
-            // use — nothing else is read off the value.
-            const [, rawParams] = args as unknown as [
-                string,
-                { totalChunks?: unknown },
-            ];
-            if (!deps.beginPlan) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "review_plan_begin: chunked submission is unavailable in this round; use review_submit_plan with the complete planMarkdown instead.",
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const totalChunks =
-                typeof rawParams?.totalChunks === "number" &&
-                Number.isInteger(rawParams.totalChunks) &&
-                rawParams.totalChunks > 0
-                    ? rawParams.totalChunks
-                    : undefined;
-            const result = deps.beginPlan(totalChunks);
-            if (!result.ok) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `review_plan_begin: ${result.error ?? "could not start chunked submission"}`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const maxChunkChars =
-                result.maxChunkChars ?? deps.maxChunkChars ?? DEFAULT_MAX_CHUNK_CHARS;
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: [
-                            "review_plan_begin: ready.",
-                            `Send the plan in order with review_plan_chunk (max ${maxChunkChars} characters per chunk).`,
-                            "After the last chunk, call review_plan_finalize (or review_submit_plan without planMarkdown).",
-                        ].join("\n"),
-                    },
-                ],
-                details: { totalChunks, maxChunkChars },
-            };
-        },
-    };
-}
-
-/** `review_plan_chunk` — append one ordered part of the rewrite. */
-export function createReviewPlanChunkTool(deps: ReviewSubmitDeps): {
-    name: string;
-    label: string;
-    description: string;
-    parameters: TSchema;
-    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
-} {
-    return {
-        name: "review_plan_chunk",
-        label: "Append Plan Chunk",
-        description:
-            "Append one ordered chunk of the revised plan. Start with review_plan_begin, send index 1, 2, … without skipping or repeating, then finalise with review_submit_plan (no planMarkdown).",
-        parameters: Type.Object({
-            index: Type.Number({
-                description: "1-based chunk index. Must be the next expected index.",
-            }),
-            content: Type.String({
-                description:
-                    "The chunk's markdown. Do not repeat earlier chunks or add a Review changes section.",
-            }),
-        }),
-        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
-            // SAFETY: Pi calls every tool `execute(toolCallId, params, …)`,
-            // so index 1 is the model-supplied params object. `index` and
-            // `content` are narrowed below before use.
-            const [, rawParams] = args as unknown as [
-                string,
-                { index?: unknown; content?: unknown },
-            ];
-            const index =
-                typeof rawParams?.index === "number" ? rawParams.index : NaN;
-            if (!Number.isInteger(index) || index < 1) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "review_plan_chunk: index must be a positive integer.",
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const content =
-                typeof rawParams?.content === "string" ? rawParams.content : "";
-            if (!content) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "review_plan_chunk: content is empty.",
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const maxChunkChars = deps.maxChunkChars ?? DEFAULT_MAX_CHUNK_CHARS;
-            if (content.length > maxChunkChars) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `review_plan_chunk: chunk ${index} is ${content.length} characters; the limit is ${maxChunkChars}. Split it and resend.`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            if (!deps.appendPlanChunk) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "review_plan_chunk: chunked submission is unavailable in this round; use review_submit_plan with the complete planMarkdown instead.",
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const result = deps.appendPlanChunk(index, content);
-            if (!result.ok) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `review_plan_chunk: ${result.error ?? "chunk rejected"}`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            const nextIndex = result.nextIndex ?? index + 1;
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: [
-                            `review_plan_chunk: accepted chunk ${index}.`,
-                            `received ${result.received ?? index} chunk(s), ${result.totalChars ?? content.length} characters so far.`,
-                            `Next expected index: ${nextIndex}. When done, call review_submit_plan without planMarkdown.`,
-                        ].join("\n"),
-                    },
-                ],
-                details: {
-                    index,
-                    nextIndex,
-                    totalChars: result.totalChars ?? content.length,
-                },
-            };
-        },
-    };
-}
-
-/**
- * `review_submit_plan` — the ONLY write path for Review Mode.
+ * `review_submit` — the ONLY write path for Review Mode, and it is append-only.
  *
  * Three things happen here, in order, and nothing is written unless all three
  * pass:
  *
- *  1. (step 10) Validate the submission against the author's plan. A stub or a
- *     heading-less blob is rejected and returned to the reviewer to fix, so a
- *     degenerate rewrite can never silently replace a real plan.
- *  2. (step 11) Compose the changelog and append it, so the user can see
- *     exactly what the reviewer changed and why.
- *  3. (steps 12-13) Hand the composed plan to the parent, which writes it to the
- *     SAME plan path Plan Mode chose and records an entry.
+ *  1. (step 10) Validate the submission: the round must know a plan path and the
+ *     author's plan body must be non-empty, otherwise the reviewer is told to
+ *     report the failure instead of writing.
+ *  2. (step 11) Render the advisory `## Reviewer Revisions (round N)` appendix
+ *     (findings, verdict, summary, required revisions) and append it to the
+ *     author's plan body. Any earlier revisions section is stripped first, so a
+ *     round always leaves exactly one and the body itself is never rewritten.
+ *  3. (steps 12-13) Hand the appended plan text to the parent, which writes it to
+ *     the SAME plan path Plan Mode chose and records an entry.
  */
 export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
     name: string;
@@ -900,6 +691,12 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
             revisions: Type.Optional(
                 Type.Array(
                     Type.Object({
+                        id: Type.Optional(
+                            Type.String({
+                                description:
+                                    "Stable id, e.g. R1. Optional — the harness assigns R1..Rn when omitted.",
+                            }),
+                        ),
                         step: Type.Optional(
                             Type.String({
                                 description:
@@ -910,6 +707,12 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                             description:
                                 "The concrete revision the author must make.",
                         }),
+                        findingIds: Type.Optional(
+                            Type.Array(Type.String(), {
+                                description:
+                                    "Finding ids this revision addresses, e.g. ['F1', 'F3']. Optional.",
+                            }),
+                        ),
                     }),
                     {
                         description:
@@ -941,33 +744,7 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                     ? rawParams.summary.trim()
                     : "";
             const findings = sanitizeFindings(rawParams?.findings);
-            const revisions = Array.isArray(rawParams?.revisions)
-                ? rawParams.revisions
-                      .map((entry) => {
-                          if (!entry || typeof entry !== "object") return undefined;
-                          const record = entry as {
-                              step?: unknown;
-                              change?: unknown;
-                          };
-                          const change =
-                              typeof record.change === "string"
-                                  ? record.change.trim()
-                                  : "";
-                          if (!change) return undefined;
-                          const step =
-                              typeof record.step === "string" &&
-                              record.step.trim()
-                                  ? record.step.trim()
-                                  : undefined;
-                          return step ? { step, change } : { change };
-                      })
-                      .filter(
-                          (
-                              entry,
-                          ): entry is { step?: string; change: string } =>
-                              entry !== undefined,
-                      )
-                : [];
+            const revisions = normalizeRevisions(rawParams?.revisions);
 
             // Pass 2 resubmits against a plan file that already carries pass 1's
             // revisions section: strip it so the round's section is replaced,
@@ -1070,13 +847,57 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
     };
 }
 
+const REVIEW_ADVISORY_LINE =
+    "_Advisory review notes. The approved plan body is authoritative on any conflict._";
+
+/**
+ * Normalise the model's revisions: drop entries without a change, trim strings,
+ * and assign `R1..Rn` in submission order whenever an id is missing, so the
+ * model cannot produce an id-less note.
+ */
+function normalizeRevisions(raw: unknown): ReviewRevision[] {
+    if (!Array.isArray(raw)) return [];
+    const out: ReviewRevision[] = [];
+    for (const entry of raw) {
+        if (!entry || typeof entry !== "object") continue;
+        const record = entry as {
+            id?: unknown;
+            step?: unknown;
+            change?: unknown;
+            findingIds?: unknown;
+        };
+        const change =
+            typeof record.change === "string" ? record.change.trim() : "";
+        if (!change) continue;
+        const revision: ReviewRevision = {
+            id:
+                typeof record.id === "string" && record.id.trim()
+                    ? record.id.trim()
+                    : `R${out.length + 1}`,
+            change,
+        };
+        if (typeof record.step === "string" && record.step.trim()) {
+            revision.step = record.step.trim();
+        }
+        if (Array.isArray(record.findingIds)) {
+            const findingIds = record.findingIds
+                .filter((value): value is string => typeof value === "string")
+                .map((value) => value.trim())
+                .filter(Boolean);
+            if (findingIds.length > 0) revision.findingIds = findingIds;
+        }
+        out.push(revision);
+    }
+    return out;
+}
+
 function renderReviewerRevisions(
     findings: ReviewFinding[],
     meta: {
         modelLabel?: string;
         verdict: ReviewVerdict;
         summary: string;
-        revisions: Array<{ step?: string; change: string }>;
+        revisions: ReviewRevision[];
         round: number;
     },
 ): string {
@@ -1086,87 +907,17 @@ function renderReviewerRevisions(
     });
     const lines = [
         `## Reviewer Revisions (round ${meta.round})`,
+        REVIEW_ADVISORY_LINE,
         "",
         meta.modelLabel ? `Reviewer: \`${meta.modelLabel}\`` : "",
         `Verdict: **${meta.verdict}**`,
         meta.summary ? `Summary: ${meta.summary}` : "",
         "",
     ].filter(Boolean);
-    if (meta.revisions.length > 0) {
-        lines.push("### Required changes", "");
-        for (const revision of meta.revisions) {
-            lines.push(
-                `- ${revision.step ? `**Step ${revision.step}:** ` : ""}${revision.change}`,
-            );
-        }
-        lines.push("");
-    }
+    const required = renderRequiredChanges(meta.revisions);
+    if (required) lines.push(required, "");
     lines.push(body.trimEnd());
     return lines.join("\n").trimEnd();
-}
-
-// ── Step 17: review_plan_finalize ────────────────────────────────────
-
-/**
- * `review_plan_finalize` — finalise a chunked rewrite.
- *
- * The chunks were accepted by `review_plan_chunk`; this is the step that turns
- * them into the plan file. It delegates to the SAME `review_submit_plan`
- * funnel, so `writePlan` stays the only writer and `notifySubmitted` fires once.
- */
-export function createReviewPlanFinalizeTool(deps: ReviewSubmitDeps): {
-    name: string;
-    label: string;
-    description: string;
-    parameters: TSchema;
-    execute: (...args: unknown[]) => Promise<ReviewToolTextResult>;
-} {
-    const submit = createReviewSubmitTool(deps);
-    return {
-        name: "review_plan_finalize",
-        label: "Finalize Chunked Plan",
-        description:
-            "Finalise the plan you sent with review_plan_begin + review_plan_chunk. The assembled chunks become the plan body; the findings and verdict are recorded exactly as review_submit_plan would. Refuses an incomplete assembly — send the missing chunks first.",
-        parameters: Type.Object({
-            findings: Type.Array(FINDING_SCHEMA, {
-                description:
-                    "Every issue you found. Use an empty array if the plan is sound and you are submitting it unchanged.",
-            }),
-            verdict: VERDICT_SCHEMA,
-            summary: Type.String({
-                description: "One sentence describing what you changed.",
-            }),
-        }),
-        async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
-            const [toolCallId, rawParams, ...rest] = args as [
-                string,
-                Record<string, unknown>,
-                ...unknown[],
-            ];
-            let assembled: string | undefined;
-            try {
-                assembled = deps.takeAssembledPlan?.();
-            } catch {
-                assembled = undefined;
-            }
-            if (!assembled || !assembled.trim()) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "review_plan_finalize: no complete plan to finalise. Call review_plan_begin, send every chunk with review_plan_chunk (watch the expected next index), then finalise.",
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-            return submit.execute(
-                toolCallId,
-                { ...(rawParams ?? {}) },
-                ...rest,
-            );
-        },
-    };
 }
 
 // ── Step 15: review_pass_done ────────────────────────────────────────
@@ -1290,7 +1041,7 @@ export function createReviewPassDoneTool(deps: ReviewPassDoneDeps): {
                     {
                         type: "text",
                         text: deps.willVerify()
-                            ? "review_pass_done: pass 1 recorded. A verification pass is scheduled — wait for the harness to prompt you, then confirm the rewrite addressed each finding and dropped no original content."
+                            ? "review_pass_done: pass 1 recorded. A verification pass is scheduled — wait for the harness to prompt you, then confirm the required revisions still address each finding without contradicting the approved plan body."
                             : `review_pass_done: pass ${pass} recorded (${verdict}, ${findings.length} finding${findings.length === 1 ? "" : "s"}). Your review is complete.`,
                     },
                 ],
@@ -1374,9 +1125,6 @@ export function createReviewTools(
     unavailable.push(...guarded.unavailable);
 
     tools.push(createReviewExploreTool(deps.explore));
-    tools.push(createReviewPlanBeginTool(deps.submit));
-    tools.push(createReviewPlanChunkTool(deps.submit));
-    tools.push(createReviewPlanFinalizeTool(deps.submit));
     tools.push(createReviewSubmitTool(deps.submit));
     tools.push(createReviewPassDoneTool(deps.passDone));
 

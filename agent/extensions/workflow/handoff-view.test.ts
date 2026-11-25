@@ -111,6 +111,55 @@ test("buildHandoffQuestion pluralizes and omits missing detail", () => {
   assert.ok(!String(bare.context).includes("Review:"));
 });
 
+test("buildHandoffQuestion pluralizes and omits a non-positive note count", () => {
+  const two = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "revise",
+    findingCount: 2,
+    revisionCount: 2,
+  });
+  assert.ok(
+    String(two.context).includes("Review: revise · 2 findings · 2 notes"),
+    "the advisory note count sits on the existing Review line",
+  );
+
+  const one = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+    revisionCount: 1,
+  });
+  assert.ok(
+    String(one.context).includes("Review: approve · 3 findings · 1 note"),
+  );
+  assert.ok(!String(one.context).includes("1 notes"));
+
+  const zero = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+    revisionCount: 0,
+  });
+  assert.match(
+    String(zero.context),
+    /Review: approve · 3 findings$/m,
+    "0 notes must not be printed",
+  );
+  assert.doesNotMatch(String(zero.context), /\d+ notes?\b/);
+
+  const missing = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+  });
+  assert.match(String(missing.context), /Review: approve · 3 findings$/m);
+  assert.doesNotMatch(String(missing.context), /\d+ notes?\b/);
+});
+
 test("handoffReasonLabel covers every reason", () => {
   const reasons = [
     "reviewed",

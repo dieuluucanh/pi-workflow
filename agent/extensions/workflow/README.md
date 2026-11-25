@@ -180,6 +180,18 @@ short Plan → Review → Build work keeps its current behavior.
 - **Cross-repo work is multiple rows.** One row, one root. `cwd` is a declared
   alias or an absolute path inside a declared root; an unknown or ambiguous
   root is refused rather than guessed.
+- **Review notes are advisory.** When the approved plan carries a
+  `## Reviewer Revisions (round N)` appendix, the harness parses its
+  `### Required changes` lines into notes with stable `R<n>` ids and attaches
+  them to rows. Binding is count-gated: a note is bound to a row only when the
+  plan's numbered step count matches the model's row count; otherwise every
+  note stays unbound and the mission asks the parent to place it, never guesses.
+  Each bound row's child kickoff carries a `## Review notes (advisory)` block,
+  the child must acknowledge every id in its final summary (`applied`,
+  `not applicable — <why>`, or `conflicts with the plan — followed the plan`),
+  and the parent reports each conflict with the row ref and the child's reason.
+  **The approved plan wins on any conflict**; a note is never a requirement, a
+  gate or an acceptance criterion.
 
 ### Host contract
 
@@ -519,7 +531,7 @@ Plan Mode (main session) ──plan file──▶ Review Mode (child session, ga
 - **Feedback** → Plan revises, Review re-reviews the revision, Plannotator reopens.
 - **A broken Plannotator is never a dead end.** Every handoff path (automatic, `/review`, `/review resume`, a closed browser tab) falls back to the workflow's own questionnaire: the plan is appended to the transcript (scroll up to read it), and `Approve plan (choose execution next)` / `Give feedback (stay in Plan)` / `Skip for now (stay in Plan)` are pinned at the bottom. The fallback keeps the SAME handoff record, so its identity and recommendation survive; a late browser event cannot act on the native decision.
 - **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with direct Build and Orchestrator as equal options, plus *Decide later*. No destination is saved or recommended. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build sends one execute turn in this session; Orchestrator freezes the plan into one TODO row per step and starts the first visible Build child immediately.
-- **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit_plan` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the round. `timeoutMs` defaults to **5 minutes**; set `0` to opt out into unlimited, and a pass that outlives the cap is aborted — though a plan submitted before the deadline is always kept.
+- **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the round. `timeoutMs` defaults to **5 minutes**; set `0` to opt out into unlimited, and a pass that outlives the cap is aborted — though a plan submitted before the deadline is always kept.
 
 ### Enabling
 
@@ -575,10 +587,7 @@ Plan Mode and Review Mode share one role-based command policy (`permissions.ts`)
 | `read`, `grep`, `find`, `ls` | Inspect the repository |
 | `review_bash` | Shell access on the same role policy Plan Mode uses: read-only inspection plus **test/lint/typecheck** runners (`npm test`, `npm run lint/typecheck`, `eslint`, `tsc --noEmit`, `node --test`, `pytest`, `cargo clippy`, …). No file redirects (`2>/dev/null` and `2>&1` are allowed), no `sed`/`awk`, no `rm`/`mv`/`cp`/`mkdir`/`touch`, no `sudo`, no package installs, no builds, no `git add/commit/push` |
 | `review_explore` | Read-only reconnaissance subagents on the **explorer** role's model, capped by `exploreBudget` per round |
-| `review_plan_begin` | Starts a **chunked** rewrite: resets the per-round assembler and states the per-chunk size limit |
-| `review_plan_chunk` | Appends one ordered chunk of the rewrite (`index` 1, 2, 3, …). Out-of-order, repeated or oversized chunks are refused with the index that is expected next |
-| `review_plan_finalize` | Turns the accepted chunks into the plan. Refuses an incomplete assembly; goes through the same `review_submit_plan` funnel, so the plan is written exactly once |
-| `review_submit_plan` | The **only** write path: validates and saves the revised plan to Plan Mode's own `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md` (an existing plan keeps its name). Also the one-shot path for short plans |
+| `review_submit` | The **only** write path, and it is append-only: one call carries the findings, verdict, summary and required revisions, and the harness appends a single `## Reviewer Revisions (round N)` section to Plan Mode's own `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md` (an existing plan keeps its name). The plan body is never modified |
 | `review_pass_done` | Ends a pass with a verdict (refused if nothing was submitted) |
 
 The policy classifies commands into three classes and maps them to roles:
@@ -586,7 +595,7 @@ The policy classifies commands into three classes and maps them to roles:
 | Role | Command class | Write tools | Used by |
 | --- | --- | --- | --- |
 | planner | read-only + verify | `.pi/plans/` only | Plan Mode |
-| reviewer | read-only + verify | `review_submit_plan` only | Review Mode |
+| reviewer | read-only + verify | `review_submit` only | Review Mode |
 | explorer | read-only | none | `explore` / `review_explore` subagents |
 | builder | full (unrestricted) | all | Build Mode / normal sessions |
 
@@ -598,30 +607,65 @@ Compound commands are checked segment-by-segment, and each check reads the view 
 
 The built-in `bash`, `edit` and `write` tools are never given to the reviewer at all.
 
-### One append-only submission
+### Advisory revisions (append-only)
 
-The reviewer submits findings, a verdict and a summary in one call; the
-harness appends a `## Reviewer Revisions (round N)` section and preserves the
-original plan body. The chunked `review_plan_begin`/`chunk`/`finalize` write
-path and the `replacement-body` submission are gone.
+The reviewer submits findings, a verdict, a summary and required revisions in
+one `review_submit` call. The harness appends **one**
+`## Reviewer Revisions (round N)` section to the plan file and **the plan body
+is never modified** — the appendix is the review's durable record, not the
+plan's text. There is no diff of the plan and no apply/keep choice at the
+handoff: the plan is printed as the author wrote it, plus the review's note
+count.
+
+Each required change carries a stable id and, when it answers known findings,
+those finding ids, so a note is addressable across the handoff:
+
+```markdown
+### Required changes
+
+- **R2 · Step 3:** Count the plan's numbered steps before binding notes _(F1)_
+```
+
+Ids are normalised to `R1..Rn` in submission order when the model omits them, so
+every note is addressable. The appendix is **reference, not authority**: the
+approved plan body wins on any conflict.
+
+That precedence is stated wherever the notes are consumed:
+
+- The Orchestrator carries the notes with the run's mission, binds each note to
+  the matching row by numeric step (and leaves it unbound and surfaced to the
+  parent when the plan's step count and the row count do not align), and each
+  bound row's child kickoff carries a `## Review notes (advisory)` block.
+- The Build child acknowledges every note id in its final summary as `applied`,
+  `not applicable — <why>`, or `conflicts with the plan — followed the plan`.
+- The Orchestrator reports every note a child reported as conflicting, with the
+  row ref and the child's reason — so a note is never silently dropped.
+
+Nothing in the pipeline treats a note as a requirement, a gate or an acceptance
+criterion. A note that requires a step change still goes back to Plan through
+the handoff's Feedback path; the reviewer has no write path into the body.
 
 A pass-2 resubmission **replaces** that round's `## Reviewer Revisions (round N)`
-section instead of stacking a second one, and the original plan body is still
-preserved — so `planHash` stays the author's body across both passes.
+section instead of stacking a second one. The chunked `review_plan_begin` /
+`review_plan_chunk` / `review_plan_finalize` write path, the assembled-body
+submission and the `chunkedSubmit`/`chunkChars` settings are removed: there is
+no body rewrite left to configure. `planHash` still covers the author's body
+plus the appendix, so the same body with the same appendix hashes identically.
 
 ### Two passes
 
-1. **Review** — audits the plan against the repository and the guidance, records findings, and submits the required revisions (append-only).
-2. **Self-verify** — re-reads the original and the appended revisions, confirms every `accepted` finding appears as a concrete revision, checks that nothing was dropped or weakened, and runs the named **over-engineering check**: do the revisions add layers, abstractions, configuration flags, dependencies, phases or steps the requirements do not need?
+1. **Review** — audits the plan against the repository and the guidance, records findings, and submits the required revisions as advisory notes in the `## Reviewer Revisions` appendix (append-only; the body is untouched).
+2. **Self-verify** — re-reads the author's plan and the appendix it just wrote, confirms every `accepted` finding appears as a concrete note, checks that nothing was dropped or weakened, and runs the named **over-engineering check**: do the notes add layers, abstractions, configuration flags, dependencies, phases or steps the requirements do not need? It never rewrites the plan body — its only output is a corrected appendix.
 
-Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews keep pass 1's section as-is. When pass 2 runs it checks a **unified diff** of the revisions (not two full plans), so the self-check costs roughly a tenth of the tokens.
+Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews keep pass 1's appendix as-is, and those notes are simply not self-verified (accepted, because they are advisory). When pass 2 runs it checks a **unified diff** of the appended revisions (not two full plans), so the self-check costs roughly a tenth of the tokens.
 
-### Every change is visible
+### Every finding is visible
 
-A `## Review changes` appendix is appended to the plan automatically (the reviewer is told not to write it), grouped by tier with file:line, severity, confidence and rationale:
+The harness renders a findings changelog **inside** that appendix (the reviewer is told not to write it), grouped by tier with file:line, severity, confidence and rationale:
 
 ```markdown
-## Review changes
+## Reviewer Revisions (round 1)
+…
 
 reviewer `opencode-go/muse-spark-1.3-contributor` · verdict **revise**
 
@@ -653,7 +697,7 @@ Mode changes are reported by Pi's **footer status** (`⏸ plan` / `▶ build`, p
 | `▌ REVIEW PAUSED` | warning | The round stopped for a pause — `/review resume` continues it, `/review abort` discards it |
 | action headers | muted | One line per reviewer tool call with its key argument (`▸ read src/app.ts`, `▸ review_bash: git log -5`). Assistant prose and thinking are not streamed, so the transcript stays close to Plan Mode's; status lines are muted |
 | `▌ REVIEW DONE` | success / warning | Round finished, with the verdict or the fallback reason |
-| `▌ REVIEW SUMMARY` | success / warning | The submitted plan's verdict, plan path and findings (severity-colored) |
+| `▌ REVIEW SUMMARY` | success / warning | The round's verdict, plan path and findings (severity-colored) |
 
 These are **display-only custom entries** (`pi.appendEntry` + `pi.registerEntryRenderer`): they are durable in the transcript and survive `/reload`, but they never enter the LLM context, so Plan Mode and Build Mode cannot see the reviewer's work. Consecutive identical bands are suppressed (the gate is seeded from the newest band on reload, and a resumed/paused band is never treated as identical to the band it follows), so cycling modes or re-running a review cannot grow the transcript. Long reviews are coalesced (flushed roughly every 400 ms, and always flushed before a band) and capped, with a one-line notice pointing at `/review status` when output is truncated.
 
@@ -692,7 +736,7 @@ A paused review is in-memory and belongs to the cycle that recorded it: it canno
 - **A plain handoff is not Review.** When Review Mode is off (or a manual cycle is not involved), finishing Plan opens the plan handoff as a Plan sub-state (`⏸ plan — handoff pending`, never `🔍 review`). Modes and prompts stay free; switching mode or typing a new prompt supersedes the handoff, and a late browser approve/deny is ignored. The plan is always printed into the transcript, so a browser tab that cannot render is never the only copy. `/handoff fallback` converts the pending browser decision to the native questionnaire without changing `workflow.handoff`; `/review mode off` does the same downgrade while disabling automatic review.
 - **ESC** pauses the round **everywhere it is active** — while the gated handoff waits, while a manual round runs, with no prompt on screen at all. One long-lived terminal listener maps it to `/review pause` semantics (warm session kept) and stays registered through the paused window: a second ESC while a gated review is paused is swallowed with a hint instead of aborting the parked plan turn (that abort used to poison the turn's signal and stall every `/review resume`). With no review owning the turn it passes ESC through, so the editor and questionnaire keep it. Headless/RPC hosts have no listener and keep `/review abort` as their stop path.
 - `/review pause` is the same pause as a command. Pausing mid-handoff does **not** render the handoff — the gate stays open until you resume or abort.
-- `/review resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result. A resumed round is **running** again — the notice/footer return to the running form, and a second ESC can pause it. It runs on a fresh controller and deliberately does **not** inherit the parked turn's signal, so an interrupted parent turn cannot instantly re-abort every resume; ESC, `/review pause` and `/review abort` are its stop paths. The transcript says so explicitly (`▌ REVIEW MODE  resumed · round N · model` followed by `reviewer resumed`). A rewrite the reviewer wrote to the plan file before the pause is **not** mistaken for an edit of yours: resume compares the file against a hash snapshot taken at pause time (refreshed when the round settles), so only a change made after the pause starts a fresh round. Its notice names the real outcome (rewritten, unchanged, paused, aborted, skipped or fallback).
+- `/review resume` continues the paused round on the warm session (or starts a fresh round if the plan changed since the pause), and settles the waiting handoff with the result. A resumed round is **running** again — the notice/footer return to the running form, and a second ESC can pause it. It runs on a fresh controller and deliberately does **not** inherit the parked turn's signal, so an interrupted parent turn cannot instantly re-abort every resume; ESC, `/review pause` and `/review abort` are its stop paths. The transcript says so explicitly (`▌ REVIEW MODE  resumed · round N · model` followed by `reviewer resumed`). An appendix the reviewer appended to the plan file before the pause is **not** mistaken for an edit of yours: resume compares the file against a hash snapshot taken at pause time (refreshed when the round settles), so only a change made after the pause starts a fresh round. Its notice names the real outcome (rewritten, unchanged, paused, aborted, skipped or fallback).
 - `/review abort` stops the round — or discards a paused one — and is a **strict local exit**. With a waiting handoff (a pending browser decision included) it resolves the in-flight request, settles the gate with the author's plan, closes the turn, and presents the **native** questionnaire: the plan is printed above and Approve/Feedback/Skip are pinned at the bottom. It never re-opens Plannotator, so a broken bridge cannot strand the turn. The aborted revision is not auto-reviewed again until the plan changes. A repeat abort is idempotent (`Nothing to abort — no review, pause, or handoff is active.`) instead of a soft-lock. It also releases the mode-switch and prompt locks immediately.
 - A host interrupt (**Ctrl+C**) while a gated review is paused resolves the gate, aborts the reviewer, clears the pause and hands off the author's plan, so the turn can never hang on a parked review.
 - `/review say <message>` talks to the in-flight reviewer.
@@ -1284,14 +1328,12 @@ Review Mode settings live under `workflow.reviewMode`:
 | --- | --- | --- |
 | `enabled` | `false` | Automatic-review toggle. When false, the automatic handoff review/prefetch/planner note are off and the plan handoff is **plain** (modes/prompts stay free); the manual `/review` commands still work |
 | `rounds` | `1` | Max Plan↔Review rounds per plan/feedback cycle. A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
-| `passes` | `2` | `1` = review+rewrite only; `2` = review, then self-verify |
+| `passes` | `2` | `1` = a single review pass (advisory notes only); `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |
 | `providerRecovery` | `"fallback"` | After a recoverable provider cut, try the fallback chain instead of failing the round immediately. `"off"` restores the single-model behaviour |
 | `providerRetries` | `1` | SDK retries per reviewer model before the chain advances (0–2) |
 | `fallbackModel` | unset | Optional explicit first fallback `{ provider, id, thinking }`; the automatic chain still follows it |
-| `chunkedSubmit` | `"auto"` | Submit long rewrites through `review_plan_begin`/`review_plan_chunk`/`review_plan_finalize` instead of one oversized response. `"off"` keeps the one-shot `review_submit_plan` |
-| `chunkChars` | `6000` | Max characters per chunk; also sets the auto threshold (`chunkChars × 2` plan characters). `0` disables chunked submission |
 | `recoveryBudgetMs` | `0` | Overall time budget for the provider/fallback attempts. `0` uses the round deadline |
 | `exploreBudget` | `1` | Max `review_explore` subagents per round (cost ceiling). `0` whenever the Planner manifest already carries `explore` recon — the reviewer then verifies instead of re-exploring |
 | `timeoutMs` | `300000` | Wall-clock cap for a whole round, run included (5 minutes). `0` = unlimited (explicit opt-out); a pass then ends on `review_pass_done`, run settle, abort or error. A silent reviewer is still caught immediately by the settle race. `/review mode status` prints the value and the settings file that set it, and `/review mode timeout <seconds\|unlimited>` changes it without editing JSON |
@@ -1458,9 +1500,9 @@ After editing `models.json`, run `/reload` or restart `pi` so every runtime pick
 
 ### `the reviewer's provider failed after N retry attempt(s): …` in a Review Mode round
 
-The warning reads `review skipped (the reviewer's provider failed after 3 retry attempt(s): 429 Too Many Requests …)` and the reviewer pane shows the provider's error text live. This is the reviewer's **model provider** failing mid-run — its API returned errors until Pi's auto-retry budget (`settings.retry.maxRetries`, default 3) ran out, so the run settled without ever reaching `review_submit_plan`. It is **not** a Review Mode fault and nothing was written; the author's plan is handed over unchanged.
+The warning reads `review skipped (the reviewer's provider failed after 3 retry attempt(s): 429 Too Many Requests …)` and the reviewer pane shows the provider's error text live. This is the reviewer's **model provider** failing mid-run — its API returned errors until Pi's auto-retry budget (`settings.retry.maxRetries`, default 3) ran out, so the run settled without ever reaching `review_submit`. It is **not** a Review Mode fault and nothing was written; the author's plan is handed over unchanged.
 
-Earlier versions mislabeled this as `the reviewer finished without submitting a plan — it has no write path…`; since 0.3.3 the real provider error is captured from the reviewer session and reported here, in the pane, and via `/review status` (the old message now appears only when the reviewer genuinely settled without calling `review_submit_plan`).
+Earlier versions mislabeled this as `the reviewer finished without submitting a plan — it has no write path…`; since 0.3.3 the real provider error is captured from the reviewer session and reported here, in the pane, and via `/review status` (the old message now appears only when the reviewer genuinely settled without calling `review_submit`).
 
 **If the text is `This operation was aborted`, the provider was not at fault.** That is Node's default abort reason: Review Mode aborted the reviewer's closing tail after `review_pass_done` (or on pause/teardown), and the SDK's `lazyStream` setup path recorded the cancellation as a `stopReason: "error"` assistant message. Before the abort classifier shipped, that was displayed as `reviewer run ended on a provider error: This operation was aborted` and could land in `/review status` as a `provider:` line. It consumed no retry, wrote nothing, and is not actionable — it no longer appears in the pane or the status.
 

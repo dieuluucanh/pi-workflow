@@ -1,3 +1,67 @@
+## [0.16.0] - 2026-11-25
+
+### Changed — Review Mode is advisory: the plan body is never rewritten (2026-11-25)
+
+- **The reviewer is a reference, not an author.** `review_submit` appends
+  exactly one `## Reviewer Revisions (round N)` section to the plan file and
+  leaves the author's plan body byte-identical; a pass-2 resubmission replaces
+  that round's section instead of stacking a second one. Nothing in the
+  pipeline applies a revision to the body, so there is no diff and no
+  apply/keep choice at the handoff — the plan is printed as the planner wrote
+  it.
+- **Revision ids make every note addressable.** Each required change is
+  rendered as `- **R2 · Step 3:** … _(F1)_`: a stable `R<n>` id (normalised to
+  `R1..Rn` in submission order when the model omits one) plus the finding ids
+  it answers. The appendix also states its own precedence:
+  `_Advisory review notes. The approved plan body is authoritative on any
+  conflict._`
+- **The notes reach the Orchestrator and the Build child, with a fallback.**
+  `parseReviewNotes` parses the appendix deterministically (shared with the
+  renderer, with a render→parse round-trip test), the run keeps every note it
+  could not bind in `unboundReviewNotes`, and the mission tells the parent to
+  place those notes itself. Rows are bound only when the plan's numbered step
+  count and the model's row count match — otherwise every note stays unbound
+  and the mismatch is reported, never guessed onto a row.
+- **The child kickoff carries `## Review notes (advisory)`.** The Build child
+  gets the approved plan as authoritative and each bound row's notes as a
+  bounded block that never drops an id (surplus notes collapse into
+  `… and N more: R7, R8, R9`). Its final summary must acknowledge every id as
+  `applied`, `not applicable — <why>`, or
+  `conflicts with the plan — followed the plan`, and the parent reports each
+  conflict with the row ref and the child's reason. A note is never a
+  requirement, a gate or an acceptance criterion.
+- **The chunked rewrite path is deleted, not repaired.**
+  `review_plan_begin`/`review_plan_chunk`/`review_plan_finalize`, their
+  registration and permission rows, the plan assembler
+  (`beginPlan`/`appendPlanChunk`/`takeAssembledPlan`/`resetPlan`), the
+  `replacement-body` submission, the pass-1 chunk prompt branch, and the
+  `chunkedSubmit`/`chunkChars` config keys are gone. An old `settings.json`
+  that still carries those keys is tolerated: unknown review keys are ignored,
+  not fatal.
+- **The handoff names the note count.** The handoff line gains `· N notes`
+  beside the finding count (`Review: revise · 3 findings · 2 notes`). No body
+  rewrite is implied by it.
+- **`planHash` and the guards are documented as they behave.**
+  `stripReviewAppendix` removes only `## Review changes` and
+  `## Unresolved findings`, so the hash covers the author's body **plus** the
+  `## Reviewer Revisions` appendix: a reviewer round changes it once, and the
+  same body with the same appendix hashes identically. Tests pin the handoff
+  print dedupe, the Plannotator stale-tab check, the approval re-read and the
+  pause/review `unchanged` comparison against that behaviour.
+
+### Compatibility
+
+- This checkout is `@dieulc/workflow` **0.16.0**. Pi Desktop's
+  `resources/workflow.lock.json` still pins the previously published tarball;
+  it moves to 0.16.0 only after a separate, explicitly approved release. The
+  Desktop architecture docs that name an older publisher version are release
+  follow-ups, not part of this change.
+- The reviewer tool allowlist is exactly `read`, `grep`, `find`, `ls`,
+  `review_bash`, `review_explore`, `review_submit`, `review_pass_done`; the
+  removed `review_plan_*` names are not registered in any form.
+- Contribution v1, the mode/menu contract and the 0.14.0 verb grammar are
+  unchanged.
+
 ## [0.15.0] - 2026-11-25
 
 ### Changed — action groups, the mode menu and inline controls (2026-11-25)

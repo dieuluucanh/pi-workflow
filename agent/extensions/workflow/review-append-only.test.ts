@@ -60,7 +60,14 @@ test("review_submit appends Reviewer Revisions and never replaces the body", asy
   assert.equal(payload.planBody, ORIGINAL_PLAN);
   assert.ok(payload.planText.startsWith(ORIGINAL_PLAN.trimEnd()));
   assert.ok(payload.changelog.includes("## Reviewer Revisions (round 2)"));
-  assert.ok(payload.changelog.includes("Register the route in the app."));
+  assert.ok(
+    payload.changelog.includes(
+      "_Advisory review notes. The approved plan body is authoritative on any conflict._",
+    ),
+  );
+  assert.ok(
+    payload.changelog.includes("- **R1 · Step 2:** Register the route in the app."),
+  );
   assert.ok(result.content[0].text.includes("review_pass_done"));
 });
 

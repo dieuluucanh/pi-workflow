@@ -6,9 +6,12 @@
  * (the child's working root), local `fetch_content` / `browser_*` file URLs,
  * and a conservative generic path-key scan for extension/MCP tools.
  *
- * Known writers are skipped (the write policy owns them). An unknown tool with
- * a path-like input is guarded; an unknown tool without one is allowed. This
- * is deliberately fail-safe without pretending every MCP tool is a file read.
+ * Known writers are skipped: their own write path already owns the target, so
+ * re-classifying their inputs as reads would double-guard them (for
+ * `review_submit` that would let a finding's `file` anchor block the whole
+ * submission). An unknown tool with a path-like input is guarded; an unknown
+ * tool without one is allowed. This is deliberately fail-safe without
+ * pretending every MCP tool is a file read.
  */
 
 import { fileURLToPath } from "node:url";
@@ -29,10 +32,7 @@ const KNOWN_WRITE_TOOLS = new Set([
   "edit",
   "write",
   "ast_grep_replace",
-  "review_submit_plan",
-  "review_plan_begin",
-  "review_plan_chunk",
-  "review_plan_finalize",
+  "review_submit",
 ]);
 
 const EXEMPT_TOOLS = new Set([

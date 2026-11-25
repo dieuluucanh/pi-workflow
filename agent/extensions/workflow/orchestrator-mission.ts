@@ -15,10 +15,20 @@
 import type { OrchestratorRunPhase } from "./orchestrator-run.ts";
 
 export const ORCHESTRATOR_CONTEXT_ENTRY = "workflow-orchestrator-context";
-export const ORCHESTRATOR_MISSION_VERSION = 4 as const;
+export const ORCHESTRATOR_MISSION_VERSION = 5 as const;
 
 /** `unbound` means no run is bound yet; preparation is still available. */
 export type OrchestratorPhase = OrchestratorRunPhase | "unbound";
+
+/**
+ * One advisory note the harness could not bind to a row. The mission renders
+ * it so the parent places it, but it never becomes a requirement or a gate.
+ */
+export interface OrchestratorMissionReviewNote {
+  id: string;
+  step?: string;
+  change: string;
+}
 
 export interface OrchestratorMissionState {
   phase: OrchestratorPhase;
@@ -28,7 +38,39 @@ export interface OrchestratorMissionState {
   pendingDecision?: string;
   /** Rows the TODO list reports done, and the run's total rows. */
   taskCounts?: { done: number; total: number };
+  /**
+   * Review-note seam: the caller (`index.ts`, next to `taskCounts` and
+   * `sourceLabel`) passes the run's `unboundReviewNotes` here. The builder
+   * stays pure — it never reads the run, the plan or the filesystem.
+   */
+  unboundReviewNotes?: readonly OrchestratorMissionReviewNote[];
   workspaces?: string;
+}
+
+const MAX_UNBOUND_NOTE_CHARS = 200;
+const MAX_UNBOUND_NOTE_LINES = 10;
+
+function boundNoteChange(change: string): string {
+  const flat = String(change ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > MAX_UNBOUND_NOTE_CHARS
+    ? `${flat.slice(0, MAX_UNBOUND_NOTE_CHARS)}…`
+    : flat;
+}
+
+/** Bounded, id-preserving lines for notes the harness could not bind. */
+function unboundNoteLines(
+  notes: readonly OrchestratorMissionReviewNote[],
+): string[] {
+  const shown = notes.slice(0, MAX_UNBOUND_NOTE_LINES);
+  const lines = shown.map((note) => {
+    const step = note.step ? ` · Step ${note.step}` : "";
+    return `- ${note.id}${step}: ${boundNoteChange(note.change)}`;
+  });
+  const rest = notes.slice(MAX_UNBOUND_NOTE_LINES);
+  if (rest.length > 0) {
+    lines.push(`… and ${rest.length} more: ${rest.map((note) => note.id).join(", ")}`);
+  }
+  return lines;
 }
 
 function phaseLine(state: OrchestratorMissionState): string {
@@ -92,6 +134,11 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "",
     "Reporting: when the run ends, your final message must list each row's outcome (done / done with a policy-blocked step and why / retried / aborted). Never omit an unresolved deviation.",
     "",
+    "Review notes (advisory):",
+    "- The harness attaches each row's review notes to that row's child kickoff. Do not drop them and do not restate them as extra requirements.",
+    "- A note is advisory: the approved plan wins on any conflict, and a note is never a requirement, a gate or an acceptance criterion.",
+    "- When the run ends, list every note a child reported as `conflicts with the plan`, with the row ref and the child's reason.",
+    "",
     "Work entry (do this instead of changing mode):",
     "- When the user agrees, call orchestrator_start. Pass planPath for an approved plan, or title + steps for a standalone run.",
     "- Use orchestrator_status to inspect the run; /orchestrator inspect shows a row's instruction and last report.",
@@ -115,6 +162,14 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
   ];
   if (state.pendingDecision && state.pendingDecision !== "none") {
     lines.push(`Pending decision: ${state.pendingDecision}`);
+  }
+  if (state.unboundReviewNotes && state.unboundReviewNotes.length > 0) {
+    lines.push(
+      "",
+      "Unbound review notes (place them yourself):",
+      ...unboundNoteLines(state.unboundReviewNotes),
+      "These notes are advisory and could not be bound to a row. Decide which row each one belongs to before you dispatch it; the approved plan still wins on any conflict.",
+    );
   }
   return lines.join("\n");
 }

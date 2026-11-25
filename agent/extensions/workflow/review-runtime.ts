@@ -228,7 +228,7 @@ export interface ReviewModelSwitchResult {
   error?: string;
 }
 
-/** Prompt for pass 1: review and rewrite. */
+/** Prompt for pass 1: audit the plan, then submit findings + required revisions. */
 export function buildPass1Prompt(input: {
   planPath: string;
   planText: string;
@@ -240,19 +240,7 @@ export function buildPass1Prompt(input: {
   round: number;
   totalRounds: number;
   verify: boolean;
-  /**
-   * Max characters per submitted chunk (step 18). `0` disables chunked mode.
-   * When set and the plan is longer than two chunks, pass 1 asks for the
-   * chunked protocol instead of one oversized response.
-   */
-  chunkChars?: number;
 }): string {
-  const chunkChars = input.chunkChars ?? 0;
-  // Append-only review: the reviewer never submits a replacement plan body, so
-  // chunked rewrite submission is not used. Keep the field for callers that
-  // still pass it; it is deliberately ignored.
-  const chunked = false;
-  void chunkChars;
   const parts: string[] = [
     `[REVIEW MODE — PASS 1 of ${input.verify ? 2 : 1} — round ${input.round}/${input.totalRounds}]`,
     "",
@@ -330,43 +318,13 @@ export function buildPass1Prompt(input: {
     "required revisions as soon as they are ready.",
   );
 
-  if (chunked) {
-    parts.push(
-      "",
-      "## Chunked submission (required for this plan)",
-      "",
-      `This plan is long enough that a single response may be cut off. Send the`,
-      `rewrite in ordered chunks of at most ${chunkChars} characters:`,
-      "",
-      "1. `review_plan_begin` (optionally with `totalChunks`).",
-      "2. `review_plan_chunk` with `index` 1, 2, 3, … — never skip or repeat. The",
-      "   tool echoes the next expected index; if a chunk is rejected, resend that",
-      "   index and continue (accepted chunks are kept).",
-      "3. `review_plan_finalize` with your findings, verdict and summary. Nothing is",
-      "   written before this call succeeds.",
-      "",
-      "Do not call `review_submit` with a full `planMarkdown` in this round, and",
-      "do not repeat earlier chunks. Split on heading boundaries where possible.",
-    );
-  }
-
   parts.push(
     "",
     "## Required output",
     "",
-        ...(chunked
-      ? [
-          "1. `review_plan_begin`, then `review_plan_chunk` for every part of the",
-          "   COMPLETE revised plan (readable markdown, original structure preserved,",
-          "   no `Review changes` section — it is generated).",
-          "2. `review_plan_finalize` with your findings, verdict and summary.",
-          "3. `review_pass_done` with the same findings.",
-        ]
-      : [
-          "1. `review_submit` with your findings, verdict, summary and required",
-          "   revisions. Do not send a replacement plan body.",
-          "2. `review_pass_done` with your verdict and the same findings.",
-        ]),
+    "1. `review_submit` with your findings, verdict, summary and required",
+    "   revisions. Do not send a replacement plan body.",
+    "2. `review_pass_done` with your verdict and the same findings.",
     "",
     "You may run read-only and test/lint/typecheck commands, but you cannot build or",
     "write any file other than the plan. Say what you could not verify instead of",
@@ -491,71 +449,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
   const resetExpectedAborts = (): void => {
     expectedAbortEnds = 0;
-  };
-
-  /** Ordered plan chunks for the current pass; reset on submit/abort/switch. */
-  let planAssembler:
-    | { chunks: string[]; nextIndex: number; totalChunks?: number }
-    | undefined;
-
-  const resetPlanAssembler = (): void => {
-    planAssembler = undefined;
-  };
-
-  const beginPlan = (totalChunks?: number) => {
-    if (config().chunkedSubmit === "off") {
-      return {
-        ok: false,
-        error: "chunked submission is off; pass the complete plan to review_submit",
-      };
-    }
-    planAssembler = {
-      chunks: [],
-      nextIndex: 1,
-      ...(totalChunks !== undefined ? { totalChunks } : {}),
-    };
-    return { ok: true, maxChunkChars: config().chunkChars };
-  };
-
-  const appendPlanChunk = (index: number, content: string) => {
-    if (!planAssembler) {
-      return { ok: false, error: "call review_plan_begin first" };
-    }
-    if (index !== planAssembler.nextIndex) {
-      return {
-        ok: false,
-        error: `expected chunk ${planAssembler.nextIndex}, got ${index}`,
-      };
-    }
-    const maxChunkChars = config().chunkChars;
-    if (content.length > maxChunkChars) {
-      return {
-        ok: false,
-        error: `chunk ${index} is ${content.length} characters; the limit is ${maxChunkChars}`,
-      };
-    }
-    planAssembler.chunks.push(content);
-    planAssembler.nextIndex += 1;
-    return {
-      ok: true,
-      received: planAssembler.chunks.length,
-      nextIndex: planAssembler.nextIndex,
-      totalChars: planAssembler.chunks.reduce(
-        (sum, chunk) => sum + chunk.length,
-        0,
-      ),
-    };
-  };
-
-  const takeAssembledPlan = (): string | undefined => {
-    if (!planAssembler || planAssembler.chunks.length === 0) return undefined;
-    if (
-      planAssembler.totalChunks !== undefined &&
-      planAssembler.chunks.length < planAssembler.totalChunks
-    ) {
-      return undefined;
-    }
-    return planAssembler.chunks.join("");
   };
 
   /** Record one provider failure. The message arrives pre-decoded, non-empty. */
@@ -844,7 +737,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     // A choice for a session that never existed has no target anymore.
     pendingModel = undefined;
     gate = createReviewRoundGate();
-    resetPlanAssembler();
     if (options.keepRoundController !== true) abortController = undefined;
     try {
       deps.onState?.(undefined);
@@ -983,11 +875,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
               gate.notifySubmitted(payload);
               return { ok: true, path: written.path };
             },
-            beginPlan,
-            appendPlanChunk,
-            takeAssembledPlan,
-            resetPlan: resetPlanAssembler,
-            maxChunkChars: config().chunkChars,
             log: deps.log,
           },
           passDone: {
@@ -1240,8 +1127,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
     try {
       roundActive = true;
-      // Chunks from an earlier round must never leak into this one.
-      resetPlanAssembler();
       // A round is a new logical review request: its shell budget starts fresh.
       currentShellRecovery = createShellGuardRecovery();
       shellGuardTrip = undefined;
@@ -1461,9 +1346,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         round: input.round,
         totalRounds: cfg.rounds,
         verify: cfg.verify && cfg.passes > 1,
-        // `chunkedSubmit: "off"` is the coarse switch; `chunkChars: 0` is the
-        // numeric one. Both mean "ask for the one-shot submission".
-        chunkChars: cfg.chunkedSubmit === "off" ? 0 : cfg.chunkChars,
       });
 
       const p1 = await runPass(1, deadline, rc, () => {
@@ -1647,7 +1529,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           finalPlan = p2.submitted.planText;
         } else if (p2Provider) {
           // The run settled without a submission AND a provider error was
-          // seen this pass: say why, then keep going with pass 1's rewrite.
+          // seen this pass: say why, then keep going with pass 1's plan text.
           deps.log(
             `verification pass ended without a submission (${p2Provider}) — keeping pass 1's plan.`,
             "warning",
@@ -1817,9 +1699,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       } catch {
         /* cancellation is best-effort */
       }
-      // An aborted round cannot be finalised: drop partial chunks so a retry
-      // starts a clean submission instead of silently stitching two rewrites.
-      resetPlanAssembler();
       if (state && state.phase !== "done") state.phase = "aborted";
     },
     async sendUserMessage(text: string, images?: unknown[]): Promise<boolean> {

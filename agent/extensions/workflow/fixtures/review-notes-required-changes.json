@@ -1,0 +1,11 @@
+{
+  "revisions": [
+    {
+      "id": "R1",
+      "step": "2",
+      "change": "Register the route.",
+      "findingIds": ["F1"]
+    }
+  ],
+  "requiredChanges": "### Required changes\n\n- **R1 · Step 2:** Register the route. _(F1)_"
+}
