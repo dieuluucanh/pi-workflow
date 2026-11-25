@@ -23,6 +23,10 @@
  * deliberately — `workflow_worker_ready`, `orchestrator_report|checkpoint|
  * verify|accept|repair` and the `workflow-bridge` command were removed;
  * `orchestrator-pause|resume|abort|view` were added. See CHANGELOG.md.
+ *
+ * 2026-11-25 (settle recovery): `orchestrator_abort` is the fifth parent tool,
+ * so the pinned registered-tool set changed deliberately. `orchestrator_retry`
+ * gained an optional `instructions` field (a property change, not a new tool).
  */
 
 import { test } from "node:test";

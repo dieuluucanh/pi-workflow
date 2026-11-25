@@ -15,8 +15,9 @@ import {
 } from "./orchestrator-tools.ts";
 import type { OrchestratorRun, OrchestratorRunStep } from "./orchestrator-run.ts";
 
-export const TOOL_ADAPTER_SCHEMA_VERSION = 3 as const;
+export const TOOL_ADAPTER_SCHEMA_VERSION = 4 as const;
 export const MAX_TOOL_TEXT = 2_000;
+const MAX_ABORT_REASON_CHARS = 500;
 
 /** A model-supplied workspace declaration, before the resolver runs. */
 export interface WorkspaceDeclarationInput {
@@ -46,6 +47,11 @@ export interface ParentToolPorts {
     workspaces?: readonly WorkspaceDeclarationInput[];
   }) => Promise<
     | { ok: true; text: string; details: Record<string, unknown> }
+    | { ok: false; code: string; text: string }
+  >;
+  /** Stop the live child; never accepts a row and never rewrites a report. */
+  abort?: (input: { reason: string }) => Promise<
+    | { ok: true; text: string; details?: Record<string, unknown> }
     | { ok: false; code: string; text: string }
   >;
   now?: () => number;
@@ -157,6 +163,43 @@ export function createParentToolRuntime(ports: ParentToolPorts): ParentToolRunti
 
       if (name === "orchestrator_status") {
         return { ok: true, tool: name, text: ports.statusText(), details: {} };
+      }
+
+      if (name === "orchestrator_abort") {
+        const reason =
+          typeof input.reason === "string"
+            ? input.reason.trim().slice(0, MAX_ABORT_REASON_CHARS)
+            : "";
+        if (!reason) {
+          return {
+            ok: false,
+            tool: name,
+            code: "invalid",
+            text: "orchestrator_abort requires a short `reason` for stopping the child.",
+          };
+        }
+        const aborted = await ports.abort?.({ reason });
+        if (!aborted) {
+          return {
+            ok: false,
+            tool: name,
+            code: "unavailable",
+            text: "No child abort is bound; nothing was stopped.",
+          };
+        }
+        return aborted.ok
+          ? {
+              ok: true,
+              tool: name,
+              text: aborted.text,
+              details: aborted.details ?? {},
+            }
+          : {
+              ok: false,
+              tool: name,
+              code: aborted.code,
+              text: aborted.text,
+            };
       }
 
       const run = ports.run();

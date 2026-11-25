@@ -16,18 +16,19 @@ import {
 } from "./orchestrator-tools.ts";
 import { normalizeToolSteps } from "./orchestrator-tool-runtime.ts";
 
-test("the parent tool surface is exactly the four model tools", () => {
+test("the parent tool surface is exactly the five model tools", () => {
   assert.deepEqual([...ORCHESTRATOR_TOOL_NAMES], [
     "orchestrator_start",
     "orchestrator_dispatch",
     "orchestrator_status",
     "orchestrator_retry",
+    "orchestrator_abort",
   ]);
   assert.deepEqual(
     ORCHESTRATOR_TOOLS.map((tool) => tool.name),
     [...ORCHESTRATOR_TOOL_NAMES],
   );
-  assert.equal(TOOLS_SCHEMA_VERSION, 2);
+  assert.equal(TOOLS_SCHEMA_VERSION, 3);
 });
 
 test("every descriptor is bounded, closed and has a description", () => {
@@ -67,13 +68,29 @@ test("dispatch advertises rowRef, instructions and a declared cwd", () => {
   assert.deepEqual(dispatch.parameters.required, ["instructions"]);
 });
 
-test("retry names a row and its stored instruction, never a frozen task", () => {
+test("retry names a row and a stored instruction, never a frozen task", () => {
   const retry = ORCHESTRATOR_TOOLS.find((tool) => tool.name === "orchestrator_retry");
   assert.ok(retry);
   assert.ok(retry.parameters.properties.rowRef);
+  assert.ok(
+    retry.parameters.properties.instructions,
+    "a retry can amend the instruction for the next attempt",
+  );
   assert.equal(retry.parameters.properties.taskId, undefined);
   assert.match(retry.description, /stored instruction/i);
+  assert.match(retry.description, /amend/i);
   assert.doesNotMatch(retry.description, /frozen/i);
+});
+
+test("abort requires a reason and never claims acceptance", () => {
+  const abort = ORCHESTRATOR_TOOLS.find((tool) => tool.name === "orchestrator_abort");
+  assert.ok(abort);
+  assert.deepEqual(abort.parameters.required, ["reason"]);
+  const reason = abort.parameters.properties.reason as { description: string };
+  assert.match(reason.description, /why the child must stop/i);
+  assert.match(abort.description, /retryable/i);
+  assert.match(abort.description, /preserved/i);
+  assert.doesNotMatch(abort.description, /accept/i);
 });
 
 test("normalizeToolSteps accepts strings and {text, workspace}", () => {

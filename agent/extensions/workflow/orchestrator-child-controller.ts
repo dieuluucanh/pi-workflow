@@ -10,6 +10,10 @@ import { formatActionLabel } from "./review.ts";
 import type { ReviewLineKind } from "./review.ts";
 import type { InProcessChildSession } from "./in-process-child.ts";
 import type { ChildModelRef, ChildRuntimeStats } from "./child-stats.ts";
+import {
+  isPolicyRefusal,
+  normalizePolicyRefusals,
+} from "./orchestrator-report.ts";
 import type { TodoItem } from "./utils.ts";
 
 export type OrchestratorChildPhase =
@@ -43,6 +47,10 @@ export interface OrchestratorChildState {
   lastTool?: string;
   todos: TodoItem[];
   lastError?: string;
+  /** When the current settle started; the report has a bounded window. */
+  settlingAt?: number;
+  /** Bounded policy refusals the child hit (commit/folder/write/read/shell). */
+  policyRefusals?: string[];
 }
 
 export interface OrchestratorChildOp {
@@ -73,6 +81,10 @@ export interface ChildSettledInput {
   summary: string;
   toolCalls: number;
   durationMs: number;
+  /** The child's final task-local list, snapshotted for the report. */
+  todos: TodoItem[];
+  /** Policy refusals observed while the child ran (bounded). */
+  policyRefusals: string[];
 }
 
 export interface OrchestratorChildPorts {
@@ -93,8 +105,22 @@ export interface OrchestratorChildPorts {
   onOps?: (ops: OrchestratorChildOp[]) => void;
   onState?: (state: OrchestratorChildState) => void;
   onSettled?: (input: ChildSettledInput) => void | Promise<void>;
-  onError?: (input: { taskId: string; attemptId: string; error: string }) => void | Promise<void>;
-  onAborted?: (input: { taskId: string; attemptId: string; reason: string }) => void | Promise<void>;
+  onError?: (input: {
+    taskId: string;
+    attemptId: string;
+    error: string;
+    todos: TodoItem[];
+    policyRefusals: string[];
+  }) => void | Promise<void>;
+  onAborted?: (input: {
+    taskId: string;
+    attemptId: string;
+    reason: string;
+    /** False for a parent-tool abort: the tool result is the notification. */
+    notify: boolean;
+    todos: TodoItem[];
+    policyRefusals: string[];
+  }) => void | Promise<void>;
   /**
    * The model the parent currently wants this child to run (the effective
    * Builder role, profile overlay applied). Read at start/resume so a profile
@@ -104,6 +130,8 @@ export interface OrchestratorChildPorts {
   now?: () => number;
   timeoutMs?: number;
   maxToolCalls?: number;
+  /** Bound on recording a settle report before the child is failed/released. */
+  settleReportTimeoutMs?: number;
 }
 
 export interface OrchestratorChildController {
@@ -143,13 +171,18 @@ export interface OrchestratorChildController {
   reenter(repair: string): Promise<boolean>;
   pause(): Promise<boolean>;
   resume(note?: string): Promise<boolean>;
-  abort(reason: string): Promise<void>;
+  /** Abort the live child. `notify:false` suppresses the parent wake. */
+  abort(reason: string, opts?: { notify?: boolean }): Promise<void>;
   dispose(): Promise<void>;
   deliver(text: string): Promise<{ ok: boolean; queued?: boolean; error?: string }>;
 }
 
 export const DEFAULT_CHILD_TIMEOUT_MS = 45 * 60_000;
+export const DEFAULT_SETTLE_REPORT_TIMEOUT_MS = 15_000;
 export const MAX_CHILD_TOOL_CALLS = 300;
+/** Refusals kept for the report; the last few are the relevant ones. */
+const MAX_CHILD_POLICY_REFUSALS = 3;
+const MAX_TOOL_ERROR_CHARS = 2_000;
 
 function assistantText(messages: unknown): string {
   if (!Array.isArray(messages)) return "";
@@ -172,6 +205,41 @@ function assistantText(messages: unknown): string {
     if (text) return text.slice(0, 8_000);
   }
   return "";
+}
+
+/**
+ * Bounded text for a failed tool result. Pi's blocked-tool result carries the
+ * refusal in `content[].text`; shells may use `output`; anything else is
+ * stringified defensively so a policy refusal is never silently dropped.
+ */
+function toolErrorText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const record = result as { content?: unknown; output?: unknown; text?: unknown };
+  if (Array.isArray(record.content)) {
+    const text = record.content
+      .map((block) =>
+        block &&
+        typeof block === "object" &&
+        (block as { type?: unknown }).type === "text" &&
+        typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : "",
+      )
+      .join("\n")
+      .trim();
+    if (text) return text.slice(0, MAX_TOOL_ERROR_CHARS);
+  }
+  if (typeof record.output === "string" && record.output.trim()) {
+    return record.output.trim().slice(0, MAX_TOOL_ERROR_CHARS);
+  }
+  if (typeof record.text === "string" && record.text.trim()) {
+    return record.text.trim().slice(0, MAX_TOOL_ERROR_CHARS);
+  }
+  try {
+    return JSON.stringify(result).slice(0, MAX_TOOL_ERROR_CHARS);
+  } catch {
+    return "";
+  }
 }
 
 function asTodoItems(value: unknown): TodoItem[] {
@@ -212,6 +280,11 @@ export function createOrchestratorChildController(
   const now = ports.now ?? (() => Date.now());
   const timeoutMs = ports.timeoutMs ?? DEFAULT_CHILD_TIMEOUT_MS;
   const maxToolCalls = ports.maxToolCalls ?? MAX_CHILD_TOOL_CALLS;
+  const settleReportTimeoutMs =
+    typeof ports.settleReportTimeoutMs === "number" &&
+    ports.settleReportTimeoutMs > 0
+      ? Math.max(1, Math.floor(ports.settleReportTimeoutMs))
+      : DEFAULT_SETTLE_REPORT_TIMEOUT_MS;
 
   let state: OrchestratorChildState = { phase: "idle", todos: [] };
   let child: InProcessChildSession | undefined;
@@ -219,6 +292,10 @@ export function createOrchestratorChildController(
   let generation = 0;
   let expectedAbort: "abort" | "stop" | undefined;
   let settledOnce = false;
+  /** A failure/report was already emitted for this attempt. */
+  let failedOnce = false;
+  /** Bounded policy refusals observed through failed tool results. */
+  let policyRefusals: string[] = [];
   let toolCalls = 0;
   let summary = "";
   let startedAt = 0;
@@ -378,6 +455,23 @@ export function createOrchestratorChildController(
     }
   };
 
+  /** A copy of the final list; the report owns its snapshot. */
+  const snapshotTodos = (): TodoItem[] =>
+    state.todos.map((item) => ({ ...item }));
+
+  const snapshotPolicyRefusals = (): string[] =>
+    normalizePolicyRefusals(policyRefusals);
+
+  /** Remember a refusal without letting a retry loop unbounded the list. */
+  const notePolicyRefusal = (text: string): void => {
+    const value = text.trim();
+    if (!value || policyRefusals.includes(value)) return;
+    policyRefusals.push(value.slice(0, MAX_TOOL_ERROR_CHARS));
+    if (policyRefusals.length > MAX_CHILD_POLICY_REFUSALS) {
+      policyRefusals.shift();
+    }
+  };
+
   const clearTimer = (): void => {
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -482,20 +576,30 @@ export function createOrchestratorChildController(
     }
   };
 
-  const release = (): void => {
-    clearTimer();
+  /** Unsubscribe the current listener; the session may stay warm. */
+  const unsubscribeEvents = (): void => {
     try {
       unsubscribe?.();
     } catch {
       /* ignore */
     }
     unsubscribe = undefined;
+  };
+
+  /** Dispose only the current child; a prepared child is left for `start`. */
+  const disposeCurrentChild = (): void => {
+    unsubscribeEvents();
     try {
       child?.dispose();
     } catch {
       /* ignore */
     }
     child = undefined;
+  };
+
+  const release = (): void => {
+    clearTimer();
+    disposeCurrentChild();
     if (prepared) {
       try {
         prepared.child.dispose();
@@ -506,40 +610,120 @@ export function createOrchestratorChildController(
     }
   };
 
+  /**
+   * Report a failure once, release the session and wake the parent with the
+   * child's final facts. Centralised so no call site can leak a live session.
+   */
   const fail = (reason: string): void => {
-    if (!state.taskId || !state.attemptId) return;
-    publish({ phase: "disposed", lastError: reason });
+    if (failedOnce) return;
+    const taskId = state.taskId;
+    const attemptId = state.attemptId;
+    if (!taskId || !attemptId) return;
+    failedOnce = true;
+    settledOnce = true;
+    expectedAbort = "abort";
+    const todos = snapshotTodos();
+    const refusals = snapshotPolicyRefusals();
+    release();
+    publish({
+      phase: "disposed",
+      lastError: reason,
+      pausePending: false,
+      retrying: false,
+    });
     void Promise.resolve(
-      ports.onError?.({
-        taskId: state.taskId,
-        attemptId: state.attemptId,
-        error: reason,
-      }),
+      ports.onError?.({ taskId, attemptId, error: reason, todos, policyRefusals: refusals }),
     ).catch(() => undefined);
   };
 
+  /**
+   * Publish the post-settle state and release the session.
+   *
+   * Disposal is deferred to the next macrotask: `finish()` runs inside the
+   * SDK's `agent_settled` dispatch, and disposing a session mid-dispatch tears
+   * down listeners that are still being iterated. The generation guard keeps a
+   * late timer from touching a newer attempt.
+   */
+  const settleIdle = (gen: number): void => {
+    if (gen !== generation) return;
+    publish({
+      phase: "idle",
+      settlingAt: undefined,
+      pausePending: false,
+      retrying: false,
+    });
+    unsubscribeEvents();
+    const target = child;
+    if (!target) return;
+    const handle = setTimeout(() => {
+      if (gen !== generation) return;
+      if (child === target) child = undefined;
+      try {
+        target.dispose();
+      } catch {
+        /* ignore */
+      }
+    }, 0);
+    (handle as { unref?: () => void }).unref?.();
+  };
+
   const finish = (): void => {
-    if (settledOnce) return;
+    if (settledOnce || failedOnce) return;
     settledOnce = true;
     clearTimer();
-    publish({ phase: "settling", pausePending: false, retrying: false });
+    const gen = generation;
+    publish({
+      phase: "settling",
+      settlingAt: now(),
+      pausePending: false,
+      retrying: false,
+    });
     const taskId = state.taskId ?? "";
     const attemptId = state.attemptId ?? "";
-    void Promise.resolve(
+    const todos = snapshotTodos();
+    const refusals = snapshotPolicyRefusals();
+    const settleReport = Promise.resolve(
       ports.onSettled?.({
         taskId,
         attemptId,
         summary: summary || "(no final summary)",
         toolCalls,
         durationMs: Math.max(0, now() - startedAt),
+        todos,
+        policyRefusals: refusals,
       }),
-    ).catch((error: unknown) => {
-      fail(error instanceof Error ? error.message : String(error));
+    );
+    // A stuck persistence/UI port must never wedge the run in `settling`: the
+    // dispatch guard would refuse the next row forever. Bound the report and
+    // fail honestly if it cannot be recorded.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const reportDeadline = new Promise<never>((_resolve, reject) => {
+      settleTimer = setTimeout(() => {
+        reject(
+          new Error(
+            `the child settled but its report was not recorded within ${Math.round(
+              settleReportTimeoutMs / 1000,
+            )}s`,
+          ),
+        );
+      }, settleReportTimeoutMs);
+      // SAFETY: Node's Timeout carries `unref()`; a DOM-style numeric handle
+      // from a non-Node host does not, so the call is optional.
+      (settleTimer as unknown as { unref?: () => void }).unref?.();
     });
+    void Promise.race([settleReport, reportDeadline])
+      .then(() => settleIdle(gen))
+      .catch((error: unknown) => {
+        if (gen !== generation) return;
+        fail(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (settleTimer !== undefined) clearTimeout(settleTimer);
+      });
   };
 
-  const onEvent = (raw: unknown): void => {
-    if (!child) return;
+  const onEvent = (raw: unknown, gen: number): void => {
+    if (!child || gen !== generation) return;
     const event =
       raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
     const type = typeof event.type === "string" ? event.type : "";
@@ -571,6 +755,9 @@ export function createOrchestratorChildController(
         const result = event.result as { details?: { todos?: unknown } } | undefined;
         const todos = asTodoItems(result?.details?.todos);
         if (todos.length > 0) publish({ todos });
+      } else if (failed) {
+        const text = toolErrorText(event.result);
+        if (text && isPolicyRefusal(text)) notePolicyRefusal(text);
       }
       return;
     }
@@ -720,9 +907,14 @@ export function createOrchestratorChildController(
       if (state.phase === "starting" || state.phase === "running") {
         return { ok: false, error: "a child is already active" };
       }
+      // A settled child is already released, but be defensive: never adopt a
+      // new attempt while a leftover session still exists.
+      disposeCurrentChild();
       generation += 1;
       const gen = generation;
       settledOnce = false;
+      failedOnce = false;
+      policyRefusals = [];
       expectedAbort = undefined;
       pauseState = "none";
       resolvePause();
@@ -740,8 +932,10 @@ export function createOrchestratorChildController(
         ref: input.ref,
         total: input.total,
         startedAt,
+        settlingAt: undefined,
         lastTool: undefined,
         lastError: undefined,
+        policyRefusals: [],
         todos: [],
       });
 
@@ -833,32 +1027,31 @@ export function createOrchestratorChildController(
         retrying: false,
       });
       refreshStats();
-      unsubscribe = child.subscribe(onEvent);
+      unsubscribe = child.subscribe((event) => onEvent(event, gen));
       armDeadline(gen);
-      try {
-        await child.prompt(
-          ports.buildPrompt({
-            taskId: input.taskId,
-            attemptId: input.attemptId,
-            ref: input.ref,
-            total: input.total,
-            ...(input.cwd ? { cwd: input.cwd } : {}),
-            ...(input.workspace ? { workspace: input.workspace } : {}),
-            ...(input.repair ? { repair: input.repair } : {}),
-          }),
-        );
-      } catch (error: unknown) {
-        if (gen !== generation) return { ok: false, error: "superseded" };
+      // Short admission: the parent must regain control immediately. The run's
+      // completion arrives through `agent_settled`; a rejection is handled
+      // exactly like `resume()` so a real failure is still reported once.
+      const launched = child.prompt(
+        ports.buildPrompt({
+          taskId: input.taskId,
+          attemptId: input.attemptId,
+          ref: input.ref,
+          total: input.total,
+          ...(input.cwd ? { cwd: input.cwd } : {}),
+          ...(input.workspace ? { workspace: input.workspace } : {}),
+          ...(input.repair ? { repair: input.repair } : {}),
+        }),
+      );
+      void launched.catch((error: unknown) => {
+        if (gen !== generation) return;
         // An intentional pause aborts the SDK run; its prompt rejection is not
         // a child failure and must not dispose the warm session.
-        if (pauseState !== "none") return { ok: true };
-        if (expectedAbort !== undefined) return { ok: false, error: "aborted" };
+        if (pauseState !== "none") return;
+        if (expectedAbort !== undefined) return;
         const text = error instanceof Error ? error.message : String(error);
-        expectedAbort = "abort";
-        release();
         fail(`the child prompt failed: ${text}`);
-        return { ok: false, error: text };
-      }
+      });
       return { ok: true };
     },
 
@@ -977,12 +1170,31 @@ export function createOrchestratorChildController(
       return true;
     },
 
-    async abort(reason) {
+    async abort(reason, opts) {
+      const taskId = state.taskId ?? "";
+      const attemptId = state.attemptId ?? "";
+      const notify = opts?.notify !== false;
+      const live =
+        state.phase === "starting" ||
+        state.phase === "running" ||
+        state.phase === "paused";
+      // A settled (or already stopped) child has no live work: release only and
+      // never rewrite the report that already landed.
+      if (!live || settledOnce) {
+        generation += 1;
+        expectedAbort = "abort";
+        pauseState = "none";
+        clearTimer();
+        failWaiters();
+        release();
+        publish({ phase: "disposed", pausePending: false, retrying: false });
+        return;
+      }
+      const todos = snapshotTodos();
+      const refusals = snapshotPolicyRefusals();
       generation += 1;
       expectedAbort = "abort";
       pauseState = "none";
-      const taskId = state.taskId ?? "";
-      const attemptId = state.attemptId ?? "";
       clearTimer();
       failWaiters();
       try {
@@ -994,7 +1206,14 @@ export function createOrchestratorChildController(
       publish({ phase: "disposed", pausePending: false, retrying: false });
       if (taskId && attemptId) {
         try {
-          await ports.onAborted?.({ taskId, attemptId, reason });
+          await ports.onAborted?.({
+            taskId,
+            attemptId,
+            reason,
+            notify,
+            todos,
+            policyRefusals: refusals,
+          });
         } catch {
           /* ignore */
         }

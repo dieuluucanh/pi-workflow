@@ -147,6 +147,23 @@ export function formatOrchestratorChildStatus(
   });
 }
 
+/**
+ * A settled child is `idle` with a task id: the report landed and the session
+ * was released, but its final task-local list is still worth showing.
+ *
+ * Shared by the pinned panel (`childPanelActive`) and the status line so the
+ * two surfaces cannot disagree about whether a settle happened.
+ */
+export function orchestratorChildSettled(
+  state: { phase?: string; taskId?: string } | undefined,
+): boolean {
+  return (
+    state?.phase === "idle" &&
+    typeof state.taskId === "string" &&
+    state.taskId.length > 0
+  );
+}
+
 /** The compact detail carried by the historical child band (model excluded). */
 export function formatOrchestratorChildProgress(
   state: OrchestratorChildState | undefined,

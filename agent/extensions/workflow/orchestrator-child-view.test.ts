@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   formatOrchestratorChildProgress,
   formatOrchestratorChildStatus,
+  orchestratorChildSettled,
 } from "./orchestrator-child-view.ts";
 import type { OrchestratorChildState } from "./orchestrator-child-controller.ts";
 
@@ -35,6 +36,18 @@ test("child status: idle and disposed render nothing", () => {
   assert.equal(formatOrchestratorChildStatus(undefined), "");
   assert.equal(formatOrchestratorChildStatus(state({ phase: "idle" })), "");
   assert.equal(formatOrchestratorChildStatus(state({ phase: "disposed" })), "");
+});
+
+test("a settled child is idle with a task id, and stays visible to the panel", () => {
+  assert.equal(orchestratorChildSettled(undefined), false);
+  assert.equal(orchestratorChildSettled({ phase: "idle" }), false);
+  assert.equal(orchestratorChildSettled({ phase: "running", taskId: "t" }), false);
+  assert.equal(orchestratorChildSettled({ phase: "idle", taskId: "" }), false);
+  assert.equal(
+    orchestratorChildSettled({ phase: "idle", taskId: "row-1" }),
+    true,
+    "idle + taskId is the settled predicate shared by status and the panel",
+  );
 });
 
 test("child status: carries phase, model, stats and elapsed without counters", () => {

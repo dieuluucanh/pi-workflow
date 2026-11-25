@@ -1204,7 +1204,11 @@ export interface FakeOrchestratorChildOptions {
     session: FakeOrchestratorChildSession,
   ) => Promise<void> | void;
   /** Todos mirrored from a workflow_todo tool result on settle. */
-  todos?: Array<{ text: string; completed?: boolean }>;
+  todos?: Array<{
+    text: string;
+    completed?: boolean;
+    status?: "pending" | "in_progress" | "completed" | "cancelled";
+  }>;
   summary?: string;
   /** Values the fake `stats()` reports (defaults are a small sample). */
   stats?: {
@@ -1267,12 +1271,16 @@ function emitFakeSettle(
       toolName: "workflow_todo",
       result: {
         details: {
-          todos: options.todos.map((todo, index) => ({
-            step: index + 1,
-            text: todo.text,
-            status: todo.completed ? "completed" : "pending",
-            completed: todo.completed === true,
-          })),
+          todos: options.todos.map((todo, index) => {
+            const status =
+              todo.status ?? (todo.completed ? "completed" : "pending");
+            return {
+              step: index + 1,
+              text: todo.text,
+              status,
+              completed: status === "completed",
+            };
+          }),
         },
       },
     });

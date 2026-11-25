@@ -82,3 +82,23 @@ test("a repair round names the concrete blocker without claiming acceptance", ()
   assert.match(kickoff, /typecheck failed at src\/d\.ts:12/);
   assert.doesNotMatch(kickoff, /acceptance/i);
 });
+
+test("the contract tells the child how to record a policy-blocked step", () => {
+  const system = buildOrchestratorChildSystemPrompt(context);
+  assert.match(system, /workflow\.commitPolicy: never/);
+  assert.match(system, /never mark it completed/);
+  assert.match(system, /`cancelled`/);
+  assert.match(system, /## Not done/);
+
+  const kickoff = buildOrchestratorChildKickoff({
+    context,
+    row: { ref: "1", text: "Implement D" },
+  });
+  assert.match(
+    kickoff,
+    /every step you did NOT complete with the reason \(policy or otherwise\)/,
+  );
+  assert.match(kickoff, /mark it `cancelled` with the policy named/);
+  assert.match(kickoff, /## Not done/);
+  assert.doesNotMatch(kickoff, /acceptance/i);
+});

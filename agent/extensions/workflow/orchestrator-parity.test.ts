@@ -313,9 +313,9 @@ test("interrupt, resume and close control the warm child exactly once", async ()
   child.emit({ type: "agent_settled" });
   assert.equal(b.settles.length, 1, "a duplicate settle is ignored");
 
+  // A settled child is released, so a later abort has no live work to report.
   await b.controller.abort("user aborted");
-  assert.equal(b.aborted.length, 1);
-  assert.equal(b.aborted[0]?.reason, "user aborted");
+  assert.equal(b.aborted.length, 0);
   assert.equal(b.controller.state().phase, "disposed");
 });
 

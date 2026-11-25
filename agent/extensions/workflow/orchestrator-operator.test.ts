@@ -105,6 +105,8 @@ test("status reports the run record, TODO completion and the next row", async ()
   assert.match(result.text, /plan \.pi\/plans\/x\.md/);
   assert.match(result.text, /1\/2 rows done · next 2/);
   assert.match(result.text, /W=C:\/repo\/main \(primary\)/);
+  assert.match(result.text, /report \(row 2\):/);
+  assert.match(result.text, /Blocked on a missing token\./);
   assert.match(result.text, /next row: 2/);
   assert.doesNotMatch(result.text, /accepted/i);
 });
@@ -154,6 +156,16 @@ test("resume without a warm child re-dispatches the current row", async () => {
   const result = await operator.run("resume");
   assert.equal(result.ok, true);
   assert.deepEqual(calls, ["retry:2"]);
+  assert.match(result.text, /Fresh child started for row 2/);
+});
+
+test("a settled child is not resumable; resume starts a fresh child", async () => {
+  const { operator, calls } = harness({
+    child: () => ({ phase: "settling", todos: [] }),
+  });
+  const result = await operator.run("resume");
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["retry:2"], "settling is not a warm paused child");
   assert.match(result.text, /Fresh child started for row 2/);
 });
 
@@ -232,6 +244,9 @@ test("input routing forwards, queues and refuses around the live child", () => {
   });
   const idle = orchestratorInputDecision("keep going", { childPhase: "idle", hasRun: true });
   assert.equal(idle.action, "refuse");
+  if (idle.action !== "refuse") return;
+  assert.match(idle.notice, /orchestrator retry/);
+  assert.match(idle.notice, /[Rr]esume only continues a paused warm child/);
   assert.match(idle.action === "refuse" ? idle.notice : "", /orchestrator retry/);
   assert.deepEqual(orchestratorInputDecision("start", { childPhase: undefined, hasRun: false }), {
     action: "allow",

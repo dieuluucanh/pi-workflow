@@ -40,5 +40,5 @@ Everything else is ignored rather than validated.
 Removed: `workflow_execution`, `/orchestrator-repair-checks`, the
 `workflow-execution` footer segment, `plan_validate`, `/plan lint`,
 `/workflow lint`, and the chunked `review_plan_begin`/`chunk`/`finalize` write
-path. The four parent tools are `orchestrator_start`, `orchestrator_dispatch`,
-`orchestrator_status` and `orchestrator_retry`.
+path. The five parent tools are `orchestrator_start`, `orchestrator_dispatch`,
+`orchestrator_status`, `orchestrator_retry` and `orchestrator_abort`.

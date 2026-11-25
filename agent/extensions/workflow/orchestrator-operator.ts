@@ -206,6 +206,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
       switch (parsed.verb) {
         case "status": {
           const line = childLine(child);
+          const currentRow = run.currentRef
+            ? run.rows.find((row) => row.ref === run.currentRef)
+            : undefined;
           return {
             ok: true,
             verb: parsed.verb,
@@ -225,7 +228,15 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
                 : []),
               ...(line ? [line] : []),
               ...(run.blockedReason ? [`blocked: ${run.blockedReason}`] : []),
-              ...(next ? [`next row: ${next.ref} — ${next.text.slice(0, 200)}`] : ["every row is done"]),
+              ...(currentRow?.lastReport
+                ? [
+                    `report (row ${currentRow.ref}):`,
+                    currentRow.lastReport.slice(0, 1_200),
+                  ]
+                : []),
+              ...(next
+                ? [`next row: ${next.ref} — ${next.text.slice(0, 200)}`]
+                : ["every row is done"]),
             ].join("\n"),
           };
         }
@@ -259,7 +270,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "resume": {
-          if (child && (child.phase === "paused" || child.phase === "settling")) {
+          // Only a warm PAUSED child can be resumed. A settled child was
+          // released by the settle path, so the fallback starts a fresh one.
+          if (child && child.phase === "paused") {
             const resumed = await ports.resumeChild?.(parsed.rest || undefined);
             if (!resumed) {
               return fail(
@@ -441,7 +454,7 @@ export function orchestratorInputDecision(
     return {
       action: "refuse",
       notice:
-        "The Orchestrator run owns this session but no child is live. Use /orchestrator-resume to continue the warm child, or /orchestrator retry to start a fresh one.",
+        "The Orchestrator run owns this session but no child is live. Use /orchestrator retry to start a fresh child for the current row, or /orchestrator status to read its report. Resume only continues a paused warm child.",
     };
   }
   return { action: "allow" };

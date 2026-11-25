@@ -234,11 +234,92 @@ export function recordReport(
   });
 }
 
+/**
+ * Record a dispatch unless the row already reported after the attempt started.
+ *
+ * `dispatchOrchestratorRow` awaits child creation and prompt admission before
+ * it can record the dispatch. A child that settles inside that window has
+ * already written the report; recording against the pre-await snapshot would
+ * overwrite it (the 2026-11-24 session lost row 1's report that way). The
+ * settle wins: return the live record untouched and tell the caller.
+ */
+export function recordDispatchIfNotReported(
+  run: OrchestratorRun,
+  input: {
+    rowRef: string;
+    instruction: string;
+    childSessionId?: string;
+    workspaceId?: string;
+    cwd?: string;
+    /** Wall-clock captured before the child was created/admitted. */
+    startedAt: number;
+  },
+): { run: OrchestratorRun; recorded: boolean } {
+  const row = runRow(run, input.rowRef);
+  if (
+    row?.lastReportAt !== undefined &&
+    Number.isFinite(row.lastReportAt) &&
+    row.lastReportAt >= input.startedAt
+  ) {
+    return { run, recorded: false };
+  }
+  return { run: recordDispatch(run, input), recorded: true };
+}
+
+/**
+ * The parent (or the operator) stopped the live child. The row stays retryable
+ * and an existing settle report is never overwritten by the abort note.
+ */
+export function recordAbort(
+  run: OrchestratorRun,
+  input: { rowRef: string; report: string; reason: string; now?: number },
+): OrchestratorRun {
+  const rowRef = String(input.rowRef);
+  const at = input.now ?? Date.now();
+  const reason = cleanText(input.reason) || "child aborted";
+  return touch(run, {
+    phase: "paused",
+    blockedReason: `Aborted: ${reason}`,
+    rows: run.rows.map((row) =>
+      row.ref === rowRef && row.lastReport === undefined
+        ? { ...row, lastReport: input.report, lastReportAt: at }
+        : row,
+    ),
+  });
+}
+
+/**
+ * A child failure is not a normal settle: keep the row retryable, name the
+ * reason and record the report so a reload still explains what happened.
+ */
+export function recordFailure(
+  run: OrchestratorRun,
+  input: { rowRef: string; report: string; reason: string; now?: number },
+): OrchestratorRun {
+  const rowRef = String(input.rowRef);
+  const at = input.now ?? Date.now();
+  const reason = cleanText(input.reason) || "the child failed";
+  return touch(run, {
+    phase: "interrupted",
+    blockedReason: reason,
+    rows: run.rows.map((row) =>
+      row.ref === rowRef
+        ? { ...row, lastReport: input.report, lastReportAt: at }
+        : row,
+    ),
+  });
+}
+
 export function setRunPhase(
   run: OrchestratorRun,
   phase: OrchestratorRunPhase,
 ): OrchestratorRun {
-  const base = phase === "interrupted" ? run : clearBlockedReason(run);
+  // `paused` and `interrupted` are recovery states: their reason must survive
+  // the operator's follow-up `setPhase` call after an abort/failure.
+  const base =
+    phase === "interrupted" || phase === "paused"
+      ? run
+      : clearBlockedReason(run);
   return touch(base, { phase });
 }
 

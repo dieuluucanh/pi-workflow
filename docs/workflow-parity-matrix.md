@@ -101,17 +101,18 @@ Anchors are symbol names because line numbers drift. Sources: `agent/extensions/
 Frozen list: `agent/extensions/workflow/fixtures/compat-baseline.json` →
 `commands`. `compat-baseline.test.ts` fails on accidental drift.
 
-### 2.2 Registered tools (7)
+### 2.2 Registered tools (8)
 
 | Tool | Purpose | Anchor |
 | --- | --- | --- |
-| `workflow_todo` | todo list state, global refs, panel semantics | `todo-service.ts`, `todo-snapshot.ts` |
-| `workflow_execution` | execution/approval bookkeeping | `execution-state.ts` |
+| `workflow_todo` | todo list state, global refs, panel semantics, `cancel` for policy-blocked steps | `todo-service.ts`, `index.ts` |
 | `explore` | read-only reconnaissance subagent | `index.ts` (`runSingleAgent`) |
 | `questionnaire` | clarification UI tool | `questionnaire-view.ts`, `questionnaire-layout.ts` |
-| `orchestrator_start` | start an orchestrator row run | `orchestrator-tool-runtime.ts` |
-| `orchestrator_status` | report run/child state | `orchestrator-tool-runtime.ts` |
-| `orchestrator_retry` | retry a blocked row | `orchestrator-tool-runtime.ts` |
+| `orchestrator_start` | bind the run's rows | `orchestrator-tool-runtime.ts` |
+| `orchestrator_dispatch` | dispatch one row to a fresh in-process child | `orchestrator-tool-runtime.ts` |
+| `orchestrator_status` | report run/child state, the current report and the next action | `index.ts` (`orchestratorStatusText`) |
+| `orchestrator_retry` | re-dispatch the same row, with amended `instructions` | `orchestrator-tool-runtime.ts` |
+| `orchestrator_abort` | stop a live child, preserve its report, leave the row retryable | `orchestrator-tool-runtime.ts` |
 
 Frozen list: fixture `registeredTools`. Active Plan/Build tool sets are also
 frozen (`planActiveTools`, `buildActiveTools`), including the built-ins
@@ -322,7 +323,7 @@ explicitly labelled NOT RUN), **Class**, **Owning plan step**.
 | --- | --- |
 | Terminal/W | `orchestrator-*.ts` (state, store, runtime, tools, child controller/session/ui/view, workspace set, advance, mission, operator, adapters); in-process Build child; tools `orchestrator_start/status/retry`; commands `orchestrator`, `orchestrator-pause|resume|abort|view`; tests `orchestrator-*.test.ts` (state/store/runtime/tools/child-contract/advance/mission/operator/workspace/workspace-set/tool-runtime/adapters). |
 | D current | Generic related-session bridge (`src/shared/related-sessions.ts`, `src/host/related-sessions.ts`) with source-bound ownership, grants, epochs, dedupe; test fixtures `tests/host/extension-contract.e2e.test.ts` + `tests/fixtures/two-extension-contract.json`. |
-| Evidence | W: `orchestrator-*.test.ts` plus `orchestrator-parity.test.ts` (Builder model/source bootstrap and the empty-provider fallback, exact child tool allowlist excluding `orchestrator_*`/`questionnaire`, duplicate launch refused, stale/superseded launch disposal, provider/host failure without a settle, pause/resume/abort/settle-once, display-only child visibility) and `extension.test.ts` OE1–OE4 (real entrypoint: auto-accept/advance, warm repair then block, prose cascade without a parent turn, abort/retry). D: `tests/host/related-sessions.test.ts` + `tests/main/related-sessions.test.ts` (source-bound owner, host grant/epoch, duplicate request join/replay, timeout/teardown, idempotent create, focus/inspect/interrupt/close) and the real staged artifact in `tests/host/workflow-artifact-parity.test.ts` §“Orchestrator / related-session parity” (mode entry and status dispatch nothing, start without a plan refuses, child controls are inert, `/prompt` shows usage with zero orchestrator calls and zero `session-host:request`). Live provider turn, visible terminal child, separate window/pane, real `/reload` and host kill: **NOT RUN**. |
+| Evidence | W: `orchestrator-*.test.ts` plus `orchestrator-parity.test.ts` and `orchestrator-lifecycle.test.ts` (Builder model/source bootstrap and the empty-provider fallback, exact child tool allowlist excluding `orchestrator_*`/`questionnaire`, duplicate launch refused, stale/superseded launch disposal, provider/host failure without a settle, pause/resume, explicit abort reported once, settle release, display-only child visibility, the policy-blocked-vs-in-scope report contract, and next-row dispatch with no manual abort) and `extension.test.ts` OE1–OE4 (real entrypoint: auto-accept/advance, warm repair then block, prose cascade without a parent turn, abort/retry). D: `tests/host/related-sessions.test.ts` + `tests/main/related-sessions.test.ts` (source-bound owner, host grant/epoch, duplicate request join/replay, timeout/teardown, idempotent create, focus/inspect/interrupt/close) and the real staged artifact in `tests/host/workflow-artifact-parity.test.ts` §“Orchestrator / related-session parity” (mode entry and status dispatch nothing, start without a plan refuses, child controls are inert, `/prompt` shows usage with zero orchestrator calls and zero `session-host:request`). Live provider turn, visible terminal child, separate window/pane, real `/reload` and host kill: **NOT RUN**. |
 | Class | **SUPPORTED** (in-process Orchestrator contract + generic related-session bridge mechanics) · **UNVERIFIED** (live provider/visible-host acceptance) |
 | Steps | 33, 37 |
 

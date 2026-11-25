@@ -1,5 +1,57 @@
 ## Unreleased
 
+### Fixed — a settled Orchestrator child is released and its report can no longer be lost (2026-11-25)
+
+Session `01a20fc1-feb9-77a9-bb14-9e17961c1beb` proved three independent defects: a
+settle never released the child, the dispatch record overwrote the report, and
+the report was queued behind the parent's polling turn.
+
+- **The settle now releases the child.** `finish()` publishes `settling`, waits
+  (bounded) for `onSettled`, then publishes `idle`, unsubscribes and disposes
+  the session on the next macrotask. A report that cannot be recorded within
+  15 s fails honestly and still releases, so `orchestrator_dispatch` for the
+  next row can never be wedged by "a child is already settling".
+- **The lost update is fixed.** `dispatchOrchestratorRow` captured the run
+  record before `await controller.start()` and then wrote it back, clobbering
+  the report `onSettled` had just recorded (23:09:53.380 `idle`+report →
+  23:09:53.383 `running`+none). `recordDispatchIfNotReported(run, {startedAt})`
+  is a compare-and-set: a report at/after the attempt start wins. Dispatch is
+  also a short admission now (the tool no longer awaits the whole child run),
+  and the row's TODO status is only set when the dispatch was recorded.
+- **Reports are steered, not queued.** The wake message uses
+  `deliverAs: "steer"` (was `followUp`), so it lands at the parent's next tool
+  boundary instead of after its whole polling turn — the 23:12:56Z delay is
+  gone.
+- **The report is self-sufficient.** `orchestrator-report.ts` prepends
+  `Status:`, `Todos:`, `Cancelled:`, `Open:`, `Policy refusals:` and a
+  deterministic `Suggested:` line built from the child's final TODO list and
+  the policy refusals the controller observed. External blockers (a policy
+  refusal or a user-only action) are never re-dispatched; in-scope work is
+  retried on the same row. A hung settle cannot be misread as success.
+- **The parent can abort a live child.** New `orchestrator_abort` tool. It
+  releases `starting|running|paused`, preserves an existing report, and leaves
+  the row retryable; a settled child returns "nothing to abort" and its report
+  is never overwritten (the old path replaced it with "Child aborted: user
+  abort"). `orchestrator_retry` now accepts amended `instructions` for the
+  loop-back branch.
+- **Run-record honesty.** New `recordAbort`/`recordFailure`: abort keeps a real
+  report and records the reason as `paused`, failure records `interrupted`, and
+  `setRunPhase("paused")` no longer clears `blockedReason`.
+- **Child honesty.** `workflow_todo` gains `cancel`; a policy-blocked step is
+  recorded as `cancelled` (never `completed`) and the child contract requires
+  the final summary to name every step it did not complete and why. A cancelled
+  run row is terminal for row selection, so it cannot be re-dispatched forever.
+- **Mission v4** states the two-branch rubric, forbids polling while a child
+  runs, and requires the parent's final report to list every row's outcome and
+  every external deviation.
+- **Docs corrected:** the README no longer claims the deleted automatic
+  settle → diff → checks → verify → accept engine or "runtime-owned evidence";
+  the parent tool list is `start|dispatch|status|retry|abort`.
+- New tests: `orchestrator-report.test.ts`, `orchestrator-lifecycle.test.ts`
+  (7 end-to-end cases including the RC2 race and the policy-blocked branch),
+  plus controller/run/tool/operator/mission/contract coverage. The previously
+  unregistered `orchestrator-parity.test.ts` is now part of `npm test`.
+
 ### Changed — plan filenames carry a UTC time prefix (2026-11-24)
 
 New plans are written to `.pi/plans/YYYY-MM-DD-HHmm-<slug>.md` (UTC `HHmm`), so

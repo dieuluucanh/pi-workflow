@@ -32,7 +32,7 @@ test("tools: Orchestrator has the Build tool set plus the parent tools", () => {
   for (const tool of ["edit", "write", "bash", "read", "workflow_todo"]) {
     assert.ok(orchestrator.includes(tool), `${tool} must stay active`);
   }
-  for (const tool of ["orchestrator_start", "orchestrator_status"]) {
+  for (const tool of ["orchestrator_start", "orchestrator_status", "orchestrator_abort"]) {
     assert.ok(orchestrator.includes(tool), `${tool} must be active`);
   }
   assert.ok(orchestrator.includes("third_party_tool"));

@@ -28,10 +28,25 @@ test("the mission describes the dispatcher contract, not the frozen engine", () 
   assert.match(text, /trust the child's report/i);
   assert.match(text, /## Verification/);
   assert.match(text, /Never edit the plan file/);
+  assert.match(text, /do not poll/i);
   assert.doesNotMatch(text, /frozen row/i);
   assert.doesNotMatch(text, /automatic acceptance/i);
   assert.doesNotMatch(text, /bounded repair/i);
   assert.doesNotMatch(text, /row checks/i);
+});
+
+test("the mission routes external and in-scope blockers separately", () => {
+  const text = buildOrchestratorMission({ phase: "idle" });
+  assert.match(text, /Status:/);
+  assert.match(text, /Suggested:/);
+  assert.match(text, /External \/ out of scope/i);
+  assert.match(text, /do not re-dispatch/i);
+  assert.match(text, /orchestrator_abort/);
+  assert.match(text, /Internal \/ in scope/i);
+  assert.match(text, /retry the SAME row with orchestrator_retry/i);
+  assert.match(text, /amended `instructions`/);
+  assert.match(text, /final message must list each row's outcome/i);
+  assert.doesNotMatch(text, /mark it done"\s*,\s*"If it is blocked/i);
 });
 
 test("row counts are done/total, never accepted", () => {
@@ -57,9 +72,9 @@ test("every run phase has a next action, and unbound stays available", () => {
 });
 
 test("the mission version is bumped for the contract change", () => {
-  assert.equal(ORCHESTRATOR_MISSION_VERSION, 3);
+  assert.equal(ORCHESTRATOR_MISSION_VERSION, 4);
   assert.match(
     buildOrchestratorMission({ phase: "unbound" }),
-    /mission v3/,
+    /mission v4/,
   );
 });

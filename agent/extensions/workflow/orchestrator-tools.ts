@@ -9,7 +9,7 @@
  * Nothing here launches a session, calls a model or writes a file.
  */
 
-export const TOOLS_SCHEMA_VERSION = 2 as const;
+export const TOOLS_SCHEMA_VERSION = 3 as const;
 export const MAX_RECEIPT_TEXT = 1_000;
 export const MAX_STATUS_ROWS = 100;
 export const MAX_STEPS = 200;
@@ -21,6 +21,7 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "orchestrator_dispatch",
   "orchestrator_status",
   "orchestrator_retry",
+  "orchestrator_abort",
 ] as const;
 
 export type OrchestratorToolName = (typeof ORCHESTRATOR_TOOL_NAMES)[number];
@@ -139,7 +140,7 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
   {
     name: "orchestrator_retry",
     description:
-      "Re-dispatch the current or named row with its stored instruction and start a fresh in-process Build child for it. This is recovery, not acceptance: a compliant row is still completed through workflow_todo.",
+      "Re-dispatch the current or named row and start a fresh in-process Build child for it. Pass `instructions` to amend the stored instruction when the previous attempt left in-scope work unfinished; the amended instruction is stored for later retries. This is recovery, not acceptance: a compliant row is still completed through workflow_todo.",
     parameters: {
       type: "object",
       properties: {
@@ -147,8 +148,31 @@ export const ORCHESTRATOR_TOOLS: readonly ToolSpec[] = [
           type: "string",
           description: "Row ref (1..N). Omit to retry the current row.",
         },
+        instructions: {
+          type: "string",
+          description:
+            "Amended instruction for this attempt: name the concrete blocker and what remains. Omit to reuse the stored instruction.",
+        },
       },
       required: [],
+      additionalProperties: false,
+    },
+    bounded: true,
+  },
+  {
+    name: "orchestrator_abort",
+    description:
+      "Abort the live in-process Build child of the current row after checking its status. The row stays in progress and retryable with orchestrator_retry, an existing child report is preserved, and the worktree is released. It never marks the row done.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description:
+            "Why the child must stop; recorded in the run and in the parent's final report.",
+        },
+      },
+      required: ["reason"],
       additionalProperties: false,
     },
     bounded: true,

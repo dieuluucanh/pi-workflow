@@ -135,10 +135,13 @@ function makeController(over: {
     error?: string;
   }>;
   desiredModel?: () => { provider: string; id: string; thinking?: string } | undefined;
+  onSettled?: (input: ChildSettledInput) => void | Promise<void>;
+  settleReportTimeoutMs?: number;
 } = {}) {
   const states: OrchestratorChildState[] = [];
   const ops: Array<{ kind: string; text: string }> = [];
   const settled: unknown[] = [];
+  const errors: string[] = [];
   let creates = 0;
   const controller = createOrchestratorChildController({
     create: async () => {
@@ -154,8 +157,15 @@ function makeController(over: {
       ops.push(...list.map((op) => ({ kind: op.kind, text: op.text }))),
     onSettled: (input: ChildSettledInput) => {
       settled.push(input);
+      return over.onSettled?.(input);
+    },
+    onError: ({ error }: { error: string }) => {
+      errors.push(error);
     },
     ...(over.desiredModel ? { desiredModel: over.desiredModel } : {}),
+    ...(over.settleReportTimeoutMs === undefined
+      ? {}
+      : { settleReportTimeoutMs: over.settleReportTimeoutMs }),
     now: () => 1_000,
   } as never);
   return {
@@ -163,6 +173,7 @@ function makeController(over: {
     states,
     ops,
     settled,
+    errors,
     creates: () => creates,
   };
 }
@@ -397,8 +408,78 @@ test("controller: settle publishes the child's stats", async () => {
 
   fake.emit({ type: "agent_settled" });
   await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(settled.length, 1, "settle still runs");
+  assert.equal(
+    controller.state().phase,
+    "idle",
+    "a settled child is released, not left in settling",
+  );
+  assert.equal(fake.calls.disposes, 1, "the settled session is disposed");
+});
+
+test("controller: the settle event carries the final todos and policy refusals", async () => {
+  const fake = makeChild({ model: { provider: "open", id: "m" } });
+  const { controller, settled } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "open/m" }),
+  });
+  await controller.start(BASE);
+  fake.emit({
+    type: "tool_execution_end",
+    toolName: "workflow_todo",
+    isError: false,
+    result: {
+      details: {
+        todos: [
+          { step: 1, text: "Write the change", status: "completed" },
+          {
+            step: 2,
+            text: "Commit (blocked: commitPolicy=never)",
+            status: "cancelled",
+          },
+        ],
+      },
+    },
+  });
+  fake.emit({
+    type: "tool_execution_end",
+    toolName: "bash",
+    isError: true,
+    result: {
+      content: [
+        {
+          type: "text",
+          text: "Commit policy is 'never' (workflow.commitPolicy): `git add` is blocked.",
+        },
+      ],
+    },
+  });
+  fake.emit({ type: "agent_end", messages: [{ role: "assistant", content: "done" }] });
+  fake.emit({ type: "agent_settled" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const input = settled[0] as ChildSettledInput;
+  assert.equal(input.todos.length, 2);
+  assert.equal(input.todos[1]?.status, "cancelled");
+  assert.equal(input.policyRefusals.length, 1);
+  assert.match(input.policyRefusals[0] ?? "", /Commit policy is 'never'/);
+});
+
+test("controller: a hung settle report fails, releases and never wedges settling", async () => {
+  const fake = makeChild();
+  const { controller, errors } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "fake/model" }),
+    settleReportTimeoutMs: 20,
+    onSettled: () => new Promise<void>(() => {}),
+  });
+  await controller.start(BASE);
+  fake.emit({ type: "agent_settled" });
   assert.equal(controller.state().phase, "settling");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(controller.state().phase, "disposed");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0] ?? "", /report was not recorded/);
+  assert.equal(fake.calls.disposes, 1);
 });
 
 test("controller: stats are not republished when nothing changed", async () => {
@@ -627,10 +708,33 @@ test("a paused prompt rejection is not reported as a child failure", async () =>
   await waitForDeferred(() => h.controller.state().phase === "running", "running");
   await h.controller.pause();
   h.child.rejectPrompt(new Error("aborted by pause"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   const result = await running;
   assert.equal(result.ok, true);
   assert.deepEqual(h.errors, []);
   assert.equal(h.child.disposeCalls, 0);
+});
+
+test("start is a short admission and returns while the prompt is held", async () => {
+  const h = makeDeferredHarness();
+  const result = await h.controller.start(deferredStartInput);
+  assert.equal(result.ok, true);
+  assert.equal(h.controller.state().phase, "running");
+  assert.equal(h.child.promptCalls, 1);
+  h.child.finishPrompt();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+});
+
+test("a prompt rejection after admission reports one failure and releases", async () => {
+  const h = makeDeferredHarness();
+  const result = await h.controller.start(deferredStartInput);
+  assert.equal(result.ok, true);
+  h.child.rejectPrompt(new Error("network down"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(h.errors.length, 1);
+  assert.match(h.errors[0] ?? "", /network down/);
+  assert.equal(h.controller.state().phase, "disposed");
+  assert.equal(h.child.disposeCalls, 1);
 });
 
 test("resume is a short admission and waits for pause settlement", async () => {

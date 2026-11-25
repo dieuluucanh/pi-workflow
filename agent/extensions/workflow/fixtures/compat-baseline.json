@@ -8,6 +8,7 @@
   },
   "registeredTools": [
     "explore",
+    "orchestrator_abort",
     "orchestrator_dispatch",
     "orchestrator_retry",
     "orchestrator_start",

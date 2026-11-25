@@ -54,7 +54,7 @@ function harness(overrides: Partial<ParentToolPorts> = {}) {
 }
 
 test("the adapter schema version tracks the changed surface", () => {
-  assert.equal(TOOL_ADAPTER_SCHEMA_VERSION, 3);
+  assert.equal(TOOL_ADAPTER_SCHEMA_VERSION, 4);
 });
 
 test("start forwards the step union and workspace declarations", async () => {
@@ -148,7 +148,57 @@ test("retry accepts the legacy task-<ref> form and an explicit instruction", asy
   assert.deepEqual(calls.dispatch, { rowRef: "2", instructions: "Amended instruction." });
 });
 
-test("registration exposes exactly the four descriptors", () => {
+test("abort requires a reason, forwards it and accepts the truthful idle result", async () => {
+  const calls: Array<{ reason: string }> = [];
+  const { runtime } = harness({
+    abort: async (input) => {
+      calls.push(input);
+      return { ok: true as const, text: `aborted: ${input.reason}` };
+    },
+  });
+
+  const missing = await runtime.call("orchestrator_abort", {});
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.code, "invalid");
+  assert.equal(calls.length, 0, "a missing reason never reaches the child");
+
+  const result = await runtime.call("orchestrator_abort", {
+    reason: "  the child is stuck in a retry loop  ",
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.match(result.text, /the child is stuck in a retry loop/);
+  assert.deepEqual(calls, [{ reason: "the child is stuck in a retry loop" }]);
+});
+
+test("abort without a bound dispatcher is a clean refusal", async () => {
+  const { runtime } = harness();
+  const result = await runtime.call("orchestrator_abort", { reason: "stuck" });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "unavailable");
+    assert.match(result.text, /nothing was stopped/);
+  }
+});
+
+test("retry forwards an amended instruction so the parent can loop back", async () => {
+  const run = recordDispatch(boundRun(), {
+    rowRef: "1",
+    instruction: "Stored instruction for row one.",
+  });
+  const { runtime, calls } = harness({ run: () => run });
+  const result = await runtime.call("orchestrator_retry", {
+    rowRef: "1",
+    instructions: "The test at src/a.test.ts still fails; fix it and rerun.",
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.dispatch, {
+    rowRef: "1",
+    instructions: "The test at src/a.test.ts still fails; fix it and rerun.",
+  });
+});
+
+test("registration exposes exactly the five descriptors", () => {
   const { runtime } = harness();
   const registered: string[] = [];
   const outcome = runtime.register({
@@ -162,6 +212,7 @@ test("registration exposes exactly the four descriptors", () => {
     "orchestrator_dispatch",
     "orchestrator_status",
     "orchestrator_retry",
+    "orchestrator_abort",
   ]);
   assert.deepEqual(outcome.registered, registered);
   assert.equal(outcome.refused, null);

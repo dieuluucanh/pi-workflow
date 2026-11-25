@@ -15,7 +15,7 @@
 import type { OrchestratorRunPhase } from "./orchestrator-run.ts";
 
 export const ORCHESTRATOR_CONTEXT_ENTRY = "workflow-orchestrator-context";
-export const ORCHESTRATOR_MISSION_VERSION = 3 as const;
+export const ORCHESTRATOR_MISSION_VERSION = 4 as const;
 
 /** `unbound` means no run is bound yet; preparation is still available. */
 export type OrchestratorPhase = OrchestratorRunPhase | "unbound";
@@ -47,13 +47,13 @@ function nextLine(state: OrchestratorMissionState): string {
     case "unbound":
       return "Next action: when the user agrees, call orchestrator_start with one step per plan row and the workspaces the plan declares.";
     case "idle":
-      return "Next action: dispatch the next pending row with orchestrator_dispatch.";
+      return "Next action: read the current row's report, mark it done (or retry it with an amended instruction), then dispatch the next pending row.";
     case "running":
-      return "Next action: wait for the child's report; it wakes this parent.";
+      return "Next action: end your turn; the child's report wakes you (do not poll).";
     case "paused":
-      return "Next action: /orchestrator-resume continues the warm child, or /orchestrator retry starts a fresh one.";
+      return "Next action: /orchestrator-resume continues a warm paused child; otherwise orchestrator_retry re-dispatches the row with an amended instruction.";
     case "interrupted":
-      return "Next action: explain the blocker, then /orchestrator retry re-dispatches the stored row instruction.";
+      return "Next action: explain the blocker, then orchestrator_retry re-dispatches the stored row instruction with your amendment.";
     case "cancelled":
       return "Next action: the run was cancelled; start again from the approved plan when the user agrees.";
     case "completed":
@@ -79,14 +79,24 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "1. Read the approved plan (or the user's agreed steps) and decide the row list. One row is one repository root and one coherent change.",
     "2. Call orchestrator_start with `steps` — a string, or {text, workspace} for a non-primary root — and `workspaces` when the plan declares more than one root. The extension validates and resolves the roots; it does not compile the plan.",
     "3. Dispatch one row at a time with orchestrator_dispatch. It launches an in-process Build child with that row's root as cwd; no window or tab is opened.",
-    "4. When the child settles, its report wakes you. Read it. If the row is complete, mark it done with workflow_todo. If it is blocked, inspect the root cause, amend the row instruction and re-dispatch the same row.",
+    "4. When the child settles, its report wakes you. Read `Status:` and `Suggested:` first: they say whether the blocker is outside the row (a policy refusal such as workflow.commitPolicy: never, or an action only the user can take) or inside it (failing checks, missing code, unfinished work).",
     "5. Run the plan's `## Verification` once with ordinary bash before the last row is marked done. Show the real command and its output; there is no hidden gate.",
     "6. Never edit the plan file. Cross-repo work is multiple rows, never one row touching two roots.",
+    "",
+    "Blocker routing (the report's `Suggested:` line implements this):",
+    "- External / out of scope: do not re-dispatch. The child has already been released when you read its report; if it is still live (starting/running/paused), call orchestrator_abort first. Mark the row done with workflow_todo and carry the reason and the child's status into your final report.",
+    "- Internal / in scope: retry the SAME row with orchestrator_retry and amended `instructions` that name the concrete blocker and what remains. Do not start over.",
+    "",
+    "After orchestrator_dispatch, end your turn. The report is steered into your next step; do not poll orchestrator_status while the child works. Use orchestrator_status after a reload or when a report is unclear.",
+    "Use orchestrator_abort only for a live child that must stop (it preserves the last report and leaves the row retryable).",
+    "",
+    "Reporting: when the run ends, your final message must list each row's outcome (done / done with a policy-blocked step and why / retried / aborted). Never omit an unresolved deviation.",
     "",
     "Work entry (do this instead of changing mode):",
     "- When the user agrees, call orchestrator_start. Pass planPath for an approved plan, or title + steps for a standalone run.",
     "- Use orchestrator_status to inspect the run; /orchestrator inspect shows a row's instruction and last report.",
-    "- orchestrator_retry re-dispatches the current or named row with its stored instruction; it never accepts a row.",
+    "- orchestrator_retry re-dispatches the current or named row; pass `instructions` to amend it. It never accepts a row.",
+    "- orchestrator_abort stops a live child. It never accepts a row and never rewrites an existing report.",
     "",
     "Interaction:",
     "- User prompts while a child runs are forwarded to that child. Do not answer them yourself and do not ask the user to switch modes.",
@@ -94,7 +104,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "- /profile and /role switch the live Build child in place; the next child always launches on the same effective model.",
     "",
     "Permissions and limits:",
-    "- You have full Build permissions, but while a child is starting, running or settling the extension refuses your edits, writes and mutating shell commands: the child owns the worktree. Wait for its report or pause/abort it.",
+    "- You have full Build permissions, but while a child is starting, running or settling the extension refuses your edits, writes and mutating shell commands: the child owns the worktree. Wait for its report; call orchestrator_abort only if it must stop.",
     "- The approved plan is immutable by convention. Never edit the plan file.",
     "- Folder, read, write, commit and shell policies still apply exactly as they do in Build.",
     "- You trust the child's report; you do not re-run its checks. Mark a row done only after reading the report.",

@@ -282,7 +282,9 @@ import {
   createOrchestratorRun,
   markRunInterrupted,
   nextPendingRow,
-  recordDispatch,
+  recordAbort,
+  recordDispatchIfNotReported,
+  recordFailure,
   recordReport,
   restoreOrchestratorRun as restoreOrchestratorRunRecord,
   runRow,
@@ -317,15 +319,18 @@ import {
 } from "./orchestrator-child-contract.ts";
 import { createOrchestratorBuildChild } from "./orchestrator-child-session.ts";
 import {
+  DEFAULT_SETTLE_REPORT_TIMEOUT_MS,
   createOrchestratorChildController,
   type OrchestratorChildController,
 } from "./orchestrator-child-controller.ts";
+import { buildChildReport, summarizeChildTodos } from "./orchestrator-report.ts";
 import { orchestratorActivity } from "./orchestrator-activity.ts";
 import { createChildUiBridge, type ChildUiBridge } from "./orchestrator-child-ui.ts";
 import {
   ORCHESTRATOR_CHILD_BAND_ENTRY,
   ORCHESTRATOR_CHILD_TRANSCRIPT_ENTRY,
   formatOrchestratorChildProgress,
+  orchestratorChildSettled,
   registerOrchestratorChildRenderers,
 } from "./orchestrator-child-view.ts";
 import { orchestratorChildTeardowns } from "./orchestrator-child-teardown.ts";
@@ -1814,14 +1819,23 @@ export default function workflowExtension(
    * Which TODO list the pinned panel shows. `child` is a display toggle only:
    * prompt routing and the durable roadmap never change.
    */
+  /**
+   * A settled child is `idle` with a task id: the report landed and the
+   * session was released, but its final list is still worth showing.
+   */
   function childPanelActive(): boolean {
-    const phase = orchestratorChild?.state().phase;
+    const state = orchestratorChild?.state();
+    const phase = state?.phase;
     const live =
       phase === "starting" ||
       phase === "running" ||
       phase === "paused" ||
       phase === "settling";
-    return orchestratorChildView === "child" || (orchestratorChildView === "auto" && live);
+    return (
+      orchestratorChildView === "child" ||
+      (orchestratorChildView === "auto" &&
+        (live || orchestratorChildSettled(state)))
+    );
   }
 
   function refreshTodoPanel(ctx: ExtensionContext) {
@@ -1979,6 +1993,22 @@ export default function workflowExtension(
     const refs = new Set<string>();
     for (const item of todos.snapshot().items) {
       if (item.status === "completed" || item.completed === true) {
+        refs.add(item.ref ?? String(item.step));
+      }
+    }
+    return refs;
+  }
+
+  /**
+   * Rows that need no further dispatch: completed or explicitly cancelled.
+   * A cancelled row is terminal for row selection, otherwise an omitted
+   * `rowRef` (or retry's fallback) would pick it forever.
+   */
+  function settledRunRefs(): Set<string> {
+    const refs = new Set<string>();
+    for (const item of todos.snapshot().items) {
+      const status = itemStatus(item);
+      if (status === "completed" || status === "cancelled") {
         refs.add(item.ref ?? String(item.step));
       }
     }
@@ -9997,13 +10027,14 @@ export default function workflowExtension(
     name: "workflow_todo",
     label: "Workflow Todo",
     description:
-      "Manage the plan todo list. Steps are numbered GLOBALLY 1..N — use these numbers as refs. Actions: list, update (send the COMPLETE list; items you omit are removed), done/pending (set one item's status by ref), add (new ad-hoc item), toggle, sync (re-read the plan file), clear.",
+      "Manage the plan todo list. Steps are numbered GLOBALLY 1..N — use these numbers as refs. Actions: list, update (send the COMPLETE list; items you omit are removed), done/pending/cancel (set one item's status by ref), add (new ad-hoc item), toggle, sync (re-read the plan file), clear.",
     promptGuidelines: [
       "workflow_todo: update existing tasks with their returned `id` (or current `ref`); never rewrite the whole plan with shortened text-only entries — that creates duplicate tasks.",
       "workflow_todo: send the COMPLETE todo list to `update`; a step you omit is removed and stays removed (explicit `sync` may restore it).",
       "workflow_todo: mark a step `completed` IMMEDIATELY after finishing it (never batch completions at the end).",
       "workflow_todo: keep exactly one step `in_progress`; set it before starting a step and clear it when that step is done.",
       "workflow_todo: never mark a step `completed` unless the work is fully done (Claude Code rule: never based on intent).",
+      "workflow_todo: cancel a step a policy forbids (name the policy in the step text) — never mark it completed.",
       "workflow_todo: reference steps by their GLOBAL number (shown before the text), never the plan's per-phase label.",
     ],
     parameters: Type.Object({
@@ -10012,6 +10043,7 @@ export default function workflowExtension(
         "update",
         "done",
         "pending",
+        "cancel",
         "add",
         "toggle",
         "clear",
@@ -10157,7 +10189,8 @@ export default function workflowExtension(
           };
         }
         case "done":
-        case "pending": {
+        case "pending":
+        case "cancel": {
           const ref =
             params.label === undefined
               ? params.step === undefined
@@ -10191,8 +10224,43 @@ export default function workflowExtension(
             };
           }
           const it = resolved.item;
+          if (params.action === "done") {
+            const childState = orchestratorChild?.state();
+            const phase = childState?.phase;
+            const live =
+              phase === "starting" ||
+              phase === "running" ||
+              phase === "paused";
+            const liveRef = childState?.ref ?? orchestratorRun?.currentRef;
+            if (
+              workflowMode === "orchestrator" &&
+              orchestratorRun !== undefined &&
+              live &&
+              liveRef !== undefined &&
+              todoRef(it) === liveRef
+            ) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Row ${todoRef(it)} is still being executed by the Build child. Wait for its report, or call orchestrator_abort first; the row stays retryable with orchestrator_retry.`,
+                  },
+                ],
+                details: {
+                  action: params.action,
+                  todos: [...todos.items],
+                  nextStep: todos.items.length + 1,
+                  error: "child-live",
+                } as TodoDetails,
+              };
+            }
+          }
           const status: TodoStatus =
-            params.action === "done" ? "completed" : "pending";
+            params.action === "done"
+              ? "completed"
+              : params.action === "cancel"
+                ? "cancelled"
+                : "pending";
           setTodoStatus(it, status);
           try {
             if (currentSessionCtx) {
@@ -10207,7 +10275,13 @@ export default function workflowExtension(
             content: [
               {
                 type: "text",
-                text: `${todoRef(it)}. ${it.text} ${it.completed ? "done" : "pending"}`,
+                text: `${todoRef(it)}. ${it.text} ${
+                  status === "completed"
+                    ? "done"
+                    : status === "cancelled"
+                      ? "cancelled"
+                      : "pending"
+                }`,
               },
             ],
             details: {
@@ -13082,7 +13156,14 @@ export default function workflowExtension(
     if (!run) {
       return "No Orchestrator run is bound to this session. Call orchestrator_start with the plan's steps.";
     }
-    const lines = [
+    const child = orchestratorChild?.state();
+    const summary = child ? summarizeChildTodos(child.todos) : undefined;
+    const settledChild = orchestratorChildSettled(child);
+    const firstLine = (value: string): string =>
+      (value.split(/\r?\n/).find((line) => line.trim()) ?? value)
+        .trim()
+        .slice(0, 160);
+    const lines: string[] = [
       `Run ${run.runId} · ${run.phase} · ${run.title}`,
       ...(run.planPath ? [`Plan: ${run.planPath}`] : []),
     ];
@@ -13090,16 +13171,107 @@ export default function workflowExtension(
       const item = todos.items.find((candidate) => todoRef(candidate) === row.ref);
       lines.push(`${row.ref}. [${item?.status ?? "pending"}] ${row.text}`);
       if (row.lastReport) {
+        // The current row gets the status block and the start of the summary;
+        // earlier rows stay one line so six rows cannot flood the tool result.
         lines.push(
-          `   report: ${row.lastReport.replace(/\s+/g, " ").slice(0, 400)}`,
+          `   report: ${
+            row.ref === run.currentRef
+              ? row.lastReport.slice(0, 1_200).replace(/\n/g, "\n   ")
+              : firstLine(row.lastReport)
+          }`,
         );
       }
     }
-    const child = orchestratorChild?.state();
-    lines.push(
-      `Child: ${child?.phase ?? "idle"}${child?.modelLabel ? ` · ${child.modelLabel}` : ""}`,
-    );
-    return lines.join("\n");
+    if (child?.taskId) {
+      const word =
+        child.phase === "settling"
+          ? "settling"
+          : child.phase === "disposed"
+            ? child.lastError
+              ? "failed"
+              : run.phase === "cancelled" || run.phase === "completed"
+                ? run.phase
+                : run.blockedReason?.startsWith("Aborted:")
+                  ? "aborted"
+                  : "disposed — no error recorded"
+            : settledChild
+              ? "settled"
+              : child.phase;
+      const bits = [`Child: ${word}`];
+      if (child.ref) {
+        bits.push(`row ${child.ref}${child.total ? `/${child.total}` : ""}`);
+      }
+      if (summary && summary.total > 0) {
+        bits.push(
+          `todos ${summary.completed}/${summary.total} · ${summary.cancelled} cancelled · ${summary.open} open`,
+        );
+      }
+      if (child.modelLabel) bits.push(child.modelLabel);
+      if (child.phase === "settling" && child.settlingAt !== undefined) {
+        bits.push(
+          `report pending for ${Math.round(
+            Math.max(0, Date.now() - child.settlingAt) / 1000,
+          )}s`,
+        );
+      }
+      lines.push(bits.join(" · "));
+      if (child.lastError && child.phase === "disposed") {
+        lines.push(`  error: ${child.lastError.slice(0, 300)}`);
+      }
+      if (summary && summary.cancelledItems.length > 0) {
+        lines.push(
+          `  cancelled: ${summary.cancelledItems
+            .map((item) => `${item.step}. ${item.text}`)
+            .join(" | ")}`,
+        );
+      }
+      if (summary && summary.openItems.length > 0) {
+        lines.push(
+          `  open: ${summary.openItems
+            .map((item) => `${item.step}. ${item.text}`)
+            .join(" | ")}`,
+        );
+      }
+      const refusals = child.policyRefusals ?? [];
+      if (refusals.length > 0) {
+        lines.push(`  policy refused: ${refusals[refusals.length - 1]!.slice(0, 300)}`);
+      }
+    } else {
+      lines.push("Child: idle");
+    }
+    const live =
+      child !== undefined &&
+      (child.phase === "starting" ||
+        child.phase === "running" ||
+        child.phase === "paused" ||
+        child.phase === "settling");
+    const current = run.currentRef ? runRow(run, run.currentRef) : undefined;
+    const currentComplete =
+      current !== undefined &&
+      todos.items.find((item) => todoRef(item) === current.ref)?.completed === true;
+    let next: string;
+    if (live) {
+      next =
+        "Wait for the report; it is steered into your next step. Do not poll while the child runs.";
+    } else if (run.phase === "interrupted") {
+      next = `Retry row ${run.currentRef ?? "?"} with orchestrator_retry and an amended instruction.`;
+    } else if (run.phase === "paused") {
+      next = `Retry row ${run.currentRef ?? "?"} with orchestrator_retry (resume only continues a paused warm child).`;
+    } else if (run.phase === "cancelled" || run.phase === "completed") {
+      next = "No further dispatch; report the run result to the user.";
+    } else if (current && current.lastReport !== undefined && !currentComplete) {
+      next = `Read row ${current.ref}'s report, then mark it done or retry it with an amended instruction.`;
+    } else if (currentComplete) {
+      const pending = nextPendingRow(run, (ref) => settledRunRefs().has(ref));
+      next = pending
+        ? `Dispatch row ${pending.ref} with orchestrator_dispatch.`
+        : "Every row is done; run the plan's final verification if it has one.";
+    } else {
+      next = "Dispatch the next pending row with orchestrator_dispatch.";
+    }
+    lines.push(`Next: ${next}`);
+    const text = lines.join("\n");
+    return text.length > 12_000 ? `${text.slice(0, 11_999)}…` : text;
   }
 
   async function dispatchOrchestratorRow(input: {
@@ -13118,22 +13290,51 @@ export default function workflowExtension(
         text: "No Orchestrator run is bound. Call orchestrator_start first.",
       };
     }
-    const phase = orchestratorChild?.state().phase;
+    const childState = orchestratorChild?.state();
+    const phase = childState?.phase;
     if (
       phase === "starting" ||
       phase === "running" ||
       phase === "settling" ||
       phase === "paused"
     ) {
+      const settlingFor =
+        phase === "settling" && childState?.settlingAt !== undefined
+          ? Math.max(0, Date.now() - childState.settlingAt)
+          : 0;
+      const stalled = settlingFor > DEFAULT_SETTLE_REPORT_TIMEOUT_MS * 0.8;
       return {
         ok: false,
         code: "busy",
-        text: `A child is already ${phase}. Wait for its report, or pause/abort it first.`,
+        text: stalled
+          ? `The child settled but its report has been pending for ${Math.round(settlingFor / 1000)}s; it is released automatically within ${Math.round(DEFAULT_SETTLE_REPORT_TIMEOUT_MS / 1000)}s. If it stays stuck, call orchestrator_abort.`
+          : `A child is already ${phase}. Wait for its report${
+              phase === "paused"
+                ? ", or /orchestrator-resume to continue it"
+                : ""
+            }. Use orchestrator_abort only if it must be stopped.`,
       };
     }
-    const completed = (ref: string) =>
-      todos.items.find((item) => todoRef(item) === ref)?.completed === true;
-    const rowRef = input.rowRef?.trim() || nextPendingRow(run, completed)?.ref;
+    const settled = (ref: string) => {
+      const item = todos.items.find((candidate) => todoRef(candidate) === ref);
+      if (!item) return false;
+      const status = itemStatus(item);
+      return status === "completed" || status === "cancelled";
+    };
+    const explicitRef = input.rowRef?.trim();
+    const current = run.currentRef ? runRow(run, run.currentRef) : undefined;
+    if (
+      !explicitRef &&
+      current?.lastReport !== undefined &&
+      !settled(current.ref)
+    ) {
+      return {
+        ok: false,
+        code: "pending-report",
+        text: `Row ${current.ref} has a recorded report but is still pending. Read it and mark it done with workflow_todo, or retry it with orchestrator_retry and an amended instruction.`,
+      };
+    }
+    const rowRef = explicitRef || nextPendingRow(run, settled)?.ref;
     if (!rowRef) {
       return {
         ok: false,
@@ -13240,6 +13441,7 @@ export default function workflowExtension(
       };
     }
     orchestratorPendingInstruction = instructions;
+    const dispatchStartedAt = Date.now();
     const started = await controller.start({
       taskId,
       attemptId,
@@ -13257,21 +13459,43 @@ export default function workflowExtension(
         text: `The Build child could not start: ${started.error}.`,
       };
     }
-    orchestratorRun = recordDispatch(run, {
+    const liveRun = orchestratorRun;
+    if (!liveRun || liveRun.runId !== run.runId) {
+      orchestratorPendingInstruction = undefined;
+      return {
+        ok: false,
+        code: "stale",
+        text: "The run changed while the child was starting, so the dispatch was not recorded. Inspect it with orchestrator_status before dispatching again.",
+      };
+    }
+    const recorded = recordDispatchIfNotReported(liveRun, {
       rowRef: row.ref,
       instruction: instructions,
       childSessionId: sessionId,
       ...(workspaceId ? { workspaceId } : {}),
       ...(cwd ? { cwd } : {}),
+      startedAt: dispatchStartedAt,
     });
+    orchestratorRun = recorded.run;
     orchestratorPendingInstruction = undefined;
-    todos.setStatus(row.ref, "in_progress");
+    if (recorded.recorded) {
+      todos.setStatus(row.ref, "in_progress");
+    }
     persistState();
     updateStatus(owner);
     return {
       ok: true,
-      text: `Dispatched row ${row.ref}/${total} to an in-process Build child${cwd ? ` in ${cwd}` : ""}. The child owns verification; its report will wake you.`,
-      details: { runId: run.runId, rowRef: row.ref, attemptId, sessionId, cwd },
+      text: recorded.recorded
+        ? `Dispatched row ${row.ref}/${total} to an in-process Build child${cwd ? ` in ${cwd}` : ""}. The child owns the row now; end your turn — its report will wake you, so do not poll orchestrator_status.`
+        : `Row ${row.ref} settled before its dispatch was recorded; the report is recorded. Read it before dispatching another row.`,
+      details: {
+        runId: run.runId,
+        rowRef: row.ref,
+        attemptId,
+        sessionId,
+        cwd,
+        recorded: recorded.recorded,
+      },
     };
   }
 
@@ -13284,7 +13508,7 @@ export default function workflowExtension(
     const ref =
       rowRef ??
       run.currentRef ??
-      nextPendingRow(run, (candidate) => completedRunRefs().has(candidate))?.ref;
+      nextPendingRow(run, (candidate) => settledRunRefs().has(candidate))?.ref;
     const row = ref ? runRow(run, ref) : undefined;
     if (!row) {
       return {
@@ -13299,10 +13523,53 @@ export default function workflowExtension(
     return { ok: dispatched.ok, text: dispatched.text };
   }
 
+  /**
+   * Stop the live Build child on the parent's behalf.
+   *
+   * Idempotent by design: a settled child has already been released, so the
+   * tool reports "nothing to abort" instead of an error and never overwrites
+   * the report that landed. The row is never accepted here.
+   */
+  async function abortOrchestratorRow(reason: string): Promise<{
+    ok: true;
+    text: string;
+    details: Record<string, unknown>;
+  }> {
+    const run = orchestratorRun;
+    if (!run) {
+      return {
+        ok: true,
+        text: "No Orchestrator run is bound; nothing was aborted.",
+        details: { aborted: false },
+      };
+    }
+    const state = orchestratorChild?.state();
+    const phase = state?.phase;
+    const live =
+      phase === "starting" || phase === "running" || phase === "paused";
+    const ref = state?.ref ?? run.currentRef ?? "";
+    if (!live) {
+      return {
+        ok: true,
+        text: `No live Build child${ref ? ` for row ${ref}` : ""} to abort. Its last report is recorded; mark the row done or retry it with orchestrator_retry.`,
+        details: { aborted: false, ...(ref ? { rowRef: ref } : {}) },
+      };
+    }
+    const bounded = reason.trim().slice(0, 500) || "parent abort";
+    await orchestratorChild?.abort(bounded, { notify: false });
+    updateStatusIfBound();
+    return {
+      ok: true,
+      text: `Aborted the Build child for row ${ref}. The row stays retryable with orchestrator_retry; an existing report was preserved.`,
+      details: { aborted: true, ...(ref ? { rowRef: ref } : {}) },
+    };
+  }
+
   const parentTools = createParentToolRuntime({
     run: () => orchestratorRun,
     statusText: () => orchestratorStatusText(),
     dispatch: async (input) => dispatchOrchestratorRow(input),
+    abort: async (input) => abortOrchestratorRow(input.reason),
     startEligible: () => {
       if (workflowMode !== "orchestrator") {
         return "Orchestrator start is available in Orchestrator mode only. Enter it with /orchestrator; no /build switch is needed.";
@@ -18644,34 +18911,57 @@ export default function workflowExtension(
         const run = orchestratorRun;
         const ref = orchestratorChild?.state().ref ?? run?.currentRef;
         if (run && ref) {
-          orchestratorRun = recordReport(run, {
+          const report = buildChildReport({
+            outcome: "settled",
+            summary: settled.summary,
+            todos: settled.todos,
+            policyRefusals: settled.policyRefusals,
+          });
+          orchestratorRun = recordReport(run, { rowRef: ref, report });
+          persistState();
+          wakeParentWithReport(ref, report);
+        }
+        updateStatusIfBound();
+      },
+      onError: async ({ error, todos, policyRefusals }) => {
+        const run = orchestratorRun;
+        const ref = orchestratorChild?.state().ref ?? run?.currentRef;
+        if (run && ref) {
+          const report = buildChildReport({
+            outcome: "failed",
+            reason: error,
+            summary: "",
+            todos,
+            policyRefusals,
+          });
+          orchestratorRun = recordFailure(run, {
             rowRef: ref,
-            report: settled.summary,
+            report,
+            reason: error,
           });
           persistState();
-          wakeParentWithReport(ref, settled.summary);
-        }
-        updateStatusIfBound();
-      },
-      onError: async ({ error }) => {
-        const run = orchestratorRun;
-        const ref = orchestratorChild?.state().ref ?? run?.currentRef;
-        if (run && ref) {
-          const report = `Child failed: ${error}`;
-          orchestratorRun = recordReport(run, { rowRef: ref, report });
-          persistState();
           wakeParentWithReport(ref, report);
         }
         updateStatusIfBound();
       },
-      onAborted: async ({ reason }) => {
+      onAborted: async ({ reason, notify, todos, policyRefusals }) => {
         const run = orchestratorRun;
         const ref = orchestratorChild?.state().ref ?? run?.currentRef;
         if (run && ref) {
-          const report = `Child aborted: ${reason}`;
-          orchestratorRun = recordReport(run, { rowRef: ref, report });
+          const report = buildChildReport({
+            outcome: "aborted",
+            reason,
+            summary: "",
+            todos,
+            policyRefusals,
+          });
+          orchestratorRun = recordAbort(run, {
+            rowRef: ref,
+            report,
+            reason,
+          });
           persistState();
-          wakeParentWithReport(ref, report);
+          if (notify !== false) wakeParentWithReport(ref, report);
         }
         updateStatusIfBound();
       },
@@ -18683,9 +18973,12 @@ export default function workflowExtension(
     const text = [
       `[ORCHESTRATOR CHILD REPORT — row ${ref}]`,
       "",
-      report.slice(0, 8_000),
+      report.slice(0, 12_000),
       "",
-      "Review the report. If the row is complete, mark it done with `workflow_todo` and call `orchestrator_dispatch` for the next row. If it is blocked, inspect the root cause, amend the row instruction and re-dispatch it with `orchestrator_retry` or `orchestrator_dispatch`. Run the plan's `## Verification` once before the last row is marked done.",
+      "Read `Status:` and `Suggested:` first, then branch:",
+      "- External blocker (a policy refusal such as workflow.commitPolicy: never, or an action only the user can take): do not re-dispatch. The child has already been released; if it is still live, call `orchestrator_abort` first. Mark the row done and carry the reason and the child's status into your final report to the user.",
+      "- In-scope blocker (failing checks, missing code, unfinished work the child can still do): retry the same row with `orchestrator_retry` and amended `instructions` that name the concrete blocker and what remains.",
+      "After dispatch, end your turn: the report is steered into your next step, so do not poll `orchestrator_status`. Run the plan's `## Verification` once before the last row is marked done.",
     ].join("\n");
     try {
       void (pi as any).sendMessage?.(
@@ -18694,7 +18987,7 @@ export default function workflowExtension(
           content: text,
           display: true,
         },
-        { triggerTurn: true, deliverAs: "followUp" },
+        { triggerTurn: true, deliverAs: "steer" },
       );
     } catch {
       /* display-only */

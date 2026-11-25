@@ -27,9 +27,11 @@
 > - a reload blocks a `running` row and pauses the run; retry starts a fresh
 >   child. Old managed-worker sessions open as ordinary Build.
 >
-> Parent tools are `orchestrator_start|status|retry`; there is no
-> `workflow_worker_ready`, `orchestrator_verify|accept|repair` or
-> `workflow-bridge`. See the package README and CHANGELOG.
+> Parent tools are `orchestrator_start|dispatch|status|retry|abort`; there is
+> no `workflow_worker_ready`, `orchestrator_verify|accept|repair` or
+> `workflow-bridge`. A settle always produces a `Status:`/`Suggested:` report
+> and releases the child before the parent sees it. See the package README and
+> CHANGELOG.
 
 > **Superseded 2026-11-22 (Orchestrator simplification).** The
 > propose → preview → execution-approval pipeline described in the older body of
@@ -60,15 +62,28 @@ named platform/provider.
 The implementation is opt-in and experimental. Orchestrator mode is off by
 default; ordinary Plan → Review → Build is unchanged.
 
+## Current flow (2026-11-25) — manual checklist
+
+These four cases are the current contract. They require a real provider and a
+real terminal; the automated suites use fake ports and are **not** a substitute.
+
+| # | Case | Expected evidence | Status |
+| --- | --- | --- | --- |
+| C1 | External policy blocker | A row whose last step is a commit, with `workflow.commitPolicy: never`. The child marks the step `cancelled` with the policy named; the report shows `Policy refusals: Commit policy is 'never'` and `Suggested: External blocker (policy)`. The parent does **not** retry; it marks the row done and row 2 dispatches immediately. | NOT RUN |
+| C2 | In-scope blocker | A failing check the child leaves red. The report shows an open step and `Suggested: Work remains…`; the parent calls `orchestrator_retry` with amended `instructions`, and the fresh child finishes the row. | NOT RUN |
+| C3 | Stuck child | A child held `running` (or a dead provider). `orchestrator_abort` releases it, an existing report is intact, and `orchestrator_retry` starts a fresh child. | NOT RUN |
+| C4 | Reload between rows | Settle row 1, `/reload`, then dispatch row 2. The run restores `idle` with the report; dispatch succeeds without an abort. | NOT RUN |
+
 ## Status update (2026-11-24, step 33 parity)
 
 **Automated (run and green, not live acceptance):** workflow
-`orchestrator-parity.test.ts` pins the Builder model/source bootstrap
-(role vs session fallback, no borrowed thinking level), the exact child tool
-allowlist (never `orchestrator_*` or `questionnaire`), duplicate-launch
-refusal, stale/superseded launch disposal, honest host/provider failure
-without a settle, pause/resume/abort settling once, and the display-only child
-visibility projection. Desktop
+`orchestrator-parity.test.ts` is now part of `npm test` and pins the Builder
+model/source bootstrap (role vs session fallback, no borrowed thinking level),
+the exact child tool allowlist (never `orchestrator_*` or `questionnaire`),
+duplicate-launch refusal, stale/superseded launch disposal, honest
+host/provider failure without a settle, pause/resume, an explicit abort reported
+once, a settled child released without an abort callback, and the display-only
+child visibility projection. Desktop
 `tests/host/workflow-artifact-parity.test.ts` loads the **real staged
 `@dieulc/workflow` bundle** and proves Orchestrator mode entry/status dispatch
 nothing, an Orchestrator start without an approved plan refuses, the child

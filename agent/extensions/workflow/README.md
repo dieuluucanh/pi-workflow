@@ -133,17 +133,32 @@ short Plan → Review → Build work keeps its current behavior.
   extension instance. It gets the Workflow-managed Build tool set and every
   policy gate (write, folder, read, commit, shell), creates its own task-local
   TODO list before the first edit, and never orchestrates or edits the parent
-  run. A managed child is exempt from the parent/child worktree exclusion; the
-  parent itself is refused edit/write/mutating shell while a child is live.
+  run. A managed child is exempt from the parent/child worktree exclusion.
+- **The parent has full Build permissions; the child owns the worktree while
+  live.** The parent may read, inspect and use its TODO list, but edit/write and
+  mutating shell are refused while the child is `starting|running|settling`.
+  A settle releases the child immediately.
 - **One panel list authority.** The session `TodoStore` is the list the pinned
   panel renders and the list `workflow_todo` mutates; a child has its own.
-- **The parent trusts the report.** A settled child's report wakes the parent
-  with `workflow_todo`/`orchestrator_dispatch` instructions. The parent reads
-  it, marks the row done with `workflow_todo`, and dispatches the next row. It
-  does not re-run the child's checks and does not fix code itself.
-- **Blockers stay visible.** A blocked report leaves the row in progress: the
-  parent inspects the root cause, amends the instruction and re-dispatches
-  (`orchestrator_retry` reuses the stored instruction).
+- **The parent trusts the report.** A settle produces a report and releases
+  the child. The report is steered into the parent's next step (never a
+  follow-up queued behind a polling turn) and carries a deterministic
+  `Status:`/`Todos:`/`Suggested:` block built from the child's final task-local
+  list and any policy refusal. The parent reads it, marks the row done with
+  `workflow_todo`, and dispatches the next row. It does not re-run the child's
+  checks and does not fix code itself.
+- **Blocker routing is explicit.** An external blocker — a policy refusal such
+  as `workflow.commitPolicy: never`, or an action only the user may take — is
+  never re-dispatched: the child is already released, the row is marked done,
+  and the reason plus the child's status go into the parent's final report. An
+  in-scope blocker — failing checks, missing code, unfinished work — is retried
+  on the same row with `orchestrator_retry` and amended `instructions`.
+- **The parent can stop a live child.** `orchestrator_abort` releases a child
+  that is `starting|running|paused`; the row stays retryable, an existing report
+  is preserved, and a settled child reports "nothing to abort" instead of an
+  error. Dispatch is a short admission: it returns as soon as the child accepts
+  the kickoff, so the parent must end its turn rather than poll
+  `orchestrator_status`.
 - **Reload is a lost child.** `restoreOrchestratorRun` restores the record; a
   `running` phase becomes `interrupted` and the footer says so. Old journals,
   frozen snapshots and run directories are never read or migrated.
@@ -221,21 +236,25 @@ verdicts.
 
 - **Wired in the entrypoint:** the four-mode ring, a fresh authoritative
   mission injection, `orchestrator_start` (plan path or explicit steps), the
-  frozen TODO snapshot and its persistence, the automatic settle →
-  report → diff → checks → verify → accept → next-row engine, the parent tools
-  (`orchestrator_start|status|retry`), the child lifecycle controller, the
-  transcript entries and the operator commands (`/orchestrator status|start|
-  pause|resume|abort|stop|inspect|view|say|retry|cancel` plus the
-  `/orchestrator-*` aliases), and the neutral execution chooser.
+  mutable TODO row list and its persistence, the model-driven dispatch
+  lifecycle (short admission → child runs → settle report → release → next
+  row), the five parent tools (`orchestrator_start|dispatch|status|retry|abort`),
+  the child lifecycle controller, the transcript entries, the operator commands
+  (`/orchestrator status|start|pause|resume|abort|stop|inspect|view|say|retry|
+  cancel` plus the `/orchestrator-*` aliases), and the neutral execution chooser.
 - **Child composition:** one in-process SDK session per row with
   `noExtensions: true` + this extension as the only additional path, an explicit
   Workflow-managed Build allowlist (`questionnaire` and `orchestrator_*` are
   excluded), the parent UI bridge for permission dialogs, and a registered
   teardown that runs after `AgentSession.dispose()` (which never emits
   `session_shutdown`).
-- **Runtime-owned evidence:** the engine captures the baseline and the diff,
-  runs the checks through the gated executor and applies acceptance itself. No
-  model-supplied evidence exists.
+- **Settle report and release:** `onSettled` prepends a deterministic
+  `Status:`/`Todos:`/`Cancelled:`/`Open:`/`Policy refusals:`/`Suggested:` block
+  to the child's summary, stores it on the row, releases the child session and
+  steers the report into the parent's next step. `onError` and `onAborted` use
+  the same builder and record `interrupted`/`paused` with a reason; neither
+  overwrites an existing settle report. There is no automatic accept: the
+  parent marks rows done through `workflow_todo`.
 - **NOT RUN:** real provider/model turns, real terminal/Desktop rendering of the
   child transcript entries, and `/reload` in a live TUI. See
   [`../../../docs/orchestrator-live-acceptance.md`](../../../docs/orchestrator-live-acceptance.md)

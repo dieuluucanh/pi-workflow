@@ -225,6 +225,7 @@ export function buildOrchestratorChildSystemPrompt(
     "- Do not sync or adopt the parent plan's steps. Your list is local to this row.",
     "- Do not ask the user to switch modes or to use /build. You already have full Build tools and policies.",
     "- Do not ask the user questions; if a decision is genuinely ambiguous, choose the safest reasonable assumption and state it in your final summary.",
+    "- If a policy forbids a step (for example a commit under `workflow.commitPolicy: never`, or a folder/read/write denial), do not retry it and never mark it completed. Record it as `cancelled` with the policy named in the item text, leave the work uncommitted, and list it under `## Not done` in your final summary.",
     "- Use read/edit/write/bash/grep/find/ls normally. The normal write, folder, read, commit and shell policies apply.",
     "- When the row is done, stop with a short summary of what changed, the files touched and exactly what you ran to verify it. The parent trusts your report; do not claim acceptance.",
   ].join("\n");
@@ -289,7 +290,9 @@ export function buildOrchestratorChildKickoff(
       "1. Create your task-local TODO list now with `workflow_todo` — one item per real sub-step. Mutations are refused until it exists.",
       "2. Work the list in order. Mark a step completed immediately; keep one in progress.",
       "3. Run the verification the row or the plan names, then say exactly what you ran and what it printed.",
-      "4. Stop and answer with a concise summary: what changed, files touched, checks run, anything the parent must know.",
+      "4. Stop and answer with a concise summary: what changed, files touched, checks run with their real result, and every step you did NOT complete with the reason (policy or otherwise). The parent branches on it.",
+      "",
+      "When a policy forbids a step, do not retry it and never mark it completed: mark it `cancelled` with the policy named in the item text, leave the work uncommitted, and list it under `## Not done` in your final summary.",
       "",
       "Do not orchestrate, do not edit the parent run, and do not ask the user to switch modes. The parent trusts your report instead of re-verifying it.",
       repair,
