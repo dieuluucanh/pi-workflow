@@ -608,6 +608,26 @@ export interface ReviewSubmitDeps {
 
 const DEFAULT_MAX_CHUNK_CHARS = 6_000;
 
+/**
+ * Remove a previously appended `## Reviewer Revisions (round N)` section.
+ *
+ * `ReviewSubmitDeps.originalPlan()` reads the LIVE plan file, which after pass 1
+ * already ends with pass 1's revisions section. Composing the next submission
+ * from that raw text would stack a second section on top of the first, so the
+ * base is cut back to the author's body before the new section is rendered.
+ * Cutting at the FIRST heading also drops any sections stacked behind it.
+ *
+ * Deliberately NOT folded into `utils.stripReviewAppendix`: that helper defines
+ * `planHash` and the re-review dedupe inputs, so widening it would change which
+ * plans count as already reviewed.
+ */
+export function stripReviewerRevisions(text: string): string {
+    if (typeof text !== "string") return "";
+    const hit = text.search(/^[ \t]*## Reviewer Revisions \(round /m);
+    if (hit === -1) return text;
+    return text.slice(0, hit).trimEnd();
+}
+
 const VERDICT_SCHEMA = Type.Union([
     Type.Literal("approve"),
     Type.Literal("revise"),
@@ -949,7 +969,10 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                       )
                 : [];
 
-            const original = deps.originalPlan() ?? "";
+            // Pass 2 resubmits against a plan file that already carries pass 1's
+            // revisions section: strip it so the round's section is replaced,
+            // not stacked, and `planHash(planBody)` stays the author's body.
+            const original = stripReviewerRevisions(deps.originalPlan() ?? "");
             const targetPath = deps.planPath();
             if (!targetPath) {
                 return {
@@ -1185,7 +1208,7 @@ export function createReviewPassDoneTool(deps: ReviewPassDoneDeps): {
         name: "review_pass_done",
         label: "Finish Review Pass",
         description:
-            "End the current review pass with your verdict and findings. Call this AFTER review_submit_plan — a pass that submits nothing is rejected. Pass 1 completes the review; if the harness schedules a verification pass, it will prompt you for pass 2 next.",
+            "End the current review pass with your verdict and findings. Call this AFTER review_submit — a pass that submits nothing is rejected. Pass 1 completes the review; if the harness schedules a verification pass, it will prompt you for pass 2 next.",
         parameters: Type.Object({
             pass: Type.Optional(
                 Type.Union([Type.Literal(1), Type.Literal(2)], {
@@ -1228,11 +1251,11 @@ export function createReviewPassDoneTool(deps: ReviewPassDoneDeps): {
                         {
                             type: "text",
                             text: [
-                                "review_pass_done: REFUSED — you have not submitted a plan this pass.",
+                                "review_pass_done: REFUSED — you have not submitted findings this pass.",
                                 "",
-                                "Your review only reaches the user through `review_submit_plan`.",
-                                "Submit the complete revised plan (unchanged is fine if it is sound),",
-                                "then call review_pass_done again.",
+                                "Your review only reaches the user through `review_submit`.",
+                                "Submit your findings and required revisions (unchanged is fine if",
+                                "the plan is sound), then call review_pass_done again.",
                             ].join("\n"),
                         },
                     ],

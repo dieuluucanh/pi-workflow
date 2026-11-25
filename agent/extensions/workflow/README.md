@@ -73,7 +73,7 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/prompt-model [status]` | Show the effective prompt-refinement model and thinking level, its source (trusted project / global / Default-mode inherit) and any shadowed scope. `set <provider/model> [thinking] [global\|project]` saves a validated override; `inherit [global\|project]` writes an explicit inherit sentinel (a trusted project inherit suppresses a global override); `reset [global\|project]` removes only that scope. Never changes the main session model |
 | `/review-mode [on\|off] [global\|project]` | Enable/disable Review Mode (default `off`). `status` prints the effective config, naming the settings file that supplied the timeout, and any shadowed scope. `off` is allowed while a finished handoff is pending (it becomes a plain handoff) but refused while a reviewer round/pause/gate is active (`/review-abort` first) |
 | `/review-mode timeout <seconds\|unlimited> [global\|project]` | Set or show the per-pass time cap (`unlimited`/`0` = no cap). Writes only `timeoutMs` to global settings by default; it never pins `enabled` |
-| `/review-prompt [global]` | Edit the reviewer's guidance (defaults to "align with the existing framework and industry best practice") |
+| `/review-prompt [global]` | Edit the project's additional reviewer guidance (adds to the fixed criteria — it can never replace or weaken one) |
 | `/review-status` | Show review phase, model, plan hash, findings and any error |
 | `/review [path]` | Run a one-shot review round now, **in Plan mode only**. Without a path it uses this run's plan write, then the session's latest plan write; works with Review Mode on or off (mode stays OFF). Outside Plan it refuses with guidance (`/plan`, then `/review`) and never switches modes implicitly. An explicit path must be under `.pi/plans/` |
 | `/review-pause` | Pause the in-flight review round (keeps the reviewer session warm). Same as ESC while a review owns the turn |
@@ -461,9 +461,17 @@ Roles load from `~/.pi/agent/roles.json` (with a `<cwd>/.pi/roles.json` project 
 
 ### Reviewer guidance
 
-`.pi/review-prompt.md` (project) wins over `~/.pi/agent/review-prompt.md` (global), which wins over the built-in default. Edit it with `/review-prompt`.
+The five review criteria are **fixed in the reviewer's system prompt** (`REVIEW_CRITERIA`, embedded in `REVIEW_SYSTEM_PROMPT`). No file can override them:
 
-The built-in default asks the reviewer to, in priority order: align with the **existing project framework**, follow **industry best practice**, verify every requirement maps to a plan step, check the plan is executable without guessing, and prefer simplicity. Repository context files (`AGENTS.md`, `CLAUDE.md`, …) also load into the reviewer's system prompt, which is where most framework alignment actually comes from.
+1. **Framework alignment** — follow the conventions, module layout, naming, error handling and dependency choices this repository already established; call out every divergence.
+2. **Industry best practice** — correctness, security, error handling, testability, observability, performance, migration/rollback safety.
+3. **Requirement coverage** — every requirement maps to at least one plan step (a requirement with no step is a Critical finding).
+4. **Executability** — each step is concrete enough to implement without guessing: file paths, symbols, a verifiable outcome.
+5. **Simplicity and over-engineering** — prefer the smallest change that satisfies the requirements; flags unnecessary steps, speculative abstractions, extra layers, dependencies nobody asked for, and out-of-scope work. Solving more than the requirement asks for is a finding, not extra value.
+
+`.pi/review-prompt.md` (project) wins over `~/.pi/agent/review-prompt.md` (global), which wins over the built-in default text. Edit it with `/review-prompt`. Either file is **additional guidance appended to the fixed criteria**, never a replacement — so an override cannot remove or weaken a criterion, it can only add emphasis or project-specific rules.
+
+Repository context files (`AGENTS.md`, `CLAUDE.md`, …) also load into the reviewer's system prompt, which is where most framework alignment actually comes from.
 
 This guidance lives **only in the reviewer's session**. Plan Mode receives a single neutral line ("a reviewer will audit this plan") and can never see the reviewer's prompt, findings, or transcript.
 
@@ -506,12 +514,16 @@ harness appends a `## Reviewer Revisions (round N)` section and preserves the
 original plan body. The chunked `review_plan_begin`/`chunk`/`finalize` write
 path and the `replacement-body` submission are gone.
 
+A pass-2 resubmission **replaces** that round's `## Reviewer Revisions (round N)`
+section instead of stacking a second one, and the original plan body is still
+preserved — so `planHash` stays the author's body across both passes.
+
 ### Two passes
 
-1. **Review + rewrite** — audits the plan against the repository and the guidance, records findings, submits the revised plan (one-shot for short plans, `review_plan_begin`/`chunk`/`finalize` when the plan exceeds two chunks).
-2. **Self-verify** — re-reads the original and the rewrite, confirms every accepted finding was actually addressed, and reports anything that was silently dropped. This pass exists because a rewrite can lose a requirement the author cared about.
+1. **Review** — audits the plan against the repository and the guidance, records findings, and submits the required revisions (append-only).
+2. **Self-verify** — re-reads the original and the appended revisions, confirms every `accepted` finding appears as a concrete revision, checks that nothing was dropped or weakened, and runs the named **over-engineering check**: do the revisions add layers, abstractions, configuration flags, dependencies, phases or steps the requirements do not need?
 
-Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews resubmit pass 1's plan directly. When pass 2 runs it checks a **unified diff** of the rewrite (not two full plans), so the self-check costs roughly a tenth of the tokens.
+Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews keep pass 1's section as-is. When pass 2 runs it checks a **unified diff** of the revisions (not two full plans), so the self-check costs roughly a tenth of the tokens.
 
 ### Every change is visible
 

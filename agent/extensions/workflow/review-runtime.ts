@@ -261,7 +261,10 @@ export function buildPass1Prompt(input: {
     "`review_pass_done`. The harness appends one Reviewer Revisions section to",
     "the plan; the original body is preserved.",
     "",
-    "## Your review guidance (authoritative)",
+    "## Additional reviewer guidance",
+    "",
+    "This guidance supplements the fixed review criteria in your system prompt and",
+    "cannot remove or replace them.",
     "",
     input.reviewPrompt,
   ];
@@ -373,22 +376,23 @@ export function buildPass1Prompt(input: {
   return parts.join("\n");
 }
 
-/** Prompt for pass 2: verify the reviewer's own rewrite. */
+/** Prompt for pass 2: verify the reviewer's own findings and revisions. */
 export function buildPass2Prompt(input: {
   planPath: string;
   originalPlan: string;
   rewrittenPlan: string;
   findings: ReviewFinding[];
 }): string {
-  // Step 9: pass 2 checks the rewrite against a diff, not two full plans.
+  // Step 9: pass 2 checks the revision against a diff, not two full plans.
   const diff = buildPlanDiff(input.originalPlan, input.rewrittenPlan);
   return [
-    "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REWRITE]",
+    "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REVISIONS]",
     "",
-    "You just rewrote the plan and submitted it. Now check your own work. This pass",
-    "exists because a rewrite can silently drop a requirement the author cared about.",
+    "You just submitted findings and required revisions. Now check your own work.",
+    "This pass exists because a revision can silently drop a requirement the author",
+    "cared about — or add work the plan does not need.",
     "",
-    "## What changed (unified diff of your rewrite)",
+    "## What changed (unified diff of the revisions you appended)",
     "",
     "```diff",
     diff,
@@ -405,17 +409,25 @@ export function buildPass2Prompt(input: {
     "",
     "## Check, in order",
     "",
-    "1. Is every finding you marked `accepted` actually reflected in the rewrite?",
-    "2. Did you drop or weaken any requirement, step, invariant, or verification",
-    "   item that was present in the original? List anything lost — this is the most",
-    "   important check.",
-    "3. Does the rewrite still describe a plan that can be executed without guessing?",
+    "1. Does every finding you marked `accepted` appear as a concrete revision in the",
+    "   appended `## Reviewer Revisions` section?",
+    "2. Did any revision drop or weaken a requirement, step, invariant, or verification",
+    "   item that was present in the original plan? List anything lost — this is the",
+    "   most important check.",
+    "3. Over-engineering check — do the required revisions add work the stated",
+    "   requirements do not need: extra layers, abstractions, configuration flags,",
+    "   dependencies, phases, or steps? Delete such a revision or mark it `deferred`",
+    "   instead of prescribing it.",
+    "4. Does the plan, with those revisions applied, still describe work that can be",
+    "   executed without guessing?",
     "",
     "## Required output",
     "",
-    "If the rewrite is correct, resubmit it unchanged with an empty findings array and",
-    "verdict `approve`. If you lost something or a finding is not addressed, fix it and",
-    "resubmit with the corrected plan. Then call `review_pass_done` with pass 2.",
+    "Call `review_submit` again with the SAME findings and required revisions,",
+    "corrected only where this check found a problem. Do NOT submit an empty findings",
+    "array: the resubmission REPLACES this round's `## Reviewer Revisions` section",
+    "rather than stacking a second one, and an empty array would re-render it without",
+    "pass 1's findings. Then call `review_pass_done` with pass 2.",
   ].join("\n");
 }
 
@@ -1597,7 +1609,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const pass2Prompt = buildPass2Prompt({
           planPath: input.planPath,
           originalPlan,
-          rewrittenPlan: p1.submitted.planBody,
+          rewrittenPlan: p1.submitted.planText,
           findings: state?.findings ?? [],
         });
         const p2 = await runPass(2, deadline, rc, () => {

@@ -6374,7 +6374,7 @@ export default function workflowExtension(
 
   pi.registerCommand("review-prompt", {
     description:
-      "Edit the reviewer's guidance (framework alignment / best practice) used by Review Mode",
+      "Edit the project's additional reviewer guidance — adds to (never replaces) the fixed review criteria",
     handler: async (args, ctx) => {
       const cwd = (ctx as any)?.cwd ?? process.cwd();
       const agentDir = reviewAgentDir();

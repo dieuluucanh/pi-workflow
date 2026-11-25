@@ -1,5 +1,36 @@
 ## Unreleased
 
+### Changed — Review criteria are fixed; reviewer guidance is additive (2026-11-25)
+
+- **The five criteria moved out of the overridable prompt.** They now live in
+  `REVIEW_CRITERIA`, embedded verbatim in `REVIEW_SYSTEM_PROMPT`, instead of in
+  the `DEFAULT_REVIEW_PROMPT` text a file could replace. The rules of
+  engagement (read-only, protocol, restraint) moved with them.
+- **`review-prompt.md` is additional guidance.** `.pi/review-prompt.md`
+  (project) still wins over `~/.pi/agent/review-prompt.md` (global), but both
+  are now appended to the fixed criteria and can no longer replace a criterion —
+  an override cannot remove or weaken one, only add emphasis.
+- **Criterion 5 is extended to simplicity and over-engineering.** It now names
+  the smallest change that satisfies the requirements, and flags unnecessary
+  steps, speculative abstractions, extra layers, unwanted configuration or
+  dependencies, and out-of-scope work as findings.
+- **Pass 2 diffs the actual revisions.** It re-reads the original plan and the
+  appended `## Reviewer Revisions` section, and its prompt includes the named
+  **over-engineering check** (do the revisions add layers, abstractions,
+  configuration flags, dependencies, phases or steps the requirements do not
+  need?).
+- **A round's resubmission replaces its section.** Pass 2's `review_submit`
+  strips the round's `## Reviewer Revisions (round N)` section before appending,
+  so the section is replaced rather than stacked and `planHash` stays the
+  author's plan body.
+- **`/review-prompt` and the `prompt` status line say guidance-only.** The
+  command description reads "additional reviewer guidance — adds to (never
+  replaces) the fixed review criteria", and `/review-mode status` prints
+  `prompt : <source> (guidance; fixed criteria always apply)`, so neither reads
+  as a way to rewrite the criteria themselves.
+- `DEFAULT_REVIEW_PROMPT` is kept as a deprecated alias for the new
+  `DEFAULT_REVIEW_GUIDANCE`, which holds the built-in guidance text only.
+
 ### Fixed — a settled Orchestrator child is released and its report can no longer be lost (2026-11-25)
 
 Session `01a20fc1-feb9-77a9-bb14-9e17961c1beb` proved three independent defects: a

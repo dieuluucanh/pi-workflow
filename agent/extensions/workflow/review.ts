@@ -646,7 +646,7 @@ export interface ReviewStatusInput {
   timeoutSource: ReviewConfigScopeSource;
   /** Effective reviewer model, when the reviewer role is configured. */
   reviewer?: { provider: string; id: string; thinking: string };
-  /** Resolved reviewer prompt source (path or built-in label). */
+  /** Where the additional reviewer guidance came from (project/global/default). */
   promptSource: string;
   /** Whether each settings file carries a `workflow.reviewMode` fragment. */
   sources: { global: boolean; project: boolean };
@@ -668,7 +668,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
         ? `${model.provider}/${model.id} (${model.thinking})`
         : "unconfigured — /role set reviewer <provider/model>"
     }`,
-    `  prompt         : ${input.promptSource}`,
+    `  prompt         : ${input.promptSource} (guidance; fixed criteria always apply)`,
     `  rounds         : ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
     `  explore budget : ${c.exploreBudget}   timeout: ${formatReviewTimeoutLabel(
       c.timeoutMs,
@@ -712,44 +712,25 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
 // ── Step 3: Review prompt resolution ─────────────────────────────────
 
 /**
- * Built-in reviewer guidance. The resolved prompt is appended to the
+ * Built-in reviewer guidance. The resolved guidance is appended to the
  * reviewer's SYSTEM prompt inside the child session only — it is never
  * injected into the parent (Plan Mode) context.
+ *
+ * The review criteria and the reviewer's rules of engagement live in
+ * `REVIEW_CRITERIA` / `REVIEW_SYSTEM_PROMPT` (they are fixed), so this default
+ * is guidance only, not the criteria set: a project/global review-prompt.md
+ * replaces this default text as guidance only and still gets the system
+ * prompt's criteria and rules.
  */
-export const DEFAULT_REVIEW_PROMPT = [
-  "Always align with the existing project framework and industry best practice.",
-  "",
-  "Your job is to independently audit a plan that another agent produced, then",
-  "rewrite it so it is correct, complete, and idiomatic for THIS repository.",
-  "",
-  "Review criteria, in priority order:",
-  "",
-  "1. Framework alignment — does the plan follow the conventions, module layout,",
-  "   naming, error-handling style, and dependency choices already established in",
-  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
-  "   divergence explicitly.",
-  "2. Industry best practice — correctness, security, error handling, testability,",
-  "   observability, performance, and migration/rollback safety. Cite the specific",
-  "   practice when you flag a gap.",
-  "3. Requirement coverage — every requirement in the shared context must map to at",
-  "   least one plan step. A requirement with no step is a Critical finding.",
-  "4. Executability — each step must be concrete enough to implement without",
-  "   guessing: file paths, symbols, and a verifiable outcome.",
-  "5. Simplicity — remove unnecessary steps, speculative abstractions, and work that",
-  "   is out of scope for the stated goal.",
-  "",
-  "Rules:",
-  "",
-  "- You may READ anything: files, git history, docs, tests, prior plans.",
-  "- You may NOT write code or modify any file. The ONLY write you may perform is",
-  "  submitting the revised plan through `review_submit`.",
-  "- Never invent files, APIs, or conventions. Verify with read/grep/find/ls first.",
-  "- If the plan is already sound, say so and submit it unchanged rather than",
-  "  inventing findings to look useful.",
-  "- Preserve the original plan's structure and the author's intent. Adjust; do not",
-  "  replace it with your own different plan.",
-  "- Keep the plan's existing heading style so its steps remain machine-extractable.",
-].join("\n");
+export const DEFAULT_REVIEW_GUIDANCE =
+  "Always align with the existing project framework and industry best practice.";
+
+/**
+ * @deprecated Use DEFAULT_REVIEW_GUIDANCE. Kept for published imports.
+ * Guidance only — never the full criteria set (those are fixed in
+ * `REVIEW_SYSTEM_PROMPT`).
+ */
+export const DEFAULT_REVIEW_PROMPT = DEFAULT_REVIEW_GUIDANCE;
 
 export interface ReviewPromptPaths {
   global: string;
@@ -776,17 +757,25 @@ function readTextSafe(fp: string): string | undefined {
   }
 }
 
+/** Which scope supplied the reviewer guidance (`default` = built-in text). */
 export type ReviewPromptSource = "project" | "global" | "default";
 
 export interface ResolvedReviewPrompt {
+  /** Additional reviewer guidance; appended to the fixed system prompt. */
   text: string;
+  /** Which scope supplied `text` (project wins over global over default). */
   source: ReviewPromptSource;
+  /** File that supplied `text`; absent for the built-in default. */
   path?: string;
 }
 
 /**
- * Resolve the user's reviewer guidance: project file wins over global file
- * wins over the built-in default. Never throws.
+ * Resolve the user's additional reviewer guidance: project file wins over
+ * global file wins over the built-in default. Never throws.
+ *
+ * The result is GUIDANCE ONLY. Both files add guidance on top of the fixed
+ * `REVIEW_CRITERIA` embedded in `REVIEW_SYSTEM_PROMPT`; no file can remove or
+ * replace a criterion.
  */
 export function resolveReviewPrompt(
   cwd: string,
@@ -2565,9 +2554,41 @@ export class ReviewTranscript {
 }
 
 /**
+ * The fixed review criteria, in priority order. Embedded verbatim in
+ * `REVIEW_SYSTEM_PROMPT`; user guidance (review-prompt.md) is appended to that
+ * prompt and can add emphasis, but it cannot remove these criteria.
+ *
+ * One array element per printed line, matching `REVIEW_SYSTEM_PROMPT`.
+ */
+export const REVIEW_CRITERIA: readonly string[] = [
+  "1. Framework alignment — does the plan follow the conventions, module layout,",
+  "   naming, error-handling style, and dependency choices already established in",
+  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
+  "   divergence explicitly.",
+  "2. Industry best practice — correctness, security, error handling, testability,",
+  "   observability, performance, and migration/rollback safety. Cite the specific",
+  "   practice when you flag a gap.",
+  "3. Requirement coverage — every requirement in the shared context must map to at",
+  "   least one plan step. A requirement with no step is a Critical finding.",
+  "4. Executability — each step must be concrete enough to implement without",
+  "   guessing: file paths, symbols, and a verifiable outcome.",
+  "5. Simplicity and over-engineering — prefer the smallest change that satisfies",
+  "   the stated requirements and this repository's conventions. Flag unnecessary",
+  "   steps, speculative abstractions, extra layers, configuration or dependencies",
+  "   nobody asked for, and work that is out of scope for the stated goal. Solving",
+  "   more than the requirement asks for is a finding, not extra value.",
+];
+
+/**
  * The reviewer's system prompt. The user's guidance (review-prompt.md) is
  * APPENDED to this, and the whole thing lives only in the child session —
  * Plan Mode never sees it (requirement: Plan cannot see Review's context).
+ *
+ * `## Review criteria` carries the fixed `REVIEW_CRITERIA`. The rules that used
+ * to live in the old `DEFAULT_REVIEW_PROMPT` "Rules:" block now live here:
+ * the READ-ONLY paragraph (no writes except the submit tool), the Protocol
+ * steps (read context, verify, record findings, submit, pass_done), and
+ * Restraint (never invent, submit unchanged if sound, preserve structure).
  */
 export const REVIEW_SYSTEM_PROMPT = [
   "You are REVIEW MODE: an independent auditor that supervises another agent's plan.",
@@ -2578,7 +2599,11 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "You are READ-ONLY. You cannot edit files, run mutating shell commands, install",
   "anything, or build. You may run test/lint/typecheck commands. Your single write",
-  "action is submitting the revised plan through the `review_submit` tool.",
+  "action is submitting findings and required revisions through `review_submit`.",
+  "",
+  "## Review criteria (fixed; in priority order)",
+  "",
+  ...REVIEW_CRITERIA,
   "",
   "## Tools",
   "",
@@ -2594,8 +2619,9 @@ export const REVIEW_SYSTEM_PROMPT = [
   "  tests or linters — but never assert that something passes unless you ran it.",
   "- `review_explore` — delegate focused read-only reconnaissance to subagents",
   "  (rarely needed: the pass-1 prompt already carries Plan Mode's recon).",
-  "- `review_submit` — submit the final rewritten plan. This is the ONLY way",
-  "  your work reaches the user. A review that never submits is a failed review.",
+  "- `review_submit` — submit your findings and required revisions. This is the",
+  "  ONLY way your work reaches the user. A review that never submits is a failed",
+  "  review.",
   "- `review_pass_done` — end the current pass with a verdict and your findings.",
   "",
   "## Protocol",
@@ -2606,8 +2632,8 @@ export const REVIEW_SYSTEM_PROMPT = [
   "   about what exists.",
   "3. Record every issue as a finding: severity 1-10, confidence 0-100, a category, a",
   "   file/line anchor when you have one, a one-line summary, and a rationale.",
-  "4. Rewrite the plan so it is correct and framework-aligned, then submit it with",
-  "   `review_submit`.",
+  "4. Record the required revisions that make the plan correct and",
+  "   framework-aligned, then submit them with `review_submit`.",
   "5. End the pass with `review_pass_done`.",
   "",
   "You may run test/lint/typecheck commands, but not builds. Never assert that",
@@ -2618,9 +2644,9 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "- If the plan is sound, submit it unchanged and say so. Never invent findings to",
   "  appear useful — a false finding costs the user more than a missed nit.",
-  "- Adjust the plan; do not replace it with a different plan of your own. Preserve",
-  "  the author's structure, step numbering, and heading style so the plan stays",
-  "  machine-extractable.",
+  "- Adjust the plan through required revisions; do not replace it with a different",
+  "  plan of your own. Preserve the author's structure, step numbering, and heading",
+  "  style so the plan stays machine-extractable.",
   "- Never invent files, symbols, APIs, or conventions. If you cannot verify",
   "  something, say so in the finding rather than asserting it.",
 ].join("\n");
@@ -2676,6 +2702,8 @@ export interface CreateReviewSessionOptions {
   findModel: (provider: string, id: string) => unknown;
   /**
    * Resolved user reviewer guidance, appended to REVIEW_SYSTEM_PROMPT.
+   * The review criteria live in the system prompt itself (`REVIEW_CRITERIA`);
+   * this text supplements them and can never remove or replace one.
    *
    * Note: the pruned Plan Mode history is NOT passed to the session manager.
    * The 3-argument `SessionManager.inMemory(cwd, opts, entries)` form only
