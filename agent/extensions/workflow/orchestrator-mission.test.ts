@@ -86,59 +86,10 @@ test("every run phase has a next action, and unbound stays available", () => {
 });
 
 test("the mission version is bumped for the contract change", () => {
-  assert.equal(ORCHESTRATOR_MISSION_VERSION, 5);
+  assert.equal(ORCHESTRATOR_MISSION_VERSION, 6);
   assert.match(
     buildOrchestratorMission({ phase: "unbound" }),
-    /mission v5/,
-  );
-});
-
-test("the mission states how review notes are carried and reported", () => {
-  const text = buildOrchestratorMission({ phase: "idle" });
-  assert.match(text, /Review notes \(advisory\):/);
-  assert.match(text, /attaches each row's review notes to that row's child kickoff/i);
-  assert.match(text, /Do not drop them/i);
-  assert.match(text, /advisory/i);
-  assert.match(text, /approved plan wins on any conflict/i);
-  assert.match(text, /never a requirement, a gate or an acceptance criterion/i);
-  assert.match(text, /conflicts with the plan/);
-  assert.match(text, /with the row ref and the child's reason/i);
-});
-
-test("unbound review notes render with ids and step refs, capped", () => {
-  const long = "x".repeat(600);
-  const text = buildOrchestratorMission({
-    phase: "running",
-    unboundReviewNotes: [
-      { id: "R2", step: "3", change: "tighten the retry guard" },
-      { id: "R4", change: "name the seam" },
-      { id: "R9", step: "7", change: long },
-    ],
-  });
-  assert.match(text, /Unbound review notes \(place them yourself\):/);
-  assert.match(text, /- R2 · Step 3: tighten the retry guard/);
-  assert.match(text, /- R4: name the seam/);
-  const cappedLine = text
-    .split("\n")
-    .find((line) => line.startsWith("- R9 · Step 7:"));
-  assert.ok(cappedLine, "the R9 line is rendered");
-  assert.match(cappedLine, /…$/);
-  assert.ok(
-    cappedLine.length <= 230,
-    `long note change is capped, got ${cappedLine.length} chars`,
-  );
-  assert.match(text, /Decide which row each one belongs to/i);
-  assert.match(text, /approved plan still wins on any conflict/i);
-});
-
-test("no unbound notes means no unbound section", () => {
-  assert.doesNotMatch(
-    buildOrchestratorMission({ phase: "idle" }),
-    /Unbound review notes/,
-  );
-  assert.doesNotMatch(
-    buildOrchestratorMission({ phase: "idle", unboundReviewNotes: [] }),
-    /Unbound review notes/,
+    /mission v6/,
   );
 });
 

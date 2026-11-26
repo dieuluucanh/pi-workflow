@@ -894,16 +894,24 @@ export interface PlanHandoffEligibility {
    * when the run ends in Plan (the tool_result handler was missed).
    */
   planWrittenInPlanMode: boolean;
+  /**
+   * A Planner↔Reviewer revision turn resolved in THIS run (the Planner settled
+   * `plan_revision_done`, silently revised the body, or made no change at all).
+   * Pass it only for the run that answers a revision follow-up: that run may
+   * hand off (or re-review) without writing a plan itself.
+   */
+  revisionSettled?: boolean;
 }
 
 /**
- * A handoff requires all three: the workflow is in Plan mode NOW, the run
- * wrote a plan, and that write happened under Plan mode. Session-lifetime
- * plan files and old todos never authorize a handoff.
+ * A handoff requires Plan mode plus EITHER a write made under Plan mode in this
+ * run, OR a revision turn that resolved in this run. Session-lifetime plan
+ * files and old todos never authorize a handoff.
  */
 export function shouldHandoffPlan(input: PlanHandoffEligibility): boolean {
+  if (input.mode !== "plan") return false;
+  if (input.revisionSettled === true) return true;
   return (
-    input.mode === "plan" &&
     input.planWrittenThisRun === true &&
     input.planWrittenInPlanMode === true
   );
@@ -1549,16 +1557,7 @@ export interface ParsedReviewNotes {
   notes: ReviewNote[];
   /** Round number of the section that was read, when the plan has one. */
   round?: number;
-  /** Top-level numbered plan steps outside the appendix (row alignment count). */
-  stepCount: number;
 }
-
-/**
- * Appendix headings. `stripReviewAppendix` and `countPlanSteps` share this
- * list so "outside the appendix" means the same thing in both places.
- */
-const REVIEW_APPENDIX_HEADING =
-  /^[ \t]*##[ \t]+(?:Reviewer Revisions|Review changes|Unresolved findings)\b/m;
 
 /** `## Reviewer Revisions (round N)` — the last match wins in the parser. */
 const REVIEWER_REVISIONS_HEADING =
@@ -1572,31 +1571,6 @@ const ANY_MARKDOWN_HEADING = /^[ \t]*#{1,6}[ \t]+\S/;
 
 /** Trailing `_(F1, F3)_` fragment rendered by `renderRequiredChanges`. */
 const FINDINGS_FRAGMENT = /[ \t]*_\(([^()]*)\)_[ \t]*$/;
-
-/**
- * Count the plan's top-level numbered step items, excluding the appendix.
- *
- * Heuristic shared with the Orchestrator's note-to-row alignment: cut the
- * appendix, then count `^\d+\.\s+` items after the LAST `^## ` heading that
- * matches `/steps?|plan/i` (`## Steps`, `## Plan Steps`, `## Plan`, …). With no
- * such heading the whole body is counted. Indented (sub-)items never count
- * because the regex is anchored at column 0. Pure; never throws.
- */
-export function countPlanSteps(planText: string): number {
-  const text = String(planText ?? "")
-    .replace(/\r\n?/g, "\n")
-    .trim();
-  if (!text) return 0;
-  const appendix = REVIEW_APPENDIX_HEADING.exec(text);
-  const body = appendix ? text.slice(0, appendix.index) : text;
-  let start = 0;
-  for (const match of body.matchAll(/^##[ \t]+.*$/gm)) {
-    const title = match[0].replace(/^##[ \t]+/, "");
-    if (/steps?|plan/i.test(title)) start = match.index + match[0].length;
-  }
-  const region = body.slice(start);
-  return region.match(/^\d+\.[ \t]+\S/gm)?.length ?? 0;
-}
 
 interface ParsedRequiredChange {
   id?: string;
@@ -1677,14 +1651,13 @@ function nextLegacyId(start: number, taken: Set<string>): string {
  * stay parseable without rewriting the plan body.
  *
  * A malformed line is skipped, never thrown. A plan with no appendix (or a
- * round without required changes) returns `{ notes: [], stepCount }`.
+ * round without required changes) returns `{ notes: [] }`.
  */
 export function parseReviewNotes(planText: string): ParsedReviewNotes {
   const text = String(planText ?? "").replace(/\r\n?/g, "\n");
-  const stepCount = countPlanSteps(text);
   const headings = [...text.matchAll(REVIEWER_REVISIONS_HEADING)];
   const last = headings[headings.length - 1];
-  if (!last || last.index === undefined) return { notes: [], stepCount };
+  if (!last || last.index === undefined) return { notes: [] };
 
   const round = Number(last[1]);
   const afterHeading = text.slice(last.index + last[0].length);
@@ -1694,7 +1667,7 @@ export function parseReviewNotes(planText: string): ParsedReviewNotes {
     : afterHeading;
 
   const blockHeading = REQUIRED_CHANGES_HEADING.exec(section);
-  if (!blockHeading) return { notes: [], round, stepCount };
+  if (!blockHeading) return { notes: [], round };
   const block = section.slice(blockHeading.index + blockHeading[0].length);
 
   const notes: ReviewNote[] = [];
@@ -1715,7 +1688,52 @@ export function parseReviewNotes(planText: string): ParsedReviewNotes {
     taken.add(note.id);
     notes.push(note);
   }
-  return { notes, round, stepCount };
+  return { notes, round };
+}
+
+/**
+ * Split a reviewed plan into the Planner's body and the Reviewer's appendix.
+ *
+ * The appendix is the LAST `## Reviewer Revisions (round N)` section — from
+ * that heading to the next H2 or EOF — using the same
+ * `REVIEWER_REVISIONS_HEADING` grammar as {@link parseReviewNotes}, so one
+ * plan carrying several rounds splits on the round the parser reads. A plan
+ * with no appendix returns `{ body: planText.trim(), appendix: "" }`.
+ *
+ * Ownership (plan 2026-11-26): the Planner may rewrite `body` and must leave
+ * `appendix` untouched. Line endings are normalized to `\n` and trailing
+ * horizontal whitespace per line is dropped on BOTH halves, so a Windows
+ * editor save (CRLF, trailing blanks) is not mistaken for an appendix edit and
+ * does not change the body hash.
+ *
+ * Why this is not `review-tools.stripReviewerRevisions`: that helper cuts at
+ * the FIRST round heading and discards the appendix; the Planner loop needs the
+ * LAST section's text to compare against the expected appendix.
+ *
+ * Deliberately does NOT touch {@link planHash} or {@link stripReviewAppendix}:
+ * those define which plans count as already reviewed.
+ */
+export function splitReviewerAppendix(planText: string): {
+  body: string;
+  appendix: string;
+} {
+  const text = String(planText ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "");
+  if (!text.trim()) return { body: "", appendix: "" };
+  const headings = [...text.matchAll(REVIEWER_REVISIONS_HEADING)];
+  const last = headings[headings.length - 1];
+  if (!last || last.index === undefined) {
+    return { body: text.trim(), appendix: "" };
+  }
+  const afterHeading = text.slice(last.index + last[0].length);
+  const nextSection = /^[ \t]*##[ \t]+\S[^\n]*$/m.exec(afterHeading);
+  const appendixEnd =
+    last.index + last[0].length + (nextSection ? nextSection.index : afterHeading.length);
+  return {
+    body: text.slice(0, last.index).trim(),
+    appendix: text.slice(last.index, appendixEnd).trim(),
+  };
 }
 
 /**

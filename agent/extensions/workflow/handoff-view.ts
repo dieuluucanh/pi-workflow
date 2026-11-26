@@ -98,11 +98,17 @@ export interface HandoffQuestionInput {
   verdict?: string;
   findingCount?: number;
   /**
-   * Advisory notes the reviewer recorded in the plan's last round appendix.
-   * Shown next to the findings count only when positive; the plan body itself
-   * is never amended by them.
+   * Reviewer notes recorded in the plan's `## Reviewer Revisions` appendix.
+   * Shown as a count next to the findings only when positive; the notes live
+   * in the appendix, never in the plan body the Planner owns.
    */
   revisionCount?: number;
+  /**
+   * One line for a Planner↔Reviewer loop that stopped without converging
+   * (the revision budget is spent and notes are still open). Rendered only
+   * when present, so converged and non-negotiated handoffs are unchanged.
+   */
+  revisionNote?: string;
 }
 
 function normalize(value: string): string {
@@ -180,6 +186,9 @@ export function buildHandoffQuestion(
     lines.push(`Review: ${input.verdict.trim()}${count}`);
   }
   lines.push("The plan is printed above in the transcript — scroll up to read it.");
+  if (typeof input.revisionNote === "string" && input.revisionNote.trim()) {
+    lines.push(input.revisionNote.trim());
+  }
   lines.push("Approving the plan is not execution: you choose where it runs next.");
   const options: QuestionnaireOption[] = [
     {

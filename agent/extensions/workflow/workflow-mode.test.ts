@@ -55,12 +55,42 @@ test("tools: Plan keeps the gated tools active and owns the workflow set", () =>
     "explore",
     "questionnaire",
     "workflow_todo",
+    "plan_revision_done",
   ]);
   // edit/write stay active so the tool_call gate can explain the refusal.
   assert.ok(plan.includes("edit"));
   assert.ok(plan.includes("write"));
   // A third-party tool is never silently dropped by a mode switch.
   assert.ok(plan.includes("third_party_tool"));
+});
+
+test("tools: plan_revision_done is Plan-only, never Build/Default", () => {
+  // The Planner↔Reviewer loop's child report answers a revision turn, which
+  // only Plan mode has; Build/Default must not advertise it.
+  assert.equal(
+    (PLAN_MODE_TOOLS as readonly string[]).includes("plan_revision_done"),
+    true,
+  );
+  assert.equal(
+    (NORMAL_MODE_TOOLS as readonly string[]).includes("plan_revision_done"),
+    false,
+  );
+  const build = buildModeTools(["read", "bash"]);
+  assert.equal(build.includes("plan_revision_done"), false);
+  // A Plan → Build switch drops it from the active set (it is managed, and
+  // Build's managed set does not contain it).
+  assert.equal(
+    buildModeTools(["read", "plan_revision_done"]).includes("plan_revision_done"),
+    false,
+  );
+  assert.equal(planModeTools(["read", "bash"]).includes("plan_revision_done"), true);
+  // Orchestrator inherits the Plan set (it is a superset of Build + parent
+  // tools), so the tool is present but inert there: it refuses unless a
+  // revision turn is pending, which only the Plan↔Review loop opens.
+  assert.equal(
+    orchestratorModeTools(["read", "bash"]).includes("plan_revision_done"),
+    true,
+  );
 });
 
 test("tools: Build restores the managed set first and keeps unmanaged tools", () => {

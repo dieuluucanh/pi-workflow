@@ -22,6 +22,7 @@
 
 import type { TodoItem } from "./utils.ts";
 import { ORCHESTRATOR_TOOL_NAMES } from "./orchestrator-tools.ts";
+import { PLAN_REVISION_TOOL_NAME } from "./plan-revision.ts";
 
 /** `null` is Default (workflow off). Orchestrator is in the ordinary cycle. */
 export type WorkflowMode = "plan" | "build" | "orchestrator" | null;
@@ -39,6 +40,10 @@ export function isWorkflowMode(value: unknown): value is WorkflowMode {
  * `tool_call` gate refuses them outside `.pi/plans/`, and a blocked tool that
  * is active can explain why. Deactivating them would turn a helpful refusal
  * into "unknown tool".
+ *
+ * `plan_revision_done` is Plan-only: it is the Planner↔Reviewer loop's child
+ * report, and the tool itself refuses when no revision turn is pending, so
+ * Build/Default never need it. See `NORMAL_MODE_TOOLS`.
  */
 export const PLAN_MODE_TOOLS = [
   "read",
@@ -51,6 +56,7 @@ export const PLAN_MODE_TOOLS = [
   "explore",
   "questionnaire",
   "workflow_todo",
+  PLAN_REVISION_TOOL_NAME,
 ] as const;
 
 /**
@@ -63,8 +69,14 @@ export const ORCHESTRATOR_MODE_TOOLS = [
   ...ORCHESTRATOR_TOOL_NAMES,
 ] as const;
 
-/** Tools Build (the normal state) ensures are present. */
-export const NORMAL_MODE_TOOLS = [...PLAN_MODE_TOOLS] as const;
+/**
+ * Tools Build (the normal state) ensures are present. `plan_revision_done` is
+ * the one Plan-only exception: it answers a Planner revision turn, which only
+ * exists inside the Plan↔Review loop.
+ */
+export const NORMAL_MODE_TOOLS: readonly string[] = PLAN_MODE_TOOLS.filter(
+  (name) => name !== PLAN_REVISION_TOOL_NAME,
+);
 
 /** Tools Plan removes from an inherited set before re-adding its own. */
 export const PLAN_DISABLED_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);

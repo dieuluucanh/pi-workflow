@@ -130,7 +130,7 @@ export const REVIEW_VERBS = [
     name: "mode",
     usage: "/review mode <on|off|status|timeout> [value] [global|project]",
     summary:
-      "Configure Review Mode: on|off, status, timeout <seconds|unlimited>.",
+      "Configure Review Mode: on|off, status, timeout <seconds|unlimited>; settings carry maxRevisions (0 = one-shot).",
     group: "config",
     blockWhileChildActive: true,
     blockLabel: "/review mode",
@@ -506,6 +506,7 @@ export function formatReviewHelp(verb?: unknown): string {
   lines.push(
     "Shadowing: a plan file named exactly `status`, `pause`, `resume`, `abort`, `say`, `mode`, `prompt` or `help` loses to the verb — quote the path (/review \"status\") or name it from a directory.",
     "Different questions: /review status reports the review round; /review mode status reports configuration (enabled, timeout and source, prompt source, shadowed scope).",
+    "Revisions: reviewMode.maxRevisions (0-5, default 3) caps automatic Planner revision turns; 0 makes every review one-shot.",
     `Unknown-token hints use edit distance up to ${SUGGEST_MAX_DISTANCE}; paths and file names are never corrected.`,
   );
   return lines.join("\n");

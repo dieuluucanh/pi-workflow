@@ -180,18 +180,15 @@ short Plan → Review → Build work keeps its current behavior.
 - **Cross-repo work is multiple rows.** One row, one root. `cwd` is a declared
   alias or an absolute path inside a declared root; an unknown or ambiguous
   root is refused rather than guessed.
-- **Review notes are advisory.** When the approved plan carries a
-  `## Reviewer Revisions (round N)` appendix, the harness parses its
-  `### Required changes` lines into notes with stable `R<n>` ids and attaches
-  them to rows. Binding is count-gated: a note is bound to a row only when the
-  plan's numbered step count matches the model's row count; otherwise every
-  note stays unbound and the mission asks the parent to place it, never guesses.
-  Each bound row's child kickoff carries a `## Review notes (advisory)` block,
-  the child must acknowledge every id in its final summary (`applied`,
-  `not applicable — <why>`, or `conflicts with the plan — followed the plan`),
-  and the parent reports each conflict with the row ref and the child's reason.
-  **The approved plan wins on any conflict**; a note is never a requirement, a
-  gate or an acceptance criterion.
+- **The approved plan's steps are the work.** The Orchestrator (and direct
+  Build) consume the plan's `## Steps` and nothing else. The
+  `## Reviewer Revisions (round N)` appendix is the Reviewer's record of the
+  review that produced that plan: it is never parsed into rows, never counted
+  as steps, and never bound to a row or a child. There is no
+  `## Review notes (advisory)` kickoff block and no mission section for notes
+  that could not be placed — the revision argument happens in Plan, before
+  approval, through the Planner↔Reviewer loop (see [Review Mode](#review-mode)).
+  **The approved plan wins on any conflict** with an appendix line.
 
 ### Host contract
 
@@ -607,57 +604,81 @@ Compound commands are checked segment-by-segment, and each check reads the view 
 
 The built-in `bash`, `edit` and `write` tools are never given to the reviewer at all.
 
-### Advisory revisions (append-only)
+### The Planner↔Reviewer loop (append-only appendix)
 
-The reviewer submits findings, a verdict, a summary and required revisions in
+The reviewer submits findings, a verdict, a summary and its required changes in
 one `review_submit` call. The harness appends **one**
-`## Reviewer Revisions (round N)` section to the plan file and **the plan body
-is never modified** — the appendix is the review's durable record, not the
-plan's text. There is no diff of the plan and no apply/keep choice at the
-handoff: the plan is printed as the author wrote it, plus the review's note
-count.
+`## Reviewer Revisions (round N)` section to the plan file; a pass-2
+resubmission **replaces** that round's section instead of stacking a second
+one. The two halves of the file now have two owners:
+
+- **The Planner owns the plan BODY.** Nothing in Review Mode rewrites it, and
+  there is no diff/apply choice at the handoff.
+- **The Reviewer owns the `## Reviewer Revisions (round N)` appendix.** It is
+  the braindump of what the review found, not a second plan.
 
 Each required change carries a stable id and, when it answers known findings,
-those finding ids, so a note is addressable across the handoff:
+those finding ids, so a note is addressable across turns:
 
 ```markdown
 ### Required changes
 
-- **R2 · Step 3:** Count the plan's numbered steps before binding notes _(F1)_
+- **R2 · Step 3:** Cover the validation error before the route is wired _(F1)_
 ```
 
-Ids are normalised to `R1..Rn` in submission order when the model omits them, so
-every note is addressable. The appendix is **reference, not authority**: the
-approved plan body wins on any conflict.
+Ids are normalised to `R1..Rn` in submission order when the model omits them.
 
-That precedence is stated wherever the notes are consumed:
+#### The revision loop
 
-- The Orchestrator carries the notes with the run's mission, binds each note to
-  the matching row by numeric step (and leaves it unbound and surfaced to the
-  parent when the plan's step count and the row count do not align), and each
-  bound row's child kickoff carries a `## Review notes (advisory)` block.
-- The Build child acknowledges every note id in its final summary as `applied`,
-  `not applicable — <why>`, or `conflicts with the plan — followed the plan`.
-- The Orchestrator reports every note a child reported as conflicting, with the
-  row ref and the child's reason — so a note is never silently dropped.
+1. The Planner writes the plan body.
+2. The reviewer audits it and appends `## Reviewer Revisions (round N)`.
+3. When `maxRevisions > 0` and the appendix leaves required changes open, the
+   Planner gets **one revision turn**: it edits the body (never the appendix)
+   and answers every note id through `plan_revision_done` as `applied`,
+   `rejected` or `not_applicable`, with a concrete reason for the last two.
+   An `applied` with an unchanged body is refused, and any edit to the
+   appendix is refused.
+4. The reviewer re-reviews the **revised body** with those responses in hand —
+   a rejected note has to survive the Planner's reason, not be repeated.
+5. Repeat until the reviewer approves or the budget is spent, then hand off.
 
-Nothing in the pipeline treats a note as a requirement, a gate or an acceptance
-criterion. A note that requires a step change still goes back to Plan through
-the handoff's Feedback path; the reviewer has no write path into the body.
+`maxRevisions` (`0`–`5`, default `3`; `0` = one-shot) is the budget. `rounds`
+stays the per-cycle Review round cap — it counts review passes over one plan,
+not Planner revisions. When the budget is spent with notes still open, the
+loop stops without converging: the handoff says so, and
+**Approve** accepts the plan as written while **Give feedback** continues the
+argument. The loop runs for the automatic post-Plan review and for `/review`
+in Plan mode; `/review` outside Plan mode is still the one-shot review.
 
-A pass-2 resubmission **replaces** that round's `## Reviewer Revisions (round N)`
-section instead of stacking a second one. The chunked `review_plan_begin` /
-`review_plan_chunk` / `review_plan_finalize` write path, the assembled-body
-submission and the `chunkedSubmit`/`chunkChars` settings are removed: there is
-no body rewrite left to configure. `planHash` still covers the author's body
-plus the appendix, so the same body with the same appendix hashes identically.
+The appendix is **reference, not authority**: the approved plan body wins on
+any conflict, and the revision argument belongs in Plan, before approval — not
+in the child that executes the plan.
+
+**Downstream consumes the plan steps, nothing else.** The Orchestrator and
+direct Build work from the approved plan's `## Steps`. They never read, parse,
+count or bind the appendix: no `## Review notes (advisory)` block in a child
+kickoff, no unbound-notes section in the mission, no note-to-row binding. The
+number of plan steps is the model's call (one step per row), never a heuristic
+over the file, so a long plan cannot produce a false step-count warning.
+
+**Which build runs the loop.** The live extension is loaded from the checkout
+at `C:/Users/Lenovo/.pi/agent/extensions/workflow` (the W checkout), so a Pi
+session pointed at it has the loop. A packaged Pi Desktop runs its own pinned
+bundle of this extension, so a Desktop build shows the loop only after that pin
+is bumped — re-pinning is a separate release step, not part of this plan.
+
+The chunked `review_plan_begin` / `review_plan_chunk` / `review_plan_finalize`
+write path, the assembled-body submission and the `chunkedSubmit`/`chunkChars`
+settings are removed and stay removed: there is no body rewrite left to
+configure. `planHash` still covers the planner's body plus the appendix, so the
+same body with the same appendix hashes identically.
 
 ### Two passes
 
-1. **Review** — audits the plan against the repository and the guidance, records findings, and submits the required revisions as advisory notes in the `## Reviewer Revisions` appendix (append-only; the body is untouched).
-2. **Self-verify** — re-reads the author's plan and the appendix it just wrote, confirms every `accepted` finding appears as a concrete note, checks that nothing was dropped or weakened, and runs the named **over-engineering check**: do the notes add layers, abstractions, configuration flags, dependencies, phases or steps the requirements do not need? It never rewrites the plan body — its only output is a corrected appendix.
+1. **Review** — audits the plan against the repository and the guidance, records findings, and submits its required changes in the `## Reviewer Revisions` appendix (append-only; the body is untouched).
+2. **Self-verify** — re-reads the author's plan and the appendix it just wrote, confirms every `accepted` finding appears as a concrete note, checks that nothing was dropped or weakened, and runs the named **over-engineering check**: do the notes ask for layers, abstractions, configuration flags, dependencies, phases or steps the requirements do not need? It never rewrites the plan body — its only output is a corrected appendix.
 
-Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews keep pass 1's appendix as-is, and those notes are simply not self-verified (accepted, because they are advisory). When pass 2 runs it checks a **unified diff** of the appended revisions (not two full plans), so the self-check costs roughly a tenth of the tokens.
+Pass 2 is skipped when `verify` is false, or when pass 1 left nothing at severity ≥ 7 with an `accepted` disposition — clean and low-severity reviews keep pass 1's appendix as-is, and those notes are simply not self-verified (they stay as the Reviewer wrote them). When pass 2 runs it checks a **unified diff** of the appended revisions (not two full plans), so the self-check costs roughly a tenth of the tokens.
 
 ### Every finding is visible
 
@@ -1327,8 +1348,9 @@ Review Mode settings live under `workflow.reviewMode`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Automatic-review toggle. When false, the automatic handoff review/prefetch/planner note are off and the plan handoff is **plain** (modes/prompts stay free); the manual `/review` commands still work |
-| `rounds` | `1` | Max Plan↔Review rounds per plan/feedback cycle. A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
-| `passes` | `2` | `1` = a single review pass (advisory notes only); `2` = review, then self-verify |
+| `rounds` | `1` | Max Review rounds per plan/feedback cycle (review passes over one plan — not Planner revisions). A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
+| `maxRevisions` | `3` | Planner revision budget per negotiation (`0`–`5`; `0` = one-shot review, no Planner turn). Each round with open required changes costs one revision turn; the Reviewer then re-reviews the revised body. Spent with notes still open → the handoff says the loop did not converge and Approve accepts the plan as written |
+| `passes` | `2` | `1` = a single review pass (no self-verify); `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |
 | `providerRecovery` | `"fallback"` | After a recoverable provider cut, try the fallback chain instead of failing the round immediately. `"off"` restores the single-model behaviour |

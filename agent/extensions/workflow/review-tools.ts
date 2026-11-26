@@ -659,7 +659,9 @@ const FINDING_SCHEMA = Type.Object({
  *
  *  1. (step 10) Validate the submission: the round must know a plan path and the
  *     author's plan body must be non-empty, otherwise the reviewer is told to
- *     report the failure instead of writing.
+ *     report the failure instead of writing. An `approve` verdict that carries
+ *     required changes is refused too — approval means the plan is converged,
+ *     so the reviewer must use `revise` or drop the revisions.
  *  2. (step 11) Render the advisory `## Reviewer Revisions (round N)` appendix
  *     (findings, verdict, summary, required revisions) and append it to the
  *     author's plan body. Any earlier revisions section is stripped first, so a
@@ -678,7 +680,7 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
         name: "review_submit",
         label: "Submit Review",
         description:
-            "Submit your findings and required revisions. Do NOT rewrite the plan: the harness appends one '## Reviewer Revisions' section to the plan file and keeps the original body unchanged. Call review_pass_done afterwards.",
+            "Submit your findings and required revisions. Do NOT rewrite the plan: the harness appends one '## Reviewer Revisions' section to the plan file and keeps the original body unchanged. Call review_pass_done afterwards. `approve` means no required changes — if you have any, use `revise` (or drop them), because an approve that carries revisions is refused.",
         parameters: Type.Object({
             findings: Type.Array(FINDING_SCHEMA, {
                 description:
@@ -745,6 +747,24 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                     : "";
             const findings = sanitizeFindings(rawParams?.findings);
             const revisions = normalizeRevisions(rawParams?.revisions);
+
+            // Convergence gate: `approve` is the reviewer's "nothing left to
+            // change" signal, so it cannot carry required changes. Refuse BEFORE
+            // anything is written or submitted; the tool result is error-shaped
+            // and the round's state stays untouched.
+            if (verdict === "approve" && revisions.length > 0) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "review_submit: verdict approve cannot carry required changes; use revise or drop the revisions.",
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+            const convergedWithoutNotes =
+                verdict !== "approve" && revisions.length === 0;
 
             // Pass 2 resubmits against a plan file that already carries pass 1's
             // revisions section: strip it so the round's section is replaced,
@@ -828,6 +848,9 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                             `- findings: ${findings.length}`,
                             `- revisions: ${revisions.length}`,
                             summary ? `- summary: ${summary}` : "",
+                            convergedWithoutNotes
+                                ? "No required changes — the Planner has nothing to revise; the host treats this round as converged."
+                                : "",
                             "",
                             "The plan body was not modified. Now call review_pass_done.",
                         ]
@@ -848,7 +871,7 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
 }
 
 const REVIEW_ADVISORY_LINE =
-    "_Advisory review notes. The approved plan body is authoritative on any conflict._";
+    "_Review notes for the Planner. The plan body is authoritative once the Planner has revised it; unresolved notes are listed below._";
 
 /**
  * Normalise the model's revisions: drop entries without a change, trim strings,

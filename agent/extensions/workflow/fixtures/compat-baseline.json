@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "capturedAt": "2026-11-23",
-  "note": "Behavioral baseline for ordinary Plan/Build, updated for the in-process Orchestrator Build child (2026-11-23).",
+  "capturedAt": "2026-11-26",
+  "note": "Behavioral baseline for ordinary Plan/Build. 2026-11-26: Plan mode gains the inert-until-pending plan_revision_done tool (Planner↔Reviewer loop); Build keeps the old set.",
   "sdk": {
     "package": "@earendil-works/pi-coding-agent",
     "version": "1.5.0"
@@ -13,6 +13,7 @@
     "orchestrator_retry",
     "orchestrator_start",
     "orchestrator_status",
+    "plan_revision_done",
     "questionnaire",
     "workflow_todo"
   ],
@@ -26,7 +27,8 @@
     "ls",
     "explore",
     "questionnaire",
-    "workflow_todo"
+    "workflow_todo",
+    "plan_revision_done"
   ],
   "buildActiveTools": [
     "read",

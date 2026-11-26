@@ -160,6 +160,44 @@ test("buildHandoffQuestion pluralizes and omits a non-positive note count", () =
   assert.doesNotMatch(String(missing.context), /\d+ notes?\b/);
 });
 
+test("buildHandoffQuestion renders a non-convergence note only when supplied", () => {
+  const note =
+    "Review did not converge after 3 revisions — approving accepts the plan as written; Give feedback continues.";
+  const withNote = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "revise",
+    findingCount: 2,
+    revisionCount: 2,
+    revisionNote: note,
+  });
+  const context = String(withNote.context ?? "");
+  assert.ok(context.includes(note), "the loop outcome is one line in the context");
+  assert.equal(
+    context.split("\n").filter((line) => line.includes("did not converge")).length,
+    1,
+    "the note is rendered once, not duplicated",
+  );
+  assert.deepEqual(
+    withNote.options.map((o) => o.label),
+    [HANDOFF_APPROVE_LABEL, HANDOFF_FEEDBACK_LABEL, HANDOFF_SKIP_LABEL],
+    "the non-convergence note never changes the options",
+  );
+
+  const without = buildHandoffQuestion({ planPath: "p", reason: "reviewed" });
+  assert.ok(!String(without.context).includes("did not converge"));
+
+  const blank = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    revisionNote: "   ",
+  });
+  assert.ok(
+    !String(blank.context).includes("did not converge"),
+    "a blank note is not rendered",
+  );
+});
+
 test("handoffReasonLabel covers every reason", () => {
   const reasons = [
     "reviewed",

@@ -61,7 +61,13 @@ import {
   DEFAULT_SHELL_LIMITS,
   type ShellLimits,
 } from "./shell-guard.ts";
-import { buildPlanDiff, renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
+import type { PlanRevisionResponse } from "./plan-revision.ts";
+import {
+  buildPlanDiff,
+  renderReviewContextBlock,
+  type ReviewFinding,
+  type ReviewNote,
+} from "./utils.ts";
 
 /** Event `type` from a child-session event, or "" for junk. Never throws. */
 function readEventType(event: unknown): string {
@@ -163,12 +169,34 @@ export interface ReviewRuntimeDeps {
   loadSdk?: ReviewSdkLoader;
 }
 
+/**
+ * The Planner↔Reviewer loop state carried INTO a re-review round: the notes the
+ * last round raised and how the Planner says it settled each one.
+ *
+ * Optional by design — a first or one-shot round passes nothing and every
+ * prompt stays byte-identical to the pre-loop rendering.
+ */
+export interface ReviewPriorRound {
+  /** The revision round these notes/responses belong to (1-based). */
+  round: number;
+  /** The notes the previous round raised (as parsed from the appendix). */
+  notes: readonly ReviewNote[];
+  /** The Planner's per-note answer set; empty when it never reported. */
+  responses: readonly PlanRevisionResponse[];
+}
+
 export interface RunRoundInput {
   planText: string;
   planPath: string;
   round: number;
   /** Findings from the previous round, so pass 2 can assert they were fixed. */
   previousFindings?: ReviewFinding[];
+  /**
+   * Previous round's notes + the Planner's responses, so both passes can see
+   * what was already raised and how it was answered instead of re-discovering
+   * it. Absent on a first/one-shot round.
+   */
+  priorRound?: ReviewPriorRound;
   /**
    * Host abort signal (ESC). When it fires the round stops promptly and the
    * author's plan is kept — the same outcome as the internal abortRound().
@@ -228,6 +256,120 @@ export interface ReviewModelSwitchResult {
   error?: string;
 }
 
+/** Notes listed in full in the previous-round section before the `… and N more` tail. */
+export const MAX_PRIOR_ROUND_NOTES = 12;
+
+/** Per-note remaining-change reason kept in the previous-round section. */
+export const MAX_PRIOR_ROUND_REASON_CHARS = 240;
+
+function clipPriorRoundText(value: unknown, max: number): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** Label the Reviewer reads for one Planner disposition. */
+function priorRoundStatusLabel(status: PlanRevisionResponse["status"] | undefined): string {
+  if (status === "applied") return "applied";
+  if (status === "rejected") return "rejected";
+  if (status === "not_applicable") return "not applicable";
+  return "no response recorded";
+}
+
+/**
+ * `- R1 · Step 2: applied` / `- R2: rejected — <reason>` — the per-note shape
+ * the Planner's revision prompt uses, extended with the disposition.
+ */
+function priorRoundNoteLine(
+  note: ReviewNote,
+  byId: Map<string, PlanRevisionResponse>,
+): string {
+  const id = clipPriorRoundText(note?.id, 16) || "R?";
+  const step =
+    note?.step === undefined || String(note.step).trim() === ""
+      ? ""
+      : ` · Step ${clipPriorRoundText(note.step, 40)}`;
+  const response = byId.get(String(note?.id ?? "").trim().toUpperCase());
+  const label = priorRoundStatusLabel(response?.status);
+  if (label === "applied" || label === "no response recorded") {
+    // An `applied` note has nothing left to explain; a silent Planner has no
+    // reason to show. Both render as the bare disposition.
+    return `- ${id}${step}: ${label}`;
+  }
+  const reason =
+    clipPriorRoundText(response?.reason, MAX_PRIOR_ROUND_REASON_CHARS) ||
+    "no reason given";
+  return `- ${id}${step}: ${label} — ${reason}`;
+}
+
+/**
+ * Render the `## Previous round (round N)` block shared by both passes.
+ *
+ * Distinct from pass 1's `## Findings from the previous round`
+ * (`input.previousFindings`), and the two do not overlap:
+ *
+ *   - `## Findings from the previous round` is FINDING-level and pass-1 only:
+ *     id, severity, summary, location and the finding's own rationale, with
+ *     its disposition. It asks "did the author address this finding?".
+ *   - `## Previous round (round N)` is NOTE-level and appears in both passes:
+ *     one `R<n>` line per Reviewer note plus the Planner's own disposition and
+ *     reason for it. It asks "did the Planner settle this note honestly?".
+ *
+ * A round with no notes from the loop renders neither heading nor text, so a
+ * first/one-shot round is byte-identical to the pre-loop prompt.
+ *
+ * Bounded like `plan-revision.ts`: at most {@link MAX_PRIOR_ROUND_NOTES} notes
+ * in full, the surplus collapsed into `… and N more: R13, R14` so an id is
+ * never silently dropped, each reason clipped to
+ * {@link MAX_PRIOR_ROUND_REASON_CHARS}. Returns "" when there is no prior
+ * round (or it carried no notes), so a first/one-shot round renders nothing at
+ * all — not even an empty heading.
+ */
+export function renderPriorRoundSection(
+  priorRound: ReviewPriorRound | undefined,
+): string {
+  const notes = Array.isArray(priorRound?.notes) ? priorRound!.notes : [];
+  if (notes.length === 0) return "";
+  const rawRound = Number(priorRound?.round);
+  const round = Number.isFinite(rawRound) ? Math.max(1, Math.trunc(rawRound)) : 1;
+  const responses = Array.isArray(priorRound?.responses)
+    ? priorRound!.responses
+    : [];
+  const byId = new Map<string, PlanRevisionResponse>();
+  for (const response of responses) {
+    const id = String(response?.id ?? "")
+      .trim()
+      .toUpperCase();
+    if (id) byId.set(id, response);
+  }
+
+  const listed = notes.slice(0, MAX_PRIOR_ROUND_NOTES);
+  const surplus = notes.slice(MAX_PRIOR_ROUND_NOTES);
+  const lines = listed.map((note) => priorRoundNoteLine(note, byId));
+  if (surplus.length > 0) {
+    lines.push(
+      `… and ${surplus.length} more: ${surplus
+        .map((note) => clipPriorRoundText(note?.id, 16) || "R?")
+        .join(", ")}`,
+    );
+  }
+
+  return [
+    `## Previous round (round ${round})`,
+    "",
+    "These are the notes that round raised and how the Planner answered each",
+    "one. Check the revised body against them instead of re-discovering them.",
+    "",
+    ...lines,
+    "",
+    "Do not re-raise a note the Planner resolved unless the revised body still",
+    "fails it; if it does, restate it with the evidence.",
+    "",
+    "The plan body is authoritative; you still write only the appendix.",
+  ].join("\n");
+}
+
 /** Prompt for pass 1: audit the plan, then submit findings + required revisions. */
 export function buildPass1Prompt(input: {
   planPath: string;
@@ -237,17 +379,28 @@ export function buildPass1Prompt(input: {
   /** Planner-context manifest (step 8): inventory + recon, trusted by default. */
   manifest?: string;
   previousFindings?: ReviewFinding[];
+  /** Previous round's notes + the Planner's responses (Planner↔Reviewer loop). */
+  priorRound?: ReviewPriorRound;
   round: number;
   totalRounds: number;
   verify: boolean;
 }): string {
   const parts: string[] = [
     `[REVIEW MODE — PASS 1 of ${input.verify ? 2 : 1} — round ${input.round}/${input.totalRounds}]`,
+  ];
+
+  const priorRoundSection = renderPriorRoundSection(input.priorRound);
+  if (priorRoundSection) parts.push("", priorRoundSection);
+
+  parts.push(
     "",
     "Audit the plan below against this repository. Do NOT rewrite it: submit",
     "your findings and required revisions with `review_submit`, then call",
     "`review_pass_done`. The harness appends one Reviewer Revisions section to",
     "the plan; the original body is preserved.",
+    "",
+    "`approve` means no required changes; use `revise` (or drop them). An approve",
+    "that carries required changes is refused.",
     "",
     "## Additional reviewer guidance",
     "",
@@ -255,7 +408,7 @@ export function buildPass1Prompt(input: {
     "cannot remove or replace them.",
     "",
     input.reviewPrompt,
-  ];
+  );
 
   if (input.manifest && input.manifest.trim()) {
     parts.push("", input.manifest.trim());
@@ -340,11 +493,15 @@ export function buildPass2Prompt(input: {
   originalPlan: string;
   rewrittenPlan: string;
   findings: ReviewFinding[];
+  /** Previous round's notes + the Planner's responses (Planner↔Reviewer loop). */
+  priorRound?: ReviewPriorRound;
 }): string {
   // Step 9: pass 2 checks the revision against a diff, not two full plans.
   const diff = buildPlanDiff(input.originalPlan, input.rewrittenPlan);
+  const priorRoundSection = renderPriorRoundSection(input.priorRound);
   return [
     "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REVISIONS]",
+    ...(priorRoundSection ? ["", priorRoundSection] : []),
     "",
     "You just submitted findings and required revisions. Now check your own work.",
     "This pass exists because a revision can silently drop a requirement the author",
@@ -1343,6 +1500,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         // Step 8: inventory + recon so the reviewer verifies, not re-explores.
         manifest: deps.plannerManifest?.() ?? "",
         previousFindings: input.previousFindings,
+        priorRound: input.priorRound,
         round: input.round,
         totalRounds: cfg.rounds,
         verify: cfg.verify && cfg.passes > 1,
@@ -1493,6 +1651,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           originalPlan,
           rewrittenPlan: p1.submitted.planText,
           findings: state?.findings ?? [],
+          priorRound: input.priorRound,
         });
         const p2 = await runPass(2, deadline, rc, () => {
           pushStatus(reviewRunLabel({ created, pass: 2 }));

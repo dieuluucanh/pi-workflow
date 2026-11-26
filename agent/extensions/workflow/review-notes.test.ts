@@ -14,12 +14,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  countPlanSteps,
   parseReviewNotes,
   planHash,
   renderRequiredChanges,
   REVIEW_CHANGELOG_HEADING,
   REVIEW_UNRESOLVED_HEADING,
+  splitReviewerAppendix,
   stripReviewAppendix,
   type ReviewRevision,
 } from "./utils.ts";
@@ -43,7 +43,7 @@ const FIXTURE_PATH = path.join(
 );
 
 const ADVISORY_LINE =
-  "_Advisory review notes. The approved plan body is authoritative on any conflict._";
+  "_Review notes for the Planner. The plan body is authoritative once the Planner has revised it; unresolved notes are listed below._";
 
 const ORIGINAL_PLAN = [
   "# Plan: Export",
@@ -223,6 +223,44 @@ test("the advisory line sits immediately under the Reviewer Revisions heading", 
   const heading = lines.indexOf("## Reviewer Revisions (round 1)");
   assert.notEqual(heading, -1);
   assert.equal(lines[heading + 1], ADVISORY_LINE);
+  // The retired wording is gone: the Planner's revision is authoritative now,
+  // not the body the reviewer approved. The parser ignores either line.
+  assert.ok(!writes[0]!.changelog.includes("approved plan body is authoritative"));
+});
+
+test("the rendered appendix parses back to the fixture's notes", async () => {
+  const fixture = readFixture();
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  await tool.execute(
+    "id",
+    {
+      findings: [FINDING],
+      verdict: "revise",
+      summary: "One revision.",
+      revisions: fixture.revisions,
+    },
+    undefined,
+    undefined,
+    {},
+  );
+
+  const written = writes[0]!.planText;
+  // New advisory line present exactly once, old line absent entirely.
+  assert.equal(
+    written
+      .split("\n")
+      .filter((line) => line === ADVISORY_LINE).length,
+    1,
+    written,
+  );
+  assert.ok(!written.includes("Advisory review notes"));
+  assert.ok(written.includes(fixture.requiredChanges));
+  // Round-trip: the appendix the tool renders reads back as the same notes.
+  assert.deepEqual(parseReviewNotes(written).notes, fixture.revisions);
 });
 
 test("two review_submit calls in one round leave exactly one section", async () => {
@@ -257,7 +295,7 @@ test("two review_submit calls in one round leave exactly one section", async () 
   assert.equal(headings?.length, 1, writes[1]!.planText);
   assert.equal(
     writes[1]!.planText.match(
-      /^_Advisory review notes\. The approved plan body is authoritative on any conflict\._$/gm,
+      /^_Review notes for the Planner\. The plan body is authoritative once the Planner has revised it; unresolved notes are listed below\._$/gm,
     )?.length,
     1,
   );
@@ -299,7 +337,6 @@ test("parseReviewNotes reads numeric and non-numeric steps", () => {
       { id: "R3", change: "Do the thing." },
     ],
     round: 1,
-    stepCount: 3,
   });
 });
 
@@ -330,7 +367,6 @@ test("two appended rounds parse the last round only", () => {
     { id: "R1", step: "2", change: "Round two change." },
     { id: "R2", step: "1", change: "Second note." },
   ]);
-  assert.equal(parsed.stepCount, 2);
 });
 
 test("a round without a required-changes block yields no notes", () => {
@@ -345,7 +381,6 @@ test("a round without a required-changes block yields no notes", () => {
   assert.deepEqual(parseReviewNotes(approving), {
     notes: [],
     round: 1,
-    stepCount: 3,
   });
 
   const emptyBlock = [
@@ -362,7 +397,6 @@ test("a round without a required-changes block yields no notes", () => {
   assert.deepEqual(parseReviewNotes(emptyBlock), {
     notes: [],
     round: 1,
-    stepCount: 3,
   });
 });
 
@@ -394,16 +428,14 @@ test("a legacy round-1 section without R ids gets positional R1..Rn", () => {
       { id: "R2", step: "2", change: "Register the route." },
     ],
     round: 1,
-    stepCount: 3,
   });
 });
 
 test("a plan with no appendix parses to no notes", () => {
   assert.deepEqual(parseReviewNotes(ORIGINAL_PLAN), {
     notes: [],
-    stepCount: 3,
   });
-  assert.deepEqual(parseReviewNotes(""), { notes: [], stepCount: 0 });
+  assert.deepEqual(parseReviewNotes(""), { notes: [] });
 });
 
 test("malformed required-change bullets are skipped, never thrown", () => {
@@ -457,7 +489,6 @@ test("renderRequiredChanges → parseReviewNotes round-trip (fixture contract)",
 
   assert.deepEqual(parseReviewNotes(plan), {
     round: 1,
-    stepCount: 3,
     notes: [
       {
         id: "R1",
@@ -468,58 +499,6 @@ test("renderRequiredChanges → parseReviewNotes round-trip (fixture contract)",
       { id: "R2", change: "Add tests.", findingIds: ["F1", "F3"] },
     ],
   });
-});
-
-test("stepCount counts numbered items under the last step-ish heading", () => {
-  const plan = [
-    "# Plan: Export",
-    "",
-    "## Context",
-    "",
-    "1. Not a step",
-    "2. Still context",
-    "",
-    "## Plan Steps",
-    "",
-    "1. Add the CSV writer",
-    "2. Add the route",
-    "3. Document the endpoint",
-    "   1. nested detail",
-    "",
-  ].join("\n");
-
-  assert.equal(countPlanSteps(plan), 3);
-  assert.equal(parseReviewNotes(plan).stepCount, 3);
-
-  const withAppendix = [
-    plan,
-    "## Reviewer Revisions (round 1)",
-    ADVISORY_LINE,
-    "",
-    "### Required changes",
-    "",
-    "- **R1 · Step 1:** Fix it.",
-    "",
-    "1. Appendix numbering never counts",
-    "",
-  ].join("\n");
-  assert.equal(countPlanSteps(withAppendix), 3);
-  assert.equal(parseReviewNotes(withAppendix).stepCount, 3);
-});
-
-test("stepCount falls back to every top-level numbered item without a step heading", () => {
-  const plan = [
-    "# Plan: Export",
-    "",
-    "1. Add the CSV writer",
-    "2. Add the route",
-    "3. Document the endpoint",
-    "  1. nested detail",
-    "",
-  ].join("\n");
-
-  assert.equal(countPlanSteps(plan), 3);
-  assert.equal(parseReviewNotes(plan).stepCount, 3);
 });
 
 // ── planHash invariants (row 8) ──────────────────────────────────────
@@ -709,4 +688,92 @@ test("guard: pause/review fold — identical text is unchanged, amended body is 
   );
   assert.equal(hashVerdict(authorPlan, reviewedText()), "unchanged");
   assert.equal(hashVerdict(authorPlan, reviewedText(1, amendedBody())), "changed");
+});
+
+// ── splitReviewerAppendix (Planner↔Reviewer loop, row 2) ─────────────
+//
+// The Planner owns `body`, the Reviewer owns `appendix`. The split must use
+// the same heading grammar as `parseReviewNotes` (last round wins) and must
+// normalize line endings + trailing blank space on both halves, so a CRLF save
+// is not refused as "Do not edit the Reviewer's appendix".
+
+test("splitReviewerAppendix: one appendix splits body from appendix", () => {
+  const plan = reviewedText();
+  const { body, appendix } = splitReviewerAppendix(plan);
+
+  assert.equal(body, REVIEWED_BODY);
+  assert.equal(
+    appendix.split("\n")[0],
+    "## Reviewer Revisions (round 1)",
+  );
+  assert.ok(appendix.includes("- **R1 · Step 2:** Round 1 change."), appendix);
+  assert.ok(!appendix.endsWith("\n"), "the appendix is trimmed");
+  // Reconstruction: the plan is exactly `body`, one newline, then the appendix.
+  assert.equal(`${body}\n${appendix}`, plan.trimEnd());
+});
+
+test("splitReviewerAppendix: multiple rounds — the last section wins", () => {
+  const plan = [
+    REVIEWED_BODY,
+    ...appendix(["### Required changes", "", "- **R1:** Round 1 change."], 1),
+    ...appendix(["### Required changes", "", "- **R1:** Round 2 change."], 2),
+  ].join("\n");
+
+  const split = splitReviewerAppendix(plan);
+
+  // The reviewed body is the last heading's text: everything before it.
+  assert.ok(split.body.startsWith(REVIEWED_BODY), split.body);
+  assert.ok(split.body.includes("## Reviewer Revisions (round 1)"), split.body);
+  assert.ok(!split.body.includes("round 2"), split.body);
+  assert.equal(
+    split.appendix.split("\n")[0],
+    "## Reviewer Revisions (round 2)",
+  );
+  assert.ok(split.appendix.includes("Round 2 change."), split.appendix);
+  assert.ok(!split.appendix.includes("Round 1 change."), split.appendix);
+  // Same section the note parser reads.
+  assert.deepEqual(parseReviewNotes(plan).notes.map((n) => n.change), [
+    "Round 2 change.",
+  ]);
+});
+
+test("splitReviewerAppendix: no appendix leaves the trimmed body", () => {
+  assert.deepEqual(splitReviewerAppendix(`\n\n${ORIGINAL_PLAN}\n\n`), {
+    body: ORIGINAL_PLAN.trim(),
+    appendix: "",
+  });
+  assert.deepEqual(splitReviewerAppendix(""), { body: "", appendix: "" });
+  // A heading that is not the `(round N)` grammar is body text.
+  const loose = `${REVIEWED_BODY}\n\n## Reviewer Revisions\n\n- old format\n`;
+  assert.deepEqual(splitReviewerAppendix(loose), {
+    body: `${REVIEWED_BODY}\n\n## Reviewer Revisions\n\n- old format`,
+    appendix: "",
+  });
+});
+
+test("splitReviewerAppendix: CRLF and trailing whitespace are normalized", () => {
+  const lf = reviewedText();
+  const crlf = `${lf.replace(/\n/g, "\r\n")}\r\n`;
+  const padded = lf
+    .split("\n")
+    .map((line) => `${line}  \t`)
+    .join("\n");
+
+  const expected = splitReviewerAppendix(lf);
+  assert.deepEqual(splitReviewerAppendix(crlf), expected);
+  assert.deepEqual(splitReviewerAppendix(padded), expected);
+  // The body hash a Windows editor save produces is the same hash.
+  assert.equal(
+    planHash(splitReviewerAppendix(crlf).body),
+    planHash(splitReviewerAppendix(lf).body),
+  );
+});
+
+test("splitReviewerAppendix: a body-only edit changes the body hash only", () => {
+  const before = splitReviewerAppendix(reviewedText());
+  const after = splitReviewerAppendix(reviewedText(1, amendedBody()));
+
+  assert.equal(after.appendix, before.appendix);
+  assert.notEqual(after.body, before.body);
+  assert.notEqual(planHash(after.body), planHash(before.body));
 });

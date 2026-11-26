@@ -78,6 +78,12 @@ export interface ReviewModeConfig {
   enabled: boolean;
   /** Max Review↔Plan rounds per user-feedback cycle. */
   rounds: number;
+  /**
+   * Max automatic Planner revision turns after a revise verdict; 0 = one-shot.
+   * Separate from `rounds` (the per-cycle Review round cap): the revision
+   * budget is not reset by `beginReviewCycle`.
+   */
+  maxRevisions: number;
   /** 1 = review + advisory notes only. 2 = review + notes, then self-verify. */
   passes: number;
   /** Run the self-verification pass (only when pass 1 found severity >= 5). */
@@ -120,6 +126,7 @@ export interface ReviewModeConfig {
 export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   enabled: false,
   rounds: 1,
+  maxRevisions: 3,
   passes: 2,
   verify: true,
   fallbackOnError: "skip",
@@ -135,6 +142,8 @@ export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
 
 const ROUNDS_MIN = 1;
 const ROUNDS_MAX = 5;
+const MAX_REVISIONS_MIN = 0;
+const MAX_REVISIONS_MAX = 5;
 const PASSES_MIN = 1;
 const PASSES_MAX = 2;
 const EXPLORE_MIN = 0;
@@ -287,6 +296,12 @@ export function coerceReviewModeConfig(
   return {
     enabled: asBool(r.enabled, base.enabled),
     rounds: clampInt(r.rounds, ROUNDS_MIN, ROUNDS_MAX, base.rounds),
+    maxRevisions: clampInt(
+      r.maxRevisions,
+      MAX_REVISIONS_MIN,
+      MAX_REVISIONS_MAX,
+      base.maxRevisions,
+    ),
     passes: clampInt(r.passes, PASSES_MIN, PASSES_MAX, base.passes),
     verify: asBool(r.verify, base.verify),
     fallbackOnError,
@@ -648,7 +663,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
         : "unconfigured — /role set reviewer <provider/model>"
     }`,
     `  prompt         : ${input.promptSource} (guidance; fixed criteria always apply)`,
-    `  rounds         : ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
+    `  rounds         : ${c.rounds}   revisions: ${c.maxRevisions}   passes: ${c.passes}   verify: ${c.verify}`,
     `  explore budget : ${c.exploreBudget}   timeout: ${formatReviewTimeoutLabel(
       c.timeoutMs,
       input.timeoutSource,

@@ -84,6 +84,26 @@ test("review policy: automatic needs both the flag and a current submission", ()
   );
 });
 
+test("review policy: a settled Planner revision admits a tool-only round", () => {
+  // A revision turn whose Planner rejected every note writes NO plan: the
+  // host passes `hasCurrentPlanSubmission: planRevisionSettled`, so the policy
+  // must admit exactly as it does for a real write (and still refuse when the
+  // revision did not settle).
+  for (const trigger of ["auto", "manual", "resume"] as const) {
+    assert.deepEqual(
+      admitReviewer({ ...PLAN_AUTO, trigger, hasCurrentPlanSubmission: true }),
+      { ok: true },
+      trigger,
+    );
+  }
+  const unsettled = admitReviewer({
+    ...PLAN_AUTO,
+    hasCurrentPlanSubmission: false,
+  });
+  assert.equal(unsettled.ok, false);
+  if (!unsettled.ok) assert.equal(unsettled.code, "no-current-submission");
+});
+
 test("review policy: every non-Plan mode is refused for every trigger", () => {
   for (const mode of ["build", "orchestrator", null] as const) {
     for (const trigger of ["auto", "manual", "resume"] as const) {

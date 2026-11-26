@@ -501,6 +501,53 @@ test("shouldHandoffPlan requires Plan + a write made under Plan mode", () => {
   );
 });
 
+test("shouldHandoffPlan: a resolved revision turn hands off without a plan write", () => {
+  const revisionOnly = {
+    mode: "plan" as const,
+    planWrittenThisRun: false,
+    planWrittenInPlanMode: false,
+    revisionSettled: true,
+  };
+  assert.equal(
+    shouldHandoffPlan(revisionOnly),
+    true,
+    "a settled/ silent revision turn is a current Plan submission",
+  );
+  assert.equal(
+    shouldHandoffPlan({ ...revisionOnly, mode: "build" }),
+    false,
+    "Build mode never hands off",
+  );
+  assert.equal(
+    shouldHandoffPlan({ ...revisionOnly, mode: null }),
+    false,
+    "Default mode never hands off",
+  );
+  assert.equal(
+    shouldHandoffPlan({ ...revisionOnly, revisionSettled: false }),
+    false,
+    "without a revision turn the plan write is mandatory",
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      mode: "plan",
+      planWrittenThisRun: false,
+      planWrittenInPlanMode: false,
+    }),
+    false,
+    "an omitted revisionSettled is the old three-part rule",
+  );
+  assert.equal(
+    shouldHandoffPlan({
+      ...revisionOnly,
+      planWrittenThisRun: true,
+      planWrittenInPlanMode: true,
+    }),
+    true,
+    "a revision turn that also wrote a plan still hands off",
+  );
+});
+
 test("findPlanWritePathInMessages reads only the supplied (current) run", () => {
   const cwd = "C:/repo";
   const messages = [

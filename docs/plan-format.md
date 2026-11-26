@@ -57,6 +57,64 @@ plain list of commands the model runs before the last row is marked done. The
 model may also add `## Decisions`, `## Risks` or any other section it finds
 useful; nothing parses or validates them.
 
+## Reviewer appendix and the Planner loop
+
+When Review Mode is on, the finished plan is audited by an independent
+reviewer. That review does not produce a second plan: it appends one
+`## Reviewer Revisions (round N)` section at the end of the same file. The file
+therefore has two owners:
+
+- **the Planner owns the body** — everything above the appendix, including
+  `## Steps` and `## Verification`;
+- **the Reviewer owns the appendix** — the findings changelog and the
+  `### Required changes` list (`- **R2 · Step 3:** …`), with stable `R<n>` ids
+  normalised to submission order.
+
+Neither side writes the other's half. The reviewer has no tool that edits the
+body, and a Planner revision turn that touches the appendix is refused.
+
+### The loop
+
+1. The Planner writes the body.
+2. The reviewer appends `## Reviewer Revisions (round N)`.
+3. If the appendix leaves required changes open and the `maxRevisions` budget
+   (`0`–`5`, default `3`; `0` = one-shot) is not spent, the Planner gets one
+   revision turn: it edits the body and records a disposition per note id
+   through `plan_revision_done`:
+   - `applied` — the body edit addressing that note is already saved; a
+     claimed `applied` with an unchanged body is refused;
+   - `rejected` — the note is declined, with a concrete reason (the evidence
+     or requirement that makes it unnecessary);
+   - `not_applicable` — the note does not describe this plan, with a reason.
+   Every current note id needs exactly one disposition; unknown, duplicate or
+   missing ids are refused.
+4. The reviewer re-reviews the revised body with those dispositions, so a
+   rejected note has to survive the Planner's reason instead of being repeated.
+5. Repeat until the reviewer approves or the budget is spent, then hand off.
+
+When the budget is spent with notes still open the loop stops without
+converging: the handoff says so, **Approve** accepts the plan as written and
+**Give feedback** continues the argument. The loop covers the automatic
+post-Plan review and `/review` in Plan mode; `/review` outside Plan mode stays
+a one-shot review.
+
+### What downstream reads
+
+The approved plan body wins on any conflict with the appendix. Rows are the
+model's call — one plan step per row supplied to `orchestrator_start` (or
+created directly in Build) — and the Orchestrator and direct Build consume only
+the plan's `## Steps`:
+
+- the appendix is never parsed into rows, notes or requirements;
+- no step/row count is computed from the file, so a long plan cannot trigger a
+  false step-count warning;
+- no note is bound to a row or a child, there is no child
+  `## Review notes (advisory)` block and no mission section for unplaced notes.
+
+The revision argument happens in Plan, before approval. If a plan still needs a
+step change after approval, it goes back to Plan through the handoff's Feedback
+path — never into a running child as a note.
+
 ## What changed
 
 The former contract — `Acceptance:`, `Checks:`, `Files:`, `Workspaces:`,

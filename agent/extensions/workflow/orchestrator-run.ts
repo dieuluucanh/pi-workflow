@@ -34,26 +34,10 @@ export interface OrchestratorRunWorkspace {
   primary: boolean;
 }
 
-/** One advisory review note attached to a row. Never a gate. */
-export interface OrchestratorRowReviewNote {
-  /** Stable note id, `R<n>`. */
-  id: string;
-  /** The required change, as parsed from the plan appendix. */
-  change: string;
-}
-
-/** A note the harness could not bind to a row; the parent must place it. */
-export interface OrchestratorUnboundReviewNote extends OrchestratorRowReviewNote {
-  /** The plan step reference when the note carried one. */
-  step?: string;
-}
-
 export interface OrchestratorRunRow {
   /** Display ref, stable for the life of the run: "1".."N". */
   ref: string;
   text: string;
-  /** Advisory review notes bound to this row; never acceptance criteria. */
-  reviewNotes?: OrchestratorRowReviewNote[];
   /** The parent's latest instruction for this row, reused on a retry. */
   instruction?: string;
   /** The child's final summary for the last dispatch. */
@@ -76,8 +60,6 @@ export interface OrchestratorRun {
   planPath?: string;
   title: string;
   rows: OrchestratorRunRow[];
-  /** Notes that could not be attached to a row; advisory and parent-placed. */
-  unboundReviewNotes?: OrchestratorUnboundReviewNote[];
   /** Resolved roots the model declared at start time. */
   workspaces?: OrchestratorRunWorkspace[];
   currentRef?: string;
@@ -94,8 +76,6 @@ export interface CreateOrchestratorRunInput {
   planPath?: string;
   steps: readonly OrchestratorRunStep[];
   workspaces?: readonly OrchestratorRunWorkspace[];
-  /** Notes the caller could not bind to a row; preserved on the run. */
-  unboundReviewNotes?: readonly OrchestratorUnboundReviewNote[];
   now?: number;
 }
 
@@ -176,7 +156,6 @@ export function createOrchestratorRun(
   }
   const primary = workspaces?.find((workspace) => workspace.primary);
   const rows = buildRows(input.steps, byId, primary);
-  const unboundReviewNotes = restoreUnboundReviewNotes(input.unboundReviewNotes);
   const title = (input.title ?? "").trim() || "Orchestrator work";
   const slug = title
     .toLowerCase()
@@ -189,7 +168,6 @@ export function createOrchestratorRun(
     ...(input.planPath ? { planPath: input.planPath } : {}),
     title,
     rows,
-    ...(unboundReviewNotes ? { unboundReviewNotes } : {}),
     ...(workspaces ? { workspaces } : {}),
     phase: "idle",
     createdAt: now,
@@ -388,40 +366,6 @@ export function nextPendingRow(
   return run.rows.find((row) => !isCompleted(row.ref));
 }
 
-/** Validate bound notes; drop malformed entries rather than failing a restore. */
-function restoreRowReviewNotes(value: unknown): OrchestratorRowReviewNote[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const notes: OrchestratorRowReviewNote[] = [];
-  for (const entry of value) {
-    if (!entry || typeof entry !== "object") continue;
-    const note = entry as Partial<OrchestratorRowReviewNote>;
-    const id = typeof note.id === "string" ? note.id.trim() : "";
-    const change = typeof note.change === "string" ? note.change.trim() : "";
-    if (!id || !change) continue;
-    notes.push({ id, change });
-  }
-  return notes.length > 0 ? notes : undefined;
-}
-
-/** Validate run-level notes; drop malformed entries rather than failing a restore. */
-function restoreUnboundReviewNotes(
-  value: unknown,
-): OrchestratorUnboundReviewNote[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const notes: OrchestratorUnboundReviewNote[] = [];
-  for (const entry of value) {
-    if (!entry || typeof entry !== "object") continue;
-    const note = entry as Partial<OrchestratorUnboundReviewNote>;
-    const id = typeof note.id === "string" ? note.id.trim() : "";
-    const change = typeof note.change === "string" ? note.change.trim() : "";
-    if (!id || !change) continue;
-    const step =
-      typeof note.step === "string" && note.step.trim() ? note.step.trim() : undefined;
-    notes.push({ id, change, ...(step ? { step } : {}) });
-  }
-  return notes.length > 0 ? notes : undefined;
-}
-
 /** Drop corrupt workspace entries instead of failing the whole restore. */
 function restoreWorkspaces(value: unknown): OrchestratorRunWorkspace[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -461,11 +405,9 @@ function restoreRow(
     typeof row.workspaceId === "string" && workspaceIds.has(row.workspaceId)
       ? row.workspaceId
       : undefined;
-  const reviewNotes = restoreRowReviewNotes(row.reviewNotes);
   return {
     ref,
     text: row.text,
-    ...(reviewNotes ? { reviewNotes } : {}),
     ...(typeof row.instruction === "string" ? { instruction: row.instruction } : {}),
     ...(typeof row.lastReport === "string" ? { lastReport: row.lastReport } : {}),
     ...(typeof row.lastReportAt === "number" ? { lastReportAt: row.lastReportAt } : {}),
@@ -484,71 +426,6 @@ function restorePhase(value: unknown): OrchestratorRunPhase {
     : "idle";
 }
 
-export interface BindReviewNotesResult {
-  /** One slot per step row; `reviewNotes` is present only on bound rows. */
-  rows: Array<{ ref: string; reviewNotes?: OrchestratorRowReviewNote[] }>;
-  unboundReviewNotes: OrchestratorUnboundReviewNote[];
-  /** True only when the plan's step count equals the run's row count. */
-  aligned: boolean;
-  planStepCount: number;
-  rowCount: number;
-}
-
-/**
- * Attach advisory notes to rows by 1-based plan step index.
- *
- * Binding is positional and deliberately bounded: it happens only when the
- * plan's numbered-step count equals the model-supplied row count. A merged,
- * split or reordered row list with a different count leaves every note on the
- * run (`aligned: false`) so the parent can place them; even with equal counts a
- * reordered list still binds by index, because a row carries no plan-step
- * identity. A non-numeric or out-of-range step is never guessed onto a row.
- */
-export function bindReviewNotes(
-  notes: readonly OrchestratorUnboundReviewNote[],
-  planStepCount: number,
-  steps: readonly OrchestratorRunStep[],
-): BindReviewNotesResult {
-  const rowCount = steps.length;
-  const rows: BindReviewNotesResult["rows"] = steps.map((_step, index) => ({
-    ref: String(index + 1),
-  }));
-  const input = Array.isArray(notes) ? notes.filter(Boolean) : [];
-  if (input.length === 0) {
-    return { rows, unboundReviewNotes: [], aligned: true, planStepCount, rowCount };
-  }
-  if (planStepCount !== rowCount) {
-    return {
-      rows,
-      unboundReviewNotes: input.map((note) => ({
-        id: note.id,
-        ...(note.step ? { step: note.step } : {}),
-        change: note.change,
-      })),
-      aligned: false,
-      planStepCount,
-      rowCount,
-    };
-  }
-  const unboundReviewNotes: OrchestratorUnboundReviewNote[] = [];
-  for (const note of input) {
-    const rawStep = typeof note.step === "string" ? note.step.trim() : "";
-    const index = /^\d+$/.test(rawStep) ? Number(rawStep) : Number.NaN;
-    if (!Number.isInteger(index) || index < 1 || index > rowCount) {
-      unboundReviewNotes.push({
-        id: note.id,
-        ...(note.step ? { step: note.step } : {}),
-        change: note.change,
-      });
-      continue;
-    }
-    const row = rows[index - 1];
-    if (!row) continue;
-    (row.reviewNotes ??= []).push({ id: note.id, change: note.change });
-  }
-  return { rows, unboundReviewNotes, aligned: true, planStepCount, rowCount };
-}
-
 export function restoreOrchestratorRun(value: unknown): OrchestratorRun | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Partial<OrchestratorRun>;
@@ -562,7 +439,6 @@ export function restoreOrchestratorRun(value: unknown): OrchestratorRun | undefi
     .map((entry) => restoreRow(entry, workspaceIds))
     .filter((row): row is OrchestratorRunRow => row !== undefined);
   if (rows.length === 0) return undefined;
-  const unboundReviewNotes = restoreUnboundReviewNotes(record.unboundReviewNotes);
   const phase = restorePhase(record.phase);
   return {
     schemaVersion: ORCHESTRATOR_RUN_SCHEMA_VERSION,
@@ -570,7 +446,6 @@ export function restoreOrchestratorRun(value: unknown): OrchestratorRun | undefi
     ...(typeof record.planPath === "string" ? { planPath: record.planPath } : {}),
     title: typeof record.title === "string" && record.title.trim() ? record.title : "Orchestrator work",
     rows,
-    ...(unboundReviewNotes ? { unboundReviewNotes } : {}),
     ...(workspaces ? { workspaces } : {}),
     ...(typeof record.currentRef === "string" ? { currentRef: record.currentRef } : {}),
     ...(typeof record.childSessionId === "string"

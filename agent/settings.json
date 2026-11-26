@@ -28,7 +28,7 @@
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4.1-flash",
+  "defaultModel": "hy4-flash-free",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -64,10 +64,10 @@
     },
     "modelDefault": {
       "provider": "opencode-go",
-      "id": "deepseek-v4.1-flash",
+      "id": "hy4-flash-free",
       "thinking": "high"
     },
-    "defaultProfile": "Opencode-Deepseek-V4.1-Flash",
+    "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
     "commitPolicy": {
       "mode": "never",
       "allowedPaths": []

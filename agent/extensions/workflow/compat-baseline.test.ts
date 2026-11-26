@@ -178,11 +178,19 @@ test("compat baseline: mode rules survive any tool-list refresh", () => {
   for (const tool of ["read", "bash", "edit", "write", "workflow_todo"]) {
     assert.ok(baseline.planActiveTools.includes(tool), `plan must include ${tool}`);
   }
-  // Build is the full normal set; nothing from Plan is lost.
+  // Build is the full normal set; nothing from Plan is lost EXCEPT the
+  // Plan-only `plan_revision_done` (the Planner↔Reviewer loop's child report,
+  // which answers a revision turn Build never has).
   for (const tool of baseline.planActiveTools) {
+    if (tool === "plan_revision_done") continue;
     assert.ok(baseline.buildActiveTools.includes(tool), `build must include ${tool}`);
   }
-  assert.deepEqual(baseline.planActiveTools, baseline.buildActiveTools);
+  assert.ok(baseline.planActiveTools.includes("plan_revision_done"));
+  assert.equal(baseline.buildActiveTools.includes("plan_revision_done"), false);
+  assert.deepEqual(
+    baseline.planActiveTools.filter((tool) => tool !== "plan_revision_done"),
+    baseline.buildActiveTools,
+  );
 });
 
 test("compat baseline: roles and profile whitelist stay aligned", () => {

@@ -81,7 +81,9 @@ import {
   buildPlannerContextManifest,
   stripReviewAppendix,
   parseReviewNotes,
+  splitReviewerAppendix,
   REVIEW_UNRESOLVED_HEADING,
+  type ReviewNote,
   type TodoStatus,
   type TodoItem,
   type TodoUpdateEntry,
@@ -280,7 +282,6 @@ import {
   type WorkflowPanelState,
 } from "./workflow-contributions.ts";
 import {
-  bindReviewNotes,
   createOrchestratorRun,
   markRunInterrupted,
   nextPendingRow,
@@ -351,6 +352,16 @@ import {
   roleForMode,
   type WorkflowMode,
 } from "./workflow-mode.ts";
+import {
+  PLAN_REVISION_TOOL_NAME,
+  buildPlanRevisionPrompt,
+  createPlanRevisionDoneTool,
+  type PlanRevisionResponse,
+} from "./plan-revision.ts";
+import {
+  decidePlanRevision,
+  type ReviewNegotiationDecision,
+} from "./review-negotiation.ts";
 import {
   defaultProfileConfig,
   loadProfilesDetailed,
@@ -2476,6 +2487,101 @@ export default function workflowExtension(
   let pendingHandoffReviewOwned = false;
   /** The next plan turn is the feedback/refine continuation of a Deny. */
   let reviewFeedbackTurn = false;
+
+  // ── Planner↔Reviewer revision loop (2026-11-26 plan, row 2/3) ──────
+  //
+  // Ownership: the Planner edits the plan BODY, the Reviewer owns the
+  // `## Reviewer Revisions` appendix. This state is what `plan_revision_done`
+  // answers; `beginPlannerRevision` (step 3) opens a turn by setting
+  // `planRevisionPending`, and `resolvePlanRevisionTurn` settles it on the next
+  // run.
+  /** Revision turns spent in this negotiation (separate from `reviewRound`). */
+  let planRevisionRound = 0;
+  /** True while a Planner revision turn is waiting for its report. */
+  let planRevisionPending = false;
+  /**
+   * True once the Planner settled the turn with `plan_revision_done` (any
+   * status mix). Consumed by the re-review that follows; a new turn clears it.
+   */
+  let planRevisionSettled = false;
+  /** Notes the Planner was asked to answer. */
+  let planRevisionNotes: ReviewNote[] = [];
+  /** The response set the Planner settled with. */
+  let planRevisionResponses: PlanRevisionResponse[] = [];
+  /** The Reviewer's appendix exactly as it stood when the turn started. */
+  let planRevisionAppendix = "";
+  /** Body hash recorded when the revision turn started. */
+  let planRevisionBodyHash = "";
+  /** Plan path the pending/settled revision belongs to. */
+  let planRevisionPlanPath: string | undefined;
+  /**
+   * One line for the handoff that follows a NON-CONVERGED loop (the revision
+   * budget is spent with notes still open). Ephemeral, never persisted, and
+   * consumed once by `presentPlanHandoff` so it cannot outlive its decision:
+   * the options are unchanged — approving accepts the plan as written, Give
+   * feedback continues.
+   */
+  let pendingHandoffRevisionNote: string | undefined;
+
+  /**
+   * Set/clear the handoff's non-convergence line from ONE loop decision.
+   *
+   * Only `exhausted` earns it: `no-revision` (budget disabled or nothing to
+   * revise) and `converged` are ordinary handoffs and must stay unchanged.
+   * Called on every decision, so a stale note can never survive into a later
+   * handoff for another round.
+   */
+  function setHandoffRevisionNote(
+    decision: ReviewNegotiationDecision | undefined,
+  ): void {
+    pendingHandoffRevisionNote =
+      decision?.outcome === "exhausted"
+        ? `Review did not converge after ${decision.revisionsUsed} revision${
+            decision.revisionsUsed === 1 ? "" : "s"
+          } — approving accepts the plan as written; Give feedback continues.`
+        : undefined;
+  }
+
+  /**
+   * Drop the loop state (fresh prompt, Build/Orchestrator entry, new plan).
+   * Returns true when anything changed, so the caller can persist once.
+   */
+  function resetPlanRevisionLoop(): boolean {
+    const changed =
+      planRevisionRound !== 0 ||
+      planRevisionPending ||
+      planRevisionSettled ||
+      planRevisionNotes.length > 0 ||
+      planRevisionResponses.length > 0 ||
+      planRevisionAppendix !== "" ||
+      planRevisionBodyHash !== "" ||
+      planRevisionPlanPath !== undefined;
+    planRevisionRound = 0;
+    planRevisionPending = false;
+    planRevisionSettled = false;
+    planRevisionNotes = [];
+    planRevisionResponses = [];
+    planRevisionAppendix = "";
+    planRevisionBodyHash = "";
+    planRevisionPlanPath = undefined;
+    pendingHandoffRevisionNote = undefined;
+    return changed;
+  }
+
+  /**
+   * Keep the loop bound to ONE plan path: a different target supersedes a
+   * pending/recorded revision instead of answering notes about another file.
+   */
+  function syncPlanRevisionPath(planPath: string | undefined): void {
+    if (!planPath) return;
+    if (
+      planRevisionPlanPath &&
+      !samePlanPath(planPath, planRevisionPlanPath, reviewCwd())
+    ) {
+      resetPlanRevisionLoop();
+    }
+    planRevisionPlanPath = planPath;
+  }
   /** Long-lived ESC listener covering a round and the paused window. */
   let detachReviewEscListener: (() => void) | undefined;
   /**
@@ -3803,8 +3909,13 @@ export default function workflowExtension(
       trigger,
       ...(trigger === "auto"
         ? {
+            // A Planner revision turn that settled (or silently rewrote the
+            // body) is a current Plan submission even without a plan write in
+            // this run — otherwise every note-rejected revision would be
+            // refused admission.
             hasCurrentPlanSubmission:
-              planWrittenThisRun && planWrittenInPlanModeThisRun,
+              (planWrittenThisRun && planWrittenInPlanModeThisRun) ||
+              planRevisionSettled,
           }
         : {}),
     });
@@ -3863,11 +3974,24 @@ export default function workflowExtension(
     }
     try {
       const rt = ensureReviewRuntime();
+      // The Planner↔Reviewer loop state for the revision just settled: the
+      // notes the last round raised and how the Planner answered each. The
+      // prompt reads it, so it must still be populated here (it is cleared in
+      // `finally`, after the round).
+      const priorRound =
+        planRevisionRound > 0 && planRevisionNotes.length > 0
+          ? {
+              round: planRevisionRound,
+              notes: planRevisionNotes,
+              responses: planRevisionResponses,
+            }
+          : undefined;
       const res = await rt.runRound({
         planText,
         planPath: currentPlanFile ?? "",
         round,
         previousFindings,
+        ...(priorRound === undefined ? {} : { priorRound }),
         signal: controller.signal,
         ...(resumed === true ? { resumed: true } : {}),
       });
@@ -3978,6 +4102,12 @@ export default function workflowExtension(
     } finally {
       activeReview = undefined;
       reviewModelSnapshot = undefined;
+      // The round consumed the previous notes/responses (both passes rendered
+      // them). Clear them on every exit — success, pause, abort, failure — so a
+      // later round cannot restate a stale argument. `planRevisionRound` stays:
+      // it is the revision budget.
+      planRevisionNotes = [];
+      planRevisionResponses = [];
       try {
         detachHostSignal?.();
       } catch (_e) {
@@ -4028,7 +4158,8 @@ export default function workflowExtension(
       ...(trigger === "auto"
         ? {
             hasCurrentPlanSubmission:
-              planWrittenThisRun && planWrittenInPlanModeThisRun,
+              (planWrittenThisRun && planWrittenInPlanModeThisRun) ||
+              planRevisionSettled,
           }
         : {}),
     });
@@ -4346,10 +4477,13 @@ export default function workflowExtension(
     }
     if (reviewCyclePlanPath === null) {
       reviewCyclePlanPath = next;
+      syncPlanRevisionPath(next);
       return false;
     }
     if (samePlanPath(next, reviewCyclePlanPath, cwd)) return false;
     reviewCyclePlanPath = next;
+    // A new plan target ends the previous Planner↔Reviewer negotiation.
+    syncPlanRevisionPath(next);
     reviewRound = 0;
     lastReviewedPlanHash = undefined;
     abortedReviewHash = undefined;
@@ -6231,7 +6365,7 @@ export default function workflowExtension(
       const manualCfg = reviewConfigForManual();
       const cfgLine =
         manualCfg !== undefined
-          ? ` Saved config: rounds ${manualCfg.rounds}, passes ${manualCfg.passes}.`
+          ? ` Saved config: rounds ${manualCfg.rounds}, revisions ${manualCfg.maxRevisions}, passes ${manualCfg.passes}.`
           : "";
       ctx.ui.notify(
         [
@@ -6638,6 +6772,40 @@ export default function workflowExtension(
       (ctx as any).signal as AbortSignal | undefined,
       "manual",
     );
+    // Planner↔Reviewer negotiation (manual `/review`): a revise verdict with
+    // open notes earns a Planner revision turn instead of the one-shot
+    // handoff. The command's Plan-only admission above is unchanged; outside
+    // Plan mode the previous one-shot behaviour stands verbatim.
+    if (workflowMode === "plan") {
+      let revisionDecision: ReviewNegotiationDecision | undefined;
+      try {
+        const negotiationCfg =
+          reviewConfigNow()?.config ?? DEFAULT_REVIEW_MODE_CONFIG;
+        revisionDecision = planRevisionDecisionFor(result, negotiationCfg);
+      } catch (_e) {
+        void _e;
+      }
+      // The handoff this round ends in carries the non-convergence line when
+      // the budget is spent (and nothing when the loop is not engaged).
+      setHandoffRevisionNote(revisionDecision);
+      // The revision turn that earned this round is consumed either way.
+      planRevisionSettled = false;
+      if (revisionDecision?.request === true) {
+        endReviewTurn();
+        const opened = await beginPlannerRevision(ctx as ExtensionContext, {
+          notes: parseReviewNotes(result.planText).notes,
+          planText: result.planText,
+          round: planRevisionRound + 1,
+        });
+        if (opened) return;
+      } else if (
+        revisionDecision !== undefined &&
+        (revisionDecision.outcome === "exhausted" ||
+          revisionDecision.outcome === "no-revision")
+      ) {
+        notifyReview(revisionDecision.reason, "info");
+      }
+    }
     // The manual path never flips the persisted flag: tell the user when
     // automatic review is still off so the one-shot is not mistaken for it.
     const offSuffix = reviewEnabled()
@@ -7857,6 +8025,16 @@ export default function workflowExtension(
       // The shell quarantine survives a reload through this entry, not through
       // the removed execution state.
       shellQuarantine: shellGuardRuntime?.quarantineInfo() ?? null,
+      // Planner↔Reviewer negotiation: round counter, pending/settled flags and
+      // the response set. A pending turn cannot survive a reload (its follow-up
+      // and appendix snapshot are gone), so restore clears it and says so.
+      planRevision: {
+        round: planRevisionRound,
+        pending: planRevisionPending,
+        settled: planRevisionSettled,
+        noteIds: planRevisionNotes.map((note) => note.id),
+        responses: planRevisionResponses,
+      },
     } as any);
     lastPersistedPlanFile = currentPlanFile;
     publishContributions();
@@ -7936,8 +8114,11 @@ export default function workflowExtension(
     if (workflowMode === null) captureDefaultModel(ctx, "build");
     workflowMode = "build";
     syncLegacyFlags();
-    // Leaving Plan invalidates this cycle's handoff/provenance.
+    // Leaving Plan invalidates this cycle's handoff/provenance and the
+    // Planner↔Reviewer negotiation (a revision turn cannot survive the exit).
     resetPlanRunProvenance();
+    // Build entry: no revision turn exists outside Plan, so the loop state goes.
+    resetPlanRevisionLoop();
     clearPendingHandoffDecision();
     pi.setActiveTools(
       toolsBeforePlanMode ?? buildModeTools(pi.getActiveTools()),
@@ -7994,6 +8175,9 @@ export default function workflowExtension(
     if (workflowMode === null) captureDefaultModel(ctx, "orchestrator");
     workflowMode = "orchestrator";
     syncLegacyFlags();
+    // Orchestrator entry ends any Planner↔Reviewer negotiation: no revision
+    // turn is pending in Orchestrator mode (the tool refuses there).
+    resetPlanRevisionLoop();
     clearPendingHandoffDecision();
     if (toolsBeforePlanMode === undefined)
       toolsBeforePlanMode = pi.getActiveTools();
@@ -8041,6 +8225,7 @@ export default function workflowExtension(
     // todos stay as reference, but no per-run eligibility survives.
     clearPendingHandoffDecision();
     resetPlanRunProvenance();
+    resetPlanRevisionLoop();
     // Restore the model that was active in Default mode (don't leak the
     // Build/Plan role model into Default).
     try {
@@ -8258,6 +8443,8 @@ export default function workflowExtension(
       syncLegacyFlags();
       // The plan is being handed to Build; this Plan cycle cannot hand off again.
       resetPlanRunProvenance();
+      // A Planner revision turn belongs to Plan; the approval ends it.
+      resetPlanRevisionLoop();
       clearPendingHandoffDecision();
       // Approve path: Plan mode is off in favour of Build, but the reviewer
       // session stays warm — a landing review must not append to the plan the
@@ -8800,6 +8987,178 @@ export default function workflowExtension(
   }
 
   /**
+   * The one cycle/reset/send sequence for a Planner follow-up turn.
+   *
+   * Every path that answers a review with more Planner work (the browser/native
+   * Deny, and the automatic Planner↔Reviewer loop) must behave identically:
+   * drop the pending handoff decision, start a feedback cycle that keeps the
+   * findings, hand the turn back to the Planner (idle turn + feedback flag),
+   * persist, then deliver the todo-list custom message and `message` as a
+   * `followUp`. The caller names the audit entry so each path keeps its own
+   * history shape. Never throws.
+   */
+  async function sendRevisionFollowUp(
+    _ctx: ExtensionContext,
+    opts: {
+      message: string;
+      reason: "deny" | "refine";
+      entry: { type: string; data: Record<string, unknown> };
+    },
+  ): Promise<void> {
+    clearPendingHandoffDecision();
+    // Feedback cycle: the next plan revision gets a fresh review round, and the
+    // outstanding findings are carried forward so the reviewer can confirm they
+    // were actually addressed rather than re-raising them.
+    await beginReviewCycle({ reason: opts.reason, keepFindings: true });
+    setReviewTurn("idle");
+    // The feedback turn is not a fresh user prompt: keeping the refine reason
+    // preserves manualReviewCycle, so a manual review with automatic Review
+    // Mode off still re-reviews the revision.
+    reviewFeedbackTurn = true;
+    persistState();
+    const message = opts.message || "Please revise the plan.";
+    try {
+      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
+      const planTodoListMessage = {
+        customType: "workflow-todo-list",
+        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
+        display: true,
+      };
+      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      if ((pi as any).sendUserMessage) {
+        (pi as any).sendUserMessage(message, { deliverAs: "followUp" });
+      } else {
+        (pi as any).sendMessage?.(message, { deliverAs: "followUp" });
+      }
+    } catch (_e) {
+      void _e;
+    }
+    try {
+      pi.appendEntry(opts.entry.type, opts.entry.data);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  /**
+   * Open ONE Planner revision turn (Planner↔Reviewer loop).
+   *
+   * Guarded: Plan mode, no live review turn, and a revision budget that is not
+   * yet spent. On success it records the notes, the Reviewer's appendix and the
+   * body hash the Planner must beat, resets the pending/settled flags, and
+   * reuses {@link sendRevisionFollowUp} for the delivery. Returns true only
+   * when a turn was actually sent.
+   */
+  async function beginPlannerRevision(
+    ctx: ExtensionContext,
+    opts: { notes: readonly ReviewNote[]; planText: string; round: number },
+  ): Promise<boolean> {
+    if (workflowMode !== "plan") return false;
+    if (reviewTurn !== "idle") return false;
+    const cfg = reviewConfigNow()?.config ?? DEFAULT_REVIEW_MODE_CONFIG;
+    if (!(planRevisionRound < cfg.maxRevisions)) return false;
+    planRevisionRound += 1;
+    planRevisionPending = true;
+    planRevisionSettled = false;
+    planRevisionNotes = [...opts.notes];
+    const split = splitReviewerAppendix(opts.planText);
+    planRevisionAppendix = split.appendix;
+    planRevisionBodyHash = planHash(split.body);
+    planRevisionResponses = [];
+    planRevisionPlanPath = currentPlanFile;
+    // A new revision turn supersedes any non-convergence line from the handoff
+    // of the previous cycle.
+    pendingHandoffRevisionNote = undefined;
+    const round =
+      Number.isFinite(opts.round) && opts.round > 0
+        ? Math.trunc(opts.round)
+        : planRevisionRound;
+    await sendRevisionFollowUp(ctx, {
+      message: buildPlanRevisionPrompt({
+        planPath: currentPlanFile ?? "",
+        round,
+        maxRounds: cfg.maxRevisions,
+        notes: opts.notes,
+      }),
+      reason: "refine",
+      entry: {
+        type: "workflow-review-revision",
+        data: {
+          at: Date.now(),
+          round,
+          noteIds: opts.notes.map((note) => note.id),
+        },
+      },
+    });
+    return true;
+  }
+
+  /**
+   * The one revision decision for a finished review round.
+   *
+   * `cfg` is the config the round ran with (never a mid-round re-read); the
+   * verdict comes from the folded `reviewState` the round just wrote. Pure
+   * policy is `decidePlanRevision` — this helper only supplies the inputs.
+   */
+  function planRevisionDecisionFor(
+    reviewed: Pick<ReviewExecutionResult, "outcome" | "planText">,
+    cfg: { maxRevisions: number },
+  ): ReviewNegotiationDecision {
+    return decidePlanRevision({
+      reviewOutcome: reviewed.outcome,
+      verdict: reviewState?.verdict,
+      notes: parseReviewNotes(reviewed.planText).notes,
+      revisionsUsed: planRevisionRound,
+      maxRevisions: cfg.maxRevisions,
+    });
+  }
+
+  /**
+   * Resolve a pending Planner revision turn at the start of the next run.
+   *
+   * Three endings, one pass: the tool settled (`planRevisionSettled`), the
+   * Planner silently rewrote the plan BODY (hash differs), or nothing changed.
+   * The first two return `reReview` and let the caller re-run the Reviewer; the
+   * no-op clears the loop and hands the reviewer's notes to the user. Never
+   * sends anything.
+   */
+  function resolvePlanRevisionTurn(): {
+    resolved: boolean;
+    reReview: boolean;
+  } {
+    if (!planRevisionPending) return { resolved: false, reReview: false };
+    planRevisionPending = false;
+    const settled = planRevisionSettled;
+    const target = planRevisionPlanPath ?? currentPlanFile;
+    let planText: string | undefined;
+    if (target) {
+      try {
+        planText = fs.readFileSync(target, "utf8");
+      } catch (_e) {
+        planText = undefined;
+      }
+    }
+    const bodyChanged =
+      typeof planText === "string" &&
+      planHash(splitReviewerAppendix(planText).body) !== planRevisionBodyHash;
+    if (settled || bodyChanged) {
+      // A silent body edit is a revision too: it earns the re-review even when
+      // the Planner never called `plan_revision_done`. Its (empty) response set
+      // is the honest record; `planRevisionSettled` stays "the tool settled".
+      if (!settled) planRevisionResponses = [];
+      return { resolved: true, reReview: true };
+    }
+    // No revision at all: hand the reviewer's notes over with the plan the user
+    // has, instead of looping forever on an unchanged body.
+    planRevisionSettled = false;
+    notifyReview(
+      "Planner made no revision — handing off the reviewer's notes",
+      "info",
+    );
+    return { resolved: true, reReview: false };
+  }
+
+  /**
    * Apply a handoff "refine" decision: switch a manual review back to Plan,
    * start a feedback cycle, and send the revision follow-up.
    *
@@ -8834,50 +9193,19 @@ export default function workflowExtension(
         "info",
       );
     }
-    clearPendingHandoffDecision();
-    // Feedback cycle: the next plan revision gets a fresh review round, and the
-    // outstanding findings are carried forward so the reviewer can confirm they
-    // were actually addressed rather than re-raising them.
-    await beginReviewCycle({
+    await sendRevisionFollowUp(ctx, {
+      message: feedback,
       reason: opts.reason ?? "deny",
-      keepFindings: true,
+      entry: {
+        type: "workflow-handoff-result",
+        data: {
+          at: Date.now(),
+          choice: "refine",
+          source: opts.source,
+          feedback,
+        },
+      },
     });
-    setReviewTurn("idle");
-    // The feedback turn is not a fresh user prompt: keeping the refine reason
-    // preserves manualReviewCycle, so a manual review with automatic Review
-    // Mode off still re-reviews the revision.
-    reviewFeedbackTurn = true;
-    persistState();
-    try {
-      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
-      const planTodoListMessage = {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
-        display: true,
-      };
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
-      if ((pi as any).sendUserMessage) {
-        (pi as any).sendUserMessage(feedback || "Please revise the plan.", {
-          deliverAs: "followUp",
-        });
-      } else {
-        (pi as any).sendMessage?.(feedback || "Please revise the plan.", {
-          deliverAs: "followUp",
-        });
-      }
-    } catch (_e) {
-      void _e;
-    }
-    try {
-      pi.appendEntry("workflow-handoff-result", {
-        at: Date.now(),
-        choice: "refine",
-        source: opts.source,
-        feedback,
-      });
-    } catch (_e) {
-      void _e;
-    }
   }
 
   /**
@@ -8905,6 +9233,11 @@ export default function workflowExtension(
     },
   ): Promise<"browser" | "native" | "none"> {
     pendingExecutionKickoff = null;
+    // Consume the non-convergence line here, not at the call site: this is the
+    // ONE presentation per decision, so the note appears exactly once and
+    // never outlives the handoff it describes.
+    const revisionNote = pendingHandoffRevisionNote;
+    pendingHandoffRevisionNote = undefined;
     const manualSource =
       input.source === "manual" ||
       pendingHandoffSource === "manual" ||
@@ -9012,10 +9345,9 @@ export default function workflowExtension(
     overlayDepth += 1;
     handoffModalOpen = true;
     let result: QuestionnaireResult | null = null;
-    // Advisory notes are surfaced as a count only: the plan body is never
-    // amended for them, so there is no diff/apply choice at the handoff.
-    // Parse once here; a skipped or plain handoff passes 0 so the line is
-    // unchanged.
+    // The notes live in the Reviewer's appendix as a count only: the plan body
+    // (the Planner's half) is what the user approves. Parse once here; a
+    // skipped or plain handoff passes 0 so the line is unchanged.
     const revisionCount =
       input.reason === "reviewed"
         ? parseReviewNotes(input.planText).notes.length
@@ -9029,6 +9361,7 @@ export default function workflowExtension(
           ? { findingCount: input.findingCount }
           : {}),
         revisionCount,
+        ...(revisionNote !== undefined ? { revisionNote } : {}),
       });
       result = await ctx.ui.custom<QuestionnaireResult | null>(
         (tui, theme, _kb, done) =>
@@ -13156,13 +13489,12 @@ export default function workflowExtension(
       };
     }
     let planPath: string | undefined;
-    let planText: string | undefined;
     if (typeof input.planPath === "string" && input.planPath.trim().length > 0) {
       planPath = path.isAbsolute(input.planPath)
         ? input.planPath
         : path.resolve(orchestratorRoot(), input.planPath);
       try {
-        planText = await fs.promises.readFile(planPath, "utf8");
+        await fs.promises.readFile(planPath, "utf8");
       } catch (error: unknown) {
         return {
           ok: false,
@@ -13189,51 +13521,12 @@ export default function workflowExtension(
         displayPath: root.displayPath,
         primary: root.primary,
       }));
-      const parsedNotes = planText !== undefined ? parseReviewNotes(planText) : undefined;
-      const bindings = parsedNotes
-        ? bindReviewNotes(parsedNotes.notes, parsedNotes.stepCount, steps)
-        : undefined;
       orchestratorRun = createOrchestratorRun({
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(planPath !== undefined ? { planPath } : {}),
         steps,
         workspaces,
-        ...(bindings && bindings.unboundReviewNotes.length > 0
-          ? { unboundReviewNotes: bindings.unboundReviewNotes }
-          : {}),
       });
-      if (bindings) {
-        const notesByRef = new Map(
-          bindings.rows
-            .filter((row) => row.reviewNotes !== undefined && row.reviewNotes.length > 0)
-            .map((row) => [row.ref, row.reviewNotes!] as const),
-        );
-        if (notesByRef.size > 0) {
-          orchestratorRun = {
-            ...orchestratorRun,
-            rows: orchestratorRun.rows.map((row) => {
-              const reviewNotes = notesByRef.get(row.ref);
-              return reviewNotes ? { ...row, reviewNotes } : row;
-            }),
-          };
-        }
-      }
-      // Advisory only: never block a start because notes did not line up.
-      if (parsedNotes && parsedNotes.notes.length > 0 && bindings) {
-        if (!bindings.aligned) {
-          notifyWorkflow(
-            `Plan has ${bindings.planStepCount} numbered steps but the run has ${bindings.rowCount} rows; review notes were left unbound.`,
-            "warning",
-          );
-        } else if (bindings.unboundReviewNotes.length > 0) {
-          notifyWorkflow(
-            `Review notes ${bindings.unboundReviewNotes
-              .map((note) => note.id)
-              .join(", ")} could not be bound to a row; they were left unbound.`,
-            "warning",
-          );
-        }
-      }
     } catch (error: unknown) {
       return {
         ok: false,
@@ -13940,6 +14233,52 @@ export default function workflowExtension(
           routing: "explorer-single",
           results,
         },
+      };
+    },
+  });
+
+  // ── Planner revision report (Planner↔Reviewer loop, row 2/3) ──────
+  //
+  // `plan_revision_done` is the Planner's child report: it answers the Reviewer
+  // notes for ONE revision turn. It is registered always but only ACTIVE in
+  // Plan mode (`PLAN_MODE_TOOLS`), and it refuses unless a turn is pending, so
+  // a stale call can never settle a later turn. `beginPlannerRevision` opens
+  // the turn; its `settle` callback closes it.
+  const planRevisionTool = createPlanRevisionDoneTool({
+    pending: () => planRevisionPending,
+    notes: () => planRevisionNotes,
+    readPlan: () => {
+      const target = planRevisionPlanPath ?? currentPlanFile;
+      if (!target) return undefined;
+      try {
+        return fs.readFileSync(target, "utf8");
+      } catch (_e) {
+        return undefined;
+      }
+    },
+    expectedAppendix: () => planRevisionAppendix,
+    bodyHashAtStart: () => planRevisionBodyHash,
+    // The BODY hash only: the appendix belongs to the Reviewer, so a body diff
+    // is the only thing `applied` may claim.
+    planHashBody: (text) => planHash(splitReviewerAppendix(text).body),
+    settle: (responses) => {
+      planRevisionResponses = [...responses];
+      planRevisionPending = false;
+      planRevisionSettled = true;
+    },
+  });
+
+  pi.registerTool({
+    name: planRevisionTool.name,
+    label: planRevisionTool.label,
+    description: planRevisionTool.description,
+    parameters: planRevisionTool.parameters,
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const result = await planRevisionTool.execute(_id, params);
+      return {
+        content: result.content,
+        details: result.details ?? {},
+        ...(result.isError ? { isError: true } : {}),
       };
     },
   });
@@ -14768,6 +15107,8 @@ export default function workflowExtension(
     let profileModel: PersistedModelDefault | undefined;
     /** True when an old entry still carries the removed freeze/execution shape. */
     let legacyRunEntrySeen = false;
+    /** A persisted revision turn cannot resume: tell the user once. */
+    let revisionReloadNotice = false;
     try {
       const entries = ctx.sessionManager.getBranch();
       for (const e of entries as any[]) {
@@ -14967,6 +15308,24 @@ export default function workflowExtension(
               // legacy `awaitingDecision` boolean must not resurrect Review.
               awaitingDecision = false;
             }
+            // Planner↔Reviewer negotiation: keep the spent-round counter across
+            // a reload, but never resurrect a PENDING turn — its follow-up and
+            // appendix snapshot did not survive, and restoring it would let a
+            // stale settle re-review a plan nobody asked about. A restored
+            // `settled` flag is never trusted either: the round it earned is
+            // gone. Notify once instead of auto-sending a Planner prompt.
+            const restoredRevision = (d as any).planRevision;
+            if (restoredRevision && typeof restoredRevision === "object") {
+              const restoredRound = Number(restoredRevision.round);
+              if (Number.isFinite(restoredRound) && restoredRound > 0) {
+                planRevisionRound = Math.trunc(restoredRound);
+              }
+              if (restoredRevision.pending === true) {
+                planRevisionPending = false;
+                planRevisionSettled = false;
+                revisionReloadNotice = true;
+              }
+            }
           }
         }
         if (
@@ -14991,6 +15350,18 @@ export default function workflowExtension(
       }
     } catch (_e) {
       void _e;
+    }
+    if (revisionReloadNotice) {
+      try {
+        (ctx as any).ui?.notify?.(
+          reviewNoticeText(
+            "Review negotiation stopped by reload — run /review to continue.",
+          ),
+          "info",
+        );
+      } catch (_e) {
+        void _e;
+      }
     }
     // The shell guard's own session reset must not clear the persisted
     // quarantine. Re-adopt it after the restore loop.
@@ -17755,15 +18126,21 @@ export default function workflowExtension(
       const age = lastHandoffAt ? Date.now() - lastHandoffAt : Infinity;
       const cleared = clearPendingHandoffDecision();
       resetPlanRunProvenance();
-      if (cleared) {
+      // A fresh prompt supersedes a pending negotiation. The revision turn
+      // itself is delivered as a followUp (a continuation run), so a turn still
+      // marked pending here belongs to work the user has moved on from.
+      const clearedRevision = resetPlanRevisionLoop();
+      if (cleared || clearedRevision) {
         persistState();
-        try {
-          pi.appendEntry("workflow-handoff-reset-before-start", {
-            at: Date.now(),
-            age,
-          });
-        } catch (_e) {
-          void _e;
+        if (cleared) {
+          try {
+            pi.appendEntry("workflow-handoff-reset-before-start", {
+              at: Date.now(),
+              age,
+            });
+          } catch (_e) {
+            void _e;
+          }
         }
       }
     } catch (_e) {
@@ -17828,9 +18205,6 @@ export default function workflowExtension(
               runId: run.runId,
               sourceLabel: run.planPath ?? "standalone steps",
               taskCounts: { done, total },
-              // Review-note seam: the builder is pure, so the run's unbound
-              // notes are passed in here and never read inside the builder.
-              unboundReviewNotes: run.unboundReviewNotes,
             }
           : {}),
       });
@@ -17855,7 +18229,7 @@ export default function workflowExtension(
       // The note says the plan body is not modified: the reviewer's output is an
       // appended appendix, so the planner's text is what the handoff renders.
       const reviewNote = reviewEnabled()
-        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required revisions to the plan file as a review appendix. The plan body is not modified — the reviewer cannot rewrite it. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step.`
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required changes to the plan file as a \`## Reviewer Revisions\` appendix. You own the plan BODY; the reviewer owns the appendix. When the review leaves required changes and the review budget allows it, you get one revision turn: revise the body (never the appendix) and answer every note id through \`plan_revision_done\` as \`applied\`, \`rejected\` or \`not_applicable\` (a concrete reason is required for the last two), then the reviewer re-reviews the revised body. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step: the approved plan's steps are what execution consumes — the appendix is never a step list.`
         : "";
       return {
         message: {
@@ -18968,9 +19342,6 @@ export default function workflowExtension(
             ref: row.ref,
             text: row.text,
             instruction,
-            ...(row.reviewNotes && row.reviewNotes.length > 0
-              ? { reviewNotes: row.reviewNotes }
-              : {}),
             ...(workspace ? { workspace } : {}),
           },
           ...(input.repair ? { repair: input.repair } : {}),
@@ -19864,12 +20235,27 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
+      // ── Planner↔Reviewer negotiation: resolve the revision turn first ──
+      // The run that follows a revision follow-up ends one of three ways: the
+      // Planner settled `plan_revision_done`, it silently rewrote the plan
+      // BODY, or it did nothing. The first two re-review; the no-op hands the
+      // reviewer's notes over. A resolved turn may review/hand off without
+      // writing a plan itself, so it runs BEFORE the per-run write gate.
+      const revisionTurn = resolvePlanRevisionTurn();
+      if (revisionTurn.resolved) {
+        try {
+          persistState();
+        } catch (_e) {
+          void _e;
+        }
+      }
       // Per-run handoff gate (plan 2026-10-25 follow-up): a Plan-mode run
       // that wrote no plan this run must not reconcile, review, or hand off
       // an older plan. This runs before the reviewer prefetch so a new task
       // cannot even boot a reviewer on stale state. Build mode keeps its own
-      // completion branch below.
-      if (workflowMode === "plan" && !planWrittenThisRun) {
+      // completion branch below. A resolved revision turn owns the plan target
+      // it was sent for, so it is exempt.
+      if (workflowMode === "plan" && !planWrittenThisRun && !revisionTurn.resolved) {
         const cwd = (ctx as any)?.cwd ?? process.cwd();
         const found =
           planWritePathThisRun ??
@@ -19906,6 +20292,9 @@ export default function workflowExtension(
           mode: workflowMode,
           planWrittenThisRun,
           planWrittenInPlanMode: planWrittenInPlanModeThisRun,
+          // Only the run that answers a revision follow-up may qualify on the
+          // resolved turn alone (it wrote no plan of its own).
+          ...(revisionTurn.resolved ? { revisionSettled: true } : {}),
         });
         if (!eligible) {
           if (planWrittenThisRun) {
@@ -20016,8 +20405,14 @@ export default function workflowExtension(
       // The current run's write is the only authoritative plan source. Old
       // `currentPlanFile`/`lastPlanWritePath` values and session-branch scans
       // are session-lifetime state and must never reach a new task's handoff.
+      // A resolved revision turn contributes the plan it was sent for (the
+      // Planner may have settled the tool without writing, or written nothing).
+      const revisionPlanPath =
+        revisionTurn.resolved
+          ? (planRevisionPlanPath ?? currentPlanFile ?? undefined)
+          : undefined;
       const planCandidate: string | undefined =
-        planWritePathThisRun ?? undefined;
+        planWritePathThisRun ?? revisionPlanPath;
       if (!planCandidate) return; // the per-run gate above should have caught this
       let planAbs: string | undefined;
       try {
@@ -20084,7 +20479,7 @@ export default function workflowExtension(
       }
 
       // The run write is the handoff path; never prefer an older currentPlanFile.
-      let planPath = planWritePathThisRun;
+      let planPath = planWritePathThisRun ?? revisionPlanPath;
       if (!planPath) return;
       if (!path.isAbsolute(planPath))
         planPath = path.join((ctx as any).cwd, planPath);
@@ -20107,7 +20502,7 @@ export default function workflowExtension(
       // Current-run write only: a stale file can never be rendered for a new
       // task. The assistant draft is acceptable only because the run wrote a
       // plan (the per-run gate above), so it is current-run text.
-      const fromRunWrite = tryRead(planWritePathThisRun);
+      const fromRunWrite = tryRead(planWritePathThisRun ?? revisionPlanPath);
       if (fromRunWrite) {
         planTextForRender = fromRunWrite;
         planSource = "run-write";
@@ -20155,7 +20550,12 @@ export default function workflowExtension(
         // TODO list; nothing parses or merges plan markdown here.
         planTextForRender = finalText;
       };
-      const reviewThisCycle = reviewEnabled() || manualReviewCycle;
+      const reviewThisCycle =
+        (reviewEnabled() || manualReviewCycle) &&
+        // A revision turn that changed nothing is not reviewed again: the same
+        // revision already has a verdict, so the notes go straight to the user
+        // with the plan (see `resolvePlanRevisionTurn`).
+        !(revisionTurn.resolved && !revisionTurn.reReview);
       // True only when the reviewer block below actually ran. The handoff
       // presenter must not treat a plain automatic handoff as review-owned.
       let reviewedThisHandoff = false;
@@ -20166,7 +20566,8 @@ export default function workflowExtension(
         const gateAdmission = admitReviewerNow({
           trigger: manualReviewCycle ? "manual" : "auto",
           hasCurrentPlanSubmission:
-            planWrittenThisRun && planWrittenInPlanModeThisRun,
+            (planWrittenThisRun && planWrittenInPlanModeThisRun) ||
+            planRevisionSettled,
         });
         if (gateAdmission.ok) {
           reviewedThisHandoff = true;
@@ -20177,6 +20578,9 @@ export default function workflowExtension(
         // Review owns the turn before the reviewer boots. A plan handoff with
         // Review Mode off never reaches this block (no Review turn).
         beginReviewTurn();
+        // Surfaced for the negotiation decision after the gate settles: the
+        // round's own scope ends at the try/finally below.
+        let reviewedRound: ReviewExecutionResult | undefined;
         try {
           const reviewed = await runReviewStep(
             authorPlan,
@@ -20184,6 +20588,7 @@ export default function workflowExtension(
             (ctx as any).signal as AbortSignal | undefined,
             manualReviewCycle ? "manual" : "auto",
           );
+          reviewedRound = reviewed;
           if (handoffCycle !== reviewCycleId) {
             endReviewTurn();
             return;
@@ -20194,7 +20599,8 @@ export default function workflowExtension(
           const afterAdmission = admitReviewerNow({
             trigger: manualReviewCycle ? "manual" : "auto",
             hasCurrentPlanSubmission:
-              planWrittenThisRun && planWrittenInPlanModeThisRun,
+              (planWrittenThisRun && planWrittenInPlanModeThisRun) ||
+              planRevisionSettled,
           });
           if (!afterAdmission.ok) {
             endReviewTurn();
@@ -20284,6 +20690,65 @@ export default function workflowExtension(
         if (handoffCycle !== reviewCycleId) {
           endReviewTurn();
           return;
+        }
+        // Planner↔Reviewer negotiation: the settled round may want a Planner
+        // revision instead of the handoff. Decided once, with the config the
+        // round ran with; the gate is already settled with the reviewed text
+        // above, so a stale pause can no longer reopen it.
+        let revisionDecision: ReviewNegotiationDecision | undefined;
+        try {
+          const negotiationCfg =
+            reviewConfigNow()?.config ?? DEFAULT_REVIEW_MODE_CONFIG;
+          if (reviewedRound !== undefined) {
+            revisionDecision = planRevisionDecisionFor(
+              reviewedRound,
+              negotiationCfg,
+            );
+          }
+        } catch (_e) {
+          void _e;
+        }
+        // The handoff below carries the non-convergence line when the revision
+        // budget is spent with notes still open.
+        setHandoffRevisionNote(revisionDecision);
+        // Whichever way it goes, the revision turn that earned this round is
+        // consumed; a new settle sets it again.
+        planRevisionSettled = false;
+        if (revisionDecision?.request === true && reviewedRound !== undefined) {
+          if (!reviewHandoffGate.settled()) {
+            reviewHandoffGate.resolve({
+              outcome: "reviewed",
+              planText: reviewedRound.planText,
+            });
+          }
+          endReviewTurn();
+          const opened = await beginPlannerRevision(ctx as ExtensionContext, {
+            notes: parseReviewNotes(reviewedRound.planText).notes,
+            planText: reviewedRound.planText,
+            round: planRevisionRound + 1,
+          });
+          if (opened) {
+            try {
+              pi.appendEntry("workflow-review-negotiation", {
+                at: Date.now(),
+                outcome: revisionDecision.outcome,
+                round: planRevisionRound,
+                reason: revisionDecision.reason,
+              });
+            } catch (_e) {
+              void _e;
+            }
+            // The Planner follow-up owns the next run: never present the
+            // handoff on a revise round.
+            return;
+          }
+        } else if (
+          revisionDecision !== undefined &&
+          (revisionDecision.outcome === "exhausted" ||
+            revisionDecision.outcome === "no-revision")
+        ) {
+          // Out of budget or nothing to revise: say why, then hand off as-is.
+          notifyReview(revisionDecision.reason, "info");
         }
         } else {
           notifyReview(gateAdmission.reason, "info");

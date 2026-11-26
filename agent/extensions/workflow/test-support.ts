@@ -610,6 +610,83 @@ export const submitThenFinishPass2 =
     );
   };
 
+/** One scripted reviewer round (1-based `round`), run inside `fakeSdk.pass1`. */
+export type ScriptedReviewRound = (
+  capture: FakeCapture,
+  round: number,
+) => Promise<void>;
+
+/**
+ * Script a reviewer sequence, one submission per review round.
+ *
+ * `fakeSdk` calls `pass1` once per round, so the wrapper hands each call the
+ * next script. The final script repeats if the loop reviews more rounds than
+ * scripted — a reviewer that keeps raising the same notes. `round()` exposes
+ * how many rounds ran so a test can assert the sequence, not just its output.
+ */
+export function scriptedReviewer(
+  rounds: readonly ScriptedReviewRound[],
+): {
+  pass1: (capture: FakeCapture) => Promise<void>;
+  round: () => number;
+} {
+  let current = 0;
+  return {
+    round: () => current,
+    pass1: async (capture) => {
+      const script = rounds[Math.min(current, rounds.length - 1)];
+      current += 1;
+      if (!script) {
+        throw new Error("scriptedReviewer: at least one round is required");
+      }
+      await script(capture, current);
+    },
+  };
+}
+
+/** One review submission for `submitReviewRound`. */
+export interface ScriptedReviewSubmission {
+  verdict: "approve" | "revise" | "block";
+  findings?: readonly unknown[];
+  /** Required changes; `approve` must not carry any. */
+  revisions?: ReadonlyArray<{
+    id?: string;
+    step?: string;
+    change: string;
+  }>;
+  summary?: string;
+}
+
+/**
+ * Submit one fake review round through the live append-only protocol:
+ * `review_submit` then `review_pass_done` for pass 1.
+ */
+export async function submitReviewRound(
+  capture: FakeCapture,
+  submission: ScriptedReviewSubmission,
+): Promise<void> {
+  const findings = [...(submission.findings ?? [])];
+  await capture.tools.review_submit.execute(
+    "submit",
+    {
+      findings,
+      verdict: submission.verdict,
+      summary: submission.summary ?? `${submission.verdict} submission`,
+      ...(submission.revisions ? { revisions: submission.revisions } : {}),
+    },
+    undefined,
+    undefined,
+    {},
+  );
+  await capture.tools.review_pass_done.execute(
+    "done",
+    { pass: 1, verdict: submission.verdict, findings },
+    undefined,
+    undefined,
+    {},
+  );
+}
+
 // ── Fake Pi host ─────────────────────────────────────────────────────
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown | Promise<unknown>;

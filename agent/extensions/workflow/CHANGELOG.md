@@ -1,3 +1,51 @@
+## [0.17.0] - 2026-11-26
+
+This release is **cut by the 2026-11-26 review-note/step-count plan** (version
+bumped by it, not published); the `0.16.0` advisory-note bullets below are
+superseded.
+
+### Breaking — the Planner↔Reviewer revision loop replaces the advisory notes (2026-11-26)
+
+- **The reviewed plan now has two owners.** The Planner owns the plan BODY; the
+  Reviewer owns the `## Reviewer Revisions (round N)` appendix. A revise verdict
+  with open required changes now earns the Planner a **revision turn** instead
+  of ending the cycle: it edits the body, answers every note id through
+  `plan_revision_done` as `applied`, `rejected` or `not_applicable` (a concrete
+  reason is required for the last two, an `applied` with an unchanged body is
+  refused, and editing the appendix is refused), and the reviewer re-reviews
+  the revised body with those responses. The loop repeats until the reviewer
+  approves or the budget is spent, then hands off.
+- **`maxRevisions` is the new budget** (`workflow.reviewMode.maxRevisions`,
+  `0`–`5`, default `3`; `0` = the previous one-shot review). `rounds` stays the
+  per-cycle Review round cap. When the budget is exhausted with notes still
+  open the loop stops without converging: the handoff says so, Approve accepts
+  the plan as written and Give feedback continues. The loop covers the
+  automatic post-Plan review and `/review` in Plan mode; `/review` outside Plan
+  mode stays one-shot.
+- **The downstream advisory-note pipeline is reverted, not deprecated.** Rows
+  no longer carry `reviewNotes`, the run no longer keeps `unboundReviewNotes`,
+  the child kickoff no longer carries a `## Review notes (advisory)` block, the
+  mission asks the parent for no note placement or acknowledgement (mission
+  **v6**), and the report no longer lists note conflicts. **The Orchestrator and
+  direct Build consume only the approved plan's steps** — they never read, parse
+  or bind the appendix. A step change goes back to Plan through the handoff's
+  Feedback path.
+- **`countPlanSteps`/`stepCount` are deleted.** The harness no longer guesses a
+  plan's step count from its text, so the note-to-row binding heuristic and its
+  false warning (a long plan reported as "24 numbered steps") are gone with it.
+  One step per row is the model's call.
+- **The chunked rewrite path stays deleted.** `review_plan_begin` /
+  `review_plan_chunk` / `review_plan_finalize`, the plan assembler, the
+  `replacement-body` submission and the `chunkedSubmit`/`chunkChars` settings
+  remain removed; there is no body rewrite left to configure.
+
+### Changed — docs
+
+- `README.md` and `docs/plan-format.md` describe the loop, the body/appendix
+  ownership split, the `plan_revision_done` dispositions and the fact that the
+  appendix never reaches a row or a child. `maxRevisions` is documented in the
+  Review Mode settings table.
+
 ## [0.16.0] - 2026-11-25
 
 ### Changed — Review Mode is advisory: the plan body is never rewritten (2026-11-25)

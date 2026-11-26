@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { DEFAULT_REVIEW_MODE_CONFIG, formatReviewStatusLines } from "./review.ts";
 import {
   REVIEW_DEFAULT_FORM,
   REVIEW_DESCRIPTION,
@@ -669,4 +670,43 @@ test("completions: non-string input behaves like the verb position", () => {
     [...EXPECTED_VERBS, ".pi/plans/a.md", ".pi/plans/b.md"],
   );
   assert.deepEqual(labels(reviewCompletionItems(null)), EXPECTED_VERBS);
+});
+
+// ── Revision budget copy ─────────────────────────────────────────────
+
+test("help: names the revision budget", () => {
+  const help = formatReviewHelp();
+  assert.match(help, /maxRevisions/);
+  assert.match(help, /0-5, default 3/);
+  assert.match(help, /0 makes every review one-shot/);
+  // The mode verb itself carries the name, so `/review help mode` teaches it.
+  assert.match(formatReviewHelp("mode"), /maxRevisions/);
+});
+
+test("status: the config block shows the revisions value beside rounds/passes", () => {
+  const lines = formatReviewStatusLines({
+    enabled: true,
+    config: { ...DEFAULT_REVIEW_MODE_CONFIG, rounds: 1, maxRevisions: 3, passes: 2 },
+    timeoutSource: "default",
+    promptSource: "default",
+    sources: { global: false, project: false },
+    runtime: "not started",
+  });
+  const row = lines.find((line) => line.includes("rounds"));
+  assert.ok(row, `missing rounds row in:\n${lines.join("\n")}`);
+  assert.match(row, /rounds\s+: 1/);
+  assert.match(row, /revisions: 3/);
+  assert.match(row, /passes: 2/);
+
+  const disabledBudget = formatReviewStatusLines({
+    enabled: false,
+    config: { ...DEFAULT_REVIEW_MODE_CONFIG, maxRevisions: 0 },
+    timeoutSource: "default",
+    promptSource: "default",
+    sources: { global: false, project: false },
+    runtime: "not started",
+  });
+  const disabledRow = disabledBudget.find((line) => line.includes("rounds"));
+  assert.ok(disabledRow);
+  assert.match(disabledRow, /revisions: 0/);
 });
