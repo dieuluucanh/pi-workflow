@@ -69,16 +69,17 @@ export interface OrchestratorVerbSpec {
 
 /**
  * The verb table. There is exactly one entry per verb; no aliases, no hidden
- * forms. `start` is the only verb that refuses a bound run, and `status`,
- * `inspect`, `view` and `help` are the only verbs usable outside Orchestrator
- * mode.
+ * forms. `start` is the only verb that refuses an active run: a completed or
+ * cancelled run (or one whose rows are all settled) is replaced instead, and
+ * `status`, `inspect`, `view` and `help` are the only verbs usable outside
+ * Orchestrator mode.
  */
 export const ORCHESTRATOR_VERBS = [
   {
     name: "start",
     usage: "/orchestrator start [path]",
     summary:
-      "Record the approved plan and start the model-driven run (dispatches one row at a time).",
+      "Record the approved plan and start the model-driven run (replaces a completed or cancelled run; dispatches one row at a time).",
     args: "path?",
     group: "run",
     requiresMode: true,
@@ -381,7 +382,7 @@ export function describeOrchestratorGuards(spec: OrchestratorVerbSpec): string {
     spec.run === "required"
       ? "a bound run is required"
       : spec.run === "forbidden"
-        ? "refuses an already-bound run"
+        ? "refuses an active run; replaces a completed or cancelled one"
         : "no run needed";
   const child = spec.requiresChild
     ? "; a live or paused child is required"

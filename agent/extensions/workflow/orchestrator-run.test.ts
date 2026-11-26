@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   createOrchestratorRun,
+  isTerminalRunPhase,
   markRunInterrupted,
   nextPendingRow,
   recordAbort,
@@ -11,7 +12,10 @@ import {
   recordFailure,
   recordReport,
   restoreOrchestratorRun,
+  runAcceptsNewStart,
+  runRowsSettled,
   setRunPhase,
+  TERMINAL_RUN_PHASES,
   workspaceForRow,
 } from "./orchestrator-run.ts";
 import type { OrchestratorRunWorkspace } from "./orchestrator-run.ts";
@@ -264,6 +268,62 @@ test("run: interrupted, cancelled and paused phases survive a restore", () => {
     rows: [{ ref: "1", text: "One" }],
   });
   assert.equal(cancelledFromIdle?.phase, "cancelled", "a reload must not revive a cancelled run as idle");
+});
+
+test("run: only completed and cancelled are terminal phases", () => {
+  assert.deepEqual([...TERMINAL_RUN_PHASES], ["completed", "cancelled"]);
+  for (const phase of ["completed", "cancelled"] as const) {
+    assert.equal(isTerminalRunPhase(phase), true, `${phase} must be terminal`);
+  }
+  for (const phase of ["idle", "running", "paused", "interrupted", undefined] as const) {
+    assert.equal(isTerminalRunPhase(phase), false, `${String(phase)} is not terminal`);
+  }
+});
+
+test("run: rows settle only when every ref is settled", () => {
+  const run = createOrchestratorRun({ steps: ["One", "Two"], now: 1_700_000_000_000 });
+  const settled = (refs: string[]) => (ref: string) => refs.includes(ref);
+  assert.equal(runRowsSettled(run, settled([])), false);
+  assert.equal(runRowsSettled(run, settled(["1"])), false, "one pending row is not settled");
+  assert.equal(runRowsSettled(run, settled(["1", "2"])), true);
+  const empty = { ...run, rows: [] };
+  assert.equal(runRowsSettled(empty, () => true), false, "an empty row list is never settled");
+});
+
+test("run: a new start is refused while rows are pending or a child is live", () => {
+  const run = createOrchestratorRun({ steps: ["One", "Two"], now: 1_700_000_000_000 });
+  const settled = (refs: string[]) => (ref: string) => refs.includes(ref);
+
+  assert.equal(
+    runAcceptsNewStart(run, settled(["1"])),
+    false,
+    "an idle run with pending rows keeps its record",
+  );
+  assert.equal(runAcceptsNewStart(run, settled(["1", "2"])), true, "all rows settled allows");
+  assert.equal(
+    runAcceptsNewStart({ ...run, phase: "running" }, settled(["1", "2"])),
+    true,
+    "between rows a settled run accepts a replacement",
+  );
+  assert.equal(
+    runAcceptsNewStart(run, settled(["1", "2"]), true),
+    false,
+    "a live child refuses the replacement",
+  );
+  assert.equal(
+    runAcceptsNewStart({ ...run, rows: [] }, () => true),
+    false,
+    "an idle empty row list refuses",
+  );
+
+  for (const phase of ["completed", "cancelled"] as const) {
+    assert.equal(
+      runAcceptsNewStart({ ...run, phase }, settled([])),
+      true,
+      `a ${phase} run is replaced even with pending rows`,
+    );
+    assert.equal(runAcceptsNewStart({ ...run, phase }, settled([]), true), false);
+  }
 });
 
 test("run: an old v1 record without workspaces still restores", () => {

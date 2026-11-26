@@ -15,7 +15,7 @@
 import type { OrchestratorRunPhase } from "./orchestrator-run.ts";
 
 export const ORCHESTRATOR_CONTEXT_ENTRY = "workflow-orchestrator-context";
-export const ORCHESTRATOR_MISSION_VERSION = 6 as const;
+export const ORCHESTRATOR_MISSION_VERSION = 7 as const;
 
 /** `unbound` means no run is bound yet; preparation is still available. */
 export type OrchestratorPhase = OrchestratorRunPhase | "unbound";
@@ -55,9 +55,9 @@ function nextLine(state: OrchestratorMissionState): string {
     case "interrupted":
       return "Next action: explain the blocker, then orchestrator_retry re-dispatches the stored row instruction with your amendment.";
     case "cancelled":
-      return "Next action: the run was cancelled; start again from the approved plan when the user agrees.";
+      return "Next action: the run was cancelled — answer the user. When the user asks for new work, call orchestrator_start with the new steps; a cancelled run is replaced, never revived, and its unfinished rows are not carried over.";
     case "completed":
-      return "Next action: every row is done; report the result and stop.";
+      return "Next action: the run is complete — answer the user. When the user asks for new work, call orchestrator_start with the new steps; a completed run is replaced, never revived.";
     default:
       return "Next action: inspect the run with orchestrator_status.";
   }
@@ -100,6 +100,7 @@ export function buildOrchestratorMission(state: OrchestratorMissionState): strin
     "",
     "Interaction:",
     "- User prompts while a child runs are forwarded to that child. Do not answer them yourself and do not ask the user to switch modes.",
+    "- A terminal run never blocks a prompt; the parent answers and may start a replacement run.",
     "- The child interaction surface is command-only: /orchestrator pause, resume, abort, view, inspect.",
     "- /profile and /role switch the live Build child in place; the next child always launches on the same effective model.",
     "",

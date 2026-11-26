@@ -67,7 +67,7 @@
       "id": "hy4-flash-free",
       "thinking": "high"
     },
-    "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
+    "defaultProfile": "Opencode-Free",
     "commitPolicy": {
       "mode": "never",
       "allowedPaths": []

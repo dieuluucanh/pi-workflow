@@ -324,6 +324,48 @@ export function setRunPhase(
 }
 
 /**
+ * Phases that end a run. A terminal run is sealed: dispatch, retry and resume
+ * must not revive it, and a new `orchestrator_start` replaces the record
+ * instead. Kept as a tuple so the operator and `index.ts` share one list.
+ */
+export const TERMINAL_RUN_PHASES = ["completed", "cancelled"] as const;
+
+export type TerminalRunPhase = (typeof TERMINAL_RUN_PHASES)[number];
+
+/** True when the phase no longer admits dispatch, retry or resume. */
+export function isTerminalRunPhase(
+  phase: OrchestratorRunPhase | undefined,
+): phase is TerminalRunPhase {
+  return (TERMINAL_RUN_PHASES as readonly (OrchestratorRunPhase | undefined)[]).includes(
+    phase,
+  );
+}
+
+/**
+ * True when the run has at least one row and every row ref is settled.
+ * Settled is caller-supplied because it is read from the live TODO list.
+ */
+export function runRowsSettled(
+  run: OrchestratorRun,
+  isSettled: (ref: string) => boolean,
+): boolean {
+  return run.rows.length > 0 && run.rows.every((row) => isSettled(row.ref));
+}
+
+/**
+ * Whether a new run may replace this record. A live child always blocks the
+ * replacement; otherwise a terminal phase or a fully settled row list does.
+ */
+export function runAcceptsNewStart(
+  run: OrchestratorRun,
+  isSettled: (ref: string) => boolean,
+  childLive = false,
+): boolean {
+  if (childLive) return false;
+  return isTerminalRunPhase(run.phase) || runRowsSettled(run, isSettled);
+}
+
+/**
  * The reload lost the in-process child, or the child reported an error/abort.
  * The run stays resumable through `/orchestrator retry`.
  */

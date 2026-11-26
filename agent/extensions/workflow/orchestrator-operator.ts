@@ -35,14 +35,23 @@ import {
   parseOrchestratorInvocation,
   type OrchestratorVerbName,
 } from "./orchestrator-command.ts";
-import type { OrchestratorRun, OrchestratorRunPhase } from "./orchestrator-run.ts";
+import {
+  isTerminalRunPhase,
+  runAcceptsNewStart,
+  type OrchestratorRun,
+  type OrchestratorRunPhase,
+} from "./orchestrator-run.ts";
+import { executionOwnsSession } from "./review-policy.ts";
 import type { WorkflowMode } from "./workflow-mode.ts";
 
 /**
  * Bumped when the operator's public surface changes shape. 4 = schema-driven
  * grammar (no `cancel`, no aliases, `mode`/`start`/`abort` ports).
+ * 5 = phase-based input state (`OrchestratorInputState.runPhase` replaces the
+ * record-existence `hasRun`) and `OperatorTodoRow.settled`, so a cancelled row
+ * counts as settled in the operator.
  */
-export const OPERATOR_SCHEMA_VERSION = 4 as const;
+export const OPERATOR_SCHEMA_VERSION = 5 as const;
 
 export type OperatorVerb = OrchestratorVerbName | "mode-entry";
 
@@ -72,6 +81,8 @@ export interface OperatorTodoRow {
   ref: string;
   text: string;
   completed: boolean;
+  /** The row is terminal (`completed` or `cancelled`), not merely checked. */
+  settled?: boolean;
 }
 
 /**
@@ -131,6 +142,15 @@ function boundRunRefusalText(run: OrchestratorRun): string {
   return `A run is already bound (${run.runId}); use /orchestrator status to read it, /orchestrator retry to dispatch a row, or /orchestrator stop to cancel it before starting another.`;
 }
 
+/** A completed/cancelled run is sealed; only a new run may replace it. */
+function terminalRunRefusalText(
+  run: OrchestratorRun,
+  verb: "retry" | "resume",
+): string {
+  const action = verb === "resume" ? "resumed" : "retried";
+  return `Run ${run.runId} is ${run.phase}; a terminal run cannot be ${action}. Call orchestrator_start with new rows to start a new run.`;
+}
+
 function childLine(child: OperatorChildSnapshot | undefined): string | undefined {
   if (!child) return undefined;
   const model =
@@ -162,9 +182,18 @@ function childLine(child: OperatorChildSnapshot | undefined): string | undefined
   return `${line}${error}`;
 }
 
-/** Rows the TODO list reports complete, keyed by run ref. */
-function completedRefs(rows: readonly OperatorTodoRow[]): Set<string> {
-  return new Set(rows.filter((row) => row.completed).map((row) => row.ref));
+/**
+ * Rows that need no further dispatch, keyed by run ref.
+ *
+ * `settled` (terminal: completed or cancelled) wins when the host supplies it;
+ * `completed` is the backward-compatible fallback, so a host that predates the
+ * field still counts checked rows. A cancelled row is terminal for row
+ * selection, otherwise `next`/retry would pick it forever.
+ */
+function settledTodoRefs(rows: readonly OperatorTodoRow[]): Set<string> {
+  return new Set(
+    rows.filter((row) => row.settled ?? row.completed).map((row) => row.ref),
+  );
 }
 
 export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRuntime {
@@ -205,6 +234,10 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
 
       const run = ports.run();
       const child = ports.child?.();
+      // The TODO rows are read BEFORE the bound-run guard because `start` may
+      // replace a terminal/settled run, and that decision needs them.
+      const rows = ports.todos?.() ?? [];
+      const settledRefs = settledTodoRefs(rows);
 
       // ── Decision 3 guards, read from the table (never inferred). ──────
       // A wired `mode` port is authoritative; an unwired one is permissive so
@@ -213,11 +246,20 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
       if (spec.requiresMode && mode !== undefined && mode !== "orchestrator") {
         return fail(verb, modeRefusalText(verb));
       }
-      if (spec.run === "forbidden" && run) {
+      // `run: "forbidden"` stays the table schema flag for every verb that
+      // needs a record; `start` is the documented exception, because it CREATES
+      // the run. It may replace a terminal or fully settled run when no child is
+      // live; an active run must still be stopped or retried first.
+      const replacesBoundRun =
+        verb === "start" &&
+        !child &&
+        run !== undefined &&
+        runAcceptsNewStart(run, (ref) => settledRefs.has(ref), false);
+      if (spec.run === "forbidden" && run && !replacesBoundRun) {
         return fail(verb, boundRunRefusalText(run));
       }
 
-      // ── `start` runs before the run-bound guard (it CREATES the run). ──
+      // ── `start` creates (or replaces) the run, so it never reads it. ────
       if (verb === "start") {
         if (!ports.start) {
           return fail(
@@ -248,11 +290,15 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
           : fail(verb, NO_RUN_TEXT);
       }
 
-      const rows = ports.todos?.() ?? [];
-      const doneRefs = completedRefs(rows);
-      const done = run.rows.filter((row) => doneRefs.has(row.ref)).length;
+      const done = run.rows.filter((row) => settledRefs.has(row.ref)).length;
       const total = run.rows.length;
-      const next = run.rows.find((row) => !doneRefs.has(row.ref));
+      // Settled rows (completed or cancelled) are never the next row, and never
+      // the retry/resume fallback target. A terminal run has no next row at
+      // all: it is sealed, and `orchestrator_start` is its replacement path.
+      const terminal = isTerminalRunPhase(run.phase);
+      const next = terminal
+        ? undefined
+        : run.rows.find((row) => !settledRefs.has(row.ref));
       const target = (): string | undefined =>
         parsed.rowRef || run.currentRef || next?.ref;
 
@@ -289,7 +335,13 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
                 : []),
               ...(next
                 ? [`next row: ${next.ref} — ${next.text.slice(0, 200)}`]
-                : ["every row is done"]),
+                : terminal
+                  ? [
+                      done === total
+                        ? "every row is settled · no further dispatch · orchestrator_start replaces this run when the user asks for new work"
+                        : "no further dispatch for this terminal run · orchestrator_start replaces it when the user asks for new work",
+                    ]
+                  : ["every row is done"]),
             ].join("\n"),
           };
         }
@@ -320,6 +372,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "resume": {
+          if (isTerminalRunPhase(run.phase)) {
+            return fail(verb, terminalRunRefusalText(run, "resume"));
+          }
           // Only a warm PAUSED child can be resumed. A settled child was
           // released by the settle path, so the fallback starts a fresh one.
           if (child && child.phase === "paused") {
@@ -446,6 +501,9 @@ export function createOperatorRuntime(ports: OperatorRuntimePorts): OperatorRunt
         }
 
         case "retry": {
+          if (isTerminalRunPhase(run.phase)) {
+            return fail(verb, terminalRunRefusalText(run, "retry"));
+          }
           const rowRef = target();
           if (!rowRef) return fail(verb, "There is no row to retry.");
           const retried = await ports.retry?.(rowRef);
@@ -490,7 +548,12 @@ export type OrchestratorChildInputPhase =
 
 export interface OrchestratorInputState {
   childPhase: OrchestratorChildInputPhase | undefined;
-  hasRun: boolean;
+  /**
+   * The bound run's phase. Ownership is execution-based: only a `running` run
+   * owns prompts between children, so an idle, paused, interrupted, completed
+   * or cancelled record never cages the session.
+   */
+  runPhase?: OrchestratorRunPhase;
 }
 
 export type OrchestratorInputDecision =
@@ -500,13 +563,21 @@ export type OrchestratorInputDecision =
   | { action: "refuse"; notice: string };
 
 /**
- * Decide what a user prompt means while an Orchestrator run owns the session.
+ * Decide what a user prompt means while an Orchestrator run is bound.
  *
  * - a slash command always passes through (its own guard may still refuse it);
  * - prose while a child runs is forwarded to that child (steer);
  * - prose while the child is paused is queued for the next resume;
- * - prose with a bound run but no live child is refused with the recovery
- *   command, so the parent model never starts a second owner.
+ * - prose while the child starts or settles is refused with a short notice: the
+ *   controller cannot accept a delivery in either phase;
+ * - prose while the run still owns execution (`running` between rows) is
+ *   refused with a short wait/status notice;
+ * - every other run phase (idle, paused, interrupted, completed, cancelled)
+ *   allows the prompt, because a dormant or terminal record never cages the
+ *   session — the parent answers and may start a replacement run.
+ *
+ * Ownership is shared with mode switching and Reviewer admission through
+ * `executionOwnsSession()`, so the three cannot drift.
  */
 export function orchestratorInputDecision(
   text: string,
@@ -518,6 +589,7 @@ export function orchestratorInputDecision(
   if (state.childPhase === "running") {
     return { action: "forward" };
   }
+  if (state.childPhase === "paused") return { action: "queue" };
   if (state.childPhase === "starting") {
     // The controller cannot deliver into a session that is still being
     // created; saying "forwarded" would be a lie and drop the prompt.
@@ -527,12 +599,20 @@ export function orchestratorInputDecision(
         "The Build child is starting. Wait until the composer shows Working, then send the note again.",
     };
   }
-  if (state.childPhase === "paused") return { action: "queue" };
-  if (state.hasRun) {
+  if (state.childPhase === "settling") {
+    // The report is being recorded right now; abort only applies to
+    // starting|running|paused, so offering it here would refuse.
     return {
       action: "refuse",
       notice:
-        "The Orchestrator run owns this session but no child is live. Use /orchestrator retry to start a fresh child for the current row, or /orchestrator status to read its report. Resume only continues a paused warm child.",
+        "The Build child settled and its report is still being recorded. Wait a moment and send the note again, or read /orchestrator status.",
+    };
+  }
+  if (executionOwnsSession({ runPhase: state.runPhase })) {
+    return {
+      action: "refuse",
+      notice:
+        "The Orchestrator run is executing between rows, so it still owns this turn. Wait for the next row to start, or read /orchestrator status.",
     };
   }
   return { action: "allow" };

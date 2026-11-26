@@ -104,11 +104,14 @@ test("guards: status needs no mode and no run", () => {
   assert.equal(status.requiresChild, false);
 });
 
-test("guards: start needs Orchestrator mode and refuses a bound run", () => {
+test("guards: start needs Orchestrator mode and refuses an active run", () => {
   const start = spec("start");
   assert.equal(start.requiresMode, true);
   assert.equal(start.run, "forbidden");
   assert.equal(start.requiresChild, false);
+  // `run: "forbidden"` stays the schema flag; the replacement exception lives
+  // in the runtime and the help copy.
+  assert.match(start.summary, /replaces a completed or cancelled run/);
 });
 
 test("guards: pause needs mode, a bound run and a live child", () => {
@@ -142,7 +145,12 @@ test("guards: status/inspect/view/help work in any mode", () => {
 test("guards: describeOrchestratorGuards names mode, run and child", () => {
   assert.match(describeOrchestratorGuards(spec("status")), /any mode/);
   assert.match(describeOrchestratorGuards(spec("status")), /no run needed/);
-  assert.match(describeOrchestratorGuards(spec("start")), /refuses an already-bound run/);
+  assert.match(describeOrchestratorGuards(spec("start")), /refuses an active run/);
+  assert.match(
+    describeOrchestratorGuards(spec("start")),
+    /replaces a completed or cancelled one/,
+  );
+  assert.doesNotMatch(describeOrchestratorGuards(spec("start")), /already-bound/);
   const pause = describeOrchestratorGuards(spec("pause"));
   assert.match(pause, /Orchestrator mode required/);
   assert.match(pause, /a bound run is required/);
@@ -398,6 +406,14 @@ test("help: one verb prints its usage, summary and guards", () => {
   assert.match(help, /a bound run is required/);
   assert.match(help, /live or paused child/);
   assert.match(help, /Run \/orchestrator help for every verb/);
+});
+
+test("help: the start verb documents the replacement exception", () => {
+  const help = formatOrchestratorHelp("start");
+  assert.match(help, /replaces a completed or cancelled run/);
+  assert.match(help, /refuses an active run/);
+  assert.match(help, /replaces a completed or cancelled one/);
+  assert.doesNotMatch(help, /already-bound/);
 });
 
 test("help: unknown or blank verb input falls back to the full list", () => {

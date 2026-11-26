@@ -100,7 +100,7 @@ function harness(overrides: Partial<OperatorRuntimePorts> = {}) {
 }
 
 test("the operator schema version tracks the schema-driven grammar", () => {
-  assert.equal(OPERATOR_SCHEMA_VERSION, 4);
+  assert.equal(OPERATOR_SCHEMA_VERSION, 5);
 });
 
 test("parse: bare is mode entry, extras and unknown verbs are errors", () => {
@@ -183,13 +183,72 @@ test("start calls the start port with the parsed path, and bare start with empty
   assert.deepEqual(bare.calls, ["start:"]);
 });
 
-test("start refuses an already-bound run before touching the start port", async () => {
+test("start refuses an active run before touching the start port", async () => {
   const { operator, calls } = harness();
   const result = await operator.run("start");
   assert.equal(result.ok, false);
   assert.match(result.text, /A run is already bound/);
   assert.match(result.text, /\/orchestrator status/);
   assert.deepEqual(calls, []);
+});
+
+test("start refuses an active run with rows left to settle, even without a child", async () => {
+  // Phase alone is not enough: the live TODO rows still have pending work, so
+  // the record is active and the start port must never be reached.
+  const { operator, calls } = harness({ child: () => undefined });
+  const result = await operator.run("start .pi/plans/y.md");
+  assert.equal(result.ok, false);
+  assert.match(result.text, /A run is already bound/);
+  assert.deepEqual(calls, []);
+
+  const running = harness({ run: () => setRunPhase(boundRun(), "running") });
+  assert.equal((await running.operator.run("start")).ok, false);
+  assert.deepEqual(running.calls, []);
+});
+
+test("start replaces a terminal run when no child is live", async () => {
+  for (const phase of ["completed", "cancelled"] as const) {
+    const { operator, calls } = harness({
+      run: () => setRunPhase(boundRun(), phase),
+      child: () => undefined,
+    });
+    const result = await operator.run("start .pi/plans/next.md");
+    assert.equal(result.ok, true, `${phase} must not block a replacement`);
+    assert.deepEqual(calls, ["start:.pi/plans/next.md"]);
+  }
+});
+
+test("start replaces a non-terminal run once every row is settled", async () => {
+  const allSettled: OperatorTodoRow[] = [
+    { ref: "1", text: "First row", completed: true, settled: true },
+    { ref: "2", text: "Second row", completed: false, settled: true },
+  ];
+  const { operator, calls } = harness({
+    todos: () => allSettled,
+    child: () => undefined,
+  });
+  const result = await operator.run("start");
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["start:"]);
+});
+
+test("start still refuses while a child is live, even for a terminal run", async () => {
+  for (const phase of ["completed", "cancelled"] as const) {
+    const { operator, calls } = harness({
+      run: () => setRunPhase(boundRun(), phase),
+    });
+    const result = await operator.run("start");
+    assert.equal(result.ok, false, `${phase} must not be replaced under a live child`);
+    assert.match(result.text, /A run is already bound/);
+    assert.deepEqual(calls, [], "no dispatch while the child owns the session");
+  }
+
+  const settling = harness({
+    run: () => setRunPhase(boundRun(), "completed"),
+    child: () => ({ phase: "settling", todos: [] }),
+  });
+  assert.equal((await settling.operator.run("start")).ok, false);
+  assert.deepEqual(settling.calls, []);
 });
 
 test("start in another mode names /orchestrator instead of switching", async () => {
@@ -296,6 +355,129 @@ test("stop is the only cancel", async () => {
   assert.deepEqual(cancelled.calls, []);
 });
 
+test("settled rows are never the next row or the retry target", async () => {
+  const rows: OperatorTodoRow[] = [
+    { ref: "1", text: "One", completed: true, settled: true },
+    { ref: "2", text: "Two", completed: false, settled: true },
+    { ref: "3", text: "Three", completed: false },
+  ];
+  const run = createOrchestratorRun({
+    title: "Three rows",
+    steps: ["One", "Two", "Three"],
+    now: 2,
+  });
+  const { operator, calls } = harness({
+    run: () => run,
+    todos: () => rows,
+    child: () => undefined,
+  });
+
+  const status = await operator.run("status");
+  assert.match(status.text, /2\/3 rows done/);
+  assert.match(status.text, /next 3/);
+  assert.doesNotMatch(status.text, /next 2/);
+
+  // `currentRef` is unset, so retry/resume fall back to the same settled-aware
+  // target instead of re-dispatching the cancelled row forever.
+  assert.equal((await operator.run("retry")).ok, true);
+  assert.deepEqual(calls, ["retry:3"]);
+});
+
+test("rows without `settled` still fall back to the legacy `completed` flag", async () => {
+  const rows: OperatorTodoRow[] = [
+    { ref: "1", text: "One", completed: true },
+    { ref: "2", text: "Two", completed: false },
+  ];
+  const run = createOrchestratorRun({ title: "Legacy rows", steps: ["One", "Two"], now: 3 });
+  const { operator } = harness({
+    run: () => run,
+    todos: () => rows,
+    child: () => undefined,
+  });
+  const status = await operator.run("status");
+  assert.match(status.text, /1\/2 rows done/);
+  assert.match(status.text, /next 2/);
+});
+
+test("every row settled leaves no next row and no retry target", async () => {
+  const rows: OperatorTodoRow[] = [
+    { ref: "1", text: "One", completed: true, settled: true },
+    { ref: "2", text: "Two", completed: false, settled: true },
+  ];
+  const run = createOrchestratorRun({ title: "Done rows", steps: ["One", "Two"], now: 4 });
+  const { operator, calls } = harness({
+    run: () => setRunPhase(run, "completed"),
+    todos: () => rows,
+    child: () => undefined,
+  });
+  const status = await operator.run("status");
+  assert.match(status.text, /every row is settled/);
+  assert.doesNotMatch(status.text, /next row:/);
+  assert.match(status.text, /orchestrator_start replaces this run/);
+
+  const retried = await operator.run("retry");
+  assert.equal(retried.ok, false);
+  assert.match(retried.text, /terminal run cannot be retried/);
+  assert.match(retried.text, /orchestrator_start/);
+  assert.deepEqual(calls, []);
+});
+
+test("a terminal run reports no next row even while rows are still pending", async () => {
+  // `boundRun()` leaves row 2 undispatched, so the settled refs alone would
+  // pick it as `next`. A sealed run must not advertise it: dispatch/retry both
+  // refuse, and the only forward path is `orchestrator_start` with new rows.
+  for (const phase of ["completed", "cancelled"] as const) {
+    const { operator, calls } = harness({
+      run: () => setRunPhase(boundRun(), phase),
+      child: () => undefined,
+    });
+    const status = await operator.run("status");
+    assert.equal(status.ok, true);
+    assert.match(status.text, new RegExp(`· ${phase}`));
+    assert.match(status.text, /1\/2 rows done/);
+    assert.doesNotMatch(status.text, /next 2/);
+    assert.doesNotMatch(status.text, /next row:/);
+    assert.match(status.text, /no further dispatch/);
+    assert.match(status.text, /orchestrator_start/);
+    assert.match(status.text, /new work/);
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("retry and resume refuse a terminal run with new-run guidance", async () => {
+  for (const phase of ["completed", "cancelled"] as const) {
+    for (const verb of ["retry", "resume"] as const) {
+      const { operator, calls } = harness({
+        run: () => setRunPhase(boundRun(), phase),
+        child: () => undefined,
+        todos: () => TODO_ROWS,
+      });
+      const result = await operator.run(verb);
+      assert.equal(result.ok, false, `${verb} must refuse a ${phase} run`);
+      assert.match(
+        result.text,
+        new RegExp(
+          `terminal run cannot be ${verb === "resume" ? "resumed" : "retried"}`,
+        ),
+      );
+      assert.match(result.text, new RegExp(phase));
+      assert.match(result.text, /orchestrator_start/);
+      assert.match(result.text, /new rows/);
+      assert.deepEqual(calls, [], "the retry port is never reached");
+    }
+  }
+
+  // Sealing wins over a stale warm-paused child: a terminal run never resumes.
+  const warmButTerminal = harness({
+    run: () => setRunPhase(boundRun(), "completed"),
+    child: () => ({ phase: "paused", todos: [] }),
+  });
+  const resumed = await warmButTerminal.operator.run("resume");
+  assert.equal(resumed.ok, false);
+  assert.match(resumed.text, /terminal run cannot be resumed/);
+  assert.deepEqual(warmButTerminal.calls, []);
+});
+
 test("retry re-dispatches the stored instruction for the current or named row", async () => {
   const { operator, calls } = harness();
   assert.equal((await operator.run("retry")).ok, true);
@@ -368,23 +550,86 @@ test("view stores and reports the composer view before the run guard", async () 
   assert.match(refused.text, /Unknown view "sideways"/);
 });
 
-test("input routing forwards, queues and refuses around the live child", () => {
-  assert.deepEqual(orchestratorInputDecision("/status", { childPhase: "running", hasRun: true }), {
-    action: "allow",
+test("input routing: slash commands and empty text always pass", () => {
+  for (const runPhase of ["running", "idle", "completed"] as const) {
+    assert.deepEqual(
+      orchestratorInputDecision("/status", { childPhase: "running", runPhase }),
+      { action: "allow" },
+    );
+    assert.deepEqual(
+      orchestratorInputDecision("/orchestrator status", { childPhase: undefined, runPhase }),
+      { action: "allow" },
+    );
+  }
+  assert.deepEqual(
+    orchestratorInputDecision("   ", { childPhase: "running", runPhase: "running" }),
+    { action: "allow" },
+  );
+});
+
+test("input routing: a live child forwards, queues, or refuses briefly per phase", () => {
+  assert.deepEqual(
+    orchestratorInputDecision("keep going", { childPhase: "running", runPhase: "running" }),
+    { action: "forward" },
+  );
+  assert.deepEqual(
+    orchestratorInputDecision("keep going", { childPhase: "paused", runPhase: "paused" }),
+    { action: "queue" },
+  );
+
+  const starting = orchestratorInputDecision("keep going", {
+    childPhase: "starting",
+    runPhase: "running",
   });
-  assert.deepEqual(orchestratorInputDecision("keep going", { childPhase: "running", hasRun: true }), {
-    action: "forward",
+  assert.equal(starting.action, "refuse");
+  if (starting.action !== "refuse") return;
+  assert.match(starting.notice, /child is starting/i);
+  assert.doesNotMatch(starting.notice, /orchestrator retry|Resume only continues/);
+
+  const settling = orchestratorInputDecision("keep going", {
+    childPhase: "settling",
+    runPhase: "running",
   });
-  assert.deepEqual(orchestratorInputDecision("keep going", { childPhase: "paused", hasRun: true }), {
-    action: "queue",
-  });
-  const idle = orchestratorInputDecision("keep going", { childPhase: "idle", hasRun: true });
-  assert.equal(idle.action, "refuse");
-  if (idle.action !== "refuse") return;
-  assert.match(idle.notice, /orchestrator retry/);
-  assert.match(idle.notice, /[Rr]esume only continues a paused warm child/);
-  assert.match(idle.action === "refuse" ? idle.notice : "", /orchestrator retry/);
-  assert.deepEqual(orchestratorInputDecision("start", { childPhase: undefined, hasRun: false }), {
-    action: "allow",
-  });
+  assert.equal(settling.action, "refuse");
+  if (settling.action !== "refuse") return;
+  assert.match(settling.notice, /settled/);
+  assert.match(settling.notice, /report is still being recorded/);
+  assert.match(settling.notice, /orchestrator status/);
+  // Abort only applies to starting|running|paused, so it must not be offered.
+  assert.doesNotMatch(settling.notice, /orchestrator abort/);
+  assert.doesNotMatch(settling.notice, /orchestrator retry|Resume only continues/);
+
+  for (const childPhase of ["idle", "disposed", undefined] as const) {
+    assert.deepEqual(
+      orchestratorInputDecision("keep going", { childPhase, runPhase: "idle" }),
+      { action: "allow" },
+    );
+  }
+});
+
+test("input routing: only a running run owns the turn between children", () => {
+  for (const runPhase of [
+    "idle",
+    "paused",
+    "interrupted",
+    "cancelled",
+    "completed",
+    undefined,
+  ] as const) {
+    assert.deepEqual(
+      orchestratorInputDecision("keep going", { childPhase: "idle", runPhase }),
+      { action: "allow" },
+    );
+  }
+
+  for (const childPhase of ["idle", "disposed", undefined] as const) {
+    const decision = orchestratorInputDecision("keep going", {
+      childPhase,
+      runPhase: "running",
+    });
+    assert.equal(decision.action, "refuse");
+    if (decision.action !== "refuse") return;
+    assert.match(decision.notice, /orchestrator status/);
+    assert.doesNotMatch(decision.notice, /orchestrator retry|Resume only continues/);
+  }
 });

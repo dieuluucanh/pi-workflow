@@ -97,14 +97,14 @@ Manage it with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workf
 | `/default` | Switch to Default mode (no workflow gating, full access) |
 | `/workflow-cycle` | Cycle the workflow mode (Default → Plan → Orchestrator → Build); the host-bound equivalent of `Tab`/`Ctrl+Alt+P` |
 | `/orchestrator` | Enter Orchestrator mode (bare). Entering the mode launches nothing |
-| `/orchestrator start [path]` | Record the approved plan and send the start kickoff; the model then calls `orchestrator_start` with the rows. Bare start uses the current/last plan and otherwise refuses with `/orchestrator start <path>` |
+| `/orchestrator start [path]` | Record the approved plan and send the start kickoff; the model then calls `orchestrator_start` with the rows. Replaces a completed or cancelled (or fully settled) run when no child is live; an active run must be stopped or retried first. Bare start uses the current/last plan and otherwise refuses with `/orchestrator start <path>` |
 | `/orchestrator status` | Report the bound run, row progress, the live child and the next row |
 | `/orchestrator inspect [rowRef]` | Show one run row: root, instruction, last report and child detail |
 | `/orchestrator pause` | Pause the in-process Build child (warm session kept) |
-| `/orchestrator resume` | Resume a paused in-process Build child on the warm session, or start a fresh one through the retry path |
+| `/orchestrator resume` | Resume a paused in-process Build child on the warm session, or start a fresh one through the retry path; never revives a completed or cancelled run |
 | `/orchestrator abort` | Abort the in-process Build child and leave the row retryable |
-| `/orchestrator retry [rowRef]` | Dispatch the named row again (or the current/next row) with its stored instruction |
-| `/orchestrator stop` | Stop the run: dispose the child and cancel the run record |
+| `/orchestrator retry [rowRef]` | Dispatch the named row again (or the current/next row) with its stored instruction; a completed or cancelled run is not revivable (use `/orchestrator start`) |
+| `/orchestrator stop` | Stop the run: dispose the child and cancel the run record. The escape when the rows can no longer settle |
 | `/orchestrator say <text>` | Deliver a message to the running or paused child |
 | `/orchestrator view [child\|parent\|auto]` | Show or set which session the pinned panel and footer follow |
 | `/orchestrator help [verb]` | Print the verb list, or the usage and guards for one verb |
@@ -127,6 +127,30 @@ short Plan → Review → Build work keeps its current behavior.
 - **Mode entry is not execution.** Tab or `/orchestrator` enters the mode;
   nothing runs until the user approves a plan (or explicitly agrees the
   standalone steps) and picks an execution destination.
+- **Ownership is execution-phase based, not record based.** A run owns the
+  interactive turn only while a child is `starting|running|paused|settling`, or
+  while the run phase is `running` between rows. A record in `idle`,
+  `interrupted`, `paused`, `completed` or `cancelled` never blocks a prompt — in
+  Orchestrator or any other mode — so the parent can answer between children.
+  While a child is live, prose still reaches it (steering) and a paused child
+  queues the note.
+- **A settled run completes itself.** When every run row is `completed` or
+  `cancelled` and no child is live, the run phase moves to `completed` — from a
+  TODO write, a child settle, or a session restore. A recorded failure or abort
+  always wins: a fully settled run whose child then fails or is aborted ends
+  `interrupted`/`paused`, never `completed`.
+- **A terminal run is replaceable, not revivable.** `completed` and `cancelled`
+  are sealed: `/orchestrator retry`, `/orchestrator resume` and
+  `orchestrator_dispatch` (including an explicit row) refuse, and the
+  replacement is `orchestrator_start` with new rows. A new start also replaces a
+  run whose rows are all settled once no child is live, but never a run with a
+  live child.
+- **Mode-gated controls apply to live children.** `/orchestrator abort` keeps
+  `requiresMode: true` unchanged because abort only ever applies to a
+  `starting|running|paused` child; a dormant run has nothing to abort.
+  `/orchestrator stop` remains the escape when a run's rows can no longer settle
+  — for example after `/todos clear`, because settling is read from the live
+  TODO list — and cancels the record so a new run can start.
 - **The model owns the row list.** After the discussion is agreed the model
   calls `orchestrator_start` with one step per row (a string, or
   `{text, workspace}` for a non-primary root) and the workspaces the plan

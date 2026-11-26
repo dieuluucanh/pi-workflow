@@ -881,6 +881,36 @@ test("build: no resume action without an approved wait", () => {
   assert.equal(idle.some((entry) => entry.id === "handoff-continue"), false);
 });
 
+test("the orchestrator-run status row never pairs a terminal phase with a next row", () => {
+  const byId = (phase: string, nextTaskId?: string) =>
+    new Map(
+      buildWorkflowContributions({
+        mode: "orchestrator",
+        done: 2,
+        total: 2,
+        orchestration: {
+          phase,
+          ...(nextTaskId ? { nextTaskId } : {}),
+          view: "parent",
+        },
+        childPanelActive: false,
+      }).map((entry) => [entry.id, entry]),
+    );
+
+  const running = byId("running", "2").get("orchestrator-run");
+  assert.ok(running && running.kind === "status");
+  assert.equal(running.text, "run running · next 2");
+
+  // `orchestrationStatus()` omits `nextTaskId` once the run is terminal, so the
+  // footer can never render `run completed · next 2` / `run cancelled · next 2`.
+  for (const phase of ["completed", "cancelled"]) {
+    const row = byId(phase).get("orchestrator-run");
+    assert.ok(row && row.kind === "status", phase);
+    assert.equal(row.text, `run ${phase}`);
+    assert.doesNotMatch(row.text, /next/);
+  }
+});
+
 test("orchestrator child rows: the run controls are one inline group and no child status row duplicates the footer", () => {
   const contributions = buildWorkflowContributions({
     mode: "orchestrator",

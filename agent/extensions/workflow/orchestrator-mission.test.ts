@@ -78,6 +78,7 @@ test("every run phase has a next action, and unbound stays available", () => {
     const text = buildOrchestratorMission({ phase });
     assert.match(text, /Next action:/, phase);
     assert.doesNotMatch(text, /verify and accept|automatically/i, phase);
+    assert.doesNotMatch(text, /accepted/i, phase);
   }
   assert.match(
     buildOrchestratorMission({ phase: "unbound" }),
@@ -85,11 +86,33 @@ test("every run phase has a next action, and unbound stays available", () => {
   );
 });
 
+test("the mission teaches that a terminal run is replaceable", () => {
+  const completed = buildOrchestratorMission({ phase: "completed" });
+  assert.match(completed, /the run is complete/);
+  assert.match(completed, /answer the user/);
+  assert.match(completed, /orchestrator_start/);
+  assert.match(completed, /replaced, never revived/);
+
+  const cancelled = buildOrchestratorMission({ phase: "cancelled" });
+  assert.match(cancelled, /the run was cancelled/);
+  assert.match(cancelled, /answer the user/);
+  assert.match(cancelled, /orchestrator_start/);
+  assert.match(cancelled, /replaced, never revived/);
+
+  for (const text of [completed, cancelled]) {
+    assert.match(
+      text,
+      /A terminal run never blocks a prompt; the parent answers and may start a replacement run\./,
+    );
+    assert.doesNotMatch(text, /accepted|automatically|verify and accept/i);
+  }
+});
+
 test("the mission version is bumped for the contract change", () => {
-  assert.equal(ORCHESTRATOR_MISSION_VERSION, 6);
+  assert.equal(ORCHESTRATOR_MISSION_VERSION, 7);
   assert.match(
     buildOrchestratorMission({ phase: "unbound" }),
-    /mission v6/,
+    /mission v7/,
   );
 });
 

@@ -46,6 +46,40 @@ superseded.
   appendix never reaches a row or a child. `maxRevisions` is documented in the
   Review Mode settings table.
 
+### Fixed — Orchestrator ownership follows execution, not record existence (2026-11-26)
+
+A finished run kept refusing every prompt: input ownership was derived from
+whether an `OrchestratorRun` record existed (`state.hasRun`) instead of whether
+a child or the run phase still owned execution, so an idle, interrupted or
+settled record blocked Orchestrator, Plan, Build and Default alike.
+
+- **Input is phase-based.** `orchestratorInputDecision()` now takes
+  `runPhase`/`childPhase`: `running` forwards, `paused` queues, `starting` and
+  `settling` return short truthful wait notices, the run phase `running`
+  (between rows) refuses, and every dormant or terminal phase allows the prompt.
+  It shares `executionOwnsSession()` with mode switching and Reviewer admission
+  so the three cannot drift. `OPERATOR_SCHEMA_VERSION` is `5`.
+- **A settled run auto-completes.** New `completeOrchestratorRunIfSettled()`
+  sets `completed` when every row is `completed`/`cancelled` and no child is
+  live, fired from a successful TODO write, the child's `idle` publish after its
+  report is recorded, and session restore. A recorded failure or abort wins, so
+  a settled run whose child then fails or is aborted stays `interrupted`/`paused`.
+- **Terminal runs are sealed and replaceable.** `completed`/`cancelled` runs are
+  not revivable by `orchestrator_dispatch` (explicit row included),
+  `orchestrator_retry`, `/orchestrator retry` or `/orchestrator resume`;
+  `orchestrator_start` and `/orchestrator start` replace a terminal or fully
+  settled run once no child is live. A cancelled row is terminal for `next`,
+  retry and resume selection, and terminal status reports no stale next row.
+- **Abort and stop clarified, not changed.** `/orchestrator abort` keeps
+  `requiresMode: true` because it only applies to a live child.
+  `/orchestrator stop` remains the escape when rows can no longer settle (for
+  example after `/todos clear`, since `runRowsSettled` reads the live TODO list).
+- New/updated tests: `orchestrator-run.test.ts` (terminal/settled helpers),
+  `orchestrator-operator.test.ts` (phase decisions, replacement, cancelled rows),
+  `orchestrator-lifecycle.test.ts` (settle → complete → prompt reaches parent in
+  Plan and Orchestrator → replacement start → `start <plan>` recording → failure
+  and abort precedence) and `workflow-contributions.test.ts` (no stale next row).
+
 ## [0.16.0] - 2026-11-25
 
 ### Changed — Review Mode is advisory: the plan body is never rewritten (2026-11-25)

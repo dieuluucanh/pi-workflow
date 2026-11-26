@@ -283,6 +283,7 @@ import {
 } from "./workflow-contributions.ts";
 import {
   createOrchestratorRun,
+  isTerminalRunPhase,
   markRunInterrupted,
   nextPendingRow,
   recordAbort,
@@ -290,7 +291,9 @@ import {
   recordFailure,
   recordReport,
   restoreOrchestratorRun as restoreOrchestratorRunRecord,
+  runAcceptsNewStart,
   runRow,
+  runRowsSettled,
   setRunPhase,
   workspaceForRow,
   type OrchestratorRun,
@@ -1780,6 +1783,13 @@ export default function workflowExtension(
     turnsSinceLastTodoWrite = 0;
     mutatedSinceLastTodoWrite = false;
     todoStale = false;
+    // A todo mutation may settle the last run row. Completion, persistence and
+    // the repaint are run side effects, so they are not wrapped in a
+    // display-only catch: a persistence failure must not be swallowed.
+    if (completeOrchestratorRunIfSettled()) {
+      persistState();
+      updateStatusIfBound();
+    }
   }
 
   /**
@@ -2039,6 +2049,38 @@ export default function workflowExtension(
     return refs;
   }
 
+  /**
+   * Close the run when nothing is left to dispatch.
+   *
+   * Auto-completion is phase-based, not time-based: it fires only when every
+   * run row is settled in the live TODO list AND no child owns the session.
+   * A live child (including `settling`, whose report is still being recorded)
+   * always keeps the run open, and a terminal run is never re-completed.
+   * Returns true when it changed the phase, so the caller persists and repaints.
+   *
+   * Precedence: a recorded failure or abort wins. `onError`/`onAborted` set
+   * `interrupted`/`paused` before the child reaches `idle`, so this helper sees
+   * a non-terminal-but-unsettled state or simply no change to make.
+   */
+  function completeOrchestratorRunIfSettled(): boolean {
+    const run = orchestratorRun;
+    if (!run || isTerminalRunPhase(run.phase)) return false;
+    const child = orchestratorChild?.state();
+    if (
+      child !== undefined &&
+      (child.phase === "starting" ||
+        child.phase === "running" ||
+        child.phase === "paused" ||
+        child.phase === "settling")
+    ) {
+      return false;
+    }
+    const settled = settledRunRefs();
+    if (!runRowsSettled(run, (ref) => settled.has(ref))) return false;
+    orchestratorRun = setRunPhase(run, "completed");
+    return true;
+  }
+
   /** Bound-run phase/approval, for the footer; absent when no run exists. */
   function orchestrationStatus():
     | {
@@ -2080,8 +2122,14 @@ export default function workflowExtension(
       child?.startedAt === undefined
         ? undefined
         : Math.max(0, (child.pausedAt ?? Date.now()) - child.startedAt);
-    const doneRefs = completedRunRefs();
-    const nextRow = nextPendingRow(run, (ref) => doneRefs.has(ref));
+    // A terminal run has nothing left to dispatch, and a cancelled row is
+    // terminal for row selection just like a completed one. Deriving both from
+    // the settled refs keeps the footer from rendering
+    // `run completed · next <ref>` (workflow-contributions).
+    const settledRefs = settledRunRefs();
+    const nextRow = isTerminalRunPhase(run.phase)
+      ? undefined
+      : nextPendingRow(run, (ref) => settledRefs.has(ref));
     return {
       phase: run.phase,
       ...(blocked ? { blockedReason: blocked } : {}),
@@ -13462,12 +13510,36 @@ export default function workflowExtension(
         text: "Orchestrator start is available in Orchestrator mode only. Enter it with /orchestrator.",
       };
     }
-    if (orchestratorRun) {
-      return {
-        ok: false,
-        code: "state",
-        text: `Run ${orchestratorRun.runId} is already active. Use orchestrator_status; stop it before starting another run.`,
-      };
+    // A terminal (completed/cancelled) run, or a run whose rows are all
+    // settled, no longer owns the session: starting again replaces the record.
+    // An active run, or any live child, still refuses. The old record is kept
+    // until the new steps/workspaces validate and createOrchestratorRun()
+    // succeeds, so a rejected start leaves the previous run intact.
+    const existingRun = orchestratorRun;
+    if (existingRun) {
+      const existingChild = orchestratorChild?.state();
+      const childLive =
+        existingChild !== undefined &&
+        (existingChild.phase === "starting" ||
+          existingChild.phase === "running" ||
+          existingChild.phase === "paused" ||
+          existingChild.phase === "settling");
+      const existingSettled = settledRunRefs();
+      if (
+        !runAcceptsNewStart(
+          existingRun,
+          (ref) => existingSettled.has(ref),
+          childLive,
+        )
+      ) {
+        return {
+          ok: false,
+          code: "state",
+          text: childLive
+            ? `Run ${existingRun.runId} has a live Build child (${existingChild?.phase}). Let it settle, then retry or stop the run before starting another one; orchestrator_start replaces only a completed or cancelled run.`
+            : `Run ${existingRun.runId} is still active (${existingRun.phase}) with rows left to settle. Retry or stop it before starting another run; orchestrator_start replaces a completed or cancelled run.`,
+        };
+      }
     }
     const steps = (input.steps ?? [])
       .map((step) =>
@@ -13661,7 +13733,9 @@ export default function workflowExtension(
     } else if (run.phase === "paused") {
       next = `Retry row ${run.currentRef ?? "?"} with orchestrator_retry (resume only continues a paused warm child).`;
     } else if (run.phase === "cancelled" || run.phase === "completed") {
-      next = "No further dispatch; report the run result to the user.";
+      // A terminal run is sealed: nothing is dispatched again for this record.
+      // The replacement is a fresh `orchestrator_start` with new rows.
+      next = `No further dispatch for this ${run.phase} run; report the run result to the user. When the user asks for new work, call orchestrator_start with the new steps — it replaces this run.`;
     } else if (current && current.lastReport !== undefined && !currentComplete) {
       next = `Read row ${current.ref}'s report, then mark it done or retry it with an amended instruction.`;
     } else if (currentComplete) {
@@ -13691,6 +13765,16 @@ export default function workflowExtension(
         ok: false,
         code: "unavailable",
         text: "No Orchestrator run is bound. Call orchestrator_start first.",
+      };
+    }
+    // A completed/cancelled run is sealed: no stale tool call may revive it and
+    // record a fresh dispatch. Cover an explicit rowRef too, not only the
+    // default next-row path. The replacement path is a new run.
+    if (isTerminalRunPhase(run.phase)) {
+      return {
+        ok: false,
+        code: "state",
+        text: `Run ${run.runId} is ${run.phase}; a terminal run accepts no further dispatch. Call orchestrator_start with new rows to start a new run.`,
       };
     }
     const childState = orchestratorChild?.state();
@@ -13908,6 +13992,12 @@ export default function workflowExtension(
   ): Promise<{ ok: boolean; text: string }> {
     const run = orchestratorRun;
     if (!run) return { ok: false, text: "No Orchestrator run is bound." };
+    if (isTerminalRunPhase(run.phase)) {
+      return {
+        ok: false,
+        text: `Run ${run.runId} is ${run.phase}; a terminal run cannot be retried. Call orchestrator_start with new rows to start a new run.`,
+      };
+    }
     const ref =
       rowRef ??
       run.currentRef ??
@@ -14778,7 +14868,7 @@ export default function workflowExtension(
             typeof event.text === "string" ? event.text : "",
             {
               childPhase: liveChild?.phase,
-              hasRun: orchestratorRun !== undefined,
+              runPhase: orchestratorRun?.phase,
             },
           );
     if (orchestratorDecision.action === "refuse") {
@@ -15371,14 +15461,21 @@ export default function workflowExtension(
     // footer is honest and /orchestrator retry can dispatch a fresh child.
     if (orchestratorRun?.phase === "running") {
       orchestratorRun = markRunInterrupted(orchestratorRun);
+      // A restored record whose rows all settled finished before the reload:
+      // normalize it to `completed` instead of leaving it interrupted. The
+      // retry toast would be a lie in that case.
+      const completed = completeOrchestratorRunIfSettled();
       persistState();
-      try {
-        (ctx as any).ui?.notify?.(
-          "The in-process Build child did not survive the reload; /orchestrator retry starts a fresh one.",
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
+      updateStatusIfBound();
+      if (!completed) {
+        try {
+          (ctx as any).ui?.notify?.(
+            "The in-process Build child did not survive the reload; /orchestrator retry starts a fresh one.",
+            "warning",
+          );
+        } catch (_e) {
+          void _e;
+        }
       }
     }
     if (legacyRunEntrySeen && !orchestratorRun) {
@@ -15866,14 +15963,20 @@ export default function workflowExtension(
     reapplyPersistedShellQuarantine(ctx as ExtensionContext);
     if (orchestratorRun?.phase === "running") {
       orchestratorRun = markRunInterrupted(orchestratorRun);
+      // Same normalization as the reload path: a fully settled restored run is
+      // completed, not interrupted, so `/orchestrator retry` is not offered.
+      const completed = completeOrchestratorRunIfSettled();
       persistState();
-      try {
-        (ctx as any).ui?.notify?.(
-          "The in-process Build child did not survive the rewind; /orchestrator retry starts a fresh one.",
-          "warning",
-        );
-      } catch (_e) {
-        void _e;
+      updateStatusIfBound();
+      if (!completed) {
+        try {
+          (ctx as any).ui?.notify?.(
+            "The in-process Build child did not survive the rewind; /orchestrator retry starts a fresh one.",
+            "warning",
+          );
+        } catch (_e) {
+          void _e;
+        }
       }
     }
     if (legacyRunEntrySeen && !orchestratorRun) {
@@ -19394,6 +19497,18 @@ export default function workflowExtension(
         } catch {
           /* display-only */
         }
+        // A child that publishes `idle` has already had its report recorded:
+        // `settleIdle()` runs after `onSettled`. `disposed` is deliberately
+        // NOT enough — it precedes `onError`/`onAborted`/`stop`, which record
+        // `interrupted`/`paused`/`cancelled`, and a failure or abort always
+        // wins over completion. The phase change, its persistence and the
+        // repaint stay outside the display-only catch so a persistence
+        // failure is not swallowed.
+        if (state.phase !== "idle") return;
+        if (completeOrchestratorRunIfSettled()) {
+          persistState();
+          updateStatusIfBound();
+        }
       },
       onSettled: async (settled) => {
         const run = orchestratorRun;
@@ -19602,11 +19717,35 @@ export default function workflowExtension(
   async function startOrchestratorWork(
     rest: string,
   ): Promise<{ ok: boolean; text: string }> {
-    if (orchestratorRun) {
-      return {
-        ok: false,
-        text: "A run is already bound; use /orchestrator status, then retry after fixing the blocker.",
-      };
+    // Recording a plan does not create the run: `orchestrator_start` does that
+    // later. A terminal (completed/cancelled) run, or one whose rows are all
+    // settled, no longer owns the session, so recording may proceed and the
+    // old record stays visible until the model binds the replacement. An
+    // active run, or any live child, still refuses.
+    const existingRun = orchestratorRun;
+    if (existingRun) {
+      const existingChild = orchestratorChild?.state();
+      const childLive =
+        existingChild !== undefined &&
+        (existingChild.phase === "starting" ||
+          existingChild.phase === "running" ||
+          existingChild.phase === "paused" ||
+          existingChild.phase === "settling");
+      const existingSettled = settledRunRefs();
+      if (
+        !runAcceptsNewStart(
+          existingRun,
+          (ref) => existingSettled.has(ref),
+          childLive,
+        )
+      ) {
+        return {
+          ok: false,
+          text: childLive
+            ? `Run ${existingRun.runId} has a live Build child (${existingChild?.phase}). Let it settle, then retry or stop the run before recording another plan.`
+            : `Run ${existingRun.runId} is still active (${existingRun.phase}) with rows left to settle. Retry or stop it before recording another plan; orchestrator_start replaces a completed or cancelled run.`,
+        };
+      }
     }
     const requested = rest.trim();
     const boundPlan = currentPlanFile ?? todos.planPath;
@@ -19639,11 +19778,17 @@ export default function workflowExtension(
       run: () => orchestratorRun,
       mode: () => workflowMode,
       todos: () =>
-        todos.snapshot().items.map((item) => ({
-          ref: item.ref ?? String(item.step),
-          text: item.text,
-          completed: item.status === "completed" || item.completed === true,
-        })),
+        todos.snapshot().items.map((item) => {
+          const status = itemStatus(item);
+          return {
+            ref: item.ref ?? String(item.step),
+            text: item.text,
+            // `completed` stays the display flag (a cancelled row is not
+            // checked); `settled` is the terminal flag row selection uses.
+            completed: status === "completed" || item.completed === true,
+            settled: status === "completed" || status === "cancelled",
+          };
+        }),
       child: () => {
         const state = orchestratorChild?.state();
         if (!state || state.phase === "idle" || state.phase === "disposed") {
