@@ -806,3 +806,110 @@ test("an explicit abort still reports the destructive callback once", async () =
   h.child.finishPrompt();
   await running;
 });
+
+// ── thinking-only live switches (profile/role plan step) ─────────────
+
+test("controller: a thinking-only change reaches a RUNNING child with the same provider/id", async () => {
+  const fake = makeChild({
+    model: { provider: "p", id: "m" },
+    setModel: async (provider, id, thinking) => ({
+      ok: true,
+      model: { provider, id, ...(thinking ? { thinking } : {}) },
+    }),
+  });
+  const { controller, ops } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "p/m" }),
+  });
+  await controller.start(BASE);
+  const result = await controller.applyModel({
+    provider: "p",
+    id: "m",
+    thinking: "high",
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    changed: true,
+    model: { provider: "p", id: "m", thinking: "high" },
+  });
+  assert.deepEqual(fake.calls.setModels, [{ provider: "p", id: "m", thinking: "high" }]);
+  assert.equal(controller.state().thinking, "high");
+  assert.ok(
+    ops.some((op) => op.text.includes("p/m (high)")),
+    `onOps must fire a notice for the applied level (saw ${JSON.stringify(ops)})`,
+  );
+});
+
+test("controller: a thinking-only change reaches a PREPARED child", async () => {
+  const fake = makeChild({
+    model: { provider: "p", id: "m" },
+    setModel: async (provider, id, thinking) => ({
+      ok: true,
+      model: { provider, id, ...(thinking ? { thinking } : {}) },
+    }),
+  });
+  const { controller } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "p/m" }),
+  });
+  await controller.prepare(BASE);
+  const result = await controller.applyModel({
+    provider: "p",
+    id: "m",
+    thinking: "xhigh",
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    changed: true,
+    model: { provider: "p", id: "m", thinking: "xhigh" },
+  });
+  assert.deepEqual(fake.calls.setModels, [{ provider: "p", id: "m", thinking: "xhigh" }]);
+});
+
+test("controller: a thinking-only desired-model change is applied while STARTING", async () => {
+  const fake = makeChild({
+    model: { provider: "p", id: "m" },
+    setModel: async (provider, id, thinking) => ({
+      ok: true,
+      model: { provider, id, ...(thinking ? { thinking } : {}) },
+    }),
+  });
+  let desired: { provider: string; id: string; thinking?: string } | undefined = {
+    provider: "p",
+    id: "m",
+  };
+  const { controller } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "p/m" }),
+    desiredModel: () => desired,
+  });
+  await controller.prepare(BASE);
+  // The profile switch lands between prepare() and start().
+  desired = { provider: "p", id: "m", thinking: "medium" };
+  const started = await controller.start(BASE);
+  assert.equal(started.ok, true);
+  assert.deepEqual(fake.calls.setModels, [{ provider: "p", id: "m", thinking: "medium" }]);
+  assert.equal(controller.state().thinking, "medium");
+});
+
+test("controller: a refused thinking switch keeps the child and warns with both labels", async () => {
+  const fake = makeChild({
+    model: { provider: "p", id: "m", thinking: "low" },
+    setModel: async () => ({ ok: false, error: "level not supported" }),
+  });
+  const { controller, ops } = makeController({
+    create: async () => ({ ok: true, child: fake.child, modelLabel: "p/m" }),
+  });
+  await controller.start(BASE);
+  const result = await controller.applyModel({
+    provider: "p",
+    id: "m",
+    thinking: "high",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(controller.state().phase, "running", "a refusal keeps the child");
+  assert.equal(fake.calls.disposes, 0);
+  assert.ok(
+    ops.some(
+      (op) => op.text.includes("p/m (low)") && op.text.includes("p/m (high)"),
+    ),
+    `the refusal notice must name the kept and requested labels (saw ${JSON.stringify(ops)})`,
+  );
+});

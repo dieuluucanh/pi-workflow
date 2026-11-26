@@ -15,8 +15,19 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { wrapAgentSession } from "./in-process-child.ts";
+import workflowExtension from "./index.ts";
+import { ORCHESTRATOR_CHILD_VERSION } from "./orchestrator-child-contract.ts";
+import { PROFILE_CONFIG_VERSION } from "./profiles.ts";
+import {
+  fakeSdk,
+  makeFakeCtx,
+  makeFakePi,
+  tmpProject,
+} from "./test-support.ts";
 
 interface RawOptions {
   model?: {
@@ -284,4 +295,151 @@ test("child handle: prompt steers while streaming, followUp is deferred", async 
   assert.deepEqual(calls.prompts, []);
   assert.deepEqual(calls.followUps, ["later"]);
   assert.equal(child.isStreaming(), true);
+});
+
+/**
+ * A child-local `/profile use` is session-scoped. It must switch the child's
+ * own model but never write the parent's global default-profile / default-model
+ * settings: one child's row assignment is not a user preference.
+ */
+test("child: /profile use switches the child model without writing parent global defaults", async () => {
+  const { root, cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    fs.writeFileSync(
+      path.join(agentDir, "profiles.json"),
+      JSON.stringify({
+        version: PROFILE_CONFIG_VERSION,
+        profiles: [
+          {
+            name: "child-live",
+            description: "child-local profile",
+            roles: {
+              builder: { provider: "p", id: "child-builder", thinking: "medium" },
+              reviewer: { provider: "p", id: "child-reviewer", thinking: "high" },
+            },
+            defaultModel: { provider: "p", id: "child-default", thinking: "medium" },
+          },
+        ],
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(agentDir, "settings.json"), "{}", "utf8");
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), "{}", "utf8");
+
+    const pi = makeFakePi({ activeTools: ["read", "write", "edit", "bash"] });
+    // The fake SDK factory needs a script (empty here: this child never
+    // launches a review session); the child's global-write assertions below
+    // are unchanged.
+    const { sdk } = fakeSdk({});
+    await workflowExtension(pi as never, {
+      loadSdk: async () => sdk as never,
+      selfExtensionPath: "/fake/index.ts",
+      isTerminalHost: () => true,
+    });
+    const made = makeFakeCtx({
+      cwd,
+      hasUI: false,
+      branch: [
+        {
+          type: "custom",
+          customType: "workflow-orchestrator-child",
+          data: {
+            version: ORCHESTRATOR_CHILD_VERSION,
+            runId: "run-1",
+            taskId: "task-1",
+            attemptId: "attempt-1",
+            ref: "1",
+            total: 1,
+            parentSessionRef: "parent-1",
+          },
+        },
+      ],
+      modelRegistry: {
+        find: (provider: string, id: string) => ({
+          provider,
+          id,
+          contextWindow: 1000,
+          maxOutputTokens: 1000,
+        }),
+      },
+    });
+    await pi.emit("session_start", { reason: "startup" }, made.ctx);
+    await pi.commands["profile"].handler("use child-live", made.ctx);
+
+    // The child's own model still switches — the global-write guard must not
+    // suppress the session-scoped effect.
+    assert.equal(
+      (pi.model as { provider?: string; id?: string } | undefined)?.id,
+      "child-builder",
+      "the child's own pi.setModel must still run",
+    );
+    // The row's switch is audited in the child transcript only — there is no
+    // child→parent channel, and the parent-only owners stay silent.
+    const switchScopes = pi.entries
+      .filter((entry) => entry.type === "workflow-model-switch")
+      .map((entry) => (entry.data as { scope?: string })?.scope);
+    assert.ok(
+      switchScopes.includes("child"),
+      `a child-local profile activation must audit its own model switch (${JSON.stringify(switchScopes)})`,
+    );
+    assert.deepEqual(
+      switchScopes.filter((scope) => scope !== "child"),
+      [],
+      "a child must never emit a parent/reviewer/builder-child model switch",
+    );
+
+    // A programmatic model_select inside the child also reaches the global
+    // default-model mirror handler; it must refuse to persist there too.
+    await pi.emit(
+      "model_select",
+      {
+        type: "model_select",
+        source: "user-select",
+        model: {
+          provider: "p",
+          id: "child-select",
+          thinking: "high",
+          contextWindow: 1000,
+          maxOutputTokens: 1000,
+        },
+      },
+      made.ctx,
+    );
+
+    const global = JSON.parse(
+      fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"),
+    ) as Record<string, unknown>;
+    const workflow = (global.workflow ?? {}) as Record<string, unknown>;
+    assert.equal(
+      workflow.defaultProfile,
+      undefined,
+      "a child must not persist workflow.defaultProfile globally",
+    );
+    for (const key of ["defaultModel", "model", "defaultProvider", "defaultThinkingLevel"]) {
+      assert.equal(
+        global[key],
+        undefined,
+        `a child must not persist the parent's global ${key}`,
+      );
+      assert.equal(
+        workflow[key],
+        undefined,
+        `a child must not persist the parent's workflow.${key}`,
+      );
+    }
+    assert.equal(
+      pi.entries.filter(
+        (entry) => entry.type === "workflow-model-default-skip",
+      ).length,
+      0,
+      "a child-local profile activation must not be reported as a global default write",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

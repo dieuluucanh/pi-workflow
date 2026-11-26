@@ -575,6 +575,24 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     | undefined;
   /** Serializes model switches; never held across a prompt or a boot. */
   let modelLane: Promise<unknown> = Promise.resolve();
+  /**
+   * Parent-registry resolutions, memoized by provider/id. The live child was
+   * created with the parent's model object; switching back to that same target
+   * reuses it rather than resolving the same reference twice.
+   */
+  const resolvedParentModels = new Map<string, unknown>();
+  const findParentModel = (provider: string, id: string): unknown => {
+    const key = `${provider}\u0000${id}`;
+    if (resolvedParentModels.has(key)) return resolvedParentModels.get(key);
+    let found: unknown;
+    try {
+      found = deps.findModel(provider, id);
+    } catch {
+      found = undefined;
+    }
+    resolvedParentModels.set(key, found);
+    return found;
+  };
   /** True while `runRound` is in flight (gates prompt routing). */
   let roundActive = false;
   /**
@@ -1078,7 +1096,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           cwd: deps.cwd,
           agentDir: deps.agentDir,
           modelRef,
-          findModel: deps.findModel,
+          findModel: findParentModel,
           reviewPrompt: deps.promptText(),
           customTools: built.tools,
           providerRetries: cfg.providerRetries,
@@ -1784,8 +1802,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const current = target.currentModel?.();
         const sameModel =
           current?.provider === model.provider && current.id === model.id;
+        // An unknown/missing current level is NOT the requested level: the
+        // child may not report one, so a level-only switch must still be
+        // applied instead of being mistaken for a no-op.
         const sameThinking =
-          !current?.thinking || current.thinking === model.thinking;
+          current?.thinking !== undefined && current.thinking === model.thinking;
         if (sameModel && sameThinking) {
           const thinking = current?.thinking ?? model.thinking;
           sessionModelKey = `${model.provider}/${model.id}/${thinking}`;
@@ -1801,10 +1822,15 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
             error: "this reviewer session cannot switch models (unsupported SDK)",
           };
         }
+        // The reviewer child runs in isolation: resolve the target in the
+        // parent's registry first so a child-registry miss cannot block the
+        // switch. A parent miss keeps the child's existing ref fallback.
+        const parentModel = findParentModel(model.provider, model.id);
         const result = await target.setModel(
           model.provider,
           model.id,
           model.thinking,
+          parentModel,
         );
         if (!result.ok) return { ok: false, error: result.error };
         const applied = {

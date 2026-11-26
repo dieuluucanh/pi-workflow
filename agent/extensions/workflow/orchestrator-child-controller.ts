@@ -369,8 +369,11 @@ export function createOrchestratorChildController(
     const current = target.currentModel?.();
     const sameModel =
       current?.provider === ref.provider && current.id === ref.id;
+    // An absent request keeps the current level; an unknown CURRENT level is
+    // never proof that the requested one is already applied. Comparing both
+    // explicitly is what lets a thinking-only profile change reach the child.
     const sameThinking =
-      !ref.thinking || !current?.thinking || ref.thinking === current.thinking;
+      !ref.thinking || (!!current?.thinking && ref.thinking === current.thinking);
     if (sameModel && sameThinking) {
       return { ok: true, changed: false, ...(current ? { model: current } : {}) };
     }
@@ -385,7 +388,22 @@ export function createOrchestratorChildController(
       ref.id,
       ref.thinking,
     );
-    if (!result.ok) return { ok: false, error: result.error };
+    if (!result.ok) {
+      if (target === child) {
+        const kept = current
+          ? `${current.provider}/${current.id}${current.thinking ? ` (${current.thinking})` : ""}`
+          : target.modelLabel;
+        const wanted = `${ref.provider}/${ref.id}${ref.thinking ? ` (${ref.thinking})` : ""}`;
+        ops([
+          {
+            op: "new",
+            kind: "error",
+            text: `model switch refused: keeping ${kept} — ${wanted} failed${result.error ? ` (${result.error})` : ""}`,
+          },
+        ]);
+      }
+      return { ok: false, error: result.error };
+    }
     const model = result.model;
     const label = `${model.provider}/${model.id}`;
     if (target === child) {
@@ -423,8 +441,7 @@ export function createOrchestratorChildController(
       current.provider === desired.provider &&
       current.id === desired.id &&
       (!desired.thinking ||
-        !current.thinking ||
-        desired.thinking === current.thinking)
+        (!!current.thinking && desired.thinking === current.thinking))
     ) {
       return { ok: true };
     }

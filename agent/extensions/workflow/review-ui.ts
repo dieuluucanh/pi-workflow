@@ -39,6 +39,8 @@ import {
 export const REVIEW_MODE_ENTRY_TYPE = "workflow-review-mode";
 /** Custom entry type for streamed reviewer transcript chunks. */
 export const REVIEW_TRANSCRIPT_ENTRY_TYPE = "workflow-review-transcript";
+/** Custom entry type for the durable live model-switch audit (see index.ts). */
+export const MODEL_SWITCH_ENTRY_TYPE = "workflow-model-switch";
 
 /**
  * True only for terminal Pi (an interactive TUI on a real terminal).
@@ -86,6 +88,20 @@ export interface ReviewModeBandData {
 export interface ReviewTranscriptEntryData {
   at?: number;
   lines?: ReviewEntryLine[];
+}
+
+/** Payload of a `workflow-model-switch` audit entry. */
+export interface ModelSwitchEntryData {
+  scope?: string;
+  /** Legacy alias of `scope`, kept for restored entries. */
+  role?: string;
+  from?: string;
+  to?: string;
+  ok?: boolean;
+  changed?: boolean;
+  error?: string;
+  reason?: string;
+  at?: number;
 }
 
 /** Flattened shape of a `workflow-review-submitted` entry (see review.ts). */
@@ -367,6 +383,32 @@ export function formatReviewModeBand(
   return [theme.fg("muted", "▌ review")];
 }
 
+/** Render one durable model-switch audit as a compact timeline row. */
+export function formatModelSwitchEntry(
+  data: ModelSwitchEntryData | undefined,
+  theme: ThemeLike,
+): string[] {
+  const scope = data?.scope || data?.role || "model";
+  const owner = typeof scope === "string" ? scope : "model";
+  const label = (value: unknown): string =>
+    typeof value === "string" && value ? value : "unknown";
+  const from = label(data?.from);
+  const to = label(data?.to);
+  const ok = data?.ok === true;
+  const changed = data?.changed === true;
+  const color: ThemeColor = !ok ? "warning" : changed ? "accent" : "muted";
+  const title = theme.fg(color, theme.bold("▌ MODEL SWITCH"));
+  let detail = `${owner}: ${from} → ${to}`;
+  if (!ok) detail += " refused";
+  else if (!changed) detail += " (unchanged)";
+  if (typeof data?.error === "string" && data.error) {
+    detail += ` — ${data.error}`;
+  } else if (typeof data?.reason === "string" && data.reason) {
+    detail += ` · ${data.reason}`;
+  }
+  return [title + theme.fg("muted", `  ${detail}`)];
+}
+
 const MAX_SUMMARY_FINDINGS = 15;
 
 /** Render the `workflow-review-submitted` audit entry as a dated summary card. */
@@ -522,5 +564,10 @@ export function registerReviewEntryRenderers(host: EntryRendererHost): void {
     HANDOFF_PLAN_ENTRY_TYPE,
     (entry, _options, theme) =>
       createHandoffPlanComponent(entry?.data, theme),
+  );
+  host.registerEntryRenderer<ModelSwitchEntryData>(
+    MODEL_SWITCH_ENTRY_TYPE,
+    (entry, _options, theme) =>
+      createReviewEntryComponent(formatModelSwitchEntry(entry?.data, theme)),
   );
 }

@@ -83,13 +83,16 @@ export interface InProcessChildSession {
   stats?(): ChildRuntimeStats | undefined;
   /**
    * Switch the live session's model (and thinking) WITHOUT aborting it.
-   * Auth and registry resolution happen inside the session's own runtime.
+   * Auth happens inside the session's own runtime; a model already resolved
+   * by the parent may be supplied to avoid a child-registry miss. Without it,
+   * resolution still happens inside the session's own runtime.
    * Never throws: a refusal is a `{ ok: false, error }` result.
    */
   setModel?(
     provider: string,
     id: string,
     thinking?: string,
+    preResolvedModel?: unknown,
   ): Promise<SwitchChildModelResult>;
 }
 
@@ -579,14 +582,16 @@ function readRawChildTokens(
 }
 
 /**
- * Switch the raw session's model without aborting it. Resolution and auth
- * happen inside the session's own runtime (the same path Pi's `/model` uses).
+ * Switch the raw session's model without aborting it. A pre-resolved model
+ * from the parent registry is used first; otherwise resolution (like auth)
+ * happens inside the session's own runtime, the path Pi's `/model` uses.
  */
 async function switchRawChildModel(
   s: RawChildSession,
   provider: string,
   id: string,
   thinking: string | undefined,
+  preResolvedModel?: unknown,
 ): Promise<SwitchChildModelResult> {
   if (typeof s.setModel !== "function") {
     return {
@@ -594,11 +599,13 @@ async function switchRawChildModel(
       error: "this session cannot switch models (unsupported SDK)",
     };
   }
-  let resolved: unknown;
-  try {
-    resolved = s.modelRuntime?.getModel?.(provider, id);
-  } catch {
-    resolved = undefined;
+  let resolved: unknown = preResolvedModel;
+  if (!resolved) {
+    try {
+      resolved = s.modelRuntime?.getModel?.(provider, id);
+    } catch {
+      resolved = undefined;
+    }
   }
   if (!resolved) {
     return {
@@ -713,11 +720,16 @@ export function wrapAgentSession(
         ...(context ? { context } : {}),
       };
     },
-    async setModel(provider: string, id: string, thinking?: string) {
+    async setModel(
+      provider: string,
+      id: string,
+      thinking?: string,
+      preResolvedModel?: unknown,
+    ) {
       if (disposed) {
         return { ok: false, error: "the child session is disposed" };
       }
-      return switchRawChildModel(s, provider, id, thinking);
+      return switchRawChildModel(s, provider, id, thinking, preResolvedModel);
     },
     dispose() {
       if (disposed) return;

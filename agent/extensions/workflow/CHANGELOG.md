@@ -812,7 +812,68 @@ records.
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.17.2] - 2026-11-26
+
+This patch makes a `/profile` or `/role` selection switch the live owners in
+place instead of waiting for the next child/round. Version bumped by this
+change, **not published**. The plan assumed a `0.16.0` base and a `0.16.1`
+patch, but the live tree already carried the Planner/Reviewer `0.17.1` work, so
+the fresh unreleased patch is `0.17.2` — there is no downgrade. The older
+`0.16.0` release remains its own approval item.
+
+### Added — final `/profile` live-switch contract
+
+- **Triggers.** `/profile use`, the profile picker's activate action,
+  `/profile use none`, `/role set` and a `/role` picker save all run the same
+  reconciliation. The in-flight request keeps the old model; the next provider
+  request uses the new one. Nothing is aborted, no session is restarted and no
+  review round is re-seeded. The warm reviewer keeps its session: its recorded
+  model key and `ReviewState.modelLabel` are updated, so the footer, status
+  line, `/review status` and the next round all agree with what actually runs.
+- **One durable audit per owner.** Every activation appends exactly one
+  display-only `workflow-model-switch` entry (`scope`/`role`, `from`, `to`,
+  `ok`, `changed`, `at`, plus `error`/`reason` when present) with a Desktop
+  renderer. Scopes are `parent`, `reviewer`, `builder-child` and `child`; the
+  `role` alias keeps older transcript readers working. An entry never notifies.
+- **Single notice channel.** The activation summary (`notifyWorkflow`) or the
+  review notice (`notifyReview`) is the only user-facing message for each
+  owner; the entry writer is silent. When no reviewer or live child will report
+  its own switch, the parent summary names the child notice channel once so
+  the activation is not silent. A refused switch keeps the live owner's model,
+  warns with both models and still applies the new model to the next child or
+  round.
+
+| Owner / state | What switches live | Notice + audit |
+| --- | --- | --- |
+| **Plan** (parent) | This chat's planner model; no live reviewer/child activity is implied | one `notifyWorkflow` summary + one `parent` entry |
+| **Build** (parent) | This chat's builder model | one `notifyWorkflow` summary + one `parent` entry |
+| **Orchestrator parent** | Parent chat plus the live Build child (a `settling` child is left alone); the next child starts on the same selection | parent summary + `parent` entry; the child reports once through `notifyWorkflow` + `builder-child` entry |
+| **Review** running / paused / review-owned handoff / warm-idle | The existing reviewer session, in place; an automatic Plan-loop prefetch session is not a live owner and is picked up at its next round | one `notifyReview` notice + one `reviewer` entry; `/review status` prints the applied model once |
+| **Default** | The profile's `defaultModel` switches this chat when present; otherwise roles apply on the next mode/role use. No live child/reviewer is reconciled | one activation notice + one `parent` entry |
+| **Managed Build child** | Its own session model only (see below) | one child-local notice + one `child` entry in the child transcript |
+
+### Changed — the parent owns the launch model (2026-11-26)
+
+- A managed in-process Build child may run `/profile use` for its own row, but
+  it is a session-scoped choice only: the child still switches its own live
+  model through `applyModeModel` / `pi.setModel` (`setModel(..., { persist:
+  false })`), while `workflow.defaultProfile`, `workflow.modelDefault` and Pi's
+  native `defaultProvider` / `defaultModel` / `defaultThinkingLevel` mirror are
+  never written from the child. A child `model_select` mirror is refused too.
+  The parent remains the sole owner of the profile and model every new child
+  launches with; a child has no channel back to the parent's settings or
+  transcript, and live reviewer / Build-child reconciliation stays parent-only.
+- The child-local switch is audited as one `workflow-model-switch` entry with
+  scope `child` in the child transcript; no parent/reviewer/builder-child entry
+  and no default-model-skip entry are emitted for a child-local activation.
+- `profile-live-switch.test.ts` covers the running, paused, handoff-owned and
+  warm-idle reviewer, the refused switch, the parent's live-builder entry,
+  the single notice/entry contract for Plan, Build, Orchestrator, Default,
+  `/profile use none`, child-tab and `/role` activation, and the
+  footer/status model ownership. `in-process-child.test.ts` covers the missing
+  global writes, the child's own model change, the child-scoped audit and a
+  child `model_select` mirror refusal; `review-runtime.test.ts` and
+  `review-ui.test.ts` cover the runtime switch and durable entry renderer.
 
 ### Changed — Orchestrator runs an in-process Build child (no window or tab)
 

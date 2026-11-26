@@ -1524,16 +1524,88 @@ export default function workflowExtension(
     }
     if (workflowMode === "orchestrator") {
       lines.push(
-        "  Applied to orchestrator mode now; a live Build child switches immediately, and the next child always uses it.",
+        "  Applied to orchestrator mode now; this chat uses the selection and future children start on it.",
       );
     } else if (workflowMode) {
-      lines.push(`  Applied to ${workflowMode} mode now; explore/review pick it up on next use.`);
+      lines.push(
+        `  Applied to ${workflowMode} mode now; this chat uses the selection.`,
+      );
+    } else if (profile.defaultModel) {
+      lines.push("  Default mode switches this chat to the profile default now.");
     } else {
       lines.push(
-        "  Applies on the next /plan, /build, explore subagent, or review round.",
+        "  Default mode keeps the current chat model; role models apply when a role mode starts.",
+      );
+    }
+    // Parent/child summary only. When no live owner is about to report its own
+    // switch, name the child notice channel once so the activation is not
+    // silent; the entry writer itself never notifies.
+    if (!ownedReviewerLive() && !ownedBuilderChildLive()) {
+      lines.push(
+        "  Live Builder child (when present) reports separately; this chat uses the selection.",
       );
     }
     return lines.join("\n");
+  }
+
+  /** A reviewer owned by a manual round, handoff or pause (not auto prefetch). */
+  function ownedReviewerLive(): boolean {
+    return (
+      reviewOwnerSession ||
+      reviewTurn === "handoff" ||
+      pendingHandoffReviewOwned ||
+      currentPausedReview() !== undefined
+    );
+  }
+
+  /** A live Build child exists and will report its own model switch. */
+  function ownedBuilderChildLive(): boolean {
+    const controller = orchestratorChild;
+    if (!controller) return false;
+    try {
+      const phase = controller.state().phase;
+      return phase !== "idle" && phase !== "disposed";
+    } catch (_e) {
+      void _e;
+      return false;
+    }
+  }
+
+  type ModelSwitchScope = "parent" | "reviewer" | "builder-child" | "child";
+  interface ModelSwitchReport {
+    ok: boolean;
+    changed: boolean;
+    from?: string;
+    to?: string;
+    error?: string;
+    reason?: string;
+  }
+
+  /**
+   * Durable audit for one model owner. Deliberately display-only: it writes
+   * the entry and nothing else, so an owner's `notifyReview`/`notifyWorkflow`
+   * or the profile summary remains the single notice channel. The `role`
+   * alias keeps older transcript readers working alongside `scope`.
+   */
+  function appendModelSwitchEntry(
+    scope: ModelSwitchScope,
+    report: ModelSwitchReport,
+  ): void {
+    try {
+      pi.appendEntry("workflow-model-switch", {
+        scope,
+        role: scope,
+        from: report.from ?? "",
+        to: report.to ?? "",
+        ok: report.ok,
+        changed: report.changed,
+        ...(report.error ? { error: report.error } : {}),
+        ...(report.reason ? { reason: report.reason } : {}),
+        at: Date.now(),
+      });
+    } catch (_e) {
+      void _e;
+    }
   }
 
   /**
@@ -1556,11 +1628,16 @@ export default function workflowExtension(
    * settings write must not cancel the activation the user asked for. Scope
    * follows `defaultProfileWriteScope` so an existing project value is not
    * shadowed by a global write.
+   *
+   * Parent-only: a managed child's `/profile use` is row-scoped, not a user
+   * preference. The parent owns the launch profile; the child must not write
+   * `workflow.defaultProfile` at all.
    */
   function persistDefaultProfileChoice(
     ctx: ExtensionContext,
     opts?: { quiet?: boolean },
   ): void {
+    if (inProcessChildContext) return;
     const cwd = (ctx as any)?.cwd ?? process.cwd();
     const agentDir = getAgentDir();
     try {
@@ -1707,30 +1784,69 @@ export default function workflowExtension(
     // in-memory switch so a failed settings write cannot cancel activation.
     if (opts?.persistChoice !== false)
       persistDefaultProfileChoice(ctx, opts);
+    // One report per live owner. This same function is the parent site and,
+    // in a child instance (workflowMode=build), the child site; reviewer and
+    // builder-child owners apply through reconcileLiveRoleModels below (also
+    // used by /role), so each owner has exactly one audit site.
+    const reportParentActivation = (report: ModelSwitchReport): void => {
+      appendModelSwitchEntry(
+        inProcessChildContext ? "child" : "parent",
+        { ...report, reason: "profile" },
+      );
+    };
     if (workflowMode) {
       try {
-        await applyModeModel(ctx as any, { quiet: opts?.quiet });
+        await applyModeModel(ctx as any, {
+          quiet: opts?.quiet,
+          onResult: reportParentActivation,
+        });
       } catch (_e) {
         void _e;
       }
-      // The profile's Default-mode model becomes the saved default even while
-      // a role mode is active — it is what the next session starts on.
+      // The profile's Default-mode model is mirrored as the saved default even
+      // while a role mode is active — it is what the next session starts on.
+      // The parent owns that launch model: a child activates a profile only
+      // for its own session and must not mirror it into global settings.
       if (
+        !inProcessChildContext &&
         prof?.defaultModel &&
         registryModel(ctx, prof.defaultModel.provider, prof.defaultModel.id)
       ) {
         persistModelDefault(ctx as any, prof.defaultModel, "profile");
       }
-    } else if (prof?.defaultModel) {
+    } else if (prof?.defaultModel && !inProcessChildContext) {
       // In Default mode, apply the profile's default model immediately.
+      const m = prof.defaultModel;
+      const to = `${m.provider}/${m.id}`;
+      let from = "";
       try {
-        const m = prof.defaultModel;
+        const current =
+          (pi as any)?.getCurrentModel?.() ??
+          (ctx as any)?.model ??
+          (pi as any)?.model ??
+          null;
+        if (current?.provider && current?.id)
+          from = `${current.provider}/${current.id}`;
+      } catch (_e) {
+        void _e;
+      }
+      let report: ModelSwitchReport | undefined;
+      try {
         const found = registryModel(ctx, m.provider, m.id);
-        if (found) {
+        if (!found) {
+          report = {
+            ok: false,
+            changed: false,
+            from,
+            to,
+            error: `model ${to} is not in the model registry`,
+          };
+        } else {
           await withPersistSuppressed(async () => {
             await (pi as any).setModel?.(found);
             applyThinkingForModel(ctx, found, m.thinking, "Default mode");
           });
+          report = { ok: true, changed: from !== to, from, to };
           if (!opts?.quiet) {
             ctx.ui.notify(
               `Default mode: model → ${m.provider}/${m.id}${m.thinking ? ` (${m.thinking})` : ""}`,
@@ -1739,17 +1855,30 @@ export default function workflowExtension(
           }
           persistModelDefault(ctx as any, m, "profile");
         }
-      } catch (_e) {
-        void _e;
+      } catch (e: any) {
+        report = {
+          ok: false,
+          changed: false,
+          from,
+          to,
+          error: String(e?.message || e),
+        };
       }
+      if (report) reportParentActivation(report);
     }
     if (!opts?.quiet) {
-      ctx.ui.notify(
-        activeProfileName
-          ? profileActivationSummary(activeProfileName)
-          : "Profile deactivated — default roles flow active.",
-        "info",
-      );
+      let summary = activeProfileName
+        ? profileActivationSummary(activeProfileName)
+        : "Profile deactivated — default roles flow active. Default mode keeps the current chat model.";
+      if (
+        !activeProfileName &&
+        !ownedReviewerLive() &&
+        !ownedBuilderChildLive()
+      ) {
+        summary +=
+          " Live Builder child (when present) reports separately; this chat uses the selection.";
+      }
+      ctx.ui.notify(summary, "info");
     }
     // A live Build child follows the same profile. Switching only the parent
     // is what made `/profile use` look inert in `/orchestrator-view child`.
@@ -2527,6 +2656,12 @@ export default function workflowExtension(
    */
   let reviewTurn: ReviewTurnPhase = "idle";
   /**
+   * A manually started Review round owns its warm session; the automatic
+   * Plan-loop round only borrows one. Ownership drives profile live-switch
+   * auditing so an auto-prefetched session is not mistaken for a live owner.
+   */
+  let reviewOwnerSession = false;
+  /**
    * A pending plan handoff (browser/native) that is not a Review turn. A plain
    * handoff owns only the pending decision; modes and prompts stay free. See
    * `beginPlanHandoff` / `endPlanHandoff`.
@@ -2882,8 +3017,11 @@ export default function workflowExtension(
 
   /**
    * Reviewer model snapshot for the current round (plan 2026-10-23, step 4).
-   * Resolved once per round so `/role` and `/profile` switches mid-round
-   * take effect next round, never mid-pass. Cleared when the round ends.
+   * Live-switch contract: a `/role` or `/profile` switch reaches the warm
+   * reviewer in place — the in-flight request finishes on the old model and
+   * the next provider request uses the new one. This snapshot is updated to
+   * the APPLIED model on a successful switch so the band and status name the
+   * model that actually runs; it is cleared when the round ends.
    */
   let reviewModelSnapshot: RoleModel | undefined;
 
@@ -2952,7 +3090,8 @@ export default function workflowExtension(
   /** Reviewer model label for the mode band (best-effort). */
   function reviewModelLabel(): string {
     // While a round runs, the band names the snapshotted model — the one
-    // actually auditing — even if the user switched roles mid-round.
+    // actually auditing. A live switch updates that snapshot to the applied
+    // model; the in-flight request still finishes on the old one.
     if (reviewModelSnapshot) return formatModelRef(reviewModelSnapshot);
     ensureRoleConfig(reviewCwd());
     ensureProfilesConfig(reviewCwd());
@@ -3610,9 +3749,10 @@ export default function workflowExtension(
       // review_bash needs the same finite shell deadlines as the main session.
       shellGuardLimits: () => shellGuardLimitsFor(currentSessionCtx).config,
       reviewerModel: () => {
-        // The round snapshot wins while set (see executeReviewRound): a
-        // mid-round switch must not change the reviewer mid-pass. Outside a
-        // round (e.g. prefetch) resolve live.
+        // The round snapshot wins while set (see executeReviewRound): it records
+        // the applied model after a live switch, so the in-flight request keeps
+        // its old model while the next provider request uses the new one.
+        // Outside a round (e.g. prefetch) resolve live.
         if (reviewModelSnapshot) return reviewModelSnapshot;
         return resolveReviewerModel();
       },
@@ -4003,6 +4143,7 @@ export default function workflowExtension(
   }): Promise<ReviewExecutionResult> {
     const { planText, round, previousFindings, ctx, signal, resumed } = opts;
     const trigger: ReviewTrigger = opts.trigger ?? "manual";
+    if (trigger !== "auto") reviewOwnerSession = true;
     const hash = planHash(planText);
     // Re-check admission immediately before the lazy runtime is created. The
     // caller may have awaited (a target read, a pause snapshot, a modal), so a
@@ -4042,8 +4183,10 @@ export default function workflowExtension(
       ...(resumed === true ? { resumed: true } : {}),
     });
     activeReview = { planText, round, controller };
-    // Snapshot the reviewer model for this round (step 4): a `/role` or
-    // `/profile` switch mid-round takes effect next round, never mid-pass.
+    // Snapshot the reviewer model for this round (step 4). A `/role` or
+    // `/profile` switch now updates this snapshot with the applied model:
+    // the request in flight finishes on the old model, the next request uses
+    // the new one.
     reviewModelSnapshot = resolveReviewerModel();
     // Working signal: the footer segment (via updateStatus) follows the round;
     // the Desktop working row and the Terminal `workflow-review-status` widget
@@ -4629,6 +4772,7 @@ export default function workflowExtension(
     const rt = reviewRuntime;
     reviewRuntime = undefined;
     reviewState = undefined;
+    reviewOwnerSession = false;
     activeReview = undefined;
     pausedReview = undefined;
     reviewPreviousFindings = undefined;
@@ -4658,6 +4802,7 @@ export default function workflowExtension(
     }
     reviewRuntime = undefined;
     reviewState = undefined;
+    reviewOwnerSession = false;
     if (opts.keepHandoff !== true) manualReviewCycle = false;
     lastReviewedPlanHash = undefined;
     reviewRound = 0;
@@ -4731,6 +4876,7 @@ export default function workflowExtension(
     }
     reviewRuntime = undefined;
     reviewState = undefined;
+    reviewOwnerSession = false;
     manualReviewCycle = false;
     lastReviewedPlanHash = undefined;
     reviewRound = 0;
@@ -7457,6 +7603,12 @@ export default function workflowExtension(
     /** A managed Build child: set mode/tools/model without plan re-import or a
      * Review cycle. The child creates its own task-local TODO list. */
     fromManagedChild?: boolean;
+    /**
+     * Optional activation report sink. Keeps the long-standing boolean return
+     * intact while letting setActiveProfile audit `{ok, changed, from, to,
+     * error}` without a second orchestration path. Never throws into callers.
+     */
+    onResult?: (report: ModelSwitchReport) => void;
   }
 
   /** Pure helper for tests: resolve which RoleModel plan/build will switch to. */
@@ -7477,6 +7629,14 @@ export default function workflowExtension(
     opts?: ModeSwitchOptions,
   ): Promise<boolean> {
     if (!workflowMode) return false;
+    const report = (result: ModelSwitchReport): boolean => {
+      try {
+        opts?.onResult?.(result);
+      } catch (_e) {
+        void _e;
+      }
+      return result.ok;
+    };
     try {
       ensureRoleConfig((ctx as any)?.cwd ?? ctx.cwd);
       ensureProfilesConfig((ctx as any)?.cwd ?? ctx.cwd);
@@ -7503,7 +7663,15 @@ export default function workflowExtension(
           "warning",
         );
       }
-      return false;
+      return report({
+        ok: false,
+        changed: false,
+        error: targetName
+          ? role
+            ? `role "${targetName}" has no model configured`
+            : `role "${targetName}" not found`
+          : `no role model for ${workflowMode} mode`,
+      });
     }
     const { role, model: m } = resolved;
     let fromLabel = "";
@@ -7539,7 +7707,12 @@ export default function workflowExtension(
           void _e;
         }
       });
-      return true;
+      return report({
+        ok: true,
+        changed: false,
+        from: fromLabel,
+        to: `${m.provider}/${m.id}`,
+      });
     }
     let found: any;
     try {
@@ -7553,7 +7726,13 @@ export default function workflowExtension(
         `Workflow ${workflowMode} → ${m.provider}/${m.id} not in model registry — staying on current model. Configure via /role set ${role.name} <provider/model>.`,
         "warning",
       );
-      return false;
+      return report({
+        ok: false,
+        changed: false,
+        from: fromLabel,
+        to: `${m.provider}/${m.id}`,
+        error: `${m.provider}/${m.id} not in model registry`,
+      });
     }
     try {
       const result = await withPersistSuppressed(async () =>
@@ -7565,7 +7744,13 @@ export default function workflowExtension(
         `Model switch to ${m.provider}/${m.id} failed: ${String(e?.message || e)} — staying on current model (auth or registry error).`,
         "warning",
       );
-      return false;
+      return report({
+        ok: false,
+        changed: false,
+        from: fromLabel,
+        to: `${m.provider}/${m.id}`,
+        error: String(e?.message || e),
+      });
     }
     await withPersistSuppressed(async () => {
       try {
@@ -7589,7 +7774,12 @@ export default function workflowExtension(
         "info",
       );
     }
-    return true;
+    return report({
+      ok: true,
+      changed: true,
+      from: fromLabel,
+      to: `${m.provider}/${m.id}`,
+    });
   }
 
   /**
@@ -7874,6 +8064,11 @@ export default function workflowExtension(
    * change should persist (`user-select` / `cycle` / `profile` /
    * `role-default` / `thinking`). Internal switches call this only after an
    * explicit user decision.
+   *
+   * Parent-only: a managed child's model comes from its role/row assignment,
+   * so neither `workflow.modelDefault` nor Pi's native `defaultProvider` /
+   * `defaultModel` / `defaultThinkingLevel` mirror may be written by a child.
+   * The child's own `pi.setModel` stays session-scoped and is unaffected.
    */
   function persistModelDefault(
     ctx: ExtensionContext | null,
@@ -7883,6 +8078,7 @@ export default function workflowExtension(
       | undefined,
     source: "user-select" | "cycle" | "profile" | "role-default" | "thinking",
   ): boolean {
+    if (inProcessChildContext) return false;
     const coerced = coerceModelDefault(
       model && model.provider && model.id
         ? {
@@ -15255,6 +15451,7 @@ export default function workflowExtension(
     // In-process Orchestrator child identity first: it decides the mode and
     // suppresses every parent-only surface (contributions, handoff, review).
     inProcessChildContext = undefined;
+    reviewOwnerSession = false;
     try {
       const early = (ctx.sessionManager.getBranch() as unknown[]) ?? [];
       const childRead = readOrchestratorChildContext(early as never);
@@ -15943,6 +16140,9 @@ export default function workflowExtension(
     // owns the Review turn; a plain handoff leaves modes/prompts free.
     reviewTurn =
       awaitingDecision && pendingHandoffReviewOwned ? "handoff" : "idle";
+    // A restored review-owned handoff keeps its warm reviewer as a live owner
+    // even after the handoff decision settles later in boot.
+    if (reviewTurn === "handoff") reviewOwnerSession = true;
     currentSessionCtx = ctx as any;
     // Give Tab back to autocomplete while a suggestion list is visible; the raw
     // `tab` shortcut keeps cycling modes otherwise.
@@ -19355,6 +19555,14 @@ export default function workflowExtension(
   ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
     // A child extension instance has no child of its own and must never notify.
     if (inProcessChildContext) return { applied: false };
+    // This is the ONLY builder-child audit site (also used by /role). It is a
+    // durable entry only; notifyWorkflow below remains the notice channel.
+    const record = (report: ModelSwitchReport): void => {
+      appendModelSwitchEntry("builder-child", {
+        ...report,
+        reason: opts?.reason ?? "model",
+      });
+    };
     const controller = orchestratorChild;
     if (!controller) return { applied: false };
     const state = controller.state();
@@ -19372,6 +19580,13 @@ export default function workflowExtension(
     }
     const plan = builderModelPlan();
     if (!plan) {
+      record({
+        ok: false,
+        changed: false,
+        from: state.modelLabel ?? "",
+        to: "",
+        error: "no Builder model is configured",
+      });
       if (!opts?.quiet) {
         notifyWorkflow(
           "No Builder model is configured — the live child keeps its current model.",
@@ -19389,6 +19604,13 @@ export default function workflowExtension(
         error: error instanceof Error ? error.message : String(error),
       };
     }
+    record({
+      ok: result.ok,
+      changed: result.changed ?? false,
+      from: state.modelLabel ?? "",
+      to: `${plan.provider}/${plan.id}`,
+      ...(result.error ? { error: result.error } : {}),
+    });
     try {
       updateStatusIfBound();
       persistState();
@@ -19431,28 +19653,32 @@ export default function workflowExtension(
     opts?: { quiet?: boolean; reason?: "profile" | "role" },
   ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
     if (inProcessChildContext) return { applied: false };
+    // This is the ONLY reviewer audit site (also used by /role). It is a
+    // durable entry only; notifyReview below remains the notice channel.
+    const record = (report: ModelSwitchReport): void => {
+      appendModelSwitchEntry("reviewer", {
+        ...report,
+        reason: opts?.reason ?? "model",
+      });
+    };
     const runtime = reviewRuntime;
     if (!runtime || typeof runtime.switchModel !== "function") {
       return { applied: false };
     }
-    // Only a live review turn owns a reviewer session. A retained terminal
-    // state from an older round must not look like a switchable session.
-    let roundActive = false;
-    try {
-      roundActive = runtime.isRoundActive() === true;
-    } catch (_e) {
-      void _e;
-    }
-    if (
-      reviewTurn === "idle" &&
-      !roundActive &&
-      activeReview === undefined &&
-      currentPausedReview() === undefined
-    ) {
-      return { applied: false };
-    }
+    // A manually started round (including its warm-idle session), a handoff
+    // turn or a paused round owns a reviewer. The automatic Plan-loop round
+    // may leave a warm session behind, but that session is not a live owner
+    // for profile/reporting purposes; no new round is seeded here.
+    if (!ownedReviewerLive()) return { applied: false };
     const model = resolveReviewerModel();
     if (!model) {
+      record({
+        ok: false,
+        changed: false,
+        from: reviewState?.modelLabel ?? "",
+        to: "",
+        error: "no reviewer model is configured",
+      });
       if (!opts?.quiet) {
         notifyReview(
           "No reviewer model is configured — the live reviewer keeps its current model.",
@@ -19470,6 +19696,13 @@ export default function workflowExtension(
         error: error instanceof Error ? error.message : String(error),
       };
     }
+    record({
+      ok: result.ok,
+      changed: result.changed ?? false,
+      from: reviewState?.modelLabel ?? "",
+      to: `${model.provider}/${model.id}`,
+      ...(result.error ? { error: result.error } : {}),
+    });
     if (result.ok) {
       // The snapshot is what the running round audits with; keep every surface
       // (band, /review-status, status line) on the model that actually runs.

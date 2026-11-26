@@ -1675,7 +1675,8 @@ export const REVIEW_RUNNING_HINT =
   "ESC or /review pause to pause · /review abort to stop";
 
 /** Cold-boot and running prefix; the state detail is appended when it lands. */
-export const REVIEW_RUNNING_LINE = `🔍 Reviewing plan… · ${REVIEW_RUNNING_HINT}`;
+const REVIEW_RUNNING_PREFIX = "🔍 Reviewing plan…";
+export const REVIEW_RUNNING_LINE = `${REVIEW_RUNNING_PREFIX} · ${REVIEW_RUNNING_HINT}`;
 
 /**
  * The paused line shared by the host working message, the footer status and
@@ -1712,7 +1713,11 @@ export function reviewFooterSegment(
   // A retained terminal phase belongs to the previous round: during a new
   // round's cold boot paint the generic line, never the stale verdict.
   if (starting && !reviewIsActive(state.phase)) return REVIEW_RUNNING_LINE;
-  return `${REVIEW_RUNNING_LINE} · ${reviewStateDetails(state)}`;
+  // The LIVE line names the reviewer actually auditing the plan. Only this
+  // footer carries the label: `reviewStateSummary` (and therefore `/review
+  // status`) keeps its single `model :` row instead of printing it twice.
+  const model = state.modelLabel ? ` · ${state.modelLabel}` : "";
+  return `${REVIEW_RUNNING_PREFIX}${model} · ${REVIEW_RUNNING_HINT} · ${reviewStateDetails(state)}`;
 }
 
 /**

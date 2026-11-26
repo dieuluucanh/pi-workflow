@@ -512,10 +512,47 @@ A profile is a **named combination of role model settings** — one `{provider, 
 - **What a profile overrides**: model + thinking for the four built-in roles only. Tools, `systemPromptAddendum` and custom roles are global (roles.json) and are never touched by a profile. Partial profiles are allowed in hand-edited files — roles a profile does not name fall back to the base role model.
 - **Activation is session-scoped.** `/profile use` changes only the current session and rides the session's `workflow` entry, so `/resume` restores it and **two concurrent sessions can run different profiles** — session 1 on a cheap provider, session 2 on a premium one. There is deliberately no global "active profile" file.
 - **Optional default**: `workflow.defaultProfile` (see [Settings](#settings)) seeds sessions that never made an explicit choice; an explicit `/profile use <name|none>` always wins for that session.
-- **Effect**: `/plan` switches to the profile's planner, `/build` to the profile's builder, `explore` subagents run on the profile's explorer, and Review Mode's reviewer session uses the profile's reviewer (planner fallback preserved). Activating while in plan/build re-applies the mode model immediately; in Default mode nothing switches until the next plan/build/explore/review use — the manual chat model is never touched by activation.
-- **Live children follow the switch.** An Orchestrator Build child and a Review reviewer already running are switched in place (`/profile use`, `/profile` prompt-pick, `/role set`, and the role picker): the in-flight request finishes on the old model and the next provider request uses the new one — no abort, no session restart. A paused child switches before resume. The next child/round always launches on the new model. If the switch is refused (missing model, provider auth), the live session keeps its model, the warning names both, and the next child/round still uses the profile. The child never writes the global default model/thinking.
+- **Effect**: `/plan` switches to the profile's planner, `/build` to the profile's builder, `explore` subagents run on the profile's explorer, and Review Mode's reviewer session uses the profile's reviewer (planner fallback preserved). Activating while in plan/build re-applies the mode model immediately; in Default mode only a profile that carries a `defaultModel` switches this chat at once, otherwise roles apply on the next plan/build/explore/review use.
+- **Live owners follow the switch.** `/profile use`, the profile picker's activate action, `/profile use none`, `/role set` and a `/role` picker save all switch the live owners in place (see the owner matrix below). The in-flight request finishes on the old model and the next provider request uses the new one — no abort, no session restart, no re-seeded review round. If the switch is refused (missing model, provider auth), the live session keeps its model, the warning names both, and the next child/round still uses the profile. A managed child never writes the global default model/thinking.
 - **`/role` keeps editing the base roles.** With a profile active, the `/role` picker shows a notice and `/role list` prints the profile's overrides; `/profile edit <name>` is the way to change what actually runs.
 - **Fallback**: no profiles (or none active) → the roles.json flow, identical to before profiles existed. A profile referencing a model missing from the registry is warned about at save time and refused at switch time ("staying on current model"), same as `/role`.
+
+#### Live-switch contract
+
+The parent owns the launch profile and model; each live owner switches only
+its own session. The warm reviewer keeps its session — its recorded model key,
+`ReviewState.modelLabel`, the mode band, the status line and `/review status`
+change to the applied model so every surface names what actually runs. A
+`settling` Build child is left alone and starts its successor on the new model.
+
+| Owner / state | What switches live | Notice + durable audit |
+| --- | --- | --- |
+| **Plan** (parent) | This chat's planner model | one activation notice + one `workflow-model-switch` entry, scope `parent` |
+| **Build** (parent) | This chat's builder model | one activation notice + one entry, scope `parent` |
+| **Orchestrator parent + live child** | Parent chat and the live Build child (paused children switch before resume); the next child starts on the same selection | parent notice/entry plus one child notice/entry, scope `builder-child` |
+| **Review: running / paused / handoff-owned / warm-idle** | The existing reviewer session in place; no new round is seeded. An automatic Plan-loop prefetch session is not a live owner and is picked up at its next round | one `notifyReview` notice + one entry, scope `reviewer`; `/review status` prints the applied model once |
+| **Default** | The profile's `defaultModel` switches this chat when present; otherwise role models apply on the next mode/role use. No live child or reviewer is reconciled | one activation notice + one entry, scope `parent` |
+| **Managed Build child (`/profile use` inside the row)** | The child's own session model only | one child-local notice + one entry, scope `child`, in the child transcript |
+
+Each activation appends **exactly one** display-only `workflow-model-switch`
+entry per owner: `{scope, role, from, to, ok, changed, at}` plus `error` or
+`reason` when applicable. `role` mirrors `scope` for older readers, and the
+entry has a Desktop timeline renderer. The entry writer never notifies: the
+activation summary (`notifyWorkflow`) or the review notice (`notifyReview`)
+is the **single notice channel** for that owner. When no live reviewer or child
+will report itself, the parent summary names the child notice channel once so
+the activation is not silent.
+
+**Child-local scope / parent-owns-launch-model rule.** A managed in-process
+Build child may activate a profile for its own row, but that choice never
+leaves the child session: it switches via `applyModeModel` / `pi.setModel(...,
+{ persist: false })`, and it must never write `workflow.defaultProfile`,
+`workflow.modelDefault` or Pi's native `defaultProvider` / `defaultModel` /
+`defaultThinkingLevel` mirror (a `model_select` mirror is refused too). The
+child emits only its own `scope: "child"` entry — no parent, reviewer or
+builder-child entry, and no default-model-skip entry — and has no channel back
+to the parent's settings or transcript. The parent alone decides the profile
+and model with which **new** children launch.
 
 **Picker keys**: `/profile` and `/role` are fuzzy-filterable — start typing to narrow models by `provider/id` or display name (e.g. `flash`, `open/beam`, `muse spark`) and profiles by name, marker, description or one of their models. `↑`/`↓` navigate, `Enter` selects/commits (inert when nothing matches), `Tab`/`←`/`→` switch role tabs, and `Ctrl+O` toggles scoped ↔ all while keeping the filter. `Esc` (or `Ctrl+C`) clears a non-empty filter first; a second press backs out or cancels. A completed `/profile` action closes the overlay; Esc-cancel, a failed save and the action menu's Back keep the profile list open, with its filter remembered.
 
@@ -579,7 +616,7 @@ Review Mode runs in its own session with its own model, taken from the **`review
 
 If the reviewer role has no model, Review Mode falls back to the planner model and warns rather than silently doing nothing.
 
-The model is **snapshotted when a round starts**, but a `/role` or `/profile` switch now also switches the LIVE reviewer session in place (the next provider request uses it, the round is not aborted, and the warm session is kept for the next round). The mode band, the status widget and `/review status` name the model that is actually auditing. A switch made in the cold-start window (before the session exists) is retained for that first session. If the switch is refused, the live reviewer keeps its model and the next round applies the new one.
+The model is **snapshotted when a round starts**, but a `/role` or `/profile` switch now also switches the LIVE reviewer session in place (the next provider request uses it, the round is not aborted, and the warm session is kept for the next round). The mode band, the status widget and `/review status` name the model that is actually auditing. A switch made in the cold-start window (before the session exists) is retained for that first session. If the switch is refused, the live reviewer keeps its model and the next round applies the new one. One `notifyReview` notice and one durable `workflow-model-switch` (`scope: "reviewer"`) entry report the switch; see [Live-switch contract](#live-switch-contract) for the full owner matrix.
 
 Roles load from `~/.pi/agent/roles.json` (with a `<cwd>/.pi/roles.json` project override) **at session start and again whenever either file changes on disk**, so a `/role` change made in another window is picked up without `/reload`. A missing, unreadable, or legacy `roles.json` is never overwritten: the built-in defaults are used in memory and a warning naming the file is shown, leaving it intact. `/review mode status`, the mode band and the reviewer run all read through the same loader.
 
