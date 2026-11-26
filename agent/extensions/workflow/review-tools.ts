@@ -24,9 +24,11 @@
 
 import { Type, type TSchema } from "typebox";
 import {
+    parseReviewNotes,
     renderRequiredChanges,
     renderReviewChangelog,
     type ReviewFinding,
+    type ReviewNote,
     type ReviewRevision,
 } from "./utils.ts";
 import { explainCommandRefusal } from "./permissions.ts";
@@ -569,6 +571,13 @@ export interface ReviewSubmitPayload {
     planText: string;
     findings: ReviewFinding[];
     verdict: ReviewVerdict;
+    /**
+     * Required changes the reviewer submitted, AFTER normalization
+     * (`revisions.length`). The appendix parse is the only other record of the
+     * count, so keeping the submitted number here is what lets the negotiation
+     * tell "asked for N, parsed 0" (fail-closed) from "asked for nothing".
+     */
+    requiredChanges: number;
     /** The reviewer's one-line summary of the change. */
     summary: string;
     /** The rendered changelog section. */
@@ -663,9 +672,12 @@ const FINDING_SCHEMA = Type.Object({
  *     required changes is refused too — approval means the plan is converged,
  *     so the reviewer must use `revise` or drop the revisions.
  *  2. (step 11) Render the advisory `## Reviewer Revisions (round N)` appendix
- *     (findings, verdict, summary, required revisions) and append it to the
- *     author's plan body. Any earlier revisions section is stripped first, so a
- *     round always leaves exactly one and the body itself is never rewritten.
+ *     (findings, verdict, summary, required revisions), append it to the
+ *     author's plan body, then parse that would-be text back and compare the
+ *     full note shape (`id`/`step`/`change`/`findingIds`, in order) with the
+ *     normalised revisions. Any drift refuses the submission and nothing is
+ *     written. Any earlier revisions section is stripped first, so a round
+ *     always leaves exactly one and the body itself is never rewritten.
  *  3. (steps 12-13) Hand the appended plan text to the parent, which writes it to
  *     the SAME plan path Plan Mode chose and records an entry.
  */
@@ -696,7 +708,7 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                         id: Type.Optional(
                             Type.String({
                                 description:
-                                    "Stable id, e.g. R1. Optional — the harness assigns R1..Rn when omitted.",
+                                    "Note id, `R<n>` only (case-insensitive; `R01` canonicalises to `R1`). Numbering restarts at R1 every round, so a note restated in a later round may reuse its previous id. Omit it and the harness assigns R1..Rn in submission order. Any other form (`RV1`, `F1`, `1`, blanks) is rejected, as are duplicate ids.",
                             }),
                         ),
                         step: Type.Optional(
@@ -746,7 +758,19 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                     ? rawParams.summary.trim()
                     : "";
             const findings = sanitizeFindings(rawParams?.findings);
-            const revisions = normalizeRevisions(rawParams?.revisions);
+            const normalized = normalizeRevisions(rawParams?.revisions);
+            // A submission whose ids or `change` text do not fit the appendix
+            // grammar is refused BEFORE anything is rendered or written: the
+            // renderer/parser pair would silently drop or reshape the note, so
+            // the plan file keeps the previous round's notes and the reviewer is
+            // told exactly what to fix.
+            if (normalized.error) {
+                return {
+                    content: [{ type: "text", text: normalized.error }],
+                    isError: true,
+                };
+            }
+            const revisions = normalized.revisions;
 
             // Convergence gate: `approve` is the reviewer's "nothing left to
             // change" signal, so it cannot carry required changes. Refuse BEFORE
@@ -803,11 +827,35 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
                 round,
             });
             const planText = `${original.trimEnd()}\n\n${changelog}\n`;
+
+            // Round-trip gate: the appendix is the only record of this round's
+            // revisions, so what the parser reads back MUST be the notes the
+            // reviewer submitted — same ids, same steps, same change text, same
+            // finding ids, same order. A drift here would silently hand the
+            // Planner a different instruction than the reviewer gave, so it is
+            // refused BEFORE `deps.submit`: nothing is written and the error
+            // names the first field/index that failed to survive.
+            const drift = revisionRoundTripDrift(
+                revisions,
+                parseReviewNotes(planText).notes,
+            );
+            if (drift) {
+                deps.log(
+                    `Review submission refused — appendix round-trip drift: ${drift.split("\n")[0]}`,
+                    "warning",
+                );
+                return {
+                    content: [{ type: "text", text: drift }],
+                    isError: true,
+                };
+            }
+
             const payload: ReviewSubmitPayload = {
                 planBody: original,
                 planText,
                 findings,
                 verdict,
+                requiredChanges: revisions.length,
                 summary,
                 changelog,
             };
@@ -873,14 +921,185 @@ export function createReviewSubmitTool(deps: ReviewSubmitDeps): {
 const REVIEW_ADVISORY_LINE =
     "_Review notes for the Planner. The plan body is authoritative once the Planner has revised it; unresolved notes are listed below._";
 
+/** The appendix grammar's id form: `R<n>`, case-insensitive. */
+const REVISION_ID = /^R(\d+)$/i;
+
+/** Trailing `_(F1, F3)_` fragment `renderRequiredChanges` appends. */
+const REVISION_FINDINGS_FRAGMENT = /_\([^()]*\)_[ \t]*$/;
+
 /**
- * Normalise the model's revisions: drop entries without a change, trim strings,
- * and assign `R1..Rn` in submission order whenever an id is missing, so the
- * model cannot produce an id-less note.
+ * Canonicalise a supplied note id, or return undefined when it is not `R<n>`.
+ *
+ * Only `R<n>` (>= 1) survives: `R01` canonicalises to `R1`, while `RV1`, `F1`,
+ * `1` and blanks return undefined. Deliberately strict — the appendix parser
+ * reads `R<n>` only, so letting any other form through would render a bullet
+ * the parser then drops, losing the note without telling anyone.
  */
-function normalizeRevisions(raw: unknown): ReviewRevision[] {
-    if (!Array.isArray(raw)) return [];
-    const out: ReviewRevision[] = [];
+function canonicalRevisionId(value: string): string | undefined {
+    const match = REVISION_ID.exec(value.trim());
+    if (!match) return undefined;
+    const n = Number(match[1]);
+    if (!Number.isInteger(n) || n < 1) return undefined;
+    return `R${n}`;
+}
+
+/**
+ * Why a `change` cannot survive the appendix round-trip, if it cannot.
+ *
+ * `renderRequiredChanges` writes one `- **R1:** <change> _(F1)_` bullet, and
+ * `parseReviewNotes` reads it back with that exact grammar. A change that
+ * fights it is refused here rather than rendered into a bullet that reads back
+ * as a different note:
+ *
+ *   - a line break injects extra bullets / breaks the list,
+ *   - a trailing `_(...) _` is stripped and re-read as `findingIds`,
+ *   - a leading `**` is consumed as the bold id head.
+ */
+function revisionChangeProblem(change: string): string | undefined {
+    if (/[\r\n]/.test(change)) return "it must be a single line";
+    if (REVISION_FINDINGS_FRAGMENT.test(change))
+        return "it must not end in a findings fragment such as _(F1)_; use findingIds instead";
+    if (change.trimStart().startsWith("**"))
+        return "it must not start with '**'";
+    return undefined;
+}
+
+/**
+ * The four fields a note must round-trip, in the order the appendix writes
+ * them into one bullet: `id`, `step`, `change`, `findingIds`.
+ */
+const NOTE_FIELDS = ["id", "step", "change", "findingIds"] as const;
+
+type NoteField = (typeof NOTE_FIELDS)[number];
+
+/** One note normalised the way BOTH sides are compared. */
+interface NoteShape {
+    id: string;
+    step?: string;
+    change: string;
+    findingIds?: string[];
+}
+
+/**
+ * Normalise a note so absent optional fields are absent on both sides.
+ *
+ * `normalizeRevisions` drops blank `step`s and empty `findingIds` and so does
+ * `parseReviewNotes`, so a note with neither must compare equal to a parsed
+ * note with neither — `{}` is never compared with `{ step: undefined }`.
+ */
+function noteShape(note: ReviewRevision | ReviewNote): NoteShape {
+    const shape: NoteShape = { id: note.id, change: note.change };
+    if (note.step) shape.step = note.step;
+    if (note.findingIds && note.findingIds.length > 0)
+        shape.findingIds = [...note.findingIds];
+    return shape;
+}
+
+function findingIdsEqual(a: string[] | undefined, b: string[] | undefined): boolean {
+    if (!a || !b) return a === b;
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function fieldValue(shape: NoteShape, field: NoteField): unknown {
+    return shape[field];
+}
+
+function describeField(value: unknown): string {
+    return value === undefined ? "absent" : JSON.stringify(value);
+}
+
+/**
+ * Why the rendered appendix does not read back as the submitted revisions.
+ *
+ * Compares the FULL note shape — `id`, `step`, `change`, `findingIds` — field by
+ * field and in order, after normalising absent optionals on both sides. Returns
+ * undefined when every note survives the round-trip unchanged, otherwise an
+ * error text that names the first mismatching note index and field and shows
+ * both sides so the reviewer can correct the submission. The caller refuses the
+ * write on any result, so a drifting note can never reach the plan file.
+ */
+function revisionRoundTripDrift(
+    expected: ReviewRevision[],
+    parsed: ReviewNote[],
+): string | undefined {
+    const expectedShapes = expected.map(noteShape);
+    const parsedShapes = parsed.map(noteShape);
+    const problems: string[] = [];
+    const total = Math.max(expectedShapes.length, parsedShapes.length);
+    for (let index = 0; index < total; index++) {
+        const want = expectedShapes[index];
+        const got = parsedShapes[index];
+        if (!want) {
+            problems.push(
+                `note ${index + 1} is an extra note the appendix invented: ${describeField(got)}`,
+            );
+            break;
+        }
+        if (!got) {
+            problems.push(
+                `note ${index + 1} (${want.id}) is missing from the appendix — work out why the bullet did not parse and resubmit it`,
+            );
+            break;
+        }
+        let mismatch = false;
+        for (const field of NOTE_FIELDS) {
+            const equal =
+                field === "findingIds"
+                    ? findingIdsEqual(want.findingIds, got.findingIds)
+                    : fieldValue(want, field) === fieldValue(got, field);
+            if (equal) continue;
+            problems.push(
+                `note ${index + 1} \`${field}\` reads back as ${describeField(
+                    fieldValue(got, field),
+                )} but the submission says ${describeField(fieldValue(want, field))}`,
+            );
+            mismatch = true;
+            break;
+        }
+        if (mismatch) break;
+    }
+    if (problems.length === 0) return undefined;
+    const render = (shapes: NoteShape[]): string =>
+        shapes.length === 0 ? "[]" : JSON.stringify(shapes, null, 0);
+    return [
+        `review_submit: the revision appendix does not round-trip — ${problems[0]}.`,
+        `Nothing was written: the appendix must read back exactly as submitted, because that is what the Planner revises from.`,
+        `expected: ${render(expectedShapes)}`,
+        `parsed:   ${render(parsedShapes)}`,
+        "Resubmit the revisions so each note survives the one-bullet grammar (single-line change, no leading '**', no trailing _(F…)_ fragment; use findingIds).",
+    ].join("\n");
+}
+
+interface NormalizedRevisions {
+    revisions: ReviewRevision[];
+    /** Refusal text naming the offending ids/`change`s; absent when valid. */
+    error?: string;
+}
+
+/**
+ * Normalise the model's revisions and validate them against the appendix
+ * grammar, so the model can neither produce an id-less note nor an id/`change`
+ * the parser cannot read back.
+ *
+ * Ids: `R<n>` only (canonicalised, so `R01` becomes `R1`), assignments `R1..Rn`
+ * in submission order when an id is omitted, and a refusal for any other
+ * supplied form, a duplicate supplied id, or an assigned id that collides with
+ * a supplied one. Numbering restarts per round, so a restated note may reuse its
+ * previous id — ids are per-round, not global.
+ *
+ * Entries without a change are still dropped silently (the model may leave an
+ * optional slot empty); everything that survives is either valid or refused.
+ */
+function normalizeRevisions(raw: unknown): NormalizedRevisions {
+    if (!Array.isArray(raw)) return { revisions: [] };
+    const kept: Array<{
+        suppliedId?: string;
+        /** A supplied but unusable id (blank or non-string), echoed in errors. */
+        badId?: string;
+        step?: string;
+        change: string;
+        findingIds?: string[];
+    }> = [];
     for (const entry of raw) {
         if (!entry || typeof entry !== "object") continue;
         const record = entry as {
@@ -892,26 +1111,111 @@ function normalizeRevisions(raw: unknown): ReviewRevision[] {
         const change =
             typeof record.change === "string" ? record.change.trim() : "";
         if (!change) continue;
-        const revision: ReviewRevision = {
-            id:
-                typeof record.id === "string" && record.id.trim()
-                    ? record.id.trim()
-                    : `R${out.length + 1}`,
-            change,
-        };
+        const slot: (typeof kept)[number] = { change };
+        // Present-but-unusable ids are rejected, not silently reassigned: a
+        // blank or non-string id is still the model claiming an id.
+        if (record.id !== undefined && record.id !== null) {
+            if (typeof record.id !== "string") {
+                slot.badId = JSON.stringify(record.id) ?? String(record.id);
+            } else {
+                slot.suppliedId = record.id.trim();
+            }
+        }
         if (typeof record.step === "string" && record.step.trim()) {
-            revision.step = record.step.trim();
+            slot.step = record.step.trim();
         }
         if (Array.isArray(record.findingIds)) {
             const findingIds = record.findingIds
                 .filter((value): value is string => typeof value === "string")
                 .map((value) => value.trim())
                 .filter(Boolean);
-            if (findingIds.length > 0) revision.findingIds = findingIds;
+            if (findingIds.length > 0) slot.findingIds = findingIds;
         }
-        out.push(revision);
+        kept.push(slot);
     }
-    return out;
+
+    // Pass 1: every supplied id must be `R<n>` and unique after canonicalising.
+    const supplied = new Map<string, number>();
+    const invalid: string[] = [];
+    const duplicates: string[] = [];
+    for (const [index, slot] of kept.entries()) {
+        if (slot.badId !== undefined) {
+            invalid.push(`revision ${index + 1} has id ${slot.badId}`);
+            continue;
+        }
+        if (slot.suppliedId === undefined) continue;
+        const canonical = canonicalRevisionId(slot.suppliedId);
+        if (!canonical) {
+            invalid.push(`revision ${index + 1} has id ${JSON.stringify(slot.suppliedId)}`);
+            continue;
+        }
+        const seen = supplied.get(canonical);
+        if (seen !== undefined) {
+            duplicates.push(
+                `duplicate revision ids: ${canonical} (revisions ${seen + 1} and ${index + 1})`,
+            );
+            continue;
+        }
+        supplied.set(canonical, index);
+    }
+    if (invalid.length > 0) {
+        return {
+            revisions: [],
+            error: `review_submit: revisions ids must be R<n> (for example R1) — ${invalid.join(
+                "; ",
+            )}. Forms such as RV1, F1, 1 or blank are rejected; omit the id and the harness assigns R1..Rn in submission order.`,
+        };
+    }
+    if (duplicates.length > 0) {
+        return {
+            revisions: [],
+            error: `review_submit: ${duplicates.join(
+                "; ",
+            )} — each revision needs its own id. Numbering restarts at R1 every round, so reusing a previous round's id is fine but two notes in one submission may not share one.`,
+        };
+    }
+
+    // Pass 2: assign the omitted ids in submission order and validate `change`.
+    const revisions: ReviewRevision[] = [];
+    const collisions: string[] = [];
+    const changeProblems: string[] = [];
+    for (const [index, slot] of kept.entries()) {
+        const id = slot.suppliedId
+            ? (canonicalRevisionId(slot.suppliedId) as string)
+            : `R${index + 1}`;
+        if (!slot.suppliedId && supplied.has(id)) {
+            collisions.push(
+                `revision ${index + 1} was assigned ${id}, which a supplied id already uses`,
+            );
+            continue;
+        }
+        const problem = revisionChangeProblem(slot.change);
+        if (problem) {
+            changeProblems.push(`revision ${id} has an unusable change — ${problem}`);
+            continue;
+        }
+        const revision: ReviewRevision = { id, change: slot.change };
+        if (slot.step) revision.step = slot.step;
+        if (slot.findingIds) revision.findingIds = slot.findingIds;
+        revisions.push(revision);
+    }
+    if (collisions.length > 0) {
+        return {
+            revisions: [],
+            error: `review_submit: inconsistent revision ids — ${collisions.join(
+                "; ",
+            )}. Omit an id only to receive the next free R<n>, or supply the ids you want.`,
+        };
+    }
+    if (changeProblems.length > 0) {
+        return {
+            revisions: [],
+            error: `review_submit: the \`change\` field must survive the appendix round-trip — ${changeProblems.join(
+                "; ",
+            )}. One single-line bullet per revision, no leading '**' and no trailing _(F…)_ fragment (use findingIds).`,
+        };
+    }
+    return { revisions };
 }
 
 function renderReviewerRevisions(

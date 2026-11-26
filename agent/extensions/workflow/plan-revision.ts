@@ -36,6 +36,14 @@ export const MAX_REVISION_PROMPT_NOTES = 12;
 /** Per-note change text kept in the prompt. */
 export const MAX_REVISION_PROMPT_CHANGE_CHARS = 400;
 
+/**
+ * The corrective line for the retry of a Planner turn that changed nothing.
+ * It is phrased as an instruction, never as a new task, so the same notes are
+ * still the only thing the Planner answers.
+ */
+export const PLAN_REVISION_CORRECTIVE_PREAMBLE =
+  "Your previous revision turn changed nothing. Apply the notes or reject them with a concrete reason.";
+
 /** The three dispositions a Planner may report for one note. */
 export type PlanRevisionStatus = "applied" | "rejected" | "not_applicable";
 
@@ -87,6 +95,12 @@ export function buildPlanRevisionPrompt(input: {
   round: number;
   maxRounds: number;
   notes: readonly ReviewNote[];
+  /**
+   * Optional corrective note placed under the heading. Only a retried turn
+   * (the previous one changed nothing) sets it; the normal prompt format is
+   * unchanged when it is absent.
+   */
+  preamble?: string;
 }): string {
   const planPath = String(input?.planPath ?? "").trim() || "the current plan file";
   const rawRound = Number(input?.round);
@@ -96,6 +110,10 @@ export function buildPlanRevisionPrompt(input: {
     ? Math.max(round, Math.trunc(rawMax))
     : round;
   const notes = Array.isArray(input?.notes) ? input.notes : [];
+  const preamble = String(input?.preamble ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
 
   const listed = notes.slice(0, MAX_REVISION_PROMPT_NOTES);
   const surplus = notes.slice(MAX_REVISION_PROMPT_NOTES);
@@ -110,6 +128,7 @@ export function buildPlanRevisionPrompt(input: {
   const lines = [
     `# Planner revision — round ${round} of ${maxRounds}`,
     "",
+    ...(preamble ? [`> ${preamble}`, ""] : []),
     `Plan file: ${planPath}`,
     "",
     "The Reviewer reviewed your plan and left notes. You are the Planner: you own",

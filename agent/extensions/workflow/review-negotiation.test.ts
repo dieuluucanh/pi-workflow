@@ -10,8 +10,9 @@
  * The second half drives the REAL extension through the fake Pi host to pin
  * the loop seam added in step 3: a revise round sends exactly one Planner
  * follow-up and never presents the handoff, a settled tool / silent body edit
- * re-reviews, a no-op hands the notes over, the budget stops after
- * `maxRevisions`, and a fresh prompt drops a stale revision turn.
+ * re-reviews, a no-op earns a corrective turn while the budget remains and an
+ * exhausted handoff once it is spent, the budget stops after `maxRevisions`,
+ * and a fresh prompt drops a stale revision turn.
  */
 
 import { test } from "node:test";
@@ -25,6 +26,8 @@ import {
   MAX_REVISIONS_LIMIT,
   decidePlanRevision,
   type PlanRevisionInput,
+  type ReviewNegotiationDecision,
+  type ReviewNegotiationOutcome,
 } from "./review-negotiation.ts";
 import type { ReviewExecutionOutcome, ReviewVerdict } from "./review.ts";
 import {
@@ -35,6 +38,8 @@ import {
   type ReviewNote,
 } from "./utils.ts";
 import { HANDOFF_PLAN_ENTRY_TYPE } from "./handoff-view.ts";
+import { REVIEW_MODE_ENTRY_TYPE } from "./review-ui.ts";
+import { PLAN_REVISION_CORRECTIVE_PREAMBLE } from "./plan-revision.ts";
 import workflowExtension from "./index.ts";
 import {
   fakeSdk,
@@ -236,6 +241,140 @@ test("a garbage input object still returns a decision", () => {
     assert.equal(decision.outcome, "review-failed", String(junk));
     assert.ok(decision.reason.length > 0, String(junk));
   }
+});
+
+// ── Submitted-but-unparsed required changes (fail-closed) ────────────
+//
+// A reviewer that submits N required changes in an id form the appendix
+// parser cannot read (the reported session's `RV1`..`RV4`) leaves the round
+// with verdict `revise` and zero parsed notes. That is NOT the reviewer's
+// "nothing to change" signal: the host must refuse the handoff, because a
+// handoff here approves a plan the reviewer explicitly asked to change.
+
+/** Today's decision type plus the fields the loop fix adds (steps 4/5). */
+type DecisionUnderFix = ReviewNegotiationDecision & {
+  handoff?: boolean;
+  outcome: ReviewNegotiationOutcome | "notes-unparsed";
+};
+
+type PlanRevisionInputUnderFix = PlanRevisionInput & {
+  requiredChanges?: number;
+};
+
+function decideUnderFix(
+  patch: Partial<PlanRevisionInputUnderFix> = {},
+): DecisionUnderFix {
+  const input: PlanRevisionInputUnderFix = {
+    reviewOutcome: "rewritten",
+    verdict: "revise",
+    notes: notes(2),
+    revisionsUsed: 0,
+    maxRevisions: 3,
+    ...patch,
+  };
+  // The extra `requiredChanges`/`handoff` fields land with the production fix;
+  // casting keeps this suite compiling against the base.
+  return decidePlanRevision(
+    input as PlanRevisionInput,
+  ) as unknown as DecisionUnderFix;
+}
+
+test("notes-unparsed: a revise with submitted-but-unreadable changes never hands off", () => {
+  const decision = decideUnderFix({ requiredChanges: 4, notes: [] });
+
+  assert.equal(decision.outcome, "notes-unparsed");
+  assert.equal(decision.request, false, "never request a revision with no notes");
+  assert.equal(decision.handoff, false, "never hand off an unread revise");
+  // The reason carries the submitted-vs-parsed counts for the notice.
+  assert.match(decision.reason, /4/);
+  assert.match(decision.reason, /0/);
+});
+
+test("notes-unparsed is not the zero-required-changes signal", () => {
+  // A revise with genuinely zero required changes stays `no-revision` and
+  // still hands off (the existing reviewer "nothing to change" semantics).
+  const decision = decideUnderFix({ requiredChanges: 0, notes: [] });
+
+  assert.equal(decision.outcome, "no-revision");
+  assert.equal(decision.request, false);
+  assert.equal(decision.handoff, true);
+});
+
+test("notes-unparsed covers a block verdict too", () => {
+  const decision = decideUnderFix({
+    verdict: "block",
+    requiredChanges: 2,
+    notes: [],
+  });
+  assert.equal(decision.outcome, "notes-unparsed");
+  assert.equal(decision.handoff, false);
+});
+
+test("a partial parse is not notes-unparsed: only the zero-note mismatch is", () => {
+  // The guard is deliberately the submitted-vs-parsed COUNT mismatch with no
+  // readable notes at all; readable notes always spend a revision turn.
+  const decision = decideUnderFix({ requiredChanges: 4, notes: notes(2) });
+  assert.equal(decision.outcome, "continue");
+  assert.equal(decision.request, true);
+  assert.equal(decision.handoff, false);
+});
+
+test("junk requiredChanges never fakes a parse failure", () => {
+  // Only a real positive count may turn an empty note list into notes-unparsed.
+  for (const junk of [
+    undefined,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    -3,
+    -0.5,
+    0,
+    "junk" as unknown as number,
+  ]) {
+    const decision = decideUnderFix({
+      requiredChanges: junk as number | undefined,
+      notes: [],
+    });
+    assert.equal(decision.outcome, "no-revision", String(junk));
+    assert.equal(decision.request, false, String(junk));
+    assert.equal(decision.handoff, true, String(junk));
+  }
+});
+
+test("an approve with no notes converges even if the count is inconsistent", () => {
+  // Rule order: convergence is decided before the unparsed check, so an
+  // approving round always hands off (review_submit rejects approve+notes).
+  const decision = decideUnderFix({
+    verdict: "approve",
+    requiredChanges: 4,
+    notes: [],
+  });
+  assert.equal(decision.outcome, "converged");
+  assert.equal(decision.request, false);
+  assert.equal(decision.handoff, true);
+});
+
+test("every decision carries the handoff flag", () => {
+  assert.equal(decideUnderFix({ notes: notes(2) }).handoff, false, "continue");
+  assert.equal(
+    decideUnderFix({ verdict: "approve", notes: [] }).handoff,
+    true,
+    "converged",
+  );
+  assert.equal(
+    decideUnderFix({ notes: notes(1), revisionsUsed: 3 }).handoff,
+    true,
+    "exhausted",
+  );
+  assert.equal(
+    decideUnderFix({ reviewOutcome: "skipped" }).handoff,
+    true,
+    "review-failed",
+  );
+  assert.equal(
+    decideUnderFix({ maxRevisions: 0, notes: notes(1) }).handoff,
+    true,
+    "no-revision",
+  );
 });
 
 // ── The loop ─────────────────────────────────────────────────────────
@@ -774,6 +913,9 @@ test("loop seam: a silent body change re-reviews without the tool", async () => 
   try {
     await plannerWrotePlan(booted);
     const promptsBefore = booted.capture.prompts.length;
+    // The revision follow-up's own run starts first: a pending turn may only
+    // resolve on the run it was sent for (loop fix, step 10).
+    await startRevisionRun(booted);
     // No `plan_revision_done`: the body hash is the only evidence.
     revisePlanBody(booted.planPath);
     await booted.pi.emit(
@@ -794,28 +936,74 @@ test("loop seam: a silent body change re-reviews without the tool", async () => 
 });
 
 
-test("loop e2e: a no-op hands off without re-review, one notice, current appendix", async () => {
+test("loop e2e: an in-budget no-op opens a corrective turn, never a handoff", async () => {
   const booted = await bootLoop();
   try {
     await plannerWrotePlan(booted);
+    assert.equal(revisionFollowUps(booted).length, 1, "revision 1 was sent");
     const promptsBefore = booted.capture.prompts.length;
-    // The Planner changed nothing: no tool, no body edit.
+    // The Planner's revision run changes nothing: no tool, no body edit.
+    await startRevisionRun(booted);
     await endRun(booted);
+
     assert.equal(
       booted.capture.prompts.length,
       promptsBefore,
-      "an unchanged revision is not re-reviewed",
+      "an unchanged revision is never re-reviewed",
     );
-    assert.equal(revisionFollowUps(booted).length, 1, "no extra revision");
-    assert.equal(handoffs(booted).length, 1, "the plan is handed off");
-    const notices = booted.fake.notifies.map((n) => n.message);
-    const noProgress = notices.filter((message) =>
-      message.includes(
-        "Planner made no revision — handing off the reviewer's notes",
+    const followUps = revisionFollowUps(booted);
+    assert.equal(followUps.length, 2, "one corrective revision turn was sent");
+    const corrective = String(followUps[1]!.content);
+    assert.match(corrective, /round 2 of 3/, "the correction spends revision 2");
+    assert.ok(
+      corrective.includes(PLAN_REVISION_CORRECTIVE_PREAMBLE),
+      corrective,
+    );
+    assert.ok(corrective.includes("- R1"), "the same note is re-sent");
+    assert.equal(handoffs(booted).length, 0, "no handoff while budget remains");
+    assert.ok(
+      !booted.fake.notifies.some((notice) =>
+        notice.message.includes("Planner made no revision"),
       ),
+      "no premature no-progress handoff notice",
     );
-    assert.equal(noProgress.length, 1, "exactly one no-progress notice");
-    // The handoff carries the plan the user has, with the current appendix.
+    const state = persistedRevision(booted)!;
+    assert.equal(state.round, 2, "the corrective turn is recorded");
+    assert.equal(state.pending, true, "the corrective turn waits for its report");
+    assert.deepEqual(state.noteIds, ["R1"], "the same notes are pending");
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop e2e: a no-op with the budget spent hands off the exhausted warning, no corrective turn", async () => {
+  const booted = await bootLoop({ maxRevisions: 1, hasUI: true });
+  try {
+    const nativeHandoff = captureNativeHandoff(booted);
+    await plannerWrotePlan(booted);
+    assert.equal(revisionFollowUps(booted).length, 1, "revision 1 of 1 was sent");
+    const promptsBefore = booted.capture.prompts.length;
+    // The one revision turn changed nothing: the budget is spent either way.
+    await startRevisionRun(booted);
+    await endRun(booted);
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore,
+      "an unchanged revision is never re-reviewed",
+    );
+    assert.equal(
+      revisionFollowUps(booted).length,
+      1,
+      "no corrective turn once the budget is spent",
+    );
+    const rendered = nativeHandoff.join("\n").replace(/\s+/g, " ");
+    assert.ok(rendered.length > 0, "the handoff questionnaire rendered");
+    assert.match(
+      rendered,
+      /Review did not converge after 1 revision — approving accepts the plan as written; Give feedback continues\./,
+      "the exhausted decision built the non-convergence warning",
+    );
     const presented = handoffPlan(booted);
     assert.ok(presented, "the plan is printed for the handoff");
     assert.match(
@@ -824,6 +1012,15 @@ test("loop e2e: a no-op hands off without re-review, one notice, current appendi
       "the current appendix travels with the handoff",
     );
     assert.match(presented!.planText, /R1/);
+    const notices = booted.fake.notifies.map((notice) => notice.message);
+    assert.ok(
+      notices.some((message) => /budget spent \(1\/1\)/.test(message)),
+      `expected the exhaustion notice, saw: ${notices.join(" | ")}`,
+    );
+    assert.ok(
+      !notices.some((message) => message.includes("Planner made no revision")),
+      "the warning is never hand-set as a no-progress notice",
+    );
   } finally {
     booted.cleanup();
   }
@@ -1198,6 +1395,457 @@ test("loop e2e: a reload never auto-sends; /review is the resume path", async ()
   }
 });
 
+// ── Loop e2e: the fail-closed revision loop (loop fix, step 1c/f/h) ──
+//
+// These tests emulate the host's run boundary between a revision follow-up
+// and its run (`startRevisionRun`) because the fake host only records
+// `sendUserMessage`. That boundary is exactly where the reported session lost
+// the revision turn, so the e2e is only faithful with it emitted.
+
+/** The revision prompt the last Planner follow-up carried. */
+function latestRevisionPrompt(booted: LoopBoot): string {
+  const followUps = revisionFollowUps(booted);
+  assert.ok(followUps.length > 0, "a Planner revision follow-up was sent");
+  return String(followUps[followUps.length - 1]!.content);
+}
+
+/**
+ * Emulate the run that answers the revision follow-up: the host starts it as a
+ * `messageType: "user"` run whose prompt is the follow-up content.
+ */
+async function startRevisionRun(booted: LoopBoot): Promise<void> {
+  await booted.pi.emit(
+    "before_agent_start",
+    {
+      type: "before_agent_start",
+      messageType: "user",
+      prompt: latestRevisionPrompt(booted),
+    },
+    booted.ctx,
+  );
+}
+
+/** The persisted loop state (`planRevision` of the workflow entry). */
+function persistedRevision(
+  booted: LoopBoot,
+):
+  | {
+      round?: number;
+      pending?: boolean;
+      settled?: boolean;
+      noteIds?: string[];
+    }
+  | undefined {
+  return workflowState(booted).planRevision as
+    | { round?: number; pending?: boolean; settled?: boolean; noteIds?: string[] }
+    | undefined;
+}
+
+/** Every `workflow-review-negotiation` audit entry, in order. */
+function negotiationEntries(
+  booted: LoopBoot,
+): Array<Record<string, unknown>> {
+  return booted.pi.entries
+    .filter((entry) => entry.type === "workflow-review-negotiation")
+    .map((entry) => (entry.data ?? {}) as Record<string, unknown>);
+}
+
+/**
+ * Answer the pending revision turn: optionally revise the plan body (keeping
+ * the Reviewer's appendix byte-identical), report the write, then settle the
+ * turn through the real `plan_revision_done` tool.
+ */
+async function settleRevision(
+  booted: LoopBoot,
+  responses: Array<{ id: string; status: string; reason?: string }>,
+  marker?: string,
+): Promise<void> {
+  assert.ok(
+    responses.some((response) => response.status === "applied"),
+    "settleRevision with an applied note needs a body edit",
+  );
+  const live = fs.readFileSync(booted.planPath, "utf8");
+  const split = splitReviewerAppendix(live);
+  const addition = marker ?? "3. Add the exporter";
+  fs.writeFileSync(
+    booted.planPath,
+    `${split.body
+      .replace("2. Add the route", `2. Add the route\n${addition}`)
+      .trimEnd()}\n\n${split.appendix}`,
+    "utf8",
+  );
+  await booted.pi.emit(
+    "tool_result",
+    { toolName: "write", isError: false, input: { path: booted.planPath } },
+    booted.ctx,
+  );
+  const settled = await reportRevision(booted, responses);
+  assert.equal(settled.isError, undefined, settled.content[0]?.text);
+}
+
+/** No auto-review was refused for round budget or admission this run. */
+function assertNoCapOrAdmissionRefusal(booted: LoopBoot): void {
+  const refused = booted.fake.notifies
+    .map((n) => n.message)
+    .filter((message) =>
+      /round limit|not admitted|no current plan submission|review refused/i.test(
+        message,
+      ),
+    );
+  assert.deepEqual(refused, [], "a loop re-review is never capped or refused");
+}
+
+/** Every `workflow-review-mode` band the extension appended, in order. */
+function reviewBands(booted: LoopBoot): Array<Record<string, unknown>> {
+  return booted.pi.entries
+    .filter((entry) => entry.type === REVIEW_MODE_ENTRY_TYPE)
+    .map((entry) => (entry.data ?? {}) as Record<string, unknown>);
+}
+
+/**
+ * Loop fix, step 9: `rounds` is a WITHIN-cycle cap, never a session-wide one.
+ *
+ * `sendRevisionFollowUp` calls `beginReviewCycle({ keepFindings: true })`,
+ * which resets `reviewRound = 0` (together with `lastReviewedPlanHash` and
+ * `abortedReviewHash`), so the next plan revision starts at round 1 of
+ * `rounds` again. With `rounds: 1` every revision must therefore earn a full
+ * round: a `round limit (1) reached` band here is the reverted session-wide
+ * counter coming back, and `runReviewStep`/`nextReviewRound` carry no
+ * `loopReReview`/`keepRound` bypass to work around it.
+ *
+ * The same cap never limits a manual `/review` either: `handleReviewRound`
+ * resets `reviewRound = 0` before its `runReviewStep("manual")`, so a second
+ * `/review` is a fresh cycle's round 1 rather than a refused round 2. A test
+ * asserting a manual `/review` cap would pin the opposite of the design.
+ */
+function assertNoRoundLimitBand(booted: LoopBoot): void {
+  const limited = reviewBands(booted).filter((band) =>
+    /round limit/i.test(String(band.reason ?? "")),
+  );
+  assert.deepEqual(
+    limited,
+    [],
+    "`rounds` never cuts a revision cycle: the per-revision reset re-opens round 1",
+  );
+}
+
+test("loop fix step 9: rounds 1 re-reviews every revision — three revisions, four reviews, then approve", async () => {
+  // `bootLoop` configures `rounds: 1`. Without the per-revision
+  // `beginReviewCycle` reset the second review of this session would stop at
+  // `round limit (1) reached` and hand the plan off unreviewed. With it, the
+  // initial review plus three re-reviews all run, and the fourth review (the
+  // one after the LAST revision the budget allows) approves.
+  const revise = async (capture: FakeCapture): Promise<void> => {
+    await submitReviewRound(capture, {
+      verdict: "revise",
+      revisions: [{ step: "1", change: "Apply the required change." }],
+    });
+  };
+  const approve = async (capture: FakeCapture): Promise<void> => {
+    await submitReviewRound(capture, { verdict: "approve", findings: [] });
+  };
+  const reviewer = scriptedReviewer([revise, revise, revise, approve]);
+  const booted = await bootLoop({ reviewer: reviewer.pass1 });
+  try {
+    await plannerWrotePlan(booted);
+    for (let round = 1; round <= 3; round += 1) {
+      assert.equal(reviewer.round(), round, `review ${round} ran`);
+      assert.equal(revisionFollowUps(booted).length, round);
+      assert.match(
+        latestRevisionPrompt(booted),
+        new RegExp(`round ${round} of 3`),
+      );
+      assert.deepEqual(handoffs(booted), [], `no handoff at review ${round}`);
+      await startRevisionRun(booted);
+      await settleRevision(
+        booted,
+        [{ id: "R1", status: "applied" }],
+        `${round + 2}. Revision ${round}.`,
+      );
+      await endRun(booted);
+    }
+    // The cycle itself, independent of the audit entries: one initial review
+    // plus three re-reviews, each its own round 1 of `rounds: 1`.
+    assert.equal(
+      reviewer.round(),
+      4,
+      "the initial review plus three re-reviews ran",
+    );
+    assert.equal(
+      revisionFollowUps(booted).length,
+      3,
+      "three revision turns, no fourth",
+    );
+    assertNoRoundLimitBand(booted);
+    assertNoCapOrAdmissionRefusal(booted);
+    assert.equal(handoffs(booted).length, 1, "the approving re-review hands off");
+    assert.match(
+      handoffPlan(booted)?.planText ?? "",
+      /Verdict: \*\*approve\*\*/,
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop e2e: three revision rounds converge on approve with exactly one handoff", async () => {
+  const reviewer = scriptedReviewer([
+    async (capture) => {
+      await submitReviewRound(capture, {
+        verdict: "revise",
+        revisions: [
+          { step: "1", change: "Add the CSV writer." },
+          { step: "2", change: "Add the route test." },
+        ],
+      });
+    },
+    async (capture) => {
+      // Round 2 numbers from R1 again and reuses R1 from round 1.
+      await submitReviewRound(capture, {
+        verdict: "revise",
+        revisions: [{ id: "R1", step: "2", change: "Restate the route test." }],
+      });
+    },
+    async (capture) => {
+      await submitReviewRound(capture, { verdict: "approve", findings: [] });
+    },
+  ]);
+  const booted = await bootLoop({ reviewer: reviewer.pass1 });
+  try {
+    await plannerWrotePlan(booted);
+    // Review 1: revise with R1, R2 → revision 1 of 3, never a handoff.
+    assert.equal(revisionFollowUps(booted).length, 1);
+    assert.match(latestRevisionPrompt(booted), /round 1 of 3/);
+    assert.deepEqual(handoffs(booted), []);
+
+    await startRevisionRun(booted);
+    await settleRevision(booted, [
+      { id: "R1", status: "applied" },
+      { id: "R2", status: "applied" },
+    ]);
+    await endRun(booted);
+    // Review 2: revise with the reused R1 → revision 2 of 3, still no handoff.
+    assert.equal(reviewer.round(), 2, "the revised body was re-reviewed");
+    assert.equal(revisionFollowUps(booted).length, 2, "revision 2 requested");
+    assert.match(latestRevisionPrompt(booted), /round 2 of 3/);
+    assert.deepEqual(handoffs(booted), [], "no handoff before the approve");
+
+    await startRevisionRun(booted);
+    await settleRevision(
+      booted,
+      [{ id: "R1", status: "applied" }],
+      "4. Add the docs.",
+    );
+    await endRun(booted);
+    // Review 3: approve → exactly one handoff, no third revision.
+    assert.equal(reviewer.round(), 3, "three review rounds ran");
+    assert.equal(revisionFollowUps(booted).length, 2, "no third revision turn");
+    assert.equal(handoffs(booted).length, 1, "exactly one handoff");
+    const presented = handoffPlan(booted);
+    assert.ok(presented, "the approved plan is presented");
+    assert.match(presented!.planText, /Verdict: \*\*approve\*\*/);
+    assertNoCapOrAdmissionRefusal(booted);
+    // One audit entry per decision: continue, continue, converged.
+    assert.deepEqual(
+      negotiationEntries(booted).map((entry) => entry.outcome),
+      ["continue", "continue", "converged"],
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop e2e: a fourth revise exhausts maxRevisions and hands off with the warning", async () => {
+  const revise = async (capture: FakeCapture): Promise<void> => {
+    await submitReviewRound(capture, {
+      verdict: "revise",
+      revisions: [{ step: "1", change: "Apply the required change." }],
+    });
+  };
+  const reviewer = scriptedReviewer([revise, revise, revise, revise]);
+  const booted = await bootLoop({ hasUI: true, reviewer: reviewer.pass1 });
+  try {
+    const nativeHandoff = captureNativeHandoff(booted);
+    await plannerWrotePlan(booted);
+    for (let round = 1; round <= 3; round += 1) {
+      assert.equal(revisionFollowUps(booted).length, round);
+      assert.match(
+        latestRevisionPrompt(booted),
+        new RegExp(`round ${round} of 3`),
+      );
+      await startRevisionRun(booted);
+      await settleRevision(
+        booted,
+        [{ id: "R1", status: "applied" }],
+        `${round + 2}. Revision ${round}.`,
+      );
+      await endRun(booted);
+    }
+    // Review 4 still asks for a revision; the budget is spent, so this is the
+    // only handoff and it carries the non-convergence warning.
+    assert.equal(reviewer.round(), 4, "the fourth review ran");
+    assert.equal(revisionFollowUps(booted).length, 3, "three revision turns");
+    assert.ok(nativeHandoff.length > 0, "the native handoff rendered");
+    assert.match(
+      nativeHandoff.join("\n").replace(/\s+/g, " "),
+      /Review did not converge after 3 revisions/,
+    );
+    assert.equal(handoffPlan(booted)?.verdict, "revise");
+    assertNoRoundLimitBand(booted);
+    assertNoCapOrAdmissionRefusal(booted);
+    const last = negotiationEntries(booted).at(-1);
+    assert.equal(last?.outcome, "exhausted");
+    assert.equal(last?.handoff, true, "the exhausted decision hands off");
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop e2e: an all-rejected revision with no plan write still re-reviews and is admitted", async () => {
+  const reviewer = scriptedReviewer([
+    async (capture) => {
+      await submitReviewRound(capture, {
+        verdict: "revise",
+        revisions: [{ step: "1", change: "Apply the required change." }],
+      });
+    },
+    async (capture) => {
+      await submitReviewRound(capture, { verdict: "approve", findings: [] });
+    },
+  ]);
+  const booted = await bootLoop({ reviewer: reviewer.pass1 });
+  try {
+    await plannerWrotePlan(booted);
+    await startRevisionRun(booted);
+    // No body edit and no plan write this run: the Planner rejects the note
+    // with a reason, so `plan_revision_done` settling is the only proof that a
+    // plan submission exists for this turn.
+    const settled = await reportRevision(booted, [
+      { id: "R1", status: "rejected", reason: "The route is in step 5." },
+    ]);
+    assert.equal(settled.isError, undefined, settled.content[0]?.text);
+    await endRun(booted);
+    assert.equal(
+      reviewer.round(),
+      2,
+      "an all-rejected turn is still re-reviewed",
+    );
+    // A settled turn is never a no-op: it re-reviews and never triggers the
+    // corrective retry or the no-progress notice.
+    assert.equal(
+      revisionFollowUps(booted).length,
+      1,
+      "a settled turn is never a no-op retry",
+    );
+    assert.ok(
+      !String(revisionFollowUps(booted)[0]!.content).includes(
+        PLAN_REVISION_CORRECTIVE_PREAMBLE,
+      ),
+      "the first revision is not corrective",
+    );
+    assert.ok(
+      !booted.fake.notifies.some((notice) =>
+        notice.message.includes("Planner made no revision"),
+      ),
+      "the settled turn is not reported as a no-op",
+    );
+    assert.equal(handoffs(booted).length, 1, "the approving re-review hands off");
+    assert.match(handoffPlan(booted)?.planText ?? "", /Verdict: \*\*approve\*\*/);
+    assertNoCapOrAdmissionRefusal(booted);
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop e2e: an unreadable revise submission never hands off", async () => {
+  // The reported session's shape: four required changes submitted as
+  // `RV1`..`RV4`, an id form the appendix parser cannot read. Post-fix
+  // `review_submit` refuses that form and the compliant retry lands; either
+  // way the round must not hand off and must leave no Review turn lock.
+  const submitted = [
+    { id: "RV1", step: "1", change: "Add the writer." },
+    { id: "RV2", step: "2", change: "Add the route." },
+    { id: "RV3", step: "3", change: "Document it." },
+    { id: "RV4", step: "4", change: "Add tests." },
+  ];
+  const retry = submitted.map(({ step, change }) => ({ step, change }));
+  const reviewer = scriptedReviewer([
+    async (capture) => {
+      const first = (await capture.tools.review_submit.execute(
+        "submit-1",
+        {
+          findings: [],
+          verdict: "revise",
+          summary: "Four required changes.",
+          revisions: submitted,
+        },
+        undefined,
+        undefined,
+        {},
+      )) as { isError?: boolean };
+      // A compliant reviewer renumbers instead of arguing with the parser.
+      if (first.isError === true) {
+        const second = (await capture.tools.review_submit.execute(
+          "submit-2",
+          {
+            findings: [],
+            verdict: "revise",
+            summary: "Four required changes.",
+            revisions: retry,
+          },
+          undefined,
+          undefined,
+          {},
+        )) as { isError?: boolean };
+        assert.equal(second.isError, undefined, "the R<n> retry is accepted");
+      }
+      await capture.tools.review_pass_done.execute(
+        "done",
+        { pass: 1, verdict: "revise", findings: [] },
+        undefined,
+        undefined,
+        {},
+      );
+    },
+    async (capture) => {
+      await submitReviewRound(capture, { verdict: "approve", findings: [] });
+    },
+  ]);
+  const booted = await bootLoop({ reviewer: reviewer.pass1 });
+  try {
+    await plannerWrotePlan(booted);
+    // Fail-closed: the unreadable revise never becomes a handoff.
+    assert.deepEqual(handoffs(booted), [], "no handoff on an unread revise");
+    assert.deepEqual(booted.fake.customs, [], "no native handoff modal");
+    assert.equal(
+      revisionFollowUps(booted).length,
+      1,
+      "the readable notes spend a revision turn",
+    );
+    // The negotiation decision for the round is audited with `handoff: false`.
+    const entries = negotiationEntries(booted);
+    assert.equal(entries.length, 1, "one negotiation entry for the round");
+    assert.equal(entries[0]!.handoff, false);
+    assert.ok(
+      entries[0]!.outcome === "notes-unparsed" ||
+        entries[0]!.outcome === "continue",
+      `fail-closed outcome, saw ${String(entries[0]!.outcome)}`,
+    );
+    // No Review turn lock: `/review pause` reports an idle turn, not a lock.
+    await booted.pi.commands.review.handler("pause", booted.ctx);
+    assert.ok(
+      booted.fake.notifies.some(
+        (notice) => notice.message === "No review round running.",
+      ),
+      `expected an idle review turn, saw: ${booted.fake.notifies
+        .map((n) => n.message)
+        .join(" | ")}`,
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
 // ── The reverted advisory binding is dead code ────────────────────────
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1293,5 +1941,108 @@ test("dead-code proof: parseReviewNotes reads all 13 notes of the reported plan"
   assert.deepEqual(
     parsed.notes.map((note) => note.change),
     notes(13).map((note) => note.change),
+  );
+});
+
+// ── The round decision reads the result's state, not the closure ──────
+//
+// The orchestrator keeps a mutable `reviewState` closure next to the
+// `ReviewExecutionResult` each round returns. They normally hold the same
+// object (`reviewState = res.state`), so no fake-host harness can stage a
+// divergent pair and observe the decision change end to end. The contract is
+// therefore defensive: the decision is computed from the result the caller
+// holds, so a later write (or a failed round that produces no state at all)
+// can never decide a round it did not run. Pinned here at the seam where it is
+// decidable — the source of the wiring — plus the pure fail-closed outcome for
+// a stateless result.
+
+function sourceText(file: string): string {
+  return fs.readFileSync(path.join(HERE, file), "utf8");
+}
+
+/** The source of `function <name>(` up to its closing 2-space brace. */
+function factoryFunctionBody(source: string, name: string): string {
+  const start = source.indexOf(`function ${name}(`);
+  assert.ok(start > -1, `${name} exists in index.ts`);
+  const end = source.indexOf("\n  }", start);
+  assert.ok(end > start, `${name} has a body`);
+  return source.slice(start, end);
+}
+
+test("round-state: the negotiation decides from the result, never the closure", () => {
+  const index = sourceText("index.ts");
+  const helper = factoryFunctionBody(index, "planRevisionDecisionFor");
+  // The helper takes the result's state as an input...
+  assert.match(
+    helper,
+    /"outcome"\s*\|\s*"planText"\s*\|\s*"state"/,
+    "the helper accepts the result's state",
+  );
+  // ...and reads both inputs from it.
+  assert.match(
+    helper,
+    /verdict:\s*reviewed\.state\?\.verdict/,
+    "the verdict comes from the result's state",
+  );
+  assert.match(
+    helper,
+    /requiredChanges:\s*reviewed\.state\?\.requiredChanges/,
+    "the submitted count comes from the result's state",
+  );
+  // The call block must not read the mutable closure at all.
+  const callStart = helper.indexOf("return decidePlanRevision({");
+  assert.ok(callStart > -1, "the helper delegates to decidePlanRevision");
+  const call = helper.slice(callStart);
+  assert.doesNotMatch(
+    call,
+    /reviewState/,
+    "no stale closure verdict/count reaches the pure decision",
+  );
+  // The success result is what carries that snapshot to the caller.
+  assert.match(
+    index,
+    /outcome:\s*res\.planHash === hash \? "unchanged" : "rewritten",[\s\S]{0,500}?state:\s*res\.state,/,
+    "executeReviewRound's success result carries its round state",
+  );
+});
+
+test("round-state: the submitted count is threaded payload → state", () => {
+  // review_submit reports the NORMALIZED count (what the reviewer actually
+  // submitted), not the parsed note count.
+  assert.match(
+    sourceText("review-tools.ts"),
+    /requiredChanges:\s*revisions\.length/,
+    "the payload carries the normalized revisions.length",
+  );
+  assert.match(
+    sourceText("review-runtime.ts"),
+    /state\.requiredChanges = payload\.requiredChanges/,
+    "the submit callback folds the count into the round state",
+  );
+  // Optional, so `createReviewState` and old persisted states stay valid.
+  assert.match(
+    sourceText("review.ts"),
+    /requiredChanges\?: number;/,
+    "the state field is optional (back-compat)",
+  );
+});
+
+test("round-state: a result without a state still fails closed, never revise", () => {
+  // A skipped/failed round returns no `state`, so the helper forwards
+  // `verdict: undefined` / `requiredChanges: undefined`. Rule 1 must win:
+  // review-failed, no revision request, handoff allowed.
+  const decision = decidePlanRevision({
+    reviewOutcome: "skipped",
+    verdict: undefined,
+    notes: [],
+    requiredChanges: undefined,
+    revisionsUsed: 0,
+    maxRevisions: 3,
+  });
+  assert.equal(decision.outcome, "review-failed");
+  assert.equal(decision.request, false);
+  assert.equal(
+    (decision as unknown as { handoff?: boolean }).handoff,
+    true,
   );
 });

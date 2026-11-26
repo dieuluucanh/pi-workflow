@@ -871,6 +871,13 @@ export interface ReviewState {
   findings: ReviewFinding[];
   verdict?: ReviewVerdict;
   /**
+   * Required changes the reviewer submitted this round, after normalization
+   * (`revisions.length`), written by the submit callback. Optional so old
+   * persisted states and `createReviewState` stay valid; a missing count is
+   * the pre-fix "unknown", never a fake 0.
+   */
+  requiredChanges?: number;
+  /**
    * The submitted plan text once submitted: the author's body plus the
    * `## Reviewer Revisions` appendix. Kept under this name because it is
    * persisted in review state; the body itself is never rewritten.
@@ -1068,6 +1075,12 @@ export interface ReviewExecutionResult {
   reason?: string;
   /** True when `pausedReview` holds this revision and the gate stays open. */
   paused: boolean;
+  /**
+   * The round state that produced this result (success only). The negotiation
+   * decides from THIS snapshot, never from the mutable orchestrator closure: a
+   * stale or overwritten `reviewState` must not decide a round it did not run.
+   */
+  state?: ReviewState;
 }
 
 /**
@@ -1440,6 +1453,8 @@ export interface ReviewSubmitPayloadLike {
   planText: string;
   findings: ReviewFinding[];
   verdict: ReviewVerdict;
+  /** Required changes submitted this round (normalized count). */
+  requiredChanges: number;
   summary: string;
   changelog: string;
 }

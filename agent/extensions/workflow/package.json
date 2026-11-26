@@ -1,6 +1,6 @@
 {
   "name": "@dieulc/workflow",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "type": "module",
   "private": false,
   "keywords": [
@@ -84,6 +84,7 @@
     "permissions.ts",
     "picker.ts",
     "plan-identity.ts",
+    "plan-revision.ts",
     "policy-runtime.ts",
     "ports.ts",
     "profiles.ts",
@@ -104,6 +105,7 @@
     "read-policy-tools.ts",
     "read-policy.ts",
     "review-handoff.ts",
+    "review-negotiation.ts",
     "review-command.ts",
     "review-policy.ts",
     "review-providers.ts",

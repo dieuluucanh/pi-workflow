@@ -650,7 +650,15 @@ those finding ids, so a note is addressable across turns:
 - **R2 · Step 3:** Cover the validation error before the route is wired _(F1)_
 ```
 
-Ids are normalised to `R1..Rn` in submission order when the model omits them.
+Note ids are **strict per-round `R<n>`**: numbering restarts at `R1` in every
+review round, so a note restated in a later round may reuse its previous id.
+Omitted ids are assigned `R1..Rn` in submission order and `R01` canonicalises
+to `R1`; any other form (`RV1`, `F1`, `1`, a blank) and a duplicate id inside
+one submission are rejected by `review_submit` with the offending entries
+named. The rendered appendix is then parsed back and compared field by field
+(`id`/`step`/`change`/`findingIds`, in order) against the submission: a note
+that would not survive the one-bullet grammar is refused **before** anything is
+written, so a note can never be silently dropped or reshaped.
 
 #### The revision loop
 
@@ -662,17 +670,43 @@ Ids are normalised to `R1..Rn` in submission order when the model omits them.
    `rejected` or `not_applicable`, with a concrete reason for the last two.
    An `applied` with an unchanged body is refused, and any edit to the
    appendix is refused.
-4. The reviewer re-reviews the **revised body** with those responses in hand —
-   a rejected note has to survive the Planner's reason, not be repeated.
-5. Repeat until the reviewer approves or the budget is spent, then hand off.
+4. A revision turn that changes **nothing** is neither a revision nor a
+   verdict: while the budget allows it, the same notes earn **one corrective
+   turn** (its prompt says the previous turn changed nothing; no handoff, no
+   re-review), and once the budget is spent the handoff carries the
+   `exhausted` non-convergence line.
+5. Otherwise the reviewer re-reviews the **revised body** with those responses
+   in hand — a rejected note has to survive the Planner's reason, not be
+   repeated. Each revision turn starts a **fresh review cycle**, so its
+   re-review is round 1 of that cycle: `rounds` can never cut a revision short
+   and there is no `keepRound`/`loopReReview` cap bypass to work around.
+6. Repeat until the reviewer approves or the budget is spent, then hand off.
 
-`maxRevisions` (`0`–`5`, default `3`; `0` = one-shot) is the budget. `rounds`
-stays the per-cycle Review round cap — it counts review passes over one plan,
-not Planner revisions. When the budget is spent with notes still open, the
-loop stops without converging: the handoff says so, and
-**Approve** accepts the plan as written while **Give feedback** continues the
-argument. The loop runs for the automatic post-Plan review and for `/review`
-in Plan mode; `/review` outside Plan mode is still the one-shot review.
+`maxRevisions` (`0`–`5`, default `3`; `0` = one-shot) is the **loop budget**.
+`rounds` stays the **within-cycle** Review round cap — it counts review passes
+over one plan/feedback cycle, not Planner revisions, and a fresh prompt,
+explicit refine/deny or a different plan file starts a new cycle. The two are
+independent counters: `rounds: 1` still pays for every revision the budget
+allows, because each revision opens its own cycle.
+
+**Handoff is a decision, never a fallthrough.** A revise round cannot hand off
+silently: `continue` keeps the turn, the terminal outcomes (`converged`,
+`exhausted`, `no-revision`, `review-failed`) allow the handoff, and
+`notes-unparsed` refuses it. The last one is fail-closed — a `revise`/`block`
+that **submitted changes which parse to zero notes** is neither revisable nor
+approvable, so the Planner gets no turn, the plan is not handed off, and the
+notice names the submitted-versus-parsed counts. Every decision writes one
+`workflow-review-negotiation` audit entry (`outcome`, `request`, `handoff`,
+round, budget, parsed notes, submitted changes, verdict, reason) from the round
+snapshot it decided from, so a refused handoff stays visible. A non-final
+host attempt is skipped and audited the same way: it may not resolve the turn,
+review or hand off while the retried run owns the plan.
+
+When the budget is spent with notes still open, the loop stops without
+converging: the handoff says so, and **Approve** accepts the plan as written
+while **Give feedback** continues the argument. The loop runs for the
+automatic post-Plan review and for `/review` in Plan mode; `/review` outside
+Plan mode is still the one-shot review.
 
 The appendix is **reference, not authority**: the approved plan body wins on
 any conflict, and the revision argument belongs in Plan, before approval — not
@@ -769,7 +803,7 @@ The handoff **waits for the reviewer**: no browser prompt or native choice rende
 
 A handoff opens **only when the current run writes or edits a `.pi/plans/` file while Plan mode is active**. A mid-run switch into Plan counts — the write after the switch is eligible. A plan written before the switch does not auto-handoff: the extension shows `Plan file ready: <path>. Run /review to audit it.` and leaves the plan for the manual command. Switching Build → Plan keeps the previous plan and todos as reference; a fresh prompt also supersedes any pending browser/native handoff prompt, and a stale browser approval/denial from a previous plan is ignored.
 
-**Review cycles.** The round budget (`rounds`) is per plan/feedback cycle, not per session. A fresh prompt, a native `Give feedback`, a browser `Deny`, a different plan-file path, and entering Build all start a new cycle, so a second plan in the same session still gets reviewed with the default `rounds: 1`. Findings carry across a refinement of the same plan file and are cleared for a new plan file. A fresh prompt **abandons** a paused review: the old round is stopped, its open handoff gate settles with the author's plan, and the footer/lock clear. The old handoff cannot render or apply a plan after the new cycle starts.
+**Review cycles.** The round budget (`rounds`) is per plan/feedback cycle, not per session. A fresh prompt, a native `Give feedback`, a browser `Deny`, a different plan-file path, entering Build **and each Planner revision turn** all start a new cycle, so a second plan in the same session still gets reviewed with the default `rounds: 1` and a re-review of a revised body is round 1 of its own cycle. Findings carry across a refinement of the same plan file and are cleared for a new plan file. A fresh prompt **abandons** a paused review: the old round is stopped, its open handoff gate settles with the author's plan, and the footer/lock clear. The old handoff cannot render or apply a plan after the new cycle starts.
 
 A paused review is in-memory and belongs to the cycle that recorded it: it cannot keep `🔒 modes locked` alive or short-circuit the next plan's review after a new prompt.
 
@@ -1372,8 +1406,8 @@ Review Mode settings live under `workflow.reviewMode`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Automatic-review toggle. When false, the automatic handoff review/prefetch/planner note are off and the plan handoff is **plain** (modes/prompts stay free); the manual `/review` commands still work |
-| `rounds` | `1` | Max Review rounds per plan/feedback cycle (review passes over one plan — not Planner revisions). A fresh prompt, explicit refine/deny, or a different plan file starts a new cycle. Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
-| `maxRevisions` | `3` | Planner revision budget per negotiation (`0`–`5`; `0` = one-shot review, no Planner turn). Each round with open required changes costs one revision turn; the Reviewer then re-reviews the revised body. Spent with notes still open → the handoff says the loop did not converge and Approve accepts the plan as written |
+| `rounds` | `1` | Max Review rounds per **plan/feedback cycle** (review passes over one plan — not Planner revisions). A fresh prompt, explicit refine/deny, a different plan file **and every Planner revision turn** start a new cycle, so a re-review is round 1 of its own cycle and the cap can never cut a revision short (no special-case bypass). Reached the cap → the plan is handed over with an `## Unresolved findings` appendix |
+| `maxRevisions` | `3` | The **loop budget** per negotiation (`0`–`5`; `0` = one-shot review, no Planner turn). Each round with open required changes costs one revision turn and the Reviewer then re-reviews the revised body; a turn that changes nothing earns one corrective turn. Spent with notes still open → the handoff says the loop did not converge and Approve accepts the plan as written. A `revise`/`block` whose submitted changes parse to zero notes (`notes-unparsed`) is refused instead of handed off |
 | `passes` | `2` | `1` = a single review pass (no self-verify); `2` = review, then self-verify |
 | `verify` | `true` | Run the self-verification pass |
 | `fallbackOnError` | `"skip"` | `skip` hands over the author's plan on any failure (`block` is reserved) |

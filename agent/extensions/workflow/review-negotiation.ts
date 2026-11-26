@@ -32,18 +32,29 @@ const USABLE_OUTCOMES: ReadonlySet<ReviewExecutionOutcome> = new Set([
  * - `exhausted`     — notes are still open but `maxRevisions` is spent: hand
  *                     off with a warning.
  * - `review-failed` — the round paused/aborted/failed/skipped: never revise.
+ * - `notes-unparsed` — the reviewer submitted required changes the appendix
+ *                     parser could not read (so `notes` is empty): neither a
+ *                     revision turn nor a handoff is defensible.
  */
 export type ReviewNegotiationOutcome =
   | "continue"
   | "converged"
   | "no-revision"
   | "exhausted"
-  | "review-failed";
+  | "review-failed"
+  | "notes-unparsed";
 
 /** One decision of the Planner↔Reviewer loop. */
 export interface ReviewNegotiationDecision {
   /** True only when the host must send a Planner revision turn. */
   request: boolean;
+  /**
+   * True only when the loop is terminal and the host may hand the plan off
+   * (converged / exhausted / review-failed / no-revision). False for
+   * `continue` (the loop owns the next turn) and `notes-unparsed` (fail-closed:
+   * the host must not approve a plan the reviewer asked to change).
+   */
+  handoff: boolean;
   outcome: ReviewNegotiationOutcome;
   /** Human-readable reason, always present (used for notices and the handoff). */
   reason: string;
@@ -60,6 +71,12 @@ export interface PlanRevisionInput {
   verdict?: ReviewVerdict;
   /** Notes parsed from the reviewer's appendix for this round. */
   notes: readonly ReviewNote[];
+  /**
+   * Required changes the reviewer actually submitted this round (before the
+   * appendix parse). `notes.length === 0` with `requiredChanges > 0` means the
+   * submission was unreadable, not that the reviewer asked for nothing.
+   */
+  requiredChanges?: number;
   /** Revision turns already spent in this negotiation (separate from `rounds`). */
   revisionsUsed: number;
   /** The configured budget: 0 = one-shot, clamped to 0..5. */
@@ -73,6 +90,13 @@ function clampCount(value: unknown, max: number, fallback: number): number {
   return Math.min(max, Math.max(0, Math.trunc(n)));
 }
 
+/** Normalize a count to a whole number >= 0; junk (non-finite/negative) -> 0. */
+function normalizeCount(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.trunc(n));
+}
+
 function plural(count: number): string {
   return count === 1 ? "revision" : "revisions";
 }
@@ -83,9 +107,16 @@ function plural(count: number): string {
  * 1. `paused|aborted|fallback|skipped` → `review-failed`, never revise.
  * 2. `maxRevisions === 0` → `no-revision` (reason "disabled"): one-shot.
  * 3. `approve` with no notes → `converged`.
- * 4. no notes at all → `no-revision` (nothing to revise).
- * 5. notes present and `revisionsUsed >= maxRevisions` → `exhausted`.
- * 6. otherwise → `continue` (one request).
+ * 4. no notes, `verdict !== "approve"`, `requiredChanges > 0` →
+ *    `notes-unparsed`: the reviewer asked for changes we cannot read, so
+ *    neither a revision turn nor a handoff is defensible (fail-closed).
+ * 5. no notes otherwise → `no-revision` (nothing to revise).
+ * 6. notes present and `revisionsUsed >= maxRevisions` → `exhausted`.
+ * 7. otherwise → `continue` (one request).
+ *
+ * `handoff` is true for every terminal outcome (converged, exhausted,
+ * review-failed, no-revision) and false for `continue` (the loop keeps the
+ * turn) and `notes-unparsed` (never approve an unread revise).
  *
  * Never throws; non-finite/negative inputs are normalized and the budget is
  * clamped to 0..5 before the comparison.
@@ -104,6 +135,12 @@ export function decidePlanRevision(
   }
 
   const budget = { revisionsUsed, maxRevisions };
+  let requiredChanges = 0;
+  try {
+    requiredChanges = normalizeCount(input?.requiredChanges);
+  } catch {
+    requiredChanges = 0;
+  }
   const outcome = input?.reviewOutcome;
   const verdict = input?.verdict;
   const notes = Array.isArray(input?.notes) ? input.notes : [];
@@ -112,6 +149,7 @@ export function decidePlanRevision(
   if (!USABLE_OUTCOMES.has(outcome)) {
     return {
       request: false,
+      handoff: true,
       outcome: "review-failed",
       reason: `review did not produce a usable verdict (${String(outcome ?? "unknown")})`,
       ...budget,
@@ -121,6 +159,7 @@ export function decidePlanRevision(
   if (maxRevisions === 0) {
     return {
       request: false,
+      handoff: true,
       outcome: "no-revision",
       reason: "revisions disabled (maxRevisions 0) — one-shot review",
       ...budget,
@@ -130,8 +169,25 @@ export function decidePlanRevision(
   if (verdict === "approve" && noteCount === 0) {
     return {
       request: false,
+      handoff: true,
       outcome: "converged",
       reason: "reviewer approved with no required changes",
+      ...budget,
+    };
+  }
+
+  if (noteCount === 0 && verdict !== "approve" && requiredChanges > 0) {
+    // Fail-closed: the submission named required changes, but none survived
+    // the appendix parse. Revising nothing is useless and handing off would
+    // approve a plan the reviewer explicitly asked to change.
+    const verdictLabel = verdict ? `verdict ${verdict}` : "no verdict";
+    return {
+      request: false,
+      handoff: false,
+      outcome: "notes-unparsed",
+      reason: `${verdictLabel}: ${requiredChanges} required change${
+        requiredChanges === 1 ? "" : "s"
+      } submitted but 0 parsed — refusing the handoff`,
       ...budget,
     };
   }
@@ -140,6 +196,7 @@ export function decidePlanRevision(
     const verdictLabel = verdict ? `verdict ${verdict}` : "no verdict";
     return {
       request: false,
+      handoff: true,
       outcome: "no-revision",
       reason: `${verdictLabel} with no required changes — nothing to revise`,
       ...budget,
@@ -149,6 +206,7 @@ export function decidePlanRevision(
   if (revisionsUsed >= maxRevisions) {
     return {
       request: false,
+      handoff: true,
       outcome: "exhausted",
       reason: `revision budget spent (${revisionsUsed}/${maxRevisions}) with ${noteCount} open note${
         noteCount === 1 ? "" : "s"
@@ -160,6 +218,7 @@ export function decidePlanRevision(
   const remaining = maxRevisions - revisionsUsed;
   return {
     request: true,
+    handoff: false,
     outcome: "continue",
     reason: `${noteCount} open note${noteCount === 1 ? "" : "s"} — Planner revision ${
       revisionsUsed + 1

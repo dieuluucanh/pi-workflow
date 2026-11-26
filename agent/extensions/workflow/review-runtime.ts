@@ -366,6 +366,10 @@ export function renderPriorRoundSection(
     "Do not re-raise a note the Planner resolved unless the revised body still",
     "fails it; if it does, restate it with the evidence.",
     "",
+    "Note ids in your submission are `R<n>` only and restart at R1 each round,",
+    "so a note you restate may reuse its previous id. Omit the id to receive",
+    "R1..Rn in submission order; other forms are rejected.",
+    "",
     "The plan body is authoritative; you still write only the appendix.",
   ].join("\n");
 }
@@ -1028,6 +1032,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
                 state.rewrittenPlan = payload.planText;
                 state.findings = payload.findings;
                 state.verdict = payload.verdict;
+                // The submitted count, not the parsed note count: the round
+                // decision needs to tell "asked for N, parsed 0" apart.
+                state.requiredChanges = payload.requiredChanges;
               }
               gate.notifySubmitted(payload);
               return { ok: true, path: written.path };

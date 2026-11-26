@@ -16,18 +16,30 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import {
   MAX_REVISION_PROMPT_CHANGE_CHARS,
   MAX_REVISION_PROMPT_CHARS,
   MAX_REVISION_PROMPT_NOTES,
+  PLAN_REVISION_CORRECTIVE_PREAMBLE,
   PLAN_REVISION_TOOL_NAME,
   buildPlanRevisionPrompt,
   createPlanRevisionDoneTool,
   type PlanRevisionResponse,
   type PlanRevisionToolDeps,
 } from "./plan-revision.ts";
-import { planHash, splitReviewerAppendix, type ReviewNote } from "./utils.ts";
+import { getUtcDateTimePrefix, planHash, splitReviewerAppendix, type ReviewNote } from "./utils.ts";
+import { decidePlanRevision } from "./review-negotiation.ts";
+import workflowExtension from "./index.ts";
+import {
+  fakeSdk,
+  makeFakeCtx,
+  makeFakePi,
+  submitThenFinish,
+  tmpProject,
+} from "./test-support.ts";
 
 // ── Fixtures ─────────────────────────────────────────────────────────
 
@@ -204,6 +216,42 @@ test("prompt: a blank round/maxRounds still renders a usable prompt", () => {
   assert.ok(prompt.includes("round 1 of 1"), prompt);
   assert.ok(prompt.includes("the current plan file"), prompt);
   assert.ok(prompt.includes("(the Reviewer left no notes)"), prompt);
+});
+
+test("prompt: the corrective preamble is opt-in and never changes the normal format", () => {
+  const notes: ReviewNote[] = [{ id: "R1", step: "2", change: "Register the route." }];
+  const normal = buildPlanRevisionPrompt({
+    planPath: "/p/plan.md",
+    round: 2,
+    maxRounds: 3,
+    notes,
+  });
+  const corrective = buildPlanRevisionPrompt({
+    planPath: "/p/plan.md",
+    round: 2,
+    maxRounds: 3,
+    notes,
+    preamble: PLAN_REVISION_CORRECTIVE_PREAMBLE,
+  });
+
+  assert.ok(
+    !normal.includes(PLAN_REVISION_CORRECTIVE_PREAMBLE),
+    "the normal prompt carries no corrective line",
+  );
+  assert.ok(
+    corrective.includes(`> ${PLAN_REVISION_CORRECTIVE_PREAMBLE}`),
+    corrective,
+  );
+  // The marker (the heading) must stay the first line: follow-up runs are
+  // recognised by it, corrective or not.
+  assert.equal(
+    corrective.split("\n")[0],
+    normal.split("\n")[0],
+    "the heading is unchanged",
+  );
+  // The notes to answer are identical; only the preamble differs.
+  assert.ok(corrective.includes("- R1 · Step 2: Register the route."));
+  assert.ok(corrective.includes("## Notes to answer (1)"));
 });
 
 // ── Tool: validation matrix ──────────────────────────────────────────
@@ -467,4 +515,587 @@ test("tool: a refusal keeps the turn pending for a retry", async () => {
   assert.equal(retry.isError, undefined, resultText(retry));
   assert.equal(settled.length, 1);
   assert.equal(state.pending, false);
+});
+
+// ── Live lifecycle seam and attempt guard (loop fix, step 1d/1e/1h) ──
+//
+// These drive the REAL extension through the fake Pi host. The loop state
+// lives in `index.ts`, so the faithful test is a booted extension: the
+// follow-up run boundary (`before_agent_start` carrying the revision prompt),
+// the retry after an errored attempt, and a non-final `agent_end`. The reported
+// session lost the revision turn exactly at that boundary and then reviewed a
+// stale snapshot on an errored attempt.
+
+const SEAM_PLAN = [
+  "# Plan: Seam",
+  "",
+  "## Steps",
+  "",
+  "1. Add the CSV writer",
+  "2. Add the route",
+  "",
+  "## Verification",
+  "",
+  "- Run the export test suite",
+  "",
+].join("\n");
+
+interface SeamBoot {
+  pi: ReturnType<typeof makeFakePi>;
+  ctx: any;
+  fake: ReturnType<typeof makeFakeCtx>;
+  capture: { prompts: string[] };
+  cwd: string;
+  planPath: string;
+  planText: string;
+  cleanup(): void;
+}
+
+/**
+ * Boot the real extension on a temp project in Plan mode with Review Mode on
+ * and a fake reviewer that submits one revise note (R1) per round.
+ */
+async function bootSeam(
+  over: { maxRevisions?: number } = {},
+): Promise<SeamBoot> {
+  const { root, cwd, agentDir } = tmpProject();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  fs.mkdirSync(path.join(cwd, ".pi", "plans"), { recursive: true });
+  fs.writeFileSync(
+    path.join(cwd, ".pi", "settings.json"),
+    JSON.stringify(
+      {
+        workflow: {
+          commitPolicy: { mode: "never" },
+          reviewMode: {
+            enabled: true,
+            rounds: 1,
+            passes: 1,
+            maxRevisions: over.maxRevisions ?? 3,
+            timeoutMs: 10_000,
+            providerRecovery: "off",
+            fallbackOnError: "skip",
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  const planPath = path.join(
+    cwd,
+    ".pi",
+    "plans",
+    `${getUtcDateTimePrefix()}-seam.md`,
+  );
+  fs.writeFileSync(planPath, SEAM_PLAN, "utf8");
+  const pi = makeFakePi({ activeTools: ["read", "write", "edit", "bash"] });
+  const { sdk, capture } = fakeSdk({
+    pass1: submitThenFinish("# Plan: seam"),
+  });
+  await workflowExtension(pi as never, {
+    loadSdk: async () => sdk as never,
+    selfExtensionPath: "/fake/index.ts",
+    plannotatorRequestTimeoutMs: 20,
+    plannotatorRecoveryTimeoutMs: 20,
+    isTerminalHost: () => true,
+  });
+  const fake = makeFakeCtx({ cwd, hasUI: false, idle: false });
+  await pi.emit("session_start", { reason: "startup" }, fake.ctx);
+  await pi.commands["workflow"].handler("", fake.ctx);
+  const cleanup = () => {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  };
+  return {
+    pi,
+    ctx: fake.ctx,
+    fake,
+    capture: capture as unknown as { prompts: string[] },
+    cwd,
+    planPath,
+    planText: SEAM_PLAN,
+    cleanup,
+  };
+}
+
+/** The Planner wrote the plan in Plan mode, then the run ended cleanly. */
+async function plannerWroteSeamPlan(booted: SeamBoot): Promise<void> {
+  await booted.pi.emit(
+    "tool_result",
+    { toolName: "write", isError: false, input: { path: booted.planPath } },
+    booted.ctx,
+  );
+  await endSeamRun(booted);
+}
+
+/** A clean, errored or empty-ended run. */
+async function endSeamRun(
+  booted: SeamBoot,
+  over: {
+    stopReason?: "error" | "aborted";
+    content?: Array<{ type: "text"; text: string }>;
+  } = {},
+): Promise<void> {
+  const message = over.stopReason
+    ? { role: "assistant", stopReason: over.stopReason, content: [] }
+    : {
+        role: "assistant",
+        content: over.content ?? [{ type: "text", text: booted.planText }],
+      };
+  await booted.pi.emit(
+    "agent_end",
+    { type: "agent_end", willRetry: false, messages: [message] },
+    booted.ctx,
+  );
+}
+
+/** Planner revision follow-ups sent to the plan agent (`sendUserMessage`). */
+function seamRevisionFollowUps(
+  booted: SeamBoot,
+): Array<{ content: unknown; options?: unknown }> {
+  return booted.pi.sent.filter(
+    (entry) =>
+      typeof entry.content === "string" &&
+      entry.content.includes("# Planner revision"),
+  );
+}
+
+/** Emulate the run that answers the last revision follow-up. */
+async function startSeamRevisionRun(booted: SeamBoot): Promise<void> {
+  const followUps = seamRevisionFollowUps(booted);
+  assert.ok(followUps.length > 0, "a Planner revision follow-up was sent");
+  const prompt = String(followUps[followUps.length - 1]!.content);
+  await booted.pi.emit(
+    "before_agent_start",
+    { type: "before_agent_start", messageType: "user", prompt },
+    booted.ctx,
+  );
+}
+
+/** The persisted `planRevision` block. */
+function seamRevisionState(booted: SeamBoot):
+  | {
+      round?: number;
+      pending?: boolean;
+      settled?: boolean;
+      noteIds?: string[];
+      responses?: unknown[];
+    }
+  | undefined {
+  const entry = [...booted.pi.entries]
+    .reverse()
+    .find((item) => item.type === "workflow");
+  return (entry?.data as { planRevision?: Record<string, unknown> } | undefined)
+    ?.planRevision as
+    | {
+        round?: number;
+        pending?: boolean;
+        settled?: boolean;
+        noteIds?: string[];
+        responses?: unknown[];
+      }
+    | undefined;
+}
+
+/** Handoff presentations (headless fallback message). */
+function seamHandoffs(booted: SeamBoot): unknown[] {
+  return booted.pi.sent.filter(
+    (entry) =>
+      (entry.content as { customType?: string } | null)?.customType ===
+      "workflow-handoff-fallback",
+  );
+}
+
+/** Entries of one extension type, in order. */
+function seamEntries(
+  booted: SeamBoot,
+  type: string,
+): Array<Record<string, unknown>> {
+  return booted.pi.entries
+    .filter((entry) => entry.type === type)
+    .map((entry) => (entry.data ?? {}) as Record<string, unknown>);
+}
+
+/** Run the Planner's `plan_revision_done` report through the real tool. */
+async function seamRevisionReport(
+  booted: SeamBoot,
+  responses: Array<{ id: string; status: string; reason?: string }>,
+): Promise<{ isError?: boolean; content: Array<{ text: string }> }> {
+  const tool = booted.pi.tools["plan_revision_done"];
+  assert.ok(tool, "plan_revision_done is registered");
+  return (await tool.execute(
+    "call-revision",
+    { responses },
+    undefined,
+    undefined,
+    {},
+  )) as { isError?: boolean; content: Array<{ text: string }> };
+}
+
+/** Change the plan BODY, keeping the Reviewer's appendix byte-identical. */
+function reviseSeamBody(
+  booted: SeamBoot,
+  addition = "3. Add the exporter",
+): void {
+  const live = fs.readFileSync(booted.planPath, "utf8");
+  const split = splitReviewerAppendix(live);
+  fs.writeFileSync(
+    booted.planPath,
+    `${split.body
+      .replace("2. Add the route", `2. Add the route\n${addition}`)
+      .trimEnd()}\n\n${split.appendix}`,
+    "utf8",
+  );
+}
+
+// ── (d) The lifecycle seam ───────────────────────────────────────────
+
+test("lifecycle seam: the revision prompt's run keeps round/pending and settles", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    assert.equal(seamRevisionFollowUps(booted).length, 1);
+    const opened = seamRevisionState(booted)!;
+    assert.equal(opened.round, 1, "revision 1 opened");
+    assert.equal(opened.pending, true);
+    assert.deepEqual(opened.noteIds, ["R1"]);
+
+    // The host starts the follow-up's run with the exact revision prompt. That
+    // is a continuation, not a new task: the turn must survive it.
+    await startSeamRevisionRun(booted);
+    const running = seamRevisionState(booted)!;
+    assert.equal(running.round, 1, "the budget survives the follow-up run");
+    assert.equal(running.pending, true, "the turn is still open");
+    assert.deepEqual(running.noteIds, ["R1"]);
+
+    // `plan_revision_done` works on every round: an all-rejected answer settles
+    // the turn (no body edit needed).
+    const settled = await seamRevisionReport(booted, [
+      {
+        id: "R1",
+        status: "rejected",
+        reason: "The route is registered in step 2.",
+      },
+    ]);
+    assert.equal(settled.isError, undefined, settled.content[0]?.text);
+    const after = seamRevisionState(booted)!;
+    assert.equal(after.round, 1);
+    assert.equal(after.pending, false, "the settle closed the turn");
+    assert.equal(after.settled, true);
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("lifecycle seam: a custom run does not reset the revision turn", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    assert.equal(seamRevisionState(booted)?.pending, true);
+
+    await booted.pi.emit(
+      "before_agent_start",
+      {
+        type: "before_agent_start",
+        messageType: "custom",
+        prompt: "**Plan Steps (2):**\n\n1. Add the route",
+      },
+      booted.ctx,
+    );
+
+    const after = seamRevisionState(booted)!;
+    assert.equal(after.round, 1, "a custom run is not a new task");
+    assert.equal(after.pending, true);
+    assert.deepEqual(after.noteIds, ["R1"]);
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("lifecycle seam: a genuine new task prompt resets the revision turn", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    assert.equal(seamRevisionState(booted)?.pending, true);
+
+    await booted.pi.emit(
+      "before_agent_start",
+      { type: "before_agent_start", messageType: "user", prompt: "new task" },
+      booted.ctx,
+    );
+
+    const after = seamRevisionState(booted)!;
+    assert.equal(after.round, 0, "a new task drops the spent round");
+    assert.equal(after.pending, false, "no stale pending revision");
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("lifecycle seam: an errored attempt + the same prompt again still settles", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    assert.equal(seamRevisionState(booted)?.round, 1);
+
+    // The provider errored mid-turn: the host retries the SAME follow-up.
+    await startSeamRevisionRun(booted);
+    await endSeamRun(booted, { stopReason: "error" });
+    const errored = seamRevisionState(booted)!;
+    assert.equal(errored.round, 1, "the retry keeps the budget");
+    assert.equal(errored.pending, true, "the turn is still open for the retry");
+
+    await startSeamRevisionRun(booted);
+    const retried = seamRevisionState(booted)!;
+    assert.equal(retried.round, 1);
+    assert.equal(retried.pending, true);
+
+    // The retried run applies the note (a body edit is required for
+    // `applied`) and settles the turn through the real tool.
+    reviseSeamBody(booted);
+    await booted.pi.emit(
+      "tool_result",
+      { toolName: "write", isError: false, input: { path: booted.planPath } },
+      booted.ctx,
+    );
+    const settled = await seamRevisionReport(booted, [
+      { id: "R1", status: "applied" },
+    ]);
+    assert.equal(settled.isError, undefined, settled.content[0]?.text);
+    const after = seamRevisionState(booted)!;
+    assert.equal(after.pending, false, "the retried turn settled");
+    assert.equal(after.settled, true);
+  } finally {
+    booted.cleanup();
+  }
+});
+
+// ── (e) The attempt guard ────────────────────────────────────────────
+
+test("attempt guard: an errored attempt runs no review, resolves no turn and hands off nothing", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    const promptsBefore = booted.capture.prompts.length;
+    const followUpsBefore = seamRevisionFollowUps(booted).length;
+
+    await startSeamRevisionRun(booted);
+    await endSeamRun(booted, { stopReason: "error" });
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore,
+      "no review on a non-final attempt",
+    );
+    assert.equal(
+      seamRevisionFollowUps(booted).length,
+      followUpsBefore,
+      "no revision resolution on a non-final attempt",
+    );
+    assert.deepEqual(
+      seamHandoffs(booted),
+      [],
+      "no handoff on a non-final attempt",
+    );
+    assert.deepEqual(booted.fake.customs, [], "no native modal either");
+    const state = seamRevisionState(booted)!;
+    assert.equal(state.pending, true, "the turn survives its errored attempt");
+    assert.equal(state.round, 1);
+
+    const skips = seamEntries(booted, "workflow-handoff-skip");
+    assert.equal(skips.length, 1, "the skipped attempt is audited");
+    // The entry records the stop reason (the field name is the producer's).
+    assert.match(JSON.stringify(skips[0]), /error/);
+    assert.ok(
+      booted.fake.notifies.some((notice) => /skip/i.test(notice.message)),
+      `expected a skip notice, saw: ${booted.fake.notifies
+        .map((notice) => notice.message)
+        .join(" | ")}`,
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("attempt guard: an aborted attempt is skipped the same way", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    const promptsBefore = booted.capture.prompts.length;
+
+    await startSeamRevisionRun(booted);
+    await endSeamRun(booted, { stopReason: "aborted" });
+
+    assert.equal(booted.capture.prompts.length, promptsBefore);
+    assert.deepEqual(seamHandoffs(booted), []);
+    assert.equal(seamRevisionState(booted)?.pending, true);
+    const skips = seamEntries(booted, "workflow-handoff-skip");
+    assert.equal(skips.length, 1);
+    assert.match(JSON.stringify(skips[0]), /aborted/);
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("attempt guard: an empty attempt that wrote no plan is skipped, then one clean run reviews", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    const promptsBefore = booted.capture.prompts.length;
+
+    await startSeamRevisionRun(booted);
+    await endSeamRun(booted, { content: [] });
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore,
+      "an empty attempt is skipped",
+    );
+    assert.deepEqual(seamHandoffs(booted), []);
+    assert.equal(seamEntries(booted, "workflow-handoff-skip").length, 1);
+    assert.equal(seamRevisionState(booted)?.pending, true);
+
+    // The retried attempt does the revision and ends clean: exactly one review.
+    await startSeamRevisionRun(booted);
+    reviseSeamBody(booted);
+    await booted.pi.emit(
+      "tool_result",
+      { toolName: "write", isError: false, input: { path: booted.planPath } },
+      booted.ctx,
+    );
+    const settled = await seamRevisionReport(booted, [
+      { id: "R1", status: "applied" },
+    ]);
+    assert.equal(settled.isError, undefined, settled.content[0]?.text);
+    await endSeamRun(booted);
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore + 1,
+      "the clean attempt reviewed exactly once",
+    );
+    assert.equal(
+      seamEntries(booted, "workflow-handoff-skip").length,
+      1,
+      "no new skip",
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("attempt guard: an empty attempt that DID write the plan is not dropped", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    const promptsBefore = booted.capture.prompts.length;
+
+    // The Planner wrote the revised body but produced no assistant text.
+    await startSeamRevisionRun(booted);
+    reviseSeamBody(booted);
+    await booted.pi.emit(
+      "tool_result",
+      { toolName: "write", isError: false, input: { path: booted.planPath } },
+      booted.ctx,
+    );
+    await endSeamRun(booted, { content: [] });
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore + 1,
+      "a run that wrote the plan is still reviewed",
+    );
+    assert.equal(
+      seamEntries(booted, "workflow-handoff-skip").length,
+      0,
+      "no skip notice for a productive run",
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+// ── (h2) The pending-turn guard ──────────────────────────────────────
+
+test("pending-turn guard: an agent_end before the revision run neither reviews nor hands off", async () => {
+  const booted = await bootSeam();
+  try {
+    await plannerWroteSeamPlan(booted);
+    const promptsBefore = booted.capture.prompts.length;
+    const followUpsBefore = seamRevisionFollowUps(booted).length;
+    assert.equal(seamRevisionState(booted)?.pending, true);
+    // Do NOT start the follow-up run: this `agent_end` is the leftover boundary
+    // of the run that sent the revision prompt.
+    await endSeamRun(booted);
+
+    assert.equal(
+      booted.capture.prompts.length,
+      promptsBefore,
+      "no review while the revision follow-up has not started",
+    );
+    assert.equal(
+      seamRevisionFollowUps(booted).length,
+      followUpsBefore,
+      "no revision resolution",
+    );
+    assert.deepEqual(
+      seamHandoffs(booted),
+      [],
+      "no handoff while a turn is pending",
+    );
+    assert.equal(
+      seamRevisionState(booted)?.pending,
+      true,
+      "the pending turn is left intact for its own run",
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+// ── (g) A requested revision is never silently downgraded ─────────────
+//
+// `beginPlannerRevision`'s mode/turn guards cannot be staged from the public
+// harness (the negotiation block only runs in Plan mode and ends the review
+// turn immediately before the call), so the contract the guard protects is
+// pinned where it is decidable: for every budget, a revise round with open
+// notes either opens one more revision or ends in the exhaustion handoff. It
+// never becomes a silent handoff.
+
+test("negotiation: open notes always spend a revision or exhaust, never a silent handoff", () => {
+  for (let maxRevisions = 1; maxRevisions <= 5; maxRevisions += 1) {
+    for (
+      let revisionsUsed = 0;
+      revisionsUsed <= maxRevisions;
+      revisionsUsed += 1
+    ) {
+      const decision = decidePlanRevision({
+        reviewOutcome: "rewritten",
+        verdict: "revise",
+        notes: NOTES,
+        revisionsUsed,
+        maxRevisions,
+      }) as unknown as {
+        request: boolean;
+        outcome: string;
+        handoff?: boolean;
+      };
+      const label = `${revisionsUsed}/${maxRevisions}`;
+      if (revisionsUsed < maxRevisions) {
+        assert.equal(decision.request, true, label);
+        assert.equal(decision.handoff, false, label);
+      } else {
+        assert.equal(decision.request, false, label);
+        assert.equal(decision.outcome, "exhausted", label);
+        assert.equal(decision.handoff, true, label);
+      }
+    }
+  }
 });

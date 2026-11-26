@@ -200,6 +200,224 @@ test("review_submit keeps supplied ids and renders findingIds", async () => {
   );
 });
 
+// ── Submission contract (Planner↔Reviewer loop fix, step 1a) ─────────
+//
+// The appendix grammar is `R<n>` only. A reviewer that invents `RV1` (the id
+// form observed in the reported session) must be refused at submission, not
+// silently rendered into a plan the parser then drops. Every refusal has to
+// happen BEFORE the write, so the plan file keeps the previous round's notes.
+
+function resultText(result: {
+  content?: Array<{ text: string }>;
+  isError?: boolean;
+}): string {
+  return (result.content ?? []).map((block) => block.text).join("\n");
+}
+
+async function submitRevisions(
+  tool: ReturnType<typeof makeSubmitTool>,
+  revisions: unknown[],
+): Promise<{
+  content?: Array<{ text: string }>;
+  isError?: boolean;
+}> {
+  return (await tool.execute(
+    "id",
+    {
+      findings: [FINDING],
+      verdict: "revise",
+      summary: "Required changes.",
+      revisions,
+    },
+    undefined,
+    undefined,
+    {},
+  )) as { content?: Array<{ text: string }>; isError?: boolean };
+}
+
+test("review_submit rejects a supplied id outside the R<n> form and writes nothing", async () => {
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "RV1", step: "2", change: "Register the route." },
+  ]);
+
+  assert.equal(result.isError, true, resultText(result));
+  // The error names the offending id and the field the reviewer must fix.
+  assert.match(resultText(result), /RV1/, "names the bad id");
+  assert.match(resultText(result), /revision/i, "names the revisions field");
+  assert.equal(writes.length, 0, "an inconsistent submission never writes");
+});
+
+test("review_submit accepts a re-review submission using R1..Rn including a reused id", async () => {
+  // Round 2 restates R1 and adds R2: numbering restarts per round, and an id
+  // reused from the previous round is legal by design.
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = createReviewSubmitTool({
+    planPath: () => ".pi/plans/x.md",
+    originalPlan: () => ORIGINAL_PLAN,
+    modelLabel: () => "reviewer/model",
+    round: () => 2,
+    submit: async (payload) => {
+      writes.push(payload);
+      return { ok: true };
+    },
+    log: () => {},
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "R1", step: "2", change: "Register the route." },
+    { id: "R2", change: "Add tests." },
+  ]);
+
+  assert.equal(result.isError, undefined, resultText(result));
+  assert.equal(writes.length, 1);
+  const written = writes[0]!.planText;
+  assert.match(written, /## Reviewer Revisions \(round 2\)/);
+  assert.deepEqual(parseReviewNotes(written).notes, [
+    { id: "R1", step: "2", change: "Register the route." },
+    { id: "R2", change: "Add tests." },
+  ]);
+});
+
+test("review_submit rejects duplicate supplied ids and writes nothing", async () => {
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "R1", step: "1", change: "Add the writer." },
+    { id: "R1", step: "2", change: "Register the route." },
+  ]);
+
+  assert.equal(result.isError, true, resultText(result));
+  assert.match(resultText(result), /R1/, "names the duplicated id");
+  assert.match(resultText(result), /duplicate/i);
+  assert.equal(writes.length, 0, "a duplicate-id submission never writes");
+});
+
+test("review_submit rejects a change that breaks the bullet grammar", async () => {
+  // Each of these keeps the ids but changes the note the parser reads back:
+  // a multi-line change injects a bullet, a trailing `_(F1)_` is stripped as a
+  // findings fragment, and a leading `**` is split as an id. All three are
+  // renderer/parser drift and must be refused with an error naming `change`.
+  for (const change of [
+    "Register the route.\n- **R2:** Injected second note.",
+    "Register the route. _(F1)_",
+    "**Register** the route.",
+  ]) {
+    const writes: ReviewSubmitPayload[] = [];
+    const tool = makeSubmitTool(async (payload) => {
+      writes.push(payload);
+    });
+
+    const result = await submitRevisions(tool, [
+      { id: "R1", step: "2", change },
+    ]);
+
+    assert.equal(result.isError, true, JSON.stringify(change));
+    assert.match(resultText(result), /change/, JSON.stringify(change));
+    assert.equal(writes.length, 0, JSON.stringify(change));
+  }
+});
+
+test("review_submit refuses a `step` the appendix parser would reshape", async () => {
+  // The bullet head is `**R1 · Step <step>:**`, so a step that fights it is
+  // silently rewritten (`2**` reads back as `2`) or hides the note entirely (a
+  // line break ends the bullet and the note disappears). Both are drift: the
+  // guard names the note index and field, shows both sides, and writes nothing.
+  const cases: Array<[string, RegExp]> = [
+    ["2**", /note 1 `step` reads back as "2" but the submission says "2\*\*"/],
+    ["2\n3", /note 1 \(R1\) is missing from the appendix/],
+  ];
+  for (const [step, pattern] of cases) {
+    const writes: ReviewSubmitPayload[] = [];
+    const tool = makeSubmitTool(async (payload) => {
+      writes.push(payload);
+    });
+
+    const result = await submitRevisions(tool, [
+      { id: "R1", step, change: "Register the route." },
+    ]);
+
+    assert.equal(result.isError, true, JSON.stringify(step));
+    assert.match(resultText(result), /does not round-trip/, JSON.stringify(step));
+    assert.match(resultText(result), pattern, JSON.stringify(step));
+    // Both sides are shown so the reviewer can correct the submission.
+    assert.match(resultText(result), /\nexpected: +\[/, JSON.stringify(step));
+    assert.match(resultText(result), /\nparsed: +\[/, JSON.stringify(step));
+    assert.equal(writes.length, 0, "a drifting step never writes");
+  }
+});
+
+test("review_submit refuses findingIds the appendix would split", async () => {
+  // `_(F1,F2)_` reads back as two ids, so the note the Planner receives differs
+  // from the note the reviewer submitted.
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "R1", change: "Add tests.", findingIds: ["F1,F2"] },
+  ]);
+
+  assert.equal(result.isError, true, resultText(result));
+  assert.match(
+    resultText(result),
+    /note 1 `findingIds` reads back as \["F1","F2"\] but the submission says \["F1,F2"\]/,
+  );
+  assert.equal(writes.length, 0, "drifting findingIds never write");
+});
+
+test("review_submit accepts a note with no step and no findingIds", async () => {
+  // Absent optionals are normalised on both sides: a minimal note must not be
+  // refused just because the parser has nothing to fill in.
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "R1", change: "Do the thing." },
+    { change: "Do the other thing." },
+  ]);
+
+  assert.equal(result.isError, undefined, resultText(result));
+  assert.equal(writes.length, 1);
+  assert.deepEqual(parseReviewNotes(writes[0]!.planText).notes, [
+    { id: "R1", change: "Do the thing." },
+    { id: "R2", change: "Do the other thing." },
+  ]);
+});
+
+test("review_submit round-trips the full note shape for a valid submission", async () => {
+  const writes: ReviewSubmitPayload[] = [];
+  const tool = makeSubmitTool(async (payload) => {
+    writes.push(payload);
+  });
+
+  const result = await submitRevisions(tool, [
+    { id: "R1", step: "2", change: "Register the route." },
+    { id: "R2", change: "Add tests.", findingIds: ["F1", "F3"] },
+    { step: "3", change: "Document the endpoint." },
+  ]);
+
+  assert.equal(result.isError, undefined, resultText(result));
+  assert.equal(writes.length, 1);
+  // Field by field, in submission order: `id`, `step`, `change`,
+  // `findingIds`. The omitted id was assigned R3.
+  assert.deepEqual(parseReviewNotes(writes[0]!.planText).notes, [
+    { id: "R1", step: "2", change: "Register the route." },
+    { id: "R2", change: "Add tests.", findingIds: ["F1", "F3"] },
+    { id: "R3", step: "3", change: "Document the endpoint." },
+  ]);
+});
+
 test("the advisory line sits immediately under the Reviewer Revisions heading", async () => {
   const writes: ReviewSubmitPayload[] = [];
   const tool = makeSubmitTool(async (payload) => {

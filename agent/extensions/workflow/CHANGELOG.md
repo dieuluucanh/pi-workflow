@@ -1,3 +1,72 @@
+## [0.17.1] - 2026-11-26
+
+This release fixes the Planner↔Reviewer revision loop introduced in `0.17.0`
+(version bumped, not published). The loop existed but could stall, hand off a
+plan the reviewer had refused, or silently lose the reviewer's notes; the
+contract below is now enforced by the harness instead of trusted.
+
+### Fixed — Planner↔Reviewer revision loop
+
+- **Note ids are strict per-round `R<n>`.** Numbering restarts at `R1` in every
+  review round, so a restated note may reuse its previous id, and omitted ids
+  are still assigned `R1..Rn` in submission order (`R01` canonicalises to
+  `R1`). Any other supplied form (`RV1`, `F1`, `1`, a blank) and a duplicate id
+  inside one submission are rejected by `review_submit` with the offending
+  entries named. The rendered `## Reviewer Revisions` appendix is parsed back
+  and compared field by field (`id`/`step`/`change`/`findingIds`, in order)
+  with the submission, so a note that would not survive the one-bullet grammar
+  is refused **before** anything is written rather than silently dropped or
+  reshaped.
+- **`notes-unparsed` is a fail-closed outcome.** A `revise`/`block` round that
+  submitted required changes which parse to zero notes is neither revisable nor
+  approvable: the Planner gets no revision turn, the plan is **not handed off**,
+  and the notice names the submitted-versus-parsed counts so the refusal is
+  actionable. `ReviewNegotiationDecision` gained `handoff`, which is false for
+  `continue` and `notes-unparsed` and true for every terminal outcome
+  (`converged`, `exhausted`, `no-revision`, `review-failed`).
+- **The revision-turn lifecycle is tracked, not guessed.** A revision turn is
+  recorded before its follow-up is delivered and resolved exactly once by the
+  run that owns it; a pending turn that has not started blocks the leftover
+  `agent_end` from resolving, reviewing or handing off a stale snapshot, a
+  custom (todo/follow-up) run does not reset the turn, and a genuine new task
+  does. The decision is made from the round's result snapshot, never from the
+  mutable review-state closure, and a revise round can no longer fall through
+  to a silent handoff when the turn cannot be opened.
+- **A no-op revision gets one corrective turn.** A Planner turn that changes
+  nothing is not a revision and not a verdict: while the budget allows it, the
+  same notes earn one corrective turn whose prompt says the previous turn
+  changed nothing (no handoff, no re-review); once the budget is spent the
+  handoff carries the `exhausted` non-convergence line.
+- **Every revision turn opens a fresh review cycle.** The re-review is round 1
+  of its own cycle, so `rounds` stays a within-cycle cap and can never cut a
+  revision short; the previous session-wide counter (and any `keepRound`/
+  `loopReReview` bypass to work around it) is gone. A manual `/review` also
+  starts at round 1 of a new cycle instead of being refused as round 2.
+- **Every decision is audited.** Each negotiation decision writes one
+  `workflow-review-negotiation` entry (`outcome`, `request`, `handoff`, round,
+  budget, parsed notes, submitted changes, verdict, reason) from the round
+  snapshot it decided from, on both the automatic post-Plan path and manual
+  `/review`, so converged, exhausted, no-revision, review-failed and
+  notes-unparsed decisions all leave a trace.
+- **The attempt guard stops a non-final retry from ending the loop.** A
+  non-final (retried/truncated) run is skipped and audited: it may not resolve
+  the revision turn, review or hand off while the retried run owns the plan,
+  and the skip notice is shown once per distinct attempt.
+- New/updated tests: `review-notes.test.ts` (id grammar and round-trip),
+  `plan-revision.test.ts` (lifecycle seam, attempt guard, corrective turn),
+  `review-negotiation.test.ts` (decision matrix, fail-closed handoff, audit,
+  per-revision cycle) and `notify-scope.test.ts`.
+
+### Changed — docs and package manifest
+
+- `README.md` documents the strict per-round `R<n>` ids, `notes-unparsed`, the
+  corrective no-op turn, `rounds` (within-cycle cap) versus `maxRevisions` (the
+  loop budget), the handoff decision, the audit entry and the attempt guard, plus
+  the fact that each revision turn starts a fresh review cycle.
+- `package.json` is `0.17.1` and `files[]` now ships `plan-revision.ts` and
+  `review-negotiation.ts`, which `index.ts` imports but earlier tarballs did not
+  include.
+
 ## [0.17.0] - 2026-11-26
 
 This release is **cut by the 2026-11-26 review-note/step-count plan** (version
