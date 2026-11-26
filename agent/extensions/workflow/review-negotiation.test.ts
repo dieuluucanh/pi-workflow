@@ -553,6 +553,78 @@ async function endRun(booted: LoopBoot): Promise<void> {
   );
 }
 
+/** Run the real `workflow_todo` tool through the fake host. */
+async function callTodo(
+  booted: LoopBoot,
+  params: Record<string, unknown>,
+): Promise<{
+  text: string;
+  isError?: boolean;
+  details: Record<string, any>;
+}> {
+  const tool = booted.pi.tools["workflow_todo"];
+  assert.ok(tool, "workflow_todo is registered");
+  const result = (await tool.execute(
+    `call-todo-${String(params.action ?? "list")}`,
+    params,
+    undefined,
+    undefined,
+    booted.ctx,
+  )) as {
+    isError?: boolean;
+    content: Array<{ type?: string; text?: string }>;
+    details?: Record<string, any>;
+  };
+  return {
+    isError: result.isError,
+    text: (result.content ?? [])
+      .map((block) => (block?.type === "text" ? String(block.text ?? "") : ""))
+      .join("\n"),
+    details: result.details ?? {},
+  };
+}
+
+/** Text the tool_result handlers appended to the result payloads. */
+function resultText(results: unknown[]): string {
+  return results
+    .flatMap((result) => {
+      const content = (result as { content?: Array<{ type?: string; text?: unknown }> })
+        ?.content;
+      return Array.isArray(content) ? content : [];
+    })
+    .map((block) => (block?.type === "text" ? String(block.text ?? "") : ""))
+    .join("\n");
+}
+
+/** Messages returned by a `context` handler result. */
+function contextMessages(results: unknown[]): any[] {
+  return results.flatMap((result) => {
+    const messages = (result as { messages?: unknown })?.messages;
+    return Array.isArray(messages) ? messages : [];
+  });
+}
+
+/** An assistant message payload for `turn_end`. */
+function assistantTurn(text: string): Record<string, unknown> {
+  return {
+    message: { role: "assistant", content: [{ type: "text", text }] },
+    toolResults: [],
+  };
+}
+
+/**
+ * Switch to Build, seed one execution row, and return to Plan.
+ *
+ * Plan/Review never owns execution state, so a live list can only be seeded
+ * through the execution phase — exactly the path the leak needed.
+ */
+async function seedExecutionTodo(booted: LoopBoot, text: string): Promise<void> {
+  await booted.pi.commands.build.handler("", booted.ctx);
+  const added = await callTodo(booted, { action: "add", text });
+  assert.equal(added.isError, undefined, `the Build add succeeds: ${added.text}`);
+  await booted.pi.commands.plan.handler("", booted.ctx);
+}
+
 /** Planner revision follow-ups sent to the plan agent (`sendUserMessage`). */
 function revisionFollowUps(booted: LoopBoot): Array<{ content: unknown; options?: unknown }> {
   return booted.pi.sent.filter(
@@ -683,6 +755,110 @@ test("loop seam: a revise round sends one Planner follow-up and no handoff", asy
     assert.deepEqual(
       (revisionEntry!.data as { noteIds?: string[] }).noteIds,
       ["R1"],
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop seam: a revision turn sends exactly one follow-up and no todo-list message", async () => {
+  const booted = await bootLoop();
+  try {
+    await plannerWrotePlan(booted);
+    // Regression: a custom follow-up starts its own run before the prompt
+    // arrives, so a second display message (the rendered plan todo list) landed
+    // in that run instead of the revision prompt. Exactly ONE send is allowed.
+    assert.equal(
+      booted.pi.sent.length,
+      1,
+      `exactly one send on the revision turn, got ${JSON.stringify(booted.pi.sent)}`,
+    );
+    const sent = booted.pi.sent[0]!;
+    assert.equal(typeof sent.content, "string", "the send is the revision prompt");
+    assert.match(String(sent.content), /# Planner revision/);
+    assert.equal(
+      (sent.options as { deliverAs?: string } | undefined)?.deliverAs,
+      "followUp",
+      "the single follow-up is delivered as a followUp",
+    );
+    const serialized = JSON.stringify(booted.pi.sent);
+    assert.doesNotMatch(serialized, /Plan Steps/, "no plan-steps display message");
+    assert.doesNotMatch(
+      serialized,
+      /workflow-todo-list/,
+      "no todo-list custom message",
+    );
+    // The placeholder is NOT synthesized during Plan: execution TODOs become
+    // live only at the Build kickoff (`seedExecutionTodoOnBuild`).
+    assert.deepEqual(
+      workflowState(booted).todos ?? [],
+      [],
+      "a Plan-mode handoff creates no execution row",
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("loop seam: the Build kickoff seeds the execution row, Plan never does", async () => {
+  // `bootLoop`'s default reviewer always revises, so an approve-only script is
+  // required to reach the handoff decision that Build can be started from.
+  const reviewer = scriptedReviewer([
+    async (capture) => {
+      await submitReviewRound(capture, { verdict: "approve", findings: [] });
+    },
+  ]);
+  const booted = await bootLoop({ reviewer: reviewer.pass1 });
+  try {
+    await plannerWrotePlan(booted);
+    const handoff = handoffs(booted)[0] as
+      | { content?: { content?: unknown } }
+      | undefined;
+    assert.ok(handoff, "the approved plan is handed off");
+    const handoffText = String(handoff.content?.content ?? "");
+    const decisionId = handoffText.match(/\/handoff approve (\S+)/)?.[1];
+    assert.ok(
+      decisionId,
+      `the fallback names the decision id, got: ${handoffText}`,
+    );
+    // The placeholder is no longer synthesized during Plan.
+    assert.deepEqual(
+      workflowState(booted).todos ?? [],
+      [],
+      "Plan mode creates no execution row",
+    );
+
+    await booted.pi.commands.handoff.handler(`approve ${decisionId}`, booted.ctx);
+    booted.fake.setIdle(true);
+    await booted.pi.commands.handoff.handler(
+      `execute ${decisionId} build`,
+      booted.ctx,
+    );
+
+    const executeMessages = booted.pi.sent.filter(
+      (entry) =>
+        (entry.content as { customType?: string } | null)?.customType ===
+        "workflow-plan-execute",
+    );
+    // The approve → execute route can queue more than one kickoff (the route
+    // enters Build and then sends the execute messages); the seed must stay
+    // idempotent instead of adding a row per kickoff.
+    assert.ok(
+      executeMessages.length >= 1,
+      `approve → execute sends the Build kickoff, got ${JSON.stringify(
+        booted.pi.sent.map((entry) => entry.content),
+      )}`,
+    );
+    const seeded = ((workflowState(booted).todos ?? []) as Array<{
+      source?: string;
+      text?: string;
+    }>).filter((item) => item.source === "synthesized");
+    assert.equal(
+      seeded.length,
+      1,
+      `the Build kickoff seeds exactly one execution row, got ${JSON.stringify(
+        workflowState(booted).todos,
+      )}`,
     );
   } finally {
     booted.cleanup();
@@ -1839,6 +2015,220 @@ test("loop e2e: an unreadable revise submission never hands off", async () => {
       ),
       `expected an idle review turn, saw: ${booted.fake.notifies
         .map((n) => n.message)
+        .join(" | ")}`,
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+// ── Execution TODOs are live only in Build ───────────────────────────
+
+test("todo isolation: Plan mode has no footer, no reminder and no [DONE] completion", async () => {
+  const booted = await bootLoop();
+  try {
+    await seedExecutionTodo(booted, "Ship the route");
+
+    // 1. A plan edit is not a work item: the passive footer is never appended.
+    const editResults = await booted.pi.emit(
+      "tool_result",
+      {
+        toolName: "edit",
+        isError: false,
+        input: { path: path.join(booted.cwd, ".pi", "plans", "notes.md") },
+      },
+      booted.ctx,
+    );
+    assert.ok(editResults.length > 0, "the tool_result handlers ran");
+    assert.doesNotMatch(
+      resultText(editResults),
+      /\[TODO /,
+      "a Plan-mode plan edit earns no TODO footer",
+    );
+
+    // 2. The reminder cadence cannot append a context block in Plan mode.
+    for (let i = 0; i < 3; i++) {
+      await booted.pi.emit("turn_end", assistantTurn(`turn ${i}`), booted.ctx);
+    }
+    const contextResults = await booted.pi.emit(
+      "context",
+      { messages: [] },
+      booted.ctx,
+    );
+    const messages = contextMessages(contextResults);
+    assert.equal(
+      messages.some((message) => message?.customType === "workflow-todo-context"),
+      false,
+      "no execution reminder in Plan mode",
+    );
+
+    // 3. `[DONE:1]` is inert: the row stays pending.
+    await booted.pi.emit(
+      "turn_end",
+      assistantTurn("Finished [DONE:1]"),
+      booted.ctx,
+    );
+    const list = await callTodo(booted, { action: "list" });
+    const rows = (list.details.todos ?? []) as Array<{
+      completed?: boolean;
+      status?: string;
+    }>;
+    assert.equal(rows.length, 1, "the seeded row is still listed");
+    assert.notEqual(rows[0]!.completed, true, "Plan mode never completes a row");
+    assert.notEqual(rows[0]!.status, "completed", "the row is still pending");
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("todo isolation: workflow_todo is read-only in Plan mode", async () => {
+  const booted = await bootLoop();
+  try {
+    await seedExecutionTodo(booted, "Ship the route");
+
+    // Every mutation is refused; the refusal names the mode and the real path.
+    const refused = await callTodo(booted, { action: "done", step: 1 });
+    assert.equal(refused.isError, true, "Plan mode refuses done");
+    assert.equal(refused.details.error, "plan-mode-read-only");
+    assert.match(refused.text, /read-only/i);
+    assert.match(refused.text, /Plan mode/);
+    assert.match(refused.text, /Build kickoff/);
+    assert.match(refused.text, /plan_revision_done/);
+
+    // The refusal changed nothing: the row is still pending.
+    const listed = await callTodo(booted, { action: "list" });
+    assert.equal(listed.isError, undefined, "Plan mode still lists");
+    assert.match(
+      listed.text,
+      /Plan mode — execution steps are not started\./,
+      "the Plan-mode list says execution has not started",
+    );
+    const rows = listed.details.todos as Array<{
+      completed?: boolean;
+      status?: string;
+    }>;
+    assert.equal(rows.length, 1, "the seeded row is still listed");
+    assert.notEqual(rows[0]!.completed, true, "the refused done left it pending");
+    assert.notEqual(rows[0]!.status, "completed", "the row is still pending");
+
+    // Build is the execution phase, so the same mutation now succeeds.
+    await booted.pi.commands.build.handler("", booted.ctx);
+    const completed = await callTodo(booted, { action: "done", step: 1 });
+    assert.equal(
+      completed.isError,
+      undefined,
+      `the Build done succeeds: ${completed.text}`,
+    );
+    const buildRows = completed.details.todos as Array<{ status?: string }>;
+    assert.equal(buildRows[0]!.status, "completed", "Build completes the row");
+    const buildList = await callTodo(booted, { action: "list" });
+    assert.doesNotMatch(
+      buildList.text,
+      /execution steps are not started/,
+      "Build has no Plan-mode list note",
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("todo isolation: an armed Build mutation never warns after a Plan-mode write", async () => {
+  const booted = await bootLoop();
+  try {
+    await booted.pi.commands.build.handler("", booted.ctx);
+    await callTodo(booted, { action: "add", text: "Ship the route" });
+    // The Build footer arms `mutatedSinceLastTodoWrite`.
+    const buildResults = await booted.pi.emit(
+      "tool_result",
+      {
+        toolName: "edit",
+        isError: false,
+        input: { path: path.join(booted.cwd, "src", "route.ts") },
+      },
+      booted.ctx,
+    );
+    assert.match(
+      resultText(buildResults),
+      /\[TODO /,
+      "the Build footer arms the stale-warning flag",
+    );
+
+    await booted.pi.commands.plan.handler("", booted.ctx);
+    // Required, not decorative: this sets planWrittenThisRun /
+    // planWrittenInPlanModeThisRun so `agent_end` reaches the stale-warning
+    // block instead of returning at the per-run handoff gate. The Plan-gated
+    // footer leaves `mutatedSinceLastTodoWrite` armed, so the warning is
+    // reachable — the mode guard is the only thing that suppresses it.
+    await booted.pi.emit(
+      "tool_result",
+      { toolName: "write", isError: false, input: { path: booted.planPath } },
+      booted.ctx,
+    );
+    await endRun(booted);
+    assert.equal(
+      booted.fake.notifies.some((notice) =>
+        notice.message.includes("Todo list not updated this run"),
+      ),
+      false,
+      `no Plan-mode stale warning, got: ${booted.fake.notifies
+        .map((notice) => notice.message)
+        .join(" | ")}`,
+    );
+  } finally {
+    booted.cleanup();
+  }
+});
+
+test("todo isolation: Build keeps the footer, reminder and stale warning", async () => {
+  const booted = await bootLoop();
+  try {
+    await booted.pi.commands.build.handler("", booted.ctx);
+    await callTodo(booted, { action: "add", text: "Ship the route" });
+
+    // The execution phase still surfaces the footer on a real source edit.
+    const editResults = await booted.pi.emit(
+      "tool_result",
+      {
+        toolName: "edit",
+        isError: false,
+        input: { path: path.join(booted.cwd, "src", "route.ts") },
+      },
+      booted.ctx,
+    );
+    assert.match(resultText(editResults), /\[TODO /, "Build keeps the footer");
+
+    for (let i = 0; i < 3; i++) {
+      await booted.pi.emit("turn_end", assistantTurn(`turn ${i}`), booted.ctx);
+    }
+    const contextResults = await booted.pi.emit(
+      "context",
+      { messages: [] },
+      booted.ctx,
+    );
+    assert.ok(
+      contextMessages(contextResults).some(
+        (message) => message?.customType === "workflow-todo-context",
+      ),
+      "Build keeps the throttled execution reminder",
+    );
+
+    await booted.pi.emit(
+      "agent_end",
+      {
+        type: "agent_end",
+        willRetry: false,
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "Working" }] },
+        ],
+      },
+      booted.ctx,
+    );
+    assert.ok(
+      booted.fake.notifies.some((notice) =>
+        notice.message.includes("Todo list not updated this run"),
+      ),
+      `Build warns about the stale list, got: ${booted.fake.notifies
+        .map((notice) => notice.message)
         .join(" | ")}`,
     );
   } finally {

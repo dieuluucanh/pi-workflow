@@ -314,6 +314,19 @@ test("todoPanelSummary exact one-line forms", () => {
     todoPanelSummary(open, { stale: true }),
     "☐ Todos 1/3 ⚠ · next 2. B · /todos expand",
   );
+  const planned = items([
+    { text: "A", completed: true },
+    { text: "B", completed: true },
+    { text: "C" },
+    { text: "D" },
+    { text: "E" },
+  ]);
+  const plannedSummary = todoPanelSummary(planned, { planned: true });
+  assert.equal(
+    plannedSummary,
+    "☐ Todos 2/5 · planned · not executing · /todos expand",
+  );
+  assert.doesNotMatch(plannedSummary, /not started/);
   assert.equal(todoPanelSummary([]), "");
 });
 
@@ -357,7 +370,18 @@ test("buildTodoRows renders cancelled items and muted plan rows", () => {
     { text: "Two", status: "cancelled" },
   ]);
   const rows = buildTodoRows(plainTheme, 80, list, "plan");
-  assert.deepEqual(rows, ["▶ 1. One", "✖ 2. Two"]);
+  assert.deepEqual(rows, ["☐ 1. One", "✖ 2. Two"]);
+});
+
+test("buildTodoRows never shows the execution marker in Plan mode", () => {
+  const list = items([
+    { text: "One", completed: true },
+    { text: "Two", status: "in_progress" },
+    { text: "Three" },
+  ]);
+  const rows = buildTodoRows(plainTheme, 80, list, "plan");
+  assert.deepEqual(rows, ["☐ 2. Two", "☐ 3. Three"]);
+  assert.ok(rows.every((row) => !row.includes("▶")), rows.join(" | "));
 });
 
 test("buildTodoRows caps the window and appends +N more", () => {
@@ -393,6 +417,22 @@ test("buildTodoRows keeps the completed-list fallback anchored at the top", () =
   ]);
   const rows = buildTodoRows(plainTheme, 80, list, "build");
   assert.deepEqual(rows, ["☑ S(1. One)", "☑ S(2. Two)"]);
+});
+
+test("deriveTodoPanel: Plan mode renders a preview without a next step", () => {
+  const list = items([
+    { text: "A", completed: true },
+    { text: "B" },
+    { text: "C" },
+  ]);
+  const plan = deriveTodoPanel({ items: list, mode: "plan" });
+  assert.equal(plan.next, undefined);
+  assert.equal(
+    plan.summary,
+    "☐ Todos 1/3 · planned · not executing · /todos expand",
+  );
+  const build = deriveTodoPanel({ items: list, mode: "build" });
+  assert.equal(build.next?.text, "B");
 });
 
 test("deriveTodoPanel: a same-scope preference survives list edits", () => {

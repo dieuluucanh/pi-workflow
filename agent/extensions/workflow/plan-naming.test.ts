@@ -567,6 +567,42 @@ test("plan prompt: teaches the UTC date-time prefix, not the legacy shape", asyn
     assert.doesNotMatch(content, /\.pi\/plans\/<date>-<slug>\.md/);
     assert.doesNotMatch(content, /date -u \+%F\b/);
     assert.match(content, /reuse that exact path/);
+    // Execution TODOs are Build state: Plan mode must not be told to drive the
+    // list. It only learns that the list is read-only here.
+    assert.match(content, /execution TODOs are created by the Build kickoff/i);
+    assert.match(content, /workflow_todo is read-only here \(list only\)/);
+    assert.doesNotMatch(content, /mark a step completed IMMEDIATELY/);
+    assert.doesNotMatch(content, /when this plan is approved, its steps become/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("plan prompt: the review note keeps the revision turn planning-only", async () => {
+  // The note only exists when a reviewer is enabled, so this test opts in.
+  const { pi, ctx, cleanup } = await bootExtension({
+    workflow: { reviewMode: { enabled: true } },
+  });
+  try {
+    await pi.commands.plan.handler("", ctx);
+    const results = await pi.emit(
+      "before_agent_start",
+      { messageType: "user" },
+      ctx,
+    );
+    const planContext = results
+      .map((result: any) => result?.message)
+      .find((message: any) => message?.customType === "workflow-plan-context");
+    assert.ok(planContext, "Plan mode injects its context");
+    const content = String(planContext.content);
+    assert.match(content, /\[REVIEW MODE ACTIVE\]/);
+    // A revision turn edits the plan body: it is not an execution turn and
+    // must not touch the execution TODO list.
+    assert.match(
+      content,
+      /revision turn edits the plan body: it never executes the plan/,
+    );
+    assert.match(content, /never touches the execution TODO list/);
   } finally {
     await cleanup();
   }

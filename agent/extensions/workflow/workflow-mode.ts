@@ -172,6 +172,25 @@ export function roleForMode(mode: WorkflowMode): ModeRole {
   return null;
 }
 
+/**
+ * Invariant: TODO rows are EXECUTION state, and they are live only outside
+ * Plan mode.
+ *
+ * Plan mode, every review round, every Planner revision turn and every pending
+ * handoff are plan-editing phases. In those phases no execution prompt is
+ * delivered, no `[TODO …]` footer decorates a tool result, no TODO context
+ * reminder is injected, `[DONE:n]` does not complete a step, no stale-list
+ * warning fires and no step is auto-committed. Build (and every mode that can
+ * execute: Orchestrator and Default) is the execution phase.
+ *
+ * This is the single predicate for that decision: call sites must ask it
+ * instead of comparing against `"plan"` again, so changing the execution-phase
+ * boundary stays one edit.
+ */
+export function todoExecutionLive(mode: WorkflowMode): boolean {
+  return mode !== "plan";
+}
+
 /** Footer/status label for a mode, independent of a host's theme. */
 export function modeLabel(mode: WorkflowMode): string {
   if (mode === "plan") return "plan";

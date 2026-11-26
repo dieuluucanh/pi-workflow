@@ -25,6 +25,7 @@ import {
   planModeTools,
   orchestratorModeTools,
   roleForMode,
+  todoExecutionLive,
   type WorkflowMode,
 } from "./workflow-mode.ts";
 
@@ -160,6 +161,27 @@ test("role and label: each mode names one semantic role", () => {
   assert.equal(isWorkflowMode("orchestrator"), true);
   assert.equal(roleForMode("orchestrator"), "orchestrator");
   assert.equal(modeLabel("orchestrator"), "orchestrator");
+});
+
+test("execution phase: TODO rows are live only outside Plan", () => {
+  // TODO rows are execution state. Plan mode (and the review rounds, revision
+  // turns and pending handoffs it hosts) is a plan-editing phase, so every
+  // execution affordance must be off there. Build, Orchestrator and Default
+  // (null = workflow off) can execute, so the list is live in all three.
+  const table: ReadonlyArray<readonly [WorkflowMode, boolean]> = [
+    ["plan", false],
+    ["build", true],
+    ["orchestrator", true],
+    [null, true],
+  ];
+  for (const [mode, expected] of table) {
+    assert.equal(todoExecutionLive(mode), expected, `mode ${String(mode)}`);
+  }
+  // The predicate is exactly the Plan-mode exclusion: every other mode in the
+  // Tab ring is an execution phase.
+  for (const mode of MODE_CYCLE_ORDER) {
+    assert.equal(todoExecutionLive(mode), mode !== "plan");
+  }
 });
 
 test("cycle: Orchestrator is a full member of the ordinary ring", () => {

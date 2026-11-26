@@ -48,6 +48,8 @@ export interface TodoPanelInput {
   promptAfterSettle?: boolean;
   /** Drives the ⚠ marker in the summary; the footer owns the actual warning. */
   stale?: boolean;
+  /** Current workflow mode; Plan mode renders the list as a plan preview. */
+  mode?: TodoPanelMode;
 }
 
 export interface TodoPanelView {
@@ -146,8 +148,9 @@ export function isTodoListSettled(items: TodoItem[]): boolean {
 }
 
 /**
- * Derive the panel state. Mode is intentionally not an input: it only affects
- * row styling, not whether the panel is expanded, collapsed or hidden.
+ * Derive the panel state. `mode` only marks Plan mode as a plan preview: the
+ * state itself is unchanged, but a planned list has no execution `next` step
+ * and summarises as planned rather than in progress.
  *
  * Precedence:
  * 1. empty list → hidden;
@@ -194,8 +197,11 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
     total: items.length,
     cancelled: countCancelled(items),
     stale: input.stale === true,
-    next: firstOpenItem(items),
-    summary: todoPanelSummary(items, { stale: input.stale }),
+    next: input.mode === "plan" ? undefined : firstOpenItem(items),
+    summary: todoPanelSummary(items, {
+      stale: input.stale,
+      planned: input.mode === "plan",
+    }),
   };
 }
 
@@ -234,7 +240,7 @@ export function todoStatusText(view: TodoPanelView): string {
  */
 export function todoPanelSummary(
   items: TodoItem[],
-  opts: { stale?: boolean } = {},
+  opts: { stale?: boolean; planned?: boolean } = {},
 ): string {
   if (items.length === 0) return "";
   const done = countDone(items);
@@ -248,6 +254,9 @@ export function todoPanelSummary(
   }
   const stale = opts.stale ? " ⚠" : "";
   const head = `☐ Todos ${done}/${total}${stale}`;
+  if (opts.planned) {
+    return `${head} · planned · not executing · /todos expand`;
+  }
   const next = firstOpenItem(items);
   return next
     ? `${head} · next ${todoRef(next)}. ${next.text} · /todos expand`
@@ -314,9 +323,10 @@ export function buildTodoRows(
     const item = row.item as TodoItem;
     const ref = todoLabel(item, row.index);
     const status = itemStatus(item);
-    const isCurrent = row.index === anchorIndex && !isDone(item);
+    const isCurrent =
+      mode !== "plan" && row.index === anchorIndex && !isDone(item);
     const prefix =
-      isCurrent || status === "in_progress"
+      mode !== "plan" && (isCurrent || status === "in_progress")
         ? theme.fg("accent", "▶ ")
         : status === "completed"
           ? theme.fg("success", "☑ ")

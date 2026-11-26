@@ -148,8 +148,15 @@ test("prompt: names the plan, the round and the ownership rules", () => {
   assert.ok(prompt.includes("Answer every note exactly once"), prompt);
   assert.ok(/`rejected` and `not_applicable` require a concrete reason/.test(prompt), prompt);
   assert.ok(prompt.includes(PLAN_REVISION_TOOL_NAME), prompt);
-  // The TODO list reminder.
+  // A planning turn, not an execution one.
+  assert.match(prompt, /not implementation/);
+  // The execution TODO list belongs to the Build kickoff; Plan mode cannot
+  // mutate it. The rule still names the tool, so that assertion stays.
+  assert.match(prompt, /Leave the execution TODO list untouched/);
   assert.ok(prompt.includes("workflow_todo"), prompt);
+  assert.ok(!prompt.includes("update the TODO list with"), prompt);
+  // Each note is a plan-body edit, not an execution instruction.
+  assert.match(prompt, /not execution instructions/);
   assert.ok(prompt.includes("do not call `review_submit`"), prompt);
 });
 
@@ -800,6 +807,7 @@ test("lifecycle seam: a custom run does not reset the revision turn", async () =
     await plannerWroteSeamPlan(booted);
     assert.equal(seamRevisionState(booted)?.pending, true);
 
+    const cyclesBefore = seamEntries(booted, "workflow-review-cycle").length;
     await booted.pi.emit(
       "before_agent_start",
       {
@@ -808,6 +816,14 @@ test("lifecycle seam: a custom run does not reset the revision turn", async () =
         prompt: "**Plan Steps (2):**\n\n1. Add the route",
       },
       booted.ctx,
+    );
+
+    // A custom continuation is not a new review cycle either: opening one would
+    // reset the round budget and supersede the revision turn it belongs to.
+    assert.equal(
+      seamEntries(booted, "workflow-review-cycle").length,
+      cyclesBefore,
+      "a custom run must not open a review cycle",
     );
 
     const after = seamRevisionState(booted)!;

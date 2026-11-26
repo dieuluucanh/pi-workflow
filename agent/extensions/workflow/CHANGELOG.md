@@ -1,3 +1,58 @@
+## [0.17.3] - 2026-11-26
+
+This patch keeps execution TODOs out of the plan-editing phase. Version bumped by
+this change, **not published**; it builds on the unreleased `0.17.2` profile
+live-switch patch. A real Plan/Review session showed the failure: the revision
+turn's "Plan Steps" message started a run before the revision prompt arrived, and
+the TODO footer, reminder, `[DONE:n]` completion, stale warning and auto-commit
+fired while the Planner was only editing a plan.
+
+### Fixed — execution TODOs are live only after Build starts
+
+- **One follow-up per revision turn.** `sendRevisionFollowUp()` delivers only the
+  `# Planner revision — round N` prompt; the extra `workflow-todo-list` "Plan
+  Steps" custom message is gone, so a revision turn can no longer start an
+  execution run before its instructions arrive.
+- **The placeholder moved to the Build kickoff.** `agent_end` no longer
+  synthesizes a single "Step 1" row from the plan title during Plan/Review.
+  `seedExecutionTodoOnBuild()` creates the fallback row when Build starts from an
+  approved plan (best-effort, in its own `try/catch`, so it cannot block or roll
+  back the kickoff), and a list that belongs to a different plan is cleared
+  before the new `todos.planPath` is assigned, so a new plan does not inherit old
+  rows.
+- **The Plan TODO list is read-only.** `todoExecutionLive()` (`mode !== "plan"`)
+  is the single predicate: the passive `[TODO …]` footer, the `[TODO LIST]`
+  context reminder, `[DONE:n]` completion, the per-step auto-commit and the
+  "Todo list not updated" stale warning are all gated on it, and the footer skips
+  `.pi/plans/` writes. `workflow_todo` refuses every action except `list` in Plan
+  mode (`details.error: "plan-mode-read-only"`) and `list` reports the steps as
+  planned, not executing.
+- **Prompt wording.** The injected Plan context calls the list read-only execution
+  state created by the Build kickoff, the `[REVIEW MODE ACTIVE]` note says a
+  revision turn edits the plan and never touches the execution list, and
+  `buildPlanRevisionPrompt()` opens with "This is a planning turn, not
+  implementation" and tells the Planner to leave the execution TODO list
+  untouched (the old "update the TODO list" rule is gone).
+- **A custom continuation keeps an open revision cycle.** A non-user custom run
+  during a pending Planner revision no longer calls
+  `endReviewTurn()`/`beginReviewCycle()`, so a display message cannot reset the
+  cycle or drop the findings the Planner was asked to answer.
+- **The Plan-mode panel is a preview.** The pinned panel renders a Plan list as
+  `☐ Todos d/t · planned · not executing · /todos expand`, never promotes a row to
+  `▶` (including an `in_progress` row), and offers no `next` step until Build
+  starts.
+
+### Tests and docs
+
+- `review-negotiation.test.ts`, `plan-revision.test.ts`, `plan-naming.test.ts`,
+  `todo-panel.test.ts` and `workflow-mode.test.ts` cover the one-message revision
+  follow-up, the empty Plan list and the Build seed, the gated
+  footer/reminder/`[DONE]`/stale/auto-commit paths (with a Build-mode
+  counterpart), the read-only `workflow_todo`, the custom-continuation cycle
+  guard, the plan-preview panel and the `todoExecutionLive` table.
+- `README.md` documents the read-only Plan/Review list and the Build-kickoff
+  ownership; `package.json` is `0.17.3`.
+
 ## [0.17.1] - 2026-11-26
 
 This release fixes the Planner↔Reviewer revision loop introduced in `0.17.0`

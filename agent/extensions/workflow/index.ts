@@ -72,7 +72,6 @@ import {
   setTodoStatus,
   todoRef,
   formatTodoLine,
-  formatTodoNumberedList,
   buildTodoContextBlock,
   buildTodoFooter,
   formatAmbiguity,
@@ -353,6 +352,7 @@ import {
   encodeWorkflowMode,
   planModeTools,
   roleForMode,
+  todoExecutionLive,
   type WorkflowMode,
 } from "./workflow-mode.ts";
 import {
@@ -2026,6 +2026,7 @@ export default function workflowExtension(
       scopeKey: scope,
       promptAfterSettle: showChild ? false : todos.promptAfterSettle,
       stale: showChild ? false : todoStale,
+      mode: showChild ? "build" : workflowMode,
     });
     // A child view stays visible even before the child creates its list.
     if (showChild && view.state === "hidden") view.state = "expanded";
@@ -2069,6 +2070,7 @@ export default function workflowExtension(
             scopeKey: scope,
             promptAfterSettle: liveChild ? false : todos.promptAfterSettle,
             stale: liveChild ? false : todoStale,
+            mode: liveChild ? "build" : workflowMode,
           });
           if (liveChild) live.state = "expanded";
           if (live.state === "hidden") return [];
@@ -8392,6 +8394,10 @@ export default function workflowExtension(
     if (workflowMode === null) captureDefaultModel(ctx, "plan");
     workflowMode = "plan";
     syncLegacyFlags();
+    // Display only: the ⚠ marker does not belong to a planning phase. The
+    // stale-warning trigger (`mutatedSinceLastTodoWrite`) stays armed — the
+    // `agent_end` execution guard is the single mechanism that owns it.
+    todoStale = false;
     // Do NOT reset per-run provenance here. A fresh prompt already does it at
     // run start; preserving a plan write made earlier in THIS run is what lets
     // `/review` (and the "Plan file ready" notice) see it after a mid-run
@@ -9322,9 +9328,11 @@ export default function workflowExtension(
    * Deny, and the automatic Planner↔Reviewer loop) must behave identically:
    * drop the pending handoff decision, start a feedback cycle that keeps the
    * findings, hand the turn back to the Planner (idle turn + feedback flag),
-   * persist, then deliver the todo-list custom message and `message` as a
-   * `followUp`. The caller names the audit entry so each path keeps its own
-   * history shape. Never throws.
+   * persist, then deliver `message` as the one and only `followUp`. A custom
+   * follow-up starts its own run before the prompt arrives, so a second display
+   * message (for example a rendered todo list) is forbidden: it would land in
+   * that already-running turn. The caller names the audit entry so each path
+   * keeps its own history shape. Never throws.
    */
   async function sendRevisionFollowUp(
     _ctx: ExtensionContext,
@@ -9364,13 +9372,9 @@ export default function workflowExtension(
       at: Date.now(),
     };
     try {
-      const todoListText = formatTodoNumberedList(todos.items, { glyph: true });
-      const planTodoListMessage = {
-        customType: "workflow-todo-list",
-        content: `**Plan Steps (${todos.items.length}):**\n\n${todoListText}`,
-        display: true,
-      };
-      (pi as any).sendMessage?.(planTodoListMessage, { deliverAs: "followUp" });
+      // Exactly ONE follow-up per turn. A custom follow-up starts its own run
+      // before the prompt arrives, so any second message would be delivered to
+      // that already-running turn instead of the revision prompt.
       if ((pi as any).sendUserMessage) {
         (pi as any).sendUserMessage(message, { deliverAs: "followUp" });
       } else {
@@ -10015,11 +10019,71 @@ export default function workflowExtension(
     ].join("\n");
   }
 
+  /**
+   * Seed one visible execution row when Build starts from an approved plan.
+   *
+   * Execution TODOs are live only in the execution phase: Plan and Review never
+   * synthesize a row. This is the fallback when the approved plan reaches Build
+   * with an empty list, so the Build gate still has a step to show.
+   *
+   * Best-effort and non-throwing: the whole body is wrapped so a plan-file read,
+   * a todos write, `updateStatus` or `persistState` failure can neither prevent
+   * the `workflow-plan-execute` send nor roll back the Build entry.
+   */
+  function seedExecutionTodoOnBuild(
+    ctx: ExtensionContext,
+    kickoff: ExecutionKickoff,
+  ): void {
+    if (workflowMode !== "build") return;
+    try {
+      const cwd = (ctx as any)?.cwd ?? process.cwd();
+      if (
+        todos.planPath &&
+        !samePlanPath(todos.planPath, kickoff.planPath, cwd)
+      ) {
+        // The list belongs to a different plan: it must not become this
+        // plan's execution state.
+        todos.items = [];
+        todos.completedSignature = null;
+      }
+      if (todos.items.length > 0) return;
+      let planText = kickoff.planText;
+      if (!planText) {
+        try {
+          const abs = path.isAbsolute(kickoff.planPath)
+            ? kickoff.planPath
+            : path.join(cwd, kickoff.planPath);
+          if (fs.existsSync(abs)) planText = fs.readFileSync(abs, "utf8");
+        } catch (_e) {
+          void _e;
+        }
+      }
+      const synth = planText ? synthesizeFromPlanTitle(planText) : null;
+      todos.items = ensureTodoLabels([
+        {
+          step: 1,
+          text: synth?.text || "Review and execute the plan",
+          completed: false,
+          label: "1",
+          source: "synthesized",
+        },
+      ]);
+      todos.planPath = kickoff.planPath;
+      updateStatus(ctx);
+      persistState();
+    } catch (_e) {
+      void _e;
+    }
+  }
+
   function deliverExecutionKickoff(
     ctx: ExtensionContext,
     kickoff: ExecutionKickoff,
   ): boolean {
     pendingExecutionKickoff = null;
+    // The execution list is created here, never during Plan/Review. Never let
+    // this seed stand between the approved plan and the kickoff send.
+    seedExecutionTodoOnBuild(ctx, kickoff);
     try {
       if (typeof (pi as any).sendMessage !== "function") {
         throw new Error("the host has no sendMessage");
@@ -10902,6 +10966,7 @@ export default function workflowExtension(
       "workflow_todo: never mark a step `completed` unless the work is fully done (Claude Code rule: never based on intent).",
       "workflow_todo: cancel a step a policy forbids (name the policy in the step text) — never mark it completed.",
       "workflow_todo: reference steps by their GLOBAL number (shown before the text), never the plan's per-phase label.",
+      "workflow_todo: Plan mode is read-only for the list — only `list` is accepted; execution steps are created and completed only in Build.",
     ],
     parameters: Type.Object({
       action: StringEnum([
@@ -10969,6 +11034,7 @@ export default function workflowExtension(
       // Step 21 is gone: an Orchestrator list is a normal mutable Build list.
       // The parent owns the roadmap and may add, edit, reorder or complete rows.
       void _ctx;
+      const live = todoExecutionLive(workflowMode);
       const renderList = (items: TodoItem[]) => {
         const base = items.length
           ? `Steps are numbered GLOBALLY 1..${items.length}:
@@ -10986,13 +11052,39 @@ export default function workflowExtension(
         resolved.ambiguous
           ? formatAmbiguity(resolved.ambiguous, ref)
           : `Todo "${ref}" not found. Valid refs: ${todos.items.map((t) => todoRef(t)).join(", ") || "(none)"}`;
+      // Execution rows belong to Build. Plan/Review is plan-editing only, so
+      // every mutation is refused here; the Build kickoff creates the list and
+      // `plan_revision_done` is the revision settlement path.
+      if (!live && params.action !== "list") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                "Plan mode is read-only for `workflow_todo`: only `list` is accepted. " +
+                "Plan/Review edits the plan and never executes it. The Build kickoff creates " +
+                "the execution list from the approved plan; `plan_revision_done` is the revision settlement path.\n\n" +
+                renderList(todos.items),
+            },
+          ],
+          details: {
+            action: params.action,
+            todos: [...todos.items],
+            nextStep: todos.items.length + 1,
+            error: "plan-mode-read-only",
+          } as TodoDetails,
+        };
+      }
       switch (params.action) {
         case "list":
           return {
             content: [
               {
                 type: "text",
-                text: renderList(todos.items),
+                text: live
+                  ? renderList(todos.items)
+                  : `${renderList(todos.items)}\n\nPlan mode — execution steps are not started.`,
               },
             ],
             details: {
@@ -18603,6 +18695,10 @@ export default function workflowExtension(
     const messageType = (event as { messageType?: string }).messageType;
     const runPrompt = String((event as any).prompt ?? (event as any).text ?? "");
     const plannerFollowUp = isPlannerFollowUpRun(messageType, runPrompt);
+    // Any other non-user run while a Planner revision turn is open is a
+    // continuation of that turn (a display/followUp delivery, not a new task).
+    const revisionContinuation =
+      planRevisionPending && !plannerFollowUp && messageType !== "user";
     if (plannerFollowUp) {
       // The recorded follow-up's run started: keep the revision turn (round,
       // pending, notes) and the record itself, so a host retry of the SAME
@@ -18705,11 +18801,13 @@ export default function workflowExtension(
       // owns the turn. Starting a review cycle here reset the reviewer budget
       // on every orchestration prompt.
       if (workflowMode !== "orchestrator") {
-        if (plannerFollowUp) {
+        if (plannerFollowUp || revisionContinuation) {
           // The follow-up already opened this cycle (`sendRevisionFollowUp` →
           // `beginReviewCycle({ keepFindings: true })`). Starting it again here
           // would reset the round budget and drop the findings the Planner was
-          // asked to answer.
+          // asked to answer. A custom continuation during an open Planner
+          // revision must not reset the round budget or the findings either:
+          // the revision turn owns the cycle until it settles.
         } else {
           if (!feedbackTurn) endReviewTurn();
           await beginReviewCycle({
@@ -18784,14 +18882,14 @@ export default function workflowExtension(
       // The note says the plan body is not modified: the reviewer's output is an
       // appended appendix, so the planner's text is what the handoff renders.
       const reviewNote = reviewEnabled()
-        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required changes to the plan file as a \`## Reviewer Revisions\` appendix. You own the plan BODY; the reviewer owns the appendix. When the review leaves required changes and the review budget allows it, you get one revision turn: revise the body (never the appendix) and answer every note id through \`plan_revision_done\` as \`applied\`, \`rejected\` or \`not_applicable\` (a concrete reason is required for the last two), then the reviewer re-reviews the revised body. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step: the approved plan's steps are what execution consumes — the appendix is never a step list.`
+        ? `\n\n[REVIEW MODE ACTIVE] An independent reviewer runs after Plan Mode finishes: it audits this plan and appends its findings and required changes to the plan file as a \`## Reviewer Revisions\` appendix. You own the plan BODY; the reviewer owns the appendix. When the review leaves required changes and the review budget allows it, you get one revision turn: revise the body (never the appendix) and answer every note id through \`plan_revision_done\` as \`applied\`, \`rejected\` or \`not_applicable\` (a concrete reason is required for the last two), then the reviewer re-reviews the revised body. A revision turn edits the plan body: it never executes the plan and never touches the execution TODO list. Write a complete, self-contained, framework-aligned plan where every requirement maps to at least one step: the approved plan's steps are what execution consumes — the appendix is never a step list.`
         : "";
       return {
         message: {
           customType: "workflow-plan-context",
           content: `[PLAN MODE ACTIVE — Today is ${today} (UTC), current time ${stamp.time}. Use ${stamp.prefix} as the date-time prefix.] — read-only exploration.\n\nRestrictions:\n- edit/write blocked except .pi/plans/ — use the write tool for that path (not bash). Example: write({path: ".pi/plans/${stamp.prefix}-my-feature.md", content: "# Plan: ..."})
 - bash limited to read-only + test/lint/typecheck commands (ls, cat, rg, git log, npm test, npm run lint/typecheck, eslint, tsc --noEmit). File redirects (> and >>) to real files, installs, sed/awk, mkdir outside .pi/plans and the powershell tool stay blocked — but 2>/dev/null and 2>&1 are allowed. Do not use bash to write the plan file.\n- Use explore tool (subagents) in parallel for codebase recon\n- Use questionnaire tool for clarifications: 1-4 questions at once, first option = recommendation. Questionnaire appends "Type something." automatically — do NOT add Other/Type something in options.
-- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write a plan to .pi/plans/<date>-<HHmm>-<slug>.md where <date> is today (UTC, ${today}), <HHmm> is the current UTC time (${stamp.time}), and <slug> is kebab-case ≤40 chars. A normal, readable markdown document is enough. Recommended: # Plan: <title>, ## Context, ## Steps (a numbered list, one executable step per row), optional ## Verification (commands to run at the end). No special schema, no checks block, no minimum gate count.\n- The date-time prefix is for a NEW plan only: if this session already wrote a plan file, reuse that exact path — the extension never renames an existing plan, and re-stamping the same slug in a later minute would create a second file.\n- The plan is a document, not a contract. The executor reads it and creates the TODO rows; an indented heading or a differently numbered list is still a valid plan.\n- If the plan declares a final verification, put the commands in ## Verification as a fenced block; the parent runs them after the last row.\n- If you need to verify the timestamp, run: bash {command: "date -u +%Y-%m-%d-%H%M"} (UTC) — do not guess it. The extension fills or corrects the prefix on a new file only; an existing plan keeps its name.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — when this plan is approved, its steps become the todo list. Steps are numbered GLOBALLY 1..N; always reference them by those numbers. Update status with workflow_todo {action:"update", todos:[…COMPLETE LIST…]} — send the whole list, mark a step completed IMMEDIATELY when done (never batch), keep exactly one in_progress.]${reviewNote}\n${btwBlock}`,
+- Loop: explore → questionnaire → re-explore until no open questions.\n- Then write a plan to .pi/plans/<date>-<HHmm>-<slug>.md where <date> is today (UTC, ${today}), <HHmm> is the current UTC time (${stamp.time}), and <slug> is kebab-case ≤40 chars. A normal, readable markdown document is enough. Recommended: # Plan: <title>, ## Context, ## Steps (a numbered list, one executable step per row), optional ## Verification (commands to run at the end). No special schema, no checks block, no minimum gate count.\n- The date-time prefix is for a NEW plan only: if this session already wrote a plan file, reuse that exact path — the extension never renames an existing plan, and re-stamping the same slug in a later minute would create a second file.\n- The plan is a document, not a contract. The executor reads it and creates the TODO rows; an indented heading or a differently numbered list is still a valid plan.\n- If the plan declares a final verification, put the commands in ## Verification as a fenced block; the parent runs them after the last row.\n- If you need to verify the timestamp, run: bash {command: "date -u +%Y-%m-%d-%H%M"} (UTC) — do not guess it. The extension fills or corrects the prefix on a new file only; an existing plan keeps its name.\n- Keep asking until everything is clear. Do NOT edit source files.\n- Use brave-search skill via bash if web research needed.\n\n[TODO LIST — read-only execution state, not yours to drive. Execution TODOs are created by the Build kickoff from the approved plan; Plan mode and every review/revision turn never implement the plan. workflow_todo is read-only here (list only): do not add, advance or complete execution steps. Steps that do exist are numbered GLOBALLY 1..N and referenced by those numbers.]${reviewNote}\n${btwBlock}`,
           display: false,
         },
       } as any;
@@ -18829,10 +18927,11 @@ export default function workflowExtension(
         );
       return true;
     });
-    // Throttled passive reminder (Claude Code cadence) whenever a todo list
-    // exists — any mode. Unresolved refs from the previous turn bypass the
-    // throttle once so the model can learn the right numbers.
-    if (todos.items.length > 0) {
+    // Throttled passive reminder (Claude Code cadence) whenever an execution
+    // list exists — execution modes only; Plan/Review never re-adds one.
+    // Unresolved refs from the previous turn bypass the throttle once so the
+    // model can learn the right numbers.
+    if (todoExecutionLive(workflowMode) && todos.items.length > 0) {
       const remaining = todos.items.filter(
         (t) => !isDone(t) && itemStatus(t) !== "cancelled",
       );
@@ -18867,6 +18966,15 @@ export default function workflowExtension(
     // commit turn. Lifetime is the run: `agent_settled` clears it.
     if (todos.items.length === 0) return;
     if (!isAssistantMessage(event.message as AgentMessage)) return;
+    // Plan/Review is a planning phase: no `[DONE:n]` completion, no per-step
+    // commit. Keep the reminder counters advancing so the next live turn
+    // starts from a correct cadence.
+    if (!todoExecutionLive(workflowMode)) {
+      turnsSinceLastTodoWrite += 1;
+      turnsSinceLastReminder += 1;
+      updateStatus(ctx as any);
+      return;
+    }
     const text = getTextContent(event.message as AssistantMessage);
     const result = markCompletedRefs(text, todos.items);
     // Fallback per-step commit for steps completed via [DONE:ref] tags in the
@@ -20712,7 +20820,10 @@ export default function workflowExtension(
   // Passive todo footer: first successful mutating tool result of the turn.
   // (Separate handler so it can patch content without short-circuiting the
   // plan-write detection handler below — tool_result handlers chain.)
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx) => {
+    // Execution affordances are live only while execution is: Plan mode never
+    // sees a footer, so a plan edit cannot be mistaken for a work item.
+    if (!todoExecutionLive(workflowMode)) return;
     if (
       !event.isError &&
       (event.toolName === "edit" ||
@@ -20721,6 +20832,12 @@ export default function workflowExtension(
       !footerInjectedThisTurn &&
       todos.items.length > 0
     ) {
+      if (event.toolName === "edit" || event.toolName === "write") {
+        const input = (event.input ?? {}) as any;
+        const p = input.path || input.file_path;
+        const cwd = (ctx as any)?.cwd ?? process.cwd();
+        if (p && isPlanWritePath(String(p), cwd)) return;
+      }
       const footer = buildTodoFooter(todos.items);
       if (footer) {
         const existing = (event.content ?? [])
@@ -21097,6 +21214,7 @@ export default function workflowExtension(
           (t) => !isDone(t) && itemStatus(t) !== "cancelled",
         ).length;
         if (
+          todoExecutionLive(workflowMode) &&
           todos.items.length > 0 &&
           remainingCount > 0 &&
           mutatedSinceLastTodoWrite &&
@@ -21173,69 +21291,27 @@ export default function workflowExtension(
       const planCandidate: string | undefined =
         planWritePathThisRun ?? revisionPlanPath;
       if (!planCandidate) return; // the per-run gate above should have caught this
-      let planAbs: string | undefined;
-      try {
-        const abs = path.isAbsolute(planCandidate)
-          ? planCandidate
-          : path.join((ctx as any).cwd, planCandidate);
-        if (fs.existsSync(abs)) planAbs = abs;
-      } catch (_e) {
-        void _e;
+      // No plan parsing, merging or synthesis here: the model owns the TODO
+      // list and no code reads plan markdown to complete or replace rows. The
+      // execution list is created by the Build kickoff
+      // (`seedExecutionTodoOnBuild`), so a plan write in Plan/Review never
+      // seeds an execution row.
+      //
+      // A new plan starts from an empty execution state: rows that belong to a
+      // previous plan must not leak into this plan's handoff.
+      if (
+        todos.planPath &&
+        !samePlanPath(
+          todos.planPath,
+          planCandidate,
+          (ctx as any)?.cwd ?? process.cwd(),
+        )
+      ) {
+        todos.items = [];
+        todos.completedSignature = null;
+        todoStale = false;
       }
-      // No plan parsing or merging here: the model owns the TODO list and no
-      // code reads plan markdown to complete or replace rows. The synthesis
-      // block below still creates one visible step when the list is empty.
       todos.planPath = planCandidate;
-      // No session-branch recovery: only this run's plan write is eligible.
-      // If still zero but the run's plan file exists, synthesize a single todo
-      // from its title so the handoff still appears.
-      let _synthesizedFromTitle = false;
-      void _synthesizedFromTitle;
-      if (todos.items.length === 0) {
-        // Try to synthesize from plan file title or last assistant text
-        let synthText: string | undefined;
-        // Prefer reading the resolved plan file if we can find one
-        const candPlan = planAbs;
-        if (candPlan) {
-          try {
-            const md = fs.readFileSync(candPlan, "utf8");
-            const synth = synthesizeFromPlanTitle(md);
-            if (synth) synthText = synth.text;
-          } catch (_e) {
-            void _e;
-          }
-        }
-        if (!synthText && lastAssistant) {
-          const t = getTextContent(lastAssistant as AssistantMessage)
-            .slice(0, 80)
-            .trim();
-          if (t) synthText = t.split("\n")[0].trim().slice(0, 80);
-        }
-        if (synthText) {
-          todos.items = ensureTodoLabels([
-            {
-              step: 1,
-              text: synthText,
-              completed: false,
-              label: "1",
-              source: "synthesized",
-            },
-          ]);
-          _synthesizedFromTitle = true;
-        } else {
-          // Ultimate fallback: single generic step so gate can appear
-          todos.items = ensureTodoLabels([
-            {
-              step: 1,
-              text: "Review and execute the plan",
-              completed: false,
-              label: "1",
-              source: "synthesized",
-            },
-          ]);
-          _synthesizedFromTitle = true;
-        }
-      }
 
       // The run write is the handoff path; never prefer an older currentPlanFile.
       let planPath = planWritePathThisRun ?? revisionPlanPath;
