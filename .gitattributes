@@ -1,0 +1,3 @@
+# This shared wire-contract fixture is SHA-256 pinned by both host suites.
+# Never let core.autocrlf change its bytes in Windows checkouts.
+agent/extensions/workflow/fixtures/composer-transform.conformance.json text eol=lf

@@ -250,7 +250,7 @@ function checkScripts(dir, pkg, errors) {
     const res = runNpm(["run", script], dir);
     if (res.status !== 0) {
       errors.push(
-        `\`npm run ${script}\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`)}`,
+        `\`npm run ${script}\` failed:\n${tail(`${res.stdout ?? ""}\n${res.stderr ?? ""}`, 80)}`,
       );
     }
   }
