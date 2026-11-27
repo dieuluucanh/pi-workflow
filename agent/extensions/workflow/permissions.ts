@@ -1,9 +1,12 @@
 /**
  * Workflow Extension — role-based command permissions.
  *
- * One place decides what a role may execute. Plan Mode (planner), Review Mode
- * (reviewer) and explorer subagents (explorer) share this policy; the Builder
- * role — and a normal Pi session with no workflow mode — is unrestricted.
+ * One place decides what a role may execute. Its safe sed subset is parsed
+ * without execution, and package runners/transparent launchers share the
+ * wrapper resolver with path analysis. Arbitrary awk remains Builder-only.
+ * Plan Mode (planner), Review Mode (reviewer) and explorer subagents
+ * (explorer) share this policy; the Builder role — and a normal Pi session
+ * with no workflow mode — is unrestricted.
  *
  * Command classes, weakest to strongest:
  *   read-only  inspection that never executes project code
@@ -25,6 +28,8 @@ import {
   type ShellWord,
 } from "./shell-text.ts";
 import type { ArgumentCompletion } from "./utils.ts";
+import { parseSedInvocation } from "./shell-programs.ts";
+import { resolveWrapper } from "./shell-wrappers.ts";
 
 export type CommandClass = "read-only" | "verify" | "full";
 
@@ -671,7 +676,7 @@ export function splitCommandSegments(command: string): string[] {
 
 /** Classify one already-split segment. Unknown input → `full` (fail closed). */
 export function commandClassOf(segment: string): CommandClass {
-  return classifyWords(tokenizeWords(segment).words, segment);
+  return classifyWords(tokenizeWords(segment).words, segment, 0);
 }
 
 /**
@@ -687,11 +692,17 @@ export function commandClassOf(segment: string): CommandClass {
 function classifyWords(
   words: readonly ShellWord[],
   segment: string,
+  depth: number,
 ): CommandClass {
   const s = String(segment ?? "").trim();
   if (!s) return "full";
   const first = normalizeBinary(words[0]?.value ?? "") || firstWord(s);
   if (!first) return "full";
+  const wrapper = resolveWrapper(words, s, depth);
+  if (wrapper?.kind === "refused") return "full";
+  if (wrapper?.kind === "read-only") return "read-only";
+  if (wrapper?.kind === "inner")
+    return classifyWords(wrapper.words, wrapper.text, depth + 1);
   if (INTERPRETER_EXECUTABLES.has(first)) return "full";
 
   if (first === "cd") {
@@ -708,7 +719,7 @@ function classifyWords(
   if (first === "journalctl") return "read-only";
   if (first === "find")
     return FIND_DENIED_FLAG_RE.test(s) ? "full" : "read-only";
-  if (first === "env") return isBareEnv(s) ? "read-only" : "full";
+  if (first === "env") return "full";
   if (first === "printenv") return "read-only";
   if (first === "node") return classifyNode(s);
   if (first === "python" || first === "python3" || first === "py")
@@ -750,10 +761,14 @@ function classifyWords(
   if (first === "rg") return RG_PRE_RE.test(s) ? "full" : "read-only";
   if (first === "wget")
     return wordAt(s, 1) === "-O" && wordAt(s, 2) === "-" ? "read-only" : "full";
-  // `sed`/`awk` are deliberately NOT read-only: their programs are code (GNU
-  // sed's `e` command runs a shell command; awk can pipe to a command, write
-  // files or load a library). They fall through to `full`, so only Builder
-  // keeps them. Use rg/head/tail/cut/column/jq instead.
+  // `sed` is read-only only for the parsed print/select subset; arbitrary
+  // programs, options, in-place edits and script files fail closed. `awk`
+  // remains Builder-only because its program can execute commands or write.
+  if (first === "sed")
+    return parseSedInvocation(words.slice(1).map((word) => word.value)).readOnly
+      ? "read-only"
+      : "full";
+  if (first === "awk") return "full";
   if (first === "curl")
     return CURL_WRITE_RE.test(s) || CURL_METHOD_RE.test(s)
       ? "full"
@@ -984,12 +999,6 @@ function classifySystemctl(s: string): CommandClass {
   return SYSTEMCTL_READ_ONLY_SUBCOMMANDS.has(sub ?? "")
     ? "read-only"
     : "full";
-}
-
-function isBareEnv(s: string): boolean {
-  const rest = wordsOf(s).slice(1);
-  if (rest.length === 0) return true;
-  return rest.every((w) => /^-{1,2}[A-Za-z0-9-]+$/.test(w));
 }
 
 function classifyNode(s: string): CommandClass {

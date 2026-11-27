@@ -485,6 +485,59 @@ test("review_bash: the isolated reviewer gets a finite timeout and the probe gua
   assert.equal(seen[0]?.timeout, 120);
 });
 
+test("review_bash: safe sed and npx delegate; sed -i is refused", async () => {
+  const delegated: Array<{ toolCallId: string; command: string }> = [];
+  const builder = (_cwd: string) => ({
+    parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute(toolCallId: string, params: { command: string }) {
+      delegated.push({ toolCallId, command: params.command });
+      return { content: [{ type: "text" as const, text: "ok" }] };
+    },
+  });
+  const state = createShellGuardRecovery();
+  const tool = createReviewBashTool(builder as never, {
+    cwd: process.cwd(),
+    log: () => {},
+    folderPolicy: () => ({
+      config: DEFAULT_FOLDER_POLICY_CONFIG,
+      grants: [],
+    }),
+    shellGuard: () => ({
+      limits: { defaultTimeoutSeconds: 120, maxTimeoutSeconds: 900 },
+      state,
+    }),
+  });
+
+  const execute = (toolCallId: string, command: string) =>
+    tool.execute(
+      toolCallId,
+      { command },
+      new AbortController().signal,
+      undefined,
+      {},
+    );
+  const textOf = (result: any) =>
+    result.content
+      .map((part: any) => (part?.type === "text" ? String(part.text) : ""))
+      .join("\n");
+
+  for (const [id, command] of [
+    ["sed", "sed -n '1,5p' package.json"],
+    ["npx", "npx vitest run"],
+  ] as const) {
+    const result = await execute(id, command);
+    assert.notEqual((result as any).isError, true);
+    assert.doesNotMatch(textOf(result), /review_bash: REFUSED/);
+    assert.deepEqual(delegated.at(-1), { toolCallId: id, command });
+  }
+  assert.equal(delegated.length, 2);
+
+  const refused = await execute("sed-in-place", "sed -i 's/a/b/' package.json");
+  assert.equal((refused as any).isError, true);
+  assert.match(textOf(refused), /review_bash: REFUSED/);
+  assert.equal(delegated.length, 2);
+});
+
 test("review_bash: a quarantined reviewer does not spawn another shell", async () => {
   const seen: Array<Record<string, unknown>> = [];
   const builder = (_cwd: string) => ({

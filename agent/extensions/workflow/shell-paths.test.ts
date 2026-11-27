@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 
 import { analyzeShellPaths, type ShellPathAnalysis } from "./shell-paths.ts";
+import { analyzeCommand } from "./permissions.ts";
 import { normalizePolicyPath } from "./folder-policy.ts";
 import { resolveMsysTempRoot, translateMsysTempPath } from "./utils.ts";
 
@@ -42,6 +43,52 @@ test("read: cat / head / tail paths, including input redirection", () => {
   assert.deepEqual(readPaths(analyzeShellPaths("cat < ../a.txt", CWD)), [
     norm("../a.txt"),
   ]);
+});
+
+test("read: sed expression options attribute file operands, including in-place files", () => {
+  for (const command of ["sed --expression='1,5p' .env", "sed -e '1p' .env"]) {
+    const analysis = analyzeShellPaths(command, CWD);
+    assert.deepEqual(analysis.reads, [{ path: norm(".env"), kind: "file" }]);
+    assert.deepEqual(analysis.writes, []);
+  }
+
+  const inPlace = analyzeShellPaths("sed -n '1p' f -i", CWD);
+  assert.deepEqual(inPlace.reads, [{ path: norm("f"), kind: "file" }]);
+  assert.deepEqual(inPlace.writes, [{ path: norm("f"), kind: "file" }]);
+  assert.ok(inPlace.uncertain.includes("sed -i"));
+});
+
+test("read: package runner and every transparent launcher attribute exact paths", () => {
+  for (const command of [
+    "npx cat ../.env",
+    'npx cat "../.env"',
+    "timeout 60 npx cat ../.env",
+    "env CI=1 cat ../.env",
+    "nice -n 5 cat ../.env",
+    "stdbuf -oL cat ../.env",
+    "command cat ../.env",
+  ]) {
+    const analysis = analyzeShellPaths(command, CWD);
+    assert.deepEqual(analysis.reads, [{ path: norm("../.env"), kind: "file" }], command);
+    assert.deepEqual(analysis.writes, [], command);
+  }
+});
+
+test("uncertain: package install flags and verify runners remain unproven", () => {
+  const packageFlag = analyzeShellPaths("npx --package=x evil", CWD);
+  assert.deepEqual(packageFlag.reads, []);
+  assert.deepEqual(packageFlag.writes, []);
+  assert.ok(
+    packageFlag.uncertain.some((reason) => /option is not allowed.*--package/i.test(reason)),
+    `expected meaningful package-flag uncertainty, got: ${packageFlag.uncertain.join("; ")}`,
+  );
+
+  const verifyCommand = analyzeCommand("npx vitest run tests/foo.test.ts");
+  assert.equal(verifyCommand.segments[0]?.commandClass, "verify");
+  const verifyRunner = analyzeShellPaths("npx vitest run tests/foo.test.ts", CWD);
+  assert.deepEqual(verifyRunner.reads, []);
+  assert.deepEqual(verifyRunner.writes, []);
+
 });
 
 test("read: cd changes the base for later segments", () => {

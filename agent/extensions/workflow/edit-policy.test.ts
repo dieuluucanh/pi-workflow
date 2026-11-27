@@ -484,6 +484,9 @@ test("commandMayWrite: read-only commands are not writes", () => {
     "npm test",
     "tsc --noEmit",
     "eslint src",
+    "sed -n '1,20p' f",
+    "npx vitest run",
+    "timeout 60 npx vitest run",
   ]) {
     assert.equal(commandMayWrite(cmd).mutating, false, cmd);
   }
@@ -497,6 +500,8 @@ test("commandMayWrite: obvious mutators are writes", () => {
     "mkdir out",
     "touch f",
     "sed -i s/a/b/ f",
+    "awk '{print}' f",
+    "npx --package=x evil",
     "npm install",
     "git checkout main",
     "python -c \"open('f','w')\"",
@@ -593,9 +598,9 @@ test("commandMayWrite: an unquoted operator or expansion is still a write", () =
 
 test("commandMayWrite: the grant key is the raw segment, unchanged", () => {
   const cfg = coerceWritePolicyConfig({ mode: "ask" });
-  const sed = classifyWriteCall("bash", { command: "sed -n '1,5p' f" }, cfg);
+  const sed = classifyWriteCall("bash", { command: "sed -i 's/a/b/' f" }, cfg);
   assert.equal(sed.mutating, true);
-  assert.equal(sed.key, "sed -n '1,5p' f");
+  assert.equal(sed.key, "sed -i 's/a/b/' f");
   // A read-only command has no key at all, so no grant is ever offered.
   const rg = classifyWriteCall("bash", { command: `rg -n "rm -rf" src` }, cfg);
   assert.equal(rg.mutating, false);

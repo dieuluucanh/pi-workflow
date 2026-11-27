@@ -8,10 +8,12 @@
  * Permission model — Review Mode is read-only except for one write path:
  *
  *   review_bash         read-only + verify shell, gated by the same role policy
- *                       Plan Mode uses via `explainCommandRefusal("reviewer", …)`
- *                       (no file redirects — `2>/dev/null` and `2>&1` are fine —
- *                       no rm/mv/cp, no sudo, no installs, no sed/awk, no git
- *                       mutations; test/lint/typecheck runners are allowed)
+ *                       Plan Mode uses via `explainCommandRefusal("reviewer", …)`.
+ *                       Safe sed print/select forms and package-runner/transparent
+ *                       launcher forms are allowed only when their inner command
+ *                       is allowed. `sed -i`/`-f`, awk, file redirects (except
+ *                       `2>/dev/null` and `2>&1`), installs, builds and git
+ *                       mutations remain refused.
  *   review_explore      read-only subagents, capped by exploreBudget
  *   review_submit       the single write path: appends the reviewer's findings
  *                       and required revisions as an advisory appendix
@@ -164,7 +166,7 @@ export function createReviewBashTool(
         name: "review_bash",
         label: "Review Bash (read-only)",
         description:
-            "Run a READ-ONLY or VERIFY shell command to inspect and check the repository (git log/diff/status/show-ref, ls, cat, rg, npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo clippy). Mutating commands — file redirects (> and >>), sed/awk, rm, mv, cp, chmod, sudo, package installs/builds, git add/commit/push — are refused by the harness; `2>/dev/null` and `2>&1` are allowed. You cannot write files with this tool; use review_submit to record your findings and required revisions.",
+            "Run a READ-ONLY or VERIFY shell command to inspect and check the repository (git log/diff/status/show-ref, ls, cat, rg, npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo clippy). Safe sed print/select forms (for example, sed -n '440,510p' f) and package-runner/transparent launcher forms (npx vitest run, npm exec -- vitest, timeout 60 npx vitest) follow the same policy as Plan Mode and are allowed only when the inner command is read-only/verify. Arbitrary awk and sed -i/-f or unsafe sed programs, real file redirects (except 2>/dev/null and 2>&1), rm/mv/cp/mkdir/touch/chmod/sudo, package installs/builds and git mutations remain refused; unknown/dangerous wrapper flags and env assignments outside CI, NO_COLOR, FORCE_COLOR, TZ, LANG, LC_* and TERM are refused, and wrapper recursion is bounded. This is a policy gate, not an OS sandbox: allowlisted test runners execute project code and npx may fetch a missing named tool. Use review_submit to record your findings and required revisions.",
         parameters: inner.parameters,
         async execute(...args: unknown[]): Promise<ReviewToolTextResult> {
             // SAFETY: Pi invokes ToolDefinition.execute as
@@ -196,7 +198,7 @@ export function createReviewBashTool(
             const refusal = explainCommandRefusal("reviewer", command);
             if (refusal) {
                 deps.log(
-                    `Review Mode refused a read-only violation: ${command.slice(0, 120)}`,
+                    `Review Mode refused a command outside its read-only policy: ${refusal.detail} — ${command.slice(0, 120)}`,
                     "warning",
                 );
                 return {
@@ -209,10 +211,13 @@ export function createReviewBashTool(
                                 "",
                                 "Review Mode has Plan Mode's permissions: read-only inspection plus",
                                 "test/lint/typecheck commands (npm test, npm run lint/typecheck, eslint,",
-                                "tsc --noEmit, node --test, pytest, cargo clippy). File redirects (> and >>)",
-                                "are refused while 2>/dev/null and 2>&1 are allowed; sed/awk are not on",
-                                "the allowlist; no rm/mv/cp/mkdir/touch/chmod, no sudo, no package installs",
-                                "or builds, no git add/commit/push/checkout. Do not work around this.",
+                                "tsc --noEmit, node --test, pytest, cargo clippy). Safe sed print/select",
+                                "forms and package-runner/transparent launchers are allowed only when the",
+                                "inner command is allowed; wrapper recursion is bounded and unknown or",
+                                "dangerous flags refuse. Arbitrary awk remains Builder-only; sed -i/-f and",
+                                "unsafe sed programs, real file redirects (except 2>/dev/null and 2>&1),",
+                                "no rm/mv/cp/mkdir/touch/chmod, sudo, installs/builds or git mutations",
+                                "remain refused. Do not work around this.",
                                 "",
                                 "If you need to change the plan, call review_submit with your findings",
                                 "and required revisions — it appends an advisory section and leaves the",

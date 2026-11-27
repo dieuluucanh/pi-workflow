@@ -181,13 +181,13 @@
           "thinking": "xhigh"
         },
         "explorer": {
-          "provider": "command-code",
-          "id": "deepseek/deepseek-v4.1-flash",
-          "thinking": "low"
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
+          "thinking": "medium"
         },
         "builder": {
-          "provider": "command-code",
-          "id": "deepseek/deepseek-v4.1-flash",
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
           "thinking": "high"
         },
         "reviewer": {

@@ -20,7 +20,9 @@ import {
   analyzeCommand,
   type SegmentAnalysis,
 } from "./permissions.ts";
-import type { ShellRedirect, ShellWord } from "./shell-text.ts";
+import { tokenizeWords, type ShellRedirect, type ShellWord } from "./shell-text.ts";
+import { parseSedInvocation } from "./shell-programs.ts";
+import { resolveWrapper } from "./shell-wrappers.ts";
 import {
   type FolderTarget,
   normalizePolicyPath,
@@ -32,6 +34,8 @@ export type ShellPathFamily = "posix" | "powershell" | "cmd";
 export interface ShellPathOptions {
   /** MSYS `/tmp` translation is a POSIX-shell concern (default: "posix"). */
   family?: ShellPathFamily;
+  /** Internal wrapper recursion depth. */
+  depth?: number;
 }
 
 export type GitCommitHit = "add" | "commit" | "push";
@@ -134,17 +138,7 @@ const WRITE_COMMANDS = new Set([
   "dd",
 ]);
 
-const WRAPPERS = new Set([
-  "env",
-  "nice",
-  "time",
-  "timeout",
-  "nohup",
-  "stdbuf",
-  "command",
-  "builtin",
-  "sudo",
-]);
+const WRAPPERS = new Set(["time", "nohup", "builtin", "sudo"]);
 
 const SHELLS = new Set([
   "sh",
@@ -254,7 +248,7 @@ export function analyzeShellPaths(
   for (const match of command.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)) {
     const inner = (match[1] ?? match[2] ?? "").trim();
     if (!inner) continue;
-    const nested = analyzeShellPaths(inner, virtualCwd, { family });
+    const nested = analyzeShellPaths(inner, virtualCwd, { family, depth: options.depth ?? 0 });
     for (const target of nested.reads) analysis.reads.push(target);
     for (const target of nested.writes) analysis.writes.push(target);
     for (const reason of nested.uncertain) analysis.uncertain.push(reason);
@@ -284,6 +278,7 @@ export function analyzeShellPaths(
       addRead,
       addWrite,
       family,
+      depth: options.depth ?? 0,
       normalizePath: (value: string) => normalizeShellPath(value),
       get cwd() {
         return virtualCwd;
@@ -303,6 +298,7 @@ interface SegmentContext {
   analysis: ShellPathAnalysis;
   cwd: string;
   family: ShellPathFamily;
+  depth: number;
   /** Translate + normalize one shell path against the current cwd. */
   normalizePath: (value: string) => string;
   addRead: (value: string, kind?: FolderTarget["kind"]) => void;
@@ -326,6 +322,37 @@ function analyzeSegment(segment: SegmentAnalysis, ctx: SegmentContext): void {
   let command = segment.command;
   if (!command) return;
 
+  // Shared launcher/package-runner parsing is authoritative for path analysis.
+  // Leading assignments are preserved, but launchers themselves are resolved
+  // only by shell-wrappers.ts so quoting and source offsets remain intact.
+  let launcherIndex = 0;
+  while (launcherIndex < segment.words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(segment.words[launcherIndex]!.value)) launcherIndex++;
+  if (launcherIndex < segment.words.length) {
+    const launcherWords = segment.words.slice(launcherIndex);
+    const launcherText = segment.raw.slice(launcherWords[0]!.start);
+    const resolution = resolveWrapper(tokenizeWords(launcherText).words, launcherText, ctx.depth);
+    if (resolution?.kind === "refused") {
+      ctx.analysis.uncertain.push(resolution.reason);
+      return;
+    }
+    if (resolution?.kind === "read-only") return;
+    if (resolution?.kind === "inner") {
+      // A supported shell builtin can change the cwd for later sequential
+      // segments. Apply its cd locally rather than losing the virtual cwd in a
+      // separate recursive result.
+      if (baseCommand(resolution.words[0]?.value ?? "") === "cd") {
+        const target = resolution.words.slice(1).map((word) => word.value).find((word) => !isFlag(word));
+        if (target && !/\$|%|`/.test(target)) {
+          const next = ctx.normalizePath(target);
+          if (next) ctx.cwd = next;
+        } else if (target) ctx.analysis.uncertain.push(`cd ${target}`);
+        return;
+      }
+      mergeAnalysis(ctx, analyzeShellPaths(resolution.text, ctx.cwd, { family: ctx.family, depth: ctx.depth + 1 }));
+      return;
+    }
+  }
+
   if (command === "cd") {
     const target = words.slice(1).find((word) => !isFlag(word));
     if (!target) {
@@ -347,11 +374,37 @@ function analyzeSegment(segment: SegmentAnalysis, ctx: SegmentContext): void {
 
   // Strip wrappers and leading VAR=value assignments.
   let guard = 0;
+  let removedWords = 0;
   while (guard++ < 8) {
     const stripped = stripWrappersAndAssignments(words);
     if (stripped.length === words.length) break;
+    removedWords += words.length - stripped.length;
     words = stripped;
     command = baseCommand(words[0] ?? "");
+  }
+  // Legacy best-effort wrappers (sudo/nohup/time/builtin) are not parsed as
+  // launchers themselves. If stripping one exposes an approved launcher,
+  // hand the untouched source suffix to the shared resolver.
+  if (removedWords > 0 && removedWords < segment.words.length) {
+    const remainder = segment.raw.slice(segment.words[removedWords]!.start);
+    const resolution = resolveWrapper(tokenizeWords(remainder).words, remainder, ctx.depth);
+    if (resolution?.kind === "refused") {
+      ctx.analysis.uncertain.push(resolution.reason);
+      return;
+    }
+    if (resolution?.kind === "read-only") return;
+    if (resolution?.kind === "inner") {
+      if (baseCommand(resolution.words[0]?.value ?? "") === "cd") {
+        const target = resolution.words.slice(1).map((word) => word.value).find((word) => !isFlag(word));
+        if (target && !/\$|%|`/.test(target)) {
+          const next = ctx.normalizePath(target);
+          if (next) ctx.cwd = next;
+        } else if (target) ctx.analysis.uncertain.push(`cd ${target}`);
+        return;
+      }
+      mergeAnalysis(ctx, analyzeShellPaths(resolution.text, ctx.cwd, { family: ctx.family, depth: ctx.depth + 1 }));
+      return;
+    }
   }
 
   if (command === "git") {
@@ -459,31 +512,18 @@ function baseCommand(value: string): string {
 function stripWrappersAndAssignments(words: string[]): string[] {
   let index = 0;
   while (index < words.length) {
-    const word = words[index];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) {
       index++;
       continue;
     }
-    if (!WRAPPERS.has(baseCommand(word))) break;
-    const command = baseCommand(word);
+    const command = baseCommand(words[index]!);
+    if (!WRAPPERS.has(command)) break;
     index++;
-    while (index < words.length && isFlag(words[index])) {
-      const flag = words[index];
-      index++;
-      if (looksLikeOptionValue(flag) && index < words.length && !words[index].startsWith("-")) {
-        // Wrapper option values: nice -n 5, timeout 30, sudo -u user.
-        if (command === "nice" && flag === "-n") index++;
-        else if (command === "timeout") index++;
-        else if (command === "sudo" && (flag === "-u" || flag === "-g")) index++;
-        else if (command === "env" && (flag === "-u" || flag === "--unset")) index++;
-        else if (command === "stdbuf") index++;
+    if (command === "sudo") {
+      while (index < words.length && isFlag(words[index]!)) {
+        const flag = words[index++]!;
+        if ((flag === "-u" || flag === "-g") && index < words.length) index++;
       }
-    }
-    if (command === "timeout" && index < words.length && !words[index].startsWith("-")) {
-      index++; // duration
-    }
-    if (command === "sudo" && index < words.length && !words[index].startsWith("-")) {
-      // `sudo user command` is rare; only strip a -u value, already handled.
     }
   }
   return words.slice(index);
@@ -611,36 +651,16 @@ function analyzeFind(words: string[], ctx: SegmentContext): void {
 }
 
 function analyzeSed(words: string[], ctx: SegmentContext): void {
-  const files: string[] = [];
-  let scriptSeen = false;
-  for (let i = 1; i < words.length; i++) {
-    const word = words[i];
-    if (word === "-e" || word === "--expression") {
-      scriptSeen = true;
-      if (i + 1 < words.length) i++;
-      continue;
-    }
-    if (word === "-f" || word === "--file") {
-      if (i + 1 < words.length) ctx.addRead(words[++i]);
-      scriptSeen = true;
-      continue;
-    }
-    if (word.startsWith("-i") || word === "--in-place") {
-      ctx.analysis.uncertain.push("sed -i");
-      continue;
-    }
-    if (isFlag(word)) continue;
-    if (!scriptSeen) {
-      scriptSeen = true;
-      if (/\b[ew]\b/.test(word)) ctx.analysis.uncertain.push("sed script executes/writes");
-      continue;
-    }
-    files.push(word);
-  }
-  for (const file of files) {
+  const invocation = parseSedInvocation(words.slice(1));
+  for (const scriptFile of invocation.scriptFiles) ctx.addRead(scriptFile);
+  for (const file of invocation.files) {
     ctx.addRead(file);
-    if (words.some((word) => word.startsWith("-i") || word === "--in-place"))
-      ctx.addWrite(file);
+    if (invocation.inPlace) ctx.addWrite(file);
+  }
+  if (!invocation.readOnly) {
+    ctx.analysis.uncertain.push(
+      invocation.reason === "sed -i edits in place" ? "sed -i" : invocation.reason ?? "sed invocation is not recognized as read-only",
+    );
   }
 }
 
@@ -778,7 +798,7 @@ function analyzeShell(
         ctx.analysis.uncertain.push(`${command} ${word} without a command`);
         return;
       }
-      mergeAnalysis(ctx, analyzeShellPaths(inner, ctx.cwd, { family: ctx.family }));
+      mergeAnalysis(ctx, analyzeShellPaths(inner, ctx.cwd, { family: ctx.family, depth: ctx.depth + 1 }));
       return;
     }
     if (isFlag(word)) continue;

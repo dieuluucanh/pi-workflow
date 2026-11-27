@@ -17201,11 +17201,11 @@ export default function workflowExtension(
         // Only a concrete target path that cannot be canonicalised is folder
         // uncertainty. "Mutating but no discovered write target" is NOT: the
         // shell analyzer cannot see inside `npm run build`, `node script`,
-        // `npx`, `sed`/`awk` programs or `powershell`, and treating that as
-        // "possibly outside" made Build and writePolicy:allow prompt for
-        // ordinary in-repo toolchain commands. The capability policy owns
-        // that case — writePolicy:ask still asks for every mutating call —
-        // and undiscoverable shell writes are the documented residual
+        // an `awk` program or `powershell`, and treating that as "possibly
+        // outside" made Build and writePolicy:allow prompt for ordinary
+        // in-repo toolchain commands. The capability policy owns that case —
+        // writePolicy:ask still asks for every mutating call — and
+        // undiscoverable shell writes are the documented residual
         // (README "Not a sandbox").
         uncertain: folderEvaluation.uncertain.length > 0,
       });

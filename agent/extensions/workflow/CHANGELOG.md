@@ -1,3 +1,14 @@
+## [0.17.4] - 2026-11-27
+
+Version bumped by this change, **not published**.
+
+### Changed — shared read-only shell classification
+
+- The shared classifier now recognizes a fail-closed subset of safe `sed` print/select programs, package-runner wrappers (`npx`, `pnpm exec`, and related forms), and transparent launchers such as `env`, `timeout`, `nice`, `stdbuf` and `command`. Plan and Review use the same verdict table; Explorer receives read-only commands but not verification commands. Read-only `sed` and wrapped verification no longer count as writes under `writePolicy: ask`.
+- `awk`, `sed -i`/`-f` and unsafe `sed` programs, installs, builds, real file redirects and git mutations remain restricted. Wrapper and `sed` file operands are attributed for path checks, including operands reached through wrappers.
+- Fail-closed safeguards include an environment-assignment name allowlist (excluding startup and module-resolution variables), wrapper flag checks and a recursion-depth cap. Package-runner option parsing respects `--`; timeout duration values are validated, and unknown command flags are refused. Review refusal reasons, copy and prompts now describe the shared policy; regression tests cover write-policy ask behavior and unchanged mutation grant keys.
+- Added `shell-programs.ts` and `shell-wrappers.ts` with their tests. Verification is not an OS sandbox: allowed verification may execute project code, and a package runner may fetch a missing named tool.
+
 ## [0.17.3] - 2026-11-26
 
 This patch keeps execution TODOs out of the plan-editing phase. Version bumped by
