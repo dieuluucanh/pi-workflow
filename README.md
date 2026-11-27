@@ -73,9 +73,10 @@ Revocation stops future disclosure — it cannot recall provider data already
 sent. A conflict is never overwritten; the original draft stays recoverable.
 Pi Desktop can bundle a pinned Workflow artifact with explicit
 override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
-checkout. Tested against Workflow **0.17.5** + Pi SDK **1.5.0**; semantic quality
-and live desktop/Terminal acceptance still require human verification, not
-inference from unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
+checkout. The source tree targets Workflow **0.17.5** (release pending — npm
+still serves **0.13.0**) + Pi SDK **1.5.0**; semantic quality and live
+desktop/Terminal acceptance still require human verification, not inference
+from unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
 and the Pi Desktop
 [`architecture/extension-ui.md`](https://github.com/dieuluucanh/pi-desktop/blob/main/docs/architecture/extension-ui.md)
 composer-transform contract.
@@ -90,8 +91,9 @@ pi install npm:@dieulc/autocompact
 pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
-# pinned, for reproducible installs
-pi install npm:@dieulc/workflow@0.17.5
+# pinned, for reproducible installs (0.13.0 is the last published version;
+# 0.17.5 is release-pending in this checkout)
+pi install npm:@dieulc/workflow@0.13.0
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
@@ -126,7 +128,7 @@ First `pi` run prompts to **trust** the project — approve. Missing `npm:` pack
 
 ## Updating
 
-- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.17.5` to pin)
+- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.13.0` to pin — 0.13.0 is the last published version, 0.17.5 is release-pending)
 - Dotfiles: `cd ~/.pi && git pull`, then `pi update --extensions`
 
 ## Developing
@@ -147,25 +149,42 @@ Extensions load directly from `agent/extensions/*` — edit the `.ts` file and r
 
 ## Releasing
 
-Releases are cut locally with one script. Versions are **independent per package**, git tags look like `@dieulc/workflow@0.2.0`, and each package keeps its own `CHANGELOG.md` generated from commits since its previous tag.
+Releases are cut locally with one script, but **`npm publish` is gated on green CI for the exact release commit**. Versions are **independent per package**, git tags look like `@dieulc/workflow@0.2.0`, and each package keeps its own `CHANGELOG.md` generated from commits since its previous tag.
 
 ```bash
 npm login                      # once per machine (npm user: dieulc)
+export GH_TOKEN=…              # the CI gate reads check-runs via gh api
 npm run release:status         # read-only: manifest versions vs the npm registry
 npm run verify                 # gate: all four packages (includes the packed import closure)
 npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
 npm run release                # interactive: pick packages + bump type
 
-# non-interactive
+# non-interactive: publish the versions already in the manifests
+npm run release -- --packages workflow --bump none --yes
+
+# non-interactive: bump, then publish
 npm run release -- --packages workflow,autocompact --bump minor --yes
 ```
 
-What a release does: preflight (clean tree, `main`, npm auth) → verify (including the packed import closure and a load test of the packed file set) → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
+Preflight is deliberately local. It checks the **workspace** — expected branch (default `main`), clean tree, untouched `agent/settings.json`, no divergence from `origin` — and the **version invariants** — top `CHANGELOG.md` heading equals the manifest version, and every published version has an annotated tag whose tagged `package.json` version matches — plus npm auth. It does not query CI, because the release commit does not exist yet.
 
-- `--bump none` publishes the current version as-is (first publish, or resuming).
-- `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped. Use `--packages workflow --continue` when version and curated changelog changes are already committed; it preserves those notes instead of generating a duplicate section.
-- A package whose target version is already on npm is **skipped, never fatal** — the rest of the batch is still published, tagged and pushed, and a missing tag for an already-published version is repaired. Add a bump to actually release it again, and always pass flags after `--` (`npm run release -- --continue`).
-- `--no-push` stops before `git push`.
+Then, in this exact order, the script:
+
+1. **verify** the packages being published (packed import closure + load smoke test of the packed file set);
+2. write the version and prepend the changelog section — with `--bump none --yes` and the notes already committed, there is nothing new to write;
+3. **commit** only `package.json`, `package-lock.json` and `CHANGELOG.md` — staging is explicit, `git add -A` is gone;
+4. **push** the branch, so the release commit has a run;
+5. **await CI** for that SHA — `verify (ubuntu-latest)` *and* `verify (windows-latest)` must both be `success`; pending, unknown (including a missing leg) and red all block;
+6. only then **publish** each package, create an annotated tag per package, and **push the tags**.
+
+Release from a **fresh worktree** and run `npm ci` there after the current `package-lock.json`: the script refuses a `node_modules` that predates the lockfile, because CI verifies a fresh install and a release must not pass on ambient dependencies.
+
+- `--bump none` publishes the current version as-is (first publish, resuming, or a version whose curated changelog is already committed). `--continue` is the resume form: already-published versions and existing tags are skipped, and committed notes are preserved instead of regenerated.
+- A package whose target version is already on npm is **skipped, never fatal** — the rest of the batch is still published, tagged and pushed, and a missing tag for an already-published version is repaired. Always pass flags after `--` (`npm run release -- --continue`).
+- `--no-push` stops before the push, which also means CI cannot verify the commit: publishing then requires the bypass below.
+- **CI red?** Do not publish and do not tag. Fix forward on the *same unpublished version* — nothing reached the registry, so the version is still free — push the fix, and re-run `npm run release -- --packages <pkg> --bump none --yes` once both matrix legs are green. Never bump to "get past" a red build, and never publish a version CI rejected.
+- **Bypass:** only `RELEASE_SKIP_CI=1` in the environment *together with* `--yes` skips the gate, and the transcript then prints `CI gate bypassed by RELEASE_SKIP_CI`. There is no `--skip-ci`. Use it only for a genuine CI outage you have accepted by hand.
+- The script ends at the pushed tags. It does **not** create a GitHub Release; that is an optional manual step (`gh release create`), never implied by a successful release.
 
 See [`docs/publishing.md`](docs/publishing.md) for the full reference and recovery paths.
 
@@ -191,7 +210,7 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 ├─ docs/publishing.md        ← release reference
 ├─ scripts/
 │  ├─ verify-packages.mjs    ← pre-publish gate
-│  ├─ release.mjs            ← version + changelog + publish + tag
+│  ├─ release.mjs            ← version + changelog + CI-gated publish + tag
 │  ├─ status.mjs             ← read-only npm publish-state report
 │  └─ check-gallery.mjs      ← pi.dev gallery-catalog membership check
 ├─ .gitignore
