@@ -1,12 +1,13 @@
 > **Superseded (2026-11-24).** This document describes the removed frozen /
 > journaled Orchestrator engine and Build execution engine. It is retained as
-> historical evidence, not current behaviour. Current flow: the model-driven
-> dispatcher in `agent/extensions/workflow/README.md` (model-supplied rows, one
-> in-process child per row, verification as ordinary bash).
+> historical evidence, not current behaviour. The separately labelled current
+> checklist below covers the model-driven dispatcher. See
+> [current operations](orchestrator-operations.md) and the package README for
+> model-supplied rows, one in-process child per row and ordinary bash verification.
 
 # Orchestrator live acceptance — manual signoff
 
-> **Updated 2026-11-23 — in-process Build child.** The external child chain
+> **Historical 2026-11-23 contract — removed, not current instructions.** The external child chain
 > (Desktop tab / Terminal window / `pi --session` / child host / IPC / start-ack
 > / workspace lease) is removed. The current contract is:
 >
@@ -35,7 +36,7 @@
 
 > **Superseded 2026-11-22 (Orchestrator simplification).** The
 > propose → preview → execution-approval pipeline described in the older body of
-> this document no longer exists. The current contract is:
+> this document no longer exists. The following was the intermediate contract:
 >
 > - plan approval (or an agreed standalone discussion) freezes ONE TODO list
 >   (one row per top-level plan step) via `orchestrator_start`;

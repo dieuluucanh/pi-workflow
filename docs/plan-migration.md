@@ -1,6 +1,7 @@
 # Migrating a plan after the legacy-engine deletion
 
-> **Breaking change (2026-11-24, v0.14.0).** The frozen plan contract, the
+> **Breaking change (2026-11-24, 0.14.0 development milestone; shipped in
+> 0.17.5).** The frozen plan contract, the
 > compiler/lint/check-preview, the freeze gate, the run journal and the Build
 > execution engine are gone. Plans and runs from before the sweep are not
 > migrated: restore says "restart from the approved plan".
@@ -29,11 +30,15 @@ Everything else is ignored rather than validated.
 ## Runs
 
 - A `running` run record restores as `interrupted` after a reload. `/orchestrator
-  retry` starts a fresh child from the stored row instruction.
+  retry` starts a fresh child from the stored row instruction. Idle runs between
+  rows retain their report; explicit dispatch can continue them. Completed or
+  cancelled runs cannot be revived: use a new `orchestrator_start`.
 - Old journals, frozen v1/v2 snapshots and run directories are left on disk and
   never read. Start a new run from the approved plan.
 - The shell quarantine survives a reload through the `workflow` entry's
-  `shellQuarantine` key; `/shell-guard reset` is still the only new budget.
+  `shellQuarantine` key. A genuine new idle user prompt or explicit
+  `/shell-guard reset` can start a new budget; a reload or child replacement
+  cannot.
 
 ## Tool and command surface
 

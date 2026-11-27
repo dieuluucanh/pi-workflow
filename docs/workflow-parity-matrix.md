@@ -1,8 +1,16 @@
-> **Superseded (2026-11-24).** The frozen plan contract and the automatic
-> acceptance engine described below were removed. Current flow: a normal
-> markdown plan, optional append-only review, then Direct Build or the
-> model-driven Orchestrator dispatcher. Old runs are not resumed. See the
-> README section "2026-11-24 — model-driven Orchestrator".
+> **Historical baseline, with later local amendments.** This matrix records
+> the named baseline artifacts, not verification of the Workflow 0.17.5 release
+> against a current Pi Desktop bundle. Deleted `extension.test.ts`, legacy
+> recovery/engine modules and automatic-acceptance references below are
+> historical evidence, not current test handles. See
+> [current operations](orchestrator-operations.md) and the package README.
+>
+> **0.17.5 release audit (2026-11-27):** local four-package verification passes.
+> The dispatcher uses explicit start/dispatch/retry, child reports and parent
+> TODO completion; no automatic diff/check/accept engine remains. Review starts
+> only in Plan, execution TODOs are read-only there, and profile/role changes
+> switch live owners with one activation notice. Desktop staging/pin and live
+> provider/host acceptance were not reverified by this release.
 
 # Workflow ↔ Pi Desktop parity inventory (frozen baseline)
 
@@ -262,8 +270,8 @@ explicitly labelled NOT RUN), **Class**, **Owning plan step**.
 | Field | Detail |
 | --- | --- |
 | Terminal/W | `todo-service.ts`, `todo-panel.ts`, `todo-snapshot.ts`; `workflow_todo` tool (list/update/done/pending/add/toggle/sync/clear); widget/status `workflow-todos`; active-panel `/todos auto|show|expand|collapse|hide|clear` and terminal `Ctrl+Alt+O`; independent child run-scoped preference, empty/headerless child behavior, parent-only clear. Tests `todo-service.test.ts`, `todo-panel.test.ts`, `workflow-contributions.test.ts`, `todo-snapshot.test.ts`, `utils.todo.test.ts`. |
-| D current | Generic `progress`/`status` contributions + `TuiWidgetStrip` frames and generic action-group menu; Workflow's `todos` group is `Child todos` or `Todos` with stable action ids/verbs, while progress remains non-empty-only. No Workflow-specific parser or Workflow-specific Desktop keyboard path (`tests/architecture/no-workflow-adapters.test.ts`). Current W local package is 0.17.4; Desktop's staged Workflow pin remains at the approved baseline 0.15.0 pending later staging. |
-| Evidence | D generic rendering: `tests/host/contributions.test.ts`, `tests/renderer/contributions-bar.test.tsx`, `tests/renderer/tui-widgets.test.tsx`. W current local behavior: `todo-panel.test.ts` covers the empty child matrix, scope matching and decoding; `workflow-contributions.test.ts` exercises active `/todos` targeting and terminal shortcut, empty/hidden/headerless menu verbs, actual widget rendering/removal, run-scoped persistence/replay and parent-state isolation; `todo-service.test.ts` covers separate stores. D is still pinned to 0.15.0: these W changes are not yet in its staged artifact, and row 32's prior artifact evidence must not be read as verification of 0.17.4. Live Terminal/Desktop acceptance: **NOT RUN**. |
+| D current | Generic `progress`/`status` contributions + `TuiWidgetStrip` frames and generic action-group menu; Workflow's `todos` group is `Child todos` or `Todos` with stable action ids/verbs, while progress remains non-empty-only. No Workflow-specific parser or Workflow-specific Desktop keyboard path (`tests/architecture/no-workflow-adapters.test.ts`). Current W package is 0.17.5; the last pin recorded in this table was the 0.15.0 baseline. Desktop's current staged artifact must be checked independently. |
+| Evidence | D generic rendering: `tests/host/contributions.test.ts`, `tests/renderer/contributions-bar.test.tsx`, `tests/renderer/tui-widgets.test.tsx`. W current local behavior: `todo-panel.test.ts` covers the empty child matrix, scope matching and decoding; `workflow-contributions.test.ts` exercises active `/todos` targeting and terminal shortcut, empty/hidden/headerless menu verbs, actual widget rendering/removal, run-scoped persistence/replay and parent-state isolation; `todo-service.test.ts` covers separate stores. The prior Desktop artifact evidence was recorded for 0.15.0, not 0.17.5; this release did not re-stage or verify that bundle. Live Terminal/Desktop acceptance: **NOT RUN**. |
 | Class | **SUPPORTED** (generic rendering + real artifact panel/actions) |
 | Steps | 32, 37 |
 
