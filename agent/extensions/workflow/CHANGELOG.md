@@ -1,7 +1,42 @@
+# Changelog
+
+All notable changes to this package are documented in this file.
+
 ## [0.17.5] - 2026-11-27
 
-Local Workflow version **0.17.5**, not published to npm or GitHub. Live human
-acceptance is not verified by this entry.
+Release target: **0.17.5**, the first npm release after **0.13.0**. The
+0.14.0–0.17.4 sections below record development milestones included in this
+release, not separately published versions. Live human acceptance and Pi
+Desktop staging are **not verified** by this release.
+
+### Release overview and migration
+
+- **Breaking:** replaces the frozen/journaled execution engine with normal
+  markdown plans and a model-driven Orchestrator. Old engine runs are not
+  migrated; restart those from the approved plan. Each row uses an in-process
+  Build child; verification is ordinary visible bash, with no automatic
+  diff/check/acceptance engine.
+- **Breaking:** `/orchestrator <verb>` and `/review <verb>` replace the old
+  hyphenated command families. Reviewer body replacement and chunked plan
+  submission are removed. The Planner owns the body, the Reviewer owns its
+  appendix, and a bounded revision loop settles required changes before handoff.
+- Adds shell deadlines/quarantine, prompt refinement and its host-agnostic
+  composer contract, multi-repository rows, additive action groups/mode choices,
+  live profile/role model switching, and independent child TODO presentation.
+- Fixes dormant-run session ownership, child settle/report races, execution
+  TODOs firing during Plan/Review, shared safe-shell classification, and the
+  duplicate activation notices detailed below.
+- Maintains experimental Orchestrator status. Automated checks do not establish
+  real-provider, Terminal or Desktop acceptance.
+
+### Documentation and verification
+
+- Restores descending changelog milestone order, updates install/tested-version
+  examples, replaces obsolete operator instructions and clearly labels legacy
+  acceptance records. Desktop bundle pins must be checked independently.
+- Node 24.22.2: root release-tool tests and the four-package verification gate
+  pass, including typechecks, package tests, packed import closure and packed
+  extension load smoke tests.
 
 ### Fixed — one activation notice
 
@@ -111,6 +146,37 @@ fired while the Planner was only editing a plan.
   guard, the plan-preview panel and the `todoExecutionLive` table.
 - `README.md` documents the read-only Plan/Review list and the Build-kickoff
   ownership; `package.json` is `0.17.3`.
+
+## [0.17.2] - 2026-11-26
+
+Development milestone included in 0.17.5; the one-notice behavior in 0.17.5
+supersedes this milestone's per-owner notification channels.
+
+### Added — live profile and role switching
+
+- `/profile use`, profile-picker activation, `/profile use none`, `/role set`
+  and role-picker saves reconcile the live parent, reviewer and Build child in
+  place. The in-flight request keeps its old model; the next request uses the
+  new model without an abort, session restart or re-seeded review round.
+- Reviewer model labels, footer/status and `/review status` follow the applied
+  model. Refused switches retain the live model, warn with both model names,
+  and preserve the selection for the next child or round. A settling child is
+  left alone.
+- One display-only `workflow-model-switch` audit per owner records
+  `scope`/`role`, `from`, `to`, `ok`, `changed`, `at` and any error/reason.
+  The entry writer is silent. Scopes are `parent`, `reviewer`, `builder-child`
+  and child-local `child`.
+
+### Changed — the parent owns the launch model
+
+- A child-local profile switch affects only that in-process session through
+  `setModel(..., { persist: false })`. It never writes the global profile,
+  Workflow default model, native default model/thinking mirror, or the parent's
+  transcript/settings. The parent alone chooses new children's launch model.
+- Tests cover running/paused/handoff/warm-idle reviewers, refused switches,
+  each owner and audit scope, child-local settings isolation, and runtime/UI
+  model labels (`profile-live-switch`, `in-process-child`, `review-runtime`
+  and `review-ui` suites).
 
 ## [0.17.1] - 2026-11-26
 
@@ -428,11 +494,11 @@ settled record blocked Orchestrator, Plan, Build and Default alike.
   blocks with the corrected `/review mode` label. `/review abort` is the single
   explicit exit that stops the round or discards the pause and settles the gate,
   so no removed registration can drift from it.
-- **The 0.14.0 artifact is the parity target.** Pi Desktop's consumer fixtures
-  use the new grammar, and its lock pins the published `0.14.0` tarball by
-  registry URL plus tag, removing the manual GitHub release-asset step. The W
-  compatibility fixture now lists the two family commands instead of the ten
-  removed names; new coverage lives in `command-text.test.ts`,
+- **The 0.14.0 milestone was the parity target.** It was not separately
+  published to npm; the former claim of a published Desktop pin was incorrect.
+  Desktop staging must be verified independently. The W compatibility fixture
+  lists the two family commands instead of the ten removed names; new coverage
+  lives in `command-text.test.ts`,
   `orchestrator-command.test.ts`, `review-command.test.ts` and
   `review-command-handlers.test.ts`.
 
@@ -921,73 +987,6 @@ records.
   temp-output/structured channels are constrained. Glass tests cover excluded
   descendants, escapes, output modes, leaks, cancellation and mid-flight
   grant/exclusion/trust changes; Review Mode behavior is unchanged.
-
-# Changelog
-
-All notable changes to this package are documented in this file.
-
-## [0.17.2] - 2026-11-26
-
-This patch makes a `/profile` or `/role` selection switch the live owners in
-place instead of waiting for the next child/round. Version bumped by this
-change, **not published**. The plan assumed a `0.16.0` base and a `0.16.1`
-patch, but the live tree already carried the Planner/Reviewer `0.17.1` work, so
-the fresh unreleased patch is `0.17.2` — there is no downgrade. The older
-`0.16.0` release remains its own approval item.
-
-### Added — final `/profile` live-switch contract
-
-- **Triggers.** `/profile use`, the profile picker's activate action,
-  `/profile use none`, `/role set` and a `/role` picker save all run the same
-  reconciliation. The in-flight request keeps the old model; the next provider
-  request uses the new one. Nothing is aborted, no session is restarted and no
-  review round is re-seeded. The warm reviewer keeps its session: its recorded
-  model key and `ReviewState.modelLabel` are updated, so the footer, status
-  line, `/review status` and the next round all agree with what actually runs.
-- **One durable audit per owner.** Every activation appends exactly one
-  display-only `workflow-model-switch` entry (`scope`/`role`, `from`, `to`,
-  `ok`, `changed`, `at`, plus `error`/`reason` when present) with a Desktop
-  renderer. Scopes are `parent`, `reviewer`, `builder-child` and `child`; the
-  `role` alias keeps older transcript readers working. An entry never notifies.
-- **Single notice channel.** The activation summary (`notifyWorkflow`) or the
-  review notice (`notifyReview`) is the only user-facing message for each
-  owner; the entry writer is silent. When no reviewer or live child will report
-  its own switch, the parent summary names the child notice channel once so
-  the activation is not silent. A refused switch keeps the live owner's model,
-  warns with both models and still applies the new model to the next child or
-  round.
-
-| Owner / state | What switches live | Notice + audit |
-| --- | --- | --- |
-| **Plan** (parent) | This chat's planner model; no live reviewer/child activity is implied | one `notifyWorkflow` summary + one `parent` entry |
-| **Build** (parent) | This chat's builder model | one `notifyWorkflow` summary + one `parent` entry |
-| **Orchestrator parent** | Parent chat plus the live Build child (a `settling` child is left alone); the next child starts on the same selection | parent summary + `parent` entry; the child reports once through `notifyWorkflow` + `builder-child` entry |
-| **Review** running / paused / review-owned handoff / warm-idle | The existing reviewer session, in place; an automatic Plan-loop prefetch session is not a live owner and is picked up at its next round | one `notifyReview` notice + one `reviewer` entry; `/review status` prints the applied model once |
-| **Default** | The profile's `defaultModel` switches this chat when present; otherwise roles apply on the next mode/role use. No live child/reviewer is reconciled | one activation notice + one `parent` entry |
-| **Managed Build child** | Its own session model only (see below) | one child-local notice + one `child` entry in the child transcript |
-
-### Changed — the parent owns the launch model (2026-11-26)
-
-- A managed in-process Build child may run `/profile use` for its own row, but
-  it is a session-scoped choice only: the child still switches its own live
-  model through `applyModeModel` / `pi.setModel` (`setModel(..., { persist:
-  false })`), while `workflow.defaultProfile`, `workflow.modelDefault` and Pi's
-  native `defaultProvider` / `defaultModel` / `defaultThinkingLevel` mirror are
-  never written from the child. A child `model_select` mirror is refused too.
-  The parent remains the sole owner of the profile and model every new child
-  launches with; a child has no channel back to the parent's settings or
-  transcript, and live reviewer / Build-child reconciliation stays parent-only.
-- The child-local switch is audited as one `workflow-model-switch` entry with
-  scope `child` in the child transcript; no parent/reviewer/builder-child entry
-  and no default-model-skip entry are emitted for a child-local activation.
-- `profile-live-switch.test.ts` covers the running, paused, handoff-owned and
-  warm-idle reviewer, the refused switch, the parent's live-builder entry,
-  the single notice/entry contract for Plan, Build, Orchestrator, Default,
-  `/profile use none`, child-tab and `/role` activation, and the
-  footer/status model ownership. `in-process-child.test.ts` covers the missing
-  global writes, the child's own model change, the child-scoped audit and a
-  child `model_select` mirror refusal; `review-runtime.test.ts` and
-  `review-ui.test.ts` cover the runtime switch and durable entry renderer.
 
 ### Changed — Orchestrator runs an in-process Build child (no window or tab)
 
@@ -2558,10 +2557,6 @@ Behaviour deliberately unchanged: the fallback (the author's plan is handed over
 
 Tests: 7 new cases in `review.test.ts` — `truncateErrorText`, the translator's provider lines, the decoder matrix, and runtime rounds asserting the new reason (including an error-stop run with no retries and the no-leak-into-pass-2 guarantee); the legacy no-submission regression test still passes. The README gains a troubleshooting entry keyed on the new message.
 
-## [0.3.1] - 2026-09-20
-
-- No user-facing changes recorded.
-
 ## [0.3.2] - 2026-09-21
 
 ### Fixed — Review Mode: any provider works as the reviewer
@@ -2738,6 +2733,10 @@ Tests: 7 new cases in `review.test.ts` — `truncateErrorText`, the translator's
 
 Tests: `pane.test.ts` removed; new `review-ui.test.ts` covers the buffer, formatters and
 renderers; `review.test.ts` adds the input-routing truth table and runtime streaming tests.
+
+## [0.3.1] - 2026-09-20
+
+- No user-facing changes recorded.
 
 ## [0.3.0] - 2026-09-18
 

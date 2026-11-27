@@ -35,13 +35,16 @@ reads the approved plan, binds one row per step with `orchestrator_start`
 child per row with that row’s root as `cwd`. The child owns its TODO list and
 verification; the parent trusts its report, marks the row done with
 `workflow_todo` and dispatches the next. A blocked report wakes the parent to
-inspect and amend the instruction. Verification is ordinary bash whose real
-output is visible — there is no journal, frozen snapshot, diff gate, repair
-round, final gate or `workflow_execution` tool. A reload restores the run
-record as `interrupted`; old runs are not resumed.
+inspect the report: in-scope work is retried with amended instructions; an
+external policy/user blocker is disclosed, not retried. Verification is ordinary
+bash whose real output is visible — there is no journal, frozen snapshot, diff
+gate, repair round, final gate or `workflow_execution` tool. A reload restores
+the current record without launching work; a running phase becomes
+`interrupted`. Old frozen/journaled runs are not migrated.
 
 Mode entry alone never launches work, existing Plan → Review → Build remains the
-default, and a managed child can never auto-commit, push or accept its own work.
+default. A managed child follows the normal Build commit policy and cannot
+mark the parent's row accepted or bypass permission gates.
 The dispatcher is **experimental**: real provider turns and visible-terminal
 acceptance still need a human run (see
 [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md) and
@@ -70,9 +73,9 @@ Revocation stops future disclosure — it cannot recall provider data already
 sent. A conflict is never overwritten; the original draft stays recoverable.
 Pi Desktop can bundle a pinned Workflow artifact with explicit
 override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
-checkout. Tested against Workflow **0.14.0** + Pi SDK **1.5.0**; semantic quality
-and live desktop/Terminal acceptance remain human-verified, not inferred from
-unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
+checkout. Tested against Workflow **0.17.5** + Pi SDK **1.5.0**; semantic quality
+and live desktop/Terminal acceptance still require human verification, not
+inference from unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
 and the Pi Desktop
 [`architecture/extension-ui.md`](https://github.com/dieuluucanh/pi-desktop/blob/main/docs/architecture/extension-ui.md)
 composer-transform contract.
@@ -88,7 +91,7 @@ pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
 # pinned, for reproducible installs
-pi install npm:@dieulc/workflow@0.14.0
+pi install npm:@dieulc/workflow@0.17.5
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
@@ -123,7 +126,7 @@ First `pi` run prompts to **trust** the project — approve. Missing `npm:` pack
 
 ## Updating
 
-- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.2.0` to pin)
+- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.17.5` to pin)
 - Dotfiles: `cd ~/.pi && git pull`, then `pi update --extensions`
 
 ## Developing
@@ -160,7 +163,7 @@ npm run release -- --packages workflow,autocompact --bump minor --yes
 What a release does: preflight (clean tree, `main`, npm auth) → verify (including the packed import closure and a load test of the packed file set) → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
 
 - `--bump none` publishes the current version as-is (first publish, or resuming).
-- `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.
+- `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped. Use `--packages workflow --continue` when version and curated changelog changes are already committed; it preserves those notes instead of generating a duplicate section.
 - A package whose target version is already on npm is **skipped, never fatal** — the rest of the batch is still published, tagged and pushed, and a missing tag for an already-published version is repaired. Add a bump to actually release it again, and always pass flags after `--` (`npm run release -- --continue`).
 - `--no-push` stops before `git push`.
 

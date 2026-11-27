@@ -291,7 +291,7 @@ rows it already understands.
 
 #### Contribution compatibility
 
-| Capability | 0.13.0 (Desktop's pinned/staged artifact) | 0.14.0 | 0.15.0 (this checkout) |
+| Capability | 0.13.0 (previous npm release) | 0.14.0 milestone | 0.17.5 (this release; additions since 0.15.0) |
 | --- | --- | --- | --- |
 | `action.group` / `placement` | absent; extra fields are ignored | absent | published (`inline` + `menu`) |
 | `kind: "mode-choice"` / slot | absent; older host drops the unknown kind | absent | published; four choices, same-owner `actionRef` |
@@ -299,13 +299,13 @@ rows it already understands.
 | Review controls | standalone action/status only | `/review pause\|resume\|abort` status hints | inline Pause/Resume + Abort group |
 | Child status | `orchestrator-child` status row | same | removed; `workflow-orchestrator` line only |
 
-`0.13.0` is the real version in Pi Desktop's `resources/workflow.lock.json` and
-in its staged `resources/extensions/workflow` bundle; it is not shorthand for
-"old". This checkout is **0.15.0** (it was 0.14.0 before this release), and the
-new publisher uses the current verb grammar. The 0.15.0 package has **not** been
-staged into Desktop: the staged bundle remains the 0.13.0 build with hyphenated
-commands and no groups or mode choices. A 0.15.0 host consumes the additions
-additively; a 0.13.0 host keeps the rows it ships with.
+This package is **0.17.5**; the previous npm release was **0.13.0**.
+The intervening changelog versions are development milestones, not separate
+published artifacts. Hosts supporting groups and mode choices consume these
+additions additively; older hosts keep supported rows. Publishing Workflow does
+not update Pi Desktop's bundled artifact. Check that repository's
+`resources/workflow.lock.json` and staged bundle for its actual pin; Desktop
+staging and live acceptance were not verified by this release.
 
 #### Composer transform (frozen wire contract)
 
@@ -428,8 +428,10 @@ Why this change is needed.
 ```
 
 `## Steps` (or a numbered list under `## Plan Steps`) is the human plan; the
-model turns it into TODO rows with `workflow_todo`. `## Verification` is a
-normal list of commands the model runs before the last row is marked done.
+model supplies one row per step to `orchestrator_start` for Orchestrator,
+or creates the execution list with `workflow_todo` in direct Build.
+Plan/Review cannot mutate that execution list. `## Verification` is a normal
+list of commands the model runs before the last row is marked done.
 Nothing parses the plan, validates a schema, compiles checks or reads
 `Acceptance:`/`Files:` metadata at runtime. Old plans with those sections are
 still readable — the extra sections are simply prose.
@@ -599,7 +601,7 @@ Plan Mode (main session) ──plan file──▶ Review Mode (child session, ga
 - **Approve** in Plannotator → the destination chooser (direct Build or Orchestrator), not immediate execution; review activity suspends but the reviewer session stays warm for the next round.
 - **Feedback** → Plan revises, Review re-reviews the revision, Plannotator reopens.
 - **A broken Plannotator is never a dead end.** Every handoff path (automatic, `/review`, `/review resume`, a closed browser tab) falls back to the workflow's own questionnaire: the plan is appended to the transcript (scroll up to read it), and `Approve plan (choose execution next)` / `Give feedback (stay in Plan)` / `Skip for now (stay in Plan)` are pinned at the bottom. The fallback keeps the SAME handoff record, so its identity and recommendation survive; a late browser event cannot act on the native decision.
-- **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with direct Build and Orchestrator as equal options, plus *Decide later*. No destination is saved or recommended. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build sends one execute turn in this session; Orchestrator freezes the plan into one TODO row per step and starts the first visible Build child immediately.
+- **Approval is not execution.** Approving the plan (in Plannotator or natively) records the approval and immediately opens a second, separate question: *Plan approved — where should it run?* with direct Build and Orchestrator as equal options, plus *Decide later*. No destination is saved or recommended. Cancelling the chooser keeps the approval: the session stays in Plan with no work started, and `/handoff continue <id>` reopens the chooser while the plan is unchanged. Direct Build sends one execute turn in this session; Orchestrator sends a kickoff so the model binds one TODO row per step with `orchestrator_start`, then explicitly calls `orchestrator_dispatch` for the first in-process Build child.
 - **Any failure** (missing model, unauth'd provider, abort, error) → the author's plan is handed over unchanged with a warning. Review Mode never blocks the plan. A pass whose run ends without a `review_submit` submission fails *immediately* (the settle race), so a silent reviewer cannot hang the round. `timeoutMs` defaults to **5 minutes**; set `0` to opt out into unlimited, and a pass that outlives the cap is aborted — though a plan submitted before the deadline is always kept.
 
 ### Enabling
@@ -755,8 +757,8 @@ review or hand off while the retried run owns the plan.
 When the budget is spent with notes still open, the loop stops without
 converging: the handoff says so, and **Approve** accepts the plan as written
 while **Give feedback** continues the argument. The loop runs for the
-automatic post-Plan review and for `/review` in Plan mode; `/review` outside
-Plan mode is still the one-shot review.
+automatic post-Plan review and for `/review` in Plan mode. Starting or resuming
+review outside Plan refuses; status, pause and abort remain recovery controls.
 
 The appendix is **reference, not authority**: the approved plan body wins on
 any conflict, and the revision argument belongs in Plan, before approval — not
@@ -769,11 +771,10 @@ kickoff, no unbound-notes section in the mission, no note-to-row binding. The
 number of plan steps is the model's call (one step per row), never a heuristic
 over the file, so a long plan cannot produce a false step-count warning.
 
-**Which build runs the loop.** The live extension is loaded from the checkout
-at `C:/Users/Lenovo/.pi/agent/extensions/workflow` (the W checkout), so a Pi
-session pointed at it has the loop. A packaged Pi Desktop runs its own pinned
-bundle of this extension, so a Desktop build shows the loop only after that pin
-is bumped — re-pinning is a separate release step, not part of this plan.
+**Which build runs the loop.** Workflow **0.17.5** includes the loop, whether
+loaded from npm or a checkout. A packaged Pi Desktop uses its own pinned bundle,
+so it gains the loop only after that artifact is updated. Re-pinning and Desktop
+acceptance are separate release steps, not established by publishing this package.
 
 The chunked `review_plan_begin` / `review_plan_chunk` / `review_plan_finalize`
 write path, the assembled-body submission and the `chunkedSubmit`/`chunkChars`
@@ -1156,11 +1157,11 @@ these paths.
 | Apply | `setEditorText` with an expected-buffer check | CAS apply on the exact draft revision + idempotent receipt |
 | Old host / old extension | — | Additive fallback: text/status only, `attachmentAware: false` |
 
-**Tested versions.** This checkout is Workflow **0.15.0** against Pi SDK
-**1.5.0** (Pi Desktop's exact pin). Pi Desktop's staged/pinned artifact is the
-published **0.13.0** bundle, which predates the contribution additions above;
-the composer-transform handshake is verified against unmodified SDK 1.5, and
-automated suites are listed under [Development](#development) and in W `docs/`.
+**Tested versions.** This release is Workflow **0.17.5** against Pi SDK
+**1.5.0**. The composer-transform handshake is verified against unmodified SDK
+1.5, and automated suites are listed under [Development](#development) and in
+W `docs/`. Pi Desktop's bundled version is independent; this release does not
+establish its current pin or prove live Desktop acceptance.
 
 ### Honest acceptance limits
 

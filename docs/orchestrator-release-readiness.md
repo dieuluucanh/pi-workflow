@@ -6,7 +6,7 @@
 
 # Orchestrator release readiness (coordinated, opt-in)
 
-> **Updated 2026-11-23 — in-process Build child.** The external child chain
+> **Historical 2026-11-23 contract — removed, not current instructions.** The external child chain
 > (Desktop tab / Terminal window / `pi --session` / child host / IPC / start-ack
 > / workspace lease) is removed. The current contract is:
 >
@@ -33,7 +33,7 @@
 
 > **Superseded 2026-11-22 (Orchestrator simplification).** The
 > propose → preview → execution-approval pipeline described in the older body of
-> this document no longer exists. The current contract is:
+> this document no longer exists. The following was the intermediate contract:
 >
 > - plan approval (or an agreed standalone discussion) freezes ONE TODO list
 >   (one row per top-level plan step) via `orchestrator_start`;
@@ -51,7 +51,10 @@
 >
 > See the package README and CHANGELOG for the current operator contract.
 
-Status: **prepared, not released**. No publish, tag or push was performed. Both
+Historical status at the time of this record: **prepared, not released**.
+No publish, tag or push was performed by that preparation. For Workflow 0.17.5,
+use [current operations](orchestrator-operations.md) and npm/git release state;
+this record does not establish publication or live acceptance. Both
 repositories keep their current versions (`@dieulc/workflow` 0.13.0,
 `pi-desktop` 0.11.0); promotion requires the user's explicit release
 authorization.

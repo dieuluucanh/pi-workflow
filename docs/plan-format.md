@@ -2,8 +2,10 @@
 
 > **Current (2026-11-24).** A plan is a normal markdown document. There is no
 > schema, no compiler, no lint, no freeze gate and no executable-check block.
-> The model reads the plan, creates TODO rows with `workflow_todo`, and runs the
-> `## Verification` commands as ordinary bash.
+> In execution, the model supplies rows to `orchestrator_start` for Orchestrator
+> or creates them with `workflow_todo` in direct Build, and runs
+> `## Verification` commands as ordinary bash. Plan/Review only reads the
+> execution TODO list; it cannot mutate it.
 
 ## Where a plan lives
 
@@ -67,8 +69,9 @@ therefore has two owners:
 - **the Planner owns the body** — everything above the appendix, including
   `## Steps` and `## Verification`;
 - **the Reviewer owns the appendix** — the findings changelog and the
-  `### Required changes` list (`- **R2 · Step 3:** …`), with stable `R<n>` ids
-  normalised to submission order.
+  `### Required changes` list (`- **R2 · Step 3:** …`), with per-round `R<n>`
+  ids. Omitted ids are assigned in submission order; explicit ids must match
+  that grammar and be unique in the round.
 
 Neither side writes the other's half. The reviewer has no tool that edits the
 body, and a Planner revision turn that touches the appendix is refused.
@@ -95,8 +98,8 @@ body, and a Planner revision turn that touches the appendix is refused.
 When the budget is spent with notes still open the loop stops without
 converging: the handoff says so, **Approve** accepts the plan as written and
 **Give feedback** continues the argument. The loop covers the automatic
-post-Plan review and `/review` in Plan mode; `/review` outside Plan mode stays
-a one-shot review.
+post-Plan review and `/review` in Plan mode. Outside Plan, starting or resuming
+a review refuses; status, pause and abort remain recovery controls.
 
 ### What downstream reads
 
@@ -131,7 +134,9 @@ is approved and executed like any other plan.
 - The model runs the plan's `## Verification` as ordinary bash before the last
   row is done and states exactly what it ran. The real command and its output
   are visible; there is no hidden gate.
-- Reload does not resume a run. Restart from the approved plan.
+- Reload never auto-launches work. Current run records can be recovered with
+  explicit dispatch/retry; old frozen/journaled runs must restart from the
+  approved plan.
 
 See [`plan-template.md`](plan-template.md) for a skeleton and
 [`plan-migration.md`](plan-migration.md) for the breaking-change note.
