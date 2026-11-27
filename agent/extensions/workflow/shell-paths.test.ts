@@ -347,10 +347,14 @@ test("shell: powershell keeps C:/tmp (no MSYS translation)", () => {
 
 test("shell: a POSIX-style cwd is not MSYS-translated", () => {
   if (process.platform !== "win32") return;
+  // A drive-less POSIX cwd is anchored to the drive of the running workspace
+  // (the CI checkout lives on D:), so the expectation follows the workspace
+  // instead of assuming C:.
+  const workspaceRoot = path.parse(process.cwd()).root;
   withMsysEnv(() => {
     assert.deepEqual(
       readPaths(analyzeWithOptions("tail /tmp/tc.log", "/tmp/proj", { family: "posix" })),
-      ["c:/tmp/tc.log"],
+      [norm(path.join(workspaceRoot, "tmp", "tc.log"))],
     );
   });
 });
@@ -363,6 +367,32 @@ test("shell: /tmpfoo is not /tmp", () => {
       [norm("/tmpfoo/x")],
     );
   });
+});
+
+test("msys: an 8.3 short temp alias resolves to its canonical long path", () => {
+  if (process.platform !== "win32") return;
+  // A runner can export `TEMP=C:\Users\RUNNER~1\AppData\Local\Temp` whose
+  // canonical spelling is `C:\Users\runneradmin\...`. `/tmp` must resolve to
+  // the folder's real identity so policy roots (always canonicalised) match.
+  const env = {
+    MSYSTEM: "MINGW64",
+    TMP: "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp",
+  };
+  const exists = () => true;
+  const realpath = () => "C:\\Users\\runneradmin\\AppData\\Local\\Temp";
+  assert.equal(
+    resolveMsysTempRoot({ env, platform: "win32", exists, realpath }),
+    realpath(),
+  );
+  assert.equal(
+    translateMsysTempPath("/tmp/tc.log", {
+      env,
+      platform: "win32",
+      exists,
+      realpath,
+    }),
+    `${realpath()}/tc.log`,
+  );
 });
 
 test("msys: /tmp translation is prefix-exact, opt-in and injectable", () => {

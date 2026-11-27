@@ -226,6 +226,10 @@ export function createGuardedReadTool(
     name: "read",
     async execute(...args: unknown[]): Promise<InspectionToolResult> {
       const input = (args[1] ?? {}) as Record<string, unknown>;
+      const signal = args[2] as AbortSignal | undefined;
+      // Cancellation is decided before policy: an already-aborted call must
+      // reject deterministically instead of returning a refusal/result.
+      throwIfAborted(signal);
       const before = resolveSet(deps, ceiling);
       const requested = inputPath(input);
       const decision = evaluateInspectionTarget(
@@ -236,9 +240,7 @@ export function createGuardedReadTool(
       );
       if (!decision.allowed) return refusal("read", decision);
       const result = (await definition.execute(...args)) as InspectionToolResult;
-      if (isAborted(args[2] as AbortSignal | undefined)) {
-        throw new Error("Operation aborted");
-      }
+      throwIfAborted(signal);
       return finalize("read", result, input, deps, ceiling, before, [
         { path: requested, kind: "file" },
       ]);
@@ -260,6 +262,7 @@ export function createGuardedLsTool(
     async execute(...args: unknown[]): Promise<InspectionToolResult> {
       const input = (args[1] ?? {}) as Record<string, unknown>;
       const [signal] = [args[2] as AbortSignal | undefined];
+      throwIfAborted(signal);
       const before = resolveSet(deps, ceiling);
       const requested = inputPath(input) || deps.cwd;
       const decision = evaluateInspectionTarget(
@@ -269,7 +272,6 @@ export function createGuardedLsTool(
         deps.cwd,
       );
       if (!decision.allowed) return refusal("ls", decision);
-      if (isAborted(signal)) throw new Error("Operation aborted");
       const result = (await definition.execute(...args)) as InspectionToolResult;
       throwIfAborted(signal);
 
@@ -343,6 +345,7 @@ export function createGuardedFindTool(
     async execute(...args: unknown[]): Promise<InspectionToolResult> {
       const input = (args[1] ?? {}) as Record<string, unknown>;
       const signal = args[2] as AbortSignal | undefined;
+      throwIfAborted(signal);
       const before = resolveSet(deps, ceiling);
       const requested = inputPath(input) || deps.cwd;
       const decision = evaluateInspectionTarget(
@@ -352,7 +355,6 @@ export function createGuardedFindTool(
         deps.cwd,
       );
       if (!decision.allowed) return refusal("find", decision);
-      if (isAborted(signal)) throw new Error("Operation aborted");
       const result = (await definition.execute(...args)) as InspectionToolResult;
       throwIfAborted(signal);
 
@@ -534,6 +536,7 @@ export function createGuardedGrepTool(
     async execute(...args: unknown[]): Promise<InspectionToolResult> {
       const input = (args[1] ?? {}) as Record<string, unknown>;
       const signal = args[2] as AbortSignal | undefined;
+      throwIfAborted(signal);
       const pattern = typeof input.pattern === "string" ? input.pattern : "";
       if (!pattern) return errorResult("grep", "pattern is required");
       const before = resolveSet(deps, ceiling);
@@ -545,7 +548,6 @@ export function createGuardedGrepTool(
         deps.cwd,
       );
       if (!decision.allowed) return refusal("grep", decision);
-      throwIfAborted(signal);
 
       let regex: RegExp;
       try {
