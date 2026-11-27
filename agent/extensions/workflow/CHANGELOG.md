@@ -1,3 +1,31 @@
+## [0.17.5] - 2026-11-27
+
+Local Workflow version **0.17.5**, not published to npm or GitHub. Live human
+acceptance is not verified by this entry.
+
+### Fixed — one activation notice
+
+- **No duplicated `/profile use` block.** Every live-owner summary now arrives
+  in one info notice. The Pi TUI `showStatus` renders each info row from one
+  mutable `lastStatusMessage`, so a row created before the next entry could be
+  repainted with a later message; the extension guarantees one info notice per
+  command and never interleaves durable entries between two info notices.
+- **One info notice per command.** The entry writer never notifies: each
+  activation, role, delete and editor command emits exactly one info notice,
+  after every durable entry, with the default profile, default model,
+  Default-mode model and live reviewer/builder-child/settling-child lines
+  folded into it.
+- **Applied-switch info notices removed.** The reviewer line no longer raises a
+  separate `notifyReview` info notice; when folded into the neutral activation
+  notice it is deliberately unprefixed (profile/role summary content), while
+  reviewer-authored warnings keep the `Review Mode:` prefix. The notify-scope
+  audited set drops from 29 to 28 review-owned call sites.
+- **`/role set`, `/role use`, the `/role` picker, profile delete and the
+  profile editor** fold their summary into the same single activation notice
+  instead of emitting an extra info row.
+- **Tests:** `profile-live-switch.test.ts` (30), the profiles composer tests and
+  `notify-scope.test.ts` (audited set 28) cover the one-notice contract.
+
 ## [0.17.4] - 2026-11-27
 
 Local Workflow version **0.17.4**, not published to npm or GitHub. Desktop staging

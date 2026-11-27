@@ -1,12 +1,23 @@
 /**
  * `/profile use` must switch LIVE roles and leave a durable audit entry.
  *
- * These tests drive the real extension factory through the fake Pi host. They
- * cover the warm reviewer (running, paused, handoff, warm-idle), the live
- * Build child, and the single-notice/single-entry activation contract for
- * Plan, Build, Orchestrator, Default, `/profile use none`, child-tab and
- * `/role` activation. The missing behaviour is intentionally left to a later
- * row: every case below is red against the current source.
+ * These tests drive the real extension factory through the fake Pi host.
+ *
+ * The first three sections (live review line/status ownership, the warm
+ * reviewer and the parent-side builder child) pin the CURRENT switch/audit
+ * contract. They are green against the current source and must stay green:
+ * the live reviewer/child really is switched in place and the
+ * `workflow-model-switch` entry is really appended.
+ *
+ * Only the "single info notice" section at the bottom is the regression
+ * target. It pins the tighter, still-missing contract: one `/profile use`,
+ * `/profile use none`, `/role set` or `/role use` must produce EXACTLY ONE
+ * info notification - the summary, with the `Default profile ...` line and any
+ * live-owner (`Live reviewer →`, `Live Builder →`, `Workflow <mode>: model →`)
+ * line folded into it - as the last notification of the measured slice, on top of one
+ * durable `workflow-model-switch` entry with `changed === true`. Those
+ * assertions are expected to fail today (an activation currently emits 2–4
+ * info notices).
  */
 
 import { test } from "node:test";
@@ -40,7 +51,13 @@ const PROFILE = {
     planner: { provider: "p", id: "planner", thinking: "high" },
     builder: { provider: "p", id: "builder", thinking: "medium" },
     reviewer: { provider: "p", id: "reviewer", thinking: "xhigh" },
+    // Needed for the reported scenario: without it the orchestrator mode entry
+    // applies the BASE orchestrator model and `/profile use live` resolves the
+    // same model, so the switch under test would be a no-op.
+    orchestrator: { provider: "p", id: "orchestrator", thinking: "max" },
   },
+  // Base role models (roles.ts seedDefaultRoles) are opencode-go/*; the profile
+  // models above are p/*, so every activation is a real model change.
   defaultModel: { provider: "p", id: "default", thinking: "medium" },
 };
 
@@ -62,6 +79,8 @@ interface Boot {
   made: ReturnType<typeof makeFakeCtx>;
   capture: FakeCapture;
   childFactory: ReturnType<typeof makeFakeOrchestratorChildFactory>;
+  /** The project root the fake ctx reports; owns `<cwd>/.pi/settings.json`. */
+  cwd: string;
   planPath: string;
   /** The in-flight `/review` command, so a warm-idle test can await its exit. */
   reviewRun?: Promise<void>;
@@ -165,6 +184,7 @@ async function boot(over: {
     made,
     capture,
     childFactory,
+    cwd,
     planPath,
     async cleanup() {
       try {
@@ -177,6 +197,39 @@ async function boot(over: {
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Read-modify-write the project settings file `boot()` created
+ * (`<cwd>/.pi/settings.json`), deep-merging into the existing `workflow`
+ * object so `commitPolicy`/`reviewMode` survive.
+ *
+ * `workflow.defaultProfile` is deliberately written AFTER `boot()` and BEFORE
+ * the mode entry: session_start seeds `activeProfileName` from that key when
+ * the session has no explicit choice (index.ts:16052-16075), which would turn
+ * the measured `/profile use live` into applyModeModel's already-on-target
+ * branch. Writing it after the boot keeps the seeding out of the way while
+ * making persistDefaultProfileChoice silent (before === after).
+ */
+function writeProjectSettings(
+  cwd: string,
+  add: Record<string, unknown>,
+): void {
+  const file = path.join(cwd, ".pi", "settings.json");
+  const existing = JSON.parse(fs.readFileSync(file, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  const merged: Record<string, unknown> = { ...existing };
+  for (const [key, value] of Object.entries(add)) {
+    if (key !== "workflow") {
+      merged[key] = value;
+      continue;
+    }
+    const current = (merged.workflow ?? {}) as Record<string, unknown>;
+    merged.workflow = { ...current, ...(value as Record<string, unknown>) };
+  }
+  fs.writeFileSync(file, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
 }
 
 /** A review round that never submits, so the reviewer stays live. */
@@ -521,14 +574,58 @@ test("profile live switch: the parent audits a running builder-child entry", asy
 
 // ── Single notice / single entry activation contract ─────────────────
 
+/** Base sentence of the single info notice, per activation direction. */
+const PROFILE_ACTIVATED = "Profile ⚡ live activated:";
+const PROFILE_DEACTIVATED = "Profile deactivated — default roles flow active.";
+
+/** Every notification of a measured slice, levels included, for messages. */
+function noticesText(b: Boot, from: number): string {
+  return JSON.stringify(
+    b.made.notifies
+      .slice(from)
+      .map((n) => `${n.level ?? "none"}: ${n.message}`),
+  );
+}
+
+/** The info-level notifications of a measured slice (undefined counts as info). */
+function infoNotices(
+  b: Boot,
+  from: number,
+): Array<{ message: string; level?: string }> {
+  return b.made.notifies
+    .slice(from)
+    .filter((n) => n.level === undefined || n.level === "info");
+}
+
+/** A live-owner notice sent on its own channel instead of folded in. */
+function separateLiveOwnerNotices(
+  b: Boot,
+  from: number,
+): Array<{ message: string; level?: string }> {
+  return b.made.notifies
+    .slice(from)
+    .filter((n) => /^\s*(Review Mode:\s*)?Live (reviewer|Builder) →/.test(n.message));
+}
+
 async function activationCase(over: {
   mode?: "plan" | "build" | "orchestrator" | "default";
   args?: string;
   childTab?: boolean;
   role?: boolean;
+  /** Enter `live` in the unmeasured region first, so `use none` really switches. */
+  activateFirst?: boolean;
+  /** Enable the RED single-info-notice regression assertions. */
+  expectSingleInfo?: boolean;
 }): Promise<void> {
   const b = await boot({ orchestrator: over.mode === "orchestrator" });
   try {
+    // Variant (a): the key pre-exists, so the activation's own
+    // persistDefaultProfileChoice sees before === after and stays silent. It is
+    // written AFTER session_start on purpose: the boot time seeding of
+    // activeProfileName from `workflow.defaultProfile` (index.ts:16052-16075)
+    // would otherwise turn the measured `/profile use live` into
+    // applyModeModel's already-on-target branch (changed === false).
+    writeProjectSettings(b.cwd, { workflow: { defaultProfile: "live" } });
     if (over.mode === "orchestrator") {
       await b.pi.commands["orchestrator"].handler("", b.ctx);
     } else if (over.mode === "plan" || over.mode === "build") {
@@ -546,10 +643,15 @@ async function activationCase(over: {
       assert.ok(role, "role must be registered");
       await role.handler("set builder p/builder", b.ctx);
     }
+    if (over.activateFirst) await activate(b);
     const before = b.made.notifies.length;
+    const entriesBefore = switchEntries(b).length;
     await activate(b, over.args ?? "use live");
-    const notices = b.made.notifies.slice(before).map((n) => n.message);
-    const entries = switchEntries(b);
+    const all = b.made.notifies.slice(before);
+    const notices = all.map((n) => n.message);
+    // Only the entries the MEASURED switch appended (an unmeasured
+    // `activateFirst` legitimately leaves its own entry behind).
+    const entries = switchEntries(b).slice(entriesBefore);
     assert.equal(
       entries.length,
       1,
@@ -567,6 +669,61 @@ async function activationCase(over: {
       1,
       `exactly one live-switch notice expected (saw ${JSON.stringify(notices)})`,
     );
+    if (over.expectSingleInfo) {
+      // The switch must really have happened: one durable entry that moved
+      // the model. `from` is deliberately not pinned - it is whatever the mode
+      // entry (or the unmeasured `use live`) left as the live model.
+      const [entry] = entries;
+      assert.equal(
+        entry.changed,
+        true,
+        `the switch must report changed===true (saw ${JSON.stringify(entry)})`,
+      );
+      assert.notEqual(
+        entry.from,
+        entry.to,
+        `the switch must move the model (saw ${JSON.stringify(entry)})`,
+      );
+      // Exactly one info notice, carrying the whole activation, and last.
+      const infos = all.filter((n) => n.level === undefined || n.level === "info");
+      assert.equal(
+        infos.length,
+        1,
+        `exactly one info notice expected (saw ${infos.length} info of ${all.length} notifications: ${noticesText(b, before)})`,
+      );
+      assert.equal(
+        all.at(-1),
+        infos[0],
+        `the single info notice must be the last notification (saw ${noticesText(b, before)})`,
+      );
+      const base =
+        over.args === "use none" ? PROFILE_DEACTIVATED : PROFILE_ACTIVATED;
+      assert.ok(
+        infos[0].message.startsWith(base),
+        `the single info notice must start with ${JSON.stringify(base)} (saw ${JSON.stringify(infos[0].message)})`,
+      );
+      if (over.args === "use none") {
+        // The deactivation clears the pre-written default profile, so the
+        // folded `Default profile cleared (...)` line is expected.
+        assert.match(
+          infos[0].message,
+          /Default profile cleared \(/,
+          `the cleared default profile must be folded into the single notice (saw ${JSON.stringify(infos[0].message)})`,
+        );
+      } else {
+        // Variant (a) is already on "live", so nothing is re-written.
+        assert.doesNotMatch(
+          infos[0].message,
+          /Default profile →/,
+          `an unchanged default profile must not be re-announced (saw ${JSON.stringify(infos[0].message)})`,
+        );
+      }
+      assert.equal(
+        separateLiveOwnerNotices(b, before).length,
+        0,
+        `no separate live-owner info notice expected (saw ${noticesText(b, before)})`,
+      );
+    }
   } finally {
     await b.cleanup();
   }
@@ -586,3 +743,287 @@ test("profile live switch: child-tab activation uses the single notice/entry cha
   activationCase({ mode: "orchestrator", childTab: true }));
 test("profile live switch: /role activation uses the single notice/entry channel", () =>
   activationCase({ role: true }));
+
+// ── RED: one info notice per switch (regression target) ──────────────
+
+test("profile switch notice: Plan activation emits exactly one info notice", () =>
+  activationCase({ mode: "plan", expectSingleInfo: true }));
+test("profile switch notice: Build activation emits exactly one info notice", () =>
+  activationCase({ mode: "build", expectSingleInfo: true }));
+test("profile switch notice: Orchestrator parent activation emits exactly one info notice", () =>
+  activationCase({ mode: "orchestrator", expectSingleInfo: true }));
+test("profile switch notice: Default activation emits exactly one info notice", () =>
+  activationCase({ mode: "default", expectSingleInfo: true }));
+test("profile switch notice: /profile use none emits one deactivation info notice", () =>
+  activationCase({
+    args: "use none",
+    activateFirst: true,
+    expectSingleInfo: true,
+  }));
+test("profile switch notice: child-tab activation emits exactly one info notice", () =>
+  activationCase({ mode: "orchestrator", childTab: true, expectSingleInfo: true }));
+test("profile switch notice: /role set activation emits exactly one info notice", () =>
+  activationCase({ role: true, expectSingleInfo: true }));
+
+/**
+ * The reported scenario: `/orchestrator` then `/profile use live`. Without the
+ * profile's orchestrator override the mode entry and the activation resolve the
+ * SAME model, so the switch under test would be a no-op - which is why PROFILE
+ * carries `p/orchestrator` and this case pins `changed === true`.
+ */
+test("profile switch notice: the orchestrator parent really switches and reports once", async () => {
+  const b = await boot({ orchestrator: true });
+  try {
+    writeProjectSettings(b.cwd, { workflow: { defaultProfile: "live" } });
+    const enter = b.pi.commands["orchestrator"];
+    assert.ok(enter, "orchestrator must be registered");
+    await enter.handler("", b.ctx);
+    const before = b.made.notifies.length;
+    await activate(b);
+
+    const entries = switchEntries(b);
+    assert.equal(
+      entries.length,
+      1,
+      `exactly one durable switch entry expected (saw ${JSON.stringify(entries)})`,
+    );
+    const parent = entries[0];
+    assert.equal(parent.role, "parent", `the parent owns the orchestrator entry (saw ${JSON.stringify(parent)})`);
+    assert.equal(parent.changed, true, `the orchestrator switch must report changed===true (saw ${JSON.stringify(parent)})`);
+    assert.notEqual(parent.from, parent.to, `the orchestrator switch must move the model (saw ${JSON.stringify(parent)})`);
+    assert.equal(parent.to, "p/orchestrator", `the orchestrator must land on the profile model (saw ${JSON.stringify(parent)})`);
+    assert.notEqual(parent.from, "", "the audit must name the model the parent came from");
+
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${b.made.notifies.slice(before).length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.ok(
+      infos[0].message.startsWith(PROFILE_ACTIVATED),
+      `the single info notice must start with ${JSON.stringify(PROFILE_ACTIVATED)} (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /orchestrator → p\/orchestrator/,
+      `the single notice must report the orchestrator model it applied (saw ${JSON.stringify(infos[0].message)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+/** A live reviewer's switch belongs to the activation's one notice. */
+test("profile switch notice: a live reviewer folds into the single activation notice", async () => {
+  const b = await boot({ reviewer: holdReviewer() });
+  try {
+    writeProjectSettings(b.cwd, { workflow: { defaultProfile: "live" } });
+    await b.pi.commands["workflow"].handler("", b.ctx);
+    await startHeldReview(b);
+    const before = b.made.notifies.length;
+    await activate(b);
+
+    const all = b.made.notifies.slice(before);
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${all.length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.equal(
+      all.at(-1),
+      infos[0],
+      `the single info notice must be the last notification (saw ${noticesText(b, before)})`,
+    );
+    assert.ok(
+      infos[0].message.startsWith(PROFILE_ACTIVATED),
+      `the single info notice must start with ${JSON.stringify(PROFILE_ACTIVATED)} (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /Live reviewer → p\/reviewer/,
+      `the live reviewer line must be folded into the single notice (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.equal(
+      separateLiveOwnerNotices(b, before).length,
+      0,
+      `no separate live-owner info notice expected (saw ${noticesText(b, before)})`,
+    );
+
+    const reviewer = switchEntries(b).find((entry) => entry.role === "reviewer");
+    assert.ok(
+      reviewer,
+      `the live reviewer switch must still be audited (entries: ${JSON.stringify(switchEntries(b))})`,
+    );
+    assert.equal(
+      reviewer.changed,
+      true,
+      `the live reviewer must really move to the profile model (saw ${JSON.stringify(reviewer)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+/** A live Build child's switch belongs to the activation's one notice. */
+test("profile switch notice: a live Build child folds into the single activation notice", async () => {
+  const b = await boot({ orchestrator: true });
+  try {
+    writeProjectSettings(b.cwd, { workflow: { defaultProfile: "live" } });
+    await b.pi.commands["orchestrator"].handler("", b.ctx);
+    await dispatchBuilder(b);
+    const before = b.made.notifies.length;
+    await activate(b);
+
+    const all = b.made.notifies.slice(before);
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${all.length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.equal(
+      all.at(-1),
+      infos[0],
+      `the single info notice must be the last notification (saw ${noticesText(b, before)})`,
+    );
+    assert.ok(
+      infos[0].message.startsWith(PROFILE_ACTIVATED),
+      `the single info notice must start with ${JSON.stringify(PROFILE_ACTIVATED)} (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /Live Builder → p\/builder/,
+      `the live Build child line must be folded into the single notice (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.equal(
+      separateLiveOwnerNotices(b, before).length,
+      0,
+      `no separate live-owner info notice expected (saw ${noticesText(b, before)})`,
+    );
+
+    const child = switchEntries(b).find((entry) => entry.role === "builder-child");
+    assert.ok(
+      child,
+      `the live Build child switch must still be audited (entries: ${JSON.stringify(switchEntries(b))})`,
+    );
+    assert.equal(
+      child.changed,
+      true,
+      `the live Build child must really move to the profile model (saw ${JSON.stringify(child)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+/** `/role set` is the other activation surface: one notice, folded live owner. */
+test("profile switch notice: /role set folds the live reviewer into one info notice", async () => {
+  const b = await boot({ reviewer: holdReviewer() });
+  try {
+    await startHeldReview(b);
+    const before = b.made.notifies.length;
+    const role = b.pi.commands["role"];
+    assert.ok(role, "role must be registered");
+    await role.handler("set reviewer p/reviewer xhigh", b.ctx);
+
+    const all = b.made.notifies.slice(before);
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${all.length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /Live reviewer → p\/reviewer/,
+      `the live reviewer line must be folded into the single notice (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.equal(
+      separateLiveOwnerNotices(b, before).length,
+      0,
+      `no separate live-owner info notice expected (saw ${noticesText(b, before)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+/**
+ * `/role use` does NOT reconcile live owners: its one notice carries the model
+ * it applied to the parent instead. `explorer` is chosen because its base model
+ * differs from the Build-mode model, so the switch is real (not the
+ * already-on-target branch, which stays silent).
+ */
+test("profile switch notice: /role use reports the applied model in one info notice", async () => {
+  const b = await boot({ orchestrator: true });
+  try {
+    const build = b.pi.commands["build"];
+    assert.ok(build, "build must be registered");
+    await build.handler("", b.ctx);
+    const before = b.made.notifies.length;
+    const role = b.pi.commands["role"];
+    assert.ok(role, "role must be registered");
+    await role.handler("use explorer", b.ctx);
+
+    const all = b.made.notifies.slice(before);
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${all.length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /Workflow build: model → /,
+      `the single notice must carry the applied model line (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.doesNotMatch(
+      infos[0].message,
+      /Live (reviewer|Builder) →/,
+      `a /role use must not fold a live-owner line (saw ${JSON.stringify(infos[0].message)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});
+
+/**
+ * Variant (b): a FRESH boot with no `workflow.defaultProfile` key of its own, so
+ * the activation writes it (index.ts:1666-1672) and must fold that line in.
+ * Variant (a) cannot cover this: its key is already "live", so before === after
+ * and the write stays silent.
+ */
+test("profile switch notice: the default-profile write folds into the single activation notice", async () => {
+  const b = await boot();
+  try {
+    await b.pi.commands["workflow"].handler("", b.ctx);
+    const before = b.made.notifies.length;
+    await activate(b);
+
+    const all = b.made.notifies.slice(before);
+    const infos = infoNotices(b, before);
+    assert.equal(
+      infos.length,
+      1,
+      `exactly one info notice expected (saw ${infos.length} of ${all.length} notifications: ${noticesText(b, before)})`,
+    );
+    assert.equal(
+      all.at(-1),
+      infos[0],
+      `the single info notice must be the last notification (saw ${noticesText(b, before)})`,
+    );
+    assert.ok(
+      infos[0].message.startsWith(PROFILE_ACTIVATED),
+      `the single info notice must start with ${JSON.stringify(PROFILE_ACTIVATED)} (saw ${JSON.stringify(infos[0].message)})`,
+    );
+    assert.match(
+      infos[0].message,
+      /Default profile → ⚡ live \(/,
+      `the default-profile write must be folded into the single notice (saw ${JSON.stringify(infos[0].message)})`,
+    );
+  } finally {
+    await b.cleanup();
+  }
+});

@@ -378,6 +378,7 @@ import {
   profileArgumentCompletions,
   validateProfileName,
   applyProfileOverlay,
+  composeActivationNotice,
   missingProfileRoles,
   readDefaultProfileSetting,
   writeDefaultProfileSetting,
@@ -1639,7 +1640,7 @@ export default function workflowExtension(
    */
   function persistDefaultProfileChoice(
     ctx: ExtensionContext,
-    opts?: { quiet?: boolean },
+    opts?: { quiet?: boolean; onInfo?: (message: string) => void },
   ): void {
     if (inProcessChildContext) return;
     const cwd = (ctx as any)?.cwd ?? process.cwd();
@@ -1663,12 +1664,20 @@ export default function workflowExtension(
         return;
       }
       if (opts?.quiet) return;
-      ctx.ui.notify(
-        activeProfileName
-          ? `Default profile → ⚡ ${activeProfileName} (${scope} settings). New sessions start on it.`
-          : `Default profile cleared (${scope} settings).`,
-        "info",
-      );
+      const infoMessage = activeProfileName
+        ? `Default profile → ⚡ ${activeProfileName} (${scope} settings). New sessions start on it.`
+        : `Default profile cleared (${scope} settings).`;
+      if (opts?.onInfo) {
+        // A caller that folds this notice into its own activation report. Never
+        // let a throwing sink turn a successful write into a warning below.
+        try {
+          opts.onInfo(infoMessage);
+        } catch (_e) {
+          void _e;
+        }
+        return;
+      }
+      ctx.ui.notify(infoMessage, "info");
     } catch (e: any) {
       ctx.ui.notify(
         `Profile activated, but the default profile was not saved: ${String(e?.message || e)}`,
@@ -1719,6 +1728,7 @@ export default function workflowExtension(
   function clearDefaultProfileIfDeleted(
     ctx: ExtensionContext,
     deletedName: string,
+    opts?: { onInfo?: (message: string) => void },
   ): void {
     const cwd = (ctx as any)?.cwd ?? process.cwd();
     const agentDir = getAgentDir();
@@ -1734,10 +1744,11 @@ export default function workflowExtension(
         );
         return;
       }
-      ctx.ui.notify(
-        `Default profile cleared — it named the deleted profile "${deletedName}".`,
-        "info",
-      );
+      const infoMessage = `Default profile cleared — it named the deleted profile "${deletedName}".`;
+      // `opts.onInfo` lets a caller fold this line into its own single notice;
+      // warnings above/below stay separate and unchanged.
+      if (opts?.onInfo) opts.onInfo(infoMessage);
+      else ctx.ui.notify(infoMessage, "info");
     } catch (e: any) {
       ctx.ui.notify(
         `Profile deleted, but the default profile was not cleared: ${String(e?.message || e)}`,
@@ -1784,10 +1795,18 @@ export default function workflowExtension(
       void _e;
     }
     updateStatus(ctx as any);
+    // Every durable step below keeps its own audit/warning behaviour but
+    // contributes at most one INFO line, collected here and folded into the
+    // single activation notice at the end of this function (two consecutive
+    // info notices are merged by the TUI, last text wins).
+    const extras: string[] = [];
     // Make this the profile new sessions start on (Gap 2). Written after the
     // in-memory switch so a failed settings write cannot cancel activation.
     if (opts?.persistChoice !== false)
-      persistDefaultProfileChoice(ctx, opts);
+      persistDefaultProfileChoice(ctx, {
+        quiet: opts?.quiet,
+        onInfo: (m) => extras.push(m),
+      });
     // One report per live owner. This same function is the parent site and,
     // in a child instance (workflowMode=build), the child site; reviewer and
     // builder-child owners apply through reconcileLiveRoleModels below (also
@@ -1800,8 +1819,11 @@ export default function workflowExtension(
     };
     if (workflowMode) {
       try {
+        // `quiet: true` only suppresses this call's own standalone
+        // `Workflow <mode>: model → …` info line: the report below still
+        // appends the durable entry, and the activation notice carries it.
         await applyModeModel(ctx as any, {
-          quiet: opts?.quiet,
+          quiet: true,
           onResult: reportParentActivation,
         });
       } catch (_e) {
@@ -1816,7 +1838,9 @@ export default function workflowExtension(
         prof?.defaultModel &&
         registryModel(ctx, prof.defaultModel.provider, prof.defaultModel.id)
       ) {
-        persistModelDefault(ctx as any, prof.defaultModel, "profile");
+        persistModelDefault(ctx as any, prof.defaultModel, "profile", {
+          onInfo: (m) => extras.push(m),
+        });
       }
     } else if (prof?.defaultModel && !inProcessChildContext) {
       // In Default mode, apply the profile's default model immediately.
@@ -1851,13 +1875,13 @@ export default function workflowExtension(
             applyThinkingForModel(ctx, found, m.thinking, "Default mode");
           });
           report = { ok: true, changed: from !== to, from, to };
-          if (!opts?.quiet) {
-            ctx.ui.notify(
-              `Default mode: model → ${m.provider}/${m.id}${m.thinking ? ` (${m.thinking})` : ""}`,
-              "info",
-            );
-          }
-          persistModelDefault(ctx as any, m, "profile");
+          // The applied model line belongs to the single activation notice.
+          extras.push(
+            `Default mode: model → ${m.provider}/${m.id}${m.thinking ? ` (${m.thinking})` : ""}`,
+          );
+          persistModelDefault(ctx as any, m, "profile", {
+            onInfo: (msg) => extras.push(msg),
+          });
         }
       } catch (e: any) {
         report = {
@@ -1870,6 +1894,24 @@ export default function workflowExtension(
       }
       if (report) reportParentActivation(report);
     }
+    // A live Build child follows the same profile. Switching only the parent
+    // is what made `/profile use` look inert in `/orchestrator-view child`.
+    // It runs BEFORE the notice so its applied model is part of that one
+    // notice; `quietInfo` only drops the lines the caller folds here, while
+    // `quiet` still suppresses its warnings in a quiet activation.
+    const live = await reconcileLiveRoleModels(ctx, {
+      quiet: opts?.quiet,
+      quietInfo: true,
+      reason: "profile",
+    });
+    if (live.builder?.changed && live.builder.model)
+      extras.push(liveBuilderSwitchLine(live.builder.model, "profile"));
+    if (live.builder?.settling)
+      extras.push(
+        "The Build child is already finishing; the next child will use the updated model.",
+      );
+    if (live.reviewer?.changed && live.reviewer.model)
+      extras.push(liveReviewerSwitchLine(live.reviewer.model, "profile"));
     if (!opts?.quiet) {
       let summary = activeProfileName
         ? profileActivationSummary(activeProfileName)
@@ -1882,14 +1924,8 @@ export default function workflowExtension(
         summary +=
           " Live Builder child (when present) reports separately; this chat uses the selection.";
       }
-      ctx.ui.notify(summary, "info");
+      ctx.ui.notify(composeActivationNotice(summary, extras), "info");
     }
-    // A live Build child follows the same profile. Switching only the parent
-    // is what made `/profile use` look inert in `/orchestrator-view child`.
-    await reconcileLiveRoleModels(ctx, {
-      ...(opts?.quiet ? { quiet: true } : {}),
-      reason: "profile",
-    });
   }
 
   function activeRoleLabel(): string {
@@ -7618,7 +7654,10 @@ export default function workflowExtension(
   /**
    * Mode setters accept `quiet` so keyboard cycling (Tab / Ctrl+Alt+P) never
    * writes to the chat transcript — the footer status reports the mode instead.
-   * Explicit commands call them without options.
+   * It also covers a caller that emits its own activation notice (for example a
+   * folded profile switch), so the primitive does not report twice. `quiet`
+   * only suppresses the info notice: the `onResult` report/entry and every
+   * warning still happen. Explicit commands call them without options.
    */
   interface ModeSwitchOptions {
     quiet?: boolean;
@@ -8097,6 +8136,10 @@ export default function workflowExtension(
    * so neither `workflow.modelDefault` nor Pi's native `defaultProvider` /
    * `defaultModel` / `defaultThinkingLevel` mirror may be written by a child.
    * The child's own `pi.setModel` stays session-scoped and is unaffected.
+   *
+   * `opts.onInfo` lets a caller fold the "Default model saved" notice into its
+   * own activation report instead of a second chat notification. Warnings and
+   * the child early-return are unaffected by it.
    */
   function persistModelDefault(
     ctx: ExtensionContext | null,
@@ -8105,6 +8148,7 @@ export default function workflowExtension(
       | null
       | undefined,
     source: "user-select" | "cycle" | "profile" | "role-default" | "thinking",
+    opts?: { onInfo?: (message: string) => void },
   ): boolean {
     if (inProcessChildContext) return false;
     const coerced = coerceModelDefault(
@@ -8146,11 +8190,10 @@ export default function workflowExtension(
         const label = `${formatPersistedModel(coerced)}${
           coerced.thinking ? ` (${coerced.thinking})` : ""
         }`;
+        const infoMessage = `Default model saved → ${label}. The next session starts here (${source}).`;
         try {
-          ctx?.ui.notify(
-            `Default model saved → ${label}. The next session starts here (${source}).`,
-            "info",
-          );
+          if (opts?.onInfo) opts.onInfo(infoMessage);
+          else ctx?.ui.notify(infoMessage, "info");
         } catch (_e) {
           void _e;
         }
@@ -11587,7 +11630,10 @@ export default function workflowExtension(
       const sub = (parts[0] || "").toLowerCase();
       const rest = parts.slice(1);
 
-      const saveAndSync = (msg: string): boolean => {
+      // `silent` skips only this line's own `ctx.ui.notify`: callers that fold
+      // it into a single activation notice still get the save, the repaint and
+      // every failure warning.
+      const saveAndSync = (msg: string, opts?: { silent?: boolean }): boolean => {
         try {
           saveRoleConfig(roleConfig, "user");
           // Roles are mutated IN PLACE, so the effective-roles cache keyed on
@@ -11603,7 +11649,7 @@ export default function workflowExtension(
         }
         persistState();
         updateStatus(ctx as any);
-        ctx.ui.notify(msg, "info");
+        if (!opts?.silent) ctx.ui.notify(msg, "info");
         return true;
       };
 
@@ -11698,15 +11744,33 @@ export default function workflowExtension(
           thinking = pair.level;
         }
         role.model = { provider, id, thinking };
-        const saved = saveAndSync(
-          `Role ${roleIcon(role.name)} ${role.name} → ${provider}/${id} (${thinking})`,
-        );
+        // ONE info notice for the whole command: the role line is the summary
+        // and every applied/durable line below is folded in as an extra (two
+        // consecutive info notices are merged by the TUI, last text wins).
+        const extras: string[] = [];
+        const base = `Role ${roleIcon(role.name)} ${role.name} → ${provider}/${id} (${thinking})`;
+        const saved = saveAndSync(base, { silent: true });
         // An explicit /role set is an explicit choice of model: it becomes the
         // saved default for the next session too (mode entry never does).
         if (saved) {
-          persistModelDefault(ctx as any, role.model, "role-default");
+          persistModelDefault(ctx as any, role.model, "role-default", {
+            onInfo: (m) => extras.push(m),
+          });
           // The Builder role drives the live child: apply it now as well.
-          await reconcileLiveRoleModels(ctx as any, { reason: "role" });
+          // `quietInfo` only drops the lines folded below; warnings stay.
+          const live = await reconcileLiveRoleModels(ctx as any, {
+            quietInfo: true,
+            reason: "role",
+          });
+          if (live.builder?.changed && live.builder.model)
+            extras.push(liveBuilderSwitchLine(live.builder.model, "role"));
+          if (live.builder?.settling)
+            extras.push(
+              "The Build child is already finishing; the next child will use the updated model.",
+            );
+          if (live.reviewer?.changed && live.reviewer.model)
+            extras.push(liveReviewerSwitchLine(live.reviewer.model, "role"));
+          ctx.ui.notify(composeActivationNotice(base, extras), "info");
         }
         return;
       }
@@ -11788,11 +11852,12 @@ export default function workflowExtension(
           return;
         }
         roleConfig.activeRole = name === "auto" ? null : name.toLowerCase();
-        const saved = saveAndSync(
-          roleConfig.activeRole
-            ? `Active role → ${roleConfig.activeRole}`
-            : "Active role → auto (plan→planner, build→builder)",
-        );
+        // ONE info notice for the whole command, emitted at the very end.
+        const extras: string[] = [];
+        const base = roleConfig.activeRole
+          ? `Active role → ${roleConfig.activeRole}`
+          : "Active role → auto (plan→planner, build→builder)";
+        const saved = saveAndSync(base, { silent: true });
         // An explicit /role use names the model to run: it becomes the saved
         // default as well, so the next session starts on it.
         if (saved) {
@@ -11800,18 +11865,43 @@ export default function workflowExtension(
             ? getRole(roleConfig, roleConfig.activeRole)
             : undefined;
           if (active?.model) {
-            persistModelDefault(ctx as any, active.model, "role-default");
+            persistModelDefault(ctx as any, active.model, "role-default", {
+              onInfo: (m) => extras.push(m),
+            });
           }
         }
         if (workflowMode) {
           try {
-            await applyModeModel(ctx as any);
+            // `quiet: true` drops the primitive's own line; the report is folded
+            // below instead. The applied thinking is read from `lastModeSwitch`
+            // because `applyThinkingForModel` clamps the level to the model.
+            let report: ModelSwitchReport | undefined;
+            await applyModeModel(ctx as any, {
+              quiet: true,
+              onResult: (r) => {
+                report = r;
+              },
+            });
             updateStatus(ctx as any);
             persistState();
+            if (
+              report?.changed &&
+              report.to &&
+              lastModeSwitch?.workflowMode === workflowMode
+            ) {
+              const thinking = lastModeSwitch?.thinking;
+              extras.push(
+                `Workflow ${workflowMode}: model → ${report.to}${thinking ? ` (${thinking})` : ""}`,
+              );
+            }
           } catch (_e) {
             void _e;
           }
         }
+        // /role use never reconciles the live owners: they do not resolve
+        // through activeRole. One notice, and only for a saved change (the
+        // failed-save warning above is the whole report in that case).
+        if (saved) ctx.ui.notify(composeActivationNotice(base, extras), "info");
         return;
       }
 
@@ -12323,18 +12413,20 @@ export default function workflowExtension(
           activeProfileName = null;
           invalidateEffectiveRoles();
         }
+        // ONE info notice for the whole delete: the base line below carries
+        // the cleared default profile and the applied model as extras.
+        const base = `Profile ⚡ ${profile.name} deleted.${
+          wasActive ? " It was active — default roles flow restored." : ""
+        }`;
+        const extras: string[] = [];
+        let wasSaved = false;
         try {
           saveProfiles(profilesConfig, "user");
           // A dangling default profile would warn on every new session.
-          clearDefaultProfileIfDeleted(ctx, profile.name);
-          ctx.ui.notify(
-            `Profile ⚡ ${profile.name} deleted.${
-              wasActive
-                ? " It was active — default roles flow restored."
-                : ""
-            }`,
-            "info",
-          );
+          clearDefaultProfileIfDeleted(ctx, profile.name, {
+            onInfo: (m) => extras.push(m),
+          });
+          wasSaved = true;
         } catch (e: any) {
           ctx.ui.notify(
             `Deleted in memory but file save failed: ${String(e?.message || e)}`,
@@ -12343,12 +12435,34 @@ export default function workflowExtension(
         }
         if (wasActive && workflowMode) {
           try {
-            await applyModeModel(ctx as any);
+            // `quiet: true` drops the primitive's own line; the report is
+            // folded below instead. The applied thinking is read from
+            // `lastModeSwitch` because `applyThinkingForModel` clamps it.
+            let report: ModelSwitchReport | undefined;
+            await applyModeModel(ctx as any, {
+              quiet: true,
+              onResult: (r) => {
+                report = r;
+              },
+            });
+            if (
+              report?.changed &&
+              report.to &&
+              lastModeSwitch?.workflowMode === workflowMode
+            ) {
+              const thinking = lastModeSwitch?.thinking;
+              extras.push(
+                `Workflow ${workflowMode}: model → ${report.to}${thinking ? ` (${thinking})` : ""}`,
+              );
+            }
           } catch (_e) {
             void _e;
           }
         }
         updateStatus(ctx as any);
+        // A failed save already reported its warning: no success notice then.
+        if (wasSaved)
+          ctx.ui.notify(composeActivationNotice(base, extras), "info");
         return;
       }
     }
@@ -13001,6 +13115,10 @@ export default function workflowExtension(
       // profile, so nothing else is needed here.
       await setActiveProfile(ctx as any, profile.name, { explicit: true });
     } else {
+      // ONE info notice for the save: the applied default-model line is folded
+      // in as an extra instead of a second notification.
+      const base = `Profile ⚡ ${profile.name} saved. Activate with /profile use ${profile.name}.`;
+      const extras: string[] = [];
       // Editing the ALREADY ACTIVE profile's Default-mode model must take
       // effect without a second activation: the profile seed was just
       // authored by the user, so it is the newest choice. (Clearing the tab
@@ -13014,12 +13132,11 @@ export default function workflowExtension(
           profile.defaultModel.id,
         )
       ) {
-        persistModelDefault(ctx as any, profile.defaultModel, "profile");
+        persistModelDefault(ctx as any, profile.defaultModel, "profile", {
+          onInfo: (m) => extras.push(m),
+        });
       }
-      ctx.ui.notify(
-        `Profile ⚡ ${profile.name} saved. Activate with /profile use ${profile.name}.`,
-        "info",
-      );
+      ctx.ui.notify(composeActivationNotice(base, extras), "info");
     }
     return "completed";
   }
@@ -13040,7 +13157,10 @@ export default function workflowExtension(
       const sub = (parts[0] || "").toLowerCase();
       const rest = parts.slice(1);
 
-      const persistAndNotify = (msg: string): boolean => {
+      const persistAndNotify = (
+        msg: string,
+        opts?: { silent?: boolean },
+      ): boolean => {
         try {
           saveProfiles(profilesConfig, "user");
         } catch (e: any) {
@@ -13052,7 +13172,9 @@ export default function workflowExtension(
         }
         invalidateEffectiveRoles();
         updateStatus(ctx as any);
-        ctx.ui.notify(msg, "info");
+        // `silent` lets the caller fold this line into its own single notice;
+        // the failure warning above is unaffected.
+        if (!opts?.silent) ctx.ui.notify(msg, "info");
         return true;
       };
 
@@ -13237,21 +13359,48 @@ export default function workflowExtension(
           activeProfileName = null;
           invalidateEffectiveRoles();
         }
-        const savedOk = persistAndNotify(
-          `Profile ⚡ ${p.name} deleted.${
-            wasActive ? " It was active — default roles flow restored." : ""
-          }`,
-        );
+        // ONE info notice for the whole delete: the base line below carries
+        // the cleared default profile and the applied model as extras.
+        const base = `Profile ⚡ ${p.name} deleted.${
+          wasActive ? " It was active — default roles flow restored." : ""
+        }`;
+        const extras: string[] = [];
+        const savedOk = persistAndNotify(base, { silent: true });
         // A dangling default profile would warn on every new session.
-        if (savedOk) clearDefaultProfileIfDeleted(ctx as any, p.name);
+        if (savedOk)
+          clearDefaultProfileIfDeleted(ctx as any, p.name, {
+            onInfo: (m) => extras.push(m),
+          });
         if (savedOk && wasActive && workflowMode) {
           try {
-            await applyModeModel(ctx as any);
+            // `quiet: true` drops the primitive's own line; the report is
+            // folded below instead. The applied thinking is read from
+            // `lastModeSwitch` because `applyThinkingForModel` clamps it.
+            let report: ModelSwitchReport | undefined;
+            await applyModeModel(ctx as any, {
+              quiet: true,
+              onResult: (r) => {
+                report = r;
+              },
+            });
             updateStatus(ctx as any);
+            if (
+              report?.changed &&
+              report.to &&
+              lastModeSwitch?.workflowMode === workflowMode
+            ) {
+              const thinking = lastModeSwitch?.thinking;
+              extras.push(
+                `Workflow ${workflowMode}: model → ${report.to}${thinking ? ` (${thinking})` : ""}`,
+              );
+            }
           } catch (_e) {
             void _e;
           }
         }
+        // A failed save already reported its warning: no success notice then.
+        if (savedOk)
+          ctx.ui.notify(composeActivationNotice(base, extras), "info");
         return;
       }
 
@@ -13956,29 +14105,50 @@ export default function workflowExtension(
         return `${roleIcon(r.name)} ${r.name} → ${st.provider}/${st.id} (${st.thinking})`;
       })
       .join(" · ");
-    ctx.ui.notify(`Roles saved: ${summary}`, "info");
-    // A live Build child follows the role change immediately (the next child
-    // already resolves it from the effective roles).
-    await reconcileLiveRoleModels(ctx, { reason: "role" });
+    // ONE info notice for the whole save: the "Roles saved:" summary is the
+    // base, every applied/durable line below is folded in as an extra.
+    const base = `Roles saved: ${summary}`;
+    const extras: string[] = [];
     // An explicit picker save is an explicit choice: the role that defines the
     // Default-mode default (the forced active role, else the planner) becomes
     // the saved default for the next session. Entering Plan/Build does not.
     try {
       const defaultRoleName = roleConfig.activeRole ?? "planner";
       const st = saved.get(defaultRoleName);
-      if (st) persistModelDefault(ctx as any, st, "role-default");
+      if (st)
+        persistModelDefault(ctx as any, st, "role-default", {
+          onInfo: (m) => extras.push(m),
+        });
     } catch (_e) {
       void _e;
     }
+    // A live Build child follows the role change immediately (the next child
+    // already resolves it from the effective roles). `quietInfo` only drops the
+    // lines folded below; warnings stay.
+    const live = await reconcileLiveRoleModels(ctx, {
+      quietInfo: true,
+      reason: "role",
+    });
+    if (live.builder?.changed && live.builder.model)
+      extras.push(liveBuilderSwitchLine(live.builder.model, "role"));
+    if (live.builder?.settling)
+      extras.push(
+        "The Build child is already finishing; the next child will use the updated model.",
+      );
+    if (live.reviewer?.changed && live.reviewer.model)
+      extras.push(liveReviewerSwitchLine(live.reviewer.model, "role"));
+    // The base already names the applied model, so the primitive's own line is
+    // dropped rather than folded (it would duplicate the summary).
     if (workflowMode) {
       try {
-        await applyModeModel(ctx);
+        await applyModeModel(ctx, { quiet: true });
         updateStatus(ctx);
         persistState();
       } catch (_e) {
         void _e;
       }
     }
+    ctx.ui.notify(composeActivationNotice(base, extras), "info");
   }
 
   // ── Parent orchestration tools (orchestrator step 16) ────────────
@@ -19681,6 +19851,33 @@ export default function workflowExtension(
   }
 
   /**
+   * The ONE wording source for the folded live Build child line.
+   *
+   * `/profile use`, `/role set` and the role-picker save emit exactly one info
+   * notice each and fold the applied live child into it as an extra line. Two
+   * consecutive info notices are merged by the TUI (one shared message field,
+   * last text wins), so the line must never travel as a notice of its own.
+   */
+  function liveBuilderSwitchLine(
+    model: { provider: string; id: string; thinking?: string },
+    reason: string = "model",
+  ): string {
+    return `Live Builder → ${model.provider}/${model.id}${
+      model.thinking ? ` (${model.thinking})` : ""
+    }. The next child uses the same ${reason} selection.`;
+  }
+
+  /** Reviewer sibling of `liveBuilderSwitchLine`; same single-notice contract. */
+  function liveReviewerSwitchLine(
+    model: { provider: string; id: string; thinking?: string },
+    reason: string = "model",
+  ): string {
+    return `Live reviewer → ${model.provider}/${model.id}${
+      model.thinking ? ` (${model.thinking})` : ""
+    }. The next round uses the same ${reason} selection.`;
+  }
+
+  /**
    * Bring a LIVE Orchestrator Build child to the model this session now wants.
    *
    * `/profile use` and `/role set builder` already re-resolve the parent model
@@ -19695,12 +19892,21 @@ export default function workflowExtension(
    */
   async function reconcileLiveBuilderModel(
     ctx: ExtensionContext,
-    opts?: { quiet?: boolean; reason?: "profile" | "role" },
-  ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
+    opts?: { quiet?: boolean; quietInfo?: boolean; reason?: "profile" | "role" },
+  ): Promise<{
+    applied: boolean;
+    changed?: boolean;
+    model?: { provider: string; id: string; thinking?: string };
+    settling?: boolean;
+    error?: string;
+  }> {
     // A child extension instance has no child of its own and must never notify.
     if (inProcessChildContext) return { applied: false };
     // This is the ONLY builder-child audit site (also used by /role). It is a
-    // durable entry only; notifyWorkflow below remains the notice channel.
+    // durable entry only: the caller folds the applied model into its single
+    // activation notice, rendered by `liveBuilderSwitchLine` (the one wording
+    // source), so no info line is emitted here. `quiet` suppresses every
+    // notice, `quietInfo` only the lines the caller now folds.
     const record = (report: ModelSwitchReport): void => {
       appendModelSwitchEntry("builder-child", {
         ...report,
@@ -19714,13 +19920,14 @@ export default function workflowExtension(
       return { applied: false };
     }
     if (state.phase === "settling") {
-      if (!opts?.quiet) {
+      if (!opts?.quiet && !opts?.quietInfo) {
         notifyWorkflow(
           "The Build child is already finishing; the next child will use the updated model.",
           "info",
         );
       }
-      return { applied: false };
+      // `settling` lets the caller fold the same sentence into its own notice.
+      return { applied: false, settling: true };
     }
     const plan = builderModelPlan();
     if (!plan) {
@@ -19762,17 +19969,17 @@ export default function workflowExtension(
       void _e;
     }
     if (result.ok) {
-      if (result.changed && !opts?.quiet) {
-        const model = result.model;
-        const label = model
-          ? `${model.provider}/${model.id}${model.thinking ? ` (${model.thinking})` : ""}`
-          : `${plan.provider}/${plan.id}`;
-        notifyWorkflow(
-          `Live Builder → ${label}. The next child uses the same ${opts?.reason ?? "model"} selection.`,
-          "info",
-        );
-      }
-      return { applied: true, changed: result.changed };
+      // The applied model travels to the caller, which folds it into its single
+      // activation notice; the plan target is the honest fallback.
+      return {
+        applied: true,
+        changed: result.changed,
+        model: result.model ?? {
+          provider: plan.provider,
+          id: plan.id,
+          thinking: plan.thinking,
+        },
+      };
     }
     if (!opts?.quiet) {
       notifyWorkflow(
@@ -19794,11 +20001,22 @@ export default function workflowExtension(
    */
   async function reconcileLiveReviewerModel(
     ctx: ExtensionContext,
-    opts?: { quiet?: boolean; reason?: "profile" | "role" },
-  ): Promise<{ applied: boolean; changed?: boolean; error?: string }> {
+    opts?: { quiet?: boolean; quietInfo?: boolean; reason?: "profile" | "role" },
+  ): Promise<{
+    applied: boolean;
+    changed?: boolean;
+    model?: { provider: string; id: string; thinking?: string };
+    error?: string;
+  }> {
     if (inProcessChildContext) return { applied: false };
     // This is the ONLY reviewer audit site (also used by /role). It is a
-    // durable entry only; notifyReview below remains the notice channel.
+    // durable entry only: the caller folds the applied model into its single
+    // activation notice via `liveReviewerSwitchLine`, so no info line is
+    // emitted here. Branding: a reviewer line folded into a neutral activation
+    // notice is deliberately UNPREFIXED — it is profile/role summary content,
+    // not reviewer-authored output — while reviewer-authored notices
+    // (`Live reviewer keeps …`) keep the `Review Mode:` prefix through
+    // notifyReview.
     const record = (report: ModelSwitchReport): void => {
       appendModelSwitchEntry("reviewer", {
         ...report,
@@ -19865,16 +20083,13 @@ export default function workflowExtension(
       } catch (_e) {
         void _e;
       }
-      if (result.changed && !opts?.quiet) {
-        const applied = result.model;
-        notifyReview(
-          `Live reviewer → ${applied ? `${applied.provider}/${applied.id}` : `${model.provider}/${model.id}`}${
-            applied?.thinking ? ` (${applied.thinking})` : ""
-          }. The next round uses the same ${opts?.reason ?? "model"} selection.`,
-          "info",
-        );
-      }
-      return { applied: true, changed: result.changed };
+      // The applied model travels to the caller, which folds it into its single
+      // activation notice (`liveReviewerSwitchLine` is the wording source).
+      return {
+        applied: true,
+        changed: result.changed,
+        model: result.model ?? model,
+      };
     }
     if (!opts?.quiet) {
       notifyReview(
@@ -19894,10 +20109,14 @@ export default function workflowExtension(
    */
   async function reconcileLiveRoleModels(
     ctx: ExtensionContext,
-    opts?: { quiet?: boolean; reason?: "profile" | "role" },
-  ): Promise<void> {
-    await reconcileLiveBuilderModel(ctx, opts);
-    await reconcileLiveReviewerModel(ctx, opts);
+    opts?: { quiet?: boolean; quietInfo?: boolean; reason?: "profile" | "role" },
+  ): Promise<{
+    builder: Awaited<ReturnType<typeof reconcileLiveBuilderModel>>;
+    reviewer: Awaited<ReturnType<typeof reconcileLiveReviewerModel>>;
+  }> {
+    const builder = await reconcileLiveBuilderModel(ctx, opts);
+    const reviewer = await reconcileLiveReviewerModel(ctx, opts);
+    return { builder, reviewer };
   }
 
   /** Provider-catalogue limits for a model that is not the live session model. */

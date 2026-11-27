@@ -526,23 +526,33 @@ its own session. The warm reviewer keeps its session — its recorded model key,
 change to the applied model so every surface names what actually runs. A
 `settling` Build child is left alone and starts its successor on the new model.
 
-| Owner / state | What switches live | Notice + durable audit |
+| Owner / state | What switches live | One info notice + one durable entry |
 | --- | --- | --- |
 | **Plan** (parent) | This chat's planner model | one activation notice + one `workflow-model-switch` entry, scope `parent` |
 | **Build** (parent) | This chat's builder model | one activation notice + one entry, scope `parent` |
-| **Orchestrator parent + live child** | Parent chat and the live Build child (paused children switch before resume); the next child starts on the same selection | parent notice/entry plus one child notice/entry, scope `builder-child` |
-| **Review: running / paused / handoff-owned / warm-idle** | The existing reviewer session in place; no new round is seeded. An automatic Plan-loop prefetch session is not a live owner and is picked up at its next round | one `notifyReview` notice + one entry, scope `reviewer`; `/review status` prints the applied model once |
+| **Orchestrator parent + live child** | Parent chat and the live Build child (paused children switch before resume); the next child starts on the same selection | the parent activation notice carries the live child's applied model plus one `builder-child` entry |
+| **Review: running / paused / handoff-owned / warm-idle** | The existing reviewer session in place; no new round is seeded. An automatic Plan-loop prefetch session is not a live owner and is picked up at its next round | the activation notice carries the applied reviewer line (no `notifyReview` info notice) plus one `reviewer` entry; `/review status` prints the applied model once |
 | **Default** | The profile's `defaultModel` switches this chat when present; otherwise role models apply on the next mode/role use. No live child or reviewer is reconciled | one activation notice + one entry, scope `parent` |
 | **Managed Build child (`/profile use` inside the row)** | The child's own session model only | one child-local notice + one entry, scope `child`, in the child transcript |
 
 Each activation appends **exactly one** display-only `workflow-model-switch`
 entry per owner: `{scope, role, from, to, ok, changed, at}` plus `error` or
 `reason` when applicable. `role` mirrors `scope` for older readers, and the
-entry has a Desktop timeline renderer. The entry writer never notifies: the
-activation summary (`notifyWorkflow`) or the review notice (`notifyReview`)
-is the **single notice channel** for that owner. When no live reviewer or child
-will report itself, the parent summary names the child notice channel once so
-the activation is not silent.
+entry has a Desktop timeline renderer. **The entry writer never notifies.**
+Each activation, role, delete and editor command emits **exactly one** info
+notice, and it is emitted after every durable entry has been written: the
+default profile, default model, Default-mode model and live-owner lines
+(reviewer, builder child, settling child) are folded into that one notice
+instead of producing notices of their own. A reviewer line folded into this
+neutral activation notice is deliberately unprefixed — it is profile/role
+summary content, not reviewer output — while reviewer-authored warnings keep
+their `Review Mode:` prefix through `notifyReview`.
+
+That single-notice rule absorbs a Pi TUI quirk: `showStatus` builds every info
+row from one mutable `lastStatusMessage` field, so a row created before the next
+entry can be repainted with a later message. The extension therefore guarantees
+one info notice per command and never interleaves durable entries between two
+info notices.
 
 **Child-local scope / parent-owns-launch-model rule.** A managed in-process
 Build child may activate a profile for its own row, but that choice never
@@ -617,7 +627,7 @@ Review Mode runs in its own session with its own model, taken from the **`review
 
 If the reviewer role has no model, Review Mode falls back to the planner model and warns rather than silently doing nothing.
 
-The model is **snapshotted when a round starts**, but a `/role` or `/profile` switch now also switches the LIVE reviewer session in place (the next provider request uses it, the round is not aborted, and the warm session is kept for the next round). The mode band, the status widget and `/review status` name the model that is actually auditing. A switch made in the cold-start window (before the session exists) is retained for that first session. If the switch is refused, the live reviewer keeps its model and the next round applies the new one. One `notifyReview` notice and one durable `workflow-model-switch` (`scope: "reviewer"`) entry report the switch; see [Live-switch contract](#live-switch-contract) for the full owner matrix.
+The model is **snapshotted when a round starts**, but a `/role` or `/profile` switch now also switches the LIVE reviewer session in place (the next provider request uses it, the round is not aborted, and the warm session is kept for the next round). The mode band, the status widget and `/review status` name the model that is actually auditing. A switch made in the cold-start window (before the session exists) is retained for that first session. If the switch is refused, the live reviewer keeps its model and the next round applies the new one. The activation or role notice carries the applied reviewer line (unprefixed, as summary content) and one durable `workflow-model-switch` (`scope: "reviewer"`) entry reports the switch; a refused switch still warns through `notifyReview` with the `Review Mode:` prefix. See [Live-switch contract](#live-switch-contract) for the full owner matrix.
 
 Roles load from `~/.pi/agent/roles.json` (with a `<cwd>/.pi/roles.json` project override) **at session start and again whenever either file changes on disk**, so a `/role` change made in another window is picked up without `/reload`. A missing, unreadable, or legacy `roles.json` is never overwritten: the built-in defaults are used in memory and a warning naming the file is shown, leaving it intact. `/review mode status`, the mode band and the reviewer run all read through the same loader.
 

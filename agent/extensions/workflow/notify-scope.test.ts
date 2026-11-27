@@ -12,7 +12,7 @@
  * non-reviewer notice. This guard pins the two directions of that contract by
  * scanning the extension source:
  *
- *   1. the reviewer notifier has exactly one definition and exactly twenty-nine
+ *   1. the reviewer notifier has exactly one definition and exactly twenty-eight
  *      call sites — the audited set of review-owned notices;
  *   2. no call site carries a non-reviewer marker word (Builder, Orchestrator,
  *      child, Plannotator, browser, handoff), so a lifecycle notice cannot drift
@@ -32,8 +32,8 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-/** The audited set: 29 review-owned `notifyReview(...)` calls. */
-const EXPECTED_REVIEW_CALL_SITES = 29;
+/** The audited set: 28 review-owned `notifyReview(...)` calls. */
+const EXPECTED_REVIEW_CALL_SITES = 28;
 
 /** Markers of a non-reviewer notice; none may reach `notifyReview`. */
 const NON_REVIEWER_MARKERS = [
@@ -90,7 +90,7 @@ function extensionSource(): string {
   return stripComments(fs.readFileSync(path.join(HERE, "index.ts"), "utf8"));
 }
 
-test("notifyReview: one definition plus twenty-nine review-owned call sites", () => {
+test("notifyReview: one definition plus twenty-eight review-owned call sites", () => {
   const sites = callSites(extensionSource(), "notifyReview");
   const definitions = sites.filter((site) => site.isDefinition);
   const calls = sites.filter((site) => !site.isDefinition);

@@ -490,6 +490,32 @@ export function describeProfile(p: Profile): string {
   return lines.join("\n");
 }
 
+// ── Activation notice composer ───────────────────────────────────────
+
+/**
+ * Fold a caller's own notice lines into an activation summary.
+ *
+ * The summary's own lines are preserved byte-for-byte (they are already
+ * formatted); each extra is trimmed, blank extras are dropped, and consecutive
+ * duplicates (compared after trimming) collapse to one. Kept extras are
+ * indented two spaces and appended on their own lines, and no trailing newline
+ * is ever added. With no extra left, the summary is returned unchanged.
+ */
+export function composeActivationNotice(
+  summary: string,
+  extras: readonly string[],
+): string {
+  const kept: string[] = [];
+  for (const raw of extras) {
+    const extra = raw.trim();
+    if (!extra) continue;
+    if (kept.length > 0 && kept[kept.length - 1] === extra) continue;
+    kept.push(extra);
+  }
+  if (kept.length === 0) return summary;
+  return [summary, ...kept.map((extra) => `  ${extra}`)].join("\n");
+}
+
 // ── Picker flow ──────────────────────────────────────────────────────
 
 /** Result of a `/profile` sub-flow (editor, default picker, action). */
