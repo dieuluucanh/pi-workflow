@@ -59,7 +59,12 @@ import { writePolicyConfigPaths } from "./edit-policy.ts";
 import { readPolicyConfigPaths } from "./read-policy.ts";
 
 function tmpCwd(): { cwd: string; agentDir: string; cleanup: () => void } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-folder-policy-"));
+  // Fixtures must spell their root the way production resolves it. A runner's
+  // temp dir can be the 8.3 short path (`RUNNER~1`) while `realpathSync` hands
+  // back the long form, so every lexical expectation below would drift.
+  const dir = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(os.tmpdir(), "pi-folder-policy-")),
+  );
   const cwd = path.join(dir, "proj");
   const agentDir = path.join(dir, "agent");
   fs.mkdirSync(cwd, { recursive: true });

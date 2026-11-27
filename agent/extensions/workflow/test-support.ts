@@ -133,7 +133,13 @@ export const GREP_STATUS_MISMATCH = {
 } as const;
 
 export function tmpProject(): { root: string; cwd: string; agentDir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rv-test-"));
+  // Fixtures spell their root the way production resolves it: a Windows
+  // runner's temp dir can be the 8.3 short path (`RUNNER~1`) while git and
+  // realpathSync report the long form, which would make every fixture look
+  // outside itself.
+  const root = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(os.tmpdir(), "rv-test-")),
+  );
   const cwd = path.join(root, "proj");
   const agentDir = path.join(root, "agent");
   fs.mkdirSync(cwd, { recursive: true });

@@ -17,6 +17,11 @@ import * as path from "node:path";
 import workflowExtension from "./index.ts";
 import { makeFakeCtx, makeFakePi, tmpProject } from "./test-support.ts";
 
+// The session temp folder has to be spelled the way the fixture root is
+// resolved: on Windows a runner's temp dir can be an 8.3 short path
+// (`RUNNER~1`) while the fixture/project root is the long form.
+const TEMP_ROOT = fs.realpathSync.native(os.tmpdir());
+
 async function boot(
   settings: Record<string, unknown> = {},
   hasUI = true,
@@ -469,7 +474,7 @@ test("read: a session folder inside a specific rule is fully blocked", async () 
       folderPolicy: {
         mode: "cwd",
         outside: "ask",
-        excludePaths: [os.tmpdir()],
+        excludePaths: [TEMP_ROOT],
       },
     },
   });

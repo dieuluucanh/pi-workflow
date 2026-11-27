@@ -35,7 +35,13 @@ interface Sandbox {
 }
 
 function sandbox(): Sandbox {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-"));
+  // Canonical fixture root: on Windows a runner's temp dir can be the 8.3
+  // short path (`RUNNER~1`) while the resolved identity is `runneradmin`.
+  // Policy roots and exclusion patterns are canonicalised, so the fixture
+  // must be too; alias behaviour has its own regression below.
+  const root = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-")),
+  );
   fs.mkdirSync(path.join(root, ".git"), { recursive: true });
   fs.mkdirSync(path.join(root, "src"), { recursive: true });
   fs.mkdirSync(path.join(root, "excluded"), { recursive: true });
