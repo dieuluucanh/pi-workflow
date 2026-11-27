@@ -753,6 +753,24 @@ function isCaseInsensitivePlatform(): boolean {
   return process.platform === "win32";
 }
 
+/**
+ * A spelling that carries Windows absolute-path semantics: a drive root, an
+ * extended-length path, or a UNC share. Analysis and policy tests must agree on
+ * these regardless of the host running them.
+ */
+function isWindowsNativePath(value: string): boolean {
+  return (
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    /^\\\\/.test(value) ||
+    /^\/\/[^/]/.test(value)
+  );
+}
+
+/** MSYS/Cygwin-style drive spelling (`/c/Users`). */
+function isMsysDrivePath(value: string): boolean {
+  return /^\/[A-Za-z]\//.test(value);
+}
+
 /** Strip a Windows extended-length prefix from a realpath result. */
 export function stripWindowsPrefix(value: string): string {
   let out = value;
@@ -790,14 +808,27 @@ export function normalizePolicyPath(value: unknown, cwd: string): string {
   const foreign = translateForeignPath(raw);
   const translated = foreign.path || raw;
   const base = cwd && cwd.trim() ? cwd : process.cwd();
+  // Use the rules of the path's own platform, not the host's. A Windows drive
+  // or UNC path stays absolute when analysed on POSIX (and vice versa), and a
+  // relative spelling is resolved against a Windows-style cwd with win32
+  // semantics. Nothing changes for native paths on a native host.
+  const windowsNative =
+    isWindowsNativePath(translated) || isWindowsNativePath(base);
+  const rules = windowsNative ? path.win32 : path;
   let resolved: string;
   try {
-    resolved = path.resolve(base, translated);
+    resolved = rules.resolve(base, translated);
   } catch {
     resolved = translated;
   }
   let normalized = toPosixPath(stripWindowsPrefix(resolved));
-  if (isCaseInsensitivePlatform()) normalized = normalized.toLowerCase();
+  if (
+    isCaseInsensitivePlatform() ||
+    windowsNative ||
+    isMsysDrivePath(raw)
+  ) {
+    normalized = normalized.toLowerCase();
+  }
   while (
     normalized.length > 1 &&
     normalized.endsWith("/") &&

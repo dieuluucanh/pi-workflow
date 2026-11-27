@@ -367,7 +367,10 @@ export function writeWritePolicyConfig(
  * its own path compare equal; the filesystem root keeps its slash.
  */
 export function normalizeWritePath(p: unknown, cwd: string): string {
-  return normalizePolicyPath(p, cwd);
+  // Allowlist identity is deliberately case-folded on every host: the stored
+  // grant and the checked target must agree even when the project moved between
+  // case-insensitive and case-sensitive filesystems (see the doc above).
+  return normalizePolicyPath(p, cwd).toLowerCase();
 }
 
 /**
