@@ -23,6 +23,15 @@ export const MAX_ALIAS_CHARS = 24;
 
 const ALIAS = /^[A-Za-z][A-Za-z0-9_-]{0,23}$/;
 
+/**
+ * Path rules for the value's own platform, not the host's. Real hosts pass
+ * native paths, so this matches the host; fake/injected Windows roots on a
+ * POSIX test runner still resolve as absolute Windows paths.
+ */
+function pathRules(value: string): typeof path.posix {
+  return isWindowsPath(value) ? path.win32 : path.posix;
+}
+
 export interface WorkspaceDeclaration {
   id: string;
   /** As written in the plan; relative paths resolve against the primary root. */
@@ -132,7 +141,7 @@ function fail<T>(error: string): WorkspaceSetResult<T> {
 
 function validateRootShape(root: WorkspaceRoot): string | undefined {
   if (!ALIAS.test(root.id)) return `invalid workspace alias "${root.id}"`;
-  if (!root.root || !path.isAbsolute(root.root)) {
+  if (!root.root || !pathRules(root.root).isAbsolute(root.root)) {
     return `workspace ${root.id} has no absolute root`;
   }
   if (root.kind !== "git" && root.kind !== "plain") {
@@ -258,7 +267,7 @@ export async function resolveWorkspaceSet(
   }
   const caseInsensitive = input.caseInsensitive ?? isWindowsPath(input.primaryRoot);
   const primary = await resolveRoot(
-    path.resolve(input.primaryRoot),
+    pathRules(input.primaryRoot).resolve(input.primaryRoot),
     input.resolver,
     caseInsensitive,
   );
@@ -280,9 +289,10 @@ export async function resolveWorkspaceSet(
         `invalid workspace alias "${declaration.id}"${declaration.sourceLine === undefined ? "" : ` at line ${declaration.sourceLine}`}`,
       );
     }
-    const absolute = path.isAbsolute(declaration.path)
+    const rules = pathRules(declaration.path);
+    const absolute = rules.isAbsolute(declaration.path)
       ? declaration.path
-      : path.resolve(input.primaryRoot, declaration.path);
+      : pathRules(input.primaryRoot).resolve(input.primaryRoot, declaration.path);
     const resolved = await resolveRoot(absolute, input.resolver, caseInsensitive);
     if (!resolved.ok) {
       return fail(
