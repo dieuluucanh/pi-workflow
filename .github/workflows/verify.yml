@@ -5,14 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
+      # The pinned conformance fixture is byte-compared by both host suites.
+      # Disable autocrlf before checkout so Windows never rewrites its bytes.
+      - name: Disable core.autocrlf
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.22.2"
+      - run: node --version
       - run: npm test
       - run: npm ci
         working-directory: agent/extensions/workflow
@@ -23,3 +36,36 @@ jobs:
       - run: npm ci
         working-directory: agent/extensions/browser-inspector
       - run: npm run verify
+      - name: Assert clean worktree after verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [ -n "$status" ]; then
+            echo "::error::worktree is dirty after verification"
+            printf '%s\n' "$status"
+            exit 1
+          fi
+          git diff --exit-code
+          echo "worktree clean"
+      - name: Assert conformance fixture index EOL and SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="agent/extensions/workflow/fixtures/composer-transform.conformance.json"
+          eol="$(git ls-files --eol -- "$fixture")"
+          printf '%s\n' "$eol"
+          case "$eol" in
+            "i/lf"*) ;;
+            *)
+              echo "::error::expected i/lf index EOL for $fixture"
+              exit 1
+              ;;
+          esac
+          expected="c2cd5a5a3ea910808bf170f7adbdff1c5d6cb4608a3dcde5c73f6777295d62f3"
+          actual="$(git cat-file blob ":$fixture" | node -e 'const crypto = require("node:crypto"); const h = crypto.createHash("sha256"); process.stdin.on("data", (d) => h.update(d)).on("end", () => process.stdout.write(h.digest("hex")));')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::fixture SHA-256 mismatch: expected $expected, got $actual"
+            exit 1
+          fi
+          echo "fixture index eol i/lf and sha256 $actual"
