@@ -1209,6 +1209,7 @@ export function latestStatus(
 export function renderTodoWidget(
   widgetCalls: Array<{ key: string; value: unknown; options?: unknown }>,
   width = 80,
+  theme?: { fg(color: string, text: string): string; bold(text: string): string; strikethrough(text: string): string },
 ): string[] {
   const call = [...widgetCalls]
     .reverse()
@@ -1217,7 +1218,7 @@ export function renderTodoWidget(
   if (typeof call.value !== "function") {
     return Array.isArray(call.value) ? (call.value as string[]) : [];
   }
-  const component = (call.value as Function)({}, {
+  const component = (call.value as Function)({}, theme ?? {
     fg: (_color: string, text: string) => text,
     bold: (text: string) => text,
     strikethrough: (text: string) => text,

@@ -261,9 +261,9 @@ explicitly labelled NOT RUN), **Class**, **Owning plan step**.
 
 | Field | Detail |
 | --- | --- |
-| Terminal/W | `todo-service.ts`, `todo-panel.ts`, `todo-snapshot.ts`; `workflow_todo` tool (list/update/done/pending/add/toggle/sync/clear); widget `workflow-todos`; status `workflow-todos`; `/todos auto|expand|collapse|hide`; tests `todo-service.test.ts`, `todo-panel.test.ts`, `todo-snapshot.test.ts`, `utils.todo.test.ts`. |
-| D current | Generic `progress`/`status` contributions + `TuiWidgetStrip` frames; native Todo bar above the panel documented in `extension-ui.md` (`TodoPanelBar`, `Ctrl+Alt+L`); no Workflow-specific parser (`tests/architecture/no-workflow-adapters.test.ts`). |
-| Evidence | `tests/host/contributions.test.ts`, `tests/renderer/contributions-bar.test.tsx`, `tests/renderer/tui-widgets.test.tsx`. **Real staged artifact** (row 32): the artifact publishes the `todos` progress (done/total + `Expanded`/`Hidden` detail) and command-backed `todos-auto|expand|collapse|hide|toggle` actions over `host-contributions:update`; `/todos hide` switches only the detail and starts no turn. W action/panel semantics remain covered by `todo-*.test.ts` and `extension.test.ts` Z1–Z13. Two-session isolation (row 37): W `todo-service.test.ts` (two stores never share items, plan path or panel state) and `extension-factory-safety.test.ts` (two sessions + a resource-inspector load share no refiner/reviewer/subagent state); the D artifact boot in `workflow-artifact-parity.test.ts` uses one instance per host, matching the real one-bus-per-session boundary. |
+| Terminal/W | `todo-service.ts`, `todo-panel.ts`, `todo-snapshot.ts`; `workflow_todo` tool (list/update/done/pending/add/toggle/sync/clear); widget/status `workflow-todos`; active-panel `/todos auto|show|expand|collapse|hide|clear` and terminal `Ctrl+Alt+O`; independent child run-scoped preference, empty/headerless child behavior, parent-only clear. Tests `todo-service.test.ts`, `todo-panel.test.ts`, `workflow-contributions.test.ts`, `todo-snapshot.test.ts`, `utils.todo.test.ts`. |
+| D current | Generic `progress`/`status` contributions + `TuiWidgetStrip` frames and generic action-group menu; Workflow's `todos` group is `Child todos` or `Todos` with stable action ids/verbs, while progress remains non-empty-only. No Workflow-specific parser or Workflow-specific Desktop keyboard path (`tests/architecture/no-workflow-adapters.test.ts`). Current W local package is 0.17.4; Desktop's staged Workflow pin remains at the approved baseline 0.15.0 pending later staging. |
+| Evidence | D generic rendering: `tests/host/contributions.test.ts`, `tests/renderer/contributions-bar.test.tsx`, `tests/renderer/tui-widgets.test.tsx`. W current local behavior: `todo-panel.test.ts` covers the empty child matrix, scope matching and decoding; `workflow-contributions.test.ts` exercises active `/todos` targeting and terminal shortcut, empty/hidden/headerless menu verbs, actual widget rendering/removal, run-scoped persistence/replay and parent-state isolation; `todo-service.test.ts` covers separate stores. D is still pinned to 0.15.0: these W changes are not yet in its staged artifact, and row 32's prior artifact evidence must not be read as verification of 0.17.4. Live Terminal/Desktop acceptance: **NOT RUN**. |
 | Class | **SUPPORTED** (generic rendering + real artifact panel/actions) |
 | Steps | 32, 37 |
 
@@ -387,8 +387,9 @@ Recorded now so later rows do not “fix” them by accident:
    its own tokens/components; Terminal uses pi-tui directly.
 4. **Independent checkpoint systems.** Desktop `@dieulc/checkpoints` and
    Workflow `/rewind` keep separate authorities.
-5. **Terminal-only chords.** `Ctrl+Alt+O` for the todo panel on Terminal;
-   Desktop uses `Ctrl+Alt+L` and its native Todo bar.
+5. **Terminal-only todo chord.** `Ctrl+Alt+O` targets the active todo panel on
+   Terminal. Desktop exposes the generic `todos` action group; no Workflow
+   Desktop keyboard chord or native TodoPanelBar is asserted here.
 6. **Notification classes.** D filters only the bell/toasts; every extension
    notification still prints in the transcript (documented in
    `docs/architecture/session-parity.md`).
@@ -435,7 +436,7 @@ the code looks right; each names its reproducible check.
 | 3.2 Default/Plan/Build/Orchestrator | SUPPORTED | real artifact ring + Tab/`/workflow-cycle`, per-mode tool sets, zero execution (`workflow-artifact-parity.test.ts`); W `mode-cycle.test.ts`, `extension.test.ts` | none beyond the modes themselves |
 | 3.3 Role / profile / default model | SUPPORTED | real artifact `/role`, `/profile`, `/prompt-model set` isolation; W `roles/profiles/model-default/default-mode-model` tests | live model pickers: **NOT RUN** (UI-only) |
 | 3.4 Questionnaires | SUPPORTED | real artifact questionnaire tool through `ctx.ui.custom` (selected, cancelled, no-TUI refusal); D TUI surface suites | in-app TUI QA: **NOT RUN** (row 36) |
-| 3.5 Todos and progress | SUPPORTED | real artifact progress/actions; W two-store and two-session isolation; D contribution renderers | panel/hidden-state human QA: **NOT RUN** (row 36) |
+| 3.5 Todos and progress | SUPPORTED | W local 0.17.4: `todo-panel.test.ts`, `workflow-contributions.test.ts` (live command/shortcut targeting, rendered empty matrix, menu availability, scope persistence/replay, parent-state isolation); `todo-service.test.ts` two-store isolation; D generic contribution renderer tests. Desktop artifact remains pinned to 0.15.0 and does not include this local change. | Terminal panel and Desktop staged-artifact/human acceptance: **NOT RUN** (rows 36/37; no claim from W tests) |
 | 3.6 Explore | SUPPORTED | W `subagent-launch.test.ts`, `extension.test.ts` EX1/EX2 (role routing, refusal before spawn) | packaged child launch: **NOT RUN** (row 39) |
 | 3.7 Review | SUPPORTED | W `review*.test.ts` + real artifact review commands are safe no-ops with no round | live independent-provider round: **NOT RUN** (needs provider credentials) |
 | 3.8 Handoff | SUPPORTED | W handoff/execution-approval tests + real artifact `/handoff status` (honest no-host) | real browser/in-app tab: **NOT RUN** (row 36) · in-app tab is an accepted difference |

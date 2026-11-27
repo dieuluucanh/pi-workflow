@@ -2,8 +2,8 @@
  * Workflow Extension — Orchestrator child settle report (pure).
  *
  * The child's final assistant message is prose, so the parent cannot reliably
- * tell "the row is complete" from "a policy blocked the last step" from "the
- * child gave up mid-row". This module turns the child's task-local TODO list
+ * distinguish a completed row, a policy-blocked last step, and a child that
+ * gave up mid-row. This module turns the child's task-local TODO list
  * plus the policy refusals the controller observed into a small, deterministic
  * status block that `onSettled`/`onError`/`onAborted` prepend to the prose:
  *

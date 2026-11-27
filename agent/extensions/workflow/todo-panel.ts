@@ -50,6 +50,8 @@ export interface TodoPanelInput {
   stale?: boolean;
   /** Current workflow mode; Plan mode renders the list as a plan preview. */
   mode?: TodoPanelMode;
+  /** Permit an empty child panel to be explicitly shown; parent default stays hidden. */
+  showWhenEmpty?: boolean;
 }
 
 export interface TodoPanelView {
@@ -73,6 +75,14 @@ export interface PersistedTodoPanel {
   /** Read-only fields from a pre-0.13 entry; a caller migrates or drops them. */
   legacyOverride: TodoPanelState | null;
   legacyOverrideKey: string | null;
+  /** Optional child-only display choice; absence differs from explicit Auto. */
+  childPreference?: TodoPanelPreference;
+  /** Optional child preference lineage; null is an explicit unscoped value. */
+  childPreferenceScope?: string | null;
+}
+
+export function childTodoPanelScope(runId: string | null | undefined): string {
+  return runId ? `child-run:${runId}` : "child-session";
 }
 
 export const EMPTY_PERSISTED_TODO_PANEL: PersistedTodoPanel = {
@@ -178,7 +188,9 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
   const settled = isTodoListSettled(items);
   let state: TodoPanelState;
   if (items.length === 0) {
-    state = "hidden";
+    state = input.showWhenEmpty === true
+      ? preferred ?? "expanded"
+      : "hidden";
   } else if (preferred === "hidden") {
     state = "hidden";
   } else if (preferred === "expanded" || preferred === "collapsed") {
@@ -201,6 +213,7 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
     summary: todoPanelSummary(items, {
       stale: input.stale,
       planned: input.mode === "plan",
+      showWhenEmpty: input.showWhenEmpty === true,
     }),
   };
 }
@@ -226,12 +239,18 @@ export function todoPanelContentKey(input: {
 }
 
 /** Compact status line for the hidden/Review cases (theme-free). */
-export function todoStatusText(view: TodoPanelView): string {
-  if (view.total === 0) return "";
+export function todoStatusText(
+  view: TodoPanelView,
+  options: { child?: boolean; label?: string } = {},
+): string {
+  const label = options.label ?? (options.child ? "Child todos" : "Todos");
+  if (view.total === 0) {
+    return options.child ? `${label} · no todos yet · ${view.state}` : "";
+  }
   const mark = view.settled ? "☑" : "☐";
   const cancelled = view.cancelled > 0 ? ` · ${view.cancelled} cancelled` : "";
   const stale = view.stale ? " ⚠" : "";
-  return `${mark} Todos ${view.done}/${view.total}${stale}${cancelled} · ${view.state}`;
+  return `${mark} ${label} ${view.done}/${view.total}${stale}${cancelled} · ${view.state}`;
 }
 
 /**
@@ -240,9 +259,11 @@ export function todoStatusText(view: TodoPanelView): string {
  */
 export function todoPanelSummary(
   items: TodoItem[],
-  opts: { stale?: boolean; planned?: boolean } = {},
+  opts: { stale?: boolean; planned?: boolean; showWhenEmpty?: boolean } = {},
 ): string {
-  if (items.length === 0) return "";
+  if (items.length === 0) {
+    return opts.showWhenEmpty === true ? "No todos yet · /todos expand" : "";
+  }
   const done = countDone(items);
   const total = items.length;
   const cancelled = countCancelled(items);
@@ -398,5 +419,15 @@ export function readPersistedTodoPanel(data: unknown): PersistedTodoPanel {
     legacyOverride,
     legacyOverrideKey:
       typeof obj.overrideKey === "string" ? obj.overrideKey : null,
+    ...(obj.childPreference === "auto" ||
+    obj.childPreference === "expanded" ||
+    obj.childPreference === "collapsed" ||
+    obj.childPreference === "hidden"
+      ? { childPreference: obj.childPreference }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(obj, "childPreferenceScope") &&
+    (typeof obj.childPreferenceScope === "string" || obj.childPreferenceScope === null)
+      ? { childPreferenceScope: obj.childPreferenceScope }
+      : {}),
   };
 }

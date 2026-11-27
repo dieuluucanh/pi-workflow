@@ -53,13 +53,15 @@ const REVIEW_CONTROLS_GROUP: ContributionActionGroup = {
   placement: "inline",
 };
 
-/** The TODO view/display menu; always after the run controls. */
-const TODOS_GROUP: ContributionActionGroup = {
-  id: "todos",
-  label: "Todos",
-  order: 40,
-  placement: "menu",
-};
+/** The active TODO view/display menu; always after the run controls. */
+function todosGroup(childPanel: boolean): ContributionActionGroup {
+  return {
+    id: "todos",
+    label: childPanel ? "Child todos" : "Todos",
+    order: 40,
+    placement: "menu",
+  };
+}
 
 /** The effective todo-panel presentation, when the extension knows it. */
 export type WorkflowPanelState = "expanded" | "collapsed" | "hidden";
@@ -438,7 +440,7 @@ export function buildWorkflowContributions(
       id: "todos",
       kind: "progress",
       slot: "progress",
-      label: "Todos",
+      label: input.childPanelActive === true ? "Child todos" : "Todos",
       tone: "neutral",
       order: 10,
       done: Math.min(done, total),
@@ -449,10 +451,12 @@ export function buildWorkflowContributions(
     });
   }
 
-  // The four display verbs only affect the parent panel. In child view the
-  // extension pins that panel and ignores them, so publishing them would leave
-  // dead menu items.
-  if (total > 0 && input.childPanelActive !== true) {
+  const childPanel = input.childPanelActive === true;
+  const activeTodosGroup = todosGroup(childPanel);
+
+  // Keep child controls reachable before a child header or TODO row exists.
+  // Progress above remains independently gated by total > 0.
+  if (total > 0 || childPanel) {
     const displayActions: Array<[string, string, string]> = [
       ["todos-auto", "Auto todos", "auto"],
       ["todos-expand", "Show todos", "expand"],
@@ -467,7 +471,7 @@ export function buildWorkflowContributions(
         label,
         tone: "neutral",
         order: 11,
-        group: TODOS_GROUP,
+        group: activeTodosGroup,
         command: { name: "todos", args },
         enabled: true,
       });
@@ -496,7 +500,6 @@ export function buildWorkflowContributions(
       // `workflow-orchestrator` setStatus line already carries the child
       // telemetry, so publishing an `orchestrator-child` row here would only
       // duplicate it.
-      const childPanel = input.childPanelActive === true;
       out.push({
         id: "orchestrator-view",
         kind: "action",
@@ -504,7 +507,7 @@ export function buildWorkflowContributions(
         label: childPanel ? "Show parent todos" : "Show child todos",
         tone: "neutral",
         order: 43,
-        group: TODOS_GROUP,
+        group: activeTodosGroup,
         command: {
           name: "orchestrator",
           args: childPanel ? "view parent" : "view child",

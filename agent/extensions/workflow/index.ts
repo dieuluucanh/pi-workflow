@@ -268,6 +268,7 @@ import {
   todoListKey,
   todoPanelContentKey,
   todoStatusText,
+  childTodoPanelScope,
   type PersistedTodoPanel,
   type TodoPanelPreference,
 } from "./todo-panel.ts";
@@ -1019,6 +1020,9 @@ export default function workflowExtension(
   // Session-scoped TODO storage. One instance per extension factory call, so
   // two sessions can never share items, refs or panel preferences (step 3).
   const todos = createTodoStore("ordinary");
+  // Independent, factory-local presentation state for the mirrored child list.
+  let childPanelPreference: TodoPanelPreference = "auto";
+  let childPanelScope: string | null = null;
   /** Model-driven run record: the plan path, rows, instructions and reports. */
   let orchestratorRun: OrchestratorRun | undefined;
   /** The parent's instruction for the row currently being dispatched. */
@@ -1949,6 +1953,12 @@ export default function workflowExtension(
     cwd: string,
     planFile: string | null | undefined,
   ): void {
+    if (panel.childPreference !== undefined) {
+      childPanelPreference = panel.childPreference;
+    }
+    if (panel.childPreferenceScope !== undefined) {
+      childPanelScope = panel.childPreferenceScope;
+    }
     if (panel.preference !== "auto" || panel.preferenceScope !== null) {
       todos.panelPreference = panel.preference;
       todos.panelScope = panel.preferenceScope;
@@ -2002,14 +2012,30 @@ export default function workflowExtension(
     );
   }
 
-  function refreshTodoPanel(ctx: ExtensionContext) {
-    const cwd = (ctx as any)?.cwd ?? process.cwd();
-    const scope = todoPanelScope(cwd);
-    const showChild = childPanelActive();
-    const panelItems = showChild ? childPanelItems() : todos.items;
-    const childState = orchestratorChild?.state();
+  function activeTodoPanel(cwd: string) {
+    const isChild = childPanelActive();
+    const items = isChild ? childPanelItems() : todos.items;
+    const mode: WorkflowMode = isChild ? "build" : workflowMode;
+    const scopeKey = isChild
+      ? childTodoPanelScope(orchestratorRun?.runId)
+      : todoPanelScope(cwd);
+    const rawPreference = isChild
+      ? childPanelPreference
+      : todos.panelPreference;
+    const preferenceScope = isChild ? childPanelScope : todos.panelScope;
+    const preference: TodoPanelPreference =
+      rawPreference !== "auto" && preferenceScope !== scopeKey
+        ? "auto"
+        : rawPreference;
+    const childState = isChild ? orchestratorChild?.state() : undefined;
+    const realChildHeader = Boolean(
+      childState &&
+        (childState.phase !== "idle" && childState.phase !== "disposed" ||
+          Boolean(childState.taskId) ||
+          Boolean(childState.ref)),
+    );
     const header =
-      showChild && childState
+      realChildHeader && childState
         ? formatChildPanelHeader({
             ...(childState.ref ? { ref: childState.ref } : {}),
             ...(childState.total === undefined ? {} : { total: childState.total }),
@@ -2020,31 +2046,54 @@ export default function workflowExtension(
           })
         : undefined;
     const view = deriveTodoPanel({
-      items: panelItems,
-      preference: todos.panelPreference,
-      preferenceScope: todos.panelScope,
-      scopeKey: scope,
-      promptAfterSettle: showChild ? false : todos.promptAfterSettle,
-      stale: showChild ? false : todoStale,
-      mode: showChild ? "build" : workflowMode,
+      items,
+      preference: rawPreference,
+      preferenceScope,
+      scopeKey,
+      promptAfterSettle: isChild ? false : todos.promptAfterSettle,
+      stale: isChild ? false : todoStale,
+      mode,
+      ...(isChild ? { showWhenEmpty: true } : {}),
     });
-    // A child view stays visible even before the child creates its list.
-    if (showChild && view.state === "hidden") view.state = "expanded";
-    if (!view.settled && todos.promptAfterSettle) {
-      todos.promptAfterSettle = false;
+    return {
+      target: isChild ? "child" as const : "parent" as const,
+      isChild,
+      items,
+      mode,
+      rawPreference,
+      preference,
+      preferenceScope,
+      scopeKey,
+      header,
+      view,
+      controlsAvailable: isChild || items.length > 0,
+      widgetContentAvailable: header !== undefined || items.length > 0,
+    };
+  }
+
+  function refreshTodoPanel(ctx: ExtensionContext) {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const panel = activeTodoPanel(cwd);
+    const { items, isChild, header, view, mode, widgetContentAvailable } = panel;
+    // These are parent execution/presentation bookkeeping, never child-panel
+    // effects. Child rendering and settlement must leave them untouched.
+    if (!isChild) {
+      if (!view.settled && todos.promptAfterSettle) {
+        todos.promptAfterSettle = false;
+      }
+      // Reopened list: a later completion may emit its own card again.
+      if (!view.settled && todos.completedSignature !== null) {
+        todos.completedSignature = null;
+      }
+      if (view.settled && todoStale) todoStale = false;
     }
-    // Reopened list: a later completion may emit its own card again.
-    if (!view.settled && todos.completedSignature !== null) {
-      todos.completedSignature = null;
-    }
-    if (view.settled && todoStale) todoStale = false;
     todoPanelState = view.state;
     const contentKey = `${todoPanelContentKey({
-      items: panelItems,
+      items,
       state: view.state,
-      mode: workflowMode,
-      stale: showChild ? false : todoStale,
-    })}|${showChild ? "child" : "parent"}|${header ?? ""}`;
+      mode,
+      stale: isChild ? false : todoStale,
+    })}|${panel.target}|${header ?? ""}|${widgetContentAvailable ? "content" : "empty"}`;
     if (contentKey === todoPanelAppliedKey) return view;
     todoPanelAppliedKey = contentKey;
     // The review widget must stay below the todo widget (Pi renders
@@ -2053,54 +2102,29 @@ export default function workflowExtension(
     // status refresh to re-add its widget after this one.
     reviewWidgetApplied = null;
     try {
-      if (view.state === "hidden") {
+      if (view.state === "hidden" || !widgetContentAvailable) {
         ctx.ui.setWidget("workflow-todos", undefined);
         return view;
       }
       ctx.ui.setWidget("workflow-todos", (_tui, theme) => {
         const render = (w: number) => {
-          // Re-derive so the component always shows live items and the live
-          // mode, even though it was registered for an earlier state.
-          const liveChild = childPanelActive();
-          const liveItems = liveChild ? childPanelItems() : todos.items;
-          const live = deriveTodoPanel({
-            items: liveItems,
-            preference: todos.panelPreference,
-            preferenceScope: todos.panelScope,
-            scopeKey: scope,
-            promptAfterSettle: liveChild ? false : todos.promptAfterSettle,
-            stale: liveChild ? false : todoStale,
-            mode: liveChild ? "build" : workflowMode,
-          });
-          if (liveChild) live.state = "expanded";
-          if (live.state === "hidden") return [];
-          const liveState = orchestratorChild?.state();
-          const liveHeader =
-            liveChild && liveState
-              ? formatChildPanelHeader({
-                  ...(liveState.ref ? { ref: liveState.ref } : {}),
-                  ...(liveState.total === undefined
-                    ? {}
-                    : { total: liveState.total }),
-                  ...(liveState.modelLabel
-                    ? { model: modelRefFromLabel(liveState.modelLabel) }
-                    : {}),
-                  ...(liveState.stats ? { stats: liveState.stats } : {}),
-                })
-              : undefined;
+          // Resolve the active target and its current scope/header each time;
+          // a widget may outlive the parent/child view that registered it.
+          const livePanel = activeTodoPanel(cwd);
+          const live = livePanel.view;
+          if (live.state === "hidden" || !livePanel.widgetContentAvailable) {
+            return [];
+          }
+          const liveHeader = livePanel.header;
+          const head = liveHeader
+            ? [theme.fg("accent", theme.bold(liveHeader))]
+            : [];
           if (live.state === "collapsed") {
-            return [
-              ...(liveHeader
-                ? [theme.fg("accent", theme.bold(liveHeader))]
-                : []),
-              renderTodoSummary(theme, w, live),
-            ];
+            return [...head, renderTodoSummary(theme, w, live)];
           }
           return [
-            ...(liveHeader
-              ? [theme.fg("accent", theme.bold(liveHeader))]
-              : []),
-            ...buildTodoRows(theme, w, liveItems, workflowMode),
+            ...head,
+            ...buildTodoRows(theme, w, livePanel.items, livePanel.mode),
           ];
         };
         return { render, invalidate: () => {}, dispose: () => {} };
@@ -2116,15 +2140,19 @@ export default function workflowExtension(
     preference: TodoPanelPreference,
     note?: string,
   ) {
-    if (!todos.items.length && preference === "expanded") {
+    const cwd = (ctx as any)?.cwd ?? process.cwd();
+    const panel = activeTodoPanel(cwd);
+    if (!panel.isChild && panel.items.length === 0 && preference === "expanded") {
       ctx.ui.notify("No todos.", "info");
       return;
     }
-    todos.panelPreference = preference;
-    todos.panelScope =
-      preference === "auto"
-        ? null
-        : todoPanelScope((ctx as any)?.cwd ?? process.cwd());
+    if (panel.isChild) {
+      childPanelPreference = preference;
+      childPanelScope = preference === "auto" ? null : childTodoPanelScope(orchestratorRun?.runId);
+    } else {
+      todos.panelPreference = preference;
+      todos.panelScope = preference === "auto" ? null : todoPanelScope(cwd);
+    }
     updateStatus(ctx);
     try {
       persistState();
@@ -2542,28 +2570,26 @@ export default function workflowExtension(
       WORKFLOW_STATUS_KEYS.orchestrator,
       segments.orchestrator ? ctx.ui.theme.fg("muted", segments.orchestrator) : "",
     );
-    let todoPanelView: ReturnType<typeof refreshTodoPanel> | null = null;
-    if (todos.items.length > 0) {
-      todoPanelView = refreshTodoPanel(ctx);
-    } else {
-      ctx.ui.setWidget("workflow-todos", undefined);
-      todoPanelAppliedKey = "hidden";
-      todoPanelState = null;
-      reviewWidgetApplied = null;
-    }
+    // Reconcile the selected panel even when the parent list is empty: the
+    // active child may have rows (or a real header with no rows), and a
+    // headerless empty child still has a meaningful derived preference state.
+    const selectedTodoPanel = activeTodoPanel((ctx as any)?.cwd ?? process.cwd());
+    const todoPanelView = refreshTodoPanel(ctx);
     // The compact status is the desktop's only presence/progress signal while
-    // the panel is hidden or Review owns the turn. Outside those cases the
-    // `workflow` segment already carries `n/m`.
+    // the selected panel is hidden or Review owns the turn. Never substitute
+    // parent counts/state when the child is selected.
     const showTodoStatus =
-      todoPanelView !== null &&
-      (todoPanelView.state === "hidden" || reviewTurn !== "idle");
+      todoPanelView.state === "hidden" || reviewTurn !== "idle";
     setWorkflowStatus(
       ctx.ui,
       WORKFLOW_STATUS_KEYS.todos,
-      showTodoStatus && todoPanelView
+      showTodoStatus
         ? ctx.ui.theme.fg(
             todoPanelView.settled ? "success" : "muted",
-            todoStatusText(todoPanelView),
+            todoStatusText(todoPanelView, {
+              child: selectedTodoPanel.isChild,
+              ...(selectedTodoPanel.isChild ? { label: "Child todos" } : {}),
+            }),
           )
         : "",
     );
@@ -8344,6 +8370,8 @@ export default function workflowExtension(
       todoPanel: {
         preference: todos.panelPreference,
         preferenceScope: todos.panelScope,
+        childPreference: childPanelPreference,
+        childPreferenceScope: childPanelScope,
         promptAfterSettle: todos.promptAfterSettle,
         completedSignature: todos.completedSignature,
       },
@@ -10884,21 +10912,15 @@ export default function workflowExtension(
   try {
     if (reviewWidgetHost()) {
       pi.registerShortcut(Key.ctrlAlt("o"), {
-      description: "Toggle the workflow todo panel",
+      description: "Toggle the active parent or child todo panel",
       handler: async (ctx: any) => {
         if (overlayDepth > 0) return;
-        if (todos.items.length === 0) {
+        const panel = activeTodoPanel((ctx as any)?.cwd ?? process.cwd());
+        if (!panel.isChild && panel.items.length === 0) {
           ctx.ui.notify("No todos.", "info");
           return;
         }
-        const view = deriveTodoPanel({
-          items: todos.items,
-          preference: todos.panelPreference,
-          preferenceScope: todos.panelScope,
-          scopeKey: todoPanelScope((ctx as any)?.cwd ?? process.cwd()),
-          promptAfterSettle: todos.promptAfterSettle,
-          stale: todoStale,
-        });
+        const view = panel.view;
         setTodoPanelPreference(
           ctx as any,
           view.state === "expanded" ? "collapsed" : "expanded",
@@ -11411,7 +11433,7 @@ export default function workflowExtension(
 
   pi.registerCommand("todos", {
     description:
-      "Show or control the todo panel: /todos [show|expand|collapse|hide|auto|clear]",
+      "List/control the active parent or child todo panel; /todos clear is parent-only",
     handler: async (args, ctx) => {
       const tokens = String(args || "")
         .trim()
@@ -11419,27 +11441,30 @@ export default function workflowExtension(
         .filter(Boolean);
       const sub = (tokens[0] || "").toLowerCase();
       const usage = [
-        "Usage: /todos [show|expand|collapse|hide|auto|clear]",
-        "  (no arg)  list every step with global refs",
+        "Usage: /todos [show|expand|collapse|hide|auto|clear] (targets the active view)",
+        "  (no arg)  list active steps with global refs (Child todos in child view)",
+        "  show      alias for expand",
         "  expand    show the full pinned panel",
         "  collapse  keep one summary line",
         "  hide      remove the pinned panel (footer keeps progress)",
         "  auto      follow the automatic collapse/hide sequence",
-        "  clear     delete the todo list (asks first when UI is available)",
+        "  clear     delete parent todos only; switch with /orchestrator view parent first",
       ].join("\n");
 
       if (!sub) {
-        const list = todos.items.length
-          ? `Steps are numbered GLOBALLY 1..${todos.items.length}:
-` +
-            todos.items
+        const panel = activeTodoPanel((ctx as any)?.cwd ?? process.cwd());
+        const items = panel.items;
+        const label = panel.isChild ? "Child todos" : "Todos";
+        const list = items.length
+          ? `Steps are numbered GLOBALLY 1..${items.length}:\n` +
+            items
               .map((t) => {
                 const g = t.group ? `[${t.group}] ` : "";
                 return `${g}${formatTodoLine(t)}`;
               })
               .join("\n")
           : "No todos.";
-        ctx.ui.notify(`Todos (${todos.items.length}):\n${list}`, "info");
+        ctx.ui.notify(`${label} (${items.length}):\n${list}`, "info");
         return;
       }
 
@@ -11460,6 +11485,13 @@ export default function workflowExtension(
         return;
       }
       if (sub === "clear") {
+        if (activeTodoPanel((ctx as any)?.cwd ?? process.cwd()).isChild) {
+          ctx.ui.notify(
+            "Cannot clear child todos. Run /orchestrator view parent, then /todos clear.",
+            "warning",
+          );
+          return;
+        }
         const count = todos.items.length;
         if (count === 0) {
           ctx.ui.notify("No todos.", "info");
@@ -15643,6 +15675,8 @@ export default function workflowExtension(
     // the reconciler must register it again from the restored state.
     todos.panelPreference = "auto";
     todos.panelScope = null;
+    childPanelPreference = "auto";
+    childPanelScope = null;
     todos.promptAfterSettle = false;
     todos.completedSignature = null;
     todoPanelAppliedKey = "unregistered";
@@ -16398,6 +16432,8 @@ export default function workflowExtension(
     // A rewind is a branch boundary: the panel choice belongs to the branch.
     todos.panelPreference = "auto";
     todos.panelScope = null;
+    childPanelPreference = "auto";
+    childPanelScope = null;
     todos.promptAfterSettle = false;
     todos.completedSignature = null;
     todoPanelAppliedKey = "unregistered";

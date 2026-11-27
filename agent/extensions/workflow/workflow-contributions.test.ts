@@ -622,64 +622,89 @@ test("build: todo display actions are the Auto todos menu, not a computed toggle
   assert.equal(envelopeFor(expanded).ok, true);
 });
 
-test("build: TODO display verbs are parent-panel only", () => {
+test("build: TODO display verbs and view switch target the active panel", () => {
+  const group = (label: string) => ({ id: "todos", label, order: 40, placement: "menu" });
+  const display = [
+    ["todos-auto", "Auto todos", "auto"],
+    ["todos-expand", "Show todos", "expand"],
+    ["todos-collapse", "Collapse todos", "collapse"],
+    ["todos-hide", "Hide todos", "hide"],
+  ] as const;
   const parent = buildWorkflowContributions({
     mode: "orchestrator",
     done: 1,
     total: 3,
-    orchestration: {
-      phase: "running",
-      child: { ref: "2", total: 7, phase: "running" },
-      view: "parent",
-    },
+    orchestration: { phase: "running", child: { ref: "2", total: 7, phase: "running" }, view: "parent" },
     childPanelActive: false,
   });
-  const parentIds = parent
-    .filter((entry) => entry.kind === "action")
-    .map((entry) => entry.id);
-  for (const id of ["todos-auto", "todos-expand", "todos-collapse", "todos-hide"]) {
-    assert.ok(parentIds.includes(id), `parent view keeps ${id}`);
-  }
   const showChild = parent.find((entry) => entry.id === "orchestrator-view");
   assert.ok(showChild && showChild.kind === "action");
   assert.equal(showChild.label, "Show child todos");
   assert.deepEqual(showChild.command, { name: "orchestrator", args: "view child" });
-  assert.deepEqual(showChild.group, {
-    id: "todos",
-    label: "Todos",
-    order: 40,
-    placement: "menu",
-  });
+  assert.deepEqual(showChild.group, group("Todos"));
+  for (const [id, label, args] of display) {
+    const action = parent.find((entry) => entry.id === id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.label, label);
+    assert.deepEqual(action.command, { name: "todos", args });
+    assert.equal(action.enabled, true);
+    assert.deepEqual(action.group, group("Todos"));
+  }
+  const parentProgress = parent.find((entry) => entry.id === "todos");
+  assert.ok(parentProgress && parentProgress.kind === "progress");
+  assert.equal(parentProgress.label, "Todos");
 
-  // Child view pins the panel: only the way back is actionable, and the dead
-  // parent display verbs are omitted instead of rendered as no-ops.
+  // childPanelActive is authoritative even when orchestration.view says auto.
   const child = buildWorkflowContributions({
     mode: "orchestrator",
     done: 2,
     total: 7,
-    orchestration: {
-      phase: "running",
-      child: { ref: "2", total: 7, phase: "running" },
-      view: "auto",
-    },
+    orchestration: { phase: "running", child: { ref: "2", total: 7, phase: "running" }, view: "auto" },
     childPanelActive: true,
   });
-  const childIds = child
-    .filter((entry) => entry.kind === "action")
-    .map((entry) => entry.id);
-  for (const id of ["todos-auto", "todos-expand", "todos-collapse", "todos-hide"]) {
-    assert.equal(childIds.includes(id), false, `child view omits ${id}`);
-  }
   const showParent = child.find((entry) => entry.id === "orchestrator-view");
   assert.ok(showParent && showParent.kind === "action");
   assert.equal(showParent.label, "Show parent todos");
   assert.deepEqual(showParent.command, { name: "orchestrator", args: "view parent" });
-  assert.deepEqual(showParent.group, {
-    id: "todos",
-    label: "Todos",
-    order: 40,
-    placement: "menu",
-  });
+  assert.deepEqual(showParent.group, group("Child todos"));
+  for (const [id, label, args] of display) {
+    const action = child.find((entry) => entry.id === id);
+    assert.ok(action && action.kind === "action", id);
+    assert.equal(action.label, label);
+    assert.deepEqual(action.command, { name: "todos", args });
+    assert.equal(action.enabled, true);
+    assert.deepEqual(action.group, group("Child todos"));
+  }
+  const childProgress = child.find((entry) => entry.id === "todos");
+  assert.ok(childProgress && childProgress.kind === "progress");
+  assert.equal(childProgress.label, "Child todos");
+
+  const emptyParent = buildWorkflowContributions({ mode: "orchestrator", done: 0, total: 0, childPanelActive: false });
+  assert.equal(emptyParent.some((entry) => entry.id === "todos"), false);
+  for (const [id] of display) assert.equal(emptyParent.some((entry) => entry.id === id), false, id);
+
+  // Every empty child presentation state retains the verbs, but never a 0/0 row.
+  for (const state of ["expanded", "collapsed", "hidden", "headerless"] as const) {
+    const zeroChild = buildWorkflowContributions({
+      mode: "orchestrator",
+      done: 0,
+      total: 0,
+      childPanelActive: true,
+      ...(state === "headerless" ? {} : { panelState: state as "expanded" | "collapsed" | "hidden" }),
+      ...(state === "headerless" ? {} : { orchestration: { phase: "running", view: "auto" as const } }),
+    });
+    assert.equal(zeroChild.some((entry) => entry.id === "todos"), false, `${state}: no fake progress`);
+    for (const [id, label, args] of display) {
+      const action = zeroChild.find((entry) => entry.id === id);
+      assert.ok(action && action.kind === "action", `${state}: ${id}`);
+      assert.equal(action.label, label);
+      assert.deepEqual(action.command, { name: "todos", args });
+      assert.equal(action.enabled, true);
+      assert.deepEqual(action.group, group("Child todos"));
+    }
+    const parsed = envelopeFor(zeroChild);
+    assert.equal(parsed.ok, true, parsed.ok ? "" : `${state}: ${parsed.error}`);
+  }
 });
 
 test("extension: publishing the current mapper withdraws the retired switch buttons", () => {
@@ -948,7 +973,7 @@ test("orchestrator child rows: the run controls are one inline group and no chil
     assert.deepEqual(action.group, runControls);
   }
   // The menu group is ordered after the inline run controls.
-  const todosGroup = { id: "todos", label: "Todos", order: 40, placement: "menu" };
+  const todosGroup = { id: "todos", label: "Child todos", order: 40, placement: "menu" };
   const view = byId.get("orchestrator-view");
   assert.ok(view && view.kind === "action");
   assert.deepEqual(view.group, todosGroup);
@@ -1193,13 +1218,17 @@ interface ChildHostBoot {
   made: ReturnType<typeof import("./test-support.ts").makeFakeCtx>;
   fake: ReturnType<typeof import("./test-support.ts").makeFakeOrchestratorChildFactory>;
   envelopes: Array<{
-    contributions: Array<{ id: string; kind: string; done?: number; total?: number }>;
+    contributions: Array<{ id: string; kind: string; label?: string; done?: number; total?: number }>;
   }>;
   cleanup(): Promise<void>;
 }
 
 async function bootChildHost(
-  options: { todos?: Array<{ text: string; completed?: boolean }> } = {},
+  options: {
+    todos?: Array<{ text: string; completed?: boolean }>;
+    terminal?: boolean;
+    branch?: Array<{ type: string; customType?: string; data?: unknown }>;
+  } = {},
 ): Promise<ChildHostBoot> {
   const { default: workflowExtension } = await import("./index.ts");
   const {
@@ -1235,10 +1264,11 @@ async function bootChildHost(
     createOrchestratorChild: fake.factory as never,
     plannotatorRequestTimeoutMs: 20,
     plannotatorRecoveryTimeoutMs: 20,
-    // Desktop path: the composer working message is the surface.
-    isTerminalHost: () => false,
+    // The terminal-specific branch registers Ctrl+Alt+O; Desktop uses its
+    // working-message surface and must not claim that chord.
+    isTerminalHost: () => options.terminal === true,
   } as never);
-  const made = makeFakeCtx({ cwd, hasUI: true, branch: [] });
+  const made = makeFakeCtx({ cwd, hasUI: true, branch: options.branch ?? [] });
   await pi.emit("session_start", { reason: "startup" }, made.ctx);
   return {
     pi,
@@ -1339,6 +1369,340 @@ test("desktop: the live child hint is published as the working message and clear
   }
 });
 
+test("child todo commands render the active panel and preserve independent preferences", async () => {
+  const { renderTodoWidget } = await import("./test-support.ts");
+  const b = await bootChildHost({ todos: [{ text: "child task", completed: true }] });
+  try {
+    await callHostTool(b, "workflow_todo", {
+      action: "update",
+      todos: [{ text: "parent only", status: "pending" }],
+    });
+    await b.pi.commands.orchestrator.handler("", b.ctx);
+    await callHostTool(b, "orchestrator_start", { title: "Child panel", steps: ["Task"] });
+    await callHostTool(b, "orchestrator_dispatch", { rowRef: "1", instructions: "Do task" });
+    b.fake.created[0]?.settle("done");
+    await lifecycleTicks();
+    const listNotice = () => b.made.notifies.at(-1)?.message ?? "";
+
+    await b.pi.commands.todos.handler("", b.ctx);
+    assert.match(listNotice(), /Child todos \(1\)/);
+    assert.match(listNotice(), /child task/);
+    assert.doesNotMatch(listNotice(), /parent only/);
+
+    await b.pi.commands.todos.handler("show", b.ctx);
+    assert.doesNotMatch(listNotice(), /No todos\./);
+    await b.pi.commands.todos.handler("expand", b.ctx);
+    await b.pi.commands.todos.handler("auto", b.ctx);
+    let autoSettled = renderTodoWidget(b.made.widgetCalls, 80);
+    assert.equal(autoSettled.length, 2, `settled empty? child shows header plus collapsed summary: ${autoSettled.join(" | ")}`);
+    assert.ok(autoSettled.some((line) => /CHILD/.test(line)));
+    assert.ok(autoSettled.some((line) => /all done/.test(line)));
+    await b.pi.commands.todos.handler("show", b.ctx);
+    let lines = renderTodoWidget(b.made.widgetCalls, 80);
+    assert.ok(lines.some((line) => /CHILD/.test(line)), `child header: ${lines.join(" | ")}`);
+    assert.ok(lines.some((line) => /child task/.test(line)), `child row: ${lines.join(" | ")}`);
+
+    await b.pi.commands.todos.handler("collapse", b.ctx);
+    lines = renderTodoWidget(b.made.widgetCalls, 80);
+    assert.ok(lines.length > 0, "collapsed child remains rendered");
+    assert.ok(lines.some((line) => /No todos yet · \/todos expand/.test(line)) === false,
+      "a populated child uses its ordinary collapsed summary");
+    await b.pi.commands.todos.handler("hide", b.ctx);
+    assert.deepEqual(renderTodoWidget(b.made.widgetCalls, 80), [], "Hide removes the captured widget");
+    await b.pi.commands.todos.handler("show", b.ctx);
+    assert.ok(renderTodoWidget(b.made.widgetCalls, 80).length > 0, "Show reverses Hide");
+
+    await b.pi.commands.todos.handler("clear", b.ctx);
+    assert.match(listNotice(), /Cannot clear child todos/);
+    await b.pi.commands.todos.handler("", b.ctx);
+    assert.match(listNotice(), /Child todos \(1\)/);
+    await b.pi.commands.orchestrator.handler("view parent", b.ctx);
+    await b.pi.commands.todos.handler("", b.ctx);
+    assert.match(listNotice(), /Todos \(1\)/);
+    assert.match(listNotice(), /Task/);
+    assert.doesNotMatch(listNotice(), /child task/);
+    await b.pi.commands.todos.handler("clear", b.ctx);
+    assert.match(listNotice(), /cleared/i);
+
+    await b.pi.commands.orchestrator.handler("view child", b.ctx);
+    await b.pi.commands.todos.handler("", b.ctx);
+    assert.match(listNotice(), /Child todos \(1\)/, "parent clear does not erase child list");
+    assert.ok(renderTodoWidget(b.made.widgetCalls, 80).length > 0,
+      "child preference survives switching and parent clear");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("terminal Ctrl+Alt+O toggles the child panel, including empty child, without registering on Desktop", async () => {
+  const { renderTodoWidget } = await import("./test-support.ts");
+  const terminal = await bootChildHost({ terminal: true });
+  const desktop = await bootChildHost();
+  try {
+    assert.ok(terminal.pi.shortcuts["ctrl+alt+o"] ?? terminal.pi.shortcuts["Ctrl+Alt+O"],
+      "terminal host registers the TODO chord");
+    assert.equal(desktop.pi.shortcuts["ctrl+alt+o"] ?? desktop.pi.shortcuts["Ctrl+Alt+O"], undefined,
+      "Desktop does not register the terminal chord");
+    await terminal.pi.commands.orchestrator.handler("", terminal.ctx);
+    await callHostTool(terminal, "orchestrator_start", { title: "Empty child", steps: ["Task"] });
+    await callHostTool(terminal, "orchestrator_dispatch", { rowRef: "1", instructions: "Do task" });
+    const shortcut = terminal.pi.shortcuts["ctrl+alt+o"] ?? terminal.pi.shortcuts["Ctrl+Alt+O"];
+    assert.ok(shortcut);
+    const headerOnly = renderTodoWidget(terminal.made.widgetCalls, 80);
+    assert.ok(headerOnly.some((line) => /CHILD/.test(line)), `header-only child: ${headerOnly.join(" | ")}`);
+    assert.equal(headerOnly.length, 1, "an expanded empty child renders its header without fake rows");
+    await terminal.pi.commands.todos.handler("collapse", terminal.ctx);
+    const emptyCollapsed = renderTodoWidget(terminal.made.widgetCalls, 80);
+    assert.ok(emptyCollapsed.some((line) => /No todos yet · \/todos expand/.test(line)),
+      `collapsed empty-child summary: ${emptyCollapsed.join(" | ")}`);
+    await shortcut.handler(terminal.ctx);
+    assert.ok(renderTodoWidget(terminal.made.widgetCalls, 80).length > 0,
+      "shortcut expands a collapsed zero-row live child");
+    await terminal.pi.commands.todos.handler("hide", terminal.ctx);
+    assert.deepEqual(renderTodoWidget(terminal.made.widgetCalls, 80), [],
+      "Hide removes the empty child's renderer");
+    await shortcut.handler(terminal.ctx);
+    assert.ok(renderTodoWidget(terminal.made.widgetCalls, 80).length > 0,
+      "shortcut reverses Hide and expands the empty child");
+  } finally {
+    await terminal.cleanup();
+    await desktop.cleanup();
+  }
+});
+
+test("reload and rewind restore child panel fields without resurrecting a child", async () => {
+  const run = {
+    schemaVersion: 1,
+    runId: "run-restore-10",
+    title: "Restored run",
+    rows: [{ ref: "1", text: "Restored task" }],
+    currentRef: "1",
+    phase: "interrupted",
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  const childEntry = {
+    mode: "build",
+    orchestratorView: "child",
+    orchestratorRun: run,
+    todos: [],
+    todoPanel: {
+      preference: "collapsed",
+      preferenceScope: "/parent/plan.md",
+      childPreference: "hidden",
+      childPreferenceScope: "child-run:run-restore-10",
+      promptAfterSettle: true,
+      completedSignature: "parent-completion-sentinel",
+    },
+  };
+  const staleEntry = {
+    mode: "build",
+    orchestratorView: "child",
+    orchestratorRun: run,
+    todos: [],
+    todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md" },
+  };
+  const branch = [
+    { type: "custom", customType: "workflow", data: staleEntry },
+    { type: "custom", customType: "workflow", data: childEntry },
+    { type: "custom", customType: "workflow", data: staleEntry },
+  ];
+  const b = await bootChildHost({ branch, terminal: true });
+  try {
+    await b.pi.emit("session_start", { reason: "reload" }, b.ctx);
+    // Host action publication distinguishes usable controls from a mounted
+    // widget. A saved child choice must not manufacture a child/header.
+    b.pi.events.emit("host-contributions:hello", {
+      contractVersion: 1,
+      kinds: [],
+      slots: [],
+    });
+    assert.equal(b.made.widgetCalls.some((call) =>
+      call.key === "workflow-todos" && typeof call.value === "function"), false,
+    "headerless reload never registers an empty TODO widget factory");
+    assert.ok(b.pi.commands.todos, "the active /todos controls remain registered");
+    assert.equal(b.fake.created.length, 0, "restore creates no child controller or provider turn");
+    const chord = b.pi.shortcuts["ctrl+alt+o"] ?? b.pi.shortcuts["Ctrl+Alt+O"];
+    assert.ok(chord, "terminal reload retains the child-view toggle");
+    await chord.handler(b.ctx);
+    const restoredEntry = [...b.pi.entries].reverse().find((entry) => entry.type === "workflow");
+    const restoredPanel = (restoredEntry?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    assert.equal(restoredPanel?.childPreference, "expanded",
+      "matching saved hidden choice toggles to expanded (mismatch Auto would collapse)");
+    assert.equal(restoredPanel?.childPreferenceScope, "child-run:run-restore-10");
+    const latest = b.envelopes.at(-1);
+    assert.ok(latest);
+    for (const id of ["todos-auto", "todos-expand", "todos-collapse", "todos-hide"]) {
+      assert.ok(latest!.contributions.some((entry) => entry.id === id),
+        `headerless child still publishes ${id}`);
+    }
+    await b.pi.commands.todos.handler("show", b.ctx);
+    assert.doesNotMatch(b.made.notifies.at(-1)?.message ?? "", /No todos\./,
+      "headerless child Show stores a preference instead of refusing");
+    await b.pi.commands.todos.handler("hide", b.ctx);
+    await chord.handler(b.ctx);
+    const savedEntryAfterToggle = [...b.pi.entries].reverse().find((entry) => entry.type === "workflow");
+    const savedAfterToggle = (savedEntryAfterToggle?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    assert.equal(savedAfterToggle?.childPreference, "expanded",
+      "matching run scope restores hidden, and the terminal toggle expands it");
+    assert.equal(savedAfterToggle?.childPreferenceScope, "child-run:run-restore-10");
+
+    // session_tree resets panel baselines and replays branch entries in order;
+    // a branch with no child fields cannot inherit the prior branch's choice.
+    const otherRun = { ...run, runId: "run-restore-11" };
+    const otherBranch = [{
+      type: "custom",
+      customType: "workflow",
+      data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [], todoPanel: {
+        preference: "collapsed", preferenceScope: "/parent/plan.md",
+        childPreference: "hidden", childPreferenceScope: "child-run:run-restore-10",
+      } },
+    }];
+    const rewound = (await import("./test-support.ts")).makeFakeCtx({
+      cwd: b.ctx.cwd,
+      hasUI: true,
+      branch: otherBranch,
+    });
+    await b.pi.emit("session_tree", {}, rewound.ctx);
+    assert.equal(b.fake.created.length, 0, "rewind replay does not create child work");
+    // The branch has no child fields. Its Auto baseline is effective, not the
+    // previous branch's expanded preference: the first chord collapses the
+    // empty child, then persists the new branch's run scope.
+    await chord.handler(rewound.ctx);
+    const savedRewindEntry = () => [...b.pi.entries].reverse().find((entry) => entry.type === "workflow");
+    let rewindSaved = (savedRewindEntry()?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    assert.equal(rewindSaved?.childPreference, "collapsed");
+    assert.equal(rewindSaved?.childPreferenceScope, "child-run:run-restore-11");
+    assert.equal(rewindSaved?.preference, "collapsed", "non-Auto parent preference is preserved");
+
+    // A later explicit Auto/null in replay overrides an earlier hidden child
+    // choice, while an omitted child panel entry after the valid record does not.
+    const overrideBranch = [
+      { type: "custom", customType: "workflow", data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [], todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md" } } },
+      { type: "custom", customType: "workflow", data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [], todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md", childPreference: "hidden", childPreferenceScope: "child-run:run-restore-11" } } },
+      { type: "custom", customType: "workflow", data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [], todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md" } } },
+      { type: "custom", customType: "workflow", data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [], todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md", childPreference: "auto", childPreferenceScope: null } } },
+    ];
+    const autoBranch = (await import("./test-support.ts")).makeFakeCtx({ cwd: b.ctx.cwd, hasUI: true, branch: overrideBranch });
+    await b.pi.emit("session_tree", {}, autoBranch.ctx);
+    await chord.handler(autoBranch.ctx);
+    rewindSaved = (savedRewindEntry()?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    assert.equal(rewindSaved?.childPreference, "collapsed", "explicit Auto overrides earlier hidden before the chord");
+    assert.equal(rewindSaved?.preference, "collapsed", "child replay never changes parent preference");
+    assert.equal(rewindSaved?.childPreferenceScope, "child-run:run-restore-11");
+
+    const baselineBranch = [{
+      type: "custom", customType: "workflow",
+      data: { mode: "build", orchestratorView: "child", orchestratorRun: otherRun, todos: [],
+        todoPanel: { preference: "collapsed", preferenceScope: "/parent/plan.md" } },
+    }];
+    const baselineCtx = (await import("./test-support.ts")).makeFakeCtx({ cwd: b.ctx.cwd, hasUI: true, branch: baselineBranch });
+    await b.pi.emit("session_tree", {}, baselineCtx.ctx);
+    await chord.handler(baselineCtx.ctx);
+    rewindSaved = (savedRewindEntry()?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    assert.equal(rewindSaved?.childPreference, "collapsed",
+      "a branch with no child fields resets to Auto before the terminal toggle");
+    assert.equal(rewindSaved?.childPreferenceScope, "child-run:run-restore-11");
+    assert.equal(rewindSaved?.preference, "collapsed", "parent choice remains independent after baseline replay");
+    assert.equal(rewound.widgetCalls.some((call) =>
+      call.key === "workflow-todos" && typeof call.value === "function"), false,
+    "child choice does not invent a header after rewind");
+    assert.ok(b.pi.commands.todos, "controls remain registered after branch replay");
+  } finally {
+    await b.cleanup();
+  }
+});
+
+test("child display refreshes preserve non-default parent bookkeeping and stale state", async () => {
+  const { renderTodoWidget } = await import("./test-support.ts");
+  const run = {
+    schemaVersion: 1, runId: "row10-bookkeeping-run", title: "Bookkeeping run",
+    rows: [{ ref: "1", text: "Child work" }], currentRef: "1", phase: "running", createdAt: 1, updatedAt: 2,
+  };
+  const branch = [{ type: "custom", customType: "workflow", data: {
+    mode: "build", orchestratorView: "child", orchestratorRun: run,
+    todos: [{ text: "Parent pending", status: "pending", step: 1 }],
+    todoPanel: { preference: "expanded", preferenceScope: "/parent/plan.md", promptAfterSettle: true,
+      completedSignature: "parent-sentinel", childPreference: "expanded", childPreferenceScope: "child-run:row10-bookkeeping-run" },
+  } }];
+  const b = await bootChildHost({ branch, todos: [{ text: "Child pending" }] });
+  try {
+    const persistedPanel = () => {
+      const entry = [...b.pi.entries].reverse().find((item) => item.type === "workflow");
+      return (entry?.data as { todoPanel?: Record<string, unknown> } | undefined)?.todoPanel;
+    };
+    await b.pi.emit("session_start", { reason: "reload" }, b.ctx);
+    const initial = persistedPanel();
+    assert.equal(initial?.promptAfterSettle, true);
+    assert.equal(initial?.completedSignature, "parent-sentinel");
+
+    // Child view is active from boot; open and settle a real fake child without
+    // letting parent-derived rendering consume its non-default sentinels.
+    await callHostTool(b, "orchestrator_start", { title: "Child", steps: ["work"] });
+    await callHostTool(b, "orchestrator_dispatch", { rowRef: "1", instructions: "Do child work" });
+    await b.pi.commands.todos.handler("show", b.ctx);
+    await b.pi.commands.todos.handler("collapse", b.ctx);
+    const whileOpen = persistedPanel();
+    assert.equal(whileOpen?.promptAfterSettle, true);
+    assert.equal(whileOpen?.completedSignature, "parent-sentinel");
+    b.fake.created[0]?.settle("done");
+    await lifecycleTicks();
+    await b.pi.commands.todos.handler("auto", b.ctx);
+    const afterSettle = persistedPanel();
+    assert.equal(afterSettle?.promptAfterSettle, true);
+    assert.equal(afterSettle?.completedSignature, "parent-sentinel");
+
+    // Establish a genuine stale marker from fake lifecycle events, without an
+    // actual tool mutation or provider call, then repaint the selected child.
+    await b.pi.emit("before_agent_start", { prompt: "synthetic lifecycle", messages: [] }, b.ctx);
+    const fakeToolResult = await b.pi.emit("tool_result", {
+      toolName: "edit", isError: false, input: { path: "src/route.ts" }, content: [],
+    }, b.ctx);
+    assert.ok(fakeToolResult.some((result) => JSON.stringify(result ?? null).includes("[TODO")),
+      `Build lifecycle must inject a footer: ${JSON.stringify(fakeToolResult)}`);
+    await b.pi.emit("agent_end", {
+      type: "agent_end", willRetry: false,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Working" }] }],
+    }, b.ctx);
+    await lifecycleTicks();
+    assert.ok(b.made.notifies.some((notice) => /Todo list not updated/.test(notice.message)),
+      "the fake lifecycle created a genuine stale marker");
+    await b.pi.commands.todos.handler("show", b.ctx);
+    const childRows = renderTodoWidget(b.made.widgetCalls, 80);
+    assert.doesNotMatch(childRows.join(" "), /⚠/, "child repaint does not display the parent's stale marker");
+    assert.ok(b.made.notifies.some((notice) => /Todo list not updated/.test(notice.message)),
+      "the fake lifecycle created a genuine stale marker");
+    await b.pi.commands.orchestrator.handler("view parent", b.ctx);
+    const parentRows = renderTodoWidget(b.made.widgetCalls, 80);
+    assert.doesNotMatch(parentRows.join(" "), /⚠/, "expanded parent rows do not embed the summary marker");
+    assert.ok(b.made.statusCalls.some((call) => JSON.stringify(call.value ?? null).includes("⚠")),
+      "the non-settled parent stale marker survives child repaint/settlement and parent reappearance");
+  } finally { await b.cleanup(); }
+});
+
+test("child widget renders Build-accent styling on the actual active row body", async () => {
+  const { renderTodoWidget } = await import("./test-support.ts");
+  const b = await bootChildHost({ todos: [{ text: "Build accent body" }] });
+  try {
+    await b.pi.commands.orchestrator.handler("", b.ctx);
+    await callHostTool(b, "orchestrator_start", { title: "Accent", steps: ["task"] });
+    await callHostTool(b, "orchestrator_dispatch", { rowRef: "1", instructions: "Work" });
+    b.fake.created[0]?.settle("done");
+    await lifecycleTicks();
+    await b.pi.commands.todos.handler("show", b.ctx);
+    const colors: string[] = [];
+    const rows = renderTodoWidget(b.made.widgetCalls, 100, {
+      fg: (color, text) => { colors.push(color); return `<${color}>${text}</${color}>`; },
+      bold: (text) => text,
+      strikethrough: (text) => text,
+    });
+    assert.ok(rows.some((line) => line.includes("Build accent body")), rows.join(" | "));
+    assert.ok(colors.includes("accent"), `Build accent must be requested: ${colors.join(",")}`);
+    assert.ok(rows.some((line) => /<accent>.*Build accent body/.test(line)),
+      `active row BODY uses Build accent: ${rows.join(" | ")}`);
+  } finally { await b.cleanup(); }
+});
+
 test("desktop: progress counts follow the active child panel", async () => {
   const b = await bootChildHost({
     todos: [
@@ -1366,6 +1730,7 @@ test("desktop: progress counts follow the active child panel", async () => {
     // The parent panel is active before dispatch: its three rows drive the
     // footer count.
     const parentProgress = progressOf();
+    assert.equal(parentProgress.label, "Todos");
     assert.equal(parentProgress.total, 3);
     assert.equal(parentProgress.done, 1);
 
@@ -1392,6 +1757,7 @@ test("desktop: progress counts follow the active child panel", async () => {
     b.fake.created[0]?.settle("row one done");
     await lifecycleTicks();
     const after = progressOf();
+    assert.equal(after.label, "Child todos");
     assert.equal(after.total, 2, "the child panel's two rows drive the count");
     assert.equal(after.done, 1);
   } finally {

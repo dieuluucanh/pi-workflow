@@ -1,6 +1,26 @@
 ## [0.17.4] - 2026-11-27
 
-Version bumped by this change, **not published**.
+Local Workflow version **0.17.4**, not published to npm or GitHub. Desktop staging
+and live human acceptance are not verified by this entry.
+
+### Fixed — independent Orchestrator child TODO panel
+
+- Child display preference is independent of the parent's plan-scoped preference
+  and scoped to the child run: a new run gets effective Auto through scope
+  mismatch, while reloading the same run restores its choice.
+- `/todos` and terminal `Ctrl+Alt+O` target the active parent/child panel; use
+  `/orchestrator view parent|child|auto` to switch. The `todos` action group
+  exposes Auto, Show, Collapse and Hide in child view, including empty, hidden
+  and headerless states. `/todos clear` refuses in child view with parent-view
+  guidance.
+- Empty child presentation follows the real header/state matrix, without fake
+  rows or zero-total progress. Child refresh/replay preserves parent preference
+  and bookkeeping; progress remains non-empty-only.
+- Coverage includes pure panel derivation and decoding, contribution behavior,
+  live widget rendering, active targeting, empty/headerless selection, run-scope
+  persistence/replay, and parent-state isolation (`todo-panel.test.ts` and
+  `workflow-contributions.test.ts`). This is automated evidence, not live host
+  acceptance.
 
 ### Changed — shared read-only shell classification
 

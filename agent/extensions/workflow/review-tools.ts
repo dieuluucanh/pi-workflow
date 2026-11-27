@@ -579,8 +579,8 @@ export interface ReviewSubmitPayload {
     /**
      * Required changes the reviewer submitted, AFTER normalization
      * (`revisions.length`). The appendix parse is the only other record of the
-     * count, so keeping the submitted number here is what lets the negotiation
-     * tell "asked for N, parsed 0" (fail-closed) from "asked for nothing".
+     * count, so keeping the submitted number here lets the negotiation
+     * distinguish a fail-closed zero parse from a reviewer requesting no changes.
      */
     requiredChanges: number;
     /** The reviewer's one-line summary of the change. */
