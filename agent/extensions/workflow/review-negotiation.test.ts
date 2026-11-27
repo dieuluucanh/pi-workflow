@@ -17,7 +17,6 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2275,36 +2274,6 @@ test("dead-code: no source or test file still names the reverted advisory bindin
     }
   }
   assert.deepEqual(matches, [], "the deleted symbols must not come back");
-
-  // The plan's exact check, asserted instead of swallowed with `|| true`:
-  // rg exits 0 when it finds a match and 1 when it finds nothing.
-  const pattern = REMOVED_BINDING_TOKENS.join("|");
-  const result = spawnSync(
-    "rg",
-    [
-      "-n",
-      pattern,
-      "--glob",
-      "!node_modules",
-      "--glob",
-      "*.ts",
-      "--glob",
-      "*.json",
-      ".",
-    ],
-    { cwd: HERE, encoding: "utf8" },
-  );
-  assert.equal(
-    result.error,
-    undefined,
-    `rg must be runnable: ${String(result.error)}`,
-  );
-  assert.equal(
-    result.status,
-    1,
-    `rg must find no match (exit 1); stdout:\n${result.stdout}`,
-  );
-  assert.equal(result.stdout.trim(), "", "no match lines");
 });
 
 test("dead-code proof: parseReviewNotes reads all 13 notes of the reported plan", () => {

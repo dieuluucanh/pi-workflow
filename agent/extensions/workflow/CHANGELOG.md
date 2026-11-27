@@ -36,7 +36,9 @@ Desktop staging are **not verified** by this release.
   acceptance records. Desktop bundle pins must be checked independently.
 - Pins the shared composer conformance fixture to LF on checkout so Windows
   `core.autocrlf` cannot invalidate its byte-level checksum. Verification errors
-  retain enough test output to identify failed assertions in CI.
+  retain enough test output to identify failed assertions in CI. PATH lookup uses
+  the child platform's delimiter, and the dead-code guard scans files in-process,
+  so the suite passes without Windows hosts or a ripgrep install.
 - Node 24.22.2: root release-tool tests and the four-package verification gate
   pass, including typechecks, package tests, packed import closure and packed
   extension load smoke tests.
