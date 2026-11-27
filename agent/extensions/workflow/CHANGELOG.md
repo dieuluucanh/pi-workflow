@@ -34,6 +34,9 @@ Desktop staging are **not verified** by this release.
 - Restores descending changelog milestone order, updates install/tested-version
   examples, replaces obsolete operator instructions and clearly labels legacy
   acceptance records. Desktop bundle pins must be checked independently.
+- Pins the shared composer conformance fixture to LF on checkout so Windows
+  `core.autocrlf` cannot invalidate its byte-level checksum. Verification errors
+  retain enough test output to identify failed assertions in CI.
 - Node 24.22.2: root release-tool tests and the four-package verification gate
   pass, including typechecks, package tests, packed import closure and packed
   extension load smoke tests.
