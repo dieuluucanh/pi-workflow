@@ -359,18 +359,20 @@ export function writeWritePolicyConfig(
 
 /**
  * Canonical form of a path for allowlist comparison: absolute, forward
- * slashes, lower-cased, no trailing separator.
+ * slashes, no trailing separator.
  *
- * Lower-casing matches the existing `isPlanWritePath` convention in utils.ts
- * (Windows paths are case-insensitive) and keeps the comparison
- * platform-independent. A trailing separator is stripped so a directory and
- * its own path compare equal; the filesystem root keeps its slash.
+ * POSIX paths preserve their case, so the canonical form still names an
+ * existing directory on a case-sensitive filesystem. A Windows host still
+ * folds the canonical form, so Windows drive and UNC identity is
+ * case-insensitive in both the stored grant and the checked target. A trailing
+ * separator is stripped so a directory and its own path compare equal; the
+ * filesystem root keeps its slash.
  */
 export function normalizeWritePath(p: unknown, cwd: string): string {
-  // Allowlist identity is deliberately case-folded on every host: the stored
-  // grant and the checked target must agree even when the project moved between
-  // case-insensitive and case-sensitive filesystems (see the doc above).
-  return normalizePolicyPath(p, cwd).toLowerCase();
+  // Platform case is preserved: a POSIX path is case-sensitive, and lower-casing
+  // it would turn an existing repo root into a non-existent one. Windows drive
+  // and UNC spellings are folded by `normalizePolicyPath` on every host.
+  return normalizePolicyPath(p, cwd);
 }
 
 /**
