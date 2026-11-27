@@ -30,7 +30,7 @@
  * every OS and the module stays free of Pi/SDK imports.
  */
 
-import { delimiter, posix, win32 } from "node:path";
+import { posix, win32 } from "node:path";
 
 // ── Environment contract ─────────────────────────────────────────────
 
@@ -177,7 +177,9 @@ function findOnPath(
 ): { launcher: PiCliLauncher; problems: string[] } | { problems: string[] } {
   const pathValue = input.env.PATH ?? input.env.Path ?? "";
   const windows = input.platform === "win32";
-  const separator = windows ? delimiter : ":";
+  // The child platform's delimiter, never the host's: tests and CI resolve
+  // Windows paths on Linux (host `delimiter` is ":" there).
+  const separator = pathRules(input.platform).delimiter;
   const directories = String(pathValue)
     .split(separator)
     .map((entry) => entry.trim())
