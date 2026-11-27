@@ -17,6 +17,10 @@ web-search-cache/
 plannotator-review-status.json
 # npm pack artifacts (release tooling)
 *.tgz
+# debug scratch space — never commit (probes, dumps, throwaway patches)
+.pi/tmp*
+agent/tmp/
+**/.patch*.cjs
 # secrets / volatile caches — do not commit (templates kept as *.example)
 agent/auth.json
 agent/models-store.json
@@ -30,6 +34,5 @@ agent/models.*.bak
 # project-local workflow grants (machine-specific paths)
 /.pi/settings.json
 agent/orchestrator
-agent/workflow
 agent/workflow
 
