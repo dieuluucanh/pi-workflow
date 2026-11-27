@@ -17,21 +17,46 @@
  * entry must render something readable instead of throwing.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
-import type {
-  EntryRenderer,
-  ThemeColor,
+import { Markdown, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  getMarkdownTheme,
+  type EntryRenderer,
+  type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import {
   REVIEW_SUBMITTED_ENTRY_TYPE,
   type ReviewLineKind,
   type ReviewTranscriptOp,
 } from "./review.ts";
+import {
+  HANDOFF_PLAN_ENTRY_TYPE,
+  capHandoffPlanText,
+  handoffReasonLabel,
+  type HandoffPlanEntryData,
+} from "./handoff-view.ts";
 
 /** Custom entry type for Plan/Review/Review-done bands. */
 export const REVIEW_MODE_ENTRY_TYPE = "workflow-review-mode";
 /** Custom entry type for streamed reviewer transcript chunks. */
 export const REVIEW_TRANSCRIPT_ENTRY_TYPE = "workflow-review-transcript";
+/** Custom entry type for the durable live model-switch audit (see index.ts). */
+export const MODEL_SWITCH_ENTRY_TYPE = "workflow-model-switch";
+
+/**
+ * True only for terminal Pi (an interactive TUI on a real terminal).
+ *
+ * Pi Desktop spawns its host with piped stdio and sets `PI_DESKTOP_HOST_ENTRY`,
+ * so it fails both checks — even though it reports `ctx.mode === "tui"` and
+ * renders extension widgets. The review widget must stay Terminal-only because
+ * Desktop already renders an idle extension working message as its working row
+ * (`SessionView.tsx` `extensionBusy`).
+ */
+export function isTerminalPiHost(input: {
+  isTTY?: boolean;
+  desktopHostEntry?: string | undefined;
+}): boolean {
+  return input.desktopHostEntry === undefined && input.isTTY === true;
+}
 
 /** Transcript kinds plus the synthetic line for a user's routed note. */
 export type ReviewEntryLineKind = ReviewLineKind | "user";
@@ -50,12 +75,33 @@ export interface ReviewModeBandData {
   round?: number;
   verdict?: string;
   reason?: string;
+  /**
+   * A round that continues a paused one (`/review-resume`). The band renders
+   * `resumed` instead of `sequential audit` so the two flows never look alike.
+   */
+  resumed?: boolean;
+  /** The round stopped for a pause; renders `REVIEW PAUSED`, not `REVIEW DONE`. */
+  paused?: boolean;
 }
 
 /** Payload of a `workflow-review-transcript` chunk entry. */
 export interface ReviewTranscriptEntryData {
   at?: number;
   lines?: ReviewEntryLine[];
+}
+
+/** Payload of a `workflow-model-switch` audit entry. */
+export interface ModelSwitchEntryData {
+  scope?: string;
+  /** Legacy alias of `scope`, kept for restored entries. */
+  role?: string;
+  from?: string;
+  to?: string;
+  ok?: boolean;
+  changed?: boolean;
+  error?: string;
+  reason?: string;
+  at?: number;
 }
 
 /** Flattened shape of a `workflow-review-submitted` entry (see review.ts). */
@@ -103,6 +149,10 @@ export function reviewBandKey(data: ReviewModeBandData | undefined): string {
     data?.modelLabel ?? "",
     data?.verdict ?? "",
     data?.reason ?? "",
+    // A resumed (or paused) band is never the same event as the fresh band it
+    // continues, even when mode/round/model/verdict/reason happen to match.
+    data?.resumed === true ? "resumed" : "",
+    data?.paused === true ? "paused" : "",
   ].join("|");
 }
 
@@ -253,6 +303,7 @@ const LINE_COLORS: Record<ReviewEntryLineKind, ThemeColor> = {
   finding: "warning",
   notice: "warning",
   status: "muted",
+  error: "error",
   user: "success",
 };
 
@@ -294,19 +345,28 @@ export function formatReviewModeBand(
   }
   if (mode === "review") {
     const bits: string[] = [];
-    if (typeof data?.round === "number" && data.round > 1) {
+    const resumed = data?.resumed === true;
+    if (resumed) {
+      bits.push("resumed");
+      // Always name the round on a resume: "resumed · round 1" reads as a
+      // continuation, while a bare "resumed" hides which round continues.
+      if (typeof data?.round === "number") bits.push(`round ${data.round}`);
+    } else if (typeof data?.round === "number" && data.round > 1) {
       bits.push(`round ${data.round}`);
     }
     if (typeof data?.modelLabel === "string" && data.modelLabel) {
       bits.push(data.modelLabel);
     }
-    bits.push("sequential audit");
+    // "sequential audit" describes a fresh flow; a resumed round continues the
+    // flow it was paused in.
+    if (!resumed) bits.push("sequential audit");
     const title = theme.fg("accent", theme.bold("▌ REVIEW MODE"));
     return [title + theme.fg("muted", `  ${bits.join(" · ")}`)];
   }
   if (mode === "review-done") {
+    const paused = data?.paused === true;
     const clean = data?.verdict === "approve" && !data?.reason;
-    const color: ThemeColor = clean ? "success" : "warning";
+    const color: ThemeColor = paused || !clean ? "warning" : "success";
     let detail = "";
     if (data?.reason) {
       detail = `  ${data.reason}`;
@@ -314,10 +374,39 @@ export function formatReviewModeBand(
       detail = `  verdict: ${data.verdict}`;
     }
     return [
-      theme.fg(color, theme.bold("▌ REVIEW DONE")) + theme.fg("muted", detail),
+      theme.fg(
+        color,
+        theme.bold(paused ? "▌ REVIEW PAUSED" : "▌ REVIEW DONE"),
+      ) + theme.fg("muted", detail),
     ];
   }
   return [theme.fg("muted", "▌ review")];
+}
+
+/** Render one durable model-switch audit as a compact timeline row. */
+export function formatModelSwitchEntry(
+  data: ModelSwitchEntryData | undefined,
+  theme: ThemeLike,
+): string[] {
+  const scope = data?.scope || data?.role || "model";
+  const owner = typeof scope === "string" ? scope : "model";
+  const label = (value: unknown): string =>
+    typeof value === "string" && value ? value : "unknown";
+  const from = label(data?.from);
+  const to = label(data?.to);
+  const ok = data?.ok === true;
+  const changed = data?.changed === true;
+  const color: ThemeColor = !ok ? "warning" : changed ? "accent" : "muted";
+  const title = theme.fg(color, theme.bold("▌ MODEL SWITCH"));
+  let detail = `${owner}: ${from} → ${to}`;
+  if (!ok) detail += " refused";
+  else if (!changed) detail += " (unchanged)";
+  if (typeof data?.error === "string" && data.error) {
+    detail += ` — ${data.error}`;
+  } else if (typeof data?.reason === "string" && data.reason) {
+    detail += ` · ${data.reason}`;
+  }
+  return [title + theme.fg("muted", `  ${detail}`)];
 }
 
 const MAX_SUMMARY_FINDINGS = 15;
@@ -363,7 +452,7 @@ export function formatReviewSubmittedEntry(
     out.push(
       theme.fg(
         "muted",
-        `  … +${findings.length - shown.length} more (see /review-status)`,
+        `  … +${findings.length - shown.length} more (see /review status)`,
       ),
     );
   }
@@ -384,6 +473,59 @@ export function createReviewEntryComponent(
     },
     invalidate(): void {
       /* static content */
+    },
+  };
+}
+
+/**
+ * Render the `workflow-handoff-plan` entry: the plan is printed into the
+ * transcript (scrollable, durable) while the handoff questionnaire stays a
+ * compact bottom overlay. `Markdown` is deliberate here — the other renderers
+ * emit pre-formatted lines truncated with `truncateToWidth`, which would clip
+ * long plan lines instead of wrapping them.
+ */
+export function createHandoffPlanComponent(
+  data: HandoffPlanEntryData | undefined,
+  theme: ThemeLike,
+): ReviewEntryComponent {
+  const planPath =
+    data && typeof data.planPath === "string" ? data.planPath : "";
+  const reason =
+    data && typeof data.reason === "string" ? data.reason : "reviewed";
+  const base = (() => {
+    if (!planPath) return "(no plan file)";
+    const parts = planPath.split(/[\\/]/).filter(Boolean);
+    return parts.at(-1) ?? planPath;
+  })();
+  const capped = capHandoffPlanText(data?.planText, planPath);
+  let markdown: Markdown | undefined;
+  return {
+    render(width: number): string[] {
+      const w = Math.max(1, Math.trunc(Number(width) || 80));
+      const header =
+        theme.fg("accent", theme.bold("▌ PLAN HANDOFF")) +
+        theme.fg("muted", `  ${base} · ${handoffReasonLabel(reason)}`);
+      const out: string[] = [truncateToWidth(header, w, "…")];
+      try {
+        const body = markdown
+          ? markdown.render(w)
+          : new Markdown(capped.text, 0, 0, getMarkdownTheme()).render(w);
+        out.push(...body);
+      } catch {
+        // A malformed plan must render something readable, never throw.
+        for (const line of capped.text.split(/\r?\n/)) {
+          out.push(truncateToWidth(line, w, "…"));
+        }
+      }
+      return out;
+    },
+    invalidate(): void {
+      try {
+        markdown?.invalidate();
+      } catch {
+        /* ignore */
+      }
+      markdown = undefined;
     },
   };
 }
@@ -417,5 +559,15 @@ export function registerReviewEntryRenderers(host: EntryRendererHost): void {
     REVIEW_SUBMITTED_ENTRY_TYPE,
     (entry, _options, theme) =>
       createReviewEntryComponent(formatReviewSubmittedEntry(entry?.data, theme)),
+  );
+  host.registerEntryRenderer<HandoffPlanEntryData>(
+    HANDOFF_PLAN_ENTRY_TYPE,
+    (entry, _options, theme) =>
+      createHandoffPlanComponent(entry?.data, theme),
+  );
+  host.registerEntryRenderer<ModelSwitchEntryData>(
+    MODEL_SWITCH_ENTRY_TYPE,
+    (entry, _options, theme) =>
+      createReviewEntryComponent(formatModelSwitchEntry(entry?.data, theme)),
   );
 }

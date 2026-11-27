@@ -12,17 +12,21 @@ import {
   ROLE_POLICIES,
   WORKFLOW_ROLE_ENV,
   commandClassOf,
+  describeCommandPolicy,
   describeRolePolicy,
   explainCommandRefusal,
   forbiddenSyntaxReason,
+  gitCommitPolicyHit,
   hasForbiddenSyntax,
   isCommandAllowedForRole,
   isWorkflowRole,
+  permissionsArgumentCompletions,
   policyForRole,
   resolveSessionRole,
   splitCommandSegments,
   subagentEnv,
 } from "./permissions.ts";
+import { commandMayWrite } from "./edit-policy.ts";
 
 const allowed = (role: "planner" | "reviewer" | "explorer", cmd: string) =>
   isCommandAllowedForRole(role, cmd);
@@ -53,6 +57,33 @@ test("permissions: planner/reviewer allow read-only and verify commands", () => 
     "journalctl -u nginx",
     "git status && npm test",
     "npm test 2>&1 | tail -50",
+    "sed -n '440,510p' f",
+    "sed -n '1,20p' f",
+    "sed -n '$p' f",
+    "sed --quiet --expression='1,5p' f",
+    "sed -nE '1,5p' f",
+    "sed -n '/foo/p' f",
+    "sed -n '1,5p;30,40p' f",
+    "sed -n '1,5!p' f",
+    "sed -n '1,5{ p; q }' f",
+    "npx vitest run tests/x.test.ts",
+    "npx --no-install tsc --noEmit",
+    "npm exec -- vitest run",
+    "pnpm exec vitest run",
+    "yarn exec tsc --noEmit",
+    "bunx vitest run",
+    "pnpx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "env NO_COLOR=1 npm test",
+    "env LANG=en_US.UTF-8 npm test",
+    "env LC_ALL=C npm test",
+    "env TZ=UTC npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "command -v npm",
+    "env ls",
     "npm run lint",
     "npm run lint:eslint",
     "npm run typecheck",
@@ -102,7 +133,6 @@ test("permissions: destructive and unknown commands are denied for restricted ro
     "npm install",
     "npm run build",
     "npm run lint:fix",
-    "npx vitest",
     "sudo ls",
     "cat f > out.txt",
     "cat f >> out.txt",
@@ -131,7 +161,47 @@ test("permissions: destructive and unknown commands are denied for restricted ro
     "git reflog expire --expire=now --all",
     "git worktree remove ../x",
     "git remote add origin url",
-    "env ls",
+    "sed -i 's/a/b/' f",
+    "sed -i.bak 's/a/b/' f",
+    "sed --in-place=.bak 's/a/b/' f",
+    "sed -n '1p' f -i",
+    "sed -f prog.sed f",
+    "sed -n 'e id' f",
+    "sed -n '1w out' f",
+    "sed -n 's/a/b/w out' f",
+    "sed -n 's/a/b/e' f",
+    "sed -n '1r file' f",
+    "sed -n '1b label' f",
+    "sed -n '1~2p' f",
+    "sed -n '/foo' f",
+    "sed -n '{p' f",
+    "npx --package=evil vitest",
+    "npx -p evil vitest",
+    "npx -c 'rm -rf x'",
+    "npx --registry=http://evil vitest",
+    "npm exec --package=x vitest",
+    "npx unknown-tool",
+    "env -S 'rm x'",
+    "env PATH=. npm test",
+    "env NODE_OPTIONS=--require=./scripts/x.mjs npm test",
+    "env NODE_PATH=./node_modules npm test",
+    "env LD_PRELOAD=./x.so npm test",
+    "env LD_LIBRARY_PATH=. npm test",
+    "env DYLD_INSERT_LIBRARIES=./x.dylib npm test",
+    "env PYTHONPATH=. npm test",
+    "env PYTHONSTARTUP=./x.py pytest",
+    "env BASH_ENV=./x.sh npm test",
+    "env ENV=./x.sh npm test",
+    "env SHELL=/bin/sh npm test",
+    "env COMSPEC=cmd.exe npm test",
+    "env PATHEXT=.EXE npm test",
+    "env GIT_CONFIG_GLOBAL=./x git status",
+    "env npm_config_script_shell=/bin/sh npm test",
+    "env rm -rf x",
+    "timeout 60 rm x",
+    "nice -n 5 rm x",
+    "stdbuf -oL rm x",
+    "command rm x",
     "awk 'BEGIN{system(\"ls\")}'",
   ];
   for (const cmd of no) {
@@ -153,10 +223,52 @@ test("permissions: explorer is read-only, not verify", () => {
   assert.equal(allowed("explorer", "git log -5"), true);
   assert.equal(allowed("explorer", "rg TODO ."), true);
   assert.equal(allowed("explorer", "cat file"), true);
+  assert.equal(allowed("explorer", "sed -n '1,20p' f"), true);
   assert.equal(allowed("explorer", "npm test"), false);
+  assert.equal(allowed("explorer", "npx vitest run"), false);
+  assert.equal(allowed("explorer", "timeout 60 npx vitest run"), false);
   assert.equal(allowed("explorer", "eslint src"), false);
   assert.equal(allowed("explorer", "npm run lint"), false);
   assert.equal(allowed("explorer", "pytest"), false);
+});
+
+test("permissions: planner and reviewer agree on sed and wrappers", () => {
+  const allowedCommands = [
+    "sed -n '1,20p' f",
+    "npx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && sed -n '440,510p' node_modules/@earendil-works/pi-coding-agent/dist/core/model",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && npx vitest run tests/host/sdk-providers.test.ts 2>&1 | tail -20",
+  ];
+  const deniedCommands = [
+    "sed -i 's/a/b/' f",
+    "sed -n '1p' f -i",
+    "awk '{print}' f",
+    "npx --package=evil vitest",
+    "env NODE_OPTIONS=--require=./scripts/x.mjs npm test",
+    "timeout 60 rm x",
+    "nice -n 5 rm x",
+    "stdbuf -oL rm x",
+    "command rm x",
+  ];
+  for (const [commands, expected] of [[allowedCommands, true], [deniedCommands, false]] as const) {
+    for (const cmd of commands) {
+      assert.equal(allowed("planner", cmd), expected, `planner verdict: ${cmd}`);
+      assert.equal(allowed("reviewer", cmd), expected, `reviewer verdict: ${cmd}`);
+      assert.equal(
+        allowed("planner", cmd),
+        allowed("reviewer", cmd),
+        `planner/reviewer must agree: ${cmd}`,
+      );
+    }
+  }
+  for (const cmd of deniedCommands) {
+    assert.equal(allowed("explorer", cmd), false, `explorer must deny: ${cmd}`);
+  }
 });
 
 test("permissions: builder bypasses the gate entirely", () => {
@@ -165,6 +277,23 @@ test("permissions: builder bypasses the gate entirely", () => {
   assert.equal(isCommandAllowedForRole("builder", "npm install"), true);
   assert.equal(ROLE_POLICIES.builder.commandClass, "full");
   assert.equal(ROLE_POLICIES.builder.canWrite, true);
+});
+
+test("permissions: orchestrator has the same authority as builder", () => {
+  assert.equal(policyForRole("orchestrator").commandClass, "full");
+  assert.equal(policyForRole("orchestrator").canWrite, true);
+  for (const command of [
+    "rm -rf /",
+    "git push --force",
+    "npm install",
+    "sed -i 's/a/b/' file",
+  ]) {
+    assert.equal(
+      isCommandAllowedForRole("orchestrator", command),
+      true,
+      command,
+    );
+  }
 });
 
 test("permissions: empty/whitespace commands fail closed for restricted roles", () => {
@@ -221,9 +350,11 @@ test("permissions: commandClassOf reports the weakest sufficient class", () => {
   assert.equal(commandClassOf("frobnicate --x"), "full");
   assert.equal(commandClassOf("rm -rf x"), "full");
   assert.equal(commandClassOf(""), "full");
-  // Interpreters whose programs are code are never read-only.
-  assert.equal(commandClassOf("sed -n '1,20p' f"), "full");
+  // Safe sed print/select programs are reads; awk remains Builder-only.
+  assert.equal(commandClassOf("sed -n '1,20p' f"), "read-only");
   assert.equal(commandClassOf("awk '{print $1}' f"), "full");
+  assert.equal(commandClassOf("npx vitest run"), "verify");
+  assert.equal(commandClassOf("sed -n '1p' f -i"), "full");
   // Newly allowlisted reads and closed write vectors.
   assert.equal(commandClassOf("npm run"), "read-only");
   assert.equal(commandClassOf("node --run test"), "verify");
@@ -402,10 +533,11 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
   assert.equal(flag?.kind, "blocked-flag");
   assert.match(flag?.detail ?? "", /--fix/);
 
-  const segment = explainCommandRefusal("planner", "sed -n '1,5p' f");
+  const segment = explainCommandRefusal("planner", "awk '{print}' f");
   assert.equal(segment?.kind, "segment-class");
-  assert.equal(segment?.segment, "sed -n '1,5p' f");
+  assert.equal(segment?.segment, "awk '{print}' f");
   assert.match(segment?.suggestion ?? "", /may run/);
+  assert.equal(explainCommandRefusal("planner", "sed -n '1,5p' f"), null);
 
   // The gate IS "no refusal", so the two can never disagree.
   for (const cmd of [
@@ -413,6 +545,9 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
     "rm -rf x",
     "cat f > o",
     "sed -n '1,5p' f",
+    "awk '{print}' f",
+    "npx vitest run",
+    "sed -n '1p' f -i",
     "ls x 2>/dev/null",
     "npm test -- -u",
   ]) {
@@ -422,4 +557,284 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
       `gate and explanation disagree for: ${cmd}`,
     );
   }
+});
+
+// ── gitCommitPolicyHit (workflow.commitPolicy classifier) ───────────
+
+test("commit-policy hit: direct mutating subcommands", () => {
+  assert.equal(gitCommitPolicyHit("git add -A"), "add");
+  assert.equal(gitCommitPolicyHit("git add -p"), "add");
+  assert.equal(gitCommitPolicyHit("git add ."), "add");
+  assert.equal(gitCommitPolicyHit("git commit -m 'fix: x'"), "commit");
+  assert.equal(gitCommitPolicyHit("git commit -am x"), "commit");
+  assert.equal(gitCommitPolicyHit("git commit --allow-empty"), "commit");
+  assert.equal(gitCommitPolicyHit("git push"), "push");
+  assert.equal(gitCommitPolicyHit("git push origin main"), "push");
+  assert.equal(gitCommitPolicyHit("git push --force-with-lease"), "push");
+});
+
+test("commit-policy hit: no hit for read-only git", () => {
+  assert.equal(gitCommitPolicyHit("git status"), null);
+  assert.equal(gitCommitPolicyHit("git log --oneline -5"), null);
+  assert.equal(gitCommitPolicyHit("git diff HEAD"), null);
+  assert.equal(gitCommitPolicyHit("git show"), null);
+  assert.equal(gitCommitPolicyHit("git stash list"), null);
+  assert.equal(gitCommitPolicyHit("git config --get user.name"), null);
+  assert.equal(gitCommitPolicyHit("git tag -l"), null);
+  assert.equal(gitCommitPolicyHit("git branch -a"), null);
+  assert.equal(gitCommitPolicyHit("git remote -v"), null);
+  // `commit` appearing as a mere argument value must not trip the classifier.
+  assert.equal(gitCommitPolicyHit('git log --grep="git commit"'), null);
+  assert.equal(gitCommitPolicyHit("git log --grep=commit"), null);
+  assert.equal(gitCommitPolicyHit('rg "git commit" src'), null);
+});
+
+test("commit-policy hit: compound commands", () => {
+  assert.equal(gitCommitPolicyHit("git add -A && git commit -m x"), "add");
+  assert.equal(gitCommitPolicyHit("npm test && git commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("git status; git push origin main"), "push");
+  assert.equal(gitCommitPolicyHit("git log | head -5 && git add -u"), "add");
+  assert.equal(gitCommitPolicyHit("ls && git status"), null);
+});
+
+test("commit-policy hit: global options are parsed through", () => {
+  assert.equal(gitCommitPolicyHit("git -C path add -A"), "add");
+  assert.equal(gitCommitPolicyHit("git --no-pager diff"), null);
+  assert.equal(gitCommitPolicyHit("git --git-dir=.git --work-tree=. add ."), "add");
+  assert.equal(gitCommitPolicyHit("git -c core.hooksPath=/dev/null commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("git -c x=y diff"), null);
+  assert.equal(gitCommitPolicyHit("git --no-optional-locks status"), null);
+  assert.equal(gitCommitPolicyHit("git --paginate log"), null);
+});
+
+test("commit-policy hit: binary variants and wrappers", () => {
+  assert.equal(gitCommitPolicyHit("git.exe commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("/usr/bin/git push"), "push");
+  assert.equal(
+    gitCommitPolicyHit('"C:\\Program Files\\Git\\cmd\\git.exe" add .'),
+    "add",
+  );
+  assert.equal(gitCommitPolicyHit("env git commit -m x"), "commit");
+  assert.equal(gitCommitPolicyHit("nice -n 5 git add -A"), "add");
+  assert.equal(gitCommitPolicyHit("GIT_DIR=. git push"), "push");
+  // Fail-closed false positive is accepted for unquoted echoes.
+  assert.equal(gitCommitPolicyHit("echo git commit"), "commit");
+  // ...but quoted mentions stay clean.
+  assert.equal(gitCommitPolicyHit('echo "git commit"'), null);
+});
+
+test("commit-policy hit: non-git commands and junk", () => {
+  assert.equal(gitCommitPolicyHit(""), null);
+  assert.equal(gitCommitPolicyHit("   "), null);
+  assert.equal(gitCommitPolicyHit("ls -la"), null);
+  assert.equal(gitCommitPolicyHit("npm publish"), null);
+  assert.equal(gitCommitPolicyHit("commit -m x"), null);
+  assert.equal(gitCommitPolicyHit("github-cli push"), null);
+});
+
+// ── Quote-aware command policy (shell-text.ts) ──────────────────────
+
+test("policy: a quoted pattern is data, not a command", () => {
+  for (const cmd of [
+    `rg -n "rm -rf" src`,
+    `rg -n 'sudo' .`,
+    `rg -n "touch" src`,
+    `rg -n "mkdir" scripts`,
+    `git log --grep="rm -rf"`,
+    `git log --grep="git commit"`,
+    `rg -n "code" src`,
+    `rg -n "switch" src`,
+    `grep -rn "child_process" src`,
+    // A quoted operator is literal text, not a redirect/operator/heredoc.
+    `grep -rn 'a > b' docs`,
+    `grep -rn 'a & b' docs`,
+    `rg -n '<<' docs`,
+    `rg -n '$(x)' docs`,
+    "rg -n '${x}' docs",
+    "rg -n '`id`' docs",
+  ]) {
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      assert.equal(allowed(role, cmd), true, `${role} should allow: ${cmd}`);
+      assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+    }
+  }
+});
+
+test("policy: expansions execute only outside single quotes", () => {
+  // Double quotes and no quotes expand; single quotes do not.
+  for (const cmd of [
+    `rg -n "a $(id)" docs`,
+    `rg -n a $(id) docs`,
+    "rg -n \"a `id`\" docs",
+    `rg -n 'a' f > out`,
+    `rg -n "a" f >> out`,
+  ]) {
+    assert.equal(allowed("planner", cmd), false, `should deny: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, true, `is a write: ${cmd}`);
+  }
+  // ...but a quoted one is a literal search.
+  for (const cmd of ["rg -n 'a $(id)' docs", "rg -n '${x}' docs"]) {
+    assert.equal(allowed("explorer", cmd), true, `should allow: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+  }
+});
+
+test("policy: executors stay refused — the denylist's premise", () => {
+  // Every binary that runs its arguments as a command must be class `full`,
+  // otherwise the position-aware keyword layer would be the only defence.
+  for (const cmd of [
+    "bash -c 'rm -rf /'",
+    "sh script.sh",
+    "perl -e 1",
+    `python3 -c 'print(1)'`,
+    "node -e 1",
+    "eval 'rm x'",
+    "xargs rm",
+    "env rm -rf /",
+    "nice -n 5 rm x",
+    "timeout 5 rm x",
+    "find . -exec rm {} ;",
+    `awk '{print}' f`,
+  ]) {
+    assert.equal(commandClassOf(cmd), "full", `must be full: ${cmd}`);
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      assert.equal(allowed(role, cmd), false, `${role} should deny: ${cmd}`);
+    }
+  }
+});
+
+test("policy: the harmless-redirect exemptions are unchanged", () => {
+  for (const cmd of [
+    "2>/dev/null ls",
+    "ls 2>&1",
+    "ls >/dev/null",
+    "npm test 2>/dev/null",
+    "npm test 2> /dev/null | tail -5",
+    "rg TODO src 2>/dev/null | head -5",
+  ]) {
+    assert.equal(allowed("planner", cmd), true, `should allow: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, false, `not a write: ${cmd}`);
+  }
+  // A real file is still a write, whatever prefix it shares with /dev/null.
+  for (const cmd of ["ls > /dev/null.txt", "ls 2>/dev/nullx", "ls > out"]) {
+    assert.equal(allowed("planner", cmd), false, `should deny: ${cmd}`);
+    assert.equal(commandMayWrite(cmd).mutating, true, `is a write: ${cmd}`);
+  }
+});
+
+test("policy: the two gates agree — plan-allowed implies not-a-write", () => {
+  // The invariant the refactor exists to guarantee. If a future classifier
+  // change lets the role gate allow something the write gate calls a write,
+  // this fails instead of silently prompting the user for a read-only command.
+  const corpus = [
+    "ls -la",
+    "git status",
+    "git log --oneline -5",
+    "rg TODO src",
+    `grep -E 'a|b' src/app.ts`,
+    `rg -n "rm -rf" src`,
+    `grep -rn 'a > b' docs`,
+    `grep -rn 'a & b' docs`,
+    `sed -n '1,20p' f`,
+    "npx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && sed -n '440,510p' node_modules/@earendil-works/pi-coding-agent/dist/core/model",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && npx vitest run tests/host/sdk-providers.test.ts 2>&1 | tail -20",
+    `jq . package.json`,
+    "sort -u file.txt",
+    "find . -name '*.ts'",
+    "npm test",
+    "npm run lint",
+    "tsc --noEmit",
+    "eslint src",
+    "head -n 160 f | tail -n +100",
+    "2>/dev/null ls",
+    "ls 2>&1",
+    "git status && npm test",
+    "npm test 2>&1 | tail -50",
+    // Denied by both, in different ways — the implication holds vacuously.
+    "rm -rf x",
+    "sed -i 's/a/b/' f",
+    "npm install left-pad",
+    "eslint --fix src",
+    "git commit -m x",
+  ];
+  for (const cmd of corpus) {
+    for (const role of ["planner", "reviewer", "explorer"] as const) {
+      if (explainCommandRefusal(role, cmd) !== null) continue;
+      assert.equal(
+        commandMayWrite(cmd).mutating,
+        false,
+        `${role} allows it, so it must not be a write: ${cmd}`,
+      );
+    }
+  }
+});
+
+// ── diagnostics ─────────────────────────────────────────────────────
+
+test("describeCommandPolicy: an empty argument prints usage", () => {
+  const lines = describeCommandPolicy("");
+  assert.match(lines[0], /Usage: \/permissions explain/);
+  assert.equal(describeCommandPolicy(undefined)[0], lines[0]);
+  assert.equal(describeCommandPolicy("   ")[0], lines[0]);
+});
+
+test("describeCommandPolicy: a quoted pattern reads as read-only", () => {
+  const text = describeCommandPolicy(`rg -n "rm -rf" src`).join("\n");
+  assert.match(text, /Segments \(1\)/);
+  assert.match(text, /class=read-only|read-only · no write/);
+  assert.match(text, /planner\s+✔ allowed/);
+  assert.match(text, /Default write policy: read-only/);
+});
+
+test("describeCommandPolicy: safe sed is read-only and awk is refused", () => {
+  const sed = describeCommandPolicy(`sed -n '1,5p' f`).join("\n");
+  assert.match(sed, /read-only · no write/);
+  for (const role of ["planner", "reviewer", "explorer"] as const) {
+    assert.match(sed, new RegExp(`${role}\\s+✔ allowed`));
+  }
+  assert.match(sed, /Default write policy: read-only/);
+
+  const awk = describeCommandPolicy(`awk '{print}' f`).join("\n");
+  assert.match(awk, /full · write/);
+  assert.match(awk, /planner\s+✖ segment-class/);
+  assert.match(awk, /Default write policy: write/);
+
+  const redirect = describeCommandPolicy(`rg -n 'a' f > out`).join("\n");
+  assert.match(redirect, /forbidden shell syntax: a file redirect/);
+  assert.match(redirect, /✖ forbidden-syntax/);
+
+  const keyword = describeCommandPolicy("rm -rf x").join("\n");
+  assert.match(keyword, /destructive denylist: `rm`/);
+  assert.match(keyword, /✖ destructive-pattern/);
+
+  const commit = describeCommandPolicy("git commit -m x").join("\n");
+  assert.match(commit, /git commit \(commit policy\)/);
+  // The commit policy owns it, so the write gate does not call it a write.
+  assert.match(commit, /Default write policy: read-only/);
+});
+
+test("describeCommandPolicy: developer line names the flag", () => {
+  const flag = describeCommandPolicy("eslint --fix src").join("\n");
+  assert.match(flag, /flag --fix/);
+  assert.match(flag, /✖ blocked-flag/);
+});
+
+test("permissionsArgumentCompletions: offers only the explain subcommand", () => {
+  assert.deepEqual(permissionsArgumentCompletions("ex")?.map((c) => c.label), [
+    "explain",
+  ]);
+  assert.equal(permissionsArgumentCompletions("ex")?.[0].value, "explain ");
+  // Exact match closes the list so the first Enter submits.
+  assert.equal(permissionsArgumentCompletions("explain"), null);
+  // The command text itself is free-form.
+  assert.equal(permissionsArgumentCompletions("explain rg"), null);
+  assert.equal(permissionsArgumentCompletions("nope"), null);
+  // An empty prefix offers the subcommand, like /write-policy does.
+  assert.equal(permissionsArgumentCompletions("")?.[0].label, "explain");
 });

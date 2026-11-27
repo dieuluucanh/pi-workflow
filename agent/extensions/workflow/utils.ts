@@ -4,7 +4,174 @@
  * imports) so it stays loadable in plain Node tests.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { isCommandAllowedForRole } from "./permissions.ts";
+import { planStepIdFor, todoItemId } from "./plan-identity.ts";
+
+/**
+ * Translate shell foreign path syntax to native syntax without changing case.
+ *
+ * On Windows, Git-Bash/MSYS (`/c/...`), Cygwin (`/cygdrive/c/...`) and WSL
+ * (`/mnt/c/...`) spellings otherwise become `C:\c\...` under `path.resolve`.
+ * On POSIX, a Windows drive path is mapped to `/mnt/<drive>/...` only when the
+ * mount exists; otherwise the caller treats it as uncertain. UNC/WSL UNC
+ * paths intentionally stay network paths.
+ *
+ * This is the case-preserving plumbing used for real filesystem/settings
+ * paths. `normalizePolicyPath` applies this and then lowercases only for the
+ * comparison form.
+ */
+export function translateForeignPath(value: unknown): {
+  path: string;
+  uncertain?: boolean;
+} {
+  if (typeof value !== "string") return { path: "", uncertain: true };
+  let raw = value.trim();
+  if (!raw) return { path: "" };
+
+  if (raw.startsWith("file:")) {
+    try {
+      raw = fileURLToPath(raw);
+    } catch {
+      try {
+        raw = decodeURIComponent(raw.replace(/^file:\/\//i, ""));
+      } catch {
+        return { path: raw, uncertain: true };
+      }
+    }
+  }
+
+  if (process.platform === "win32") {
+    const drivePath = (drive: string, rest: string | undefined): string =>
+      `${drive.toUpperCase()}:/${rest ?? ""}`;
+    const cygdrive = /^\/cygdrive\/([A-Za-z])(?:\/(.*))?$/i.exec(raw);
+    if (cygdrive) return { path: drivePath(cygdrive[1], cygdrive[2]) };
+    const wsl = /^\/mnt\/([A-Za-z])(?:\/(.*))?$/i.exec(raw);
+    if (wsl) return { path: drivePath(wsl[1], wsl[2]) };
+    const msys = /^\/([A-Za-z])(?:\/(.*))?$/.exec(raw);
+    if (msys) return { path: drivePath(msys[1], msys[2]) };
+
+    // A drive-relative path (`C:foo`) or a device path is not a normal
+    // absolute path; do not guess what it means.
+    if (/^[A-Za-z]:[^\\/]/.test(raw) || /^\\\\.\\/.test(raw)) {
+      return { path: raw, uncertain: true };
+    }
+    // Extended-length prefixes are not meaningful to the policy layer.
+    raw = raw
+      .replace(/^\\\\\?\\UNC\\/i, "\\\\")
+      .replace(/^\\\\\?\\/i, "");
+    return { path: raw };
+  }
+
+  // POSIX host: map a Windows drive path only when its WSL mount exists.
+  const win = /^([A-Za-z]):[\\/](.*)$/.exec(raw);
+  if (win) {
+    const mount = `/mnt/${win[1].toLowerCase()}`;
+    if (fs.existsSync(mount)) return { path: `${mount}/${win[2]}` };
+    return { path: raw, uncertain: true };
+  }
+  return { path: raw };
+}
+
+/** Options for the Git-Bash `/tmp` translator (injectable for tests). */
+export interface MsysPathOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  exists?: (value: string) => boolean;
+  /** Only translate when the session cwd is a native Windows path. */
+  cwd?: string;
+}
+
+/** A native Windows absolute path (drive-absolute or UNC). */
+export function isNativeWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+let msysTempCache: { key: string; root: string | undefined } | undefined;
+
+function msysTempCacheKey(env: NodeJS.ProcessEnv): string {
+  return [
+    env.MSYSTEM ?? "",
+    env.SHELL ?? "",
+    env.ProgramFiles ?? "",
+    env.PI_MSYS_TMP ?? "",
+    env.TMP ?? "",
+    env.TEMP ?? "",
+    env.TMPDIR ?? "",
+    env.LOCALAPPDATA ?? "",
+    env.USERPROFILE ?? "",
+  ].join("\0");
+}
+
+/**
+ * The real Windows directory behind Git-Bash's `/tmp`.
+ *
+ * Only meaningful for MSYS/Git-Bash (Pi's default Windows shell): Git for
+ * Windows is detected by `%ProgramFiles%\Git\bin\bash.exe`, `MSYSTEM`, or a
+ * bash `SHELL`. Candidates are tried in order and the first existing one
+ * wins. Injected `env`/`exists` options bypass the cache (tests); no
+ * `cygpath` subprocess.
+ */
+export function resolveMsysTempRoot(
+  opts: MsysPathOptions = {},
+): string | undefined {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return undefined;
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? fs.existsSync;
+  const injected =
+    opts.env !== undefined ||
+    opts.exists !== undefined ||
+    opts.platform !== undefined;
+  const key = msysTempCacheKey(env);
+  if (!injected && msysTempCache?.key === key) return msysTempCache.root;
+  const enabled =
+    Boolean(env.PI_MSYS_TMP) ||
+    Boolean(env.MSYSTEM) ||
+    /bash(?:\.exe)?$/i.test(env.SHELL ?? "") ||
+    Boolean(
+      env.ProgramFiles &&
+        exists(path.join(env.ProgramFiles, "Git", "bin", "bash.exe")),
+    );
+  if (!enabled) {
+    if (!injected) msysTempCache = { key, root: undefined };
+    return undefined;
+  }
+  const candidates: string[] = [];
+  if (env.PI_MSYS_TMP && isNativeWindowsPath(env.PI_MSYS_TMP))
+    candidates.push(env.PI_MSYS_TMP);
+  for (const value of [env.TMP, env.TEMP, env.TMPDIR]) {
+    if (value && isNativeWindowsPath(value)) candidates.push(value);
+  }
+  if (env.LOCALAPPDATA)
+    candidates.push(path.join(env.LOCALAPPDATA, "Temp"));
+  if (env.USERPROFILE)
+    candidates.push(path.join(env.USERPROFILE, "AppData", "Local", "Temp"));
+  const root = candidates.find((candidate) => exists(candidate));
+  if (!injected) msysTempCache = { key, root };
+  return root;
+}
+
+/**
+ * Translate the literal `/tmp` prefix (and only that) to the real Windows
+ * temp directory for a POSIX shell. Direct tool paths keep Node semantics
+ * (`/tmp` really is `C:/tmp` there), so callers opt in.
+ */
+export function translateMsysTempPath(
+  value: string,
+  opts: MsysPathOptions = {},
+): string {
+  if (!value) return value;
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return value;
+  if (!/^\/tmp(?=\/|$)/.test(value)) return value;
+  if (opts.cwd && !isNativeWindowsPath(opts.cwd)) return value;
+  const root = resolveMsysTempRoot(opts);
+  return root ? `${root}${value.slice(4)}` : value;
+}
 
 /**
  * Backward-compatible alias for Plan Mode's command policy (read-only plus
@@ -25,7 +192,19 @@ export interface TodoItem {
   completed: boolean;
   /** Industry-style status. Legacy items derive it from `completed`. */
   status?: TodoStatus;
-  /** Stable, globally-unique identity ref assigned at creation and never renumbered. */
+  /**
+   * Stable item identity, assigned once and preserved by updates/merges.
+   * Display `ref` is a canonical position and may change when rows reorder;
+   * `id` is what identifies the work item across rewording and reindexing.
+   */
+  id?: string;
+  /**
+   * Stable plan-step binding for plan-derived rows. Absent on genuine
+   * agent-added rows. Never derived from the current position or from a
+   * shortened rewrite of the text.
+   */
+  planStepId?: string;
+  /** Canonical position, recomputed as 1..N for display. Not durable identity. */
   ref?: string;
   /** Plan-faithful label, e.g. "1", "2.3". Legacy items derive it from step. */
   label?: string;
@@ -34,6 +213,13 @@ export interface TodoItem {
   /** Where the item came from. */
   source?: "plan" | "agent" | "synthesized";
 }
+
+/** FNV-1a over normalized text: deterministic ids without persistence. */
+// Row identity lives in `plan-identity.ts` so the compiler and the display
+// adapter share one rule without an import cycle. Re-exported here because
+// `todoItemId`/`planStepIdFor` are part of this module's public surface.
+export { planStepIdFor, todoItemId };
+
 
 const TODO_STATUS_RANK: Record<TodoStatus, number> = {
   completed: 3,
@@ -134,14 +320,20 @@ export function ensureTodoLabels(items: TodoItem[]): TodoItem[] {
     // Preserve the original positional label for legacy rows without a label.
     const originalStep = Number.isFinite(it?.step) ? Number(it.step) : step;
     const status = itemStatus(it);
+    const label = it?.label || String(originalStep);
+    const source = it?.source ?? "plan";
+    const seeded = { ...it, label, group: it?.group };
     return {
-      ...it,
+      ...seeded,
       step,
-      label: it?.label || String(originalStep),
       ref: String(step),
       status,
       completed: status === "completed",
-      source: it?.source ?? "plan",
+      source,
+      id: it?.id || todoItemId(seeded),
+      ...(source === "plan"
+        ? { planStepId: it?.planStepId || planStepIdFor({ ...seeded, label }) }
+        : {}),
     };
   });
 }
@@ -157,114 +349,6 @@ export function dedupeTodoItems(items: TodoItem[]): TodoItem[] {
     out.push(it);
   }
   return out;
-}
-
-export interface TodoMergeResult {
-  items: TodoItem[];
-  added: number;
-  removed: number;
-  kept: number;
-  /** Number of unmatched `source:"agent"` items preserved from the previous list. */
-  preserved: number;
-}
-
-/**
- * Merge freshly extracted plan steps into the existing list while preserving
- * completion state for steps that are still present. Extracted order wins.
- *
- * Match order: exact `todoKey` (text+group) first, then — for existing
- * `source:"plan"` rows — the plan label (group-aware, collision-safe), so a
- * step whose wording the model rewrote in `workflow_todo update` still
- * reunites with its plan row instead of being duplicated. On a label match the
- * extracted text is authoritative and status merges by rank (a plan-file
- * `- [x]` can mark an item done, nothing un-completes it). Unmatched
- * `source:"agent"` items are preserved.
- *
- * Global refs are canonical positions: `step`/`ref` are recomputed as 1..N in
- * the returned list order, so displayed numbers always equal `todoRef`.
- */
-export function mergeTodoItems(
-  existing: TodoItem[],
-  extracted: TodoItem[],
-): TodoMergeResult {
-  const prev = ensureTodoLabels(existing ?? []);
-  const next = dedupeTodoItems((extracted ?? []).map((n) => ({ ...n })));
-  const normLabel = (s: string | undefined) =>
-    String(s ?? "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, " ")
-      .trim();
-  const byLabel = new Map<string, TodoItem[]>();
-  const byKey = new Map<string, TodoItem>();
-  for (const p of prev) {
-    const l = normLabel(p.label || String(p.step));
-    if (l) {
-      const arr = byLabel.get(l);
-      if (arr) arr.push(p);
-      else byLabel.set(l, [p]);
-    }
-    const k = todoKey(p);
-    if (k && !byKey.has(k)) byKey.set(k, p);
-  }
-  const used = new Set<TodoItem>();
-  let added = 0;
-  let kept = 0;
-  /**
-   * Collision-safe plan-label match for a re-extracted step. Only existing
-   * `source:"plan"` rows are eligible; when duplicate labels exist across
-   * phases the group must disambiguate (otherwise the label is not trusted).
-   */
-  const matchByPlanLabel = (n: TodoItem): TodoItem | undefined => {
-    const l = normLabel(n.label);
-    if (!l) return undefined;
-    const cands = (byLabel.get(l) ?? []).filter(
-      (p) => !used.has(p) && p.source === "plan",
-    );
-    if (cands.length === 0) return undefined;
-    if (cands.length === 1) return cands[0];
-    const ng = normLabel(n.group);
-    const grouped = cands.filter((p) => normLabel(p.group) === ng);
-    return grouped.length === 1 ? grouped[0] : undefined;
-  };
-  const items = next.map((n) => {
-    const nKey = todoKey(n);
-    let match: TodoItem | undefined = nKey ? byKey.get(nKey) : undefined;
-    if (match && used.has(match)) match = undefined;
-    if (!match) match = matchByPlanLabel(n);
-    if (match && !used.has(match)) {
-      used.add(match);
-      kept++;
-      const item: TodoItem = {
-        ...n,
-        group: n.group ?? match.group,
-        source: n.source ?? match.source,
-      };
-      const status = mergeStatusByRank(itemStatus(match), itemStatus(item));
-      setTodoStatus(item, status);
-      return item;
-    }
-    added++;
-    const item: TodoItem = { ...n };
-    if (item.status) item.completed = item.status === "completed";
-    else setTodoStatus(item, item.completed ? "completed" : "pending");
-    return item;
-  });
-  // Preserve unmatched agent-added items (progress + ad-hoc steps survive sync).
-  const preserved: TodoItem[] = [];
-  for (const p of prev) {
-    if (used.has(p)) continue;
-    if (p.source === "agent") preserved.push({ ...p });
-  }
-  const all = [...items, ...preserved];
-  all.forEach((it, i) => {
-    it.step = i + 1;
-    it.ref = String(i + 1);
-    if (!it.label) it.label = String(i + 1);
-  });
-  const removed = prev.filter(
-    (p) => !used.has(p) && p.source !== "agent",
-  ).length;
-  return { items: all, added, removed, kept, preserved: preserved.length };
 }
 
 export interface TodoRefResolution {
@@ -436,9 +520,11 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 // ── Wholesale update (industry-style replace) ────────────────────────
 
 export interface TodoUpdateEntry {
+  /** Stable item identity. Preferred over `ref` when supplied. */
+  id?: string;
   /** Canonical ref to an existing item (optional for new items). */
   ref?: string;
-  /** Step text. Exact/normalized match is used when no `ref` is given. */
+  /** Step text. Exact/normalized match is used when no id/ref is given. */
   text?: string;
   status?: TodoStatus;
 }
@@ -452,6 +538,12 @@ export interface TodoUpdateResult {
   normalized: number;
   /** Non-fatal resolution notes (refs matched by label/text or added as new). */
   warnings: string[];
+  /** Set when the store refused an ambiguous destructive replacement. */
+  refused?: string;
+  /** Store revision after the mutation (absent on a refused/removed-API call). */
+  revision?: number;
+  /** Plan bindings newly recorded as deliberately removed. */
+  excludedAdded?: number;
 }
 
 /**
@@ -474,10 +566,12 @@ export function applyTodoUpdate(
 ): TodoUpdateResult {
   const prev = ensureTodoLabels(existing ?? []);
   const byRef = new Map<string, TodoItem>();
+  const byId = new Map<string, TodoItem>();
   const byTextKey = new Map<string, TodoItem>();
   for (const p of prev) {
     const r = todoRef(p);
     if (r) byRef.set(r.toLowerCase(), p);
+    if (p.id) byId.set(p.id, p);
     const k = todoKey({ text: p.text });
     if (k && !byTextKey.has(k)) byTextKey.set(k, p);
   }
@@ -489,13 +583,28 @@ export function applyTodoUpdate(
   let kept = 0;
   for (const raw of incoming ?? []) {
     const text = normalizeStepText(raw?.text ?? "");
+    const rawId =
+      raw?.id !== undefined && String(raw.id).trim()
+        ? String(raw.id).trim()
+        : undefined;
     const rawRef =
       raw?.ref !== undefined && String(raw.ref).trim()
         ? String(raw.ref).trim()
         : undefined;
     let match: TodoItem | undefined;
-    let matchedBy: "ref" | "label" | "text" | undefined;
-    if (rawRef) {
+    let matchedBy: "id" | "ref" | "label" | "text" | undefined;
+    if (rawId) {
+      // A supplied stable id is authoritative; an unknown id is an error, not
+      // permission to fall back to text and mint a duplicate task.
+      const byStableId = byId.get(rawId);
+      if (!byStableId) {
+        warnings.push(`id "${short(rawId)}" not found; the entry was not applied`);
+        continue;
+      }
+      match = byStableId;
+      matchedBy = "id";
+    }
+    if (!match && rawRef) {
       match = byRef.get(rawRef.toLowerCase());
       if (match) matchedBy = "ref";
     }
@@ -526,6 +635,8 @@ export function applyTodoUpdate(
         status,
         completed: status === "completed",
         source: match.source ?? "agent",
+        id: match.id || todoItemId(match),
+        ...(match.planStepId ? { planStepId: match.planStepId } : {}),
       };
       items.push(item);
     } else {
@@ -542,6 +653,7 @@ export function applyTodoUpdate(
         completed: status === "completed",
         status,
         source: "agent",
+        id: todoItemId({ text, label: undefined, group: undefined }),
       };
       items.push(item);
     }
@@ -712,209 +824,6 @@ export function shouldRemind(state: RemindState): boolean {
 export const TURNS_SINCE_WRITE = 3;
 export const TURNS_BETWEEN_REMINDERS = 3;
 
-// ── Plan extraction (section-scoped) ─────────────────────────────
-
-const EXCLUDED_SECTION_RE =
-  /^(context|decisions?|exploration(\s+summary)?|risks?|verification|notes?|root\s+cause|background|summary|alternatives?|open\s+questions?|references?|appendix)\b/i;
-
-function headingMatch(line: string): { level: number; title: string } | null {
-  const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
-  if (!m) return null;
-  return { level: m[1].length, title: m[2].trim() };
-}
-
-/** Step-shaped heading: `### 1. Title`, `### Step 2: Title`. */
-function stepFromHeading(line: string): { label: string; text: string } | null {
-  const m = line.match(
-    /^(#{3,6})\s*(?:(\d+(?:\.\d+)?)[.)]\s+|Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s+)(.+?)\s*$/i,
-  );
-  if (!m) return null;
-  const label = m[2] ?? m[3];
-  const text = normalizeStepText(m[4] ?? "");
-  if (!label || text.length <= 3) return null;
-  return { label, text };
-}
-
-/** Bold step paragraph: `**Step 1.1: Scaffold**`. */
-function stepFromBold(line: string): { label: string; text: string } | null {
-  const m = line.match(
-    /^\s*\*\*Step\s+(\d+(?:\.\d+)?)\s*[:\uFF1A\-\u2013\u2014.)]?\s*(.+?)\*\*\s*$/i,
-  );
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { label: m[1], text };
-}
-
-/** Numbered list item: `1. Title`. */
-function stepFromList(line: string): { label: string; text: string } | null {
-  const m = line.match(/^\s*(\d+(?:\.\d+)?)[.)]\s+(.+?)\s*$/);
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { label: m[1], text };
-}
-
-/** Checkbox item: `- [ ] Title` / `- [x] Title`. */
-function stepFromCheckbox(
-  line: string,
-): { text: string; completed: boolean } | null {
-  const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.+?)\s*$/);
-  if (!m) return null;
-  const text = normalizeStepText(m[2]);
-  if (text.length <= 3) return null;
-  return { text, completed: m[1].toLowerCase() === "x" };
-}
-
-function parseStepsFromLines(lines: string[]): TodoItem[] {
-  type RawStep = {
-    label?: string;
-    text: string;
-    completed?: boolean;
-    group?: string;
-  };
-  let usedExplicit = false;
-  for (const line of lines) {
-    if (stepFromHeading(line) || stepFromBold(line)) {
-      usedExplicit = true;
-      break;
-    }
-  }
-  let numberedCount = 0;
-  if (!usedExplicit) {
-    for (const line of lines) if (stepFromList(line)) numberedCount++;
-  }
-  const useNumberedList = !usedExplicit && numberedCount >= 2;
-  const raw: RawStep[] = [];
-  let group: string | undefined;
-  for (const line of lines) {
-    const bold = stepFromBold(line);
-    if (bold) {
-      raw.push({ ...bold, group });
-      continue;
-    }
-    const heading = headingMatch(line);
-    if (heading) {
-      const step = stepFromHeading(line);
-      if (step) {
-        raw.push({ ...step, group });
-        continue;
-      }
-      const title = heading.title;
-      if (heading.level >= 3 && !EXCLUDED_SECTION_RE.test(title)) group = title;
-      continue;
-    }
-    if (useNumberedList) {
-      const list = stepFromList(line);
-      if (list) {
-        raw.push({ ...list, group });
-      }
-    }
-  }
-  if (!usedExplicit && !useNumberedList) {
-    for (const line of lines) {
-      const cb = stepFromCheckbox(line);
-      if (cb) raw.push({ text: cb.text, completed: cb.completed });
-    }
-  }
-  const items: TodoItem[] = raw.map((r, i) => ({
-    step: i + 1,
-    text: r.text,
-    completed: !!r.completed,
-    label: r.label,
-    group: r.group,
-    source: "plan" as const,
-  }));
-  const deduped = dedupeTodoItems(items);
-  deduped.forEach((it, i) => {
-    it.step = i + 1;
-    if (!it.label) it.label = String(i + 1);
-  });
-  return deduped;
-}
-
-/**
- * Extract plan steps from a plan markdown file. Section-scoped: only the
- * `## Plan Steps` section is parsed (fallback: step-shaped headings across
- * the document, skipping Context/Decisions/Exploration/Risks/Verification).
- * Labels and phase groups are preserved. Verification is never extracted.
- */
-export function extractPlanStepsFromMarkdown(md: string): TodoItem[] {
-  if (!md) return [];
-  const lines = md.split(/\r?\n/);
-  let start = -1;
-  let level = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const h = headingMatch(lines[i]);
-    if (!h || h.level < 2 || h.level > 4) continue;
-    if (/plan\s+steps/i.test(h.title)) {
-      start = i + 1;
-      level = h.level;
-      break;
-    }
-  }
-  let section: string[];
-  if (start >= 0) {
-    let end = lines.length;
-    for (let i = start; i < lines.length; i++) {
-      const h = headingMatch(lines[i]);
-      if (h && h.level <= level && !/plan\s+steps/i.test(h.title)) {
-        end = i;
-        break;
-      }
-    }
-    section = lines.slice(start, end);
-  } else {
-    section = [];
-    let skipping = false;
-    for (const line of lines) {
-      const h = headingMatch(line);
-      if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
-      else if (h && skipping) continue;
-      if (!skipping) section.push(line);
-    }
-  }
-  return parseStepsFromLines(section);
-}
-
-/**
- * Extract plan steps from assistant chat text (used when no plan file exists).
- * Finds a `Plan:` header, then parses section-scoped steps.
- */
-export function extractTodoItems(message: string): TodoItem[] {
-  if (!message) return [];
-  let headerIdx = -1;
-  let headerLen = 0;
-  const strict = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
-  if (strict && strict.index !== undefined) {
-    headerIdx = strict.index;
-    headerLen = strict[0].length;
-  } else {
-    const hashPlan = message.match(/^#{1,4}\s*\*{0,2}Plan\b[^\n]*\n/im);
-    if (hashPlan && hashPlan.index !== undefined) {
-      headerIdx = hashPlan.index;
-      headerLen = hashPlan[0].length;
-    } else {
-      const planColon = message.match(/Plan:\s*[^\n]*\n/i);
-      if (planColon && planColon.index !== undefined) {
-        headerIdx = planColon.index;
-        headerLen = planColon[0].length;
-      }
-    }
-  }
-  if (headerIdx === -1) return [];
-  const body = message.slice(headerIdx + headerLen).split(/\r?\n/);
-  const filtered: string[] = [];
-  let skipping = false;
-  for (const line of body) {
-    const h = headingMatch(line);
-    if (h && h.level <= 2) skipping = EXCLUDED_SECTION_RE.test(h.title);
-    else if (h && skipping) continue;
-    if (!skipping) filtered.push(line);
-  }
-  return parseStepsFromLines(filtered);
-}
-
 /** Single placeholder step from a plan title when no steps could be parsed. */
 export function synthesizeFromPlanTitle(md: string): TodoItem | null {
   const src = String(md ?? "");
@@ -931,42 +840,329 @@ export function isPlanWritePath(p: string, cwd: string): boolean {
   return norm.includes(".pi/plans/") || norm.startsWith(cwdNorm + "/.pi/plans");
 }
 
+/**
+ * Whether two plan paths identify the same file.
+ *
+ * Plan targets arrive in several shapes: absolute Windows paths from a
+ * `tool_result`, relative paths from `/review <path>`, forward slashes from a
+ * handoff, and case differences from the host. A review-cycle boundary must
+ * not fire for a spelling difference, and must fire for a real move. Kept in
+ * this dependency-free module so the comparison is unit-testable; callers pass
+ * the session cwd for relative paths.
+ */
+export function samePlanPath(
+  a: string | null | undefined,
+  b: string | null | undefined,
+  cwd: string = process.cwd(),
+): boolean {
+  const normalize = (raw: string | null | undefined): string => {
+    let value = String(raw ?? "").trim();
+    if (!value) return "";
+    value = value.replace(/\\/g, "/");
+    const absolute =
+      value.startsWith("/") || /^[A-Za-z]:\//.test(value);
+    if (!absolute) {
+      value = `${String(cwd ?? "").replace(/\\/g, "/").replace(/\/+$/, "")}/${value}`;
+    }
+    const parts: string[] = [];
+    for (const part of value.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (parts.length > 0) parts.pop();
+        continue;
+      }
+      parts.push(part);
+    }
+    let out = parts.join("/");
+    if (value.startsWith("/")) out = `/${out}`;
+    // Windows drive letters are case-insensitive; keep POSIX case-sensitive.
+    out = out.replace(/^([A-Za-z]):/, (_m, drive: string) => `${drive.toUpperCase()}:`);
+    return process.platform === "win32" ? out.toLowerCase() : out;
+  };
+  return normalize(a) === normalize(b);
+}
+
+/** Inputs for deciding whether this run may hand a plan off. */
+export interface PlanHandoffEligibility {
+  mode: "plan" | "build" | null;
+  /** This run wrote/edited a file under `.pi/plans/`. */
+  planWrittenThisRun: boolean;
+  /**
+   * The write happened while Plan mode was active. A run that starts in
+   * Default/Build and switches to Plan mid-run counts; a plan written before
+   * the switch does not. `agent_end`'s current-run message scan sets this too
+   * when the run ends in Plan (the tool_result handler was missed).
+   */
+  planWrittenInPlanMode: boolean;
+  /**
+   * A Planner↔Reviewer revision turn resolved in THIS run (the Planner settled
+   * `plan_revision_done`, silently revised the body, or made no change at all).
+   * Pass it only for the run that answers a revision follow-up: that run may
+   * hand off (or re-review) without writing a plan itself.
+   */
+  revisionSettled?: boolean;
+}
+
+/**
+ * A handoff requires Plan mode plus EITHER a write made under Plan mode in this
+ * run, OR a revision turn that resolved in this run. Session-lifetime plan
+ * files and old todos never authorize a handoff.
+ */
+export function shouldHandoffPlan(input: PlanHandoffEligibility): boolean {
+  if (input.mode !== "plan") return false;
+  if (input.revisionSettled === true) return true;
+  return (
+    input.planWrittenThisRun === true &&
+    input.planWrittenInPlanMode === true
+  );
+}
+
+/**
+ * Last `write`/`edit` tool call in THIS RUN whose path is under `.pi/plans/`.
+ * `messages` must be the `agent_end` run messages (the run's `newMessages`),
+ * never the session history — scanning history would resurrect old plans.
+ * Returns the path as supplied by the tool call; the caller resolves it.
+ */
+export function findPlanWritePathInMessages(
+  messages: readonly unknown[],
+  cwd: string,
+): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as any;
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (let j = m.content.length - 1; j >= 0; j--) {
+      const b = m.content[j];
+      if (b?.type !== "toolCall") continue;
+      if (b.name !== "write" && b.name !== "edit") continue;
+      const p = b.arguments?.path ?? b.arguments?.file_path;
+      if (typeof p === "string" && p && isPlanWritePath(p, cwd)) return p;
+    }
+  }
+  return undefined;
+}
+
+/** Where a manual `/review` found the plan it is about to audit. */
+export type PlanPathSource =
+  | "explicit"
+  | "run"
+  | "session"
+  | "handoff"
+  | "branch";
+
+export interface PlanPathCandidate {
+  path?: string | null;
+  source: PlanPathSource;
+}
+
+export interface PlanPathSelection {
+  path: string;
+  source: PlanPathSource;
+}
+
+/**
+ * Pick the first readable plan for a manual `/review`.
+ *
+ * Candidates arrive in priority order (`explicit` → `run` → `session` →
+ * `handoff` → `branch`). Missing, empty and unreadable candidates are skipped;
+ * a plan that disappeared since it was written must never win over the next
+ * candidate. Pure: the caller owns path resolution and the filesystem probe.
+ */
+export function choosePlanPath(
+  candidates: readonly PlanPathCandidate[],
+  isReadable: (absolutePath: string) => boolean,
+): PlanPathSelection | undefined {
+  for (const candidate of candidates) {
+    const p = candidate.path;
+    if (typeof p !== "string" || p.length === 0) continue;
+    if (isReadable(p)) return { path: p, source: candidate.source };
+  }
+  return undefined;
+}
+
+/**
+ * Newest plan reference in a session branch, used as the last manual
+ * `/review` fallback after a reload or when the in-memory path was lost.
+ *
+ * Recognises the persisted `workflow` entry (`planFile`), the
+ * `workflow-handoff-resolve` entry (`planPath`), and an assistant `write`/
+ * `edit` tool call under `.pi/plans/`. Scans newest-first and never throws.
+ */
+export function findLatestPlanWriteInBranch(
+  entries: readonly unknown[],
+  cwd: string,
+): string | undefined {
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as any;
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "custom") {
+      const p = e.data?.planPath ?? e.data?.planFile;
+      if (typeof p === "string" && p && isPlanWritePath(p, cwd)) return p;
+      continue;
+    }
+    if (e.type === "message" && e.message) {
+      const found = findPlanWritePathInMessages([e.message], cwd);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 // ── Plan date helpers (UTC) ──────────────────────────────────────
 
-/** Return YYYY-MM-DD in UTC for the given date (default: now). Uses toISOString slice, deterministic across locales. */
+/**
+ * Return YYYY-MM-DD in UTC for the given date (default: now). Uses the
+ * toISOString slice, so it is deterministic across locales.
+ *
+ * Plan FILENAMES use `getUtcPlanStamp`/`getUtcDateTimePrefix` — they carry a
+ * UTC time so same-day plans sort by creation time. This date-only helper is
+ * kept for callers that only need the day (and for legacy plan names).
+ */
 export function getUtcDatePrefix(d: Date = new Date()): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** The `.pi/plans/` filename stamp: date, time and their combined prefix. */
+export interface UtcPlanStamp {
+  /** `YYYY-MM-DD` (UTC). */
+  date: string;
+  /** `HHmm` (UTC, zero-padded, minute resolution). */
+  time: string;
+  /** `${date}-${time}` — the plan filename prefix. */
+  prefix: string;
+}
+
+/**
+ * The UTC date-time stamp used by `.pi/plans/<prefix>-<slug>.md`.
+ *
+ * Minute resolution is deliberate: a filename identifies a plan, not an event.
+ * An invalid `Date` yields empty fields instead of throwing, so a bad clock
+ * can never corrupt a plan path (`toISOString` would throw a RangeError).
+ */
+export function getUtcPlanStamp(d: Date = new Date()): UtcPlanStamp {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
+    return { date: "", time: "", prefix: "" };
+  }
+  const iso = d.toISOString(); // 2026-11-24T21:30:59.999Z
+  const date = iso.slice(0, 10);
+  const time = `${iso.slice(11, 13)}${iso.slice(14, 16)}`;
+  return { date, time, prefix: `${date}-${time}` };
+}
+
+/** The `YYYY-MM-DD-HHmm` (UTC) prefix for a new plan filename. */
+export function getUtcDateTimePrefix(d: Date = new Date()): string {
+  return getUtcPlanStamp(d).prefix;
+}
+
+/** Split a plan path into its directory prefix and basename (both separators). */
+function splitPlanBasename(p: string): { dir: string; base: string } {
+  const normalizedSep = p.replace(/\\/g, "/");
+  const lastSlash = normalizedSep.lastIndexOf("/");
+  return {
+    dir: lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "",
+    base: lastSlash >= 0 ? p.slice(lastSlash + 1) : p,
+  };
+}
+
+const PLAN_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})-(.+)$/;
+const PLAN_DATE_TIME_PREFIX = /^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})-(.+)$/;
+
+/**
+ * Apply the `.pi/plans/<UTC-date>-<HHmm>-<slug>.md` convention to one path.
+ *
+ * Policy (deliberate — see `docs/plan-format.md`):
+ *
+ * - Only paths under `.pi/plans/` are touched; everything else is returned as
+ *   supplied and no filesystem probe happens.
+ * - An EXISTING file is never renamed or moved. Legacy date-only names
+ *   (`YYYY-MM-DD-<slug>.md`) therefore keep working forever, and journals,
+ *   review entries and docs never point at a path that no longer exists.
+ * - A NEW path gets the current UTC stamp: a same-day date-time prefix is
+ *   preserved (a long turn keeps its start time), a stale date-time prefix and
+ *   a legacy date-only prefix are replaced in place, and an undated name is
+ *   prefixed. The slug (everything after a valid date-time/date prefix) is
+ *   always preserved.
+ * - An invalid `Date` (or `opts.exists` throwing) leaves the path untouched:
+ *   uncertainty never renames a plan.
+ *
+ * Returns `{ path, corrected, original }`; `original` is exactly what the
+ * caller passed in.
+ */
 export function normalizePlanPath(
   p: string,
   cwd: string,
-  today: string,
+  clock: Date = new Date(),
+  options?: { exists?: (absolutePath: string) => boolean },
 ): { path: string; corrected: boolean; original: string } {
   const original = p;
+  const unchanged = { path: p, corrected: false, original };
   // Only touch paths that are under .pi/plans
-  if (!isPlanWritePath(p, cwd)) return { path: p, corrected: false, original };
-  // Split dir + basename (handle both / and \ separators)
-  const normalizedSep = p.replace(/\\/g, "/");
-  const lastSlash = normalizedSep.lastIndexOf("/");
-  const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
-  const base = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
-  if (!base) return { path: p, corrected: false, original };
-  const m = base.match(/^(\d{4}-\d{2}-\d{2})-(.+)$/);
-  if (m) {
-    const currentDate = m[1];
-    const rest = m[2];
-    if (currentDate === today) return { path: p, corrected: false, original };
-    // Validate that today looks like YYYY-MM-DD to avoid corrupting on invalid today
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
-      return { path: p, corrected: false, original };
-    const correctedBase = `${today}-${rest}`;
-    return { path: `${dir}${correctedBase}`, corrected: true, original };
+  if (!isPlanWritePath(p, cwd)) return unchanged;
+  const { dir, base } = splitPlanBasename(p);
+  if (!base) return unchanged;
+
+  const stamp = getUtcPlanStamp(clock);
+  if (!stamp.prefix) return unchanged;
+
+  // An existing plan is never renamed: a probe that throws counts as existing.
+  const exists = options?.exists ?? fs.existsSync;
+  const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+  try {
+    if (exists(abs)) return unchanged;
+  } catch {
+    return unchanged;
   }
-  // No date prefix — prepend today-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(today))
-    return { path: p, corrected: false, original };
-  return { path: `${dir}${today}-${base}`, corrected: true, original };
+
+  const dateTime = base.match(PLAN_DATE_TIME_PREFIX);
+  if (dateTime) {
+    const [, date, hh, mm, rest] = dateTime;
+    if (Number(hh) < 24 && Number(mm) < 60) {
+      if (date === stamp.date) return unchanged;
+      return {
+        path: `${dir}${stamp.prefix}-${rest}`,
+        corrected: true,
+        original,
+      };
+    }
+    // Out-of-range time digits are not a time prefix; treat it as legacy
+    // date-only below, where `HHmm-<slug>` simply stays part of the slug.
+  }
+
+  const legacy = base.match(PLAN_DATE_PREFIX);
+  if (legacy) {
+    const [, date, rest] = legacy;
+    if (date === stamp.date) return unchanged;
+    return { path: `${dir}${stamp.prefix}-${rest}`, corrected: true, original };
+  }
+
+  // No date prefix — prepend the date-time stamp.
+  return { path: `${dir}${stamp.prefix}-${base}`, corrected: true, original };
+}
+
+/**
+ * Look up the same plan under TODAY's UTC date.
+ *
+ * Used by `/review <path>` so a mistyped date still finds the file the
+ * extension wrote. It replaces only the leading `YYYY-MM-DD` and preserves the
+ * time and slug (`2026-11-20-2130-foo.md` → `2026-11-24-2130-foo.md`), and it
+ * never writes or renames anything. `undefined` means "not a dated plan name".
+ */
+export function dateCorrectedPlanPath(
+  p: string,
+  cwd: string,
+  clock: Date = new Date(),
+): string | undefined {
+  if (!isPlanWritePath(p, cwd)) return undefined;
+  const { dir, base } = splitPlanBasename(p);
+  if (!base) return undefined;
+  const today = getUtcPlanStamp(clock).date;
+  if (!today) return undefined;
+  const m = base.match(PLAN_DATE_PREFIX);
+  if (!m) return undefined;
+  const [, date, rest] = m;
+  if (date === today) return p;
+  return `${dir}${today}-${rest}`;
 }
 
 // ── Rewind checkpoint helpers (pure, no FS/git) ─────────────────────
@@ -1123,12 +1319,20 @@ export function isUserInteractionEntry(e: any): boolean {
 // ══════════════════════════════════════════════════════════════════════
 // Review Mode — pure helpers
 //
-// Review Mode (see review.ts) audits Plan Mode's plan and rewrites it. The
+// Review Mode (see review.ts) audits Plan Mode's plan and appends advisory
+// review notes to it (the plan body itself is never rewritten). The
 // helpers below are the deterministic part: they never call a model and never
 // touch the Pi SDK, so they are fully unit-testable.
 // ══════════════════════════════════════════════════════════════════════
-
-/** Markdown heading that separates the human plan from Review Mode's changelog. */
+/**
+ * Legacy Review Mode heading (pre-append-only): it used to separate the human
+ * plan from the reviewer's changelog.
+ *
+ * Current rounds append `## Reviewer Revisions (round N)` instead, so this
+ * heading is no longer emitted by the live path. It stays exported because
+ * `stripReviewAppendix` still removes it from plans written by older versions
+ * (and `appendReviewChangelog` remains available for that legacy shape).
+ */
 export const REVIEW_CHANGELOG_HEADING = "## Review changes";
 /** Markdown heading appended when Review Mode could not clear its findings. */
 export const REVIEW_UNRESOLVED_HEADING = "## Unresolved findings";
@@ -1161,6 +1365,18 @@ export interface ReviewFinding {
   disposition: ReviewDisposition;
 }
 
+/** A required change the reviewer appends to the Reviewer Revisions appendix. */
+export interface ReviewRevision {
+  /** Stable id, `R<n>`. Normalised to submission order when the model omits it. */
+  id: string;
+  /** Plan step number or short reference, e.g. "3" or "Phase 2". */
+  step?: string;
+  /** The concrete revision the author must make. */
+  change: string;
+  /** Finding ids this revision addresses, e.g. ["F1", "F3"]. */
+  findingIds?: string[];
+}
+
 /** Tier for a finding, using severity first and confidence as the gate. */
 export function reviewFindingTier(f: {
   severity: number;
@@ -1174,11 +1390,21 @@ export function reviewFindingTier(f: {
   return "Info";
 }
 
-/** True when a severity tier is high enough to warrant the verify pass. */
+/**
+ * True when a severity tier is high enough to warrant the verify pass.
+ *
+ * Step 9: only accepted findings at severity >= 7 (with confidence >= 60)
+ * trigger self-verification. Lower findings are not worth a second full LLM
+ * turn; empty, low-severity, or rejected-only findings resubmit pass 1's
+ * plan directly.
+ */
 export function reviewNeedsVerification(findings: ReviewFinding[]): boolean {
   if (!Array.isArray(findings)) return false;
   return findings.some(
-    (f) => Number(f?.severity) >= 5 && Number(f?.confidence) >= 60,
+    (f) =>
+      Number(f?.severity) >= 7 &&
+      Number(f?.confidence) >= 60 &&
+      f?.disposition === "accepted",
   );
 }
 
@@ -1204,6 +1430,31 @@ function oneLine(s: string): string {
   return String(s ?? "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Render the `### Required changes` block of the Reviewer Revisions appendix.
+ *
+ * This is the single source of truth for the format. `renderReviewerRevisions`
+ * (review-tools.ts) calls it and `parseReviewNotes` (this module) parses
+ * exactly this output, so the renderer and parser cannot drift.
+ * Returns "" when there is nothing to list.
+ */
+export function renderRequiredChanges(
+  revisions: ReviewRevision[] | undefined,
+): string {
+  const list = Array.isArray(revisions) ? revisions.filter(Boolean) : [];
+  if (list.length === 0) return "";
+  const lines = ["### Required changes", ""];
+  for (const revision of list) {
+    const step = revision.step ? ` · Step ${revision.step}` : "";
+    const findings =
+      Array.isArray(revision.findingIds) && revision.findingIds.length > 0
+        ? ` _(${revision.findingIds.join(", ")})_`
+        : "";
+    lines.push(`- **${revision.id}${step}:** ${revision.change}${findings}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -1286,8 +1537,292 @@ export function renderReviewChangelog(
 }
 
 /**
- * Strip any previously appended Review Mode appendix from a plan.
- * Returns the plan body exactly as the author wrote it.
+// ── Advisory review notes: parse the appendix ───────────────────────
+
+/** One advisory note parsed from an appendix's `### Required changes` list. */
+export interface ReviewNote {
+  /** Stable id, `R<n>`. Legacy sections without ids get `R1..Rn` positionally. */
+  id: string;
+  /** Plan step reference, when the bullet carried ` · Step <step>`. */
+  step?: string;
+  /** The required change, with the trailing `_(F1, F3)_` fragment removed. */
+  change: string;
+  /** Finding ids from the trailing `_(F1, F3)_` fragment, when present. */
+  findingIds?: string[];
+}
+
+/** Result of {@link parseReviewNotes}. */
+export interface ParsedReviewNotes {
+  /** Notes from the LAST `## Reviewer Revisions (round N)` section only. */
+  notes: ReviewNote[];
+  /** Round number of the section that was read, when the plan has one. */
+  round?: number;
+}
+
+/** `## Reviewer Revisions (round N)` — the last match wins in the parser. */
+const REVIEWER_REVISIONS_HEADING =
+  /^[ \t]*##[ \t]+Reviewer Revisions[ \t]*\(round[ \t]*(\d+)\)[ \t]*$/gim;
+
+/** Optional `### Required changes` sub-heading of the appendix. */
+const REQUIRED_CHANGES_HEADING = /^[ \t]*###[ \t]+Required changes[ \t]*$/im;
+
+/** Any Markdown heading — ends the required-changes list region. */
+const ANY_MARKDOWN_HEADING = /^[ \t]*#{1,6}[ \t]+\S/;
+
+/** Trailing `_(F1, F3)_` fragment rendered by `renderRequiredChanges`. */
+const FINDINGS_FRAGMENT = /[ \t]*_\(([^()]*)\)_[ \t]*$/;
+
+interface ParsedRequiredChange {
+  id?: string;
+  step?: string;
+  change: string;
+  findingIds?: string[];
+}
+
+/**
+ * Parse one `- **R1 · Step 2:** change _(F1)_` bullet body (the text after
+ * `- `). Grammar: `**R<n>[ · Step <step>][:]** <change>[ _(<f1>, <f3>)_]`.
+ * Legacy bullets (`**Step 3:** change`, `**3:** change`) carry no id; the
+ * caller assigns `R1..Rn` by position within that section. Anything that does
+ * not fit the grammar returns undefined and the caller skips the line.
+ */
+function parseRequiredChangeBullet(body: string): ParsedRequiredChange | undefined {
+  const bold = /^\*\*(.+?)\*\*([\s\S]*)$/.exec(body.trim());
+  if (!bold) return undefined;
+  const head = bold[1].replace(/[ \t]+$/, "");
+  const headCore = head.endsWith(":") ? head.slice(0, -1).trimEnd() : head;
+
+  let id: string | undefined;
+  let step: string | undefined;
+  const withId = /^(R\d+)(?:[ \t]*\u00b7[ \t]*Step[ \t]+(.+))?$/i.exec(headCore);
+  if (withId) {
+    id = withId[1].toUpperCase();
+    step = withId[2]?.trim() || undefined;
+  } else {
+    const legacyStep = /^Step[ \t]+(.+)$/i.exec(headCore);
+    const legacyNumber = /^(\d+)$/.exec(headCore);
+    step = legacyStep?.[1]?.trim() || legacyNumber?.[1];
+    if (!step) return undefined;
+  }
+
+  let change = bold[2].trim();
+  let findingIds: string[] | undefined;
+  const fragment = FINDINGS_FRAGMENT.exec(change);
+  if (fragment) {
+    const ids = fragment[1]
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (ids.length > 0) findingIds = ids;
+    change = change.slice(0, fragment.index).trimEnd();
+  }
+  if (!change) return undefined;
+
+  const parsed: ParsedRequiredChange = { change };
+  if (id) parsed.id = id;
+  if (step) parsed.step = step;
+  if (findingIds) parsed.findingIds = findingIds;
+  return parsed;
+}
+
+/** Next free positional `R<n>` for a legacy (id-less) section. */
+function nextLegacyId(start: number, taken: Set<string>): string {
+  let n = start;
+  while (taken.has(`R${n}`)) n++;
+  return `R${n}`;
+}
+
+/**
+ * Parse the advisory notes out of the plan's Reviewer Revisions appendix.
+ *
+ * Reads only the LAST `## Reviewer Revisions (round N)` section (a plan can
+ * carry one per review round; the newest round wins) and only that section's
+ * `### Required changes` list — the findings changelog and anything outside the
+ * block are ignored. The block ends at the next heading, at the first line
+ * that is neither blank nor a `- ` bullet, or at the end of the section.
+ *
+ * Format: exactly what `renderRequiredChanges` emits, i.e.
+ * `- **R<n>[ · Step <step>][:]** <change>[ _(<f1>, <f3>)_]`. A trailing
+ * findings fragment is stripped from `change` and returned as `findingIds`.
+ *
+ * Legacy sections written before ids existed (`- **Step 3:** change`,
+ * `- **3:** change`) get positional ids `R1..Rn` in bullet order within that
+ * section, skipping ids already claimed by explicit bullets, so old appendices
+ * stay parseable without rewriting the plan body.
+ *
+ * A malformed line is skipped, never thrown. A plan with no appendix (or a
+ * round without required changes) returns `{ notes: [] }`.
+ */
+export function parseReviewNotes(planText: string): ParsedReviewNotes {
+  const text = String(planText ?? "").replace(/\r\n?/g, "\n");
+  const headings = [...text.matchAll(REVIEWER_REVISIONS_HEADING)];
+  const last = headings[headings.length - 1];
+  if (!last || last.index === undefined) return { notes: [] };
+
+  const round = Number(last[1]);
+  const afterHeading = text.slice(last.index + last[0].length);
+  const nextSection = /^[ \t]*##[ \t]+\S[^\n]*$/m.exec(afterHeading);
+  const section = nextSection
+    ? afterHeading.slice(0, nextSection.index)
+    : afterHeading;
+
+  const blockHeading = REQUIRED_CHANGES_HEADING.exec(section);
+  if (!blockHeading) return { notes: [], round };
+  const block = section.slice(blockHeading.index + blockHeading[0].length);
+
+  const notes: ReviewNote[] = [];
+  const taken = new Set<string>();
+  for (const line of block.split("\n")) {
+    const bullet = line.trimEnd();
+    if (!bullet.trim()) continue;
+    if (ANY_MARKDOWN_HEADING.test(bullet)) break;
+    if (!bullet.startsWith("- ")) break;
+    const parsed = parseRequiredChangeBullet(bullet.slice(2));
+    if (!parsed) continue;
+    const note: ReviewNote = {
+      id: parsed.id ?? nextLegacyId(notes.length + 1, taken),
+      change: parsed.change,
+    };
+    if (parsed.step) note.step = parsed.step;
+    if (parsed.findingIds) note.findingIds = parsed.findingIds;
+    taken.add(note.id);
+    notes.push(note);
+  }
+  return { notes, round };
+}
+
+/**
+ * Split a reviewed plan into the Planner's body and the Reviewer's appendix.
+ *
+ * The appendix is the LAST `## Reviewer Revisions (round N)` section — from
+ * that heading to the next H2 or EOF — using the same
+ * `REVIEWER_REVISIONS_HEADING` grammar as {@link parseReviewNotes}, so one
+ * plan carrying several rounds splits on the round the parser reads. A plan
+ * with no appendix returns `{ body: planText.trim(), appendix: "" }`.
+ *
+ * Ownership (plan 2026-11-26): the Planner may rewrite `body` and must leave
+ * `appendix` untouched. Line endings are normalized to `\n` and trailing
+ * horizontal whitespace per line is dropped on BOTH halves, so a Windows
+ * editor save (CRLF, trailing blanks) is not mistaken for an appendix edit and
+ * does not change the body hash.
+ *
+ * Why this is not `review-tools.stripReviewerRevisions`: that helper cuts at
+ * the FIRST round heading and discards the appendix; the Planner loop needs the
+ * LAST section's text to compare against the expected appendix.
+ *
+ * Deliberately does NOT touch {@link planHash} or {@link stripReviewAppendix}:
+ * those define which plans count as already reviewed.
+ */
+export function splitReviewerAppendix(planText: string): {
+  body: string;
+  appendix: string;
+} {
+  const text = String(planText ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "");
+  if (!text.trim()) return { body: "", appendix: "" };
+  const headings = [...text.matchAll(REVIEWER_REVISIONS_HEADING)];
+  const last = headings[headings.length - 1];
+  if (!last || last.index === undefined) {
+    return { body: text.trim(), appendix: "" };
+  }
+  const afterHeading = text.slice(last.index + last[0].length);
+  const nextSection = /^[ \t]*##[ \t]+\S[^\n]*$/m.exec(afterHeading);
+  const appendixEnd =
+    last.index + last[0].length + (nextSection ? nextSection.index : afterHeading.length);
+  return {
+    body: text.slice(0, last.index).trim(),
+    appendix: text.slice(last.index, appendixEnd).trim(),
+  };
+}
+
+/**
+ * Minimal unified diff between two plan texts (step 9).
+ *
+ * Pass 2 only checks "did the rewrite drop a requirement", so it gets a
+ * diff — not two full plans. Prefix/suffix trim with a few context lines
+ * keeps typical localized rewrites at ~1/10th the tokens; a total rewrite
+ * degrades to one hunk (no worse than today). Capped and never throws.
+ */
+export function buildPlanDiff(
+  original: string,
+  revised: string,
+  context = 3,
+): string {
+  const a = String(original ?? "").split("\n");
+  const b = String(revised ?? "").split("\n");
+  if (a.join("\n") === b.join("\n")) return "(no differences)";
+  const ctx = Number.isFinite(context)
+    ? Math.max(0, Math.min(10, Math.trunc(Number(context))))
+    : 3;
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start])
+    start++;
+  let endA = a.length - 1;
+  let endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA--;
+    endB--;
+  }
+  const fromA = Math.max(0, start - ctx);
+  const toA = Math.min(a.length - 1, endA + ctx);
+  const fromB = Math.max(0, start - ctx);
+  const toB = Math.min(b.length - 1, endB + ctx);
+  const out = [
+    "--- original (author)",
+    "+++ rewritten (reviewer)",
+    `@@ -${fromA + 1},${toA - fromA + 1} +${fromB + 1},${toB - fromB + 1} @@`,
+  ];
+  for (let i = fromA; i < start; i++) out.push(`  ${a[i]}`);
+  for (let i = start; i <= endA; i++) out.push(`- ${a[i]}`);
+  for (let i = start; i <= endB; i++) out.push(`+ ${b[i]}`);
+  const tailFrom = Math.max(endA + 1, endB + 1, start);
+  const tailTo = Math.max(toA, toB);
+  const tailSrc = toA - fromA >= toB - fromB ? a : b;
+  for (let i = tailFrom; i <= Math.min(tailTo, tailSrc.length - 1); i++)
+    out.push(`  ${tailSrc[i]}`);
+  const text = out.join("\n");
+  const MAX_DIFF_CHARS = 12_000;
+    return text.length > MAX_DIFF_CHARS
+      ? `${text.slice(0, MAX_DIFF_CHARS)}\n… [diff truncated — the rewrite is large; re-read the plan file]`
+      : text;
+}
+
+/** Outcome of landing a detached background review (steps 5/11). */
+export type ReviewLanding = "updated" | "unchanged" | "stale";
+
+/**
+ * Decide what a landed background review may announce (step 11 contract).
+ * Pure: `diskHash` is the plan file on disk, `inputHash` the reviewed
+ * revision, `finalHash` the reviewer's rewrite. Only `updated` (the disk
+ * holds the rewrite) announces a change; every other outcome keeps the
+ * author's/user's text and stays quiet or defers to a re-run.
+ */
+export function classifyReviewLanding(input: {
+  diskHash?: string;
+  inputHash: string;
+  finalHash: string;
+}): ReviewLanding {
+  if (input.diskHash === undefined) return "unchanged";
+  if (input.diskHash === input.finalHash) return "updated";
+  if (input.diskHash === input.inputHash) return "unchanged";
+  return "stale";
+}
+
+/**
+ * Strip the Review Mode changelog appendix from a plan.
+ *
+ * Strips exactly two headings (plus a `---` rule immediately before them):
+ * `## Review changes` and `## Unresolved findings`.
+ *
+ * `## Reviewer Revisions (round N)` is deliberately NOT stripped. The revision
+ * appendix is part of the reviewed document, and the review-round guards compare
+ * post-review text, so a new round is a new document by design. Widening this
+ * helper would silently change which plans count as already reviewed; pass-2
+ * resubmission owns that heading separately (`review-tools.stripReviewerRevisions`).
+ *
+ * Returns the text with those two headings removed; the revision appendix, when
+ * present, is preserved exactly.
  */
 export function stripReviewAppendix(planText: string): string {
   const text = String(planText ?? "");
@@ -1318,8 +1853,16 @@ export function appendReviewChangelog(
 }
 
 /**
- * Content hash of a plan body, ignoring any Review Mode appendix so a re-review
- * of the same revision is detected instead of re-triggering forever.
+ * Content hash of a reviewed plan document.
+ *
+ * Goes through `stripReviewAppendix`, so it ignores only `## Review changes` and
+ * `## Unresolved findings`. The `## Reviewer Revisions (round N)` appendix is
+ * intentionally INCLUDED: it is part of the reviewed document, and the
+ * review-round guards (handoff print dedupe, Plannotator stale-tab check,
+ * approval re-read, pause/review `unchanged`) compare the post-review text. A new
+ * round therefore hashes as a new document; identical reviewed text hashes
+ * identically across calls.
+ *
  * FNV-1a over whitespace-normalized text; stable across platforms.
  */
 export function planHash(planText: string): string {
@@ -1436,11 +1979,11 @@ export function pruneContextEntriesForReview(
   opts: PruneReviewContextOptions = {},
 ): any[] {
   const maxChars = Number.isFinite(opts.maxToolResultChars)
-    ? Math.max(200, Number(opts.maxToolResultChars))
-    : 4000;
+    ? Math.min(4000, Math.max(200, Number(opts.maxToolResultChars)))
+    : 1000;
   const maxEntries = Number.isFinite(opts.maxEntries)
-    ? Math.max(1, Number(opts.maxEntries))
-    : 120;
+    ? Math.min(120, Math.max(1, Number(opts.maxEntries)))
+    : 30;
   if (!Array.isArray(entries)) return [];
   const kept: any[] = [];
   try {
@@ -1469,8 +2012,13 @@ export function pruneContextEntriesForReview(
  * obvious first guess) would reject exactly the reviews that are doing their
  * job. So the bounds only catch catastrophes: a stub (below `minRatio`) or an
  * accidental paste / wholesale plan substitution (above `maxRatio`). Everything
- * in between is the reviewer legitimately doing its work, and every change is
- * still made visible to the user through the `## Review changes` appendix.
+ * in between is the reviewer legitimately doing its work, and every revision is
+ * still made visible to the user through the `## Reviewer Revisions` appendix.
+ *
+ * Dead export: the append-only submission path no longer validates a replacement
+ * body, so nothing calls this. It is kept (and re-exported by review.ts) only so
+ * the removal is a separate, reversible change; `## Review changes` in the
+ * paragraph above is the LEGACY heading that `stripReviewAppendix` still strips.
  */
 export function validateReviewedPlan(
   planMarkdown: unknown,
@@ -1554,8 +2102,8 @@ export function renderReviewContextBlock(
   opts: { maxChars?: number } = {},
 ): string {
   const maxChars = Number.isFinite(opts.maxChars)
-    ? Math.max(1000, Number(opts.maxChars))
-    : 60_000;
+    ? Math.min(60_000, Math.max(1000, Number(opts.maxChars)))
+    : 15_000;
   if (!Array.isArray(entries) || entries.length === 0) return "";
   const lines: string[] = [];
   try {
@@ -1579,7 +2127,240 @@ export function renderReviewContextBlock(
   }
   let out = lines.join("\n\n");
   if (out.length > maxChars) {
-    out = `${out.slice(0, maxChars)}\n\n… [context truncated at ${maxChars} chars]`;
+    out = `${out.slice(0, maxChars)}\n\n… [context truncated at ${maxChars} chars — re-read anything you rely on with read/grep]`;
   }
   return out;
+}
+
+// ── Planner-context manifest for the reviewer (step 8) ─────────────
+
+/** What `buildPlannerContextManifest` found in the parent branch. */
+export interface PlannerContextManifest {
+  /** Markdown section for the pass-1 prompt ("" when there is nothing). */
+  markdown: string;
+  /** Distinct file paths inventoried. */
+  files: number;
+  /** Explore recon summaries included. */
+  reconResults: number;
+}
+
+export interface BuildPlannerManifestOptions {
+  /** Max files listed in the inventory. */
+  maxFiles?: number;
+  /** Max explore results summarized. */
+  maxReconResults?: number;
+  /** Max chars taken from the tail of each explore result. */
+  maxReconChars?: number;
+  /**
+   * Describe a referenced path (size/mtime/hash token). Return undefined
+   * for paths that cannot be described — the path is still listed.
+   */
+  describeFile?: (path: string) => string | undefined;
+}
+
+const PLANNER_MANIFEST_MAX_FILES = 200;
+const PLANNER_MANIFEST_MAX_RECON = 3;
+const PLANNER_MANIFEST_RECON_CHARS = 700;
+
+/**
+ * Ordered unique `path`/`file_path` arguments from tool calls in the branch.
+ * These are the files Plan Mode touched — the reviewer can trust them
+ * unless a finding cites them (then it re-reads). Never throws.
+ */
+function manifestToolPaths(entries: unknown, maxFiles: number): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const take = (raw: unknown): void => {
+    if (paths.length >= maxFiles) return;
+    if (typeof raw !== "string") return;
+    const p = raw.trim();
+    if (!p || p.length > 500 || seen.has(p)) return;
+    seen.add(p);
+    paths.push(p);
+  };
+  try {
+    if (!Array.isArray(entries)) return paths;
+    for (const e of entries) {
+      if (paths.length >= maxFiles) break;
+      if (!e || typeof e !== "object") continue;
+      const blocks = (e as { message?: { content?: unknown } }).message
+        ?.content;
+      if (!Array.isArray(blocks)) continue;
+      for (const b of blocks) {
+        if (!b || typeof b !== "object") continue;
+        const t = (b as { type?: unknown }).type;
+        if (t !== "toolCall" && t !== "tool_use") continue;
+        const args = (b as { arguments?: unknown; input?: unknown })
+          .arguments ?? (b as { input?: unknown }).input;
+        if (args && typeof args === "object") {
+          take((args as Record<string, unknown>).path);
+          take((args as Record<string, unknown>).file_path);
+        }
+      }
+    }
+  } catch {
+    /* keep what was collected */
+  }
+  return paths;
+}
+
+/**
+ * Tails of the most recent `explore` tool results (Plan Mode recon), newest
+ * first. Conclusions tend to live at the end, so the tail is kept. Never throws.
+ */
+function manifestReconTails(
+  entries: unknown,
+  maxResults: number,
+  maxChars: number,
+): string[] {
+  const tails: string[] = [];
+  try {
+    if (!Array.isArray(entries)) return tails;
+    for (
+      let i = entries.length - 1;
+      i >= 0 && tails.length < maxResults;
+      i--
+    ) {
+      const msg = (entries[i] as { message?: unknown })?.message as
+        | { role?: unknown; toolName?: unknown; content?: unknown }
+        | undefined;
+      if (!msg || msg.role !== "toolResult" || msg.toolName !== "explore")
+        continue;
+      const text = contentBlocksToText(msg.content).trim();
+      if (!text) continue;
+      tails.push(
+        text.length > maxChars ? `…${text.slice(text.length - maxChars)}` : text,
+      );
+    }
+  } catch {
+    /* keep what was collected */
+  }
+  return tails;
+}
+
+/**
+ * Build the Planner-context manifest: a file inventory with change tokens
+ * plus recent explore recon, so the reviewer verifies instead of re-exploring
+ * (plan 2026-10-23, step 8). Takes the RAW branch — pruned entries elide the
+ * explore tails this needs. Pure except for the optional `describeFile`.
+ * Never throws; empty input yields an empty markdown section.
+ */
+export function buildPlannerContextManifest(
+  entries: unknown,
+  opts: BuildPlannerManifestOptions = {},
+): PlannerContextManifest {
+  const empty: PlannerContextManifest = {
+    markdown: "",
+    files: 0,
+    reconResults: 0,
+  };
+  try {
+    const maxFiles = Number.isFinite(opts.maxFiles)
+      ? Math.max(1, Math.min(500, Number(opts.maxFiles)))
+      : PLANNER_MANIFEST_MAX_FILES;
+    const maxRecon = Number.isFinite(opts.maxReconResults)
+      ? Math.max(0, Math.min(10, Number(opts.maxReconResults)))
+      : PLANNER_MANIFEST_MAX_RECON;
+    const maxReconChars = Number.isFinite(opts.maxReconChars)
+      ? Math.max(100, Math.min(8000, Number(opts.maxReconChars)))
+      : PLANNER_MANIFEST_RECON_CHARS;
+    const paths = manifestToolPaths(entries, maxFiles);
+    const recon = manifestReconTails(entries, maxRecon, maxReconChars);
+    if (paths.length === 0 && recon.length === 0) return empty;
+    const lines = [
+      "## Shared context (Planner — trusted unless a finding cites it)",
+      "",
+      "Plan Mode already explored this repository. Trust this inventory and",
+      "these recon summaries for everything they cover; re-read only files a",
+      "finding anchors, plus one or two spot checks.",
+      "",
+    ];
+    if (paths.length > 0) {
+      lines.push(`Files Plan Mode touched (${paths.length}):`, "");
+      for (const p of paths) {
+        let detail = "";
+        try {
+          const d = opts.describeFile?.(p);
+          if (d) detail = ` — ${d}`;
+        } catch {
+          /* a path is still listed without its token */
+        }
+        lines.push(`- \`${p}\`${detail}`);
+      }
+      lines.push("");
+    }
+    if (recon.length > 0) {
+      lines.push(`Planner recon (newest first, ${recon.length}):`, "");
+      recon.forEach((tail, i) => {
+        lines.push(`### Recon ${i + 1}`, "", tail, "");
+      });
+    }
+    return {
+      markdown: lines.join("\n").trimEnd(),
+      files: paths.length,
+      reconResults: recon.length,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+// ── Slash-command argument completions (pi-tui contract) ─────────────
+//
+// `CombinedAutocompleteProvider.getSuggestions` (pi-tui dist/autocomplete.js)
+// passes `getArgumentCompletions(argumentText)` the ENTIRE typed argument
+// text after the command name and, on accept, `applyCompletion` replaces
+// that whole argument text with `item.value` (the slash-argument branch:
+// `newLine = beforePrefix + item.value`). So an argument-position item's
+// `value` must be the complete replacement — e.g. `"use <name>"`, never the
+// bare token. Pi's own /mcp extension follows this contract
+// (`value: `${action} ${name}``). `joinArgumentValue` is the single helper
+// that enforces it: it keeps every committed token and appends (or replaces
+// the last partial token with) `token`.
+
+/** One slash-command argument completion item (pi-tui `AutocompleteItem` shape). */
+export interface ArgumentCompletion {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+/**
+ * Build the full-argument replacement `value` for a completion token.
+ *
+ * `prefix` is the typed argument text so far. Tokens separated by whitespace
+ * are "committed"; if `prefix` ends with whitespace the user is starting a
+ * fresh token, so `token` is appended — otherwise it replaces the trailing
+ * partial token. Pure; never throws.
+ *
+ *   joinArgumentValue("use Syn-De", "Syn-Deepseek-v4.1-Flash-Planner")
+ *     → "use Syn-Deepseek-v4.1-Flash-Planner"
+ *   joinArgumentValue("use ", "none") → "use none"
+ *   joinArgumentValue("", "list")     → "list"
+ */
+export function joinArgumentValue(prefix: string, token: string): string {
+  const raw = String(prefix ?? "");
+  const endsWithWs = /\s$/.test(raw);
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const committed = endsWithWs ? parts : parts.slice(0, -1);
+  return [...committed, token].join(" ");
+}
+
+/**
+ * Exact-match suppression for slash-command argument completions: when the
+ * token being typed (`partial`, "" while the prefix ends with whitespace)
+ * already equals the ONLY remaining candidate, return true so the completer
+ * yields null — pi's editor then closes the dropdown and the FIRST Enter
+ * submits instead of being consumed by the completion-accept handler
+ * (editor.js `tui.select.confirm`). Pure.
+ */
+export function suppressExactArgumentMatch(
+  candidates: readonly string[],
+  partial: string,
+): boolean {
+  if (!partial) return false;
+  return (
+    candidates.length === 1 &&
+    candidates[0].toLowerCase() === partial.toLowerCase()
+  );
 }

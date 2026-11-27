@@ -9,6 +9,9 @@ How the four `@dieulc/*` Pi extensions in this repo are verified and published t
 | `@dieulc/server-logs` | `agent/extensions/server-logs` | <https://www.npmjs.com/package/@dieulc/server-logs> |
 | `@dieulc/browser-inspector` | `agent/extensions/browser-inspector` | <https://www.npmjs.com/package/@dieulc/browser-inspector> |
 
+> `@dieulc/checkpoints` moved to the Pi Desktop repository (`packages/checkpoints`);
+> it is not released from this repo.
+
 Each package is published **independently**: its own version, its own tag (`@dieulc/workflow@0.2.0`), its own `CHANGELOG.md`. The repo root (`@dieulc/pi-workflow`) is `"private": true` and is **never published** — it is the dotfiles repo plus the release tooling.
 
 > **Local releases, by design.** Publishing happens on this machine with `npm publish` under the logged-in `dieulc` account. That keeps the flow to one command, but it means npm **provenance attestations are not generated** (those require a CI/OIDC publisher). Everything else — semver bumps, per-package changelogs, version↔tag symmetry, idempotent publishing — already matches the shape a CI publisher needs, so trusted publishing can be added later without changing this workflow.
@@ -34,7 +37,7 @@ npm run release:status                # read-only: manifest versions vs the npm 
 npm run verify                        # optional: run the gate on all four packages
 npm run release -- --dry-run          # plan only: versions, changelogs, tarballs
 npm run release                       # interactive: pick packages, then bump types
-npm run gallery                       # after publishing: are they listed on pi.dev?
+npm run gallery                       # after publishing: are they in the pi.dev gallery catalog?
 ```
 
 Non-interactive:
@@ -57,13 +60,29 @@ npm run release -- --packages workflow,autocompact,server-logs,browser-inspector
 
 1. **Preflight** — Node major check; current branch must equal `--branch` (default `main`); working tree must be clean; `git fetch` and refuse to continue if the branch is behind `origin`; `npm whoami` must be `dieulc` (override with `--npm-user`; skipped in `--dry-run`).
 2. **Resolve** — compute each selected package's next version from the bump kind, and query the registry (one `npm view <name>@<version> version` per package). A version that is already on npm is **skipped, never fatal**: the rest of the batch is still verified, published, tagged and pushed. See [Skipping already-published packages](#skipping-already-published-packages).
-3. **Verify** — run `scripts/verify-packages.mjs` for the packages that are actually going to be published: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, and a load smoke test of every `pi.extensions` entry.
+3. **Verify** — run `scripts/verify-packages.mjs` for the packages that are actually going to be published: manifest and `files[]` hygiene, peer/dependency import audit, `typecheck`, tests, `npm pack --dry-run` tarball assertions, the packed import closure (every relative import of every packed file must resolve inside the tarball), and a load smoke test of every `pi.extensions` entry from a materialized copy of the packed file set.
 4. **Changelog** — for each package being published, collect commits since that package's previous tag (`git log --no-merges … -- <package dir>`), group them by conventional type, and prepend a `## [version] - YYYY-MM-DD` section to that package's `CHANGELOG.md`.
 5. **Bump** — write the new version into the package's `package.json`.
 6. **Commit** — one commit for the released packages: `chore(release): @dieulc/workflow@0.2.0, @dieulc/autocompact@0.1.1`.
 7. **Publish** — `npm publish` in each package directory, in turn. Output is inherited so npm's 2FA/OTP prompt works. `publishConfig.access: "public"` in each manifest supplies public access for the scoped names.
 8. **Tag** — annotated tag per package: `git tag -a @dieulc/workflow@0.2.0`.
 9. **Push** — `git push origin <branch>` then `git push origin <tag> …`.
+
+### The pack gate
+
+`npm run verify` checks the **packed artifact**, not the source tree. For each package it:
+
+- runs `npm pack --dry-run --json` to get the exact file list npm would publish;
+- resolves every relative import, re-export and dynamic import in every packed `.ts` file
+  against that list — a module that is imported but omitted from `files[]` fails with
+  `tarball is missing ./X.ts (imported by Y.ts)`;
+- materializes exactly that file set in a temp directory and imports every `pi.extensions`
+  entry, so a missing module fails before publish.
+
+`prepublishOnly` runs the same check with `--pack-only` on every `npm publish`, including
+manual publishes that bypass `scripts/release.mjs`. `npm run verify -- --pack-only` is the
+fast local form; `npm run verify` additionally runs the peer/dependency audit, `typecheck`
+and the package tests.
 
 ### Skipping already-published packages
 
@@ -186,7 +205,7 @@ git tag -a "@dieulc/workflow@0.2.0" -m "@dieulc/workflow@0.2.0"
 git push origin main && git push origin "@dieulc/workflow@0.2.0"
 ```
 
-Always run `npm run verify -- --packages <pkg>` first — it catches the mistakes that manual publishing would otherwise push to the registry.
+Always run `npm run verify -- --packages <pkg>` first — it catches the mistakes that manual publishing would otherwise push to the registry. `prepublishOnly` also re-runs the pack gate on `npm publish`, so a manual publish cannot ship a tarball whose imported modules are missing.
 
 ## Verifying an install
 
@@ -203,63 +222,85 @@ To test without disturbing your own Pi config, point the config dir at a scratch
 PI_CODING_AGENT_DIR=/tmp/pi-verify pi -e npm:@dieulc/workflow
 ```
 
-Packages that carry the `pi-package` keyword are listed in the gallery at <https://pi.dev/packages> — see [Gallery listing (pi.dev)](#gallery-listing-pidev) for the crawl mechanics, the `npm run gallery` check, and what to do when a package does not show up.
+Packages that carry the `pi-package` keyword are *eligible* for the gallery at <https://pi.dev/packages>, but pi.dev ingests only a bounded, popularity-ranked slice of them — see [gallery-membership.md](gallery-membership.md) for the crawl mechanics, the measured evidence, and what to do when a package does not show up.
 
 ## Gallery listing (pi.dev)
 
-The gallery is a **crawl of the npm search index filtered by the `pi-package` keyword**. There is no
-registration step, no submission form and no dashboard: publishing a package whose npm metadata
-carries that keyword *is* the registration. All four packages ship `"keywords": ["pi-package", …]`,
-`publishConfig.access: "public"` and a `pi` manifest, and `npm run verify` fails if any of those is
-missing — so a release is gallery-eligible the moment `npm publish` succeeds.
+The gallery is **not a registry you publish into**. pi.dev builds its catalog from npm's search
+results for the `pi-package` keyword and ingests only a bounded, popularity-ranked slice of them, so a
+successful publish makes a package **eligible, not catalogued**. The mechanics, the measured evidence,
+the hypotheses that have been ruled out and the escalation path live in
+[gallery-membership.md](gallery-membership.md); two facts matter for day-to-day releases:
 
-Each card (<https://pi.dev/packages/@dieulc/workflow>) carries the author, downloads/month, age,
-type badges (`extension`, `skill`), the `pi install npm:<name>` line, the README and the parsed `pi`
-manifest. <https://pi.dev/packages?name=dieulc> filters by name, description or author; `?type=` and
-`?sort=recent` narrow it further.
+- **A gallery row is best-effort.** Nothing in `package.json` puts a package in, and a republish only
+  helps when it happens to refresh the package's npm search-index record — sometimes it does,
+  sometimes it does not.
+- **Absence is common.** When measured on 2026-09-20 the catalog held 5,374 rows against 10,255 npm
+  `keywords:pi-package` matches, so roughly 4,900 eligible packages had no catalog row at all.
+
+Every catalog card carries the author, downloads/month, age, type badges (`extension`, `skill`), the
+`pi install npm:<name>` line, the README and the parsed `pi` manifest. <https://pi.dev/packages?name=dieulc>
+filters by name, description or author; `?type=` and `?sort=recent` narrow it further. The filter does
+**not** match the `@scope/name` form — search the scope or the unscoped basename instead.
 
 ### Checking it
 
 ```bash
 npm run gallery                       # all four packages, one shot
 npm run gallery -- --packages workflow
-npm run gallery -- --wait 900         # poll until listed (default: 30 s between attempts)
+npm run gallery -- --wait 900         # keep polling (default: 30 s between attempts)
+npm run gallery -- --diagnose         # explain a verdict: index figures, catalog row, cut-off
 npm run gallery -- --json             # machine-readable
 ```
 
-The check asks both sides — npm and pi.dev — so "not indexed yet" is never confused with "publish
-failed":
+The check reads **both** pi.dev signals — whether the catalog listing (`?name=…`) has an exact-name
+card, and what the detail page's `Downloads` row says — and only reports a package as `not-indexed`
+when they agree that there is no catalog row. A disagreement, or a page it cannot read, is reported
+as `unreachable` rather than as a confident miss:
 
 | Status | Meaning |
 | --- | --- |
-| `ok` | on npm and listed, showing the version the manifest declares |
+| `ok` | on npm and in the gallery catalog, showing the version the manifest declares |
 | `missing` | not on the npm registry — run the release |
-| `pending` | on npm, pi.dev has not indexed it yet (the crawler is behind) |
-| `stale` | listed, but the card still shows an older version |
-| `ineligible` | manifest keywords lack `pi-package` — it can never be listed |
-| `unreachable` | the pi.dev request failed (network blip); retried automatically |
+| `not-indexed` | published and installable, but pi.dev has no catalog row (the listing has no card and the detail page shows `Downloads: not available`) — the bounded, popularity-ranked crawl has not picked it up |
+| `stale` | in the catalog, but the card still shows an older version |
+| `ineligible` | manifest keywords lack `pi-package` — it can never be catalogued |
+| `unreachable` | pi.dev could not be read unambiguously (request failed, markup drift, or the two signals disagree); retried automatically |
 
 The exit code is 0 only when every selected package is `ok`. `npm run release` calls the same check
-in `--warn-only` mode after a successful publish, so a slow crawl never fails a release.
+in `--warn-only` mode after a successful publish, so a package missing from the catalog never fails a
+release.
 
 ### When a package does not show up
 
-Indexing lag is normal and highly variable — usually minutes, occasionally days:
+`not-indexed` is not a lag you can wait out — the catalog only ingests packages that rank inside the
+reachable slice. In order:
 
-- Wait, then `npm run gallery -- --wait 900`.
-- If it is still missing after ~24 h, npm's search index has skipped it. That is a known upstream gap
-  ([pi#7885](https://github.com/earendil-works/pi/issues/7885),
-  [pi#6991](https://github.com/earendil-works/pi/issues/6991)) and it **only self-heals on a new
-  publish** — bump a patch and publish again:
+1. **Confirm the state and the reason.**
 
-  ```bash
-  npm run release -- --packages autocompact --bump patch --yes
-  npm run gallery -- --packages autocompact --wait 900
-  ```
+   ```bash
+   npm run gallery -- --packages workflow --diagnose
+   ```
 
-  In pi#6991 the skipped package became visible ~2.5 h after exactly such a metadata-touch publish.
-- Never try to re-publish an existing version to "refresh" it — npm rejects it. The version bump is
-  what triggers re-indexing.
+   That prints the package's npm search-index figure and search score, whether the catalog listing has
+   a row, the figure pi.dev stored, and a verdict: `no row (below window)` (its index figure is under
+   the measured cut-off, so the bounded crawl cannot reach it) or `no row (unknown)` (the cut-off does
+   **not** explain it). It also prints the by-hand URL to re-check.
+2. **Never republish solely to force a listing.** A version bump only refreshes the package's
+   search-index record; that is a measured attempt, not a fix, and repeated no-op releases burn
+   versions and tags for nothing. Ship a real release, then re-measure with `--diagnose`.
+3. **Escalate to pi.dev when the diagnosis says `no row` — especially `no row (unknown)`.** Every
+   catalog card links a prefilled **report** action (`package-report.yml`): that is the official channel
+   for “this package is missing”, and an ingest gap is not something this repo can fix.
+   [gallery-membership.md](gallery-membership.md) lists the evidence to include and the upstream issues
+   already on file.
+4. **Real downloads are hygiene, not a proven cure.** Ranking is popularity-led, but the catalog
+   already contains packages with *less* npm traction than ones it skips, so traction cannot be shown
+   to be why a specific package is missing. Promote honestly — self-download loops and CI fetch farms
+   violate npm's terms and misrepresent the package's adoption.
+
+`npm publish` never overwrites an existing version, so “refreshing” always means a new version —
+which is exactly what step 2 cautions against doing for its own sake.
 
 ## Versioning policy
 
@@ -282,6 +323,7 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | Plan line `blocked (registry query failed)` + exit 1 | The registry could not be queried (offline, mirror, rate limit, auth). Nothing was published for that package — deliberately: an unreadable state is never treated as “not published”. Re-run when it is reachable. |
 | `--continue reached npm, not this script` (exit 2) | The flags were typed without `--`, so npm consumed them. Run `npm run release -- --continue`. |
 | `verification failed` | Fix what `scripts/verify-packages.mjs` reports; nothing has been written yet. |
+| `tarball is missing ./<module>.ts (imported by <file>.ts)` | A file imported by the package is not in `files[]`. Add it to the package manifest (or the directory that contains it) and re-run the gate. This is the failure mode that shipped `@dieulc/workflow@0.9.0` without `thinking-levels.ts` and `workflow-status.ts`. |
 | `npm publish` returns 403 | Two different causes — read the message. *`403 Forbidden - PUT … you do not have permission`*: first publish of a scoped package must be public (handled by `publishConfig.access`) — check you are a member of the `@dieulc` scope. *`Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages`*: see the row below. |
 | 403 `Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages` | The configured npm credential cannot write, and npm does **not** prompt for an OTP when a token is configured — so this fails even in an interactive terminal (observed with a read-only/without-bypass granular token in `~/.npmrc`). Fix: create a **Granular Access Token** with *Bypass 2FA* enabled (npmjs.com → Access Tokens → Generate New Token; give it read+write on `@dieulc` or all packages) and put it in `~/.npmrc`. Alternative: `npm logout` / remove the token, `npm login`, then publish interactively with `npm publish --otp=<code>` (npm also reads the code from `NPM_CONFIG_OTP`). After fixing the credential, resume with `npm run release -- --continue`. |
 | 403 `… may not perform this action` when unpublishing or deprecating | Destructive registry actions require an interactive 2FA session; a bypass-2FA granular token is refused. Use the npm website or `npm login` interactively. |
@@ -289,8 +331,8 @@ Indexing lag is normal and highly variable — usually minutes, occasionally day
 | Run ends with `publish failed for <pkg>` | The other packages were published, tagged and pushed. Rerun `npm run release -- --continue` to finish the failed one. |
 | npm asks for an OTP | Expected with 2FA; the publish step inherits the terminal, so type the code when prompted. |
 | Extension does not load after install | `pi --verbose`; confirm the `pi.extensions` path is in the tarball (`npm pack --dry-run`). |
-| Published, but the package is not on pi.dev | The gallery crawls npm's search index, and new packages can be skipped for hours — sometimes days. Re-check with `npm run gallery -- --wait 900`; still missing after ~24 h → publish a patch bump (a metadata touch forces re-indexing), see [Gallery listing (pi.dev)](#gallery-listing-pidev). |
-| Gallery card shows an older version | npm's index has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
+| Published, but the package is not in the gallery | The catalog ingests only a bounded, score-ranked slice of npm's `pi-package` search results, so an installable package can stay uncatalogued. `npm run gallery` reports `not-indexed` for it; follow [When a package does not show up](#when-a-package-does-not-show-up) (republish so npm re-indexes it, then verify). |
+| Gallery card shows an older version | The catalog snapshot has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
 | `npm run gallery` reports `ineligible` | The manifest keywords lack `pi-package`. Add it (plus `publishConfig.access: "public"` and a `pi` manifest — `npm run verify` enforces all three) and release a new version. |
 | `npm run release:status` reports every package as `never-published` | Expected before the first publish. Each package flips to `in-sync` once its release lands. |
 | `npm run release:status` reports `local-ahead` | The manifest version is not on npm yet. Publish it: `npm run release -- --packages <pkg> --bump none --yes` publishes the current version as-is. |
@@ -303,7 +345,7 @@ scripts/
 ├─ verify-packages.mjs    # pre-publish gate (also: npm run verify)
 ├─ release.mjs            # release tool (also: npm run release)
 ├─ status.mjs             # read-only publish-state report (also: npm run release:status)
-├─ check-gallery.mjs      # pi.dev listing check (also: npm run gallery)
+├─ check-gallery.mjs      # pi.dev gallery catalog membership check (also: npm run gallery)
 ├─ check-gallery.test.mjs # gallery parser tests (also: npm test)
 └─ status.test.mjs        # status report tests (also: npm test)
 agent/extensions/<pkg>/

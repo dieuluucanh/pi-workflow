@@ -1,0 +1,88 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "synthetic": {
+      "baseUrl": "https://api.synthetic.new/openai/v1",
+      "apiKey": "$SYNTHETIC_API_KEY",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+          "name": "deepseek-ai/DeepSeek-V4.1-Flash",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.6,
+            "output": 1.2,
+            "cacheRead": 0.03,
+            "cacheWrite": 0
+          },
+          "contextWindow": 524288,
+          "maxTokens": 65536,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsStrictMode": false,
+            "supportsUsageInStreaming": false,
+            "supportsStore": false,
+            "maxTokensField": "max_tokens",
+            "requiresToolResultName": true,
+            "supportsReasoningEffort": true
+          }
+        }
+      ],
+      "name": "synthetic"
+    },
+    "command-code": {
+      "baseUrl": "https://api.commandcode.ai/provider/v1",
+      "name": "Command-Code",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash (CommandCode)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "off",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 65536,
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "thinkingFormat": "openai",
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

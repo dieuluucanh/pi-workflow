@@ -8,8 +8,15 @@
  * - Plan/todo items with [DONE:n] completion markers
  * - User-stated preferences
  *
+ * Overflow safety: every summarizer request is bounded to the model's context
+ * window (single call, or chunked fold-reduce when the conversation is larger),
+ * and when LLM summarization fails entirely a deterministic fallback summary is
+ * returned instead. While autocompact is enabled the `session_before_compact`
+ * hook always answers, so an over-context session can always continue instead
+ * of getting bricked.
+ *
  * Features:
- * - Idle pre-warming at 70% context (agent_settled + 15s debounce)
+ * - Idle pre-warming at 70% context (agent_settled + debounce)
  * - Cheap model override via autocompact.model setting
  * - Status footer with context percent + reserve headroom
  * - /autocompact command for status/toggle/compact/preview
@@ -22,19 +29,34 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { uuidv7 } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
-  convertToLlm,
-  serializeConversation,
-  getAgentDir,
-} from "@earendil-works/pi-coding-agent";
+  buildFallbackSummary,
+  summarizeWithFallback,
+  type CompleteFn,
+  type SummarizeInput,
+  type SummarizeStrategy,
+  type SummarizerModel,
+  type SummarizerStructured,
+} from "../summarizer.ts";
+import {
+  decideFire,
+  decideSelfHeal,
+  decideTrigger,
+  RETRY_POLL_MS,
+} from "../trigger.ts";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Backoff (ms) before the one-shot self-heal retry after a failed compaction. */
+const SELF_HEAL_RETRY_DELAY_MS = 3000;
 
 interface AutocompactSettings {
   enabled: boolean;
@@ -42,6 +64,10 @@ interface AutocompactSettings {
   keepRecentTokens: number;
   prewarmThreshold: number;
   prewarmDebounceMs: number;
+  /** Context fraction at which compaction fires without waiting for the debounce. */
+  hardTriggerThreshold: number;
+  /** Max chunks for fold-reduce summarization before middle-digest trimming. */
+  maxSummarizerChunks: number;
   model?: string;
   showStatus: boolean;
 }
@@ -52,6 +78,8 @@ const DEFAULT_SETTINGS: AutocompactSettings = {
   keepRecentTokens: 20000,
   prewarmThreshold: 0.7,
   prewarmDebounceMs: 15000,
+  hardTriggerThreshold: 0.9,
+  maxSummarizerChunks: 8,
   showStatus: true,
 };
 
@@ -61,6 +89,10 @@ interface EnrichedDetails {
   todos: { step: number; text: string; completed: boolean }[];
   planSteps: string[];
   version: 1;
+  /** How the summary was produced: single call, fold-reduce, or deterministic fallback. */
+  strategy?: SummarizeStrategy;
+  /** Present when strategy === "fallback": why the LLM path failed. */
+  fallbackReason?: string;
 }
 
 // ============================================================================
@@ -74,6 +106,16 @@ function resolveSettings(_ctx: ExtensionContext): AutocompactSettings {
     const raw = JSON.parse(readFileSync(settingsPath, "utf8"));
     const ac = raw?.autocompact as Partial<AutocompactSettings> | undefined;
     const comp = raw?.compaction as Record<string, unknown> | undefined;
+    const fraction = (value: unknown, fallback: number): number => {
+      const n = typeof value === "number" ? value : Number.NaN;
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(1, Math.max(0, n));
+    };
+    const count = (value: unknown, fallback: number): number => {
+      const n = typeof value === "number" ? value : Number.NaN;
+      if (!Number.isFinite(n) || n < 1) return fallback;
+      return Math.floor(n);
+    };
     return {
       enabled:
         ac?.enabled ?? (comp?.enabled as boolean) ?? DEFAULT_SETTINGS.enabled,
@@ -85,10 +127,20 @@ function resolveSettings(_ctx: ExtensionContext): AutocompactSettings {
         ac?.keepRecentTokens ??
         (comp?.keepRecentTokens as number) ??
         DEFAULT_SETTINGS.keepRecentTokens,
-      prewarmThreshold:
-        ac?.prewarmThreshold ?? DEFAULT_SETTINGS.prewarmThreshold,
+      prewarmThreshold: fraction(
+        ac?.prewarmThreshold,
+        DEFAULT_SETTINGS.prewarmThreshold,
+      ),
       prewarmDebounceMs:
         ac?.prewarmDebounceMs ?? DEFAULT_SETTINGS.prewarmDebounceMs,
+      hardTriggerThreshold: fraction(
+        ac?.hardTriggerThreshold,
+        DEFAULT_SETTINGS.hardTriggerThreshold,
+      ),
+      maxSummarizerChunks: count(
+        ac?.maxSummarizerChunks,
+        DEFAULT_SETTINGS.maxSummarizerChunks,
+      ),
       model: ac?.model,
       showStatus: ac?.showStatus ?? DEFAULT_SETTINGS.showStatus,
     };
@@ -274,88 +326,69 @@ function computeFileLists(fileOps: {
   return { readFiles, modifiedFiles };
 }
 
+/**
+ * Merge file lists from all previous compaction entries back into the
+ * cumulative sets.
+ *
+ * Hook-sourced compactions are saved with `fromHook=true`, and core only folds
+ * details of native compactions into `preparation.fileOps` — without this
+ * merge the cumulative read/modified tracking would silently reset at every
+ * autocompact compaction. Union across all compaction entries because native
+ * compactions only fold their immediate predecessor's details.
+ */
+function mergePreviousCompactionFiles(
+  fileLists: { readFiles: string[]; modifiedFiles: string[] },
+  branchEntries: Array<{ type: string; details?: unknown }>,
+): { readFiles: string[]; modifiedFiles: string[] } {
+  const read = new Set(fileLists.readFiles);
+  const modified = new Set(fileLists.modifiedFiles);
+  for (const entry of branchEntries) {
+    if (entry.type !== "compaction") continue;
+    const details = entry.details as
+      | { readFiles?: unknown; modifiedFiles?: unknown }
+      | undefined;
+    if (Array.isArray(details?.readFiles)) {
+      for (const f of details.readFiles) {
+        if (typeof f === "string") read.add(f);
+      }
+    }
+    if (Array.isArray(details?.modifiedFiles)) {
+      for (const f of details.modifiedFiles) {
+        if (typeof f === "string") modified.add(f);
+      }
+    }
+  }
+  return { readFiles: [...read].sort(), modifiedFiles: [...modified].sort() };
+}
+
 /** Estimate token count from text length (chars/4 heuristic) */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Build summary prompt from template + data */
-function buildSummaryPrompt(
-  conversationText: string,
-  readFiles: string[],
-  modifiedFiles: string[],
-  previousSummary?: string,
-  customInstructions?: string,
-  todos?: EnrichedDetails["todos"],
-  planSteps?: string[],
-): string {
-  const previousContext = previousSummary
-    ? `\n\nPrevious session summary for context:\n${previousSummary}`
-    : "";
+/** Resolve the summarizer model: settings override first, then the current model. */
+function resolveSummarizerModel(
+  ctx: ExtensionContext,
+  settings: AutocompactSettings,
+): SummarizerModel | undefined {
+  if (settings.model) {
+    const [provider, ...rest] = settings.model.split("/");
+    const modelId = rest.join("/");
+    const found = ctx.modelRegistry.find(provider, modelId);
+    if (found) return found;
+    ctx.ui.notify(
+      `autocompact: model "${settings.model}" not found, using current model`,
+      "warning",
+    );
+  }
+  return ctx.model ?? undefined;
+}
 
-  const todoSection =
-    todos && todos.length > 0
-      ? `\n\nActive todo items (preserve verbatim in summary):\n${todos.map((t) => `${t.step}. ${t.completed ? "✓" : "☐"} ${t.text}`).join("\n")}`
-      : "";
-
-  const planSection =
-    planSteps && planSteps.length > 0
-      ? `\n\nPlan steps (preserve verbatim in summary):\n${planSteps.join("\n")}`
-      : "";
-
-  return `You are a conversation summarizer for a coding agent. Create a comprehensive summary of this conversation that will replace the ENTIRE conversation history. The summary must be thorough and include all information needed to continue work effectively.
-${previousContext}
-## Structure the summary with these sections
-
-## Goal
-[What the user is trying to accomplish — the primary objective and any sub-goals]
-
-## Constraints & Preferences
-- [Requirements, preferences, and constraints mentioned by user]
-
-## Progress
-### Done
-- [x] [Completed tasks with enough detail to understand what was achieved]
-
-### In Progress
-- [ ] [Current work — what was being worked on when the conversation was compacted]
-
-### Blocked
-- [Issues, errors, or dependencies blocking progress]
-
-## Key Decisions
-- **[Decision]**: [Rationale — why this approach was chosen over alternatives]
-
-## Next Steps
-1. [What should happen next — ordered by priority]
-
-## Critical Context
-- [Data, file paths, error messages, environment details needed to continue]
-- [Plan file contents or plan steps if the user was in plan mode]
-- [Active todo items with their completion status]
-- [User preferences that should be respected going forward]
-${customInstructions ? `\n## User Focus\n${customInstructions}\n` : ""}
-## Important Rules
-
-1. Preserve plan-mode todo items **verbatim** with their completion status ([DONE:n] markers)
-2. Include ALL file paths that were read or modified
-3. Preserve error messages and blockers exactly as they occurred
-4. Include user-stated preferences (e.g., "always use TypeScript", "never modify .env")
-5. If there was a plan file (Plan: or TODO: sections), preserve its contents
-6. Be thorough but concise — avoid filler, focus on actionable information
-${todoSection}${planSection}
-
-<read-files>
-${readFiles.join("\n")}
-</read-files>
-
-<modified-files>
-${modifiedFiles.join("\n")}
-</modified-files>
-
-<conversation>
-${conversationText}
-</conversation>`;
+/** Human label for a compaction trigger reason. */
+function reasonLabel(reason: "manual" | "threshold" | "overflow"): string {
+  if (reason === "overflow") return "overflow recovery";
+  if (reason === "threshold") return "threshold";
+  return "manual";
 }
 
 // ============================================================================
@@ -365,9 +398,13 @@ ${conversationText}
 export default function autocompact(pi: ExtensionAPI) {
   // State (in-memory, reset on session_start)
   let lastCompactionTimestamp = 0;
-  let previousTokens: number | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let autoCompactionEnabled = true;
+  let lastStrategy: SummarizeStrategy | null = null;
+  let lastFallbackReason: string | null = null;
+  // Self-heal state: one outstanding retry per failure chain, reset on success.
+  let selfHealRetryPending = false;
+  let selfHealTimer: ReturnType<typeof setTimeout> | null = null;
 
   pi.registerFlag("autocompact", {
     description: "Enable autocompact extension",
@@ -380,8 +417,10 @@ export default function autocompact(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Reset state on new session
     lastCompactionTimestamp = 0;
-    previousTokens = null;
     autoCompactionEnabled = true;
+    lastStrategy = null;
+    lastFallbackReason = null;
+    selfHealRetryPending = false;
 
     // Check flag override
     if (pi.getFlag("autocompact") === false) {
@@ -397,6 +436,10 @@ export default function autocompact(pi: ExtensionAPI) {
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
+    }
+    if (selfHealTimer) {
+      clearTimeout(selfHealTimer);
+      selfHealTimer = null;
     }
   });
 
@@ -435,10 +478,17 @@ export default function autocompact(pi: ExtensionAPI) {
     }
   }
 
-  // --- Trigger engine: threshold + overflow + idle pre-warming ---
-
+  // --- Compaction hook: bounded summarization with deterministic fallback ---
+  //
   // The core `session_before_compact` hook intercepts ALL compaction
-  // (threshold, overflow, manual) and provides intelligent summaries
+  // (threshold, overflow, manual). Summarizer input is bounded to the model's
+  // window (single call or chunked fold-reduce — see summarizer.ts), and the
+  // LLM path degrades to a deterministic fallback summary on failure. While
+  // enabled, this hook always returns a compaction result: core's default
+  // summarizer sends the whole conversation in one unbounded request and
+  // cannot succeed once the context is full, so deferring to it would leave
+  // the session stuck.
+
   pi.on("session_before_compact", async (event, ctx) => {
     if (!autoCompactionEnabled) return;
 
@@ -453,120 +503,197 @@ export default function autocompact(pi: ExtensionAPI) {
       ...preparation.messagesToSummarize,
       ...preparation.turnPrefixMessages,
     ];
+    const label = reasonLabel(reason);
 
-    // Build enriched details with plan/todo extraction (computeFileLists converts FileOperations→{readFiles,modifiedFiles})
-    const fileLists = computeFileLists(preparation.fileOps);
+    // Enrichment: plan/todo extraction + cumulative file tracking.
+    const fileLists = mergePreviousCompactionFiles(
+      computeFileLists(preparation.fileOps),
+      branchEntries,
+    );
     const details = buildEnrichedDetails(fileLists, branchEntries);
 
-    // Resolve summarizer model
-    let model;
-    if (settings.model) {
-      const [provider, ...rest] = settings.model.split("/");
-      const modelId = rest.join("/");
-      model = ctx.modelRegistry.find(provider, modelId);
-      if (!model) {
-        ctx.ui.notify(
-          `autocompact: model "${settings.model}" not found, using default`,
-          "warning",
-        );
-      }
-    }
-    if (!model) {
-      model = ctx.model;
-    }
+    const structured: SummarizerStructured = {
+      todos: details.todos,
+      planSteps: details.planSteps,
+      readFiles: details.readFiles,
+      modifiedFiles: details.modifiedFiles,
+    };
 
-    if (!model) {
-      ctx.ui.notify(
-        "autocompact: no model available, falling back to native compaction",
-        "warning",
-      );
-      return;
-    }
-
-    // Serialize conversation for summarizer
-    const conversationText = serializeConversation(convertToLlm(allMessages));
-
-    // Build summary prompt
-    const summaryText = buildSummaryPrompt(
-      conversationText,
-      details.readFiles,
-      details.modifiedFiles,
-      preparation.previousSummary,
+    const model = resolveSummarizerModel(ctx, settings);
+    const input: SummarizeInput = {
+      model: model ?? { contextWindow: 0, maxTokens: 0 },
+      messages: convertToLlm(allMessages),
+      previousSummary: preparation.previousSummary,
       customInstructions,
-      details.todos,
-      details.planSteps,
-    );
+      reserveTokens: settings.reserveTokens,
+      structured,
+      maxChunks: settings.maxSummarizerChunks,
+      sessionId: uuidv7(),
+    };
 
-    // Build messages for LLM call
-    const summaryMessages = [
-      {
-        role: "user" as const,
-        content: [{ type: "text" as const, text: summaryText }],
-        timestamp: Date.now(),
-      },
-    ];
-
-    const reasonLabel =
-      reason === "overflow"
-        ? "overflow recovery"
-        : reason === "threshold"
-          ? "threshold"
-          : "manual";
     ctx.ui.notify(
-      `autocompact (${reasonLabel}): summarizing ${allMessages.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)...`,
+      `autocompact (${label}): summarizing ${allMessages.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)...`,
       "info",
     );
 
     try {
-      const response = await ctx.modelRegistry.complete(
-        model,
-        { messages: summaryMessages },
-        {
-          maxTokens: 8192,
-          signal,
-          cacheRetention: "none",
-          sessionId: uuidv7(),
-        },
-      );
+      const result = model
+        ? await summarizeWithFallback(
+            {
+              complete: (m, context, options) =>
+                ctx.modelRegistry.complete(m as Model<Api>, context, options),
+            },
+            input,
+          )
+        : {
+            summary: buildFallbackSummary(
+              {
+                messages: input.messages,
+                previousSummary: preparation.previousSummary,
+                structured,
+              },
+              "no summarizer model available",
+            ),
+            strategy: "fallback" as const,
+            fallbackReason: "no summarizer model available",
+          };
 
-      const summary = response.content
-        .filter((c): c is { type: "text"; text: string } => c.type === "text")
-        .map((c) => c.text)
-        .join("\n");
+      if (signal?.aborted) return;
 
-      if (!summary.trim()) {
-        if (!signal?.aborted) {
-          ctx.ui.notify(
-            "autocompact: summary was empty, falling back to native compaction",
-            "warning",
-          );
-        }
-        return;
+      if (result.strategy === "fallback") {
+        ctx.ui.notify(
+          `autocompact (${label}): LLM summarization failed (${result.fallbackReason}); using deterministic fallback summary`,
+          "warning",
+        );
+      } else {
+        const folds =
+          result.strategy === "fold" && result.folds && result.folds > 1
+            ? `, ${result.folds} parts`
+            : "";
+        ctx.ui.notify(
+          `autocompact (${label}): summary ready (${result.strategy}${folds})`,
+          "info",
+        );
+      }
+
+      // Bookkeeping: a compaction just happened; reset trigger state.
+      lastCompactionTimestamp = Date.now();
+      lastStrategy = result.strategy;
+      lastFallbackReason = result.fallbackReason ?? null;
+
+      const enrichedDetails: EnrichedDetails = {
+        ...details,
+        strategy: result.strategy,
+      };
+      if (result.fallbackReason) {
+        enrichedDetails.fallbackReason = result.fallbackReason;
       }
 
       // Return compaction result — SessionManager saves with fromHook=true
       return {
         compaction: {
-          summary,
+          summary: result.summary,
           firstKeptEntryId: preparation.firstKeptEntryId,
           tokensBefore: preparation.tokensBefore,
-          usage: response.usage,
-          details,
+          usage: result.usage,
+          details: enrichedDetails,
         },
       };
     } catch (error) {
       if (signal?.aborted) return;
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(
-        `autocompact: summarization failed (${message}), falling back to native`,
-        "error",
-      );
-      // Return undefined to let core compaction run
-      return;
+      // summarizeWithFallback already degrades internally; this net catches
+      // unexpected errors (conversion, state access) so a failed hook never
+      // defers to core's unbounded summarizer at overflow.
+      try {
+        const summary = buildFallbackSummary(
+          {
+            messages: input.messages,
+            previousSummary: preparation.previousSummary,
+            structured,
+          },
+          message,
+        );
+        lastCompactionTimestamp = Date.now();
+        lastStrategy = "fallback";
+        lastFallbackReason = message;
+        ctx.ui.notify(
+          `autocompact (${label}): summarizer crashed (${message}); using deterministic fallback summary`,
+          "error",
+        );
+        return {
+          compaction: {
+            summary,
+            firstKeptEntryId: preparation.firstKeptEntryId,
+            tokensBefore: preparation.tokensBefore,
+            details: {
+              ...details,
+              strategy: "fallback" as const,
+              fallbackReason: message,
+            },
+          },
+        };
+      } catch {
+        ctx.ui.notify(
+          `autocompact (${label}): compaction failed (${message})`,
+          "error",
+        );
+        return;
+      }
     }
   });
 
-  // --- Idle pre-warming on agent_settled ---
+  // --- Idle pre-warming on agent_settled (decisions in ../trigger.ts) ---
+
+  function runPrewarmCompact(ctx: ExtensionContext): void {
+    lastCompactionTimestamp = Date.now();
+    ctx.compact({
+      customInstructions:
+        "Pre-warming compaction — context at high capacity. Summarize for continuity, preserving all critical context, todo items, and plan state.",
+      onComplete: () => {
+        if (ctx.hasUI) {
+          ctx.ui.notify("autocompact: pre-warming completed", "info");
+          updateStatus(ctx);
+        }
+      },
+      onError: (error) => {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `autocompact: pre-warming failed (${error.message})`,
+            "error",
+          );
+        }
+      },
+    });
+  }
+
+  function schedulePrewarm(ctx: ExtensionContext, delayMs: number): void {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      const action = decideFire({
+        isIdle: ctx.isIdle(),
+        aborted: ctx.signal?.aborted === true,
+      });
+      if (action === "cancel") return;
+      if (action === "retry-later") {
+        // A run is active — poll until the first idle gap instead of silently
+        // dropping the attempt (the old behavior lost it until the next settle).
+        schedulePrewarm(ctx, RETRY_POLL_MS);
+        return;
+      }
+      // Re-check before compacting: context may have dropped (compaction or
+      // context edit since scheduling) or be within the post-compaction debounce.
+      const decision = decideTrigger({
+        usage: ctx.getContextUsage(),
+        settings: resolveSettings(ctx),
+        lastCompactionTimestamp,
+        now: Date.now(),
+      });
+      if (decision === "none" || decision === "debounce") return;
+      runPrewarmCompact(ctx);
+    }, delayMs);
+  }
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (!autoCompactionEnabled) return;
@@ -574,61 +701,98 @@ export default function autocompact(pi: ExtensionAPI) {
     const settings = resolveSettings(ctx);
     if (!settings.enabled) return;
 
-    // Clear any pending idle timer
-    if (idleTimer) {
-      clearTimeout(idleTimer);
-      idleTimer = null;
+    const decision = decideTrigger({
+      usage: ctx.getContextUsage(),
+      settings,
+      lastCompactionTimestamp,
+      now: Date.now(),
+    });
+
+    if (decision === "none") {
+      // Context dropped below the pre-warm threshold (e.g. after a compaction
+      // or context edit) — a pending attempt is no longer needed.
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      return;
+    }
+    if (decision === "debounce") return;
+    if (decision === "hard-fire") {
+      // At/above the hard threshold: bypass the debounce entirely.
+      schedulePrewarm(ctx, 0);
+      return;
+    }
+    // "fire": schedule once and let the timer poll until idle. A pending
+    // timer survives intervening runs instead of being reset by each settle,
+    // so active use no longer starves the pre-warm.
+    if (!idleTimer) {
+      schedulePrewarm(ctx, settings.prewarmDebounceMs);
+    }
+  });
+
+  // --- Compaction bookkeeping (covers native compactions too) ---
+
+  pi.on("session_compact", async (_event, ctx) => {
+    lastCompactionTimestamp = Date.now();
+    updateStatus(ctx);
+  });
+
+  pi.on("session_compact_failed", async (event, ctx) => {
+    updateStatus(ctx);
+
+    // Self-heal: when core's compaction just failed (threshold/overflow), give
+    // autocompact one bounded retry via the manual path. Our hook answers with
+    // a bounded summarizer or a deterministic fallback, so this directly
+    // un-bricks sessions where the native unbounded summarizer failed.
+    if (
+      decideSelfHeal({
+        enabled: autoCompactionEnabled && resolveSettings(ctx).enabled,
+        reason: event.reason,
+        aborted: event.aborted,
+        retryPending: selfHealRetryPending,
+      }) === "skip"
+    ) {
+      return;
     }
 
-    // Check context usage
-    const usage = ctx.getContextUsage();
-    if (!usage) return;
-
-    const percent =
-      usage.tokens == null ? 0 : usage.tokens / usage.contextWindow;
-    const threshold = settings.prewarmThreshold;
-
-    // Only pre-warm if above threshold
-    if (percent < threshold) return;
-
-    // Debounce: only compact if enough time since last compaction
-    const now = Date.now();
-    if (now - lastCompactionTimestamp < settings.prewarmDebounceMs) return;
-
-    // Track previous tokens to avoid thrashing
-    if (
-      previousTokens !== null &&
-      usage.tokens != null &&
-      usage.tokens <= previousTokens
-    )
-      return;
-    previousTokens = usage.tokens ?? previousTokens;
-
-    // Schedule pre-warming with debounce
-    idleTimer = setTimeout(() => {
-      if (!ctx.isIdle()) return;
-      if (ctx.signal?.aborted) return;
-
-      lastCompactionTimestamp = Date.now();
+    selfHealRetryPending = true;
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `autocompact: compaction failed (${event.errorMessage ?? "unknown error"}); retrying once via autocompact...`,
+        "warning",
+      );
+    }
+    if (selfHealTimer) clearTimeout(selfHealTimer);
+    selfHealTimer = setTimeout(() => {
+      selfHealTimer = null;
+      if (!ctx.isIdle() || ctx.signal?.aborted) {
+        // Busy or aborted at fire time: drop the retry (a new failure event
+        // would re-arm it; the guard resets below on settle/compaction).
+        selfHealRetryPending = false;
+        return;
+      }
       ctx.compact({
         customInstructions:
-          "Pre-warming compaction — context at high capacity. Summarize for continuity, preserving all critical context, todo items, and plan state.",
+          "Recovery compaction — the previous automatic compaction failed. Summarize for continuity, preserving all critical context, todo items, and plan state.",
         onComplete: () => {
+          selfHealRetryPending = false;
           if (ctx.hasUI) {
-            ctx.ui.notify("autocompact: pre-warming completed", "info");
+            ctx.ui.notify("autocompact: recovery compaction completed", "info");
             updateStatus(ctx);
           }
         },
-        onError: (error) => {
+        onError: () => {
+          selfHealRetryPending = false;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `autocompact: pre-warming failed (${error.message})`,
+              "autocompact: recovery compaction failed; run /autocompact compact to retry manually",
               "error",
             );
           }
         },
       });
-    }, settings.prewarmDebounceMs);
+    }, SELF_HEAL_RETRY_DELAY_MS);
   });
 
   // --- Turn-end: update status ---
@@ -664,9 +828,16 @@ export default function autocompact(pi: ExtensionAPI) {
             lastCompactionTimestamp > 0
               ? `${Math.round((Date.now() - lastCompactionTimestamp) / 1000)}s ago`
               : "never";
+          let strategyText = "—";
+          if (lastStrategy === "fallback") {
+            strategyText = `fallback${lastFallbackReason ? ` (${lastFallbackReason})` : ""}`;
+          } else if (lastStrategy) {
+            strategyText = lastStrategy;
+          }
           ctx.ui.notify(
             `autocompact: ${percent}% context (${usage.tokens?.toLocaleString() ?? "?"}/${usage.contextWindow.toLocaleString()} tokens)\n` +
-              `enabled: ${autoCompactionEnabled} | threshold: ${Math.round(settings.prewarmThreshold * 100)}% | last compact: ${timeSinceLast}`,
+              `enabled: ${autoCompactionEnabled} | prewarm: ${Math.round(settings.prewarmThreshold * 100)}% | hard: ${Math.round(settings.hardTriggerThreshold * 100)}% | max chunks: ${settings.maxSummarizerChunks}\n` +
+              `last compact: ${timeSinceLast} | last strategy: ${strategyText}`,
             "info",
           );
         } else {

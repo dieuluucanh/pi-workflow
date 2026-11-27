@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.85.1",
+  "lastChangelogVersion": "1.6.1",
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
@@ -7,29 +7,28 @@
     "npm:@plannotator/pi-extension",
     "npm:pi-memory",
     "npm:@dieulc/pi-office-protocol@0.3.0",
-    "npm:@dieulc/pi-office-bridge@^0.5.0"
+    "npm:@dieulc/pi-office-bridge@^0.6.0"
+  ],
+  "extensions": [
+    "models.ts"
   ],
   "enabledModels": [
-    "opencode-go/muse-spark-1.2-contributor",
-    "opencode-go/mimo-v2.5",
-    "opencode-go/longcat-2.0",
-    "opencode-go/deepseek-v4-flash",
-    "opencode/muse-spark-1.2-contributor-free",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/mimo-v2.5-free",
-    "opencode/ling-3.0-flash-fin-free",
-    "opencode/big-pickle",
-    "opencode/muse-spark-1.3-contributor-free",
-    "opencode-go/mimo-v2.5-pro",
     "opencode-go/muse-spark-1.3-contributor",
-    "opencode-go/omen-alpha",
-    "opencode-go/glm-5.3-flash",
-    "opencode-go/deepseek-v4.1-flash"
+    "opencode-go/deepseek-v4.1-flash",
+    "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "synthetic/hf:zai-org/GLM-5.3-Flash",
+    "opencode-go/beam-free",
+    "opencode-go/mimo-v2.6-flash",
+    "command-code/deepseek/deepseek-v4.1-flash",
+    "openai-codex/gpt-6.1-sol",
+    "openai-codex/gpt-6.1-terra",
+    "openai-codex/gpt-6-luna",
+    "opencode-go/hy4-flash-free",
+    "openai-codex/gpt-5.6-luna"
   ],
   "defaultThinkingLevel": "high",
-  "defaultProvider": "opencode-go",
-  "defaultModel": "muse-spark-1.3-contributor",
+  "defaultProvider": "command-code",
+  "defaultModel": "deepseek/deepseek-v4.1-flash",
   "terminal": {
     "showTerminalProgress": true
   },
@@ -43,8 +42,57 @@
       "passes": 2,
       "verify": true,
       "fallbackOnError": "skip",
+      "providerRecovery": "fallback",
+      "providerRetries": 1,
+      "chunkedSubmit": "auto",
+      "chunkChars": 6000,
+      "recoveryBudgetMs": 0,
       "exploreBudget": 3,
-      "timeoutMs": 0
+      "timeoutMs": 0,
+      "contextChars": 15000,
+      "contextEntries": 30,
+      "contextToolChars": 1000
+    },
+    "writePolicy": {
+      "mode": "allow",
+      "allowedPaths": [],
+      "allowedCommands": [
+        "sed -n '260,340p' docs/multi_gpu.md",
+        "sed -n '395,500p' docs/multi_gpu.md"
+      ],
+      "mutatingTools": []
+    },
+    "modelDefault": {
+      "provider": "command-code",
+      "id": "deepseek/deepseek-v4.1-flash",
+      "thinking": "high"
+    },
+    "defaultProfile": "CommandCode-Deepseek-V4.1-Flash",
+    "commitPolicy": {
+      "mode": "never",
+      "allowedPaths": []
+    },
+    "folderPolicy": {
+      "mode": "any",
+      "outside": "ask",
+      "grantScope": "project",
+      "sensitiveTemplates": "allow",
+      "sensitivePatterns": [],
+      "sensitiveExemptions": [],
+      "excludePaths": [
+        "C:/",
+        "C:/Personal"
+      ]
+    },
+    "handoff": {
+      "mode": "plannotator",
+      "executionMode": "build"
     }
-  }
+  },
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.2",
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0",
+    "{\"source\":\"npm:pi-memory\",\"scope\":\"user\"}": "0.4.2"
+  },
+  "deviceId": "6b67e4af-e228-4e81-b64c-7be5b7a132af"
 }

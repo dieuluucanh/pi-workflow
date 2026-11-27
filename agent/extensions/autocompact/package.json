@@ -1,13 +1,15 @@
 {
   "name": "@dieulc/autocompact",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "private": false,
   "keywords": ["pi-package", "autocompact", "compaction", "context-management"],
   "description": "Intelligent session context compaction for Pi. Proactive pre-warming, plan/todo-aware summarization, cheap model override, and rich UX.",
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test": "node --test summarizer.test.ts trigger.test.ts smoke-integration.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node ../../../scripts/verify-packages.mjs --pack-only --packages autocompact"
   },
   "repository": {
     "type": "git",
@@ -21,7 +23,14 @@
   "pi": {
     "extensions": ["./extensions/autocompact.ts"]
   },
-  "files": ["extensions/", "prompts/", "README.md", "LICENSE"],
+  "files": [
+    "extensions/",
+    "prompts/",
+    "summarizer.ts",
+    "trigger.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -34,8 +43,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.1.0",
     "@types/node": "^20.19.43",
     "typescript": "5.5.4"
   }

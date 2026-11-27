@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "capturedAt": "2026-11-26",
+  "note": "Behavioral baseline for ordinary Plan/Build. 2026-11-26: Plan mode gains the inert-until-pending plan_revision_done tool (Planner↔Reviewer loop); Build keeps the old set.",
+  "sdk": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "1.5.0"
+  },
+  "registeredTools": [
+    "explore",
+    "orchestrator_abort",
+    "orchestrator_dispatch",
+    "orchestrator_retry",
+    "orchestrator_start",
+    "orchestrator_status",
+    "plan_revision_done",
+    "questionnaire",
+    "workflow_todo"
+  ],
+  "planActiveTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo",
+    "plan_revision_done"
+  ],
+  "buildActiveTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "explore",
+    "questionnaire",
+    "workflow_todo"
+  ],
+  "commands": [
+    "btw",
+    "build",
+    "commit",
+    "commit-policy",
+    "default",
+    "folder-policy",
+    "handoff",
+    "orchestrator",
+    "permissions",
+    "plan",
+    "profile",
+    "prompt",
+    "prompt-model",
+    "prompt-refine",
+    "prompt-refine-companion",
+    "read-policy",
+    "review",
+    "rewind",
+    "role",
+    "shell-guard",
+    "todos",
+    "workflow",
+    "workflow-cycle",
+    "write-policy"
+  ],
+  "roles": {
+    "builtIn": [
+      "builder",
+      "explorer",
+      "orchestrator",
+      "planner",
+      "reviewer"
+    ],
+    "configVersion": 2,
+    "profileRoles": [
+      "planner",
+      "explorer",
+      "builder",
+      "reviewer",
+      "orchestrator"
+    ]
+  },
+  "statusKeys": {
+    "mode": "workflow",
+    "profile": "workflow-profile",
+    "policy": "workflow-policy",
+    "review": "workflow-review",
+    "todos": "workflow-todos",
+    "orchestrator": "workflow-orchestrator"
+  },
+  "widgetKeys": [
+    "workflow-review-status",
+    "workflow-todos"
+  ]
+}

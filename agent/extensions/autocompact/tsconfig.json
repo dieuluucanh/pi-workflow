@@ -10,5 +10,5 @@
     "noEmit": true,
     "declaration": false
   },
-  "include": ["extensions/**/*.ts"]
+  "include": ["extensions/**/*.ts", "*.ts"]
 }

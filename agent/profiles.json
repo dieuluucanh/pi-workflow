@@ -1,0 +1,211 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "Opencode-Deepseek-V4.1-Flash",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "max"
+        },
+        "explorer": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "low"
+        },
+        "builder": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "max"
+        },
+        "orchestrator": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "max"
+        }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "deepseek-v4.1-flash",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "Synthetic-Deepseek-V4.1-Flash",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "thinking": "high"
+        },
+        "builder": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "synthetic",
+          "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "thinking": "xhigh"
+        }
+      },
+      "defaultModel": {
+        "provider": "synthetic",
+        "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "Opencode-Contributor",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "opencode-go",
+          "id": "muse-spark-1.3-contributor",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "opencode-go",
+          "id": "deepseek-v4.1-flash",
+          "thinking": "xhigh"
+        }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "muse-spark-1.3-contributor",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "Opencode-Free",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "high"
+        },
+        "explorer": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "off"
+        },
+        "builder": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "high"
+        },
+        "orchestrator": {
+          "provider": "opencode-go",
+          "id": "hy4-flash-free",
+          "thinking": "high"
+        }
+      },
+      "defaultModel": {
+        "provider": "opencode-go",
+        "id": "hy4-flash-free",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "CommandCode-Deepseek-V4.1-Flash",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
+        },
+        "explorer": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "low"
+        },
+        "builder": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
+        },
+        "orchestrator": {
+          "provider": "command-code",
+          "id": "deepseek/deepseek-v4.1-flash",
+          "thinking": "max"
+        }
+      },
+      "defaultModel": {
+        "provider": "command-code",
+        "id": "deepseek/deepseek-v4.1-flash",
+        "thinking": "high"
+      }
+    },
+    {
+      "name": "openAI",
+      "description": "",
+      "roles": {
+        "planner": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "xhigh"
+        },
+        "explorer": {
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
+          "thinking": "medium"
+        },
+        "builder": {
+          "provider": "openai-codex",
+          "id": "gpt-6-luna",
+          "thinking": "high"
+        },
+        "reviewer": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "xhigh"
+        },
+        "orchestrator": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol",
+          "thinking": "xhigh"
+        }
+      },
+      "defaultModel": {
+        "provider": "openai-codex",
+        "id": "gpt-6.1-sol",
+        "thinking": "high"
+      }
+    }
+  ]
+}

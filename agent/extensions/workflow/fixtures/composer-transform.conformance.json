@@ -1,0 +1,1181 @@
+{
+  "version": 1,
+  "contract": "composer-transform-v1",
+  "note": "Byte-identical cross-repository conformance fixture for composer-transform-v1. Workflow publishes; Pi Desktop reads. Both independent validators must return the same accept/reject verdict and the same error code for every case. A contract change updates this file once and copies it verbatim to tests/shared/fixtures/composer-transform.conformance.json.",
+  "limits": {
+    "maxDraftTextChars": 262144,
+    "maxExpandedTextChars": 524288,
+    "maxCandidateTextChars": 262144,
+    "maxAttachmentCount": 16,
+    "maxAttachmentBytes": 10485760,
+    "maxTotalAttachmentBytes": 20971520,
+    "maxImageCount": 16,
+    "maxAggregateFrameBytes": 33554432,
+    "maxGrantChars": 160,
+    "grantIdChars": 22,
+    "grantSecretChars": 43,
+    "grantTtlMs": 30000,
+    "maxRendezvousClaims": 1,
+    "maxRetainedReceipts": 64,
+    "legacyContributionMaxArgsChars": 1000
+  },
+  "icons": [
+    "sparkles",
+    "wand",
+    "refresh",
+    "edit",
+    "check",
+    "close",
+    "chevron-up",
+    "chevron-down",
+    "play",
+    "pause",
+    "stop",
+    "alert"
+  ],
+  "behaviors": ["one-shot-return", "persistent"],
+  "envelopes": [
+    {
+      "name": "composer-control is additive in contribution v1",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "fixture.alpha", "version": "1.0.0" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "id": "alpha-toggle",
+            "kind": "action",
+            "slot": "action",
+            "label": "Toggle refine",
+            "tone": "neutral",
+            "order": 10,
+            "command": { "name": "alpha-toggle" },
+            "enabled": true
+          },
+          {
+            "id": "alpha-transform",
+            "kind": "action",
+            "slot": "action",
+            "label": "Refine draft",
+            "tone": "neutral",
+            "order": 11,
+            "command": { "name": "alpha-refine" },
+            "enabled": true
+          },
+          {
+            "id": "alpha-composer",
+            "kind": "composer-control",
+            "slot": "composer-actions",
+            "label": "Refine",
+            "description": "Rewrite the current draft without sending it",
+            "icon": "sparkles",
+            "tone": "accent",
+            "order": 12,
+            "checked": false,
+            "enabled": true,
+            "behavior": "one-shot-return",
+            "actionRef": "alpha-toggle",
+            "transformActionRef": "alpha-transform",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown contribution kind is dropped, not fatal",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "fixture.alpha" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "hologram", "id": "future", "text": "from the future" },
+          { "kind": "status", "id": "known", "text": "still renders" }
+        ]
+      }
+    },
+    {
+      "name": "unknown contribution contract version is rejected",
+      "expect": "error",
+      "input": {
+        "version": 2,
+        "owner": { "id": "fixture.alpha" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": []
+      }
+    },
+    {
+      "name": "more than four composer controls is refused",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "fixture.alpha" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "id": "c1",
+            "kind": "composer-control",
+            "label": "One",
+            "behavior": "persistent",
+            "actionRef": "a1",
+            "transformActionRef": "t1",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          },
+          {
+            "id": "c2",
+            "kind": "composer-control",
+            "label": "Two",
+            "behavior": "persistent",
+            "actionRef": "a2",
+            "transformActionRef": "t2",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          },
+          {
+            "id": "c3",
+            "kind": "composer-control",
+            "label": "Three",
+            "behavior": "persistent",
+            "actionRef": "a3",
+            "transformActionRef": "t3",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          },
+          {
+            "id": "c4",
+            "kind": "composer-control",
+            "label": "Four",
+            "behavior": "persistent",
+            "actionRef": "a4",
+            "transformActionRef": "t4",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          },
+          {
+            "id": "c5",
+            "kind": "composer-control",
+            "label": "Five",
+            "behavior": "persistent",
+            "actionRef": "a5",
+            "transformActionRef": "t5",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "controls": [
+    {
+      "name": "valid one-shot composer control",
+      "expect": "ok",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "slot": "composer-actions",
+        "label": "Refine",
+        "description": "Rewrite the draft without sending it",
+        "icon": "sparkles",
+        "tone": "accent",
+        "order": 4,
+        "checked": true,
+        "enabled": true,
+        "behavior": "one-shot-return",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "disabled control carries a reason",
+      "expect": "ok",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "checked": false,
+        "enabled": false,
+        "disabledReason": "the draft is empty",
+        "behavior": "one-shot-return",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "unsupported icon is refused",
+      "expect": "error",
+      "code": "unsupported-icon",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "icon": "data:image/svg+xml;base64,PHN2Zz4=",
+        "behavior": "one-shot-return",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "unknown behavior is refused",
+      "expect": "error",
+      "code": "invalid-behavior",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "behavior": "sometimes",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "toggle and transform references must differ",
+      "expect": "error",
+      "code": "invalid-reference",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-toggle",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "public and companion commands must differ",
+      "expect": "error",
+      "code": "invalid-metadata",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine"
+        }
+      }
+    },
+    {
+      "name": "wrong slot is refused",
+      "expect": "error",
+      "code": "invalid-control",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "slot": "status",
+        "label": "Refine",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "malformed control id is refused",
+      "expect": "error",
+      "code": "invalid-control",
+      "input": {
+        "id": "alpha composer/../../sh",
+        "kind": "composer-control",
+        "label": "Refine",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "newline in a control label is refused",
+      "expect": "error",
+      "code": "invalid-control",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine\nSend",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform",
+        "operation": {
+          "contract": "composer-transform-v1",
+          "publicCommand": "alpha-refine",
+          "companionCommand": "alpha-refine-companion"
+        }
+      }
+    },
+    {
+      "name": "operation metadata is mandatory",
+      "expect": "error",
+      "code": "invalid-metadata",
+      "input": {
+        "id": "alpha-composer",
+        "kind": "composer-control",
+        "label": "Refine",
+        "behavior": "persistent",
+        "actionRef": "alpha-toggle",
+        "transformActionRef": "alpha-transform"
+      }
+    }
+  ],
+  "references": [
+    {
+      "name": "two unrelated extensions resolve their own controls",
+      "expect": "ok",
+      "controls": [
+        {
+          "ownerId": "fixture.alpha",
+          "control": {
+            "id": "alpha-composer",
+            "kind": "composer-control",
+            "label": "Refine",
+            "behavior": "one-shot-return",
+            "actionRef": "alpha-toggle",
+            "transformActionRef": "alpha-transform",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          }
+        },
+        {
+          "ownerId": "fixture.beta",
+          "control": {
+            "id": "beta-composer",
+            "kind": "composer-control",
+            "label": "Rewrite",
+            "behavior": "persistent",
+            "actionRef": "beta-toggle",
+            "transformActionRef": "beta-transform",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "beta-rewrite",
+              "companionCommand": "beta-rewrite-companion"
+            }
+          }
+        }
+      ],
+      "entries": [
+        {
+          "ownerId": "fixture.alpha",
+          "id": "alpha-toggle",
+          "kind": "action",
+          "command": { "name": "alpha-toggle" }
+        },
+        {
+          "ownerId": "fixture.alpha",
+          "id": "alpha-transform",
+          "kind": "action",
+          "command": { "name": "alpha-refine" }
+        },
+        {
+          "ownerId": "fixture.beta",
+          "id": "beta-toggle",
+          "kind": "action",
+          "command": { "name": "beta-toggle" }
+        },
+        {
+          "ownerId": "fixture.beta",
+          "id": "beta-transform",
+          "kind": "action",
+          "command": { "name": "beta-rewrite" }
+        }
+      ]
+    },
+    {
+      "name": "a foreign action reference is refused",
+      "expect": "error",
+      "code": "foreign-action",
+      "controls": [
+        {
+          "ownerId": "fixture.alpha",
+          "control": {
+            "id": "alpha-composer",
+            "kind": "composer-control",
+            "label": "Refine",
+            "behavior": "one-shot-return",
+            "actionRef": "beta-toggle",
+            "transformActionRef": "alpha-transform",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          }
+        }
+      ],
+      "entries": [
+        {
+          "ownerId": "fixture.alpha",
+          "id": "alpha-transform",
+          "kind": "action",
+          "command": { "name": "alpha-refine" }
+        },
+        {
+          "ownerId": "fixture.beta",
+          "id": "beta-toggle",
+          "kind": "action",
+          "command": { "name": "beta-toggle" }
+        }
+      ]
+    },
+    {
+      "name": "a transform reference must invoke the public command",
+      "expect": "error",
+      "code": "invalid-metadata",
+      "controls": [
+        {
+          "ownerId": "fixture.alpha",
+          "control": {
+            "id": "alpha-composer",
+            "kind": "composer-control",
+            "label": "Refine",
+            "behavior": "one-shot-return",
+            "actionRef": "alpha-toggle",
+            "transformActionRef": "alpha-transform",
+            "operation": {
+              "contract": "composer-transform-v1",
+              "publicCommand": "alpha-refine",
+              "companionCommand": "alpha-refine-companion"
+            }
+          }
+        }
+      ],
+      "entries": [
+        {
+          "ownerId": "fixture.alpha",
+          "id": "alpha-toggle",
+          "kind": "action",
+          "command": { "name": "alpha-toggle" }
+        },
+        {
+          "ownerId": "fixture.alpha",
+          "id": "alpha-transform",
+          "kind": "action",
+          "command": { "name": "alpha-other" }
+        }
+      ]
+    }
+  ],
+  "sourceBinding": [
+    {
+      "name": "public and companion share one live source",
+      "expect": "ok",
+      "metadata": {
+        "contract": "composer-transform-v1",
+        "publicCommand": "alpha-refine",
+        "companionCommand": "alpha-refine-companion"
+      },
+      "commands": [
+        {
+          "name": "alpha-refine",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        },
+        {
+          "name": "alpha-refine-companion",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        }
+      ]
+    },
+    {
+      "name": "matching names from two sources are refused",
+      "expect": "error",
+      "code": "foreign-companion",
+      "metadata": {
+        "contract": "composer-transform-v1",
+        "publicCommand": "alpha-refine",
+        "companionCommand": "alpha-refine-companion"
+      },
+      "commands": [
+        {
+          "name": "alpha-refine",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        },
+        {
+          "name": "alpha-refine-companion",
+          "sourceInfo": { "path": "extensions/foreign.ts", "source": "fixture.foreign", "scope": "user" }
+        }
+      ]
+    },
+    {
+      "name": "a missing companion is refused",
+      "expect": "error",
+      "code": "missing-command",
+      "metadata": {
+        "contract": "composer-transform-v1",
+        "publicCommand": "alpha-refine",
+        "companionCommand": "alpha-refine-companion"
+      },
+      "commands": [
+        {
+          "name": "alpha-refine",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        }
+      ]
+    },
+    {
+      "name": "a different expected publisher is refused",
+      "expect": "error",
+      "code": "source-mismatch",
+      "metadata": {
+        "contract": "composer-transform-v1",
+        "publicCommand": "alpha-refine",
+        "companionCommand": "alpha-refine-companion"
+      },
+      "expectedSource": { "path": "extensions/other.ts", "source": "fixture.other", "scope": "user" },
+      "commands": [
+        {
+          "name": "alpha-refine",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        },
+        {
+          "name": "alpha-refine-companion",
+          "sourceInfo": { "path": "extensions/alpha.ts", "source": "fixture.alpha", "scope": "user" }
+        }
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "name": "valid request with metadata-only attachment and in-band image",
+      "expect": "ok",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0001",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "please imporve this prompt",
+          "expandedText": "please imporve this prompt",
+          "selection": { "start": 0, "end": 24 },
+          "attachments": [
+            {
+              "id": "image-1",
+              "digest": "sha256:6f8a",
+              "mimeType": "image/png",
+              "byteLength": 2
+            }
+          ],
+          "inputState": "idle",
+          "parentState": "foreground"
+        },
+        "images": [
+          { "id": "image-1", "mimeType": "image/png", "dataBase64": "aGk=" }
+        ]
+      }
+    },
+    {
+      "name": "malformed request id is refused",
+      "expect": "error",
+      "code": "invalid-request-id",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "../r",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [],
+          "inputState": "idle"
+        }
+      }
+    },
+    {
+      "name": "unknown operation contract is refused",
+      "expect": "error",
+      "code": "unsupported-contract",
+      "input": {
+        "contract": "composer-transform-v2",
+        "requestId": "req_alpha_0002",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [],
+          "inputState": "idle"
+        }
+      }
+    },
+    {
+      "name": "selection beyond the draft is refused",
+      "expect": "error",
+      "code": "invalid-snapshot",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0003",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 99 },
+          "attachments": [],
+          "inputState": "idle"
+        }
+      }
+    },
+    {
+      "name": "duplicate attachment ids are refused",
+      "expect": "error",
+      "code": "invalid-snapshot",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0004",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [
+            { "id": "image-1", "digest": "sha256:a", "mimeType": "image/png", "byteLength": 2 },
+            { "id": "image-1", "digest": "sha256:b", "mimeType": "image/png", "byteLength": 2 }
+          ],
+          "inputState": "idle"
+        }
+      }
+    },
+    {
+      "name": "an image must reference app-owned attachment metadata",
+      "expect": "error",
+      "code": "invalid-snapshot",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0005",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [],
+          "inputState": "idle"
+        },
+        "images": [{ "id": "image-1", "mimeType": "image/png", "dataBase64": "aGk=" }]
+      }
+    },
+    {
+      "name": "image bytes must match attachment metadata",
+      "expect": "error",
+      "code": "invalid-snapshot",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0006",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [
+            { "id": "image-1", "digest": "sha256:a", "mimeType": "image/png", "byteLength": 2 }
+          ],
+          "inputState": "idle"
+        },
+        "images": [{ "id": "image-1", "mimeType": "image/png", "dataBase64": "aGVsbG8=" }]
+      }
+    },
+    {
+      "name": "control characters in the draft are refused",
+      "expect": "error",
+      "code": "oversized-text",
+      "input": {
+        "contract": "composer-transform-v1",
+        "requestId": "req_alpha_0007",
+        "ownerId": "fixture.alpha",
+        "controlId": "alpha-composer",
+        "actionId": "alpha-toggle",
+        "transformActionId": "alpha-transform",
+        "contributionRevision": 7,
+        "binding": {
+          "sessionId": "session-a",
+          "epoch": 3,
+          "bindingId": "binding-alpha",
+          "hostGeneration": 12
+        },
+        "snapshot": {
+          "draftRevision": 4,
+          "text": "hello\u0007world",
+          "selection": { "start": 0, "end": 5 },
+          "attachments": [],
+          "inputState": "idle"
+        }
+      }
+    }
+  ],
+  "frames": {
+    "started": [
+      {
+        "name": "valid started receipt",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "status": "started",
+          "binding": {
+            "sessionId": "session-a",
+            "epoch": 3,
+            "bindingId": "binding-alpha",
+            "hostGeneration": 12
+          },
+          "startedAt": 1732400000000
+        }
+      },
+      {
+        "name": "started receipt with an unknown contract is refused",
+        "expect": "error",
+        "code": "unsupported-contract",
+        "input": {
+          "contract": "composer-transform-v0",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "status": "started",
+          "binding": {
+            "sessionId": "session-a",
+            "epoch": 3,
+            "bindingId": "binding-alpha",
+            "hostGeneration": 12
+          },
+          "startedAt": 1732400000000
+        }
+      }
+    ],
+    "progress": [
+      {
+        "name": "valid progress without prompt text",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "running",
+          "phase": "inspecting",
+          "done": 2,
+          "total": 5,
+          "message": "reading the selected files",
+          "at": 1732400000000
+        }
+      },
+      {
+        "name": "progress done cannot exceed total",
+        "expect": "error",
+        "code": "invalid-metadata",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "running",
+          "done": 6,
+          "total": 5,
+          "at": 1732400000000
+        }
+      },
+      {
+        "name": "unknown lifecycle state is refused",
+        "expect": "error",
+        "code": "invalid-state",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "dreaming",
+          "at": 1732400000000
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "name": "valid candidate",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "candidateRevision": 2,
+          "text": "Please improve this prompt.",
+          "summary": "Clarified the request",
+          "at": 1732400000000
+        }
+      },
+      {
+        "name": "empty candidate is refused",
+        "expect": "error",
+        "code": "oversized-candidate",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "candidateRevision": 2,
+          "text": "   ",
+          "at": 1732400000000
+        }
+      }
+    ],
+    "status": [
+      {
+        "name": "valid running status",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "running",
+          "revision": 3,
+          "updatedAt": 1732400000000,
+          "terminal": false
+        }
+      },
+      {
+        "name": "terminal flag must match the state",
+        "expect": "error",
+        "code": "invalid-state",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "applied",
+          "revision": 3,
+          "updatedAt": 1732400000000,
+          "terminal": false
+        }
+      }
+    ],
+    "cancel": [
+      {
+        "name": "valid cancel request",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "reason": "user armed another control"
+        }
+      },
+      {
+        "name": "valid cancel receipt",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "cancelled",
+          "at": 1732400000000
+        }
+      },
+      {
+        "name": "unknown cancel receipt state is refused",
+        "expect": "error",
+        "code": "invalid-state",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "state": "maybe",
+          "at": 1732400000000
+        }
+      }
+    ],
+    "apply": [
+      {
+        "name": "valid applied receipt",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "appliedRevision": 5,
+          "disposition": "replaced",
+          "appliedAt": 1732400000000
+        }
+      },
+      {
+        "name": "kept-candidate is a valid apply disposition",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "appliedRevision": 5,
+          "disposition": "kept-candidate",
+          "appliedAt": 1732400000000
+        }
+      },
+      {
+        "name": "unknown apply disposition is refused",
+        "expect": "error",
+        "code": "invalid-state",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "appliedRevision": 5,
+          "disposition": "overwrote",
+          "appliedAt": 1732400000000
+        }
+      }
+    ],
+    "failures": [
+      {
+        "name": "valid lifecycle failure",
+        "expect": "ok",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "operationId": "op_alpha_0001",
+          "code": "cancelled",
+          "message": "the operation was cancelled",
+          "retryable": false,
+          "at": 1732400000000
+        }
+      },
+      {
+        "name": "unknown failure code is refused",
+        "expect": "error",
+        "code": "invalid-metadata",
+        "input": {
+          "contract": "composer-transform-v1",
+          "requestId": "req_alpha_0001",
+          "code": "vibes",
+          "message": "not a lifecycle code",
+          "retryable": false,
+          "at": 1732400000000
+        }
+      }
+    ]
+  },
+  "bootstrap": {
+    "grant": "AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "channel": "composer-transform:v1:rendezvous:AAAAAAAAAAAAAAAAAAAAAA",
+    "args": "{\"contract\":\"composer-transform-v1\",\"grant\":\"AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"}",
+    "cases": [
+      { "name": "valid grant-only bootstrap", "expect": "ok", "input": "{\"contract\":\"composer-transform-v1\",\"grant\":\"AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"}" },
+      { "name": "extra draft text is refused", "expect": "error", "code": "bootstrap-invalid", "input": "{\"contract\":\"composer-transform-v1\",\"grant\":\"AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\",\"text\":\"secret\"}" },
+      { "name": "extra image payload is refused", "expect": "error", "code": "bootstrap-invalid", "input": "{\"contract\":\"composer-transform-v1\",\"grant\":\"AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\",\"images\":[]}" },
+      { "name": "wrong bootstrap contract is refused", "expect": "error", "code": "unsupported-contract", "input": "{\"contract\":\"composer-transform-v2\",\"grant\":\"AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"}" },
+      { "name": "malformed grant is refused", "expect": "error", "code": "rendezvous-invalid", "input": "{\"contract\":\"composer-transform-v1\",\"grant\":\"not-a-grant\"}" },
+      { "name": "non-JSON bootstrap is refused", "expect": "error", "code": "bootstrap-invalid", "input": "/prompt hello" }
+    ]
+  },
+  "negotiation": [
+    {
+      "name": "full composer support",
+      "expect": "ok",
+      "capabilities": {
+        "contractVersion": 1,
+        "kinds": ["mode", "status", "action", "composer-control"],
+        "slots": ["mode", "composer-actions"],
+        "maxFrameBytes": 1048576,
+        "icons": ["sparkles", "refresh"]
+      },
+      "expectFrameBytes": 1048576
+    },
+    {
+      "name": "host without composer-control",
+      "expect": "error",
+      "code": "unsupported-kind",
+      "capabilities": {
+        "contractVersion": 1,
+        "kinds": ["mode", "status", "action"],
+        "slots": ["mode"]
+      }
+    },
+    {
+      "name": "host without composer-actions slot",
+      "expect": "error",
+      "code": "unsupported-kind",
+      "capabilities": {
+        "contractVersion": 1,
+        "kinds": ["composer-control"],
+        "slots": ["action"]
+      }
+    },
+    {
+      "name": "older host version",
+      "expect": "error",
+      "code": "unknown-version",
+      "capabilities": {
+        "contractVersion": 0,
+        "kinds": ["composer-control"],
+        "slots": ["composer-actions"]
+      }
+    },
+    {
+      "name": "absent capability",
+      "expect": "error",
+      "code": "unknown-version",
+      "capabilities": null
+    },
+    {
+      "name": "host without icons",
+      "expect": "error",
+      "code": "unsupported-icon",
+      "capabilities": {
+        "contractVersion": 1,
+        "kinds": ["composer-control"],
+        "slots": ["composer-actions"],
+        "icons": []
+      }
+    }
+  ],
+  "fallback": {
+    "publicCommand": "alpha-refine",
+    "expect": {
+      "supported": false,
+      "reason": "host does not implement composer-transform-v1",
+      "textCommand": "alpha-refine",
+      "nativeControl": false,
+      "attachmentAware": false
+    }
+  },
+  "privacy": {
+    "draftSentinel": "SECRET_DRAFT_SENTINEL_7f8a",
+    "imageSentinel": "U0VDUkVUX0lNQUdFX1NFTlRJTkVM",
+    "attachmentDigestSentinel": "sha256:SECRET_DIGEST_SENTINEL",
+    "attachmentIdSentinel": "SECRET_ATTACHMENT_ID",
+    "modelSentinel": "SECRET_MODEL_SENTINEL",
+    "forbiddenKeys": [
+      "text",
+      "expandedText",
+      "digest",
+      "dataBase64",
+      "grant",
+      "secret",
+      "model",
+      "provider",
+      "context"
+    ]
+  }
+}

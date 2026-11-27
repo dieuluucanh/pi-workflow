@@ -15,19 +15,67 @@ Each extension is its own npm package (install just what you want):
 
 | Path | npm package | Description |
 | --- | --- | --- |
-| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, questionnaire (1–4 Qs, dedup), subagent `explore`, `workflow_todo`, `/rewind` shadow-checkpoint, Plannotator bridge |
+| `agent/extensions/workflow/` | `@dieulc/workflow` | Plan↔Build mode, shared folder/read permissions, Review Mode, prompt refinement (`/prompt`, `/prompt-model`, one-shot composer control), questionnaire (1–4 Qs, dedup), subagent `explore`, pinned `workflow_todo` panel, `/rewind` shadow-checkpoint, Plannotator bridge with a native handoff fallback, experimental Orchestrator |
 | `agent/extensions/autocompact/` | `@dieulc/autocompact` | Intelligent compaction: plan/todo-aware summary, 70% pre-warming, cheap model override, `/autocompact` |
 | `agent/extensions/server-logs/` | `@dieulc/server-logs` | Docker + systemd log inspection tools (remote SSH or local) |
 | `agent/extensions/browser-inspector/` | `@dieulc/browser-inspector` | Browser DevTools inspection via CDP: console, network, screenshots (fresh browser or real session) |
 | `agent/settings.json` | — | Shared config: `packages`, theme, enabled models |
-| `agent/keybindings.json` | — | Disables `tui.input.tab` (autocomplete conflict) |
+| `agent/keybindings.json` | — | Keeps `tui.input.tab` bound to Tab; workflow completes while a suggestion list is open and cycles modes otherwise |
 | `agent/plannotator.json` | — | `planning` phase tool gate + status label |
 | `agent/agents/planner.md`, `scout.md` | — | Agent presets |
 | `scripts/` | — | `verify-packages.mjs` (pre-publish gate) + `release.mjs` (release tooling) |
 
 External packages listed in `agent/settings.json` auto-install on first trusted startup.
 
+### Orchestrator (experimental)
+
+`@dieulc/workflow` also contains the opt-in Orchestrator dispatcher: the parent
+reads the approved plan, binds one row per step with `orchestrator_start`
+(including the declared repository roots), and dispatches one in-process Build
+child per row with that row’s root as `cwd`. The child owns its TODO list and
+verification; the parent trusts its report, marks the row done with
+`workflow_todo` and dispatches the next. A blocked report wakes the parent to
+inspect and amend the instruction. Verification is ordinary bash whose real
+output is visible — there is no journal, frozen snapshot, diff gate, repair
+round, final gate or `workflow_execution` tool. A reload restores the run
+record as `interrupted`; old runs are not resumed.
+
+Mode entry alone never launches work, existing Plan → Review → Build remains the
+default, and a managed child can never auto-commit, push or accept its own work.
+The dispatcher is **experimental**: real provider turns and visible-terminal
+acceptance still need a human run (see
+[`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md) and
+the verification record in
+[`docs/verification-2026-11-24-legacy-engine-deletion.md`](docs/verification-2026-11-24-legacy-engine-deletion.md)).
+
 > This repo root is **not** a Pi package and is not published (`"private": true`). Install the extensions individually, or clone the repo for the dotfiles.
+
+### Prompt refinement (`/prompt`)
+
+`@dieulc/workflow` can rewrite a **drafted request** in an isolated child session
+and hand the candidate back to the composer — it never sends or runs it. On
+Terminal Pi, `/prompt <draft>` writes the editor (a path is literal text, not an
+attachment). On Pi Desktop the extension publishes the additive
+`composer-transform-v1` capability, so the same runtime is driven by a one-shot
+composer control through a grant-only bootstrap and a private, single-use
+handoff — never by slash concatenation. `/prompt-model` gives refinement an
+independent model (trusted project → global → Default-mode inherit, with an
+explicit inherit sentinel and per-scope reset) and never changes the main
+session model, roles or profiles.
+
+Refinement is bounded, policy-safe and recoverable: an initial read/trust/grant
+ceiling is re-resolved before every inspection, provider request, question and
+candidate delivery; narrowing invalidates the operation and disposes the child.
+Revocation stops future disclosure — it cannot recall provider data already
+sent. A conflict is never overwritten; the original draft stays recoverable.
+Pi Desktop can bundle a pinned Workflow artifact with explicit
+override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
+checkout. Tested against Workflow **0.14.0** + Pi SDK **1.5.0**; semantic quality
+and live desktop/Terminal acceptance remain human-verified, not inferred from
+unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
+and the Pi Desktop
+[`architecture/extension-ui.md`](https://github.com/dieuluucanh/pi-desktop/blob/main/docs/architecture/extension-ui.md)
+composer-transform contract.
 
 ## Install
 
@@ -40,7 +88,7 @@ pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
 # pinned, for reproducible installs
-pi install npm:@dieulc/workflow@0.1.0
+pi install npm:@dieulc/workflow@0.14.0
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
@@ -50,6 +98,10 @@ pi -e npm:@dieulc/workflow
 ```
 
 Manage them with `pi list`, `pi update --extensions`, `pi remove npm:@dieulc/workflow`.
+
+> Folder checkpoints (`@dieulc/checkpoints`) moved to the Pi Desktop repository.
+> Install it with `pi install npm:@dieulc/checkpoints`; it is not part of this
+> dotfiles repo.
 
 ### B — The dotfiles (git clone)
 
@@ -97,7 +149,7 @@ Releases are cut locally with one script. Versions are **independent per package
 ```bash
 npm login                      # once per machine (npm user: dieulc)
 npm run release:status         # read-only: manifest versions vs the npm registry
-npm run verify                 # gate: all four packages
+npm run verify                 # gate: all four packages (includes the packed import closure)
 npm run release -- --dry-run   # plan only: versions, changelogs, tarballs
 npm run release                # interactive: pick packages + bump type
 
@@ -105,7 +157,7 @@ npm run release                # interactive: pick packages + bump type
 npm run release -- --packages workflow,autocompact --bump minor --yes
 ```
 
-What a release does: preflight (clean tree, `main`, npm auth) → verify → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
+What a release does: preflight (clean tree, `main`, npm auth) → verify (including the packed import closure and a load test of the packed file set) → bump `package.json` → prepend `CHANGELOG.md` sections → one commit → `npm publish` per package → annotated tag per package → push commit + tags.
 
 - `--bump none` publishes the current version as-is (first publish, or resuming).
 - `--continue` resumes after an interrupted run: already-published versions and existing tags are skipped.
@@ -138,7 +190,7 @@ If you fork, check `agent/settings.json` doesn't contain private `enabledModels`
 │  ├─ verify-packages.mjs    ← pre-publish gate
 │  ├─ release.mjs            ← version + changelog + publish + tag
 │  ├─ status.mjs             ← read-only npm publish-state report
-│  └─ check-gallery.mjs      ← pi.dev listing check
+│  └─ check-gallery.mjs      ← pi.dev gallery-catalog membership check
 ├─ .gitignore
 └─ agent/
    ├─ settings.json / .example

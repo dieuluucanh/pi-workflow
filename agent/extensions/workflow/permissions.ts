@@ -1,9 +1,12 @@
 /**
  * Workflow Extension — role-based command permissions.
  *
- * One place decides what a role may execute. Plan Mode (planner), Review Mode
- * (reviewer) and explorer subagents (explorer) share this policy; the Builder
- * role — and a normal Pi session with no workflow mode — is unrestricted.
+ * One place decides what a role may execute. Its safe sed subset is parsed
+ * without execution, and package runners/transparent launchers share the
+ * wrapper resolver with path analysis. Arbitrary awk remains Builder-only.
+ * Plan Mode (planner), Review Mode (reviewer) and explorer subagents
+ * (explorer) share this policy; the Builder role — and a normal Pi session
+ * with no workflow mode — is unrestricted.
  *
  * Command classes, weakest to strongest:
  *   read-only  inspection that never executes project code
@@ -15,9 +18,27 @@
  * stays loadable in plain Node tests, exactly like `utils.ts`.
  */
 
+import {
+  atCommandPosition,
+  scanShell,
+  splitSegments,
+  tokenizeWords,
+  wordsText,
+  type ShellRedirect,
+  type ShellWord,
+} from "./shell-text.ts";
+import type { ArgumentCompletion } from "./utils.ts";
+import { parseSedInvocation } from "./shell-programs.ts";
+import { resolveWrapper } from "./shell-wrappers.ts";
+
 export type CommandClass = "read-only" | "verify" | "full";
 
-export type WorkflowRole = "planner" | "reviewer" | "explorer" | "builder";
+export type WorkflowRole =
+  | "planner"
+  | "reviewer"
+  | "explorer"
+  | "orchestrator"
+  | "builder";
 
 export interface RolePolicy {
   role: WorkflowRole;
@@ -36,6 +57,7 @@ const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   "planner",
   "reviewer",
   "explorer",
+  "orchestrator",
   "builder",
 ];
 
@@ -57,6 +79,19 @@ export const ROLE_POLICIES: Record<WorkflowRole, RolePolicy> = {
     commandClass: "read-only",
     canWrite: false,
     description: "read-only commands only",
+  },
+  /**
+   * The Orchestrator parent has the same authority as the Builder. Delegation
+   * to a managed Build child is a prompt convention, not a permission cage:
+   * the parent may inspect, edit, verify and dispatch. Keeping a distinct
+   * identity lets refusal copy name the orchestration mission instead of
+   * claiming the session is in Plan mode.
+   */
+  orchestrator: {
+    role: "orchestrator",
+    commandClass: "full",
+    canWrite: true,
+    description: "unrestricted (Build-equivalent; delegation is a convention)",
   },
   builder: {
     role: "builder",
@@ -102,6 +137,10 @@ export function resolveSessionRole(input?: {
   const fromEnv = normalizeRole(input?.envRole);
   if (fromEnv) return fromEnv;
   if (input?.workflowMode === "plan") return "planner";
+  // Orchestrator is its own parent/verification identity. It has the same
+  // read-only command class as Plan, but it must never be described as Plan:
+  // its remedy is delegation, not `/build`.
+  if (input?.workflowMode === "orchestrator") return "orchestrator";
   if (input?.workflowMode === "build") return "builder";
   return undefined;
 }
@@ -371,8 +410,10 @@ const BLOCKED_SCRIPT_SUFFIX_RE = /[:._-](fix|write)([:._-]|$)/i;
 // ── Dangerous syntax / patterns ──────────────────────────────────────
 
 /**
- * Hard denylist. Applied to the whole raw command (quote-insensitive, like the
- * original implementation) before any allowlist classification.
+ * Hard denylist, matched in COMMAND POSITION against a segment's argv (see
+ * `destructiveHit`): a keyword inside an argument of a read-only command is
+ * data, not a command. Every binary that executes its arguments is class
+ * `full`, so the anywhere-pass still covers `env rm`, `bash -c`, `xargs`.
  *
  * The git entries are deliberately narrowed so the read-only forms the
  * allowlist exposes are actually reachable: `git tag -l` / `--list`,
@@ -424,8 +465,14 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /(^|\s)(sh|bash|dash|zsh|fish|ksh|csh|tcsh|pwsh|powershell|cmd|cscript|wscript|perl|ruby)(\.exe)?(\s|$)/i,
 ];
 
-/** Writing/formatting flags that must never reach a verify-class command. */
-const DENIED_FLAG_RE =
+/**
+ * Writing/formatting flags that must never reach a verify-class command.
+ *
+ * Exported for the write policy's command classification (edit-policy.ts):
+ * a verify-class command that carries one of these still rewrites files
+ * (`eslint --fix`), so the write gate must treat it as a write.
+ */
+export const DENIED_FLAG_RE =
   /(^|\s)(--fix|--fix-dry-run|--write|--update|--update-snapshots?|--updateSnapshot|--test-update-snapshots|--watch|--watchAll|--inspect|--inspect-brk|--in-place|--output)(\s|$|=)/i;
 
 /**
@@ -548,26 +595,56 @@ const NULL_DEVICE_REDIRECT_RE =
   /(^|[\s;&|()])(?:[12]|&)?>>?\s*\/dev\/null(?=$|[\s;&|)])/g;
 
 /**
+ * Strip harmless redirection tokens from a command: fd duplications
+ * (`2>&1` / `1>&2`) and null-device targets (`> /dev/null`). Neither writes
+ * a file the user can see, so both are removed before the command is
+ * classified by its first word — otherwise `2>/dev/null ls` would look like
+ * an unknown binary and be treated as a write.
+ *
+ * Exported for the write policy's command classification (edit-policy.ts).
+ */
+export function stripHarmlessRedirects(command: unknown): string {
+  const raw = typeof command === "string" ? command : "";
+  return raw
+    .replace(/\d*>&\d+/g, " ")
+    .replace(NULL_DEVICE_REDIRECT_RE, "$1");
+}
+
+/**
  * Why a command's syntax cannot be classified (`null` = the syntax is fine).
  * Mirrors the order the gate has always used, so a refusal can name the first
  * failing construct instead of only saying "blocked".
+ *
+ * Two views, because the shell treats the two classes of construct
+ * differently (`shell-text.ts`):
+ *  - OPERATORS (`&`, `>`, `>>`, `<<`, `<(`/`>(`) are operators only OUTSIDE
+ *    quotes, so they are read from the `structural` view. `rg 'a > b' f`
+ *    writes nothing and `rg '<<' f` reads nothing.
+ *  - EXPANSIONS (`$(…)`, backticks, `${…}`) happen OUTSIDE single quotes but
+ *    DO happen inside double quotes, so they are read from the `expandable`
+ *    view. `rg '$(id)' f` is a literal search; `rg "$(id)" f` executes.
+ *
+ * The harmless-redirect exemptions (`2>&1`, `1>&2`, `> /dev/null`) are
+ * applied to the structural view BEFORE the tests, exactly as before: they
+ * are real redirects, they just write nothing the user can see.
  */
 export function forbiddenSyntaxReason(command: unknown): string | null {
   const raw = typeof command === "string" ? command : "";
+  if (!raw) return null;
+  const scan = scanShell(raw);
   // `2>&1` / `1>&2` are fd duplications, not file writes; `/dev/null` targets
-  // are a bit bucket, not a file.
-  const scrubbed = raw
-    .replace(/\d*>&\d+/g, " ")
-    .replace(NULL_DEVICE_REDIRECT_RE, "$1");
-  if (scrubbed.replace(/&&/g, " ").includes("&"))
+  // are a bit bucket, not a file. Masked (quoted) text is already non-
+  // structural, so a quoted `2>&1` needs no exemption.
+  const structural = stripHarmlessRedirects(scan.structural);
+  if (structural.replace(/&&/g, " ").includes("&"))
     return "a background `&` (only `&&` chains are allowed)";
-  if (raw.includes("$(")) return "command substitution `$(...)`";
-  if (raw.includes("`")) return "backtick command substitution";
-  if (raw.includes("${")) return "parameter expansion `${...}`";
-  if (raw.includes("<(") || raw.includes(">("))
+  if (scan.expandable.includes("$(")) return "command substitution `$(...)`";
+  if (scan.expandable.includes("`")) return "backtick command substitution";
+  if (scan.expandable.includes("${")) return "parameter expansion `${...}`";
+  if (structural.includes("<(") || structural.includes(">("))
     return "process substitution `<(...)` / `>(...)`";
-  if (raw.includes("<<")) return "a heredoc `<<`";
-  if (/(^|[^<&])>(?!>|&)/.test(scrubbed))
+  if (structural.includes("<<")) return "a heredoc `<<`";
+  if (/(^|[^<&])>(?!>|&)/.test(structural))
     return "a file redirect (`>` / `>>`); only `/dev/null` and `2>&1` are allowed";
   return null;
 }
@@ -585,68 +662,47 @@ export function hasForbiddenSyntax(command: string): boolean {
 /**
  * Split a compound command on top-level `|`, `;`, `&&`, `||` and newlines.
  * Quote-aware: `grep -E 'a|b' f` stays one segment.
+ *
+ * Delegates to `shell-text.ts` so the policy layer has ONE definition of a
+ * segment boundary. `splitSegments` reproduces this function's original
+ * behaviour exactly (including its escape-before-quote ordering); only the
+ * implementation moved.
  */
 export function splitCommandSegments(command: string): string[] {
-  const segments: string[] = [];
-  let current = "";
-  let quote: '"' | "'" | undefined;
-  let escaped = false;
-  const push = (): void => {
-    const s = current.trim();
-    if (s) segments.push(s);
-    current = "";
-  };
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (escaped) {
-      current += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      current += ch;
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      current += ch;
-      if (ch === quote) quote = undefined;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      current += ch;
-      continue;
-    }
-    if (ch === "\n" || ch === ";") {
-      push();
-      continue;
-    }
-    if (ch === "|") {
-      push();
-      if (command[i + 1] === "|") i++;
-      continue;
-    }
-    if (ch === "&" && command[i + 1] === "&") {
-      push();
-      i++;
-      continue;
-    }
-    current += ch;
-  }
-  push();
-  return segments;
+  return splitSegments(command);
 }
 
 // ── Classification ───────────────────────────────────────────────────
 
 /** Classify one already-split segment. Unknown input → `full` (fail closed). */
 export function commandClassOf(segment: string): CommandClass {
+  return classifyWords(tokenizeWords(segment).words, segment, 0);
+}
+
+/**
+ * Classify a segment whose argv words are already tokenised.
+ *
+ * The dispatch reads `words[0]` — the command name AFTER quote removal and
+ * with redirects excluded, so `2>/dev/null ls` classifies as `ls` instead of
+ * as an unknown binary. The branch helpers keep taking the segment text: they
+ * inspect flags and script names, and rewriting all of them would mix this
+ * change with an unrelated refactor. `commandClassOf(string)` stays the
+ * public entry point (D6).
+ */
+function classifyWords(
+  words: readonly ShellWord[],
+  segment: string,
+  depth: number,
+): CommandClass {
   const s = String(segment ?? "").trim();
   if (!s) return "full";
-  const first = firstWord(s);
-
+  const first = normalizeBinary(words[0]?.value ?? "") || firstWord(s);
   if (!first) return "full";
+  const wrapper = resolveWrapper(words, s, depth);
+  if (wrapper?.kind === "refused") return "full";
+  if (wrapper?.kind === "read-only") return "read-only";
+  if (wrapper?.kind === "inner")
+    return classifyWords(wrapper.words, wrapper.text, depth + 1);
   if (INTERPRETER_EXECUTABLES.has(first)) return "full";
 
   if (first === "cd") {
@@ -663,7 +719,7 @@ export function commandClassOf(segment: string): CommandClass {
   if (first === "journalctl") return "read-only";
   if (first === "find")
     return FIND_DENIED_FLAG_RE.test(s) ? "full" : "read-only";
-  if (first === "env") return isBareEnv(s) ? "read-only" : "full";
+  if (first === "env") return "full";
   if (first === "printenv") return "read-only";
   if (first === "node") return classifyNode(s);
   if (first === "python" || first === "python3" || first === "py")
@@ -705,10 +761,14 @@ export function commandClassOf(segment: string): CommandClass {
   if (first === "rg") return RG_PRE_RE.test(s) ? "full" : "read-only";
   if (first === "wget")
     return wordAt(s, 1) === "-O" && wordAt(s, 2) === "-" ? "read-only" : "full";
-  // `sed`/`awk` are deliberately NOT read-only: their programs are code (GNU
-  // sed's `e` command runs a shell command; awk can pipe to a command, write
-  // files or load a library). They fall through to `full`, so only Builder
-  // keeps them. Use rg/head/tail/cut/column/jq instead.
+  // `sed` is read-only only for the parsed print/select subset; arbitrary
+  // programs, options, in-place edits and script files fail closed. `awk`
+  // remains Builder-only because its program can execute commands or write.
+  if (first === "sed")
+    return parseSedInvocation(words.slice(1).map((word) => word.value)).readOnly
+      ? "read-only"
+      : "full";
+  if (first === "awk") return "full";
   if (first === "curl")
     return CURL_WRITE_RE.test(s) || CURL_METHOD_RE.test(s)
       ? "full"
@@ -824,6 +884,104 @@ function classifyGit(s: string): CommandClass {
   return GIT_READ_ONLY_SUBCOMMANDS.has(sub) ? "read-only" : "full";
 }
 
+// ── Commit-policy classification ─────────────────────────────────
+
+/** Git subcommands the commit policy gates (`workflow.commitPolicy`). */
+export type CommitPolicyHit = "add" | "commit" | "push";
+
+const COMMIT_POLICY_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "add",
+  "commit",
+  "push",
+]);
+
+/** Global `git` options that take a separate value (`git -C path status`). */
+const GIT_GLOBAL_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  "-C",
+  "--git-dir",
+  "--work-tree",
+  "--namespace",
+  "--super-prefix",
+  "--exec-path",
+]);
+
+/** Global `git` flags that take no value (`git --no-pager log`). */
+const GIT_GLOBAL_FLAG_OPTIONS: ReadonlySet<string> = new Set([
+  "--no-pager",
+  "--paginate",
+  "--no-replace-objects",
+  "--bare",
+  "--no-optional-locks",
+  "--literal-pathspecs",
+  "--html-path",
+  "--man-path",
+  "--info-path",
+  "--version",
+]);
+
+/**
+ * Extract the subcommand a `git …` invocation resolves to, skipping global
+ * options. `null` when no subcommand is found. Mirrors classifyGit's
+ * option-skipping, but deliberately parses *through* `-c key=value` pairs:
+ * a config pair cannot turn a read-only subcommand into a commit, and the
+ * policy classifier must see the real subcommand (`git -c x=y commit`).
+ */
+function gitSubcommandAt(words: string[], gitIndex: number): string | null {
+  let i = gitIndex + 1;
+  while (i < words.length) {
+    const w = unquote(words[i]);
+    if (!w) {
+      i += 1;
+      continue;
+    }
+    if (w === "-c") {
+      i += 2; // -c key=value pair
+      continue;
+    }
+    if (w.startsWith("-c") && w.includes("=")) {
+      i += 1; // fused -ckey=value (defensive; git wants a space)
+      continue;
+    }
+    if (w.startsWith("--") && w.includes("=")) {
+      i += 1; // --git-dir=/x fused form
+      continue;
+    }
+    if (GIT_GLOBAL_VALUE_OPTIONS.has(w)) {
+      i += 2;
+      continue;
+    }
+    if (GIT_GLOBAL_FLAG_OPTIONS.has(w)) {
+      i += 1;
+      continue;
+    }
+    return w.toLowerCase();
+  }
+  return null;
+}
+
+/**
+ * Commit-policy classifier: does this command invoke `git add`, `git commit`
+ * or `git push` — in any segment of a compound command, including wrapper
+ * forms (`env git commit`, `nice -n 5 git add`) and global-option forms
+ * (`git -C path add`, `git.exe push`)? Returns the first matched subcommand,
+ * or null. Fail-closed by design: false positives (an unquoted
+ * `echo git commit`) are acceptable; false negatives are not.
+ */
+export function gitCommitPolicyHit(command: string): CommitPolicyHit | null {
+  if (typeof command !== "string" || !command.trim()) return null;
+  for (const segment of splitCommandSegments(command)) {
+    const words = wordsOf(segment);
+    for (let g = 0; g < words.length; g++) {
+      if (normalizeBinary(words[g]) !== "git") continue;
+      const sub = gitSubcommandAt(words, g);
+      if (sub && COMMIT_POLICY_SUBCOMMANDS.has(sub)) {
+        return sub as CommitPolicyHit;
+      }
+    }
+  }
+  return null;
+}
+
 function classifyDocker(s: string): CommandClass {
   const sub = wordAt(s, 1)?.toLowerCase();
   if (!sub) return "full";
@@ -841,12 +999,6 @@ function classifySystemctl(s: string): CommandClass {
   return SYSTEMCTL_READ_ONLY_SUBCOMMANDS.has(sub ?? "")
     ? "read-only"
     : "full";
-}
-
-function isBareEnv(s: string): boolean {
-  const rest = wordsOf(s).slice(1);
-  if (rest.length === 0) return true;
-  return rest.every((w) => /^-{1,2}[A-Za-z0-9-]+$/.test(w));
 }
 
 function classifyNode(s: string): CommandClass {
@@ -923,29 +1075,230 @@ function classifyCargo(s: string): CommandClass {
 // ── Public gate ──────────────────────────────────────────────────────
 
 /**
- * The first destructive pattern (or writing flag) that matches, with the exact
- * text that matched so a refusal can name it (`rm`, `npm install`, `--fix`).
+ * The two ways a segment can be denied outright (see `destructiveHit`).
  */
-function destructiveMatch(
-  command: string,
-): { kind: "destructive-pattern" | "blocked-flag"; label: string } | undefined {
-  const hit = DESTRUCTIVE_PATTERNS.find((p) => p.test(command));
-  if (hit) {
-    const matched = command.match(hit)?.[0]?.trim() ?? "destructive keyword";
-    return { kind: "destructive-pattern", label: `\`${matched}\`` };
+type DestructiveKind = "destructive-pattern" | "blocked-flag";
+
+/** One segment as the destructive denylist needs to see it. */
+interface DestructiveInput {
+  words: readonly ShellWord[];
+  commandClass: CommandClass;
+}
+
+/**
+ * Position/class-aware destructive match.
+ *
+ * The denylist is defence-in-depth: a command that can EXECUTE its
+ * arguments is already class `full` and `full` is refused for every
+ * restricted role, so the keyword layer only has to catch what the
+ * classifier could have got wrong. Matching it against raw text — the old
+ * behaviour — made the canonical exploration queries impossible:
+ * `rg -n "rm -rf" src` was refused because the PATTERN contained a keyword.
+ *
+ * The rule (`shell-text.ts` gives the argv words):
+ *  1. A pattern counts when it matches at the START of a segment's argv —
+ *     the command position. `rm -rf x`, `npm install`, `git commit` hit;
+ *     `rg -n rm -rf src` does not.
+ *  2. It also counts ANYWHERE in a segment already classified `full`: that
+ *     segment is refused regardless, and the more specific label makes the
+ *     refusal explain itself (`env rm -rf /`, `bash -c "rm -rf /"`).
+ *  3. Patterns are checked across every segment BEFORE any flag, preserving
+ *     the original precedence (`npm install` reports a pattern, not a flag).
+ *
+ * Flags are matched against word VALUES, not raw text, because quote removal
+ * makes `find . "-delete"` a real flag.
+ */
+function destructiveHit(
+  segments: readonly DestructiveInput[],
+): { kind: DestructiveKind; label: string; index: number } | undefined {
+  // 1. Patterns in command position.
+  for (let i = 0; i < segments.length; i++) {
+    const text = wordsText(segments[i].words);
+    if (!text) continue;
+    for (const pattern of DESTRUCTIVE_PATTERNS) {
+      const m = pattern.exec(text);
+      if (m && atCommandPosition(text, m.index)) {
+        return {
+          kind: "destructive-pattern",
+          label: `\`${m[0].trim()}\``,
+          index: i,
+        };
+      }
+    }
   }
-  const flag = command.match(DENIED_FLAG_RE);
-  if (flag)
-    return {
-      kind: "blocked-flag",
-      label: `the flag \`${flag[2] ?? flag[0].trim()}\``,
-    };
+  // 2. Patterns anywhere in a segment that is already unrestricted.
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.commandClass !== "full") continue;
+    const text = wordsText(seg.words);
+    if (!text) continue;
+    for (const pattern of DESTRUCTIVE_PATTERNS) {
+      const m = pattern.exec(text);
+      if (m) {
+        return {
+          kind: "destructive-pattern",
+          label: `\`${m[0].trim()}\``,
+          index: i,
+        };
+      }
+    }
+  }
+  // 3. A write flag on an otherwise-safe command (`eslint --fix`).
+  for (let i = 0; i < segments.length; i++) {
+    const m = DENIED_FLAG_RE.exec(wordsText(segments[i].words));
+    if (m) {
+      return {
+        kind: "blocked-flag",
+        label: `the flag \`${m[2] ?? m[0].trim()}\``,
+        index: i,
+      };
+    }
+  }
   return undefined;
+}
+
+/** Classify a command's segments the way the destructive denylist needs. */
+function destructiveInputsOf(command: unknown): DestructiveInput[] {
+  const scan = scanShell(command);
+  return scan.segments.map((seg) => ({
+    words: seg.words,
+    commandClass: commandClassOf(seg.raw),
+  }));
 }
 
 /** True when a segment is denied outright (destructive syntax or writing flags). */
 export function isDestructiveCommand(command: string): boolean {
-  return destructiveMatch(command) !== undefined;
+  return destructiveHit(destructiveInputsOf(command)) !== undefined;
+}
+
+// ── One analysis, two gates ──────────────────────────────────────────
+
+/** One segment, with both the role verdict and the write verdict. */
+export interface SegmentAnalysis {
+  /** Trimmed segment text (what `splitCommandSegments` returns). */
+  raw: string;
+  /** ARGV words after quote removal; operators and redirects excluded. */
+  words: ShellWord[];
+  /** Redirections of this segment (not argv). */
+  redirects: ShellRedirect[];
+  /** The command name, normalized (`git`, `npm`, `ls`). */
+  command: string;
+  /** Highest capability this segment needs. */
+  commandClass: CommandClass;
+  /** The write flag found on this segment, e.g. `--fix`. */
+  writeFlag?: string;
+  /** The git subcommand when this is a commit-policy operation. */
+  gitCommit: CommitPolicyHit | null;
+  /** The destructive pattern/flag that names this segment, when it is one. */
+  destructive?: { kind: DestructiveKind; label: string };
+  /** True when this segment may modify the filesystem. */
+  mutating: boolean;
+  /** Human cause, present when `mutating`. */
+  writeReason?: string;
+}
+
+/** The single analysis both gates consume (see `analyzeCommand`). */
+export interface CommandAnalysis {
+  raw: string;
+  /** The shell construct that cannot be classified, when there is one. */
+  forbiddenSyntax?: string;
+  segments: SegmentAnalysis[];
+  /** The first destructive hit across all segments, for the refusal message. */
+  destructive?: { kind: DestructiveKind; label: string };
+  /** True when ANY segment may modify the filesystem. */
+  mutating: boolean;
+  writeReason?: string;
+  writeSegment?: string;
+}
+
+/**
+ * Analyse a command ONCE for both gates.
+ *
+ * This is the single pipeline the role gate (`explainCommandRefusal`) and the
+ * write gate (`commandMayWrite` in edit-policy.ts) share, so their answers can
+ * no longer disagree about the same text.
+ *
+ * Per segment the write verdict follows the order the write policy has always
+ * documented (`edit-policy.ts`, "commandMayWrite"):
+ *   1. forbidden shell syntax → may write (a redirect is a write whatever else
+ *      runs; checked first so `git commit -m x > log` is still a write)
+ *   2. `git add|commit|push` → NOT a file write: the commit policy owns them
+ *   3. an unrestricted command class (`full`) → may write. Fail-closed default:
+ *      anything not provably read-only (interpreters, unknown binaries) may
+ *      write.
+ *   4. a write flag on a verify-class command (`eslint --fix`) → may write
+ *   5. otherwise → read-only (`ls`, `rg`, `git status`, `npm test`,
+ *      `tsc --noEmit`, and harmless redirects to `/dev/null` / `2>&1`).
+ *
+ * Classification runs on `stripHarmlessRedirects(segment)`, exactly as before:
+ * the `/dev/null` and `2>&1` exemptions are load-bearing (they keep
+ * `2>/dev/null ls` and `npm test 2> /dev/null | tail -5` read-only).
+ *
+ * Total and never throws: non-strings analyse as empty.
+ */
+export function analyzeCommand(command: unknown): CommandAnalysis {
+  const raw = typeof command === "string" ? command : "";
+  const trimmed = raw.trim();
+  if (!trimmed) return { raw, segments: [], mutating: false };
+
+  const scan = scanShell(trimmed);
+  const forbiddenSyntax = forbiddenSyntaxReason(trimmed) ?? undefined;
+  const segments: SegmentAnalysis[] = [];
+  let mutating = false;
+  let writeReason: string | undefined;
+  let writeSegment: string | undefined;
+
+  for (const seg of scan.segments) {
+    const scrubbed = stripHarmlessRedirects(seg.raw).trim();
+    const gitCommit = scrubbed ? gitCommitPolicyHit(scrubbed) : null;
+    const commandClass = commandClassOf(scrubbed || seg.raw);
+    const flag = DENIED_FLAG_RE.exec(wordsText(seg.words));
+    const segment: SegmentAnalysis = {
+      raw: seg.raw,
+      words: seg.words,
+      redirects: seg.redirects,
+      command: normalizeBinary(seg.words[0]?.value ?? ""),
+      commandClass,
+      gitCommit,
+      mutating: false,
+    };
+    if (flag) segment.writeFlag = flag[2] ?? flag[0].trim();
+
+    const syntax = forbiddenSyntaxReason(seg.raw);
+    if (syntax) {
+      segment.mutating = true;
+      segment.writeReason = syntax;
+    } else if (!scrubbed) {
+      // Nothing but harmless redirections: writes no file.
+    } else if (gitCommit) {
+      // The commit policy governs git add/commit/push; not a file write.
+    } else if (commandClass === "full") {
+      segment.mutating = true;
+      segment.writeReason = "runs a command that may modify files";
+    } else if (flag) {
+      segment.mutating = true;
+      segment.writeReason = `uses the write flag ${flag[2] ?? flag[0].trim()}`;
+    }
+
+    if (!mutating && segment.mutating) {
+      mutating = true;
+      writeReason = segment.writeReason;
+      writeSegment = seg.raw;
+    }
+    segments.push(segment);
+  }
+
+  const hit = destructiveHit(segments);
+  if (hit) {
+    segments[hit.index].destructive = { kind: hit.kind, label: hit.label };
+  }
+
+  const analysis: CommandAnalysis = { raw, segments, mutating };
+  if (forbiddenSyntax) analysis.forbiddenSyntax = forbiddenSyntax;
+  if (hit) analysis.destructive = { kind: hit.kind, label: hit.label };
+  if (writeReason) analysis.writeReason = writeReason;
+  if (writeSegment) analysis.writeSegment = writeSegment;
+  return analysis;
 }
 
 function classAllows(policyClass: CommandClass, needed: CommandClass): boolean {
@@ -974,6 +1327,9 @@ export interface CommandRefusal {
  * The single source of truth for the gate: `null` means allowed. Keeping the
  * decision and the explanation in one function stops a refusal message from
  * describing a policy the gate no longer enforces.
+ *
+ * Reads ONE `analyzeCommand` result, so this gate and the write policy cannot
+ * disagree about quoting, redirects or command position.
  */
 export function explainCommandRefusal(
   role: WorkflowRole,
@@ -987,37 +1343,55 @@ export function explainCommandRefusal(
       : { kind: "empty", detail: "the command is empty" };
   if (policy.commandClass === "full") return null;
 
-  const syntax = forbiddenSyntaxReason(raw);
-  if (syntax)
+  const analysis = analyzeCommand(raw);
+
+  const orchestratorParent = role === "orchestrator";
+
+  if (analysis.forbiddenSyntax) {
+    let suggestion: string;
+    if (analysis.forbiddenSyntax.includes("redirect")) {
+      suggestion =
+        "drop the redirect — `cmd` already captures stdout and `cmd 2>&1` also captures stderr; only `2>/dev/null` and `2>&1` are exempt";
+    } else if (orchestratorParent) {
+      suggestion =
+        "use an allowlisted read-only/verify command; project changes are delegated to a managed Build child";
+    } else {
+      suggestion = "use an allowlisted read-only/verify command, or /build for full shell access";
+    }
     return {
       kind: "forbidden-syntax",
-      detail: `forbidden shell syntax: ${syntax}`,
-      suggestion: syntax.includes("redirect")
-        ? "drop the redirect — `cmd` already captures stdout and `cmd 2>&1` also captures stderr; only `2>/dev/null` and `2>&1` are exempt"
-        : "use an allowlisted read-only/verify command, or /build for full shell access",
+      detail: `forbidden shell syntax: ${analysis.forbiddenSyntax}`,
+      suggestion,
     };
+  }
 
-  const destructive = destructiveMatch(raw);
-  if (destructive)
+  if (analysis.destructive) {
+    const { kind, label } = analysis.destructive;
     return {
-      kind: destructive.kind,
-      detail: `${destructive.label} matched the raw command text (quoting does not exempt it)`,
-      suggestion:
-        "remove or rename the argument, or use /build for unrestricted access",
+      kind,
+      detail:
+        kind === "blocked-flag"
+          ? `${label} can rewrite files`
+          : `${label} matched the destructive denylist`,
+      suggestion: orchestratorParent
+        ? "remove or rename the argument; the Orchestrator parent must not mutate the workspace itself"
+        : "remove or rename the argument, or use /build for unrestricted access",
     };
+  }
 
-  const segments = splitCommandSegments(raw);
-  if (segments.length === 0)
+  if (analysis.segments.length === 0)
     return { kind: "empty", detail: "no command segments found" };
-  for (const segment of segments) {
-    const needed = commandClassOf(segment);
-    if (classAllows(policy.commandClass, needed)) continue;
-    const head = firstWord(segment) || segment.slice(0, 40);
+  for (const segment of analysis.segments) {
+    if (classAllows(policy.commandClass, segment.commandClass)) continue;
+    const needed = segment.commandClass;
+    const head = segment.command || segment.raw.slice(0, 40);
     return {
       kind: "segment-class",
       detail: `\`${head}\` needs ${needed === "full" ? "unrestricted" : needed} access, above the ${policy.commandClass} limit`,
-      segment,
-      suggestion: `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives, or use /build`,
+      segment: segment.raw,
+      suggestion: orchestratorParent
+        ? `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives. Orchestrator delegates project changes to a Build child instead of switching mode.`
+        : `${policy.role} may run ${policy.description}; see README "Permissions" for allowlisted alternatives, or use /build`,
     };
   }
   return null;
@@ -1039,4 +1413,94 @@ export function isCommandAllowedForRole(
 export function describeRolePolicy(role: WorkflowRole): string {
   const policy = policyForRole(role);
   return `${policy.role} may run ${policy.description}`;
+}
+
+// ── Diagnostics: "/permissions explain" ─────────────────────────────
+
+/**
+ * Explain a command's verdict under every policy, for `/permissions explain`.
+ *
+ * Pure and side-effect free: it reads the same `analyzeCommand` result and
+ * the same `explainCommandRefusal` the gates use, so the answer cannot
+ * describe a policy the gate no longer enforces. Returns lines ready for
+ * `ctx.ui.notify`; the first line is always the command (or the usage).
+ */
+export function describeCommandPolicy(command: unknown): string[] {
+  const raw = typeof command === "string" ? command.trim() : "";
+  if (!raw) {
+    return [
+      "Usage: /permissions explain <command>",
+      "  Shows each segment's command class, the Plan/Review/Explorer verdict,",
+      "  and whether the write policy would treat it as a write.",
+      "  Example: /permissions explain rg -n 'a > b' docs",
+    ];
+  }
+
+  const analysis = analyzeCommand(raw);
+  const lines: string[] = [`Command: ${raw}`];
+  for (const reason of [
+    analysis.forbiddenSyntax
+      ? `forbidden shell syntax: ${analysis.forbiddenSyntax}`
+      : undefined,
+    analysis.destructive
+      ? `destructive denylist: ${analysis.destructive.label}`
+      : undefined,
+  ]) {
+    if (reason) lines.push(`  ✖ ${reason}`);
+  }
+
+  lines.push(`Segments (${analysis.segments.length}):`);
+  analysis.segments.forEach((seg, index) => {
+    const flags = [seg.commandClass, seg.mutating ? "write" : "no write"];
+    if (seg.writeFlag) flags.push(`flag ${seg.writeFlag}`);
+    if (seg.gitCommit) flags.push(`git ${seg.gitCommit} (commit policy)`);
+    lines.push(`  ${index + 1}. ${seg.raw}`, `     ${flags.join(" · ")}`);
+  });
+
+  lines.push("Role verdicts:");
+  for (const role of ["planner", "reviewer", "explorer", "orchestrator"] as const) {
+    const refusal = explainCommandRefusal(role, raw);
+    lines.push(
+      refusal
+        ? `  ${role.padEnd(9)} ✖ ${refusal.kind} — ${refusal.detail}`
+        : `  ${role.padEnd(9)} ✔ allowed`,
+    );
+  }
+
+  lines.push(
+    analysis.mutating
+      ? `Default write policy: write — ${analysis.writeReason ?? "may modify files"}`
+      : "Default write policy: read-only — no prompt",
+  );
+  return lines;
+}
+
+/**
+ * Argument completions for `/permissions`.
+ *
+ * Follows the pi-tui full-argument contract used by the other policy
+ * commands: the first token completes the subcommand and the returned value
+ * replaces the whole typed argument. The command text itself is free-form, so
+ * nothing is offered past the subcommand.
+ *
+ * The exact-match rule is `suppressExactArgumentMatch` (utils.ts) inlined: a
+ * `utils.ts` import would add a runtime cycle (utils imports this module for
+ * `isSafeCommand`). Same behaviour — typing the whole word closes the list, so
+ * the first Enter submits.
+ */
+export function permissionsArgumentCompletions(
+  argumentPrefix: string,
+): ArgumentCompletion[] | null {
+  const raw = String(argumentPrefix ?? "");
+  if (/\s/.test(raw.trim())) return null;
+  const lower = raw.trim().toLowerCase();
+  if (!"explain".startsWith(lower)) return null;
+  if (lower === "explain") return null;
+  return [
+    {
+      value: "explain ",
+      label: "explain",
+      description: "show why a command would be allowed or refused",
+    },
+  ];
 }

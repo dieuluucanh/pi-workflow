@@ -1,0 +1,12 @@
+[
+  {
+    "timestamp": "2026-09-21T14:44:21.125Z",
+    "version": "0.86.1",
+    "kind": "uncaught_exception",
+    "message": "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+    "stack": "Error: This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().\n    at Object.assertActive (file:///C:/Users/Lenovo/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/chunk-CMRUVXTE.js:1093:4122)\n    at assertActive (file:///C:/Users/Lenovo/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/chunk-CMRUVXTE.js:1093:5749)\n    at Object.emit (file:///C:/Users/Lenovo/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/chunk-CMRUVXTE.js:1093:9533)\n    at C:/Users/Lenovo/.pi/agent/npm/node_modules/@plannotator/pi-extension/plannotator-events.ts:364:25\n    at publishDecision (C:/Users/Lenovo/.pi/agent/npm/node_modules/@plannotator/pi-extension/server/serverPlan.ts:186:23)\n    at Server.<anonymous> (C:/Users/Lenovo/.pi/agent/npm/node_modules/@plannotator/pi-extension/server/serverPlan.ts:500:7)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)",
+    "sessionFile": "C:\\Users\\Lenovo\\.pi\\agent\\sessions\\--C--Users-Lenovo-Projects-pi-for-office--\\2026-09-21T13-44-22-492Z_01a0c435-e8db-75f2-b037-e93d720fe86c.jsonl",
+    "cwd": "C:\\Users\\Lenovo\\Projects\\pi-for-office",
+    "notified": true
+  }
+]

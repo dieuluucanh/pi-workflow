@@ -1,0 +1,6 @@
+{
+  "optionMode": "tui",
+  "custom": "function",
+  "surface": "terminal",
+  "capability": "headless"
+}

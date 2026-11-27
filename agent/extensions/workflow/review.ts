@@ -5,9 +5,9 @@
  *
  *   Plan Mode (main session)  ──plan file──▶  Review Mode (child session)
  *          ▲                                        │
- *          │ feedback                               │ rewrites the plan
+ *          │ feedback                               │ appends advisory notes
  *          │                                        ▼
- *      Plannotator webview  ◀────────────  reviewed plan + change log
+ *      Plannotator webview  ◀─────────  approved plan + reviewer revisions
  *
  * Design rules (see docs/plans/2026-09-18-review-mode-dual-plan.md):
  *
@@ -15,7 +15,7 @@
  *   byte-for-byte the behaviour that existed before this module.
  * - Review Mode runs in its OWN in-process session (own context, own model,
  *   own system prompt). It reads Plan Mode's context but never the reverse.
- * - Review Mode is read-only except for one write path: `review_submit_plan`
+ * - Review Mode is read-only except for one write path: `review_submit`
  *   (implemented in the parent, not in the child).
  * - This module holds the pure, I/O-light parts (config, prompt, state,
  *   validation, rendering) so they can be unit-tested without a Pi runtime.
@@ -24,9 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import {
-  getUtcDatePrefix,
   isPlanWritePath,
   normalizePlanPath,
   planHash,
@@ -36,6 +34,16 @@ import {
   type ReviewFinding,
   type ReviewTier,
 } from "./utils.ts";
+import {
+  unconfiguredReviewerProviderMessage,
+  type ProviderSeedResult,
+} from "./review-providers.ts";
+import type { InProcessChildSession } from "./in-process-child.ts";
+import { createIsolatedSession } from "./isolated-session.ts";
+
+/** Type-only handle on the Pi SDK. Erased at compile time. */
+export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
+export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
 // Re-exported so `review.ts` is the single import surface for Review Mode.
 export type { ReviewDisposition, ReviewFinding, ReviewTier };
@@ -57,24 +65,60 @@ export const REVIEW_SUBMITTED_ENTRY_TYPE = "workflow-review-submitted";
 // ── Step 2: Review Mode configuration ────────────────────────────────
 
 export type ReviewFallbackOnError = "skip" | "block";
+export type ReviewProviderRecovery = "fallback" | "off";
+/** A reviewer model reference used by the recovery chain or an explicit fallback. */
+export interface ReviewFallbackModel {
+  provider: string;
+  id: string;
+  thinking: string;
+}
 
 export interface ReviewModeConfig {
   /** Master toggle. When false every Review Mode code path is a no-op. */
   enabled: boolean;
   /** Max Review↔Plan rounds per user-feedback cycle. */
   rounds: number;
-  /** 1 = review + rewrite only. 2 = review + rewrite, then self-verify. */
+  /**
+   * Max automatic Planner revision turns after a revise verdict; 0 = one-shot.
+   * Separate from `rounds` (the per-cycle Review round cap): the revision
+   * budget is not reset by `beginReviewCycle`.
+   */
+  maxRevisions: number;
+  /** 1 = review + advisory notes only. 2 = review + notes, then self-verify. */
   passes: number;
   /** Run the self-verification pass (only when pass 1 found severity >= 5). */
   verify: boolean;
   /** What to do if the reviewer model is unavailable or the review fails. */
   fallbackOnError: ReviewFallbackOnError;
+  /**
+   * Provider recovery: after a recoverable stream failure, try the fallback
+   * chain instead of failing the round immediately. `off` restores the old
+   * single-model behaviour.
+   */
+  providerRecovery: ReviewProviderRecovery;
+  /** SDK retries per reviewer model before the chain advances (0-2). */
+  providerRetries: number;
+  /** Explicit first fallback; the runtime still dedupes and clamps it. */
+  fallbackModel?: ReviewFallbackModel;
+  /** Overall recovery budget; 0 uses the round deadline. */
+  recoveryBudgetMs: number;
   /** Max `review_explore` subagents per review round (cost ceiling). */
   exploreBudget: number;
   /**
+   * Max chars of shared Plan Mode context in the pass-1 prompt (step 7).
+   * Diet default keeps the review fast; the truncation marker tells the
+   * reviewer to re-read via read/grep anything it relies on.
+   */
+  contextChars: number;
+  /** Max pruned entries handed to the context renderer. */
+  contextEntries: number;
+  /** Max chars kept per tool-result string when pruning entries. */
+  contextToolChars: number;
+  /**
    * Optional wall-clock cap for a single review round, in milliseconds.
-   * 0 = unlimited (default). When unlimited, a pass ends on
-   * `review_pass_done`, the run settling, an abort, or a prompt error.
+   * 0 = unlimited (explicit opt-out). Default 300_000 (5 minutes, step 10):
+   * a hung reviewer must not hold the handoff forever; the settle race still
+   * ends a silent pass in seconds either way.
    */
   timeoutMs: number;
 }
@@ -82,21 +126,111 @@ export interface ReviewModeConfig {
 export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   enabled: false,
   rounds: 1,
+  maxRevisions: 3,
   passes: 2,
   verify: true,
   fallbackOnError: "skip",
-  exploreBudget: 3,
-  timeoutMs: 0,
+  providerRecovery: "fallback",
+  providerRetries: 1,
+  recoveryBudgetMs: 0,
+  exploreBudget: 1,
+  timeoutMs: 300_000,
+  contextChars: 15_000,
+  contextEntries: 30,
+  contextToolChars: 1_000,
 };
 
 const ROUNDS_MIN = 1;
 const ROUNDS_MAX = 5;
+const MAX_REVISIONS_MIN = 0;
+const MAX_REVISIONS_MAX = 5;
 const PASSES_MIN = 1;
 const PASSES_MAX = 2;
 const EXPLORE_MIN = 0;
 const EXPLORE_MAX = 8;
 const TIMEOUT_MIN = 0;
 const TIMEOUT_MAX = 3_600_000;
+const CONTEXT_CHARS_MIN = 1_000;
+const CONTEXT_CHARS_MAX = 60_000;
+const CONTEXT_ENTRIES_MIN = 1;
+const CONTEXT_ENTRIES_MAX = 120;
+const CONTEXT_TOOL_CHARS_MIN = 200;
+const CONTEXT_TOOL_CHARS_MAX = 4_000;
+
+/**
+ * Build the automatic fallback list: the parent session's model first (it just
+ * planned successfully), then the base reviewer and planner roles from
+ * roles.json (ignoring the active profile). The caller supplies the clamp so
+ * this stays independent of Pi's model registry.
+ */
+export function buildReviewerFallbacks(input: {
+  parentModel?: ReviewFallbackModel;
+  baseReviewer?: ReviewFallbackModel;
+  basePlanner?: ReviewFallbackModel;
+  clampThinking?: (model: ReviewFallbackModel) => string;
+}): ReviewFallbackModel[] {
+  const out: ReviewFallbackModel[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: ReviewFallbackModel | undefined): void => {
+    if (!candidate) return;
+    const provider = candidate.provider.trim();
+    const id = candidate.id.trim();
+    if (!provider || !id) return;
+    const key = `${provider}/${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    let thinking = candidate.thinking.trim() || "high";
+    if (input.clampThinking) {
+      try {
+        thinking = input.clampThinking({ ...candidate, provider, id }) || thinking;
+      } catch {
+        /* a registry miss keeps the stored level */
+      }
+    }
+    out.push({ provider, id, thinking });
+  };
+  push(input.parentModel);
+  push(input.baseReviewer);
+  push(input.basePlanner);
+  return out;
+}
+
+/**
+ * The bounded attempt chain for one review round: the selected reviewer model,
+ * an explicit fallback, then the automatic fallback list. Duplicate
+ * provider/id pairs are rejected so a retry never repeats the same model.
+ */
+export function buildReviewerAttempts(input: {
+  base?: ReviewFallbackModel;
+  explicitFallback?: ReviewFallbackModel;
+  fallbacks?: readonly ReviewFallbackModel[];
+  max?: number;
+}): ReviewFallbackModel[] {
+  const out: ReviewFallbackModel[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: ReviewFallbackModel | undefined): void => {
+    if (!candidate) return;
+    const provider = candidate.provider.trim();
+    const id = candidate.id.trim();
+    if (!provider || !id) return;
+    const key = `${provider}/${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      provider,
+      id,
+      thinking: candidate.thinking.trim() || "high",
+    });
+  };
+  push(input.base);
+  push(input.explicitFallback);
+  for (const model of input.fallbacks ?? []) push(model);
+  return out.slice(0, Math.max(1, Math.trunc(input.max ?? 4)));
+}
+const PROVIDER_RETRIES_MIN = 0;
+const PROVIDER_RETRIES_MAX = 2;
+const RECOVERY_BUDGET_MIN = 0;
+const RECOVERY_BUDGET_MAX = 3_600_000;
 
 /** A JSON object parsed from an untrusted source (settings file, fragment). */
 export type JsonObject = Record<string, unknown>;
@@ -122,6 +256,19 @@ function asBool(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function sanitizeFallbackModel(value: unknown): ReviewFallbackModel | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+  const id = typeof raw.id === "string" ? raw.id.trim() : "";
+  if (!provider || !id) return undefined;
+  const thinking =
+    typeof raw.thinking === "string" && raw.thinking.trim()
+      ? raw.thinking.trim()
+      : "high";
+  return { provider, id, thinking };
+}
+
 /**
  * Coerce an untrusted settings fragment into a complete ReviewModeConfig.
  * Accepts an object, or the boolean shorthand `true`/`false` for
@@ -141,12 +288,37 @@ export function coerceReviewModeConfig(
     r.fallbackOnError === "block" || r.fallbackOnError === "skip"
       ? r.fallbackOnError
       : base.fallbackOnError;
+  const providerRecovery: ReviewProviderRecovery =
+    r.providerRecovery === "off" || r.providerRecovery === "fallback"
+      ? r.providerRecovery
+      : base.providerRecovery;
+  const fallbackModel = sanitizeFallbackModel(r.fallbackModel);
   return {
     enabled: asBool(r.enabled, base.enabled),
     rounds: clampInt(r.rounds, ROUNDS_MIN, ROUNDS_MAX, base.rounds),
+    maxRevisions: clampInt(
+      r.maxRevisions,
+      MAX_REVISIONS_MIN,
+      MAX_REVISIONS_MAX,
+      base.maxRevisions,
+    ),
     passes: clampInt(r.passes, PASSES_MIN, PASSES_MAX, base.passes),
     verify: asBool(r.verify, base.verify),
     fallbackOnError,
+    providerRecovery,
+    providerRetries: clampInt(
+      r.providerRetries,
+      PROVIDER_RETRIES_MIN,
+      PROVIDER_RETRIES_MAX,
+      base.providerRetries,
+    ),
+    ...(fallbackModel ? { fallbackModel } : {}),
+    recoveryBudgetMs: clampInt(
+      r.recoveryBudgetMs,
+      RECOVERY_BUDGET_MIN,
+      RECOVERY_BUDGET_MAX,
+      base.recoveryBudgetMs,
+    ),
     exploreBudget: clampInt(
       r.exploreBudget,
       EXPLORE_MIN,
@@ -154,6 +326,24 @@ export function coerceReviewModeConfig(
       base.exploreBudget,
     ),
     timeoutMs: clampInt(r.timeoutMs, TIMEOUT_MIN, TIMEOUT_MAX, base.timeoutMs),
+    contextChars: clampInt(
+      r.contextChars,
+      CONTEXT_CHARS_MIN,
+      CONTEXT_CHARS_MAX,
+      base.contextChars,
+    ),
+    contextEntries: clampInt(
+      r.contextEntries,
+      CONTEXT_ENTRIES_MIN,
+      CONTEXT_ENTRIES_MAX,
+      base.contextEntries,
+    ),
+    contextToolChars: clampInt(
+      r.contextToolChars,
+      CONTEXT_TOOL_CHARS_MIN,
+      CONTEXT_TOOL_CHARS_MAX,
+      base.contextToolChars,
+    ),
   };
 }
 
@@ -273,12 +463,72 @@ export function readReviewModeConfig(
 }
 
 /**
- * The single gate used by every Review Mode hook.
+ * The explicit `enabled` values per scope, or `undefined` when that scope's
+ * fragment does not set the field. Used by `/review-mode` to make an on/off
+ * request effective across scopes and to report a shadowed value.
+ */
+export function reviewModeEnabledValues(
+  cwd: string,
+  agentDir: string,
+): { global?: boolean; project?: boolean } {
+  const paths = reviewConfigPaths(cwd, agentDir);
+  const valueOf = (settings: unknown): boolean | undefined => {
+    const raw = extractReviewModeRaw(settings);
+    if (typeof raw === "boolean") return raw;
+    if (
+      raw &&
+      typeof raw === "object" &&
+      !Array.isArray(raw) &&
+      Object.prototype.hasOwnProperty.call(raw, "enabled")
+    ) {
+      return (raw as Record<string, unknown>).enabled === true;
+    }
+    return undefined;
+  };
+  const globalValue = valueOf(readJsonSafe(paths.global));
+  const projectValue = valueOf(readJsonSafe(paths.project));
+  return {
+    ...(globalValue !== undefined ? { global: globalValue } : {}),
+    ...(projectValue !== undefined ? { project: projectValue } : {}),
+  };
+}
+
+/**
+ * The automatic-review gate: true only when the persisted
+ * `workflow.reviewMode.enabled` flag is on. This gates AUTOMATIC review
+ * only (background handoff kickoff, reviewer prefetch, planner prompt
+ * note). Manual one-shot commands (`/review`, `/review say|pause|resume|abort|status`)
+ * intentionally bypass this gate — see `canRunManualReview`.
  * Never throws.
  */
 export function isReviewEnabled(cwd: string, agentDir: string): boolean {
   try {
     return readReviewModeConfig(cwd, agentDir).config.enabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What caused a review round: `"auto"` is the background handoff audit
+ * (requires the persisted `enabled` flag); `"manual"` is an explicit
+ * user command (`/review`, `/review-resume` fresh-plan branch) and bypasses
+ * only the `enabled` check — limits, model and prompt still come from saved
+ * config. Never persisted; the manual path never flips `enabled`.
+ */
+export type ReviewTrigger = "auto" | "manual";
+
+/**
+ * The manual-review gate: true whenever review settings are readable,
+ * regardless of the persisted `enabled` flag. A one-shot `/review` uses the
+ * saved rounds/passes/verify/budget/timeout/model as-is and never flips
+ * `enabled`. Returns false only when settings cannot be read at all.
+ * Never throws.
+ */
+export function canRunManualReview(cwd: string, agentDir: string): boolean {
+  try {
+    readReviewModeConfig(cwd, agentDir);
+    return true;
   } catch {
     return false;
   }
@@ -304,8 +554,22 @@ export function writeReviewModeConfig(
       wfExisting && typeof wfExisting === "object" && !Array.isArray(wfExisting)
         ? { ...(wfExisting as JsonObject) }
         : {};
-    const current = coerceReviewModeConfig(wf[REVIEW_MODE_KEY]);
-    const next = coerceReviewModeConfig({ ...current, ...patch }, current);
+    // Write only the patched fields. Materialising the whole coerced config
+    // used to pin `enabled` (and every default) into the target scope: a
+    // `/review-mode timeout` could silently flip/disable automatic review, and
+    // a global `off` could be shadowed by a stale project fragment.
+    const existingRaw = wf[REVIEW_MODE_KEY];
+    const existingFragment: JsonObject =
+      existingRaw && typeof existingRaw === "object" && !Array.isArray(existingRaw)
+        ? { ...(existingRaw as JsonObject) }
+        : typeof existingRaw === "boolean"
+          ? { enabled: existingRaw }
+          : {};
+    const coerced = coerceReviewModeConfig({ ...existingFragment, ...patch });
+    const next: JsonObject = { ...existingFragment };
+    for (const key of Object.keys(patch) as Array<keyof ReviewModeConfig>) {
+      next[key] = coerced[key] as unknown;
+    }
     wf[REVIEW_MODE_KEY] = next;
     root[WORKFLOW_SETTINGS_KEY] = wf;
     fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -376,7 +640,7 @@ export interface ReviewStatusInput {
   timeoutSource: ReviewConfigScopeSource;
   /** Effective reviewer model, when the reviewer role is configured. */
   reviewer?: { provider: string; id: string; thinking: string };
-  /** Resolved reviewer prompt source (path or built-in label). */
+  /** Where the additional reviewer guidance came from (project/global/default). */
   promptSource: string;
   /** Whether each settings file carries a `workflow.reviewMode` fragment. */
   sources: { global: boolean; project: boolean };
@@ -398,19 +662,32 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
         ? `${model.provider}/${model.id} (${model.thinking})`
         : "unconfigured — /role set reviewer <provider/model>"
     }`,
-    `  prompt         : ${input.promptSource}`,
-    `  rounds         : ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
+    `  prompt         : ${input.promptSource} (guidance; fixed criteria always apply)`,
+    `  rounds         : ${c.rounds}   revisions: ${c.maxRevisions}   passes: ${c.passes}   verify: ${c.verify}`,
     `  explore budget : ${c.exploreBudget}   timeout: ${formatReviewTimeoutLabel(
       c.timeoutMs,
       input.timeoutSource,
     )}`,
+    `  recovery       : ${c.providerRecovery}${
+      c.providerRecovery === "fallback"
+        ? ` (${c.providerRetries} SDK retry/model; budget ${
+            c.recoveryBudgetMs === 0
+              ? "round deadline"
+              : `${Math.round(c.recoveryBudgetMs / 1000)}s`
+          }${
+            c.fallbackModel
+              ? `; explicit ${c.fallbackModel.provider}/${c.fallbackModel.id} (${c.fallbackModel.thinking})`
+              : ""
+          })`
+        : ""
+    }`,
   ];
   if (
     input.timeoutSource !== "default" &&
     c.timeoutMs === LEGACY_REVIEW_TIMEOUT_MS
   ) {
     lines.push(
-      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review-mode timeout unlimited removes it`,
+      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review mode timeout unlimited removes it`,
     );
   }
   lines.push(
@@ -418,7 +695,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
     `  runtime        : ${input.runtime}`,
     `  transcript     : streamed into the main Pi transcript`,
     "",
-    "Usage: /review-mode on|off [global|project] | /review-mode status | /review-mode timeout <seconds|unlimited> [global|project] | /review-prompt | /review-status | /review",
+    "Usage: /review mode on|off [global|project] | /review mode status | /review mode timeout <seconds|unlimited> [global|project] | /review prompt | /review status | /review",
   );
   return lines;
 }
@@ -426,44 +703,25 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
 // ── Step 3: Review prompt resolution ─────────────────────────────────
 
 /**
- * Built-in reviewer guidance. The resolved prompt is appended to the
+ * Built-in reviewer guidance. The resolved guidance is appended to the
  * reviewer's SYSTEM prompt inside the child session only — it is never
  * injected into the parent (Plan Mode) context.
+ *
+ * The review criteria and the reviewer's rules of engagement live in
+ * `REVIEW_CRITERIA` / `REVIEW_SYSTEM_PROMPT` (they are fixed), so this default
+ * is guidance only, not the criteria set: a project/global review-prompt.md
+ * replaces this default text as guidance only and still gets the system
+ * prompt's criteria and rules.
  */
-export const DEFAULT_REVIEW_PROMPT = [
-  "Always align with the existing project framework and industry best practice.",
-  "",
-  "Your job is to independently audit a plan that another agent produced, then",
-  "rewrite it so it is correct, complete, and idiomatic for THIS repository.",
-  "",
-  "Review criteria, in priority order:",
-  "",
-  "1. Framework alignment — does the plan follow the conventions, module layout,",
-  "   naming, error-handling style, and dependency choices already established in",
-  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
-  "   divergence explicitly.",
-  "2. Industry best practice — correctness, security, error handling, testability,",
-  "   observability, performance, and migration/rollback safety. Cite the specific",
-  "   practice when you flag a gap.",
-  "3. Requirement coverage — every requirement in the shared context must map to at",
-  "   least one plan step. A requirement with no step is a Critical finding.",
-  "4. Executability — each step must be concrete enough to implement without",
-  "   guessing: file paths, symbols, and a verifiable outcome.",
-  "5. Simplicity — remove unnecessary steps, speculative abstractions, and work that",
-  "   is out of scope for the stated goal.",
-  "",
-  "Rules:",
-  "",
-  "- You may READ anything: files, git history, docs, tests, prior plans.",
-  "- You may NOT write code or modify any file. The ONLY write you may perform is",
-  "  submitting the revised plan through `review_submit_plan`.",
-  "- Never invent files, APIs, or conventions. Verify with read/grep/find/ls first.",
-  "- If the plan is already sound, say so and submit it unchanged rather than",
-  "  inventing findings to look useful.",
-  "- Preserve the original plan's structure and the author's intent. Adjust; do not",
-  "  replace it with your own different plan.",
-  "- Keep the plan's existing heading style so its steps remain machine-extractable.",
-].join("\n");
+export const DEFAULT_REVIEW_GUIDANCE =
+  "Always align with the existing project framework and industry best practice.";
+
+/**
+ * @deprecated Use DEFAULT_REVIEW_GUIDANCE. Kept for published imports.
+ * Guidance only — never the full criteria set (those are fixed in
+ * `REVIEW_SYSTEM_PROMPT`).
+ */
+export const DEFAULT_REVIEW_PROMPT = DEFAULT_REVIEW_GUIDANCE;
 
 export interface ReviewPromptPaths {
   global: string;
@@ -490,17 +748,25 @@ function readTextSafe(fp: string): string | undefined {
   }
 }
 
+/** Which scope supplied the reviewer guidance (`default` = built-in text). */
 export type ReviewPromptSource = "project" | "global" | "default";
 
 export interface ResolvedReviewPrompt {
+  /** Additional reviewer guidance; appended to the fixed system prompt. */
   text: string;
+  /** Which scope supplied `text` (project wins over global over default). */
   source: ReviewPromptSource;
+  /** File that supplied `text`; absent for the built-in default. */
   path?: string;
 }
 
 /**
- * Resolve the user's reviewer guidance: project file wins over global file
- * wins over the built-in default. Never throws.
+ * Resolve the user's additional reviewer guidance: project file wins over
+ * global file wins over the built-in default. Never throws.
+ *
+ * The result is GUIDANCE ONLY. Both files add guidance on top of the fixed
+ * `REVIEW_CRITERIA` embedded in `REVIEW_SYSTEM_PROMPT`; no file can remove or
+ * replace a criterion.
  */
 export function resolveReviewPrompt(
   cwd: string,
@@ -567,7 +833,8 @@ export type ReviewLineKind =
   | "tool"
   | "finding"
   | "notice"
-  | "status";
+  | "status"
+  | "error";
 
 /** One line in the reviewer pane. Kept small: the pane renders these verbatim. */
 export interface ReviewTranscriptLine {
@@ -597,16 +864,31 @@ export interface ReviewState {
   pass: 1 | 2;
   /** Hash of the plan revision under review (see planHash). */
   planHash: string;
-  /** Plan path being reviewed/rewritten. */
+  /** Plan path being reviewed (the reviewer appends to this file). */
   planPath?: string;
   /** `provider/id` of the reviewer model, for display + provenance. */
   modelLabel: string;
   findings: ReviewFinding[];
   verdict?: ReviewVerdict;
-  /** The rewritten plan, once submitted. */
+  /**
+   * Required changes the reviewer submitted this round, after normalization
+   * (`revisions.length`), written by the submit callback. Optional so old
+   * persisted states and `createReviewState` stay valid; a missing count is
+   * the pre-fix "unknown", never a fake 0.
+   */
+  requiredChanges?: number;
+  /**
+   * The submitted plan text once submitted: the author's body plus the
+   * `## Reviewer Revisions` appendix. Kept under this name because it is
+   * persisted in review state; the body itself is never rewritten.
+   */
   rewrittenPlan?: string;
   /** Reviewer passes completed in this round. */
   passes: ReviewPassResult[];
+  /** Recovery attempts made in this round, in order (model labels). */
+  recoveryAttempts?: string[];
+  /** Last provider error text captured during the round. */
+  providerError?: string;
   /** Number of `review_explore` subagents used this round. */
   exploreUsed: number;
   /** Input tokens reported by the child session, when available. */
@@ -699,20 +981,29 @@ export function shouldRouteInputToReviewer(input: {
   reviewEnabled: boolean;
   reviewActive: boolean;
   hasReviewerSession: boolean;
+  /**
+   * Live ad-hoc session override: true while a manual one-shot review
+   * owns a live reviewer session (`reviewSessionLive()` in index.ts).
+   * Lets `/review say` and plain-chat steering reach the reviewer even
+   * when the persisted `enabled` flag is off. Never persisted.
+   */
+  manualSessionActive?: boolean;
 }): boolean {
+  const allowed =
+    input.reviewEnabled === true || input.manualSessionActive === true;
   return (
-    input.reviewEnabled === true &&
+    allowed &&
     input.reviewActive === true &&
     input.hasReviewerSession === true
   );
 }
 
 /**
- * One-line summary for the status strip / notify calls.
- * Example: `🔍 review · pass 2/2 · 3 findings · ● verifying`
+ * The `pass 1/2 · 3 findings · ● verifying` detail, without a prefix.
+ * Shared by the footer summary and the Terminal composer line so both name the
+ * same phase.
  */
-export function reviewStateSummary(state: ReviewState | undefined): string {
-  if (!state) return "";
+function reviewStateDetails(state: ReviewState): string {
   const bits: string[] = [];
   bits.push(`pass ${state.pass}/2`);
   if (state.round > 1) bits.push(`round ${state.round}`);
@@ -722,13 +1013,22 @@ export function reviewStateSummary(state: ReviewState | undefined): string {
     bits.push(`● ${reviewPhaseLabel(state.phase)}`);
   else if (state.phase === "done") bits.push("✓ done");
   else if (state.phase !== "idle") bits.push(reviewPhaseLabel(state.phase));
-  return `🔍 review · ${bits.join(" · ")}`;
+  return bits.join(" · ");
+}
+
+/**
+ * One-line summary for the status strip / notify calls.
+ * Example: `🔍 review · pass 2/2 · 3 findings · ● verifying`
+ */
+export function reviewStateSummary(state: ReviewState | undefined): string {
+  if (!state) return "";
+  return `🔍 review · ${reviewStateDetails(state)}`;
 }
 
 /**
  * Outcome of one Plan↔Review round, handed back to the handoff orchestrator.
  *
- * `fallback: true` means "the reviewer did not produce a usable rewrite —
+ * `fallback: true` means "the reviewer did not produce a usable submission —
  * continue with the author's plan" (see config.fallbackOnError).
  */
 export interface ReviewRoundResult {
@@ -739,6 +1039,183 @@ export interface ReviewRoundResult {
   planHash: string;
   state: ReviewState;
   reason?: string;
+  /**
+   * The round never started because the host signal was already aborted.
+   * A pre-aborted signal is an abort, never a pause (see
+   * `classifyReviewExecution`).
+   */
+  abortedBeforeStart?: boolean;
+}
+
+/**
+ * How one executed review round ended. Used for user notices and for deciding
+ * whether a paused gated handoff settles. `"paused"` is the only outcome that
+ * keeps the handoff open; everything else is terminal.
+ */
+export type ReviewExecutionOutcome =
+  | "rewritten"
+  | "unchanged"
+  | "paused"
+  | "aborted"
+  | "skipped"
+  | "fallback";
+
+/** Result of one `/review`, `/review-resume` or gated handoff execution. */
+export interface ReviewExecutionResult {
+  /** Plan to hand off: the submitted plan text (author body + appendix) or the author's text. */
+  planText: string;
+  /**
+   * Which way the round settled. `"rewritten"` is a ROUTING value (it decides
+   * `reviewResumeGateOutcome` and the handoff gate), not a claim that the plan
+   * body changed: a successful append changes the plan text, so it is reached
+   * on every completed round even though the body is untouched.
+   */
+  outcome: ReviewExecutionOutcome;
+  /** Human-facing reason for paused / aborted / skipped / fallback. */
+  reason?: string;
+  /** True when `pausedReview` holds this revision and the gate stays open. */
+  paused: boolean;
+  /**
+   * The round state that produced this result (success only). The negotiation
+   * decides from THIS snapshot, never from the mutable orchestrator closure: a
+   * stale or overwritten `reviewState` must not decide a round it did not run.
+   */
+  state?: ReviewState;
+}
+
+/**
+ * Classify one round outcome from the pieces the orchestrator already knows.
+ *
+ * Invariant: a pre-aborted/stale host signal (`abortedBeforeStart`) is an
+ * abort, never a pause. Only an explicit pause snapshot may keep the gate
+ * open, so `paused` is decided by the caller from `pausedReview.planHash`.
+ */
+export function classifyReviewExecution(input: {
+  ok: boolean;
+  aborted: boolean;
+  abortedBeforeStart?: boolean;
+  paused: boolean;
+  planChanged: boolean;
+}): ReviewExecutionOutcome {
+  if (input.paused === true) return "paused";
+  if (input.ok === true) return input.planChanged ? "rewritten" : "unchanged";
+  if (input.aborted === true || input.abortedBeforeStart === true) {
+    return "aborted";
+  }
+  return "fallback";
+}
+
+/** True when a resume outcome ends the round (everything except a re-pause). */
+export function reviewResumeSettles(result: ReviewExecutionResult): boolean {
+  return result.outcome !== "paused";
+}
+
+/**
+ * Gate outcome for a settled resume. Only a plan that actually changed counts
+ * as reviewed; an unchanged plan, a skip, an abort or a fallback hands off the
+ * author's plan. `undefined` means "keep the gate parked" (the round paused again).
+ */
+export function reviewResumeGateOutcome(
+  result: ReviewExecutionResult,
+): "reviewed" | "unreviewed" | undefined {
+  if (result.outcome === "paused") return undefined;
+  return result.outcome === "rewritten" ? "reviewed" : "unreviewed";
+}
+
+/** One accurate user-facing notice for a resume result. */
+export function reviewResumeNotice(result: ReviewExecutionResult): string {
+  const reason = result.reason ? ` (${result.reason})` : "";
+  switch (result.outcome) {
+    case "paused":
+      return "Review paused again — /review resume to continue, /review abort to stop.";
+    case "rewritten":
+      return "Review finished — advisory notes appended.";
+    case "unchanged":
+      return "Review finished — the reviewer kept the plan as-is.";
+    case "aborted":
+      return "Review stopped — the author's plan stands.";
+    case "skipped":
+      return `Review skipped${reason} — the plan will be handed over as-is.`;
+    case "fallback":
+    default:
+      return `Review could not complete${reason} — the plan will be handed over unreviewed (run /review to retry).`;
+  }
+}
+
+/**
+ * The transcript line for the run that is about to start.
+ *
+ * `agent_start` fires for every prompt on the same child session, so it cannot
+ * distinguish a cold reviewer boot from a warm resume or a next round. The
+ * runtime knows both facts (`created`, `resumed`) at the moment it sends the
+ * prompt, and this helper turns them into one truthful line.
+ *
+ * `created` wins over `resumed`: a resume whose session had to be rebuilt (the
+ * reviewer model changed) really did start a new session, and saying so is more
+ * useful than claiming a warm resume that did not happen.
+ */
+export function reviewRunLabel(input: {
+  /** The runtime had to create a reviewer session for this round. */
+  created: boolean;
+  /** `/review-resume` is continuing a paused round on the warm session. */
+  resumed?: boolean;
+  /** 1 for the audit pass, 2 for the self-verification pass. */
+  pass?: 1 | 2;
+}): string {
+  if (input.pass === 2) return "reviewer verifying — pass 2";
+  if (input.created === true) {
+    return input.resumed === true
+      ? "reviewer restarted — new reviewer session"
+      : "reviewer started";
+  }
+  return input.resumed === true ? "reviewer resumed" : "reviewer continuing";
+}
+
+/**
+ * Prefix a Review Mode notice exactly once.
+ *
+ * Callers already speak in sentences ("no reviewer model configured …"), while
+ * a few sources carried their own `Review Mode: `/`Review Mode ` prefix. Blindly
+ * interpolating produced `Review Mode: Review Mode: …`. Idempotent by design:
+ * anything already starting with `Review Mode` is returned unchanged.
+ *
+ * Ownership: this is the prefix owner for the *reviewer* notifier only
+ * (`notifyReview` in `index.ts`). Do not apply it to non-reviewer messages —
+ * Orchestrator/child, handoff/Plannotator and plan-lifecycle notices go through
+ * the neutral `notifyWorkflow` helper and must never be branded `Review Mode:`.
+ */
+export function reviewNoticeText(message: string): string {
+  const text = String(message ?? "").trim();
+  if (text.length === 0) return "Review Mode: ";
+  return /^Review Mode\b/.test(text) ? text : `Review Mode: ${text}`;
+}
+
+/** Whether `/review-resume` may reuse the paused round or must start fresh. */
+export type ReviewResumePlanChoice = "fresh" | "warm";
+
+/**
+ * Decide whether a paused review can still be resumed as-is.
+ *
+ * The plan *file* is not a reliable witness on its own: the reviewer appends
+ * its revisions section to that same file during the round (`review_submit`), so
+ * after a pause during pass 2 the file no longer matches the text the round
+ * started with. Comparing against the hash captured at pause time means only a change
+ * made **after** the pause — an author edit — starts a fresh round.
+ *
+ * A missing file (or a snapshot from before this field existed) keeps today's
+ * behaviour: resume the paused text.
+ */
+export function reviewResumePlanChoice(input: {
+  /** Hash of the text the paused round was auditing. */
+  pausedPlanHash: string;
+  /** Plan-file hash captured when the pause was recorded. */
+  pausedFileHash?: string;
+  /** Plan-file hash read by `/review-resume`; undefined when the file is gone. */
+  currentFileHash?: string;
+}): ReviewResumePlanChoice {
+  if (input.currentFileHash === undefined) return "warm";
+  const baseline = input.pausedFileHash ?? input.pausedPlanHash;
+  return input.currentFileHash === baseline ? "warm" : "fresh";
 }
 
 const DISPOSITIONS: readonly ReviewDisposition[] = [
@@ -825,7 +1302,7 @@ export interface ApplySubmittedPlanOptions {
   cwd: string;
   /** The plan path Plan Mode chose, absolute or cwd-relative. */
   planPath: string;
-  /** planBody + `## Review changes` appendix (what gets written). */
+  /** planBody + `## Reviewer Revisions` appendix (what gets written). */
   planText: string;
   planBody: string;
   verdict: ReviewVerdict;
@@ -840,7 +1317,7 @@ export interface ApplySubmittedPlanOptions {
 export interface ApplySubmittedPlanResult {
   ok: boolean;
   path: string;
-  /** True when the date prefix was corrected to today (UTC). */
+  /** True when the UTC date-time prefix was filled/corrected. */
   corrected: boolean;
   error?: string;
 }
@@ -849,9 +1326,10 @@ export interface ApplySubmittedPlanResult {
  * Steps 12-13: write the reviewed plan over Plan Mode's plan file and record it.
  *
  * Step 12 — the reviewer adjusts the SAME file Plan Mode wrote. It never picks
- * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<slug>.md`
+ * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md`
  * convention, so the plan the user reviews in Plannotator is the plan history
- * they already have. A defense-in-depth guard refuses any path outside
+ * they already have. An existing plan keeps its name; only a NEW file gets the
+ * date-time prefix. A defense-in-depth guard refuses any path outside
  * `.pi/plans/`, so even a compromised reviewer tool call cannot write elsewhere.
  *
  * Step 13 — appends a `workflow-review-submitted` entry (not part of the LLM
@@ -863,8 +1341,8 @@ export interface ApplySubmittedPlanResult {
 export function applySubmittedPlan(
   options: ApplySubmittedPlanOptions,
 ): ApplySubmittedPlanResult {
-  const today = getUtcDatePrefix();
-  const normalized = normalizePlanPath(options.planPath, options.cwd, today);
+  const now = new Date();
+  const normalized = normalizePlanPath(options.planPath, options.cwd, now);
   const relOrAbs = normalized.path;
 
   // Defense in depth: Review Mode may only ever write inside .pi/plans/.
@@ -910,6 +1388,8 @@ export function applySubmittedPlan(
         category: f.category,
         disposition: f.disposition,
       })),
+      // Kept for compatibility with existing audit readers: it means the
+      // UTC date-time prefix was filled/corrected, not only the date.
       correctedDatePrefix: normalized.corrected,
     });
   } catch {
@@ -918,7 +1398,7 @@ export function applySubmittedPlan(
 
   try {
     options.notify?.(
-      `Review Mode submitted the plan (${options.verdict}, ${options.findings.length} finding${
+      `submitted the plan (${options.verdict}, ${options.findings.length} finding${
         options.findings.length === 1 ? "" : "s"
       })`,
       "info",
@@ -939,7 +1419,7 @@ export function applySubmittedPlan(
  *
  * Both waits are edge-tolerant: whichever happens first (the tool call or the
  * await) wins, and a wait that starts after the event resolves immediately.
- * That matters because a fast reviewer can call `review_submit_plan` and
+ * That matters because a fast reviewer can call `review_submit` and
  * `review_pass_done` in the same turn, before the orchestrator awaits.
  *
  * Every wait is bounded by an AbortSignal and, when a positive timeout is
@@ -973,6 +1453,8 @@ export interface ReviewSubmitPayloadLike {
   planText: string;
   findings: ReviewFinding[];
   verdict: ReviewVerdict;
+  /** Required changes submitted this round (normalized count). */
+  requiredChanges: number;
   summary: string;
   changelog: string;
 }
@@ -985,6 +1467,10 @@ function deferredWait<T>(
 ): Promise<T | undefined> {
   const existing = current();
   if (existing !== undefined) return Promise.resolve(existing);
+  // A signal that is already aborted must resolve immediately: its `abort`
+  // event has already fired, so a listener registered below would never run
+  // and the caller (the gated handoff) would wait forever.
+  if (signal?.aborted === true) return Promise.resolve(undefined);
   return new Promise<T | undefined>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1065,6 +1551,555 @@ export function createReviewRoundGate(): ReviewRoundGate {
   };
 }
 
+// ── Gated handoff (plan 2026-10-23 follow-up) ───────────────────────────
+//
+// The handoff waits for the review instead of racing it: `runHandoff`
+// awaits this gate, and `/review-resume` / `/review-abort` / teardown
+// settle it. A pause does NOT resolve the gate — the waiter keeps waiting
+// for the resume/abort outcome. Exactly-once: the first `resolve` wins;
+// a reload drops the gate (in-memory only), so a fresh `agent_end` simply
+// reviews again instead of rendering a phantom handoff.
+
+/** Lifecycle of the gated handoff review phase (in-memory, never persisted). */
+export type ReviewHandoffPhase = "idle" | "auditing" | "paused";
+
+/** How the gated review phase ended, for handoff rendering. */
+export type ReviewHandoffOutcome = "reviewed" | "unreviewed";
+
+/** The settled value the handoff renderer consumes. */
+export interface ReviewHandoffResult {
+  outcome: ReviewHandoffOutcome;
+  /** Final plan text; `undefined` means "keep the author's draft". */
+  planText: string | undefined;
+}
+
+export interface ReviewHandoffGate {
+  /** Clear the slot for a new gated phase. */
+  reset(): void;
+  /** Settle the gate; the first call wins, later calls are no-ops. */
+  resolve(result: ReviewHandoffResult): void;
+  /** True once `resolve` has run. */
+  settled(): boolean;
+  /** Latest settled result, if any (read-only peek for the waiter). */
+  peek(): ReviewHandoffResult | undefined;
+  /**
+   * Await settlement. Resolves `undefined` if the caller's signal aborts
+   * first — the handoff then falls back to the author's draft.
+   */
+  wait(signal?: AbortSignal): Promise<ReviewHandoffResult | undefined>;
+}
+
+export function createReviewHandoffGate(): ReviewHandoffGate {
+  let result: ReviewHandoffResult | undefined;
+  let waiters: Array<(value: ReviewHandoffResult | undefined) => void> = [];
+  return {
+    reset() {
+      result = undefined;
+      waiters = [];
+    },
+    resolve(r) {
+      if (result !== undefined) return;
+      result = r;
+      for (const resolve of waiters.splice(0)) {
+        try {
+          resolve(r);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    settled() {
+      return result !== undefined;
+    },
+    peek() {
+      return result;
+    },
+    wait: (signal) =>
+      deferredWait<ReviewHandoffResult>(
+        () => result,
+        (resolve) => waiters.push(resolve),
+        undefined,
+        signal,
+      ),
+  };
+}
+
+/**
+ * Pure ESC-routing decision for the review input listener.
+ *
+ * The caller pre-filters raw input (`isKeyRelease` / `matchesKey(data,
+ * Key.escape)`); this decides from round state only: pause exactly once per
+ * round — a press while no round runs, or while already paused, falls
+ * through so the editor, questionnaire and handoff selector keep ESC.
+ */
+export function shouldPauseReviewOnEscape(input: {
+  roundActive: boolean;
+  paused: boolean;
+}): boolean {
+  return input.roundActive === true && input.paused !== true;
+}
+
+/** What the review ESC listener should do with one key press. */
+export type ReviewEscapeAction = "pause" | "swallow" | "pass";
+
+/**
+ * Route an ESC press while a review owns the turn.
+ *
+ * - A live, unpaused round pauses (exactly once per round).
+ * - A paused **gated** handoff swallows ESC with a hint: letting it reach the
+ *   editor aborts the parked parent turn and poisons `ctx.signal` for every
+ *   later `/review-resume` (the 2026-10-25 stall). `/review-abort` is the
+ *   explicit exit.
+ * - Everything else passes ESC through to the editor / questionnaire / handoff
+ *   selector.
+ */
+export function reviewEscapeAction(input: {
+  roundActive: boolean;
+  paused: boolean;
+  gatedPause: boolean;
+}): ReviewEscapeAction {
+  if (
+    shouldPauseReviewOnEscape({
+      roundActive: input.roundActive,
+      paused: input.paused,
+    })
+  ) {
+    return "pause";
+  }
+  if (input.paused === true && input.gatedPause === true) return "swallow";
+  return "pass";
+}
+
+/** Hints shown on the live running line in both hosts. */
+export const REVIEW_RUNNING_HINT =
+  "ESC or /review pause to pause · /review abort to stop";
+
+/** Cold-boot and running prefix; the state detail is appended when it lands. */
+const REVIEW_RUNNING_PREFIX = "🔍 Reviewing plan…";
+export const REVIEW_RUNNING_LINE = `${REVIEW_RUNNING_PREFIX} · ${REVIEW_RUNNING_HINT}`;
+
+/**
+ * The paused line shared by the host working message, the footer status and
+ * the Terminal widget. One owner so the surfaces cannot drift.
+ */
+export const REVIEW_PAUSED_LINE =
+  "⏸ Review paused — /review resume to continue, /review abort to stop";
+
+/** The reviewer finished; the plan waits for Approve/Revise. */
+export const REVIEW_HANDOFF_LINE =
+  "🔍 review · awaiting decision — /review abort to skip";
+
+/** A decision is being applied; the turn is briefly not actionable. */
+export const REVIEW_TRANSITION_LINE = "🔍 review · applying the decision…";
+
+/**
+ * Footer segment for a live review phase. Kept as the direct form used by
+ * tests and older callers; `reviewLine` is the host-facing composer.
+ */
+export function reviewFooterSegment(
+  state: ReviewState | undefined,
+  paused: boolean,
+  /** A round owns the turn before its first state event (cold boot). */
+  starting = false,
+  /** The reviewer finished; the plan is waiting for Approve/Revise. */
+  handoff = false,
+  /** The decision is being applied (a retained state is not a verdict). */
+  transition = false,
+): string {
+  if (paused) return REVIEW_PAUSED_LINE;
+  if (handoff) return REVIEW_HANDOFF_LINE;
+  if (transition) return REVIEW_TRANSITION_LINE;
+  if (!state) return starting ? REVIEW_RUNNING_LINE : "";
+  // A retained terminal phase belongs to the previous round: during a new
+  // round's cold boot paint the generic line, never the stale verdict.
+  if (starting && !reviewIsActive(state.phase)) return REVIEW_RUNNING_LINE;
+  // The LIVE line names the reviewer actually auditing the plan. Only this
+  // footer carries the label: `reviewStateSummary` (and therefore `/review
+  // status`) keeps its single `model :` row instead of printing it twice.
+  const model = state.modelLabel ? ` · ${state.modelLabel}` : "";
+  return `${REVIEW_RUNNING_PREFIX}${model} · ${REVIEW_RUNNING_HINT} · ${reviewStateDetails(state)}`;
+}
+
+/**
+ * Whether a review line should be visible at all.
+ *
+ * A review owns the turn only while a round is in flight (including the
+ * cold-start `activeReview` window before `isRoundActive()` flips) or a pause,
+ * handoff or decision transition exists. `reviewState` alone is deliberately
+ * NOT enough: it is retained after a round for `/review-status` and the REVIEW
+ * SUMMARY band. A retained terminal phase during a live round is still visible,
+ * but renders the generic turn-derived line, never its stale verdict.
+ */
+export function reviewStatusVisible(input: {
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  /** The reviewer finished and the browser/inline handoff owns the turn. */
+  handoff?: boolean;
+  /** The decision is being applied. */
+  transition?: boolean;
+  /** Retained phase, accepted for compatibility; see the comment above. */
+  phase?: ReviewPhase;
+}): boolean {
+  if (input.paused === true) return true;
+  if (input.handoff === true) return true;
+  if (input.transition === true) return true;
+  return input.roundInFlight === true || input.roundActive === true;
+}
+
+/**
+ * The one live Review line shared by the `workflow-review` status, the
+ * Terminal composer widget and the host working message.
+ *
+ * Empty when no review owns the turn. Paused/handoff/transition win over a
+ * retained state; a live round with no usable phase (cold boot, or a retained
+ * terminal phase) paints the generic running line.
+ */
+export function reviewLine(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  handoff?: boolean;
+  transition?: boolean;
+}): string {
+  const visible = reviewStatusVisible({
+    roundInFlight: input.roundInFlight,
+    roundActive: input.roundActive,
+    paused: input.paused,
+    handoff: input.handoff,
+    transition: input.transition,
+    phase: input.state?.phase,
+  });
+  if (!visible) return "";
+  return reviewFooterSegment(
+    input.state,
+    input.paused === true,
+    input.roundInFlight === true || input.roundActive === true,
+    input.handoff === true,
+    input.transition === true,
+  );
+}
+
+/**
+ * The text for the live footer status segment, or `""` when nothing is live.
+ * Kept as the status-facing name; it is the same formatter as `reviewLine`.
+ */
+export function reviewStatusText(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  handoff?: boolean;
+  transition?: boolean;
+}): string {
+  return reviewLine(input);
+}
+
+/**
+ * Text for the composer-area review widget in **terminal Pi**.
+ *
+ * Pi Terminal only renders the working row during a run, so a manual round
+ * needs this widget instead. The caller gates it on `isTerminalPiHost()` and
+ * `ctx.isIdle()`; this function only decides the text from the turn state.
+ * It is the same line as the `workflow-review` status so both hosts agree.
+ */
+export function reviewLiveLine(input: {
+  state: ReviewState | undefined;
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  handoff?: boolean;
+  transition?: boolean;
+}): string {
+  return reviewLine(input);
+}
+
+/**
+ * Whether a pause snapshot belongs to the current review cycle.
+ *
+ * Pauses are in-memory and cycle-tagged. A snapshot from an older cycle must
+ * never keep the review line/lock alive or be resumed after new work started.
+ */
+export function reviewPauseIsCurrent(input: {
+  pauseCycle: number | undefined;
+  currentCycle: number;
+}): boolean {
+  return (
+    typeof input.pauseCycle === "number" &&
+    input.pauseCycle === input.currentCycle
+  );
+}
+
+/** Result of consuming one review round from the cycle budget. */
+export interface ReviewRoundBudget {
+  /** The round number this attempt would use (1-based). */
+  round: number;
+  /** False when the cycle's `rounds` cap has already been consumed. */
+  allowed: boolean;
+}
+
+/**
+ * Consume one round from a cycle's budget.
+ *
+ * A new cycle starts at round 1 regardless of the previous cycle's count; this
+ * is the fix for the session-wide counter that made a second plan skip review
+ * with `round limit (1) reached`. Within a cycle the existing cap applies.
+ */
+export function nextReviewRound(input: {
+  round: number;
+  maxRounds: number;
+  newCycle?: boolean;
+}): ReviewRoundBudget {
+  const maxRaw = Number.isFinite(input.maxRounds)
+    ? Math.trunc(input.maxRounds)
+    : 1;
+  const max = Math.max(1, maxRaw);
+  const roundRaw = Number.isFinite(input.round)
+    ? Math.trunc(input.round)
+    : 0;
+  const current = Math.max(0, roundRaw);
+  const round = (input.newCycle === true ? 0 : current) + 1;
+  return { round, allowed: round <= max };
+}
+
+// ── Review turn + mode-switch lock (plan 2026-11-14) ─────────────────
+//
+// Review is an exclusive turn, not a background job: from the moment the
+// planner hands its plan to the reviewer until the browser/inline decision is
+// applied, no prompt and no mode transition is accepted. The turn is an
+// explicit state (unlike the old derived lock) because the handoff phase has
+// no running child session and must still be locked.
+//
+//   idle -> running -> paused -> running -> ... -> handoff -> transition -> idle
+//                 \-> handoff (reviewer failed/skipped) -> transition -> idle
+//
+// `transition` is the short, internal window while a decision stops the
+// reviewer, applies Build/Plan and sends the follow-up. It is locked so a
+// queued prompt cannot race the mode change.
+
+/** The exclusive Review turn. `idle` means no review owns the session. */
+export type ReviewTurnPhase =
+  | "idle"
+  | "running"
+  | "paused"
+  | "handoff"
+  | "transition";
+
+/**
+ * A pending plan handoff (browser or native) that is not a reviewer round.
+ *
+ * `plain` is the normal automatic Plan handoff with Review Mode off: it owns
+ * the pending decision but NOT the exclusive Review turn, so modes and prompts
+ * stay free. `review` is a handoff produced by an actual reviewer round (or a
+ * manual `/review`) and keeps the strict Review lock.
+ */
+export type PlanHandoffPhase = "idle" | "pending";
+export type PlanHandoffOwner = "plain" | "review";
+
+/** Only a review-owned handoff enters the exclusive Review turn. */
+export function handoffOwnsReviewTurn(
+  owner: PlanHandoffOwner | undefined,
+): boolean {
+  return owner === "review";
+}
+
+/** The Review turn a handoff enters for its owner (`idle` when plain). */
+export function reviewTurnForHandoff(
+  owner: PlanHandoffOwner | undefined,
+): ReviewTurnPhase {
+  return handoffOwnsReviewTurn(owner) ? "handoff" : "idle";
+}
+
+export function reviewTurnOwns(phase: ReviewTurnPhase): boolean {
+  return phase !== "idle";
+}
+
+/** Commands a user may run while Review owns the turn. */
+export function reviewInputAllowed(text: string): boolean {
+  const value = text.trim();
+  if (!value.startsWith("/")) return false;
+  return (
+    /^\/review(?:\s|-|$)/i.test(value) ||
+    /^\/handoff(?:\s|$)/i.test(value) ||
+    /^\/model(?:\s|$)/i.test(value) ||
+    /^\/thinking(?:\s|$)/i.test(value) ||
+    /^\/profile(?:\s|$)/i.test(value) ||
+    /^\/role(?:\s|$)/i.test(value)
+  );
+}
+
+export type ReviewInputDecision =
+  | { action: "allow" }
+  | { action: "block"; notice: string };
+
+/** One decision for `pi.on("input")`; pure so the matrix is testable. */
+export function reviewInputDecision(
+  text: string,
+  phase: ReviewTurnPhase,
+): ReviewInputDecision {
+  if (!reviewTurnOwns(phase)) return { action: "allow" };
+  if (reviewInputAllowed(text)) return { action: "allow" };
+  const state =
+    phase === "paused"
+      ? "paused"
+      : phase === "handoff"
+        ? "awaiting a decision"
+        : phase === "transition"
+          ? "applying the decision"
+          : "running";
+  return {
+    action: "block",
+    notice: `Review is ${state} — prompts are locked. /review pause, /review resume, /review abort, /handoff fallback, or change model/profile.`,
+  };
+}
+
+/** Which mode-switch lock is active, if any. Derived, never persisted. */
+export type ReviewModeLockKind =
+  | "running"
+  | "paused"
+  | "handoff"
+  | "transition";
+
+export interface ReviewModeLockInput {
+  /** `activeReview !== undefined` — set before the child session boots. */
+  roundInFlight?: boolean;
+  /** `reviewRuntime.isRoundActive()` at call time. */
+  roundActive?: boolean;
+  /** `pausedReview !== undefined`. */
+  paused?: boolean;
+  /** The gated handoff phase; `"auditing"` counts as running. */
+  gatePhase?: ReviewHandoffPhase;
+  /**
+   * The exclusive review turn (`reviewTurn`). Authoritative: a non-idle turn
+   * always owns the session, even when no round/pause/gate/decision exists —
+   * that is what closes the "locked but nothing abortable" soft-lock.
+   */
+  turn?: ReviewTurnPhase;
+  /** The browser/inline decision owns the session. */
+  handoff?: boolean;
+  /** A decision is being applied (stop reviewer -> mode -> follow-up). */
+  transition?: boolean;
+  /**
+   * Who owns a pending handoff. `plain` means no reviewer ran: even a stale
+   * `handoff` flag or turn must not lock the modes. Omitted keeps the
+   * historical `handoff`/turn meaning for existing callers.
+   */
+  handoffOwner?: PlanHandoffOwner;
+}
+
+/**
+ * Decide whether a mode transition must be refused.
+ *
+ * A real pause snapshot wins over a round that is still aborting: ESC has
+ * already been pressed, so the notice should tell the user how to resume.
+ * A live round wins over a stale gate phase: `/review-resume` clears the
+ * snapshot and starts the round before the parked handoff resets its phase,
+ * so `gatePhase === "paused"` must not mask the running reviewer. A bare
+ * paused gate (no round, no snapshot) is the fallback for the small window
+ * between an abort and the handoff continuation.
+ */
+export function reviewModeLockKind(
+  input: ReviewModeLockInput,
+): ReviewModeLockKind | undefined {
+  if (input.paused === true) return "paused";
+  if (input.roundInFlight === true || input.roundActive === true) {
+    return "running";
+  }
+  if (input.gatePhase === "paused") return "paused";
+  if (input.gatePhase === "auditing") return "running";
+  const plainHandoff = input.handoffOwner === "plain";
+  // The exclusive turn is the single source of truth for the remaining
+  // phases: a bare `running`/`handoff`/`paused`/`transition` turn must lock
+  // modes even when the round/pause/gate predicates are all clear. A plain
+  // handoff is the one exception: it was never a Review turn.
+  if (input.turn === "transition") return "transition";
+  if (input.turn === "paused") return "paused";
+  if (input.turn === "handoff") return plainHandoff ? undefined : "handoff";
+  if (input.turn === "running") return "running";
+  if (input.transition === true) return "transition";
+  if (input.handoff === true && !plainHandoff) return "handoff";
+  return undefined;
+}
+
+/**
+ * The narrower "a reviewer round or pause owns the turn" predicate.
+ * Decision handlers must use this (not the full lock): the handoff they are
+ * about to consume is not a stale decision.
+ */
+export function reviewRoundOwnsTurn(input: {
+  roundInFlight?: boolean;
+  roundActive?: boolean;
+  paused?: boolean;
+  gatePhase?: ReviewHandoffPhase;
+}): boolean {
+  return (
+    input.paused === true ||
+    input.roundInFlight === true ||
+    input.roundActive === true ||
+    input.gatePhase === "auditing"
+  );
+}
+
+/**
+ * Phase to use when `/review-resume` starts a paused gated round.
+ * A gated pause becomes an active audit again; a manual review (idle gate)
+ * is unchanged. This keeps a second ESC able to demote auditing → paused.
+ */
+export function reviewGatePhaseOnResume(
+  phase: ReviewHandoffPhase,
+): ReviewHandoffPhase {
+  return phase === "paused" ? "auditing" : phase;
+}
+
+/**
+ * Whether the gated handoff may park on the review gate.
+ *
+ * Invariant: parking requires all three — a paused phase, a pause snapshot for
+ * the current revision, and an unsettled gate. A phase without a snapshot (a
+ * stale/implicit pause) could never be released by `/review-resume`, so the
+ * handoff must settle with the author's plan instead of waiting forever.
+ */
+export function reviewHandoffParks(input: {
+  phase: ReviewHandoffPhase;
+  paused: boolean;
+  settled: boolean;
+}): boolean {
+  return (
+    input.phase === "paused" &&
+    input.paused === true &&
+    input.settled !== true
+  );
+}
+
+/** One short notice for a blocked mode transition. */
+export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
+  if (kind === "paused") {
+    return "Review is paused — mode switching stays locked. /review resume to continue, /review abort to stop.";
+  }
+  if (kind === "handoff") {
+    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review abort to hand the plan off now.";
+  }
+  if (kind === "transition") {
+    return "Review decision is being applied — mode switching is briefly locked.";
+  }
+  return "Review is running — mode switching is locked. ESC or /review pause to pause, /review resume to continue, /review abort to stop.";
+}
+
+/** Footer marker appended to the single `"workflow"` status while locked. */
+export function reviewModeLockFooter(
+  kind: ReviewModeLockKind | undefined,
+): string {
+  return kind ? "🔒 modes locked" : "";
+}
+
+/** `/review-status` row describing the lock and its allowed exits. */
+export function reviewModeLockStatusLine(
+  kind: ReviewModeLockKind | undefined,
+): string {
+  return kind ? `  lock    : ${kind} — ${reviewModeLockNotice(kind)}` : "";
+}
+
 // ── Step 16: reviewer transcript stream ──────────────────────────────
 
 /** Default cap on retained pane lines (the panes are a rolling window). */
@@ -1097,6 +2132,173 @@ function firstLine(s: string): string {
 
 function truncateLabel(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`;
+}
+
+/** Longest provider-error excerpt shown inline in a transcript line. */
+export const MAX_ERROR_TEXT = 160;
+
+/**
+ * One-line excerpt of a provider error message for `notify` and the reviewer
+ * pane. Provider errors are often multi-line JSON blobs; they must become a
+ * single line to survive a transcript entry and a `ui.notify` banner.
+ * Pure and total: empty/undefined input yields "", never throws.
+ */
+export function truncateErrorText(input: unknown, max: number = MAX_ERROR_TEXT): string {
+  const raw = typeof input === "string" ? input : "";
+  const flat = raw.replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const cap = Math.max(1, Math.trunc(max));
+  return flat.length <= cap ? flat : `${flat.slice(0, cap - 1).trimEnd()}…`;
+}
+
+/**
+ * True when an error text describes an *abort*, not a provider failure.
+ *
+ * Review Mode deliberately aborts the reviewer's tail after `review_pass_done`
+ * (and on pause/teardown). Node rejects an aborted operation with its default
+ * reason (`DOMException: This operation was aborted`); provider SDKs use
+ * `Request was aborted`; the Pi SDK's backoff cancellation reports
+ * `Retry cancelled`. The SDK's `lazyStream` setup path can record any of those
+ * as a `stopReason: "error"` assistant message, so a stop-reason check alone
+ * is not enough to tell an abort from a provider fault.
+ *
+ * Timeouts are deliberately NOT aborts: `AbortSignal.timeout()` rejects with
+ * `The operation was aborted due to timeout`, which is a transient provider
+ * failure and must keep its recovery semantics.
+ *
+ * Matching is anchored at the start of the flattened text so a provider payload
+ * that merely mentions "aborted" is not downgraded. Pure and total.
+ */
+export function isAbortStopText(input: unknown): boolean {
+  const text =
+    typeof input === "string" ? input.replace(/\s+/g, " ").trim() : "";
+  if (!text) return false;
+  // Checked first: "The operation was aborted due to timeout" is a timeout.
+  if (/\b(?:timed?\s*out|timeout)\b/i.test(text)) return false;
+  // `AgentSession._finishCancelledRetry()` reports a cancelled backoff this
+  // way; it is our own abort, never provider health.
+  if (/^retry\s+cancell?ed\b/i.test(text)) return true;
+  return (
+    /^(?:this|the|request|operation|signal)\b[^.\n]{0,40}abort(?:ed|ing)?\b/i.test(
+      text,
+    ) ||
+    /^abort(?:ed)?\s*error\b/i.test(text) ||
+    /^aborted\b/i.test(text)
+  );
+}
+
+/** How the reviewer's last assistant message stopped. */
+export type ReviewStopClassification =
+  | { kind: "clean" }
+  | { kind: "aborted"; message?: string }
+  | { kind: "provider-error"; message: string };
+
+/**
+ * Classify the outcome of a child run from an `agent_end` event's messages.
+ *
+ * Structural on purpose — SDK message shapes are not imported here. Scans
+ * backwards to the last assistant message (the only one that decides the run's
+ * outcome); a missing assistant message or junk input is `clean`. An error stop
+ * with an abort-shaped message is `aborted` even when the SDK labelled it
+ * `error` (its setup path does not check the abort signal), so callers never
+ * report a host cancellation as provider health.
+ */
+export function classifyAssistantStop(
+  messages: unknown,
+): ReviewStopClassification {
+  if (!Array.isArray(messages)) return { kind: "clean" };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const rec = messages[i] as Record<string, unknown> | null | undefined;
+    if (!rec || typeof rec !== "object") continue;
+    if (rec.role !== "assistant") continue;
+    // Last assistant message reached: this one decides the run outcome.
+    const stopReason = rec.stopReason;
+    if (stopReason === "aborted") {
+      const message =
+        typeof rec.errorMessage === "string" ? rec.errorMessage.trim() : "";
+      return message ? { kind: "aborted", message } : { kind: "aborted" };
+    }
+    if (stopReason !== "error") return { kind: "clean" };
+    const err = typeof rec.errorMessage === "string" ? rec.errorMessage.trim() : "";
+    if (isAbortStopText(err)) {
+      return err ? { kind: "aborted", message: err } : { kind: "aborted" };
+    }
+    return { kind: "provider-error", message: err || "unknown provider error" };
+  }
+  return { kind: "clean" };
+}
+
+/**
+ * What a child-session event says about provider health, decoded at the
+ * boundary so callers branch on typed values instead of SDK event shapes:
+ *
+ * - `retry`   → the SDK scheduled another attempt (`auto_retry_start`) and
+ *   reported the provider's error message.
+ * - `exhaust` → the retry budget ran out (`auto_retry_end`, `success: false`);
+ *   the run is about to settle on an error. `message` may be empty when the
+ *   event carries no `finalError` — callers then keep their earlier message.
+ * - `stop`    → the run itself ended on a provider error
+ *   (`stopReason === "error"` with a non-abort message; auto-retry disabled,
+ *   or a non-retryable failure).
+ * - `aborted` → the run ended on an abort (`stopReason === "aborted"`, or an
+ *   error stop whose message is abort-shaped — the SDK's setup path mislabels
+ *   a host cancellation as `error`). Never provider health.
+ * - `none`    → anything else, including a retry that recovered.
+ */
+export type ReviewProviderFailure =
+  | { kind: "retry"; message: string; retries: number }
+  | { kind: "exhaust"; message: string; retries: number }
+  | { kind: "stop"; message: string }
+  | { kind: "aborted"; message?: string }
+  | { kind: "none" };
+
+/** Structural decode of one provider-failure event. Never throws. */
+export function readProviderErrorEvent(
+  event: unknown,
+): ReviewProviderFailure {
+  const e = eventRecord(event);
+  if (!e) return { kind: "none" };
+  const type = typeof e.type === "string" ? e.type : "";
+  if (type === "auto_retry_start") {
+    const message =
+      typeof e.errorMessage === "string" ? e.errorMessage.trim() : "";
+    if (!message) return { kind: "none" };
+    // A cancelled retry is our own abort, not provider health.
+    if (isAbortStopText(message)) return { kind: "none" };
+    return {
+      kind: "retry",
+      message,
+      retries: readRetryAttempt(e.attempt),
+    };
+  }
+  if (type === "auto_retry_end") {
+    if (e.success !== false) return { kind: "none" };
+    const message = typeof e.finalError === "string" ? e.finalError.trim() : "";
+    if (isAbortStopText(message)) return { kind: "none" };
+    return {
+      kind: "exhaust",
+      message,
+      retries: readRetryAttempt(e.attempt),
+    };
+  }
+  if (type === "agent_end") {
+    const stop = classifyAssistantStop(e.messages);
+    if (stop.kind === "aborted") {
+      return stop.message
+        ? { kind: "aborted", message: stop.message }
+        : { kind: "aborted" };
+    }
+    if (stop.kind !== "provider-error") return { kind: "none" };
+    return { kind: "stop", message: stop.message };
+  }
+  return { kind: "none" };
+}
+
+/** Non-negative attempt count from a retry event; 0 when absent or junk. */
+function readRetryAttempt(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.trunc(value)
+    : 0;
 }
 
 /**
@@ -1134,7 +2336,7 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
         first ? ` — ${first}` : ""
       }`;
     }
-  } else if (name === "review_submit_plan") {
+  } else if (name === "review_submit") {
     const verdict = str(a.verdict) ?? "revise";
     const findings = Array.isArray(a.findings) ? a.findings.length : 0;
     detail = `verdict ${verdict} · ${findings} finding${
@@ -1170,6 +2372,17 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
  * `toolLabels` is owned by the stateful caller (`ReviewTranscript`): the end
  * event carries no args, so the start event registers `toolCallId → label` and
  * the end event consumes it. Pure otherwise; junk input never throws.
+ *
+ * Provider failures are surfaced with their real (truncated) text: the
+ * `auto_retry_start` notice carries the provider's message, and a failed
+ * `auto_retry_end` or an `agent_end` that stopped on `stopReason === "error"`
+ * appends an `error` line — a dead provider is then visible in the pane during
+ * the review instead of resurfacing later as a mysterious "no plan" failure.
+ *
+ * Run-start lines are NOT produced here. `agent_start` fires for every prompt on
+ * the same child session, so it cannot tell a cold boot from a warm resume or a
+ * next round; the runtime emits the truthful line with `reviewRunLabel` at the
+ * moment it sends the prompt.
  */
 export function translateReviewEvent(
   event: unknown,
@@ -1204,18 +2417,79 @@ export function translateReviewEvent(
     ];
   }
 
-  if (type === "agent_start") {
-    return [{ op: "new", kind: "status", text: "reviewer started" }];
-  }
+  return providerErrorOps(e, type);
+}
+
+/**
+ * Provider-error events → transcript lines, split out of
+ * `translateReviewEvent` to keep the dispatcher flat:
+ *
+ * - `agent_end`        → neutral run-end line, plus an `error` line when the run
+ *   stopped on `stopReason === "error"` (auto-retry disabled, or the first
+ *   failure was not retryable). "Run ended" is truthful for a finished,
+ *   aborted or paused run alike.
+ * - `auto_retry_start` → notice carrying the provider's message (truncated).
+ * - `auto_retry_end`   → `error` line when the retry budget is exhausted
+ *   (`success: false`); a recovered retry (`success: true`) stays silent.
+ *
+ * Unknown types and junk fields degrade to empty ops; never throws.
+ */
+function providerErrorOps(
+  e: Record<string, unknown>,
+  type: string,
+): ReviewTranscriptOp[] {
   if (type === "agent_end") {
-    return [{ op: "new", kind: "status", text: "reviewer finished this run" }];
+    const ops: ReviewTranscriptOp[] = [
+      { op: "new", kind: "status", text: "reviewer run ended" },
+    ];
+    // An abort is our own cancellation (pass complete / pause / teardown),
+    // never provider health. The SDK's setup path can label it `error` with an
+    // abort-shaped message, so classification cannot rely on `stopReason`.
+    const stop = classifyAssistantStop(e.messages);
+    if (stop.kind === "provider-error") {
+      ops.push({
+        op: "new",
+        kind: "error",
+        text: `reviewer run ended on a provider error: ${truncateErrorText(
+          stop.message,
+        )}`,
+      });
+    }
+    return ops;
   }
   if (type === "auto_retry_start") {
+    const msg = typeof e.errorMessage === "string" ? e.errorMessage : "";
+    // A cancelled backoff is an abort, not a provider notice.
+    if (isAbortStopText(msg)) return [];
     return [
-      { op: "new", kind: "notice", text: "retrying after a provider error" },
+      {
+        op: "new",
+        kind: "notice",
+        text: msg
+          ? `retrying after a provider error: ${truncateErrorText(msg)}`
+          : "retrying after a provider error",
+      },
     ];
   }
-
+  if (type === "auto_retry_end") {
+    // `success: false` ends the retry loop with the provider still failing —
+    // the run is about to settle on an error stop. `success: true` means a
+    // retry recovered; the earlier notice already covers that case.
+    if (e.success === false) {
+      const detail = truncateErrorText(e.finalError);
+      if (isAbortStopText(detail)) return [];
+      return [
+        {
+          op: "new",
+          kind: "error",
+          text: detail
+            ? `reviewer retry budget exhausted: ${detail}`
+            : "reviewer retry budget exhausted",
+        },
+      ];
+    }
+    return [];
+  }
   return [];
 }
 
@@ -1301,9 +2575,41 @@ export class ReviewTranscript {
 }
 
 /**
+ * The fixed review criteria, in priority order. Embedded verbatim in
+ * `REVIEW_SYSTEM_PROMPT`; user guidance (review-prompt.md) is appended to that
+ * prompt and can add emphasis, but it cannot remove these criteria.
+ *
+ * One array element per printed line, matching `REVIEW_SYSTEM_PROMPT`.
+ */
+export const REVIEW_CRITERIA: readonly string[] = [
+  "1. Framework alignment — does the plan follow the conventions, module layout,",
+  "   naming, error-handling style, and dependency choices already established in",
+  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
+  "   divergence explicitly.",
+  "2. Industry best practice — correctness, security, error handling, testability,",
+  "   observability, performance, and migration/rollback safety. Cite the specific",
+  "   practice when you flag a gap.",
+  "3. Requirement coverage — every requirement in the shared context must map to at",
+  "   least one plan step. A requirement with no step is a Critical finding.",
+  "4. Executability — each step must be concrete enough to implement without",
+  "   guessing: file paths, symbols, and a verifiable outcome.",
+  "5. Simplicity and over-engineering — prefer the smallest change that satisfies",
+  "   the stated requirements and this repository's conventions. Flag unnecessary",
+  "   steps, speculative abstractions, extra layers, configuration or dependencies",
+  "   nobody asked for, and work that is out of scope for the stated goal. Solving",
+  "   more than the requirement asks for is a finding, not extra value.",
+];
+
+/**
  * The reviewer's system prompt. The user's guidance (review-prompt.md) is
  * APPENDED to this, and the whole thing lives only in the child session —
  * Plan Mode never sees it (requirement: Plan cannot see Review's context).
+ *
+ * `## Review criteria` carries the fixed `REVIEW_CRITERIA`. The rules that used
+ * to live in the old `DEFAULT_REVIEW_PROMPT` "Rules:" block now live here:
+ * the READ-ONLY paragraph (no writes except the submit tool), the Protocol
+ * steps (read context, verify, record findings, submit, pass_done), and
+ * Restraint (never invent, submit unchanged if sound, preserve structure).
  */
 export const REVIEW_SYSTEM_PROMPT = [
   "You are REVIEW MODE: an independent auditor that supervises another agent's plan.",
@@ -1314,21 +2620,34 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "You are READ-ONLY. You cannot edit files, run mutating shell commands, install",
   "anything, or build. You may run test/lint/typecheck commands. Your single write",
-  "action is submitting the revised plan through the `review_submit_plan` tool.",
+  "action is submitting findings and required revisions through `review_submit`.",
+  "",
+  "## Review criteria (fixed; in priority order)",
+  "",
+  ...REVIEW_CRITERIA,
   "",
   "## Tools",
   "",
-  "- `read`, `grep`, `find`, `ls` — inspect the repository freely. Always verify a",
-  "  claim about the codebase with these before you rely on it.",
-  "- `review_bash` — a READ-ONLY/VERIFY shell on the same role allowlist Plan Mode",
-  "  uses (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch, npm",
-  "  test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo",
-  "  clippy, ...). Mutating commands, redirects, installs and builds are refused.",
-  "  Verify a plan's claims by reading the code and, where useful, by running its",
-  "  tests or linters — but never assert that something passes unless you ran it.",
-  "- `review_explore` — delegate focused read-only reconnaissance to subagents.",
-  "- `review_submit_plan` — submit the final rewritten plan. This is the ONLY way",
-  "  your work reaches the user. A review that never submits is a failed review.",
+  "- `read`, `grep`, `find`, `ls` — inspect the repository freely. The pass-1",
+  "  prompt carries Plan Mode's file inventory and recon summaries: trust them",
+  "  for what they cover, and re-read the files your findings anchor (plus a",
+  "  spot check or two) before you cite them.",
+  "- `review_bash` — a READ-ONLY/VERIFY shell using the same shared role policy as",
+  "  Plan Mode (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch,",
+  "  npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest,",
+  "  cargo clippy, ...). Safe sed print/select forms such as `sed -n 'A,Bp' file`",
+  "  and npx-style verification (`npx vitest run`, `npx eslint ...`, `npx tsc --noEmit`)",
+  "  follow that same policy; wrappers are allowed only around a permitted inner",
+  "  command. `sed -i`/`-f`, unsafe sed programs, awk, real file redirects (except",
+  "  harmless `>/dev/null` and fd duplication such as `2>&1`), installs, builds and",
+  "  git mutations are refused. Verify a plan's claims by reading the code and,",
+  "  where useful, running its tests or linters — never claim a pass unless you ran it.",
+
+  "- `review_explore` — delegate focused read-only reconnaissance to subagents",
+  "  (rarely needed: the pass-1 prompt already carries Plan Mode's recon).",
+  "- `review_submit` — submit your findings and required revisions. This is the",
+  "  ONLY way your work reaches the user. A review that never submits is a failed",
+  "  review.",
   "- `review_pass_done` — end the current pass with a verdict and your findings.",
   "",
   "## Protocol",
@@ -1339,8 +2658,8 @@ export const REVIEW_SYSTEM_PROMPT = [
   "   about what exists.",
   "3. Record every issue as a finding: severity 1-10, confidence 0-100, a category, a",
   "   file/line anchor when you have one, a one-line summary, and a rationale.",
-  "4. Rewrite the plan so it is correct and framework-aligned, then submit it with",
-  "   `review_submit_plan`.",
+  "4. Record the required revisions that make the plan correct and",
+  "   framework-aligned, then submit them with `review_submit`.",
   "5. End the pass with `review_pass_done`.",
   "",
   "You may run test/lint/typecheck commands, but not builds. Never assert that",
@@ -1351,20 +2670,12 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "- If the plan is sound, submit it unchanged and say so. Never invent findings to",
   "  appear useful — a false finding costs the user more than a missed nit.",
-  "- Adjust the plan; do not replace it with a different plan of your own. Preserve",
-  "  the author's structure, step numbering, and heading style so the plan stays",
-  "  machine-extractable.",
+  "- Adjust the plan through required revisions; do not replace it with a different",
+  "  plan of your own. Preserve the author's structure, step numbering, and heading",
+  "  style so the plan stays machine-extractable.",
   "- Never invent files, symbols, APIs, or conventions. If you cannot verify",
   "  something, say so in the finding rather than asserting it.",
 ].join("\n");
-
-/**
- * Type-only handle on the Pi SDK. This is erased at compile time, so importing
- * this module in a plain Node test does not load Pi.
- */
-export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
-
-export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
 /**
  * Built-in tool names the reviewer may call. Read-only by construction.
@@ -1374,7 +2685,7 @@ export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
  * (`dist/core/sdk.js`: `allowedToolNames = options.tools ?? ...`, then
  * `dist/core/agent-session.js`: `allCustomTools = [...].filter(tool =>
  * isAllowedTool(tool.definition.name))`). Passing only these names silently
- * drops `review_submit_plan`, i.e. the reviewer loses its only write path.
+ * drops `review_submit`, i.e. the reviewer loses its only write path.
  * Always build the session's allowlist with `reviewToolAllowlist()`.
  */
 export const REVIEW_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -1405,21 +2716,7 @@ export function reviewToolAllowlist(customTools: unknown): string[] {
  * A live reviewer session, narrowed to what Review Mode actually uses.
  * Keeps the orchestrator free of SDK types.
  */
-export interface ReviewChildSession {
-  readonly sessionId: string;
-  readonly modelLabel: string;
-  /** Subscribe to the session's event stream. Returns an unsubscribe function. */
-  subscribe(listener: (event: unknown) => void): () => void;
-  /** Send a prompt. Queues as a steer when the session is already streaming. */
-  prompt(text: string): Promise<void>;
-  /** Send a prompt that is delivered only after the current run stops. */
-  followUp(text: string): Promise<void>;
-  /** Cancel the in-flight run. Never throws. */
-  abort(): Promise<void>;
-  isStreaming(): boolean;
-  /** Unsubscribe and release. Never throws, safe to call twice. */
-  dispose(): void;
-}
+export type ReviewChildSession = InProcessChildSession;
 
 export interface CreateReviewSessionOptions {
   cwd: string;
@@ -1431,6 +2728,8 @@ export interface CreateReviewSessionOptions {
   findModel: (provider: string, id: string) => unknown;
   /**
    * Resolved user reviewer guidance, appended to REVIEW_SYSTEM_PROMPT.
+   * The review criteria live in the system prompt itself (`REVIEW_CRITERIA`);
+   * this text supplements them and can never remove or replace one.
    *
    * Note: the pruned Plan Mode history is NOT passed to the session manager.
    * The 3-argument `SessionManager.inMemory(cwd, opts, entries)` form only
@@ -1443,6 +2742,29 @@ export interface CreateReviewSessionOptions {
   reviewPrompt: string;
   /** Reviewer-only tools, built by the caller. */
   customTools: unknown[];
+  /**
+   * SDK retries per reviewer model (0-2). Applied through a runtime-only child
+   * SettingsManager override so the recovery chain advances after one doomed
+   * long request instead of spending the parent's 3-retry budget first.
+   */
+  providerRetries?: number;
+  /**
+   * Parent-side provider-registration surface (structural, feature-detected),
+   * found with `findParentProviderSurface(ctx)` — the session's model registry
+   * facade or its underlying model runtime.
+   *
+   * The reviewer session is deliberately created without ambient extensions,
+   * so a provider registered only in the parent session (e.g. by a provider
+   * extension) does not exist in the reviewer's fresh runtime. When this
+   * surface is given, every provider the parent knows that the child does not
+   * yet compose is registered onto the child BEFORE `createAgentSession` —
+   * natively when the parent has a provider object, otherwise by config.
+   * Absent or surface-less ⇒ nothing is seeded and the provider-auth preflight
+   * (below) reports the generic escape hatch instead. Providers the child
+   * already composes are skipped, so this is a no-op for every provider the
+   * runtime builds in by construction.
+   */
+  parentProviders?: unknown;
   /** Injectable for tests; defaults to a real dynamic import. */
   loadSdk?: ReviewSdkLoader;
 }
@@ -1453,6 +2775,8 @@ export interface CreateReviewSessionResult {
   modelLabel: string;
   /** Tool names the child actually has enabled, when the SDK exposes them. */
   activeTools?: string[];
+  /** What provider seeding did before the session was created, when probed. */
+  providerSeed?: ProviderSeedResult;
   error?: string;
 }
 
@@ -1467,99 +2791,14 @@ export interface CreateReviewSessionResult {
 export const REVIEW_CHILD_MARKER_ENV = "PI_WORKFLOW_REVIEW_CHILD";
 
 /**
- * Read the session's enabled tool names, when the SDK exposes them.
- * Returns `undefined` (not `[]`) when the accessor is missing OR throws, so a
- * caller can tell "cannot verify" apart from a verifiably empty tool set.
- */
-function readActiveToolNames(session: unknown): string[] | undefined {
-  try {
-    const get = (session as { getActiveToolNames?: unknown } | undefined)
-      ?.getActiveToolNames;
-    if (typeof get !== "function") return undefined;
-    const names = (get as () => unknown).call(session);
-    if (!Array.isArray(names)) return undefined;
-    return names.filter((n): n is string => typeof n === "string");
-  } catch {
-    return undefined;
-  }
-}
-
-function wrapAgentSession(
-  raw: unknown,
-  modelLabel: string,
-  sessionId: string,
-): ReviewChildSession {
-  const s = raw as {
-    subscribe: (l: (e: unknown) => void) => () => void;
-    prompt: (
-      t: string,
-      o?: { streamingBehavior?: "steer" | "followUp" },
-    ) => Promise<void>;
-    followUp: (t: string) => Promise<void>;
-    abort: () => Promise<void>;
-    isStreaming: boolean;
-  };
-  let disposed = false;
-  const unsubscribers: Array<() => void> = [];
-  return {
-    sessionId,
-    modelLabel,
-    subscribe(listener) {
-      const un = s.subscribe(listener);
-      if (disposed) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-        return () => {};
-      }
-      unsubscribers.push(un);
-      return un;
-    },
-    async prompt(text) {
-      if (disposed) return;
-      if (s.isStreaming) await s.prompt(text, { streamingBehavior: "steer" });
-      else await s.prompt(text);
-    },
-    async followUp(text) {
-      if (disposed) return;
-      await s.followUp(text);
-    },
-    async abort() {
-      try {
-        await s.abort();
-      } catch {
-        /* aborted sessions can throw; cancellation is best-effort */
-      }
-    },
-    isStreaming() {
-      return !disposed && Boolean(s.isStreaming);
-    },
-    dispose() {
-      if (disposed) return;
-      disposed = true;
-      for (const un of unsubscribers.splice(0)) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-      }
-    },
-  };
-}
-
-/**
  * Create the reviewer's in-process child session.
  *
- * Isolation properties that matter:
- * - `noExtensions: true` → the child never loads this or any other extension,
- *   so Review Mode cannot recurse or observe the parent's hooks.
- * - `SessionManager.inMemory(...)` → the child never writes a session file and
- *   never touches the parent's session history.
- * - its own `ModelRuntime` → no contention with the parent's model state.
- * - read-only built-in tools + reviewer-only custom tools.
+ * The general bootstrap (in-memory session/settings, no ambient extensions /
+ * skills / templates / themes, its own ModelRuntime, provider seeding and the
+ * auth preflight, exact active-tool assertion, disposal on failure, no silent
+ * model fallback) lives in `isolated-session.ts`. This wrapper owns only
+ * Review-specific semantics: its system prompt, user guidance, tool allowlist,
+ * provider-auth wording and the legacy anti-recursion marker.
  *
  * Never throws: a failure is returned as `{ ok: false, error }` so the caller
  * can fall back to the author's plan (config.fallbackOnError).
@@ -1567,138 +2806,48 @@ function wrapAgentSession(
 export async function createReviewSession(
   options: CreateReviewSessionOptions,
 ): Promise<CreateReviewSessionResult> {
-  const modelLabel = `${options.modelRef.provider}/${options.modelRef.id}`;
-  const loadSdk =
-    options.loadSdk ?? (() => import("@earendil-works/pi-coding-agent"));
-  const sessionId = `review-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+  const expectedTools = reviewToolAllowlist(options.customTools);
+  const result = await createIsolatedSession({
+    cwd: options.cwd,
+    agentDir: options.agentDir,
+    modelRef: options.modelRef,
+    findModel: options.findModel,
+    parentProviders: options.parentProviders,
+    providerRetries: options.providerRetries,
+    systemPrompt: REVIEW_SYSTEM_PROMPT,
+    context: options.reviewPrompt ? [options.reviewPrompt] : [],
+    tools: expectedTools,
+    customTools: options.customTools,
+    sessionIdPrefix: "review",
+    markerEnv: REVIEW_CHILD_MARKER_ENV,
+    // Review keeps its documented ambient project-context files; its explicit
+    // prompt already carries Plan Mode's context. Refinement defaults to off.
+    noContextFiles: false,
+    label: "reviewer",
+    missingModelError: (modelLabel) =>
+      `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
+    describeToolMismatch: (mismatch) =>
+      `reviewer tools are not active: ${mismatch.missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit${
+        mismatch.unexpected.length > 0
+          ? ` (unexpected: ${mismatch.unexpected.join(", ")})`
+          : ""
+      }`,
+    describeProviderAuthFailure: ({ providerId, seed, parentSurfaceFound }) =>
+      unconfiguredReviewerProviderMessage({
+        providerId,
+        seed,
+        parentSurfaceFound,
+        modelsJsonPath: path.join(options.agentDir, "models.json"),
+      }),
+    loadSdk: options.loadSdk,
+  });
 
-  const previousMarker = process.env[REVIEW_CHILD_MARKER_ENV];
-  try {
-    const sdk = await loadSdk();
-
-    const model = options.findModel(
-      options.modelRef.provider,
-      options.modelRef.id,
-    );
-    if (!model) {
-      return {
-        ok: false,
-        modelLabel,
-        error: `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
-      };
-    }
-
-    let modelRuntime: unknown;
-    try {
-      modelRuntime = await sdk.ModelRuntime.create();
-    } catch (e: unknown) {
-      return {
-        ok: false,
-        modelLabel,
-        error: `could not create a model runtime for the reviewer (auth/model catalog problem): ${
-          e instanceof Error ? e.message : String(e)
-        }`,
-      };
-    }
-
-    // No ambient extensions, no skills/prompts/themes: the reviewer gets exactly
-    // the system prompt below and nothing from the user's other packages.
-    // Project context files (AGENTS.md etc.) DO load — they are the framework
-    // signal the reviewer is meant to align with.
-    const loader = new sdk.DefaultResourceLoader({
-      cwd: options.cwd,
-      agentDir: options.agentDir,
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      systemPrompt: REVIEW_SYSTEM_PROMPT,
-      appendSystemPrompt: [options.reviewPrompt],
-    });
-    try {
-      await loader.reload?.();
-    } catch {
-      /* a reload failure must not abort the review; defaults still apply */
-    }
-
-    const sessionManager = sdk.SessionManager.inMemory(options.cwd, {
-      id: sessionId,
-    });
-
-    // MUST include the custom tool names: `tools` is an allowlist that filters
-    // custom tools too, so a built-ins-only list would silently remove
-    // `review_submit_plan` and make every review fail (see REVIEW_BUILTIN_TOOLS).
-    const expectedTools = reviewToolAllowlist(options.customTools);
-
-    process.env[REVIEW_CHILD_MARKER_ENV] = "1";
-    let created: { session?: unknown; modelFallbackMessage?: string };
-    try {
-      created = await sdk.createAgentSession({
-        cwd: options.cwd,
-        agentDir: options.agentDir,
-        modelRuntime,
-        model,
-        thinkingLevel: options.modelRef.thinking as never,
-        tools: expectedTools,
-        customTools: options.customTools as never,
-        resourceLoader: loader,
-        sessionManager,
-        sessionStartEvent: { type: "session_start", reason: "startup" },
-      } as never);
-    } finally {
-      if (previousMarker === undefined)
-        delete process.env[REVIEW_CHILD_MARKER_ENV];
-      else process.env[REVIEW_CHILD_MARKER_ENV] = previousMarker;
-    }
-
-    if (!created?.session) {
-      return {
-        ok: false,
-        modelLabel,
-        error: "createAgentSession returned no session",
-      };
-    }
-
-    // Defence in depth: assert the SDK really enabled the reviewer's tools.
-    // Without `review_submit_plan` a review can only ever end in a fallback, so
-    // failing here (instantly, with the missing names) beats a 10-minute pass
-    // that silently cannot succeed. Feature-detected: an SDK that does not
-    // expose the accessor is trusted rather than blocked.
-    const activeTools = readActiveToolNames(created.session);
-    if (activeTools) {
-      const missing = expectedTools.filter((n) => !activeTools.includes(n));
-      if (missing.length > 0) {
-        return {
-          ok: false,
-          modelLabel,
-          activeTools,
-          error: `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
-        };
-      }
-    }
-
-    // Bind in print mode so the child's UI context is explicitly non-interactive.
-    // Best-effort: a binding failure is not fatal because the child has no extensions.
-    try {
-      const bindable = created.session as {
-        bindExtensions?: (b: { mode: string }) => Promise<void>;
-      };
-      await bindable.bindExtensions?.({ mode: "print" });
-    } catch {
-      /* ignore */
-    }
-
-    return {
-      ok: true,
-      modelLabel,
-      ...(activeTools ? { activeTools } : {}),
-      session: wrapAgentSession(created.session, modelLabel, sessionId),
-    };
-  } catch (e: unknown) {
-    return {
-      ok: false,
-      modelLabel,
-      error: e instanceof Error ? e.message : String(e),
-    };
-  }
+  return {
+    ok: result.ok,
+    modelLabel: result.modelLabel,
+    ...(result.session ? { session: result.session } : {}),
+    ...(result.activeTools ? { activeTools: result.activeTools } : {}),
+    ...(result.providerSeed ? { providerSeed: result.providerSeed } : {}),
+    ...(result.error ? { error: result.error } : {}),
+  };
 }
