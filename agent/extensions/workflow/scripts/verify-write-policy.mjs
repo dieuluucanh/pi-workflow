@@ -288,14 +288,25 @@ try {
   check("4f default+allow: sed does not prompt", dialogs, 0);
   check("4g default+allow: sed is allowed", r === undefined, true);
 
-  // ── Scenario 4h: writePolicy ask is the strict opt-in ──
+  // ── Scenario 4h/4i: writePolicy ask prompts on a genuine sed write ──
   await cmds["write-policy"].handler("ask", makeCtx(ALLOW_ONCE));
   dialogs = 0;
   r = await call(makeCtx(ALLOW_ONCE), "bash", {
-    command: "sed -n '1,5p' package.json",
+    command: "sed -i 's/a/b/' package.json",
   });
-  check("4h ask: sed prompts once", dialogs, 1);
-  check("4i ask: allow once permits it", r === undefined, true);
+  check("4h ask: sed -i prompts once", dialogs, 1);
+  check("4i ask: allow once permits sed -i", r === undefined, true);
+
+  // Read-only commands remain prompt-free even in ask mode.
+  for (const [label, command] of [
+    ["sed -n", "sed -n '1,5p' package.json"],
+    ["npx vitest", "npx vitest run"],
+  ]) {
+    dialogs = 0;
+    r = await call(makeCtx("Deny"), "bash", { command });
+    check(`4i1 ask: ${label} does not prompt`, dialogs, 0);
+    check(`4i2 ask: ${label} is allowed`, r === undefined, true);
+  }
 
   // ── Scenario 4j: folderPolicy any removes the floor's asks ──
   await cmds["folder-policy"].handler("any", makeCtx("Deny"));

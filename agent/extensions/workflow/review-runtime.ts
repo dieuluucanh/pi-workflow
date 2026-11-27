@@ -61,7 +61,13 @@ import {
   DEFAULT_SHELL_LIMITS,
   type ShellLimits,
 } from "./shell-guard.ts";
-import { buildPlanDiff, renderReviewContextBlock, type ReviewFinding } from "./utils.ts";
+import type { PlanRevisionResponse } from "./plan-revision.ts";
+import {
+  buildPlanDiff,
+  renderReviewContextBlock,
+  type ReviewFinding,
+  type ReviewNote,
+} from "./utils.ts";
 
 /** Event `type` from a child-session event, or "" for junk. Never throws. */
 function readEventType(event: unknown): string {
@@ -163,12 +169,34 @@ export interface ReviewRuntimeDeps {
   loadSdk?: ReviewSdkLoader;
 }
 
+/**
+ * The Planner↔Reviewer loop state carried INTO a re-review round: the notes the
+ * last round raised and how the Planner says it settled each one.
+ *
+ * Optional by design — a first or one-shot round passes nothing and every
+ * prompt stays byte-identical to the pre-loop rendering.
+ */
+export interface ReviewPriorRound {
+  /** The revision round these notes/responses belong to (1-based). */
+  round: number;
+  /** The notes the previous round raised (as parsed from the appendix). */
+  notes: readonly ReviewNote[];
+  /** The Planner's per-note answer set; empty when it never reported. */
+  responses: readonly PlanRevisionResponse[];
+}
+
 export interface RunRoundInput {
   planText: string;
   planPath: string;
   round: number;
   /** Findings from the previous round, so pass 2 can assert they were fixed. */
   previousFindings?: ReviewFinding[];
+  /**
+   * Previous round's notes + the Planner's responses, so both passes can see
+   * what was already raised and how it was answered instead of re-discovering
+   * it. Absent on a first/one-shot round.
+   */
+  priorRound?: ReviewPriorRound;
   /**
    * Host abort signal (ESC). When it fires the round stops promptly and the
    * author's plan is kept — the same outcome as the internal abortRound().
@@ -195,6 +223,17 @@ export interface ReviewRuntime {
   isAlive(): boolean;
   /** True while `runRound` is in flight — used to route prompt input. */
   isRoundActive(): boolean;
+  /**
+   * Switch the reviewer model WITHOUT aborting the round or discarding the warm
+   * session. A live session is switched in place; with no session yet (or one
+   * still booting) the choice is retained for the next session. The next round
+   * reuses the warm session instead of restarting it.
+   */
+  switchModel(model: {
+    provider: string;
+    id: string;
+    thinking: string;
+  }): Promise<ReviewModelSwitchResult>;
   /** Cancel the in-flight review but keep the session. */
   abortRound(): Promise<void>;
   /**
@@ -208,7 +247,134 @@ export interface ReviewRuntime {
   teardown(): Promise<void>;
 }
 
-/** Prompt for pass 1: review and rewrite. */
+export interface ReviewModelSwitchResult {
+  ok: boolean;
+  /** False when the session already ran the requested model/thinking. */
+  changed?: boolean;
+  /** The model the session reports after the switch. */
+  model?: { provider: string; id: string; thinking: string };
+  error?: string;
+}
+
+/** Notes listed in full in the previous-round section before the `… and N more` tail. */
+export const MAX_PRIOR_ROUND_NOTES = 12;
+
+/** Per-note remaining-change reason kept in the previous-round section. */
+export const MAX_PRIOR_ROUND_REASON_CHARS = 240;
+
+function clipPriorRoundText(value: unknown, max: number): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** Label the Reviewer reads for one Planner disposition. */
+function priorRoundStatusLabel(status: PlanRevisionResponse["status"] | undefined): string {
+  if (status === "applied") return "applied";
+  if (status === "rejected") return "rejected";
+  if (status === "not_applicable") return "not applicable";
+  return "no response recorded";
+}
+
+/**
+ * `- R1 · Step 2: applied` / `- R2: rejected — <reason>` — the per-note shape
+ * the Planner's revision prompt uses, extended with the disposition.
+ */
+function priorRoundNoteLine(
+  note: ReviewNote,
+  byId: Map<string, PlanRevisionResponse>,
+): string {
+  const id = clipPriorRoundText(note?.id, 16) || "R?";
+  const step =
+    note?.step === undefined || String(note.step).trim() === ""
+      ? ""
+      : ` · Step ${clipPriorRoundText(note.step, 40)}`;
+  const response = byId.get(String(note?.id ?? "").trim().toUpperCase());
+  const label = priorRoundStatusLabel(response?.status);
+  if (label === "applied" || label === "no response recorded") {
+    // An `applied` note has nothing left to explain; a silent Planner has no
+    // reason to show. Both render as the bare disposition.
+    return `- ${id}${step}: ${label}`;
+  }
+  const reason =
+    clipPriorRoundText(response?.reason, MAX_PRIOR_ROUND_REASON_CHARS) ||
+    "no reason given";
+  return `- ${id}${step}: ${label} — ${reason}`;
+}
+
+/**
+ * Render the `## Previous round (round N)` block shared by both passes.
+ *
+ * Distinct from pass 1's `## Findings from the previous round`
+ * (`input.previousFindings`), and the two do not overlap:
+ *
+ *   - `## Findings from the previous round` is FINDING-level and pass-1 only:
+ *     id, severity, summary, location and the finding's own rationale, with
+ *     its disposition. It asks "did the author address this finding?".
+ *   - `## Previous round (round N)` is NOTE-level and appears in both passes:
+ *     one `R<n>` line per Reviewer note plus the Planner's own disposition and
+ *     reason for it. It asks "did the Planner settle this note honestly?".
+ *
+ * A round with no notes from the loop renders neither heading nor text, so a
+ * first/one-shot round is byte-identical to the pre-loop prompt.
+ *
+ * Bounded like `plan-revision.ts`: at most {@link MAX_PRIOR_ROUND_NOTES} notes
+ * in full, the surplus collapsed into `… and N more: R13, R14` so an id is
+ * never silently dropped, each reason clipped to
+ * {@link MAX_PRIOR_ROUND_REASON_CHARS}. Returns "" when there is no prior
+ * round (or it carried no notes), so a first/one-shot round renders nothing at
+ * all — not even an empty heading.
+ */
+export function renderPriorRoundSection(
+  priorRound: ReviewPriorRound | undefined,
+): string {
+  const notes = Array.isArray(priorRound?.notes) ? priorRound!.notes : [];
+  if (notes.length === 0) return "";
+  const rawRound = Number(priorRound?.round);
+  const round = Number.isFinite(rawRound) ? Math.max(1, Math.trunc(rawRound)) : 1;
+  const responses = Array.isArray(priorRound?.responses)
+    ? priorRound!.responses
+    : [];
+  const byId = new Map<string, PlanRevisionResponse>();
+  for (const response of responses) {
+    const id = String(response?.id ?? "")
+      .trim()
+      .toUpperCase();
+    if (id) byId.set(id, response);
+  }
+
+  const listed = notes.slice(0, MAX_PRIOR_ROUND_NOTES);
+  const surplus = notes.slice(MAX_PRIOR_ROUND_NOTES);
+  const lines = listed.map((note) => priorRoundNoteLine(note, byId));
+  if (surplus.length > 0) {
+    lines.push(
+      `… and ${surplus.length} more: ${surplus
+        .map((note) => clipPriorRoundText(note?.id, 16) || "R?")
+        .join(", ")}`,
+    );
+  }
+
+  return [
+    `## Previous round (round ${round})`,
+    "",
+    "These are the notes that round raised and how the Planner answered each",
+    "one. Check the revised body against them instead of re-discovering them.",
+    "",
+    ...lines,
+    "",
+    "Do not re-raise a note the Planner resolved unless the revised body still",
+    "fails it; if it does, restate it with the evidence.",
+    "",
+    "Note ids in your submission are `R<n>` only and restart at R1 each round,",
+    "so a note you restate may reuse its previous id. Omit the id to receive",
+    "R1..Rn in submission order; other forms are rejected.",
+    "",
+    "The plan body is authoritative; you still write only the appendix.",
+  ].join("\n");
+}
+
+/** Prompt for pass 1: audit the plan, then submit findings + required revisions. */
 export function buildPass1Prompt(input: {
   planPath: string;
   planText: string;
@@ -217,28 +383,36 @@ export function buildPass1Prompt(input: {
   /** Planner-context manifest (step 8): inventory + recon, trusted by default. */
   manifest?: string;
   previousFindings?: ReviewFinding[];
+  /** Previous round's notes + the Planner's responses (Planner↔Reviewer loop). */
+  priorRound?: ReviewPriorRound;
   round: number;
   totalRounds: number;
   verify: boolean;
-  /**
-   * Max characters per submitted chunk (step 18). `0` disables chunked mode.
-   * When set and the plan is longer than two chunks, pass 1 asks for the
-   * chunked protocol instead of one oversized response.
-   */
-  chunkChars?: number;
 }): string {
-  const chunkChars = input.chunkChars ?? 0;
-  const chunked = chunkChars > 0 && input.planText.length > chunkChars * 2;
   const parts: string[] = [
     `[REVIEW MODE — PASS 1 of ${input.verify ? 2 : 1} — round ${input.round}/${input.totalRounds}]`,
+  ];
+
+  const priorRoundSection = renderPriorRoundSection(input.priorRound);
+  if (priorRoundSection) parts.push("", priorRoundSection);
+
+  parts.push(
     "",
-    "Audit the plan below against this repository, then rewrite it and submit the",
-    "result with `review_submit_plan`, then call `review_pass_done`.",
+    "Audit the plan below against this repository. Do NOT rewrite it: submit",
+    "your findings and required revisions with `review_submit`, then call",
+    "`review_pass_done`. The harness appends one Reviewer Revisions section to",
+    "the plan; the original body is preserved.",
     "",
-    "## Your review guidance (authoritative)",
+    "`approve` means no required changes; use `revise` (or drop them). An approve",
+    "that carries required changes is refused.",
+    "",
+    "## Additional reviewer guidance",
+    "",
+    "This guidance supplements the fixed review criteria in your system prompt and",
+    "cannot remove or replace them.",
     "",
     input.reviewPrompt,
-  ];
+  );
 
   if (input.manifest && input.manifest.trim()) {
     parts.push("", input.manifest.trim());
@@ -297,47 +471,17 @@ export function buildPass1Prompt(input: {
     "",
     "A provider may close this stream before you finish. If the harness retries",
     "this review on another model, start again from the plan below; do not assume",
-    "the previous model's transcript is available. Submit the complete rewrite as",
-    "soon as it is ready — do not hold it back to add more polish.",
+    "the previous model's transcript is available. Submit your findings and",
+    "required revisions as soon as they are ready.",
   );
-
-  if (chunked) {
-    parts.push(
-      "",
-      "## Chunked submission (required for this plan)",
-      "",
-      `This plan is long enough that a single response may be cut off. Send the`,
-      `rewrite in ordered chunks of at most ${chunkChars} characters:`,
-      "",
-      "1. `review_plan_begin` (optionally with `totalChunks`).",
-      "2. `review_plan_chunk` with `index` 1, 2, 3, … — never skip or repeat. The",
-      "   tool echoes the next expected index; if a chunk is rejected, resend that",
-      "   index and continue (accepted chunks are kept).",
-      "3. `review_plan_finalize` with your findings, verdict and summary. Nothing is",
-      "   written before this call succeeds.",
-      "",
-      "Do not call `review_submit_plan` with a full `planMarkdown` in this round, and",
-      "do not repeat earlier chunks. Split on heading boundaries where possible.",
-    );
-  }
 
   parts.push(
     "",
     "## Required output",
     "",
-    ...(chunked
-      ? [
-          "1. `review_plan_begin`, then `review_plan_chunk` for every part of the",
-          "   COMPLETE revised plan (readable markdown, original structure preserved,",
-          "   no `Review changes` section — it is generated).",
-          "2. `review_plan_finalize` with your findings, verdict and summary.",
-          "3. `review_pass_done` with the same findings.",
-        ]
-      : [
-          "1. `review_submit_plan` with the COMPLETE revised plan (readable markdown,",
-          "   original structure preserved, no `Review changes` section — it is generated).",
-          "2. `review_pass_done` with your verdict and the same findings.",
-        ]),
+    "1. `review_submit` with your findings, verdict, summary and required",
+    "   revisions. Do not send a replacement plan body.",
+    "2. `review_pass_done` with your verdict and the same findings.",
     "",
     "You may run read-only and test/lint/typecheck commands, but you cannot build or",
     "write any file other than the plan. Say what you could not verify instead of",
@@ -347,22 +491,27 @@ export function buildPass1Prompt(input: {
   return parts.join("\n");
 }
 
-/** Prompt for pass 2: verify the reviewer's own rewrite. */
+/** Prompt for pass 2: verify the reviewer's own findings and revisions. */
 export function buildPass2Prompt(input: {
   planPath: string;
   originalPlan: string;
   rewrittenPlan: string;
   findings: ReviewFinding[];
+  /** Previous round's notes + the Planner's responses (Planner↔Reviewer loop). */
+  priorRound?: ReviewPriorRound;
 }): string {
-  // Step 9: pass 2 checks the rewrite against a diff, not two full plans.
+  // Step 9: pass 2 checks the revision against a diff, not two full plans.
   const diff = buildPlanDiff(input.originalPlan, input.rewrittenPlan);
+  const priorRoundSection = renderPriorRoundSection(input.priorRound);
   return [
-    "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REWRITE]",
+    "[REVIEW MODE — PASS 2 of 2: VERIFY YOUR OWN REVISIONS]",
+    ...(priorRoundSection ? ["", priorRoundSection] : []),
     "",
-    "You just rewrote the plan and submitted it. Now check your own work. This pass",
-    "exists because a rewrite can silently drop a requirement the author cared about.",
+    "You just submitted findings and required revisions. Now check your own work.",
+    "This pass exists because a revision can silently drop a requirement the author",
+    "cared about — or add work the plan does not need.",
     "",
-    "## What changed (unified diff of your rewrite)",
+    "## What changed (unified diff of the revisions you appended)",
     "",
     "```diff",
     diff,
@@ -379,17 +528,25 @@ export function buildPass2Prompt(input: {
     "",
     "## Check, in order",
     "",
-    "1. Is every finding you marked `accepted` actually reflected in the rewrite?",
-    "2. Did you drop or weaken any requirement, step, invariant, or verification",
-    "   item that was present in the original? List anything lost — this is the most",
-    "   important check.",
-    "3. Does the rewrite still describe a plan that can be executed without guessing?",
+    "1. Does every finding you marked `accepted` appear as a concrete revision in the",
+    "   appended `## Reviewer Revisions` section?",
+    "2. Did any revision drop or weaken a requirement, step, invariant, or verification",
+    "   item that was present in the original plan? List anything lost — this is the",
+    "   most important check.",
+    "3. Over-engineering check — do the required revisions add work the stated",
+    "   requirements do not need: extra layers, abstractions, configuration flags,",
+    "   dependencies, phases, or steps? Delete such a revision or mark it `deferred`",
+    "   instead of prescribing it.",
+    "4. Does the plan, with those revisions applied, still describe work that can be",
+    "   executed without guessing?",
     "",
     "## Required output",
     "",
-    "If the rewrite is correct, resubmit it unchanged with an empty findings array and",
-    "verdict `approve`. If you lost something or a finding is not addressed, fix it and",
-    "resubmit with the corrected plan. Then call `review_pass_done` with pass 2.",
+    "Call `review_submit` again with the SAME findings and required revisions,",
+    "corrected only where this check found a problem. Do NOT submit an empty findings",
+    "array: the resubmission REPLACES this round's `## Reviewer Revisions` section",
+    "rather than stacking a second one, and an empty array would re-render it without",
+    "pass 1's findings. Then call `review_pass_done` with pass 2.",
   ].join("\n");
 }
 
@@ -399,9 +556,43 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
   let transcript: Transcript | undefined;
   let gate: ReviewRoundGate = createReviewRoundGate();
   let starting: Promise<EnsureSessionResult> | undefined;
+  /**
+   * Runtime lifetime. Teardown/dispose increments this SYNCHRONOUSLY, before
+   * its first await, so an SDK bootstrap that resolves later can detect that
+   * its owner is gone and dispose the late session instead of installing it.
+   */
+  let lifetime = 0;
   let abortController: AbortController | undefined;
   /** `provider/id/thinking` the live session was created with (step 10). */
   let sessionModelKey: string | undefined;
+  /**
+   * A model chosen while no session was alive (or one was still booting).
+   * `ensureSession` consumes it so a `/profile use` in the cold-start window is
+   * not lost.
+   */
+  let pendingModel:
+    | { provider: string; id: string; thinking: string }
+    | undefined;
+  /** Serializes model switches; never held across a prompt or a boot. */
+  let modelLane: Promise<unknown> = Promise.resolve();
+  /**
+   * Parent-registry resolutions, memoized by provider/id. The live child was
+   * created with the parent's model object; switching back to that same target
+   * reuses it rather than resolving the same reference twice.
+   */
+  const resolvedParentModels = new Map<string, unknown>();
+  const findParentModel = (provider: string, id: string): unknown => {
+    const key = `${provider}\u0000${id}`;
+    if (resolvedParentModels.has(key)) return resolvedParentModels.get(key);
+    let found: unknown;
+    try {
+      found = deps.findModel(provider, id);
+    } catch {
+      found = undefined;
+    }
+    resolvedParentModels.set(key, found);
+    return found;
+  };
   /** True while `runRound` is in flight (gates prompt routing). */
   let roundActive = false;
   /**
@@ -437,71 +628,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
   const resetExpectedAborts = (): void => {
     expectedAbortEnds = 0;
-  };
-
-  /** Ordered plan chunks for the current pass; reset on submit/abort/switch. */
-  let planAssembler:
-    | { chunks: string[]; nextIndex: number; totalChunks?: number }
-    | undefined;
-
-  const resetPlanAssembler = (): void => {
-    planAssembler = undefined;
-  };
-
-  const beginPlan = (totalChunks?: number) => {
-    if (config().chunkedSubmit === "off") {
-      return {
-        ok: false,
-        error: "chunked submission is off; pass the complete plan to review_submit_plan",
-      };
-    }
-    planAssembler = {
-      chunks: [],
-      nextIndex: 1,
-      ...(totalChunks !== undefined ? { totalChunks } : {}),
-    };
-    return { ok: true, maxChunkChars: config().chunkChars };
-  };
-
-  const appendPlanChunk = (index: number, content: string) => {
-    if (!planAssembler) {
-      return { ok: false, error: "call review_plan_begin first" };
-    }
-    if (index !== planAssembler.nextIndex) {
-      return {
-        ok: false,
-        error: `expected chunk ${planAssembler.nextIndex}, got ${index}`,
-      };
-    }
-    const maxChunkChars = config().chunkChars;
-    if (content.length > maxChunkChars) {
-      return {
-        ok: false,
-        error: `chunk ${index} is ${content.length} characters; the limit is ${maxChunkChars}`,
-      };
-    }
-    planAssembler.chunks.push(content);
-    planAssembler.nextIndex += 1;
-    return {
-      ok: true,
-      received: planAssembler.chunks.length,
-      nextIndex: planAssembler.nextIndex,
-      totalChars: planAssembler.chunks.reduce(
-        (sum, chunk) => sum + chunk.length,
-        0,
-      ),
-    };
-  };
-
-  const takeAssembledPlan = (): string | undefined => {
-    if (!planAssembler || planAssembler.chunks.length === 0) return undefined;
-    if (
-      planAssembler.totalChunks !== undefined &&
-      planAssembler.chunks.length < planAssembler.totalChunks
-    ) {
-      return undefined;
-    }
-    return planAssembler.chunks.join("");
   };
 
   /** Record one provider failure. The message arrives pre-decoded, non-empty. */
@@ -765,6 +891,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
   /** Release the child session and its round state (step 10). Never throws. */
   async function disposeSession(options: { keepRoundController?: boolean } = {}): Promise<void> {
+    // Invalidate any in-flight startup FIRST, synchronously: the bootstrap may
+    // still be awaiting the SDK or `createAgentSession`. Clearing `starting`
+    // lets a later, valid lifetime boot again; the stale promise is left to
+    // observe the generation change and dispose its own late session.
+    lifetime += 1;
+    starting = undefined;
     try {
       if (options.keepRoundController !== true) abortController?.abort();
       noteExpectedAbort();
@@ -781,8 +913,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     state = undefined;
     transcript = undefined;
     sessionModelKey = undefined;
+    // A choice for a session that never existed has no target anymore.
+    pendingModel = undefined;
     gate = createReviewRoundGate();
-    resetPlanAssembler();
     if (options.keepRoundController !== true) abortController = undefined;
     try {
       deps.onState?.(undefined);
@@ -807,7 +940,12 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     id: string;
     thinking: string;
   }): Promise<EnsureSessionResult> {
-    const modelRef = modelRefOverride ?? deps.reviewerModel();
+    // A live switch that is still in flight must finish before the key compare,
+    // or the next round would restart a session that is about to be correct.
+    // Only when a session EXISTS: awaiting the lane while booting could
+    // deadlock against a switch waiting for that same boot.
+    if (session) await modelLane;
+    const modelRef = pendingModel ?? modelRefOverride ?? deps.reviewerModel();
     const modelKey = modelRef
       ? `${modelRef.provider}/${modelRef.id}/${modelRef.thinking}`
       : "";
@@ -827,13 +965,26 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       }
     }
     if (starting) return starting;
-    starting = (async (): Promise<EnsureSessionResult> => {
+    // Capture the lifetime BEFORE the first await. A teardown/reload that runs
+    // while the bootstrap is suspended makes every later step stale.
+    const generation = lifetime;
+    const stale = (): boolean => generation !== lifetime;
+    let settleStart!: (result: EnsureSessionResult) => void;
+    const thisStart = new Promise<EnsureSessionResult>((resolve) => {
+      settleStart = resolve;
+    });
+    // Publish the in-flight promise BEFORE the body runs, so a synchronous
+    // failure clears `starting` instead of caching an already-settled promise.
+    starting = thisStart;
+    void ((async (): Promise<EnsureSessionResult> => {
       const cfg = config();
       if (!modelRef) {
-        deps.log(
-          "no reviewer model configured — run /role set reviewer <provider/model>",
-          "warning",
-        );
+        if (!stale()) {
+          deps.log(
+            "no reviewer model configured — run /role set reviewer <provider/model>",
+            "warning",
+          );
+        }
         return { ok: false, created: false };
       }
       try {
@@ -843,6 +994,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const sdk = await (
           deps.loadSdk ?? (() => import("@earendil-works/pi-coding-agent"))
         )();
+        // Teardown/reload while the SDK was loading: no tool build, no child.
+        if (stale()) return { ok: false, created: false };
 
         const built = createReviewTools(sdk, {
           cwd: deps.cwd,
@@ -878,6 +1031,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
             planPath: () => deps.planPath(),
             originalPlan: () => deps.readPlan(),
             modelLabel: () => session?.modelLabel ?? "reviewer",
+            round: () => state?.round ?? 1,
             submit: async (payload) => {
               const planPath = deps.planPath();
               if (!planPath) return { ok: false, error: "no plan path" };
@@ -896,15 +1050,13 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
                 state.rewrittenPlan = payload.planText;
                 state.findings = payload.findings;
                 state.verdict = payload.verdict;
+                // The submitted count, not the parsed note count: the round
+                // decision needs to tell "asked for N, parsed 0" apart.
+                state.requiredChanges = payload.requiredChanges;
               }
               gate.notifySubmitted(payload);
               return { ok: true, path: written.path };
             },
-            beginPlan,
-            appendPlanChunk,
-            takeAssembledPlan,
-            resetPlan: resetPlanAssembler,
-            maxChunkChars: config().chunkChars,
             log: deps.log,
           },
           passDone: {
@@ -944,7 +1096,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           cwd: deps.cwd,
           agentDir: deps.agentDir,
           modelRef,
-          findModel: deps.findModel,
+          findModel: findParentModel,
           reviewPrompt: deps.promptText(),
           customTools: built.tools,
           providerRetries: cfg.providerRetries,
@@ -959,6 +1111,17 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
         const created: CreateReviewSessionResult =
           await createReviewSession(createOptions);
+
+        if (stale()) {
+          // The owner was torn down while the SDK created the child. Dispose it
+          // exactly once: nobody else holds a reference to it.
+          try {
+            created.session?.dispose();
+          } catch {
+            /* ignore */
+          }
+          return { ok: false, created: false };
+        }
 
         if (!created.ok || !created.session) {
           deps.log(
@@ -1067,16 +1230,27 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         });
         return { ok: true, created: true };
       } catch (e: unknown) {
-        deps.log(
-          `failed to start: ${e instanceof Error ? e.message : String(e)}`,
-          "warning",
-        );
+        if (!stale()) {
+          deps.log(
+            `failed to start: ${e instanceof Error ? e.message : String(e)}`,
+            "warning",
+          );
+        }
         return { ok: false, created: false };
-      } finally {
-        starting = undefined;
       }
-    })();
-    return starting;
+    })()).then(
+      (result) => {
+        // Only the CURRENT generation may clear the shared promise, so a stale
+        // startup can never clobber a newer one.
+        if (starting === thisStart) starting = undefined;
+        settleStart(result);
+      },
+      () => {
+        if (starting === thisStart) starting = undefined;
+        settleStart({ ok: false, created: false });
+      },
+    );
+    return thisStart;
   }
 
   /** Public shape: idempotent, creates the reviewer session if it is not alive. */
@@ -1135,8 +1309,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
 
     try {
       roundActive = true;
-      // Chunks from an earlier round must never leak into this one.
-      resetPlanAssembler();
       // A round is a new logical review request: its shell budget starts fresh.
       currentShellRecovery = createShellGuardRecovery();
       shellGuardTrip = undefined;
@@ -1298,6 +1470,29 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           lastFailure = `reviewer session unavailable for ${attemptLabel(attempt)}`;
           continue;
         }
+        // Cancellation/teardown that landed while the session was booting must
+        // stop the round HERE, before any prompt, pass or state publication.
+        if (rc.signal.aborted) {
+          await abortChild();
+          if (!state) {
+            state = createReviewState({
+              planHash: hash,
+              planPath: input.planPath,
+              modelLabel: attemptLabel(attempt),
+              round: input.round,
+              now: started,
+            });
+          }
+          state.phase = "aborted";
+          return {
+            ok: false,
+            fallback: true,
+            planText: state.rewrittenPlan ?? originalPlan,
+            planHash: hash,
+            state,
+            reason: "aborted",
+          };
+        }
         const created = start.created;
         const child = session;
 
@@ -1330,12 +1525,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         // Step 8: inventory + recon so the reviewer verifies, not re-explores.
         manifest: deps.plannerManifest?.() ?? "",
         previousFindings: input.previousFindings,
+        priorRound: input.priorRound,
         round: input.round,
         totalRounds: cfg.rounds,
         verify: cfg.verify && cfg.passes > 1,
-        // `chunkedSubmit: "off"` is the coarse switch; `chunkChars: 0` is the
-        // numeric one. Both mean "ask for the one-shot submission".
-        chunkChars: cfg.chunkedSubmit === "off" ? 0 : cfg.chunkChars,
       });
 
       const p1 = await runPass(1, deadline, rc, () => {
@@ -1443,7 +1636,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         }
         lastFailure = `the reviewer finished without submitting a plan on ${attemptLabel(
           attempt,
-        )} — it has no write path unless review_submit_plan succeeds`;
+        )} — it has no write path unless review_submit succeeds`;
         if (budgetExpired) lastFailure += " — provider recovery budget expired";
         if (canFallback) continue;
         return fail(lastFailure, originalPlan);
@@ -1481,8 +1674,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
         const pass2Prompt = buildPass2Prompt({
           planPath: input.planPath,
           originalPlan,
-          rewrittenPlan: p1.submitted.planBody,
+          rewrittenPlan: p1.submitted.planText,
           findings: state?.findings ?? [],
+          priorRound: input.priorRound,
         });
         const p2 = await runPass(2, deadline, rc, () => {
           pushStatus(reviewRunLabel({ created, pass: 2 }));
@@ -1519,7 +1713,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
           finalPlan = p2.submitted.planText;
         } else if (p2Provider) {
           // The run settled without a submission AND a provider error was
-          // seen this pass: say why, then keep going with pass 1's rewrite.
+          // seen this pass: say why, then keep going with pass 1's plan text.
           deps.log(
             `verification pass ended without a submission (${p2Provider}) — keeping pass 1's plan.`,
             "warning",
@@ -1600,6 +1794,95 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
     },
     isAlive: () => Boolean(session),
     isRoundActive: () => roundActive,
+    async switchModel(model) {
+      /** Apply to the live session; keeps it warm by recording the new key. */
+      const applyToLive = async (): Promise<ReviewModelSwitchResult> => {
+        const target = session;
+        if (!target) return { ok: false, error: "the reviewer session is gone" };
+        const current = target.currentModel?.();
+        const sameModel =
+          current?.provider === model.provider && current.id === model.id;
+        // An unknown/missing current level is NOT the requested level: the
+        // child may not report one, so a level-only switch must still be
+        // applied instead of being mistaken for a no-op.
+        const sameThinking =
+          current?.thinking !== undefined && current.thinking === model.thinking;
+        if (sameModel && sameThinking) {
+          const thinking = current?.thinking ?? model.thinking;
+          sessionModelKey = `${model.provider}/${model.id}/${thinking}`;
+          return {
+            ok: true,
+            changed: false,
+            model: { provider: model.provider, id: model.id, thinking },
+          };
+        }
+        if (typeof target.setModel !== "function") {
+          return {
+            ok: false,
+            error: "this reviewer session cannot switch models (unsupported SDK)",
+          };
+        }
+        // The reviewer child runs in isolation: resolve the target in the
+        // parent's registry first so a child-registry miss cannot block the
+        // switch. A parent miss keeps the child's existing ref fallback.
+        const parentModel = findParentModel(model.provider, model.id);
+        const result = await target.setModel(
+          model.provider,
+          model.id,
+          model.thinking,
+          parentModel,
+        );
+        if (!result.ok) return { ok: false, error: result.error };
+        const applied = {
+          provider: result.model.provider,
+          id: result.model.id,
+          thinking: result.model.thinking ?? model.thinking,
+        };
+        // Keeping the session WARM is the point: the recorded key stops the next
+        // `ensureSession` from restarting it just to adopt the new model.
+        sessionModelKey = `${applied.provider}/${applied.id}/${applied.thinking}`;
+        if (state) {
+          state.modelLabel = `${applied.provider}/${applied.id}`;
+          try {
+            deps.onState?.(state);
+          } catch {
+            /* display-only */
+          }
+        }
+        pushStatus(
+          `reviewer model → ${applied.provider}/${applied.id}${
+            applied.thinking ? ` (${applied.thinking})` : ""
+          }`,
+        );
+        return { ok: true, changed: true, model: applied };
+      };
+
+      const run = async (): Promise<ReviewModelSwitchResult> => {
+        if (session) return applyToLive();
+        // No session (or one still booting): retain the choice for the session
+        // that `ensureSession` is about to create, then adopt it if it landed.
+        pendingModel = { ...model };
+        if (starting) {
+          try {
+            await starting;
+          } catch {
+            /* a failed boot leaves pendingModel for the next attempt */
+          }
+          if (session) {
+            pendingModel = undefined;
+            return applyToLive();
+          }
+        }
+        return { ok: true, changed: true, model: { ...model } };
+      };
+
+      const next = modelLane.then(run, run);
+      modelLane = next.then(
+        () => undefined,
+        () => undefined,
+      );
+      return next;
+    },
     async abortRound() {
       try {
         abortController?.abort();
@@ -1608,9 +1891,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps): ReviewRuntime {
       } catch {
         /* cancellation is best-effort */
       }
-      // An aborted round cannot be finalised: drop partial chunks so a retry
-      // starts a clean submission instead of silently stitching two rewrites.
-      resetPlanAssembler();
       if (state && state.phase !== "done") state.phase = "aborted";
     },
     async sendUserMessage(text: string, images?: unknown[]): Promise<boolean> {

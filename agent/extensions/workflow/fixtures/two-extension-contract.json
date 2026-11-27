@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "note": "Two unrelated fixture extensions for the generic host contract. This file is shared verbatim with Pi Desktop (tests/fixtures/two-extension-contract.json); neither extension is Workflow. Modes are arbitrary on purpose.",
+  "extensions": [
+    {
+      "name": "fixture.alpha",
+      "envelope": {
+        "version": 1,
+        "owner": { "id": "fixture.alpha", "version": "1.0.0" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "removed": [],
+        "contributions": [
+          {
+            "id": "alpha-mode",
+            "kind": "mode",
+            "slot": "mode",
+            "label": "Focus",
+            "tone": "accent",
+            "order": 1,
+            "actions": []
+          },
+          {
+            "id": "alpha-input",
+            "kind": "input",
+            "slot": "input",
+            "availability": "available",
+            "tone": "neutral",
+            "order": 2
+          },
+          {
+            "id": "alpha-child",
+            "kind": "related-session",
+            "slot": "sessions",
+            "relation": "child",
+            "sessionRef": "tab-alpha-child",
+            "title": "Alpha task",
+            "focusable": true,
+            "tone": "info",
+            "order": 3
+          },
+          {
+            "id": "alpha-action",
+            "kind": "action",
+            "slot": "action",
+            "label": "Run alpha",
+            "command": { "name": "alpha-run" },
+            "enabled": true,
+            "tone": "neutral",
+            "order": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "fixture.beta",
+      "envelope": {
+        "version": 1,
+        "owner": { "id": "fixture.beta", "version": "1.0.0" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "removed": [],
+        "contributions": [
+          {
+            "id": "beta-mode",
+            "kind": "mode",
+            "slot": "mode",
+            "label": "Triage",
+            "tone": "accent",
+            "order": 1,
+            "actions": []
+          },
+          {
+            "id": "beta-input",
+            "kind": "input",
+            "slot": "input",
+            "availability": "locked",
+            "reason": "waiting for a decision",
+            "tone": "warning",
+            "order": 2
+          },
+          {
+            "id": "beta-action",
+            "kind": "action",
+            "slot": "action",
+            "label": "Run beta",
+            "command": { "name": "beta-run" },
+            "enabled": true,
+            "tone": "neutral",
+            "order": 3
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "ownerIds": ["fixture.alpha", "fixture.beta"],
+    "modes": ["Focus", "Triage"],
+    "inputAvailability": ["available", "locked"],
+    "childRefs": ["tab-alpha-child"],
+    "commands": ["beta-run", "alpha-run"]
+  }
+}

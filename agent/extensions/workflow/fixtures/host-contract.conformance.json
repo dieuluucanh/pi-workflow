@@ -1,0 +1,546 @@
+{
+  "version": 1,
+  "note": "Cross-repository conformance cases for the generic extension->host contribution contract (v1). Workflow publishes; Pi Desktop reads. Both implementations must produce the same accept/reject verdict, so a contract change updates this fixture and both validators together.",
+  "envelopes": [
+    {
+      "name": "minimal status envelope",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "status", "id": "build-status", "text": "Building 3/8" }]
+      }
+    },
+    {
+      "name": "mode with bounded actions",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example", "version": "1.2.3" },
+        "sessionId": "session-a",
+        "epoch": 2,
+        "revision": 7,
+        "contributions": [
+          {
+            "kind": "mode",
+            "id": "mode",
+            "label": "Plan",
+            "tone": "warning",
+            "order": 10,
+            "detail": "read-only",
+            "actions": [
+              { "id": "mode-build", "label": "Build", "command": { "name": "build" } },
+              {
+                "id": "mode-plan",
+                "label": "Plan",
+                "enabled": false,
+                "disabledReason": "already in plan"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "mode references a same-owner cycle action",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode",
+            "id": "mode",
+            "label": "Plan",
+            "tone": "warning",
+            "actionRef": "mode-cycle",
+            "actions": []
+          },
+          {
+            "kind": "action",
+            "id": "mode-cycle",
+            "label": "Cycle mode",
+            "tone": "warning",
+            "command": { "name": "workflow-cycle" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "mode actionRef must not carry a command or path",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "mode", "id": "mode", "label": "Plan", "actionRef": "../../bin/sh" }
+        ]
+      }
+    },
+    {
+      "name": "mode actionRef must be a string id",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "mode", "id": "mode", "label": "Plan", "actionRef": 7 }]
+      }
+    },
+    {
+      "name": "actions carry inline and menu groups plus a legacy ungrouped action",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "action",
+            "id": "todos-expand",
+            "label": "Expand todos",
+            "order": 5,
+            "group": {
+              "id": "workflow.todos",
+              "label": "Todos",
+              "order": 10,
+              "placement": "inline"
+            },
+            "command": { "name": "workflow-todos-expand" }
+          },
+          {
+            "kind": "action",
+            "id": "orchestrator-pause",
+            "label": "Pause child",
+            "order": 6,
+            "group": {
+              "id": "workflow.orchestrator",
+              "label": "Orchestrator",
+              "order": 20,
+              "placement": "menu"
+            },
+            "command": { "name": "workflow-orchestrator-pause" }
+          },
+          {
+            "kind": "action",
+            "id": "defaulted-group",
+            "label": "Auto todos",
+            "group": { "id": "workflow.automation", "label": "Automation" },
+            "command": { "name": "workflow-todos-auto" }
+          },
+          {
+            "kind": "action",
+            "id": "legacy-ungrouped",
+            "label": "Legacy action",
+            "command": { "name": "workflow-legacy" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "an action group placement is a closed enum",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "action",
+            "id": "a",
+            "label": "run",
+            "group": {
+              "id": "workflow.todos",
+              "label": "Todos",
+              "order": 0,
+              "placement": "sidebar"
+            },
+            "command": { "name": "run" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "an action group needs an id and a label",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "action",
+            "id": "a",
+            "label": "run",
+            "group": { "id": "workflow.todos", "placement": "menu" },
+            "command": { "name": "run" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "mode choices reference same-owner actions and carry checked state",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode",
+            "id": "mode",
+            "label": "Plan",
+            "tone": "warning",
+            "actionRef": "mode-cycle",
+            "actions": []
+          },
+          {
+            "kind": "action",
+            "id": "mode-cycle",
+            "label": "Cycle mode",
+            "command": { "name": "workflow-cycle" }
+          },
+          {
+            "kind": "action",
+            "id": "mode-plan",
+            "label": "Plan",
+            "command": { "name": "workflow-plan" }
+          },
+          {
+            "kind": "action",
+            "id": "mode-build",
+            "label": "Build",
+            "command": { "name": "workflow-build" }
+          },
+          {
+            "kind": "mode-choice",
+            "id": "choice-plan",
+            "label": "Plan",
+            "description": "Read-only planning",
+            "tone": "warning",
+            "order": 10,
+            "actionRef": "mode-plan",
+            "checked": true
+          },
+          {
+            "kind": "mode-choice",
+            "id": "choice-build",
+            "label": "Build",
+            "order": 20,
+            "actionRef": "mode-build"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a mode-choice needs an actionRef",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "mode-choice", "id": "choice-plan", "label": "Plan" }]
+      }
+    },
+    {
+      "name": "a mode-choice actionRef must be a safe id",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode-choice",
+            "id": "choice-plan",
+            "label": "Plan",
+            "actionRef": "../../bin/sh"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a mode-choice with a dangling actionRef still parses",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          {
+            "kind": "mode-choice",
+            "id": "choice-deleted",
+            "label": "Deleted",
+            "actionRef": "action-not-published-yet"
+          }
+        ]
+      }
+    },
+    {
+      "name": "progress and related session",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 2,
+        "removed": ["stale-status"],
+        "contributions": [
+          {
+            "kind": "progress",
+            "id": "todos",
+            "label": "Todos",
+            "done": 3,
+            "total": 12,
+            "stale": true
+          },
+          {
+            "kind": "related-session",
+            "id": "child-1",
+            "relation": "child",
+            "sessionRef": "opaque/child-1",
+            "title": "Task 1",
+            "focusable": true
+          },
+          {
+            "kind": "input",
+            "id": "input",
+            "availability": "restricted",
+            "reason": "Orchestrator verifies before new work"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown kind is ignored, not fatal",
+      "expect": "ok",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 3,
+        "contributions": [
+          { "kind": "hologram", "id": "future-1", "text": "from the future" },
+          { "kind": "status", "id": "known", "text": "still renders" }
+        ]
+      }
+    },
+    {
+      "name": "unknown contract version is rejected",
+      "expect": "error",
+      "input": {
+        "version": 2,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": []
+      }
+    },
+    {
+      "name": "duplicate contribution id",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "status", "id": "dup", "text": "one" },
+          { "kind": "status", "id": "dup", "text": "two" }
+        ]
+      }
+    },
+    {
+      "name": "newline in a label is rejected",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "mode", "id": "mode", "label": "Plan\nBuild" }]
+      }
+    },
+    {
+      "name": "progress cannot exceed its total",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "progress", "id": "p", "label": "x", "done": 9, "total": 8 }]
+      }
+    },
+    {
+      "name": "an action cannot name a shell command",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [
+          { "kind": "action", "id": "a", "label": "run", "command": { "name": "rm -rf /" } }
+        ]
+      }
+    },
+    {
+      "name": "unknown bootstrap-free input availability is rejected",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": [{ "kind": "input", "id": "i", "availability": "open-sesame" }]
+      }
+    },
+    {
+      "name": "missing epoch is rejected",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": { "id": "dieulc.example" },
+        "sessionId": "session-a",
+        "revision": 1,
+        "contributions": []
+      }
+    },
+    {
+      "name": "owner id is required",
+      "expect": "error",
+      "input": {
+        "version": 1,
+        "owner": {},
+        "sessionId": "session-a",
+        "epoch": 0,
+        "revision": 1,
+        "contributions": []
+      }
+    }
+  ],
+  "negotiation": [
+    { "name": "same version", "hostVersion": 1, "expect": "ok" },
+    { "name": "newer host", "hostVersion": 2, "expect": "ok" },
+    { "name": "older host", "hostVersion": 0, "expect": "error" },
+    { "name": "no version", "hostVersion": null, "expect": "error" }
+  ],
+  "apply": [
+    {
+      "name": "newer revision replaces state",
+      "current": { "epoch": 0, "revision": 1, "ids": ["a"] },
+      "next": { "epoch": 0, "revision": 2, "ids": ["b"] },
+      "expect": "ok",
+      "resultIds": ["a", "b"]
+    },
+    {
+      "name": "same revision is refused",
+      "current": { "epoch": 0, "revision": 2, "ids": ["a"] },
+      "next": { "epoch": 0, "revision": 2, "ids": ["b"] },
+      "expect": "error"
+    },
+    {
+      "name": "older revision is refused",
+      "current": { "epoch": 0, "revision": 3, "ids": ["a"] },
+      "next": { "epoch": 0, "revision": 2, "ids": ["b"] },
+      "expect": "error"
+    },
+    {
+      "name": "stale epoch is refused",
+      "current": { "epoch": 2, "revision": 1, "ids": ["a"] },
+      "next": { "epoch": 1, "revision": 9, "ids": ["b"] },
+      "expect": "error"
+    },
+    {
+      "name": "a newer epoch starts a clean registry",
+      "current": { "epoch": 1, "revision": 9, "ids": ["a"] },
+      "next": { "epoch": 2, "revision": 1, "ids": ["b"] },
+      "expect": "ok",
+      "resultIds": ["b"]
+    }
+  ],
+  "sessionHost": [
+    {
+      "name": "a full host accepts the spec",
+      "expect": "ok",
+      "capabilities": {
+        "version": 1,
+        "create": true,
+        "open": true,
+        "focus": true,
+        "inspect": true,
+        "interrupt": true,
+        "close": true,
+        "separateWindow": true,
+        "bootstrapBeforeStart": true,
+        "label": "test host"
+      }
+    },
+    {
+      "name": "a host without separate windows cannot dispatch",
+      "expect": "error",
+      "capabilities": {
+        "version": 1,
+        "create": true,
+        "open": true,
+        "focus": true,
+        "inspect": true,
+        "interrupt": true,
+        "close": true,
+        "separateWindow": false,
+        "bootstrapBeforeStart": true,
+        "label": "in-process host"
+      }
+    },
+    {
+      "name": "a host that cannot bootstrap cannot dispatch",
+      "expect": "error",
+      "capabilities": {
+        "version": 1,
+        "create": true,
+        "open": true,
+        "focus": true,
+        "inspect": true,
+        "interrupt": true,
+        "close": true,
+        "separateWindow": true,
+        "bootstrapBeforeStart": false,
+        "label": "stale host"
+      }
+    }
+  ]
+}

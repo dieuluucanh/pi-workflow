@@ -26,6 +26,7 @@ test("build mode keeps the mode/progress in `workflow` and splits the rest", () 
       mode: "▶ build 3/8",
       profile: "⚡ cheap | 🔨 builder",
       policy: "commits:ask",
+      orchestrator: "",
     },
   );
 });
@@ -42,6 +43,7 @@ test("plan no longer claims a browser review without a Review turn", () => {
       mode: "⏸ plan 1/4",
       profile: "",
       policy: "commits:never",
+      orchestrator: "",
     },
   );
 });
@@ -124,7 +126,12 @@ test("default mode stays parseable and carries the write policy", () => {
       commitMode: "ask",
       writeMode: "allow",
     }),
-    { mode: "◦ 2/3 ⚠", profile: "", policy: "commits:ask · writes:allow" },
+    {
+      mode: "◦ 2/3 ⚠",
+      profile: "",
+      policy: "commits:ask · writes:allow",
+      orchestrator: "",
+    },
   );
   assert.deepEqual(
     buildWorkflowStatusSegments({
@@ -134,7 +141,12 @@ test("default mode stays parseable and carries the write policy", () => {
       commitMode: "never",
       writeMode: "ask",
     }),
-    { mode: "◦ commits:never", profile: "", policy: "commits:never · writes:ask" },
+    {
+      mode: "◦ commits:never",
+      profile: "",
+      policy: "commits:never · writes:ask",
+      orchestrator: "",
+    },
   );
 });
 
@@ -145,6 +157,7 @@ test("the status keys are stable", () => {
     policy: "workflow-policy",
     review: "workflow-review",
     todos: "workflow-todos",
+    orchestrator: "workflow-orchestrator",
   });
 });
 
@@ -195,4 +208,256 @@ test("setWorkflowWidget sets lines, clears with [], and passes placement", () =>
 test("setWorkflowWidget is a no-op for a host without a widget API", () => {
   assert.doesNotThrow(() => setWorkflowWidget(undefined, "k", ["a"]));
   assert.doesNotThrow(() => setWorkflowWidget({}, "k", ["a"]));
+});
+
+test("the orchestrator footer reports the run without approval or recommendation prose", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 2,
+    commitMode: "never",
+    orchestration: {
+      phase: "blocked",
+      blockedReason: "no host",
+      nextTaskId: "task-2",
+    },
+  });
+  assert.match(segments.mode, /orchestrator 1\/2/);
+  assert.doesNotMatch(segments.mode, /approval/);
+  assert.match(segments.orchestrator, /run blocked/);
+  assert.match(segments.orchestrator, /next task-2/);
+  assert.match(segments.orchestrator, /blocked: no host/);
+
+  const idle = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+  });
+  assert.equal(idle.orchestrator, "");
+});
+
+test("handoff stages are named accurately and a recommendation never executes", () => {
+  const review = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "review-pending",
+  });
+  assert.match(review.mode, /handoff pending/);
+  assert.equal(review.orchestrator, "", "no destination recommendation is rendered");
+
+  const approved = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "approved",
+  });
+  assert.match(approved.mode, /execution choice pending/);
+  assert.doesNotMatch(approved.mode, /review/);
+  assert.equal(approved.orchestrator, "", "no destination recommendation is rendered");
+
+  const routing = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffStage: "routing",
+  });
+  assert.match(routing.mode, /applying execution/);
+
+  // A stale `handoffPending` flag must not override a later stage.
+  const both = buildWorkflowStatusSegments({
+    mode: "plan",
+    done: 0,
+    total: 0,
+    commitMode: "never",
+    handoffPending: true,
+    handoffStage: "approved",
+  });
+  assert.match(both.mode, /execution choice pending/);
+  assert.doesNotMatch(both.mode, /handoff pending/);
+});
+
+test("the orchestrator segment names the live child without row progress", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    commitMode: "never",
+    orchestration: {
+      phase: "running",
+      child: {
+        ref: "2",
+        total: 7,
+        phase: "running",
+        model: "builder/model",
+        todoDone: 3,
+        todoTotal: 5,
+      },
+      view: "child",
+    },
+  });
+  assert.equal(segments.orchestrator, "child running · builder/model");
+  assert.doesNotMatch(segments.orchestrator, /\d+\/\d+/, "no row pointer");
+  assert.doesNotMatch(segments.orchestrator, /todos/, "no child todo counter");
+});
+
+test("the orchestrator segment falls back to the run row without a child", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 0,
+    total: 1,
+    commitMode: "never",
+    orchestration: { phase: "paused", nextTaskId: "task-1" },
+  });
+  assert.equal(segments.orchestrator, "run paused · next task-1");
+});
+
+test("the orchestrator segment is view-aware: parent shows the run, child shows stats", () => {
+  const child = {
+    ref: "2",
+    total: 7,
+    phase: "running",
+    model: "open/muse-spark",
+    modelRef: { provider: "open", id: "muse-spark", thinking: "high" },
+    stats: {
+      tokens: {
+        input: 12_000,
+        output: 3_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 15_000,
+      },
+      context: { tokens: 86_000, contextWindow: 200_000, percent: 43 },
+    },
+    elapsedMs: 83_000,
+    todoDone: 3,
+    todoTotal: 5,
+  };
+  const base = {
+    mode: "orchestrator" as const,
+    done: 1,
+    total: 3,
+    commitMode: "never",
+  };
+
+  const parent = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", nextTaskId: "task-2", child, view: "parent" },
+  });
+  assert.equal(
+    parent.orchestrator,
+    "run running · next task-2 · child running",
+    "parent view stays about the run and points at the row by id",
+  );
+
+  const childView = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", nextTaskId: "task-2", child, view: "child" },
+  });
+  assert.equal(
+    childView.orchestrator,
+    "child running · open/muse-spark · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23",
+    "child view carries the child's own telemetry and no counters",
+  );
+
+  const auto = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: { phase: "running", child, view: "auto" },
+  });
+  assert.equal(auto.orchestrator, childView.orchestrator, "auto follows a live child");
+
+  // No stats yet: the model survives, the counters still do not.
+  const bare = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "running",
+      child: {
+        ref: "2",
+        total: 7,
+        phase: "running",
+        model: "builder/model",
+        todoDone: 3,
+        todoTotal: 5,
+      },
+      view: "child",
+    },
+  });
+  assert.equal(bare.orchestrator, "child running · builder/model");
+
+  // A pause still names the child; elapsed is frozen by the caller.
+  const paused = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "paused",
+      child: { ...child, phase: "paused", elapsedMs: 120_000 },
+      view: "child",
+    },
+  });
+  assert.match(paused.orchestrator, /^child paused · /);
+  assert.match(paused.orchestrator, /02:00/);
+  assert.doesNotMatch(paused.orchestrator, /\d+\/\d+/);
+});
+
+test("the orchestrator child line shares one phase word with the composer", () => {
+  const base = {
+    mode: "orchestrator" as const,
+    done: 1,
+    total: 3,
+    commitMode: "never",
+  };
+  const child = { ref: "2", total: 7, phase: "running", model: "a/b" };
+  const segment = (over: Record<string, unknown>) =>
+    buildWorkflowStatusSegments({
+      ...base,
+      orchestration: {
+        phase: "running",
+        child: { ...child, ...over } as never,
+        view: "child",
+      },
+    }).orchestrator;
+
+  assert.match(segment({ phase: "settling" }), /^child verifying/);
+  assert.match(segment({ phase: "paused", pausePending: true }), /^child pausing/);
+  assert.match(segment({ pausePending: false, phase: "paused" }), /^child paused/);
+  assert.match(segment({ retrying: true }), /^child retrying/);
+  // The parent hint uses the same word.
+  const parentHint = buildWorkflowStatusSegments({
+    ...base,
+    orchestration: {
+      phase: "running",
+      child: { ...child, phase: "settling" },
+      view: "parent",
+    },
+  });
+  assert.match(parentHint.orchestrator, /· child verifying$/);
+});
+
+test("the orchestrator segment is always exactly one line", () => {
+  const segments = buildWorkflowStatusSegments({
+    mode: "orchestrator",
+    done: 1,
+    total: 3,
+    commitMode: "never",
+    orchestration: {
+      phase: "running",
+      blockedReason: "line one\nline two\twith\ttabs",
+      child: {
+        ref: "1",
+        total: 2,
+        phase: "running",
+        model: "open/model\nwith newline",
+        stats: {
+          tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+          context: { tokens: 1, contextWindow: 10, percent: 10 },
+        },
+      },
+      view: "child",
+    },
+  });
+  assert.equal(/[\r\n\t]/.test(segments.orchestrator), false);
+  assert.ok(segments.orchestrator.length < 220);
 });

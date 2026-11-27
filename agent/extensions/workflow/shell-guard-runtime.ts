@@ -13,6 +13,8 @@
  * handler, never by an automatic continuation, retry or compaction.
  */
 
+import { createHash } from "node:crypto";
+
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   SHELL_GUARD_AUDIT_ENTRY,
@@ -27,6 +29,11 @@ import {
   type ShellGuardToolName,
   type ShellLimits,
 } from "./shell-guard.ts";
+
+/** SHA-256 of the exact command text; the shell guard's quarantine key. */
+export function shellCommandHash(command: string): string {
+  return createHash("sha256").update(command, "utf8").digest("hex");
+}
 
 export interface PreparedShellCall {
   toolCallId: string;
@@ -45,6 +52,8 @@ export interface ShellGuardResultEvent {
   content?: unknown;
   isError?: unknown;
   durationMs?: unknown;
+  structuredContent?: unknown;
+  result?: unknown;
 }
 
 export interface ShellGuardRuntimeDeps {
@@ -73,6 +82,9 @@ export interface ShellGuardRuntime {
   /** End hook: finalize calls that skipped `tool_result`. */
   observeEnd(event: ShellGuardResultEvent): void;
   reset(reason: string): void;
+  /** Restore a persisted execution quarantine without counting a new failure. */
+  adoptQuarantine(input: { reason: string; commandHash?: string; at?: number }): void;
+  quarantineInfo(): { reason: string; commandHash?: string; at: number } | undefined;
   isStopped(): boolean;
   stoppedReason(): string | undefined;
   snapshot(): {
@@ -112,6 +124,24 @@ function resultText(event: ShellGuardResultEvent): string {
   return "";
 }
 
+function structuredExitCode(event: ShellGuardResultEvent): number | undefined {
+  const direct = event.structuredContent;
+  const nested = event.result;
+  for (const value of [direct, nested]) {
+    if (!value || typeof value !== "object") continue;
+    const code = (value as { exit_code?: unknown }).exit_code;
+    if (typeof code === "number" && Number.isFinite(code)) return code;
+    const inner = (value as { structuredContent?: unknown }).structuredContent;
+    if (inner && typeof inner === "object") {
+      const innerCode = (inner as { exit_code?: unknown }).exit_code;
+      if (typeof innerCode === "number" && Number.isFinite(innerCode)) {
+        return innerCode;
+      }
+    }
+  }
+  return undefined;
+}
+
 function resultIsError(event: ShellGuardResultEvent): boolean {
   if (event.isError === true) return true;
   const result = (event as { result?: unknown }).result;
@@ -133,6 +163,9 @@ export function createShellGuardRuntime(
   const prepared = new Map<string, PreparedShellCall>();
   const observed = new Set<string>();
   let notifiedStop: string | undefined;
+  let lastQuarantine:
+    | { reason: string; commandHash?: string; at: number }
+    | undefined;
 
   const notify = (
     message: string,
@@ -182,17 +215,17 @@ export function createShellGuardRuntime(
       ...extra,
     });
     if (decision.action === "stop") {
+      lastQuarantine = {
+        reason: decision.reason,
+        commandHash: shellCommandHash(call.command),
+        at: deps.now?.() ?? Date.now(),
+      };
       if (notifiedStop !== decision.reason) {
         notifiedStop = decision.reason;
         notify(
-          `Shell guard stopped this request: ${decision.reason}. Start a new prompt to continue.`,
+          `Shell guard quarantined shell for this execution: ${decision.reason}. Continue with non-shell tools; start a new prompt or use /shell-guard reset only when you intend a new shell budget.`,
           "warning",
         );
-      }
-      try {
-        deps.abort?.();
-      } catch {
-        /* abort is best-effort */
       }
     }
     return decision;
@@ -209,8 +242,9 @@ export function createShellGuardRuntime(
         return {
           block: true,
           reason: [
-            `shell guard: this request is stopped — ${recovery.stoppedReason() ?? "a repeated shell failure"}.`,
-            "No further shell calls run automatically. Report the current state and wait for the user's next instruction.",
+            `shell guard: shell is quarantined for this execution — ${recovery.stoppedReason() ?? "a repeated shell failure"}.`,
+            "Do not call shell tools. Continue with non-shell tools (read, grep, find, ls, edit, write, LSP diagnostics); do not mark a shell-dependent row complete.",
+            "If no permitted action can advance, report a structured blocker instead of waiting for the user.",
           ].join(" "),
         };
       }
@@ -278,7 +312,11 @@ export function createShellGuardRuntime(
         return undefined;
       }
       const text = resultText(event);
-      const kind = classifyShellFailureText(text);
+      // A structured exit status is authoritative. Fixture/test output that
+      // merely prints a timeout sentence must not consume the guard budget.
+      const exitCode = structuredExitCode(event);
+      const kind =
+        exitCode === undefined ? classifyShellFailureText(text) : undefined;
       if (!kind) {
         observed.add(id);
         return undefined;
@@ -288,11 +326,12 @@ export function createShellGuardRuntime(
         durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined,
       });
       const guidance = shellFailureGuidance(kind, decision);
-      const baseContent = Array.isArray(event.content)
-        ? event.content
-        : typeof event.content === "string" && event.content
-          ? [{ type: "text", text: event.content }]
-          : [];
+      let baseContent: unknown[] = [];
+      if (Array.isArray(event.content)) {
+        baseContent = event.content;
+      } else if (typeof event.content === "string" && event.content) {
+        baseContent = [{ type: "text", text: event.content }];
+      }
       return {
         content: [...baseContent, { type: "text", text: guidance }],
         isError: true,
@@ -316,7 +355,9 @@ export function createShellGuardRuntime(
         return;
       }
       const text = resultText(event);
-      const kind = classifyShellFailureText(text);
+      const exitCode = structuredExitCode(event);
+      const kind =
+        exitCode === undefined ? classifyShellFailureText(text) : undefined;
       if (kind) {
         observed.add(id);
         recordFailure(kind, call, {
@@ -334,8 +375,25 @@ export function createShellGuardRuntime(
       prepared.clear();
       observed.clear();
       notifiedStop = undefined;
+      lastQuarantine = undefined;
       audit({ kind: "reset", reason });
     },
+
+    adoptQuarantine({ reason, commandHash, at }) {
+      if (recovery.isStopped()) return;
+      recovery.quarantine({ reason, command: commandHash, at });
+      prepared.clear();
+      observed.clear();
+      notifiedStop = reason;
+      lastQuarantine = {
+        reason,
+        ...(commandHash === undefined ? {} : { commandHash }),
+        at: at ?? Date.now(),
+      };
+      audit({ kind: "adopt-quarantine", reason, at });
+    },
+
+    quarantineInfo: () => lastQuarantine,
 
     isStopped: () => recovery.isStopped(),
     stoppedReason: () => recovery.stoppedReason(),

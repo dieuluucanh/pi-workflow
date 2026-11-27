@@ -60,6 +60,7 @@ export const BUILT_IN_ROLES = [
   "explorer",
   "builder",
   "reviewer",
+  "orchestrator",
 ] as const;
 
 /**
@@ -127,6 +128,23 @@ export function seedDefaultRoles(): Role[] {
       tools: [],
       systemPromptAddendum:
         "You are in BUILDER role. Implement the assigned task following the plan. Reason lightly. Ask if blocked.",
+      builtIn: true,
+    },
+    {
+      // Orchestrator owns the parent roadmap/verification turn. Existing
+      // roles.json files have no entry for it, so the in-memory default is an
+      // explicit Planner-model fallback; the file is never rewritten.
+      name: "orchestrator",
+      description:
+        "Parent roadmap and verification role — delegates implementation, never edits project sources",
+      model: {
+        provider: "opencode-go",
+        id: "muse-spark-1.2-contributor",
+        thinking: "high",
+      },
+      tools: [],
+      systemPromptAddendum:
+        "You are in ORCHESTRATOR role. Own the roadmap, decompose work, dispatch Build children, verify candidates and accept only evidence-backed results. Do not implement project changes yourself.",
       builtIn: true,
     },
     {
@@ -410,6 +428,7 @@ const ROLE_ICONS: Record<string, string> = {
   explorer: "🔍",
   builder: "🔨",
   reviewer: "🧪",
+  orchestrator: "🧭",
 };
 
 export function roleIcon(name: string): string {

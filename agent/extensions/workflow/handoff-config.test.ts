@@ -23,11 +23,13 @@ import {
   HANDOFF_TIMEOUT_MAX,
   HANDOFF_TIMEOUT_MIN,
   coerceHandoffConfig,
+  describeExecutionDestination,
   describeHandoffMode,
   extractHandoffRaw,
   handoffArgumentCompletions,
   handoffConfigPaths,
   handoffFieldSourceOf,
+  isExecutionDestination,
   isHandoffMode,
   mergeHandoffConfig,
   readHandoffConfig,
@@ -74,7 +76,10 @@ test("handoff coerce: object form accepts mode and timeoutMs", () => {
 });
 
 test("handoff coerce: invalid fields fall back to the base", () => {
-  const base = { mode: "native" as const, timeoutMs: 7_000 };
+  const base = {
+    mode: "native" as const,
+    timeoutMs: 7_000,
+  };
   assert.deepEqual(coerceHandoffConfig({ mode: "bogus" }, base), base);
   assert.deepEqual(coerceHandoffConfig({ mode: 7 }, base), base);
   assert.deepEqual(coerceHandoffConfig({ timeoutMs: "abc" }, base), base);
@@ -190,7 +195,10 @@ test("handoff read: global only, project only, both, corrupt and missing", () =>
     "utf8",
   );
   r = readHandoffConfig(cwd, agentDir);
-  assert.deepEqual(r.config, { mode: "plannotator", timeoutMs: 30_000 });
+  assert.deepEqual(r.config, {
+    mode: "plannotator",
+    timeoutMs: 30_000,
+  });
   assert.equal(r.sources.mode, "project");
   assert.equal(r.sources.timeout, "project");
 
@@ -300,10 +308,19 @@ test("handoff: isHandoffMode and describeHandoffMode are total", () => {
 
 // ── /handoff argument completions ────────────────────────────────────
 
-test("handoff completions: mode position lists modes and fallback", () => {
+test("handoff completions: mode position lists modes and subcommands", () => {
   assert.deepEqual(
     handoffArgumentCompletions("")?.map((i) => i.value),
-    ["auto ", "native ", "plannotator ", "fallback"],
+    [
+      "auto ",
+      "native ",
+      "plannotator ",
+      "approve ",
+      "continue ",
+      "execute ",
+      "status",
+      "fallback",
+    ],
   );
   assert.deepEqual(
     handoffArgumentCompletions("nat")?.map((i) => i.value),
@@ -342,4 +359,35 @@ test("handoff completions: scope position returns full-argument values", () => {
   );
   assert.equal(handoffArgumentCompletions("bogus "), null);
   assert.equal(handoffArgumentCompletions("native xyz"), null);
+});
+
+test("destination completions: execute takes a decision id then a destination", () => {
+  assert.deepEqual(
+    handoffArgumentCompletions("execute abc or")?.map((i) => i.value),
+    ["execute abc orchestrator"],
+  );
+  assert.deepEqual(
+    handoffArgumentCompletions("execute abc b")?.map((i) => i.value),
+    ["execute abc build"],
+  );
+  assert.equal(handoffArgumentCompletions("status"), null, "status is complete");
+  assert.equal(handoffArgumentCompletions("execute abc orchestrator"), null);
+});
+
+test("handoff completions: the dead execution/once subcommands are gone", () => {
+  const items = handoffArgumentCompletions("") ?? [];
+  const labels = items.map((i) => i.label);
+  const values = items.map((i) => i.value);
+  for (const dead of ["execution", "once"]) {
+    assert.equal(labels.includes(dead), false, `no ${dead} subcommand label`);
+    assert.equal(values.includes(`${dead} `), false, `no ${dead} subcommand value`);
+  }
+  assert.equal(handoffArgumentCompletions("execution "), null);
+  assert.equal(handoffArgumentCompletions("once "), null);
+  assert.ok(labels.includes("execute"), "execute remains a completion");
+  assert.deepEqual(
+    handoffArgumentCompletions("exec")?.map((i) => i.value),
+    ["execute "],
+    "the exec prefix offers only execute",
+  );
 });

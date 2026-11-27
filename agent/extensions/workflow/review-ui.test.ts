@@ -13,15 +13,21 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  REVIEW_PAUSED_LINE,
+  REVIEW_RUNNING_LINE,
+} from "./review.ts";
+import {
   createReviewBandGate,
   createReviewEntryComponent,
   createReviewLineBuffer,
+  formatModelSwitchEntry,
   formatReviewModeBand,
   formatReviewSubmittedEntry,
   formatReviewTranscriptLines,
   isTerminalPiHost,
   registerReviewEntryRenderers,
   reviewBandKey,
+  MODEL_SWITCH_ENTRY_TYPE,
   REVIEW_MODE_ENTRY_TYPE,
   REVIEW_TRANSCRIPT_ENTRY_TYPE,
   type EntryRendererHost,
@@ -186,7 +192,7 @@ test("formatReviewModeBand: plan=warning, review=accent, done follows the verdic
   );
   // A pause is not a done band.
   const paused = formatReviewModeBand(
-    { mode: "review-done", paused: true, reason: "paused — /review-resume" },
+    { mode: "review-done", paused: true, reason: "paused — /review resume" },
     theme,
   )[0];
   assert.ok(paused.includes("REVIEW PAUSED"));
@@ -302,12 +308,74 @@ test("registerReviewEntryRenderers: registers every transcript entry type", () =
   registerReviewEntryRenderers(host);
   assert.deepEqual([...registered].sort(), [
     "workflow-handoff-plan",
+    "workflow-model-switch",
     "workflow-review-mode",
     "workflow-review-submitted",
     "workflow-review-transcript",
   ]);
   assert.equal(REVIEW_MODE_ENTRY_TYPE, "workflow-review-mode");
   assert.equal(REVIEW_TRANSCRIPT_ENTRY_TYPE, "workflow-review-transcript");
+  assert.equal(MODEL_SWITCH_ENTRY_TYPE, "workflow-model-switch");
+});
+
+test("registerReviewEntryRenderers: a model switch reaches the timeline", () => {
+  type CapturedRenderer = (
+    entry: unknown,
+    options: unknown,
+    theme: ThemeLike,
+  ) => { render(width: number): string[] };
+  const renderers = new Map<string, CapturedRenderer>();
+  const host: EntryRendererHost = {
+    registerEntryRenderer(customType, renderer) {
+      renderers.set(customType, renderer as unknown as CapturedRenderer);
+    },
+  };
+  registerReviewEntryRenderers(host);
+  const renderer = renderers.get(MODEL_SWITCH_ENTRY_TYPE);
+  assert.ok(renderer, "workflow-model-switch must have a desktop renderer");
+  const component = renderer!({ data: {
+    scope: "reviewer",
+    from: "p/old",
+    to: "p/reviewer",
+    ok: true,
+    changed: true,
+  } }, {}, fakeTheme());
+  const line = component.render(120).join("\n");
+  assert.match(line, /p\/old → p\/reviewer/);
+  assert.match(line, /reviewer/);
+  assert.doesNotMatch(line, /undefined/);
+
+  // A refused switch keeps BOTH model labels visible in the same row, but
+  // is styled as a warning rather than a successful change.
+  const refused = renderer!({ data: {
+    scope: "reviewer",
+    from: "p/old",
+    to: "p/reviewer",
+    ok: false,
+    changed: false,
+    error: "registry miss",
+  } }, {}, fakeTheme());
+  const warning = refused.render(120).join("\n");
+  assert.match(warning, /p\/old/);
+  assert.match(warning, /p\/reviewer/);
+  assert.match(warning, /\[warning\]/);
+  assert.match(warning, /registry miss/);
+  assert.ok(
+    formatModelSwitchEntry(undefined, fakeTheme()).length > 0,
+    "a malformed/missing payload must still render something readable",
+  );
+});
+
+test("review lines keep the exact 0.14.0 pause/resume/abort hints", () => {
+  // The footer/status line and the controls must never disagree about the
+  // public grammar: `/review pause`, `/review resume`, `/review abort`.
+  assert.ok(REVIEW_RUNNING_LINE.includes("/review pause"));
+  assert.ok(REVIEW_RUNNING_LINE.includes("/review abort"));
+  assert.ok(REVIEW_PAUSED_LINE.includes("/review resume"));
+  assert.ok(REVIEW_PAUSED_LINE.includes("/review abort"));
+  for (const line of [REVIEW_RUNNING_LINE, REVIEW_PAUSED_LINE]) {
+    assert.doesNotMatch(line, /\/review-(?:pause|resume|abort)\b/);
+  }
 });
 
 test("isTerminalPiHost excludes every piped / Desktop host", () => {

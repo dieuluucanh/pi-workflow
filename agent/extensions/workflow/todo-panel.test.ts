@@ -11,6 +11,7 @@ import {
   EMPTY_PERSISTED_TODO_PANEL,
   TODO_PANEL_MAX_ROWS,
   buildTodoRows,
+  childTodoPanelScope,
   deriveTodoPanel,
   isTodoListSettled,
   readPersistedTodoPanel,
@@ -165,6 +166,92 @@ test("deriveTodoPanel: empty and explicit hidden always hide", () => {
   );
 });
 
+test("empty child derivation covers Auto and every explicit display state", () => {
+  const auto = deriveTodoPanel({ items: [], showWhenEmpty: true });
+  assert.equal(auto.state, "expanded");
+  assert.equal(auto.settled, false);
+  assert.equal(auto.done, 0);
+  assert.equal(auto.total, 0);
+  assert.equal(auto.cancelled, 0);
+  assert.equal(auto.next, undefined);
+  assert.equal(auto.summary, "No todos yet · /todos expand");
+
+  const expanded = deriveTodoPanel({
+    items: [], showWhenEmpty: true,
+    preference: "expanded", preferenceScope: "child-run:r1", scopeKey: "child-run:r1",
+  });
+  assert.equal(expanded.state, "expanded");
+  assert.equal(expanded.settled, false);
+  assert.equal(expanded.summary, "No todos yet · /todos expand");
+
+  const collapsed = deriveTodoPanel({
+    items: [], showWhenEmpty: true,
+    preference: "collapsed", preferenceScope: "child-run:r1", scopeKey: "child-run:r1",
+  });
+  assert.equal(collapsed.state, "collapsed");
+  assert.equal(collapsed.settled, false);
+  assert.equal(collapsed.done, 0);
+  assert.equal(collapsed.total, 0);
+  assert.equal(collapsed.cancelled, 0);
+  assert.equal(collapsed.next, undefined);
+  assert.equal(collapsed.summary, "No todos yet · /todos expand");
+  assert.equal(stripAnsi(renderTodoSummary(plainTheme, 80, collapsed)), "No todos yet · /todos expand");
+
+  const hidden = deriveTodoPanel({
+    items: [], showWhenEmpty: true,
+    preference: "hidden", preferenceScope: "child-run:r1", scopeKey: "child-run:r1",
+  });
+  assert.equal(hidden.state, "hidden");
+  assert.equal(hidden.settled, false);
+  assert.equal(hidden.summary, "No todos yet · /todos expand");
+});
+
+test("empty child scope mismatch ignores stored collapsed/hidden and derives Auto", () => {
+  for (const preference of ["collapsed", "hidden"] as const) {
+    const result = deriveTodoPanel({
+      items: [], showWhenEmpty: true,
+      preference, preferenceScope: "child-run:old", scopeKey: "child-run:new",
+    });
+    assert.equal(result.state, "expanded", `${preference} from another run`);
+    assert.equal(result.settled, false);
+  }
+});
+
+test("nonempty child uses ordinary open/settled lifecycle and scoped choices", () => {
+  const open = items([{ text: "Open" }]);
+  const settled = items([{ text: "Done", completed: true }]);
+  const options = { showWhenEmpty: true, preferenceScope: "child-run:r1", scopeKey: "child-run:r1" };
+  assert.equal(deriveTodoPanel({ items: open, ...options }).state, "expanded");
+  assert.equal(deriveTodoPanel({ items: settled, ...options }).state, "collapsed");
+  assert.equal(deriveTodoPanel({ items: open, ...options, preference: "collapsed" }).state, "collapsed");
+  assert.equal(deriveTodoPanel({ items: settled, ...options, preference: "expanded" }).state, "expanded");
+});
+
+test("empty ordinary parent remains hidden with or without explicit preference", () => {
+  assert.equal(deriveTodoPanel({ items: [] }).state, "hidden");
+  for (const preference of ["auto", "expanded", "collapsed", "hidden"] as const) {
+    const parent = deriveTodoPanel({
+      items: [], preference, preferenceScope: "plan-a", scopeKey: "plan-a",
+    });
+    assert.equal(parent.state, "hidden", preference);
+    assert.equal(parent.settled, false);
+    assert.equal(parent.done, 0);
+    assert.equal(parent.total, 0);
+    assert.equal(parent.cancelled, 0);
+    assert.equal(parent.next, undefined);
+    assert.equal(parent.summary, "");
+    assert.equal(todoStatusText(parent), "");
+  }
+});
+
+test("childTodoPanelScope scopes runs and supports an unbound session", () => {
+  assert.equal(childTodoPanelScope("run-1"), "child-run:run-1");
+  assert.equal(childTodoPanelScope("run-2"), "child-run:run-2");
+  assert.notEqual(childTodoPanelScope("run-1"), childTodoPanelScope("run-2"));
+  assert.equal(childTodoPanelScope(null), "child-session");
+  assert.equal(childTodoPanelScope(undefined), "child-session");
+});
+
 test("deriveTodoPanel: open list expands unless explicitly collapsed/hidden", () => {
   const list = items([
     { text: "A", completed: true },
@@ -314,6 +401,19 @@ test("todoPanelSummary exact one-line forms", () => {
     todoPanelSummary(open, { stale: true }),
     "☐ Todos 1/3 ⚠ · next 2. B · /todos expand",
   );
+  const planned = items([
+    { text: "A", completed: true },
+    { text: "B", completed: true },
+    { text: "C" },
+    { text: "D" },
+    { text: "E" },
+  ]);
+  const plannedSummary = todoPanelSummary(planned, { planned: true });
+  assert.equal(
+    plannedSummary,
+    "☐ Todos 2/5 · planned · not executing · /todos expand",
+  );
+  assert.doesNotMatch(plannedSummary, /not started/);
   assert.equal(todoPanelSummary([]), "");
 });
 
@@ -357,7 +457,18 @@ test("buildTodoRows renders cancelled items and muted plan rows", () => {
     { text: "Two", status: "cancelled" },
   ]);
   const rows = buildTodoRows(plainTheme, 80, list, "plan");
-  assert.deepEqual(rows, ["▶ 1. One", "✖ 2. Two"]);
+  assert.deepEqual(rows, ["☐ 1. One", "✖ 2. Two"]);
+});
+
+test("buildTodoRows never shows the execution marker in Plan mode", () => {
+  const list = items([
+    { text: "One", completed: true },
+    { text: "Two", status: "in_progress" },
+    { text: "Three" },
+  ]);
+  const rows = buildTodoRows(plainTheme, 80, list, "plan");
+  assert.deepEqual(rows, ["☐ 2. Two", "☐ 3. Three"]);
+  assert.ok(rows.every((row) => !row.includes("▶")), rows.join(" | "));
 });
 
 test("buildTodoRows caps the window and appends +N more", () => {
@@ -393,6 +504,22 @@ test("buildTodoRows keeps the completed-list fallback anchored at the top", () =
   ]);
   const rows = buildTodoRows(plainTheme, 80, list, "build");
   assert.deepEqual(rows, ["☑ S(1. One)", "☑ S(2. Two)"]);
+});
+
+test("deriveTodoPanel: Plan mode renders a preview without a next step", () => {
+  const list = items([
+    { text: "A", completed: true },
+    { text: "B" },
+    { text: "C" },
+  ]);
+  const plan = deriveTodoPanel({ items: list, mode: "plan" });
+  assert.equal(plan.next, undefined);
+  assert.equal(
+    plan.summary,
+    "☐ Todos 1/3 · planned · not executing · /todos expand",
+  );
+  const build = deriveTodoPanel({ items: list, mode: "build" });
+  assert.equal(build.next?.text, "B");
 });
 
 test("deriveTodoPanel: a same-scope preference survives list edits", () => {
@@ -482,6 +609,18 @@ test("todoStatusText is compact and exact", () => {
     todoStatusText(view({ state: "collapsed", settled: true, done: 1, total: 2, cancelled: 1 })),
     "☑ Todos 1/2 · 1 cancelled · collapsed",
   );
+  assert.equal(
+    todoStatusText(view({ state: "hidden", settled: false, done: 0, total: 0 }), { child: true }),
+    "Child todos · no todos yet · hidden",
+  );
+  assert.equal(
+    todoStatusText(view({ state: "expanded", settled: false, done: 1, total: 2 }), { child: true }),
+    "☐ Child todos 1/2 · expanded",
+  );
+  assert.equal(
+    todoStatusText(view({ state: "hidden", settled: false, done: 0, total: 0 })),
+    "",
+  );
 });
 
 test("readPersistedTodoPanel: defaults, valid data and garbage", () => {
@@ -536,6 +675,50 @@ test("readPersistedTodoPanel: defaults, valid data and garbage", () => {
     readPersistedTodoPanel({ todoPanel: { preference: "wat" } }).preference,
     "auto",
   );
+});
+
+test("readPersistedTodoPanel round-trips valid child preference and scope independently", () => {
+  for (const childPreference of ["auto", "expanded", "collapsed", "hidden"] as const) {
+    const decoded = readPersistedTodoPanel({
+      todoPanel: { childPreference, childPreferenceScope: "child-run:run-7" },
+    });
+    assert.equal(decoded.childPreference, childPreference);
+    assert.equal(decoded.childPreferenceScope, "child-run:run-7");
+  }
+
+  const explicitAuto = readPersistedTodoPanel({ todoPanel: { childPreference: "auto" } });
+  assert.equal(explicitAuto.childPreference, "auto");
+  assert.equal(Object.hasOwn(explicitAuto, "childPreferenceScope"), false);
+  const explicitNullScope = readPersistedTodoPanel({ todoPanel: { childPreferenceScope: null } });
+  assert.equal(Object.hasOwn(explicitNullScope, "childPreference"), false);
+  assert.equal(explicitNullScope.childPreferenceScope, null);
+
+  const absent = readPersistedTodoPanel({ todoPanel: {} });
+  assert.equal(Object.hasOwn(absent, "childPreference"), false);
+  assert.equal(Object.hasOwn(absent, "childPreferenceScope"), false);
+});
+
+test("readPersistedTodoPanel omits invalid child fields without disturbing legacy parent decoding", () => {
+  const badPreference = readPersistedTodoPanel({
+    todoPanel: { preference: "collapsed", preferenceScope: "/plan/p.md", childPreference: "wat" },
+  });
+  assert.equal(Object.hasOwn(badPreference, "childPreference"), false);
+  assert.equal(badPreference.preference, "collapsed");
+  assert.equal(badPreference.preferenceScope, "/plan/p.md");
+
+  const badScope = readPersistedTodoPanel({
+    todoPanel: { childPreference: "hidden", childPreferenceScope: 42 },
+  });
+  assert.equal(badScope.childPreference, "hidden");
+  assert.equal(Object.hasOwn(badScope, "childPreferenceScope"), false);
+
+  const legacy = readPersistedTodoPanel({ todoPanel: { override: "hidden", overrideKey: "legacy-key" } });
+  assert.equal(legacy.preference, "auto");
+  assert.equal(legacy.preferenceScope, null);
+  assert.equal(legacy.legacyOverride, "hidden");
+  assert.equal(legacy.legacyOverrideKey, "legacy-key");
+  assert.equal(Object.hasOwn(legacy, "childPreference"), false);
+  assert.equal(Object.hasOwn(legacy, "childPreferenceScope"), false);
 });
 
 test("readPersistedTodoPanel restores a mismatched key verbatim for expiry", () => {

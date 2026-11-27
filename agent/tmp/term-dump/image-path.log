@@ -1,0 +1,31 @@
+[>7u[>4;2m
+ ▀▀█  v1.5.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.[Extensions]
+  workflow[Extension issues]
+  path (temp) ~\.pi\agent\extensions\workflow\index.ts
+    Extension shortcut conflict: 'tab' is built-in shortcut for tui.input.tab and
+C:\Users\Lenovo\.pi\agent\extensions\workflow\index.ts. Using C:\Users\Lenovo\.pi\agent\extensions\workflow\index.ts.    Warning: Roles: no roles.json at C:\Users\Lenovo\AppData\Local\Temp\pi-terminal-acceptance-profile-SWXyJR\roles.json — 
+ using in-memory defaults────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-lAvjuV
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo/prompt Update the docs for screenshots/capture.png and keep /prompt literal.                                           
+                                                                                                                         Refining prompt with fake/fake-1…
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-lAvjuV
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo Refining prompt — waiting for the refinement model…                                                                    
+ Refined prompt ready (1 change). Nothing was run or changed. Nothing was sent or run; edit and send it yourself.       
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Refined prompt: update the docs for `screenshots/capture.png` and keep `/prompt` literal. 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~\AppData\Local\Temp\pi-terminal-acceptance-project-lAvjuV
+0.0%/200k (auto)                                                                                           (fake) fake-1
+◦ commits:never commits:never · writes:allow · folders:repo

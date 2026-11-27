@@ -54,6 +54,9 @@ npm run release -- --packages workflow,autocompact --bump none --yes
 
 # mix freely: already-published packages are skipped, the rest are published
 npm run release -- --packages workflow,autocompact,server-logs,browser-inspector --bump none --yes
+
+# version + curated changelog already committed: publish without regenerating notes
+npm run release -- --packages workflow --continue
 ```
 
 ### What the script does
@@ -331,7 +334,7 @@ which is exactly what step 2 cautions against doing for its own sake.
 | Run ends with `publish failed for <pkg>` | The other packages were published, tagged and pushed. Rerun `npm run release -- --continue` to finish the failed one. |
 | npm asks for an OTP | Expected with 2FA; the publish step inherits the terminal, so type the code when prompted. |
 | Extension does not load after install | `pi --verbose`; confirm the `pi.extensions` path is in the tarball (`npm pack --dry-run`). |
-| Published, but the package is not in the gallery | The catalog ingests only a bounded, score-ranked slice of npm's `pi-package` search results, so an installable package can stay uncatalogued. `npm run gallery` reports `not-indexed` for it; follow [When a package does not show up](#when-a-package-does-not-show-up) (republish so npm re-indexes it, then verify). |
+| Published, but the package is not in the gallery | The catalog ingests only a bounded, score-ranked slice of npm's `pi-package` search results, so an installable package can stay uncatalogued. `npm run gallery` reports `not-indexed` for it; follow [When a package does not show up](#when-a-package-does-not-show-up) (diagnose or escalate; never republish solely to force a listing). |
 | Gallery card shows an older version | The catalog snapshot has not picked up the new version yet; `npm run gallery` reports `stale`. Usually resolves within minutes. |
 | `npm run gallery` reports `ineligible` | The manifest keywords lack `pi-package`. Add it (plus `publishConfig.access: "public"` and a `pi` manifest — `npm run verify` enforces all three) and release a new version. |
 | `npm run release:status` reports every package as `never-published` | Expected before the first publish. Each package flips to `in-sync` once its release lands. |

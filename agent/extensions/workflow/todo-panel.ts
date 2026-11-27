@@ -21,7 +21,7 @@ export type TodoPanelState = "expanded" | "collapsed" | "hidden";
 export type TodoPanelPreference = "auto" | TodoPanelState;
 /** Legacy per-list choice, read from pre-0.13 entries and migrated by index.ts. */
 export type TodoPanelOverride = TodoPanelState | null;
-export type TodoPanelMode = "plan" | "build" | null;
+export type TodoPanelMode = "plan" | "build" | "orchestrator" | null;
 
 /** Row cap for the expanded panel (component factories bypass the host's 10-line limit). */
 export const TODO_PANEL_MAX_ROWS = 15;
@@ -48,6 +48,10 @@ export interface TodoPanelInput {
   promptAfterSettle?: boolean;
   /** Drives the ⚠ marker in the summary; the footer owns the actual warning. */
   stale?: boolean;
+  /** Current workflow mode; Plan mode renders the list as a plan preview. */
+  mode?: TodoPanelMode;
+  /** Permit an empty child panel to be explicitly shown; parent default stays hidden. */
+  showWhenEmpty?: boolean;
 }
 
 export interface TodoPanelView {
@@ -71,6 +75,14 @@ export interface PersistedTodoPanel {
   /** Read-only fields from a pre-0.13 entry; a caller migrates or drops them. */
   legacyOverride: TodoPanelState | null;
   legacyOverrideKey: string | null;
+  /** Optional child-only display choice; absence differs from explicit Auto. */
+  childPreference?: TodoPanelPreference;
+  /** Optional child preference lineage; null is an explicit unscoped value. */
+  childPreferenceScope?: string | null;
+}
+
+export function childTodoPanelScope(runId: string | null | undefined): string {
+  return runId ? `child-run:${runId}` : "child-session";
 }
 
 export const EMPTY_PERSISTED_TODO_PANEL: PersistedTodoPanel = {
@@ -146,8 +158,9 @@ export function isTodoListSettled(items: TodoItem[]): boolean {
 }
 
 /**
- * Derive the panel state. Mode is intentionally not an input: it only affects
- * row styling, not whether the panel is expanded, collapsed or hidden.
+ * Derive the panel state. `mode` only marks Plan mode as a plan preview: the
+ * state itself is unchanged, but a planned list has no execution `next` step
+ * and summarises as planned rather than in progress.
  *
  * Precedence:
  * 1. empty list → hidden;
@@ -175,7 +188,9 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
   const settled = isTodoListSettled(items);
   let state: TodoPanelState;
   if (items.length === 0) {
-    state = "hidden";
+    state = input.showWhenEmpty === true
+      ? preferred ?? "expanded"
+      : "hidden";
   } else if (preferred === "hidden") {
     state = "hidden";
   } else if (preferred === "expanded" || preferred === "collapsed") {
@@ -194,8 +209,12 @@ export function deriveTodoPanel(input: TodoPanelInput): TodoPanelView {
     total: items.length,
     cancelled: countCancelled(items),
     stale: input.stale === true,
-    next: firstOpenItem(items),
-    summary: todoPanelSummary(items, { stale: input.stale }),
+    next: input.mode === "plan" ? undefined : firstOpenItem(items),
+    summary: todoPanelSummary(items, {
+      stale: input.stale,
+      planned: input.mode === "plan",
+      showWhenEmpty: input.showWhenEmpty === true,
+    }),
   };
 }
 
@@ -220,12 +239,18 @@ export function todoPanelContentKey(input: {
 }
 
 /** Compact status line for the hidden/Review cases (theme-free). */
-export function todoStatusText(view: TodoPanelView): string {
-  if (view.total === 0) return "";
+export function todoStatusText(
+  view: TodoPanelView,
+  options: { child?: boolean; label?: string } = {},
+): string {
+  const label = options.label ?? (options.child ? "Child todos" : "Todos");
+  if (view.total === 0) {
+    return options.child ? `${label} · no todos yet · ${view.state}` : "";
+  }
   const mark = view.settled ? "☑" : "☐";
   const cancelled = view.cancelled > 0 ? ` · ${view.cancelled} cancelled` : "";
   const stale = view.stale ? " ⚠" : "";
-  return `${mark} Todos ${view.done}/${view.total}${stale}${cancelled} · ${view.state}`;
+  return `${mark} ${label} ${view.done}/${view.total}${stale}${cancelled} · ${view.state}`;
 }
 
 /**
@@ -234,9 +259,11 @@ export function todoStatusText(view: TodoPanelView): string {
  */
 export function todoPanelSummary(
   items: TodoItem[],
-  opts: { stale?: boolean } = {},
+  opts: { stale?: boolean; planned?: boolean; showWhenEmpty?: boolean } = {},
 ): string {
-  if (items.length === 0) return "";
+  if (items.length === 0) {
+    return opts.showWhenEmpty === true ? "No todos yet · /todos expand" : "";
+  }
   const done = countDone(items);
   const total = items.length;
   const cancelled = countCancelled(items);
@@ -248,6 +275,9 @@ export function todoPanelSummary(
   }
   const stale = opts.stale ? " ⚠" : "";
   const head = `☐ Todos ${done}/${total}${stale}`;
+  if (opts.planned) {
+    return `${head} · planned · not executing · /todos expand`;
+  }
   const next = firstOpenItem(items);
   return next
     ? `${head} · next ${todoRef(next)}. ${next.text} · /todos expand`
@@ -314,9 +344,10 @@ export function buildTodoRows(
     const item = row.item as TodoItem;
     const ref = todoLabel(item, row.index);
     const status = itemStatus(item);
-    const isCurrent = row.index === anchorIndex && !isDone(item);
+    const isCurrent =
+      mode !== "plan" && row.index === anchorIndex && !isDone(item);
     const prefix =
-      isCurrent || status === "in_progress"
+      mode !== "plan" && (isCurrent || status === "in_progress")
         ? theme.fg("accent", "▶ ")
         : status === "completed"
           ? theme.fg("success", "☑ ")
@@ -388,5 +419,15 @@ export function readPersistedTodoPanel(data: unknown): PersistedTodoPanel {
     legacyOverride,
     legacyOverrideKey:
       typeof obj.overrideKey === "string" ? obj.overrideKey : null,
+    ...(obj.childPreference === "auto" ||
+    obj.childPreference === "expanded" ||
+    obj.childPreference === "collapsed" ||
+    obj.childPreference === "hidden"
+      ? { childPreference: obj.childPreference }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(obj, "childPreferenceScope") &&
+    (typeof obj.childPreferenceScope === "string" || obj.childPreferenceScope === null)
+      ? { childPreferenceScope: obj.childPreferenceScope }
+      : {}),
   };
 }

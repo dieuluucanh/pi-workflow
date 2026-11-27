@@ -94,7 +94,7 @@ function lastNotice(notifies: Array<{ message: string; level?: string }>) {
 }
 
 test("guard: both incident commands are refused with an empty-probe reason", async () => {
-  const { pi, ctx, fake, cleanup } = await boot();
+  const { pi, ctx, cleanup } = await boot();
   try {
     for (const [i, command] of [INCIDENT_1, INCIDENT_2].entries()) {
       const { block } = await callTool(pi, ctx, "bash", `incident-${i}`, {
@@ -153,7 +153,7 @@ test("guard: project settings can tune both limits", async () => {
   }
 });
 
-test("guard: invalid timeout is refused, and a second failure stops the request", async () => {
+test("guard: invalid timeout is refused, and a second failure quarantines shell", async () => {
   const { pi, ctx, fake, cleanup } = await boot();
   try {
     const invalid = await callTool(pi, ctx, "bash", "bad", {
@@ -169,20 +169,24 @@ test("guard: invalid timeout is refused, and a second failure stops the request"
     });
     assert.equal(stopped.block?.block, true);
     assert.match(String(stopped.block?.reason), /greater than 0/);
-    assert.match(lastNotice(fake.notifies), /stopped this request/);
-    assert.equal(fake.aborts(), 1);
+    assert.match(lastNotice(fake.notifies), /quarantined/);
+    assert.equal(fake.aborts(), 0);
 
     const afterTrip = await callTool(pi, ctx, "bash", "after", {
       command: "grep -n foo bar.ts",
     });
     assert.equal(afterTrip.block?.block, true);
-    assert.match(String(afterTrip.block?.reason), /request is stopped/);
+    assert.match(String(afterTrip.block?.reason), /shell is quarantined/);
+    const nonShell = await callTool(pi, ctx, "workflow_todo", "after-nonshell", {
+      action: "list",
+    });
+    assert.equal(nonShell.block, undefined);
   } finally {
     cleanup();
   }
 });
 
-test("guard: a timeout result gets guidance; repeating the command trips and aborts", async () => {
+test("guard: a timeout result gets guidance; repeating quarantines without aborting", async () => {
   const { pi, ctx, fake, cleanup } = await boot();
   try {
     const command = "npm test";
@@ -226,8 +230,12 @@ test("guard: a timeout result gets guidance; repeating the command trips and abo
       },
       ctx,
     );
-    assert.match(lastNotice(fake.notifies), /same shell command failed again/);
-    assert.equal(fake.aborts(), 1);
+    assert.match(lastNotice(fake.notifies), /quarantined/);
+    assert.equal(fake.aborts(), 0);
+    const nonShell = await callTool(pi, ctx, "read", "after-timeout", {
+      path: "README.md",
+    });
+    assert.equal(nonShell.block, undefined);
   } finally {
     cleanup();
   }
@@ -268,7 +276,7 @@ test("guard: a new idle user prompt resets; a steer or extension message does no
         (await callTool(pi, ctx, "bash", "r3", { command: "grep x f" })).block
           ?.reason,
       ),
-      /request is stopped/,
+      /shell is quarantined/,
     );
 
     await pi.emit(
@@ -281,7 +289,7 @@ test("guard: a new idle user prompt resets; a steer or extension message does no
         (await callTool(pi, ctx, "bash", "r4", { command: "grep x f" })).block
           ?.reason,
       ),
-      /request is stopped/,
+      /shell is quarantined/,
     );
 
     await pi.emit(
@@ -294,7 +302,7 @@ test("guard: a new idle user prompt resets; a steer or extension message does no
         (await callTool(pi, ctx, "bash", "r5", { command: "grep x f" })).block
           ?.reason,
       ),
-      /request is stopped/,
+      /shell is quarantined/,
     );
 
     await pi.emit("input", { text: "new task", source: "interactive" }, ctx);
@@ -303,9 +311,27 @@ test("guard: a new idle user prompt resets; a steer or extension message does no
     });
     assert.equal(fresh.block, undefined);
     assert.equal(fresh.input.timeout, 120);
-    assert.equal(fake.aborts(), 1);
+    assert.equal(fake.aborts(), 0);
   } finally {
     cleanup();
+  }
+});
+
+test("guard: an inherited quarantine env blocks shell after session reset", async () => {
+  const previous = process.env.PI_SHELL_GUARD_QUARANTINED;
+  process.env.PI_SHELL_GUARD_QUARANTINED = "1";
+  const { pi, ctx, cleanup } = await boot();
+  try {
+    const blocked = await callTool(pi, ctx, "bash", "inherited", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(blocked.block?.block, true);
+    assert.match(String(blocked.block?.reason), /inherited from the parent/);
+    assert.match(String(blocked.block?.reason), /non-shell tools/);
+  } finally {
+    cleanup();
+    if (previous === undefined) delete process.env.PI_SHELL_GUARD_QUARANTINED;
+    else process.env.PI_SHELL_GUARD_QUARANTINED = previous;
   }
 });
 
@@ -320,6 +346,86 @@ test("guard: /shell-guard status reports limits and the request budget", async (
   } finally {
     cleanup();
   }
+});
+
+test("guard: a structured exit code overrides fixture timeout text", async () => {
+  const { pi, ctx, fake, cleanup } = await boot();
+  try {
+    await callTool(pi, ctx, "bash", "structured", { command: "npm test" });
+    await pi.emit(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "bash",
+        toolCallId: "structured",
+        isError: true,
+        structuredContent: { exit_code: 1 },
+        content: [
+          {
+            type: "text",
+            text: "fixture output: Command timed out after 120 seconds\n\nCommand exited with code 1",
+          },
+        ],
+      },
+      ctx,
+    );
+    const next = await callTool(pi, ctx, "bash", "after-structured", {
+      command: "grep -n foo bar.ts",
+    });
+    assert.equal(next.block, undefined);
+    assert.equal(fake.aborts(), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("review_bash: a thrown timeout is observed by the reviewer guard", async () => {
+  const state = createShellGuardRecovery();
+  let trips = 0;
+  const builder = () => ({
+    parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute() {
+      throw new Error("Command timed out after 120 seconds");
+    },
+  });
+  const tool = createReviewBashTool(builder as never, {
+    cwd: process.cwd(),
+    log: () => {},
+    folderPolicy: () => ({
+      config: DEFAULT_FOLDER_POLICY_CONFIG,
+      grants: [],
+    }),
+    shellGuard: () => ({
+      limits: { defaultTimeoutSeconds: 120, maxTimeoutSeconds: 900 },
+      state,
+      onTrip: () => {
+        trips += 1;
+      },
+    }),
+  });
+
+  const first = await tool.execute(
+    "1",
+    { command: "npm test" },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  assert.equal((first as any).isError, true);
+  assert.equal(trips, 0);
+  const second = await tool.execute(
+    "2",
+    { command: "npm test" },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  assert.equal((second as any).isError, true);
+  assert.equal(trips, 1);
+  const secondText = (second as any).content
+    .map((part: any) => (part?.type === "text" ? String(part.text) : ""))
+    .join("\n");
+  assert.match(secondText, /quarantined/);
 });
 
 test("review_bash: the isolated reviewer gets a finite timeout and the probe guard", async () => {
@@ -377,4 +483,93 @@ test("review_bash: the isolated reviewer gets a finite timeout and the probe gua
     {},
   );
   assert.equal(seen[0]?.timeout, 120);
+});
+
+test("review_bash: safe sed and npx delegate; sed -i is refused", async () => {
+  const delegated: Array<{ toolCallId: string; command: string }> = [];
+  const builder = (_cwd: string) => ({
+    parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute(toolCallId: string, params: { command: string }) {
+      delegated.push({ toolCallId, command: params.command });
+      return { content: [{ type: "text" as const, text: "ok" }] };
+    },
+  });
+  const state = createShellGuardRecovery();
+  const tool = createReviewBashTool(builder as never, {
+    cwd: process.cwd(),
+    log: () => {},
+    folderPolicy: () => ({
+      config: DEFAULT_FOLDER_POLICY_CONFIG,
+      grants: [],
+    }),
+    shellGuard: () => ({
+      limits: { defaultTimeoutSeconds: 120, maxTimeoutSeconds: 900 },
+      state,
+    }),
+  });
+
+  const execute = (toolCallId: string, command: string) =>
+    tool.execute(
+      toolCallId,
+      { command },
+      new AbortController().signal,
+      undefined,
+      {},
+    );
+  const textOf = (result: any) =>
+    result.content
+      .map((part: any) => (part?.type === "text" ? String(part.text) : ""))
+      .join("\n");
+
+  for (const [id, command] of [
+    ["sed", "sed -n '1,5p' package.json"],
+    ["npx", "npx vitest run"],
+  ] as const) {
+    const result = await execute(id, command);
+    assert.notEqual((result as any).isError, true);
+    assert.doesNotMatch(textOf(result), /review_bash: REFUSED/);
+    assert.deepEqual(delegated.at(-1), { toolCallId: id, command });
+  }
+  assert.equal(delegated.length, 2);
+
+  const refused = await execute("sed-in-place", "sed -i 's/a/b/' package.json");
+  assert.equal((refused as any).isError, true);
+  assert.match(textOf(refused), /review_bash: REFUSED/);
+  assert.equal(delegated.length, 2);
+});
+
+test("review_bash: a quarantined reviewer does not spawn another shell", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const builder = (_cwd: string) => ({
+    parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute(_id: string, params: any) {
+      seen.push({ ...params });
+      return { content: [{ type: "text", text: "ok" }], details: {} };
+    },
+  });
+  const state = createShellGuardRecovery();
+  state.recordFailure({ kind: "timeout", command: "npm test" });
+  state.recordFailure({ kind: "timeout", command: "npm test" });
+  const tool = createReviewBashTool(builder as never, {
+    cwd: process.cwd(),
+    log: () => {},
+    folderPolicy: () => ({
+      config: DEFAULT_FOLDER_POLICY_CONFIG,
+      grants: [],
+    }),
+    shellGuard: () => ({
+      limits: { defaultTimeoutSeconds: 120, maxTimeoutSeconds: 900 },
+      state,
+    }),
+  });
+  const result = await tool.execute(
+    "1",
+    { command: "grep -n foo bar.ts" },
+    new AbortController().signal,
+    undefined,
+    {},
+  );
+  assert.equal((result as any).isError, true);
+  assert.match(String((result as any).content[0].text), /quarantined/);
+  assert.equal(seen.length, 0);
 });

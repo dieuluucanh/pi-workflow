@@ -5,9 +5,9 @@
  *
  *   Plan Mode (main session)  ──plan file──▶  Review Mode (child session)
  *          ▲                                        │
- *          │ feedback                               │ rewrites the plan
+ *          │ feedback                               │ appends advisory notes
  *          │                                        ▼
- *      Plannotator webview  ◀────────────  reviewed plan + change log
+ *      Plannotator webview  ◀─────────  approved plan + reviewer revisions
  *
  * Design rules (see docs/plans/2026-09-18-review-mode-dual-plan.md):
  *
@@ -15,7 +15,7 @@
  *   byte-for-byte the behaviour that existed before this module.
  * - Review Mode runs in its OWN in-process session (own context, own model,
  *   own system prompt). It reads Plan Mode's context but never the reverse.
- * - Review Mode is read-only except for one write path: `review_submit_plan`
+ * - Review Mode is read-only except for one write path: `review_submit`
  *   (implemented in the parent, not in the child).
  * - This module holds the pure, I/O-light parts (config, prompt, state,
  *   validation, rendering) so they can be unit-tested without a Pi runtime.
@@ -24,9 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import {
-  getUtcDatePrefix,
   isPlanWritePath,
   normalizePlanPath,
   planHash,
@@ -37,12 +35,15 @@ import {
   type ReviewTier,
 } from "./utils.ts";
 import {
-  checkReviewerProviderAuth,
-  isParentProviderSurface,
-  seedChildRuntimeProviders,
   unconfiguredReviewerProviderMessage,
   type ProviderSeedResult,
 } from "./review-providers.ts";
+import type { InProcessChildSession } from "./in-process-child.ts";
+import { createIsolatedSession } from "./isolated-session.ts";
+
+/** Type-only handle on the Pi SDK. Erased at compile time. */
+export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
+export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
 // Re-exported so `review.ts` is the single import surface for Review Mode.
 export type { ReviewDisposition, ReviewFinding, ReviewTier };
@@ -65,8 +66,6 @@ export const REVIEW_SUBMITTED_ENTRY_TYPE = "workflow-review-submitted";
 
 export type ReviewFallbackOnError = "skip" | "block";
 export type ReviewProviderRecovery = "fallback" | "off";
-export type ReviewChunkedSubmit = "auto" | "off";
-
 /** A reviewer model reference used by the recovery chain or an explicit fallback. */
 export interface ReviewFallbackModel {
   provider: string;
@@ -79,7 +78,13 @@ export interface ReviewModeConfig {
   enabled: boolean;
   /** Max Review↔Plan rounds per user-feedback cycle. */
   rounds: number;
-  /** 1 = review + rewrite only. 2 = review + rewrite, then self-verify. */
+  /**
+   * Max automatic Planner revision turns after a revise verdict; 0 = one-shot.
+   * Separate from `rounds` (the per-cycle Review round cap): the revision
+   * budget is not reset by `beginReviewCycle`.
+   */
+  maxRevisions: number;
+  /** 1 = review + advisory notes only. 2 = review + notes, then self-verify. */
   passes: number;
   /** Run the self-verification pass (only when pass 1 found severity >= 5). */
   verify: boolean;
@@ -95,10 +100,6 @@ export interface ReviewModeConfig {
   providerRetries: number;
   /** Explicit first fallback; the runtime still dedupes and clamps it. */
   fallbackModel?: ReviewFallbackModel;
-  /** Chunked rewrite submission for long plans (default automatic by size). */
-  chunkedSubmit: ReviewChunkedSubmit;
-  /** Max characters per `review_plan_chunk`; also sets the auto threshold. */
-  chunkChars: number;
   /** Overall recovery budget; 0 uses the round deadline. */
   recoveryBudgetMs: number;
   /** Max `review_explore` subagents per review round (cost ceiling). */
@@ -125,13 +126,12 @@ export interface ReviewModeConfig {
 export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
   enabled: false,
   rounds: 1,
+  maxRevisions: 3,
   passes: 2,
   verify: true,
   fallbackOnError: "skip",
   providerRecovery: "fallback",
   providerRetries: 1,
-  chunkedSubmit: "auto",
-  chunkChars: 6_000,
   recoveryBudgetMs: 0,
   exploreBudget: 1,
   timeoutMs: 300_000,
@@ -142,6 +142,8 @@ export const DEFAULT_REVIEW_MODE_CONFIG: Readonly<ReviewModeConfig> = {
 
 const ROUNDS_MIN = 1;
 const ROUNDS_MAX = 5;
+const MAX_REVISIONS_MIN = 0;
+const MAX_REVISIONS_MAX = 5;
 const PASSES_MIN = 1;
 const PASSES_MAX = 2;
 const EXPLORE_MIN = 0;
@@ -227,8 +229,6 @@ export function buildReviewerAttempts(input: {
 }
 const PROVIDER_RETRIES_MIN = 0;
 const PROVIDER_RETRIES_MAX = 2;
-const CHUNK_CHARS_MIN = 1_000;
-const CHUNK_CHARS_MAX = 20_000;
 const RECOVERY_BUDGET_MIN = 0;
 const RECOVERY_BUDGET_MAX = 3_600_000;
 
@@ -292,14 +292,16 @@ export function coerceReviewModeConfig(
     r.providerRecovery === "off" || r.providerRecovery === "fallback"
       ? r.providerRecovery
       : base.providerRecovery;
-  const chunkedSubmit: ReviewChunkedSubmit =
-    r.chunkedSubmit === "off" || r.chunkedSubmit === "auto"
-      ? r.chunkedSubmit
-      : base.chunkedSubmit;
   const fallbackModel = sanitizeFallbackModel(r.fallbackModel);
   return {
     enabled: asBool(r.enabled, base.enabled),
     rounds: clampInt(r.rounds, ROUNDS_MIN, ROUNDS_MAX, base.rounds),
+    maxRevisions: clampInt(
+      r.maxRevisions,
+      MAX_REVISIONS_MIN,
+      MAX_REVISIONS_MAX,
+      base.maxRevisions,
+    ),
     passes: clampInt(r.passes, PASSES_MIN, PASSES_MAX, base.passes),
     verify: asBool(r.verify, base.verify),
     fallbackOnError,
@@ -311,13 +313,6 @@ export function coerceReviewModeConfig(
       base.providerRetries,
     ),
     ...(fallbackModel ? { fallbackModel } : {}),
-    chunkedSubmit,
-    chunkChars: clampInt(
-      r.chunkChars,
-      CHUNK_CHARS_MIN,
-      CHUNK_CHARS_MAX,
-      base.chunkChars,
-    ),
     recoveryBudgetMs: clampInt(
       r.recoveryBudgetMs,
       RECOVERY_BUDGET_MIN,
@@ -645,7 +640,7 @@ export interface ReviewStatusInput {
   timeoutSource: ReviewConfigScopeSource;
   /** Effective reviewer model, when the reviewer role is configured. */
   reviewer?: { provider: string; id: string; thinking: string };
-  /** Resolved reviewer prompt source (path or built-in label). */
+  /** Where the additional reviewer guidance came from (project/global/default). */
   promptSource: string;
   /** Whether each settings file carries a `workflow.reviewMode` fragment. */
   sources: { global: boolean; project: boolean };
@@ -667,8 +662,8 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
         ? `${model.provider}/${model.id} (${model.thinking})`
         : "unconfigured — /role set reviewer <provider/model>"
     }`,
-    `  prompt         : ${input.promptSource}`,
-    `  rounds         : ${c.rounds}   passes: ${c.passes}   verify: ${c.verify}`,
+    `  prompt         : ${input.promptSource} (guidance; fixed criteria always apply)`,
+    `  rounds         : ${c.rounds}   revisions: ${c.maxRevisions}   passes: ${c.passes}   verify: ${c.verify}`,
     `  explore budget : ${c.exploreBudget}   timeout: ${formatReviewTimeoutLabel(
       c.timeoutMs,
       input.timeoutSource,
@@ -686,16 +681,13 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
           })`
         : ""
     }`,
-    `  chunked submit : ${c.chunkedSubmit}${
-      c.chunkedSubmit === "auto" ? ` (${c.chunkChars} chars/chunk)` : ""
-    }`,
   ];
   if (
     input.timeoutSource !== "default" &&
     c.timeoutMs === LEGACY_REVIEW_TIMEOUT_MS
   ) {
     lines.push(
-      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review-mode timeout unlimited removes it`,
+      `  ⚠ 600s cap set in ${input.timeoutSource} settings — /review mode timeout unlimited removes it`,
     );
   }
   lines.push(
@@ -703,7 +695,7 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
     `  runtime        : ${input.runtime}`,
     `  transcript     : streamed into the main Pi transcript`,
     "",
-    "Usage: /review-mode on|off [global|project] | /review-mode status | /review-mode timeout <seconds|unlimited> [global|project] | /review-prompt | /review-status | /review",
+    "Usage: /review mode on|off [global|project] | /review mode status | /review mode timeout <seconds|unlimited> [global|project] | /review prompt | /review status | /review",
   );
   return lines;
 }
@@ -711,44 +703,25 @@ export function formatReviewStatusLines(input: ReviewStatusInput): string[] {
 // ── Step 3: Review prompt resolution ─────────────────────────────────
 
 /**
- * Built-in reviewer guidance. The resolved prompt is appended to the
+ * Built-in reviewer guidance. The resolved guidance is appended to the
  * reviewer's SYSTEM prompt inside the child session only — it is never
  * injected into the parent (Plan Mode) context.
+ *
+ * The review criteria and the reviewer's rules of engagement live in
+ * `REVIEW_CRITERIA` / `REVIEW_SYSTEM_PROMPT` (they are fixed), so this default
+ * is guidance only, not the criteria set: a project/global review-prompt.md
+ * replaces this default text as guidance only and still gets the system
+ * prompt's criteria and rules.
  */
-export const DEFAULT_REVIEW_PROMPT = [
-  "Always align with the existing project framework and industry best practice.",
-  "",
-  "Your job is to independently audit a plan that another agent produced, then",
-  "rewrite it so it is correct, complete, and idiomatic for THIS repository.",
-  "",
-  "Review criteria, in priority order:",
-  "",
-  "1. Framework alignment — does the plan follow the conventions, module layout,",
-  "   naming, error-handling style, and dependency choices already established in",
-  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
-  "   divergence explicitly.",
-  "2. Industry best practice — correctness, security, error handling, testability,",
-  "   observability, performance, and migration/rollback safety. Cite the specific",
-  "   practice when you flag a gap.",
-  "3. Requirement coverage — every requirement in the shared context must map to at",
-  "   least one plan step. A requirement with no step is a Critical finding.",
-  "4. Executability — each step must be concrete enough to implement without",
-  "   guessing: file paths, symbols, and a verifiable outcome.",
-  "5. Simplicity — remove unnecessary steps, speculative abstractions, and work that",
-  "   is out of scope for the stated goal.",
-  "",
-  "Rules:",
-  "",
-  "- You may READ anything: files, git history, docs, tests, prior plans.",
-  "- You may NOT write code or modify any file. The ONLY write you may perform is",
-  "  submitting the revised plan through `review_submit_plan`.",
-  "- Never invent files, APIs, or conventions. Verify with read/grep/find/ls first.",
-  "- If the plan is already sound, say so and submit it unchanged rather than",
-  "  inventing findings to look useful.",
-  "- Preserve the original plan's structure and the author's intent. Adjust; do not",
-  "  replace it with your own different plan.",
-  "- Keep the plan's existing heading style so its steps remain machine-extractable.",
-].join("\n");
+export const DEFAULT_REVIEW_GUIDANCE =
+  "Always align with the existing project framework and industry best practice.";
+
+/**
+ * @deprecated Use DEFAULT_REVIEW_GUIDANCE. Kept for published imports.
+ * Guidance only — never the full criteria set (those are fixed in
+ * `REVIEW_SYSTEM_PROMPT`).
+ */
+export const DEFAULT_REVIEW_PROMPT = DEFAULT_REVIEW_GUIDANCE;
 
 export interface ReviewPromptPaths {
   global: string;
@@ -775,17 +748,25 @@ function readTextSafe(fp: string): string | undefined {
   }
 }
 
+/** Which scope supplied the reviewer guidance (`default` = built-in text). */
 export type ReviewPromptSource = "project" | "global" | "default";
 
 export interface ResolvedReviewPrompt {
+  /** Additional reviewer guidance; appended to the fixed system prompt. */
   text: string;
+  /** Which scope supplied `text` (project wins over global over default). */
   source: ReviewPromptSource;
+  /** File that supplied `text`; absent for the built-in default. */
   path?: string;
 }
 
 /**
- * Resolve the user's reviewer guidance: project file wins over global file
- * wins over the built-in default. Never throws.
+ * Resolve the user's additional reviewer guidance: project file wins over
+ * global file wins over the built-in default. Never throws.
+ *
+ * The result is GUIDANCE ONLY. Both files add guidance on top of the fixed
+ * `REVIEW_CRITERIA` embedded in `REVIEW_SYSTEM_PROMPT`; no file can remove or
+ * replace a criterion.
  */
 export function resolveReviewPrompt(
   cwd: string,
@@ -883,13 +864,24 @@ export interface ReviewState {
   pass: 1 | 2;
   /** Hash of the plan revision under review (see planHash). */
   planHash: string;
-  /** Plan path being reviewed/rewritten. */
+  /** Plan path being reviewed (the reviewer appends to this file). */
   planPath?: string;
   /** `provider/id` of the reviewer model, for display + provenance. */
   modelLabel: string;
   findings: ReviewFinding[];
   verdict?: ReviewVerdict;
-  /** The rewritten plan, once submitted. */
+  /**
+   * Required changes the reviewer submitted this round, after normalization
+   * (`revisions.length`), written by the submit callback. Optional so old
+   * persisted states and `createReviewState` stay valid; a missing count is
+   * the pre-fix "unknown", never a fake 0.
+   */
+  requiredChanges?: number;
+  /**
+   * The submitted plan text once submitted: the author's body plus the
+   * `## Reviewer Revisions` appendix. Kept under this name because it is
+   * persisted in review state; the body itself is never rewritten.
+   */
   rewrittenPlan?: string;
   /** Reviewer passes completed in this round. */
   passes: ReviewPassResult[];
@@ -1036,7 +1028,7 @@ export function reviewStateSummary(state: ReviewState | undefined): string {
 /**
  * Outcome of one Plan↔Review round, handed back to the handoff orchestrator.
  *
- * `fallback: true` means "the reviewer did not produce a usable rewrite —
+ * `fallback: true` means "the reviewer did not produce a usable submission —
  * continue with the author's plan" (see config.fallbackOnError).
  */
 export interface ReviewRoundResult {
@@ -1070,13 +1062,25 @@ export type ReviewExecutionOutcome =
 
 /** Result of one `/review`, `/review-resume` or gated handoff execution. */
 export interface ReviewExecutionResult {
-  /** Plan to hand off: the reviewer's rewrite or the author's text. */
+  /** Plan to hand off: the submitted plan text (author body + appendix) or the author's text. */
   planText: string;
+  /**
+   * Which way the round settled. `"rewritten"` is a ROUTING value (it decides
+   * `reviewResumeGateOutcome` and the handoff gate), not a claim that the plan
+   * body changed: a successful append changes the plan text, so it is reached
+   * on every completed round even though the body is untouched.
+   */
   outcome: ReviewExecutionOutcome;
   /** Human-facing reason for paused / aborted / skipped / fallback. */
   reason?: string;
   /** True when `pausedReview` holds this revision and the gate stays open. */
   paused: boolean;
+  /**
+   * The round state that produced this result (success only). The negotiation
+   * decides from THIS snapshot, never from the mutable orchestrator closure: a
+   * stale or overwritten `reviewState` must not decide a round it did not run.
+   */
+  state?: ReviewState;
 }
 
 /**
@@ -1107,9 +1111,9 @@ export function reviewResumeSettles(result: ReviewExecutionResult): boolean {
 }
 
 /**
- * Gate outcome for a settled resume. Only a real rewrite counts as reviewed;
- * an unchanged plan, a skip, an abort or a fallback hands off the author's
- * plan. `undefined` means "keep the gate parked" (the round paused again).
+ * Gate outcome for a settled resume. Only a plan that actually changed counts
+ * as reviewed; an unchanged plan, a skip, an abort or a fallback hands off the
+ * author's plan. `undefined` means "keep the gate parked" (the round paused again).
  */
 export function reviewResumeGateOutcome(
   result: ReviewExecutionResult,
@@ -1123,9 +1127,9 @@ export function reviewResumeNotice(result: ReviewExecutionResult): string {
   const reason = result.reason ? ` (${result.reason})` : "";
   switch (result.outcome) {
     case "paused":
-      return "Review paused again — /review-resume to continue, /review-abort to stop.";
+      return "Review paused again — /review resume to continue, /review abort to stop.";
     case "rewritten":
-      return "Review finished — plan rewritten and saved.";
+      return "Review finished — advisory notes appended.";
     case "unchanged":
       return "Review finished — the reviewer kept the plan as-is.";
     case "aborted":
@@ -1174,6 +1178,11 @@ export function reviewRunLabel(input: {
  * a few sources carried their own `Review Mode: `/`Review Mode ` prefix. Blindly
  * interpolating produced `Review Mode: Review Mode: …`. Idempotent by design:
  * anything already starting with `Review Mode` is returned unchanged.
+ *
+ * Ownership: this is the prefix owner for the *reviewer* notifier only
+ * (`notifyReview` in `index.ts`). Do not apply it to non-reviewer messages —
+ * Orchestrator/child, handoff/Plannotator and plan-lifecycle notices go through
+ * the neutral `notifyWorkflow` helper and must never be branded `Review Mode:`.
  */
 export function reviewNoticeText(message: string): string {
   const text = String(message ?? "").trim();
@@ -1187,10 +1196,10 @@ export type ReviewResumePlanChoice = "fresh" | "warm";
 /**
  * Decide whether a paused review can still be resumed as-is.
  *
- * The plan *file* is not a reliable witness on its own: the reviewer writes its
- * rewrite to that same file during the round (`review_submit_plan`), so after a
- * pause during pass 2 the file no longer matches the text the round started
- * with. Comparing against the hash captured at pause time means only a change
+ * The plan *file* is not a reliable witness on its own: the reviewer appends
+ * its revisions section to that same file during the round (`review_submit`), so
+ * after a pause during pass 2 the file no longer matches the text the round
+ * started with. Comparing against the hash captured at pause time means only a change
  * made **after** the pause — an author edit — starts a fresh round.
  *
  * A missing file (or a snapshot from before this field existed) keeps today's
@@ -1293,7 +1302,7 @@ export interface ApplySubmittedPlanOptions {
   cwd: string;
   /** The plan path Plan Mode chose, absolute or cwd-relative. */
   planPath: string;
-  /** planBody + `## Review changes` appendix (what gets written). */
+  /** planBody + `## Reviewer Revisions` appendix (what gets written). */
   planText: string;
   planBody: string;
   verdict: ReviewVerdict;
@@ -1308,7 +1317,7 @@ export interface ApplySubmittedPlanOptions {
 export interface ApplySubmittedPlanResult {
   ok: boolean;
   path: string;
-  /** True when the date prefix was corrected to today (UTC). */
+  /** True when the UTC date-time prefix was filled/corrected. */
   corrected: boolean;
   error?: string;
 }
@@ -1317,9 +1326,10 @@ export interface ApplySubmittedPlanResult {
  * Steps 12-13: write the reviewed plan over Plan Mode's plan file and record it.
  *
  * Step 12 — the reviewer adjusts the SAME file Plan Mode wrote. It never picks
- * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<slug>.md`
+ * a new slug: `normalizePlanPath` owns the `.pi/plans/<UTC-date>-<UTC-time>-<slug>.md`
  * convention, so the plan the user reviews in Plannotator is the plan history
- * they already have. A defense-in-depth guard refuses any path outside
+ * they already have. An existing plan keeps its name; only a NEW file gets the
+ * date-time prefix. A defense-in-depth guard refuses any path outside
  * `.pi/plans/`, so even a compromised reviewer tool call cannot write elsewhere.
  *
  * Step 13 — appends a `workflow-review-submitted` entry (not part of the LLM
@@ -1331,8 +1341,8 @@ export interface ApplySubmittedPlanResult {
 export function applySubmittedPlan(
   options: ApplySubmittedPlanOptions,
 ): ApplySubmittedPlanResult {
-  const today = getUtcDatePrefix();
-  const normalized = normalizePlanPath(options.planPath, options.cwd, today);
+  const now = new Date();
+  const normalized = normalizePlanPath(options.planPath, options.cwd, now);
   const relOrAbs = normalized.path;
 
   // Defense in depth: Review Mode may only ever write inside .pi/plans/.
@@ -1378,6 +1388,8 @@ export function applySubmittedPlan(
         category: f.category,
         disposition: f.disposition,
       })),
+      // Kept for compatibility with existing audit readers: it means the
+      // UTC date-time prefix was filled/corrected, not only the date.
       correctedDatePrefix: normalized.corrected,
     });
   } catch {
@@ -1407,7 +1419,7 @@ export function applySubmittedPlan(
  *
  * Both waits are edge-tolerant: whichever happens first (the tool call or the
  * await) wins, and a wait that starts after the event resolves immediately.
- * That matters because a fast reviewer can call `review_submit_plan` and
+ * That matters because a fast reviewer can call `review_submit` and
  * `review_pass_done` in the same turn, before the orchestrator awaits.
  *
  * Every wait is bounded by an AbortSignal and, when a positive timeout is
@@ -1441,6 +1453,8 @@ export interface ReviewSubmitPayloadLike {
   planText: string;
   findings: ReviewFinding[];
   verdict: ReviewVerdict;
+  /** Required changes submitted this round (normalized count). */
+  requiredChanges: number;
   summary: string;
   changelog: string;
 }
@@ -1658,21 +1672,22 @@ export function reviewEscapeAction(input: {
 
 /** Hints shown on the live running line in both hosts. */
 export const REVIEW_RUNNING_HINT =
-  "ESC or /review-pause to pause · /review-abort to stop";
+  "ESC or /review pause to pause · /review abort to stop";
 
 /** Cold-boot and running prefix; the state detail is appended when it lands. */
-export const REVIEW_RUNNING_LINE = `🔍 Reviewing plan… · ${REVIEW_RUNNING_HINT}`;
+const REVIEW_RUNNING_PREFIX = "🔍 Reviewing plan…";
+export const REVIEW_RUNNING_LINE = `${REVIEW_RUNNING_PREFIX} · ${REVIEW_RUNNING_HINT}`;
 
 /**
  * The paused line shared by the host working message, the footer status and
  * the Terminal widget. One owner so the surfaces cannot drift.
  */
 export const REVIEW_PAUSED_LINE =
-  "⏸ Review paused — /review-resume to continue, /review-abort to stop";
+  "⏸ Review paused — /review resume to continue, /review abort to stop";
 
 /** The reviewer finished; the plan waits for Approve/Revise. */
 export const REVIEW_HANDOFF_LINE =
-  "🔍 review · awaiting decision — /review-abort to skip";
+  "🔍 review · awaiting decision — /review abort to skip";
 
 /** A decision is being applied; the turn is briefly not actionable. */
 export const REVIEW_TRANSITION_LINE = "🔍 review · applying the decision…";
@@ -1698,7 +1713,11 @@ export function reviewFooterSegment(
   // A retained terminal phase belongs to the previous round: during a new
   // round's cold boot paint the generic line, never the stale verdict.
   if (starting && !reviewIsActive(state.phase)) return REVIEW_RUNNING_LINE;
-  return `${REVIEW_RUNNING_LINE} · ${reviewStateDetails(state)}`;
+  // The LIVE line names the reviewer actually auditing the plan. Only this
+  // footer carries the label: `reviewStateSummary` (and therefore `/review
+  // status`) keeps its single `model :` row instead of printing it twice.
+  const model = state.modelLabel ? ` · ${state.modelLabel}` : "";
+  return `${REVIEW_RUNNING_PREFIX}${model} · ${REVIEW_RUNNING_HINT} · ${reviewStateDetails(state)}`;
 }
 
 /**
@@ -1931,7 +1950,7 @@ export function reviewInputDecision(
           : "running";
   return {
     action: "block",
-    notice: `Review is ${state} — prompts are locked. /review-pause, /review-resume, /review-abort, /handoff fallback, or change model/profile.`,
+    notice: `Review is ${state} — prompts are locked. /review pause, /review resume, /review abort, /handoff fallback, or change model/profile.`,
   };
 }
 
@@ -2056,15 +2075,15 @@ export function reviewHandoffParks(input: {
 /** One short notice for a blocked mode transition. */
 export function reviewModeLockNotice(kind: ReviewModeLockKind): string {
   if (kind === "paused") {
-    return "Review is paused — mode switching stays locked. /review-resume to continue, /review-abort to stop.";
+    return "Review is paused — mode switching stays locked. /review resume to continue, /review abort to stop.";
   }
   if (kind === "handoff") {
-    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review-abort to hand the plan off now.";
+    return "Review decision pending — mode switching is locked. Answer the handoff prompt (Approve / Feedback / Skip), or /review abort to hand the plan off now.";
   }
   if (kind === "transition") {
     return "Review decision is being applied — mode switching is briefly locked.";
   }
-  return "Review is running — mode switching is locked. ESC or /review-pause to pause, /review-resume to continue, /review-abort to stop.";
+  return "Review is running — mode switching is locked. ESC or /review pause to pause, /review resume to continue, /review abort to stop.";
 }
 
 /** Footer marker appended to the single `"workflow"` status while locked. */
@@ -2317,7 +2336,7 @@ export function formatActionLabel(toolName: unknown, args: unknown): string {
         first ? ` — ${first}` : ""
       }`;
     }
-  } else if (name === "review_submit_plan") {
+  } else if (name === "review_submit") {
     const verdict = str(a.verdict) ?? "revise";
     const findings = Array.isArray(a.findings) ? a.findings.length : 0;
     detail = `verdict ${verdict} · ${findings} finding${
@@ -2556,9 +2575,41 @@ export class ReviewTranscript {
 }
 
 /**
+ * The fixed review criteria, in priority order. Embedded verbatim in
+ * `REVIEW_SYSTEM_PROMPT`; user guidance (review-prompt.md) is appended to that
+ * prompt and can add emphasis, but it cannot remove these criteria.
+ *
+ * One array element per printed line, matching `REVIEW_SYSTEM_PROMPT`.
+ */
+export const REVIEW_CRITERIA: readonly string[] = [
+  "1. Framework alignment — does the plan follow the conventions, module layout,",
+  "   naming, error-handling style, and dependency choices already established in",
+  "   this codebase? Prefer the repo's own patterns over novel ones. Call out every",
+  "   divergence explicitly.",
+  "2. Industry best practice — correctness, security, error handling, testability,",
+  "   observability, performance, and migration/rollback safety. Cite the specific",
+  "   practice when you flag a gap.",
+  "3. Requirement coverage — every requirement in the shared context must map to at",
+  "   least one plan step. A requirement with no step is a Critical finding.",
+  "4. Executability — each step must be concrete enough to implement without",
+  "   guessing: file paths, symbols, and a verifiable outcome.",
+  "5. Simplicity and over-engineering — prefer the smallest change that satisfies",
+  "   the stated requirements and this repository's conventions. Flag unnecessary",
+  "   steps, speculative abstractions, extra layers, configuration or dependencies",
+  "   nobody asked for, and work that is out of scope for the stated goal. Solving",
+  "   more than the requirement asks for is a finding, not extra value.",
+];
+
+/**
  * The reviewer's system prompt. The user's guidance (review-prompt.md) is
  * APPENDED to this, and the whole thing lives only in the child session —
  * Plan Mode never sees it (requirement: Plan cannot see Review's context).
+ *
+ * `## Review criteria` carries the fixed `REVIEW_CRITERIA`. The rules that used
+ * to live in the old `DEFAULT_REVIEW_PROMPT` "Rules:" block now live here:
+ * the READ-ONLY paragraph (no writes except the submit tool), the Protocol
+ * steps (read context, verify, record findings, submit, pass_done), and
+ * Restraint (never invent, submit unchanged if sound, preserve structure).
  */
 export const REVIEW_SYSTEM_PROMPT = [
   "You are REVIEW MODE: an independent auditor that supervises another agent's plan.",
@@ -2569,7 +2620,11 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "You are READ-ONLY. You cannot edit files, run mutating shell commands, install",
   "anything, or build. You may run test/lint/typecheck commands. Your single write",
-  "action is submitting the revised plan through the `review_submit_plan` tool.",
+  "action is submitting findings and required revisions through `review_submit`.",
+  "",
+  "## Review criteria (fixed; in priority order)",
+  "",
+  ...REVIEW_CRITERIA,
   "",
   "## Tools",
   "",
@@ -2577,16 +2632,22 @@ export const REVIEW_SYSTEM_PROMPT = [
   "  prompt carries Plan Mode's file inventory and recon summaries: trust them",
   "  for what they cover, and re-read the files your findings anchor (plus a",
   "  spot check or two) before you cite them.",
-  "- `review_bash` — a READ-ONLY/VERIFY shell on the same role allowlist Plan Mode",
-  "  uses (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch, npm",
-  "  test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest, cargo",
-  "  clippy, ...). Mutating commands, redirects, installs and builds are refused.",
-  "  Verify a plan's claims by reading the code and, where useful, by running its",
-  "  tests or linters — but never assert that something passes unless you ran it.",
+  "- `review_bash` — a READ-ONLY/VERIFY shell using the same shared role policy as",
+  "  Plan Mode (ls, cat, rg, fd, jq, diff, stat, git status/log/diff/show/branch,",
+  "  npm test, npm run lint/typecheck, eslint, tsc --noEmit, node --test, pytest,",
+  "  cargo clippy, ...). Safe sed print/select forms such as `sed -n 'A,Bp' file`",
+  "  and npx-style verification (`npx vitest run`, `npx eslint ...`, `npx tsc --noEmit`)",
+  "  follow that same policy; wrappers are allowed only around a permitted inner",
+  "  command. `sed -i`/`-f`, unsafe sed programs, awk, real file redirects (except",
+  "  harmless `>/dev/null` and fd duplication such as `2>&1`), installs, builds and",
+  "  git mutations are refused. Verify a plan's claims by reading the code and,",
+  "  where useful, running its tests or linters — never claim a pass unless you ran it.",
+
   "- `review_explore` — delegate focused read-only reconnaissance to subagents",
   "  (rarely needed: the pass-1 prompt already carries Plan Mode's recon).",
-  "- `review_submit_plan` — submit the final rewritten plan. This is the ONLY way",
-  "  your work reaches the user. A review that never submits is a failed review.",
+  "- `review_submit` — submit your findings and required revisions. This is the",
+  "  ONLY way your work reaches the user. A review that never submits is a failed",
+  "  review.",
   "- `review_pass_done` — end the current pass with a verdict and your findings.",
   "",
   "## Protocol",
@@ -2597,8 +2658,8 @@ export const REVIEW_SYSTEM_PROMPT = [
   "   about what exists.",
   "3. Record every issue as a finding: severity 1-10, confidence 0-100, a category, a",
   "   file/line anchor when you have one, a one-line summary, and a rationale.",
-  "4. Rewrite the plan so it is correct and framework-aligned, then submit it with",
-  "   `review_submit_plan`.",
+  "4. Record the required revisions that make the plan correct and",
+  "   framework-aligned, then submit them with `review_submit`.",
   "5. End the pass with `review_pass_done`.",
   "",
   "You may run test/lint/typecheck commands, but not builds. Never assert that",
@@ -2609,20 +2670,12 @@ export const REVIEW_SYSTEM_PROMPT = [
   "",
   "- If the plan is sound, submit it unchanged and say so. Never invent findings to",
   "  appear useful — a false finding costs the user more than a missed nit.",
-  "- Adjust the plan; do not replace it with a different plan of your own. Preserve",
-  "  the author's structure, step numbering, and heading style so the plan stays",
-  "  machine-extractable.",
+  "- Adjust the plan through required revisions; do not replace it with a different",
+  "  plan of your own. Preserve the author's structure, step numbering, and heading",
+  "  style so the plan stays machine-extractable.",
   "- Never invent files, symbols, APIs, or conventions. If you cannot verify",
   "  something, say so in the finding rather than asserting it.",
 ].join("\n");
-
-/**
- * Type-only handle on the Pi SDK. This is erased at compile time, so importing
- * this module in a plain Node test does not load Pi.
- */
-export type PiCodingAgentSdk = typeof import("@earendil-works/pi-coding-agent");
-
-export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
 
 /**
  * Built-in tool names the reviewer may call. Read-only by construction.
@@ -2632,7 +2685,7 @@ export type ReviewSdkLoader = () => Promise<PiCodingAgentSdk>;
  * (`dist/core/sdk.js`: `allowedToolNames = options.tools ?? ...`, then
  * `dist/core/agent-session.js`: `allCustomTools = [...].filter(tool =>
  * isAllowedTool(tool.definition.name))`). Passing only these names silently
- * drops `review_submit_plan`, i.e. the reviewer loses its only write path.
+ * drops `review_submit`, i.e. the reviewer loses its only write path.
  * Always build the session's allowlist with `reviewToolAllowlist()`.
  */
 export const REVIEW_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -2663,21 +2716,7 @@ export function reviewToolAllowlist(customTools: unknown): string[] {
  * A live reviewer session, narrowed to what Review Mode actually uses.
  * Keeps the orchestrator free of SDK types.
  */
-export interface ReviewChildSession {
-  readonly sessionId: string;
-  readonly modelLabel: string;
-  /** Subscribe to the session's event stream. Returns an unsubscribe function. */
-  subscribe(listener: (event: unknown) => void): () => void;
-  /** Send a prompt. Queues as a steer when the session is already streaming. */
-  prompt(text: string): Promise<void>;
-  /** Send a prompt that is delivered only after the current run stops. */
-  followUp(text: string): Promise<void>;
-  /** Cancel the in-flight run. Never throws. */
-  abort(): Promise<void>;
-  isStreaming(): boolean;
-  /** Unsubscribe and release. Never throws, safe to call twice. */
-  dispose(): void;
-}
+export type ReviewChildSession = InProcessChildSession;
 
 export interface CreateReviewSessionOptions {
   cwd: string;
@@ -2689,6 +2728,8 @@ export interface CreateReviewSessionOptions {
   findModel: (provider: string, id: string) => unknown;
   /**
    * Resolved user reviewer guidance, appended to REVIEW_SYSTEM_PROMPT.
+   * The review criteria live in the system prompt itself (`REVIEW_CRITERIA`);
+   * this text supplements them and can never remove or replace one.
    *
    * Note: the pruned Plan Mode history is NOT passed to the session manager.
    * The 3-argument `SessionManager.inMemory(cwd, opts, entries)` form only
@@ -2750,146 +2791,14 @@ export interface CreateReviewSessionResult {
 export const REVIEW_CHILD_MARKER_ENV = "PI_WORKFLOW_REVIEW_CHILD";
 
 /**
- * Read the session's enabled tool names, when the SDK exposes them.
- * Returns `undefined` (not `[]`) when the accessor is missing OR throws, so a
- * caller can tell "cannot verify" apart from a verifiably empty tool set.
- */
-function readActiveToolNames(session: unknown): string[] | undefined {
-  try {
-    const get = (session as { getActiveToolNames?: unknown } | undefined)
-      ?.getActiveToolNames;
-    if (typeof get !== "function") return undefined;
-    const names = (get as () => unknown).call(session);
-    if (!Array.isArray(names)) return undefined;
-    return names.filter((n): n is string => typeof n === "string");
-  } catch {
-    return undefined;
-  }
-}
-
-function clampProviderRetries(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 1;
-  return Math.min(2, Math.max(0, Math.trunc(value)));
-}
-
-/**
- * Build the child's runtime-only SettingsManager so its SDK retry budget is
- * bounded. `applyOverrides` is in-memory: the shared settings.json is never
- * written. Feature-detected for older Pi runtimes; a failure here means the
- * child keeps the parent's settings and the chain simply waits that budget out.
- */
-function createChildSettingsManager(
-  sdk: unknown,
-  cwd: string,
-  agentDir: string,
-  providerRetries: number | undefined,
-): unknown | undefined {
-  try {
-    const holder = sdk as {
-      SettingsManager?: { create?: (...args: unknown[]) => unknown };
-    };
-    const SettingsManager = holder?.SettingsManager;
-    const create = SettingsManager?.create;
-    if (typeof create !== "function") return undefined;
-    const manager = create.call(SettingsManager, cwd, agentDir) as {
-      getRetrySettings?: () => Record<string, unknown>;
-      applyOverrides?: (overrides: unknown) => void;
-    };
-    if (!manager || typeof manager !== "object") return undefined;
-    if (typeof manager.applyOverrides !== "function") return manager;
-    const base =
-      typeof manager.getRetrySettings === "function"
-        ? manager.getRetrySettings()
-        : { enabled: true, maxRetries: 3, baseDelayMs: 2_000, maxAgentDelayMs: 60_000 };
-    manager.applyOverrides({
-      retry: {
-        ...base,
-        enabled: true,
-        maxRetries: clampProviderRetries(providerRetries),
-      },
-    });
-    return manager;
-  } catch {
-    return undefined;
-  }
-}
-
-function wrapAgentSession(
-  raw: unknown,
-  modelLabel: string,
-  sessionId: string,
-): ReviewChildSession {
-  const s = raw as {
-    subscribe: (l: (e: unknown) => void) => () => void;
-    prompt: (
-      t: string,
-      o?: { streamingBehavior?: "steer" | "followUp" },
-    ) => Promise<void>;
-    followUp: (t: string) => Promise<void>;
-    abort: () => Promise<void>;
-    isStreaming: boolean;
-  };
-  let disposed = false;
-  const unsubscribers: Array<() => void> = [];
-  return {
-    sessionId,
-    modelLabel,
-    subscribe(listener) {
-      const un = s.subscribe(listener);
-      if (disposed) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-        return () => {};
-      }
-      unsubscribers.push(un);
-      return un;
-    },
-    async prompt(text) {
-      if (disposed) return;
-      if (s.isStreaming) await s.prompt(text, { streamingBehavior: "steer" });
-      else await s.prompt(text);
-    },
-    async followUp(text) {
-      if (disposed) return;
-      await s.followUp(text);
-    },
-    async abort() {
-      try {
-        await s.abort();
-      } catch {
-        /* aborted sessions can throw; cancellation is best-effort */
-      }
-    },
-    isStreaming() {
-      return !disposed && Boolean(s.isStreaming);
-    },
-    dispose() {
-      if (disposed) return;
-      disposed = true;
-      for (const un of unsubscribers.splice(0)) {
-        try {
-          un();
-        } catch {
-          /* ignore */
-        }
-      }
-    },
-  };
-}
-
-/**
  * Create the reviewer's in-process child session.
  *
- * Isolation properties that matter:
- * - `noExtensions: true` → the child never loads this or any other extension,
- *   so Review Mode cannot recurse or observe the parent's hooks.
- * - `SessionManager.inMemory(...)` → the child never writes a session file and
- *   never touches the parent's session history.
- * - its own `ModelRuntime` → no contention with the parent's model state.
- * - read-only built-in tools + reviewer-only custom tools.
+ * The general bootstrap (in-memory session/settings, no ambient extensions /
+ * skills / templates / themes, its own ModelRuntime, provider seeding and the
+ * auth preflight, exact active-tool assertion, disposal on failure, no silent
+ * model fallback) lives in `isolated-session.ts`. This wrapper owns only
+ * Review-specific semantics: its system prompt, user guidance, tool allowlist,
+ * provider-auth wording and the legacy anti-recursion marker.
  *
  * Never throws: a failure is returned as `{ ok: false, error }` so the caller
  * can fall back to the author's plan (config.fallbackOnError).
@@ -2897,177 +2806,48 @@ function wrapAgentSession(
 export async function createReviewSession(
   options: CreateReviewSessionOptions,
 ): Promise<CreateReviewSessionResult> {
-  const modelLabel = `${options.modelRef.provider}/${options.modelRef.id}`;
-  const loadSdk =
-    options.loadSdk ?? (() => import("@earendil-works/pi-coding-agent"));
-  const sessionId = `review-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+  const expectedTools = reviewToolAllowlist(options.customTools);
+  const result = await createIsolatedSession({
+    cwd: options.cwd,
+    agentDir: options.agentDir,
+    modelRef: options.modelRef,
+    findModel: options.findModel,
+    parentProviders: options.parentProviders,
+    providerRetries: options.providerRetries,
+    systemPrompt: REVIEW_SYSTEM_PROMPT,
+    context: options.reviewPrompt ? [options.reviewPrompt] : [],
+    tools: expectedTools,
+    customTools: options.customTools,
+    sessionIdPrefix: "review",
+    markerEnv: REVIEW_CHILD_MARKER_ENV,
+    // Review keeps its documented ambient project-context files; its explicit
+    // prompt already carries Plan Mode's context. Refinement defaults to off.
+    noContextFiles: false,
+    label: "reviewer",
+    missingModelError: (modelLabel) =>
+      `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
+    describeToolMismatch: (mismatch) =>
+      `reviewer tools are not active: ${mismatch.missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit${
+        mismatch.unexpected.length > 0
+          ? ` (unexpected: ${mismatch.unexpected.join(", ")})`
+          : ""
+      }`,
+    describeProviderAuthFailure: ({ providerId, seed, parentSurfaceFound }) =>
+      unconfiguredReviewerProviderMessage({
+        providerId,
+        seed,
+        parentSurfaceFound,
+        modelsJsonPath: path.join(options.agentDir, "models.json"),
+      }),
+    loadSdk: options.loadSdk,
+  });
 
-  const previousMarker = process.env[REVIEW_CHILD_MARKER_ENV];
-  try {
-    const sdk = await loadSdk();
-
-    const model = options.findModel(
-      options.modelRef.provider,
-      options.modelRef.id,
-    );
-    if (!model) {
-      return {
-        ok: false,
-        modelLabel,
-        error: `reviewer model ${modelLabel} is not in the model registry — run /role set reviewer <provider/model>`,
-      };
-    }
-
-    let modelRuntime: unknown;
-    try {
-      modelRuntime = await sdk.ModelRuntime.create();
-    } catch (e: unknown) {
-      return {
-        ok: false,
-        modelLabel,
-        error: `could not create a model runtime for the reviewer (auth/model catalog problem): ${
-          e instanceof Error ? e.message : String(e)
-        }`,
-      };
-    }
-
-    // Seed providers the child does not compose yet (e.g. providers registered
-    // only in the parent session) BEFORE the session exists. Present-probe:
-    // only the difference is registered, native-first, per-provider
-    // fault-isolated — never fatal, never layer-aware.
-    const providerSeed = seedChildRuntimeProviders(
-      modelRuntime,
-      options.parentProviders,
-    );
-
-    // Provider-agnostic auth preflight, mirroring the child session's own
-    // prompt gate: fail fast here — with the seed report and the generic
-    // escape hatch — instead of mid-review with a bare "No API key found".
-    const auth = await checkReviewerProviderAuth(
-      modelRuntime,
-      options.modelRef.provider,
-    );
-    if (!auth.configured) {
-      return {
-        ok: false,
-        modelLabel,
-        providerSeed,
-        error: unconfiguredReviewerProviderMessage({
-          providerId: options.modelRef.provider,
-          seed: providerSeed,
-          parentSurfaceFound: isParentProviderSurface(options.parentProviders),
-          modelsJsonPath: path.join(options.agentDir, "models.json"),
-        }),
-      };
-    }
-
-    // No ambient extensions, no skills/prompts/themes: the reviewer gets exactly
-    // the system prompt below and nothing from the user's other packages.
-    // Project context files (AGENTS.md etc.) DO load — they are the framework
-    // signal the reviewer is meant to align with.
-    const loader = new sdk.DefaultResourceLoader({
-      cwd: options.cwd,
-      agentDir: options.agentDir,
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      systemPrompt: REVIEW_SYSTEM_PROMPT,
-      appendSystemPrompt: [options.reviewPrompt],
-    });
-    try {
-      await loader.reload?.();
-    } catch {
-      /* a reload failure must not abort the review; defaults still apply */
-    }
-
-    const sessionManager = sdk.SessionManager.inMemory(options.cwd, {
-      id: sessionId,
-    });
-
-    // MUST include the custom tool names: `tools` is an allowlist that filters
-    // custom tools too, so a built-ins-only list would silently remove
-    // `review_submit_plan` and make every review fail (see REVIEW_BUILTIN_TOOLS).
-    const expectedTools = reviewToolAllowlist(options.customTools);
-    // The child gets its own retry budget. The shared settings file is not
-    // touched: applyOverrides is runtime-only.
-    const settingsManager = createChildSettingsManager(
-      sdk,
-      options.cwd,
-      options.agentDir,
-      options.providerRetries,
-    );
-
-    process.env[REVIEW_CHILD_MARKER_ENV] = "1";
-    let created: { session?: unknown; modelFallbackMessage?: string };
-    try {
-      created = await sdk.createAgentSession({
-        cwd: options.cwd,
-        agentDir: options.agentDir,
-        modelRuntime,
-        model,
-        thinkingLevel: options.modelRef.thinking as never,
-        tools: expectedTools,
-        customTools: options.customTools as never,
-        resourceLoader: loader,
-        sessionManager,
-        ...(settingsManager ? { settingsManager } : {}),
-        sessionStartEvent: { type: "session_start", reason: "startup" },
-      } as never);
-    } finally {
-      if (previousMarker === undefined)
-        delete process.env[REVIEW_CHILD_MARKER_ENV];
-      else process.env[REVIEW_CHILD_MARKER_ENV] = previousMarker;
-    }
-
-    if (!created?.session) {
-      return {
-        ok: false,
-        modelLabel,
-        error: "createAgentSession returned no session",
-      };
-    }
-
-    // Defence in depth: assert the SDK really enabled the reviewer's tools.
-    // Without `review_submit_plan` a review can only ever end in a fallback, so
-    // failing here (instantly, with the missing names) beats a 10-minute pass
-    // that silently cannot succeed. Feature-detected: an SDK that does not
-    // expose the accessor is trusted rather than blocked.
-    const activeTools = readActiveToolNames(created.session);
-    if (activeTools) {
-      const missing = expectedTools.filter((n) => !activeTools.includes(n));
-      if (missing.length > 0) {
-        return {
-          ok: false,
-          modelLabel,
-          activeTools,
-          error: `reviewer tools are not active: ${missing.join(", ")} — the session's tools allowlist dropped them; Review Mode cannot submit a plan without review_submit_plan`,
-        };
-      }
-    }
-
-    // Bind in print mode so the child's UI context is explicitly non-interactive.
-    // Best-effort: a binding failure is not fatal because the child has no extensions.
-    try {
-      const bindable = created.session as {
-        bindExtensions?: (b: { mode: string }) => Promise<void>;
-      };
-      await bindable.bindExtensions?.({ mode: "print" });
-    } catch {
-      /* ignore */
-    }
-
-    return {
-      ok: true,
-      modelLabel,
-      ...(activeTools ? { activeTools } : {}),
-      session: wrapAgentSession(created.session, modelLabel, sessionId),
-    };
-  } catch (e: unknown) {
-    return {
-      ok: false,
-      modelLabel,
-      error: e instanceof Error ? e.message : String(e),
-    };
-  }
+  return {
+    ok: result.ok,
+    modelLabel: result.modelLabel,
+    ...(result.session ? { session: result.session } : {}),
+    ...(result.activeTools ? { activeTools: result.activeTools } : {}),
+    ...(result.providerSeed ? { providerSeed: result.providerSeed } : {}),
+    ...(result.error ? { error: result.error } : {}),
+  };
 }

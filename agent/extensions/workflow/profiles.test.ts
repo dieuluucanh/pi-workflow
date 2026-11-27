@@ -35,6 +35,7 @@ import {
   defaultProfileWriteScope,
   modelPickerItems,
   profileActionClosesPicker,
+  composeActivationNotice,
   type Profile,
 } from "./profiles.ts";
 import { joinArgumentValue } from "./utils.ts";
@@ -198,6 +199,7 @@ test("profiles: sanitizer drops bad entries, unknown role keys and invalid model
     "explorer",
     "builder",
     "reviewer",
+    "orchestrator",
   ]);
 });
 
@@ -715,4 +717,70 @@ test("profiles: only a completed action closes the profile picker", () => {
   assert.equal(profileActionClosesPicker("cancelled"), false);
   assert.equal(profileActionClosesPicker("failed"), false);
   assert.equal(profileActionClosesPicker("back"), false);
+});
+
+test("composeActivationNotice: indents each extra under the summary", () => {
+  const summary = "Profile ⚡ cheap activated:\n  🧠 planner → a/b (high)";
+  assert.equal(
+    composeActivationNotice(summary, ["Default model saved → a/b (high)."]),
+    `${summary}\n  Default model saved → a/b (high).`,
+  );
+  // Several extras keep their order, one indented line each.
+  assert.equal(
+    composeActivationNotice(summary, ["one", "two"]),
+    `${summary}\n  one\n  two`,
+  );
+});
+
+test("composeActivationNotice: trims extras and drops blank/duplicate ones", () => {
+  const summary = "Profile ⚡ cheap activated:";
+  // Surrounding whitespace is trimmed before indenting; a whitespace-only
+  // extra never becomes an indented empty line.
+  assert.equal(
+    composeActivationNotice(summary, ["  one  ", "   ", "\t\n", "two"]),
+    `${summary}\n  one\n  two`,
+  );
+  // Consecutive duplicates collapse after trimming; a duplicate separated by a
+  // different extra (or by a blank) is not consecutive and stays.
+  assert.equal(
+    composeActivationNotice(summary, [" one ", "one", " \t", "one "]),
+    `${summary}\n  one`,
+  );
+  assert.equal(
+    composeActivationNotice(summary, ["one", "two", " one "]),
+    `${summary}\n  one\n  two\n  one`,
+  );
+});
+
+test("composeActivationNotice: no extra returns the summary unchanged", () => {
+  const summary = "Profile ⚡ cheap activated:\n  🧠 planner → a/b (high)";
+  assert.equal(composeActivationNotice(summary, []), summary);
+  assert.equal(composeActivationNotice(summary, ["", "   "]), summary);
+  assert.equal(summary.endsWith("\n"), false);
+  // Byte-for-byte also means a summary is never rewritten, only appended to.
+  const withNewline = `${summary}\n`;
+  assert.equal(composeActivationNotice(withNewline, ["  "]), withNewline);
+});
+
+test("composeActivationNotice: keeps a multi-line summary byte-for-byte", () => {
+  const summary = [
+    "Profile ⚡ cheap activated:",
+    "  🧠 planner → a/b (high)",
+    "  ◦ default → a/c (low)",
+    "",
+    "  Applied to build mode now; this chat uses the selection.",
+  ].join("\n");
+  const out = composeActivationNotice(summary, ["  Default model saved.  "]);
+  assert.equal(out, `${summary}\n  Default model saved.`);
+  assert.equal(out.startsWith(summary), true);
+  // No trailing whitespace / newline anywhere in the appended line.
+  assert.equal(/\s+$/.test(out), false);
+  assert.deepEqual(out.split("\n"), [
+    "Profile ⚡ cheap activated:",
+    "  🧠 planner → a/b (high)",
+    "  ◦ default → a/c (low)",
+    "",
+    "  Applied to build mode now; this chat uses the selection.",
+    "  Default model saved.",
+  ]);
 });

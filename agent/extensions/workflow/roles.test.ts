@@ -7,6 +7,7 @@
  */
 
 import { test } from "node:test";
+import { BUILT_IN_ROLES, seedDefaultRoles } from "./roles.ts";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -253,4 +254,16 @@ test("roleArgumentCompletions: applyCompletion algebra keeps the committed token
   const item = roleArgumentCompletions(prefix, ROLE_FIXTURE)![0];
   const newLine = line.slice(0, line.length - prefix.length) + item.value;
   assert.equal(newLine, "/role set planner");
+});
+
+
+test("orchestrator: a built-in role with an explicit planner-model fallback", () => {
+  assert.ok((BUILT_IN_ROLES as readonly string[]).includes("orchestrator"));
+  const roles = seedDefaultRoles();
+  const planner = roles.find((r) => r.name === "planner");
+  const orchestrator = roles.find((r) => r.name === "orchestrator");
+  assert.ok(orchestrator?.builtIn);
+  // An existing roles.json that predates the role gets this in-memory fallback;
+  // the file itself is never rewritten by the loader.
+  assert.deepEqual(orchestrator?.model, planner?.model);
 });

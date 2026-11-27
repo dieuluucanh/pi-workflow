@@ -6,8 +6,8 @@
  * Drives the real `tool_call` handler: write mode `allow` must not escape the
  * folder scope; sensitive write targets stay blocked inside the folder; the
  * "Always allow" dialog persists a project-scoped write grant; and ordinary
- * in-repo toolchain commands (sed, npm run build, npx, …) must not prompt in
- * Default-allow or Build.
+ * in-repo commands (including read-only sed and test runners) must not prompt
+ * in Default-allow or Build.
  */
 
 import { test } from "node:test";
@@ -403,7 +403,7 @@ test("write: Build mode allows in-repo toolchain commands without a dialog", asy
   }
 });
 
-test("write: Default + writePolicy allow allows in-repo toolchain commands", async () => {
+test("write: Default + writePolicy allow allows in-repo commands", async () => {
   const { cwd, pi, ctx, selects, cleanup } = await boot({
     workflow: {
       folderPolicy: { mode: "repo", outside: "ask" },
@@ -463,7 +463,7 @@ test("write: folderPolicy any disables the floor's asks", async () => {
   }
 });
 
-test("write: writePolicy ask still prompts for an in-repo sed", async () => {
+test("write: writePolicy ask prompts for mutating sed but not read-only commands", async () => {
   const { pi, ctx, selects, cleanup } = await boot(
     {
       workflow: {
@@ -474,18 +474,29 @@ test("write: writePolicy ask still prompts for an in-repo sed", async () => {
     { selectAnswer: "Allow once (this turn)" },
   );
   try {
+    // Simulated by the fake tool-call gate; never execute this mutation.
     const result = await toolCall(pi, ctx, "bash", {
-      command: "sed -n '1,5p' package.json",
+      command: "sed -i 's/a/b/' package.json",
     });
     assert.equal(result, undefined);
     assert.equal(selects.length, 1, "ask is the strict opt-in");
     assert.match(selects[0]?.title ?? "", /Write policy/);
 
-    // A verify-class command is not a write and stays free under ask.
-    const before = selects.length;
-    const test = await toolCall(pi, ctx, "bash", { command: "npm test" });
-    assert.equal(test, undefined);
-    assert.equal(selects.length, before);
+    // Read-only sed and verification commands are not writes and stay free.
+    for (const command of [
+      "sed -n '1,5p' package.json",
+      "npx vitest run",
+      "npm test",
+    ]) {
+      const promptCountBefore: number = selects.length;
+      const allowed = await toolCall(pi, ctx, "bash", { command });
+      assert.equal(allowed, undefined, `${command} must be allowed`);
+      assert.equal(
+        selects.length,
+        promptCountBefore,
+        `${command} must not prompt`,
+      );
+    }
   } finally {
     await cleanup();
   }

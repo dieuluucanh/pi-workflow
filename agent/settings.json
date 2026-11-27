@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.5.2",
+  "lastChangelogVersion": "1.6.1",
   "theme": "dark",
   "packages": [
     "npm:pi-lens",
@@ -22,7 +22,9 @@
     "command-code/deepseek/deepseek-v4.1-flash",
     "openai-codex/gpt-6.1-sol",
     "openai-codex/gpt-6.1-terra",
-    "openai-codex/gpt-6-luna"
+    "openai-codex/gpt-6-luna",
+    "opencode-go/hy4-flash-free",
+    "openai-codex/gpt-5.6-luna"
   ],
   "defaultThinkingLevel": "high",
   "defaultProvider": "command-code",
@@ -83,11 +85,12 @@
       ]
     },
     "handoff": {
-      "mode": "plannotator"
+      "mode": "plannotator",
+      "executionMode": "build"
     }
   },
   "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.1",
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.2",
     "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0",
     "{\"source\":\"npm:pi-memory\",\"scope\":\"user\"}": "0.4.2"
   },

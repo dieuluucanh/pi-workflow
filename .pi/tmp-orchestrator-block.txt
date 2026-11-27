@@ -1,0 +1,479 @@
+  // ── Orchestrator production composition (steps 9/11/16–22) ──────
+  //
+  // Everything below turns the injected-port runtimes into live effects. The
+  // order is deliberate: a child host must exist before a dispatcher, the
+  // dispatcher before a dispatch, and verification before acceptance.
+
+  function orchestratorRoot(): string {
+    const cwd = (currentSessionCtx as any)?.cwd;
+    return typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
+  }
+
+  function orchestratorWorkspaceKey(): string {
+    const root = path.resolve(orchestratorRoot()).replace(/\\/g, "/");
+    return process.platform === "win32" ? root.toLowerCase() : root;
+  }
+
+  async function loadPiSdk(): Promise<{
+    SessionManager: {
+      create(cwd: string, sessionDir?: string, options?: { id?: string; parentSession?: string }): never;
+      open(path: string, sessionDir?: string, cwdOverride?: string): never;
+    };
+  }> {
+    // A supported peer dependency, resolved at runtime. Never a bundled copy
+    // and never a node_modules patch.
+    const moduleName = ["@earendil-works", "pi-coding-agent"].join("/");
+    const loaded: any = await import(moduleName);
+    if (!loaded || typeof loaded.SessionManager !== "object") {
+      throw new Error("the Pi SDK SessionManager is unavailable in this host");
+    }
+    return { SessionManager: loaded.SessionManager };
+  }
+
+  function ensureOrchestratorSdk(): ReturnType<typeof createSdkWorkerPort> {
+    if (orchestratorSdk) return orchestratorSdk;
+    orchestratorSdk = createSdkWorkerPort({
+      loadSdk: async () => (await loadPiSdk()) as never,
+    });
+    return orchestratorSdk;
+  }
+
+  function resolvePiCli(): Promise<{ command: string; baseArgs?: readonly string[] } | null> {
+    const explicit = (process.env.PI_CLI ?? "").trim();
+    if (explicit) {
+      return Promise.resolve(fs.existsSync(explicit) ? { command: explicit } : null);
+    }
+    try {
+      const finder = process.platform === "win32" ? "where" : "which";
+      const found = spawnSync(finder, ["pi"], { encoding: "utf8" });
+      const first = String(found.stdout ?? "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)[0];
+      return Promise.resolve(first ? { command: first } : null);
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+
+  function ensureDesktopSessionHost(): ReturnType<typeof createDesktopSessionHost> | undefined {
+    if (orchestratorDesktop) return orchestratorDesktop;
+    const bus: any = (pi as any).events;
+    if (!bus || typeof bus.on !== "function" || typeof bus.emit !== "function") return undefined;
+    try {
+      orchestratorDesktop = createDesktopSessionHost({
+        bus: {
+          on: (channel, handler) => bus.on(channel, handler),
+          emit: (channel, payload) => bus.emit(channel, payload),
+        },
+        ownerCommand: "workflow-bridge",
+        clock: {
+          now: () => Date.now(),
+          setTimeout: (callback, ms) => setTimeout(callback, ms) as unknown as object,
+          clearTimeout: (handle) => clearTimeout(handle as never),
+        },
+        grant: () => {
+          const held = bridgeGrantHolder.current();
+          return held
+            ? {
+                token: held.token,
+                ownerCommand: held.ownerCommand,
+                sessionId: held.sessionId,
+                epoch: held.epoch,
+              }
+            : undefined;
+        },
+        onError: () => undefined,
+      });
+      orchestratorDesktop.probe();
+    } catch {
+      orchestratorDesktop = undefined;
+    }
+    return orchestratorDesktop;
+  }
+
+  /** Prefer a source-bound Desktop tab, else a real Terminal window. */
+  function createPreferringChildHost(
+    desktop: ChildHost | undefined,
+    terminal: ChildHost,
+  ): ChildHost {
+    const used = new Map<string, ChildHost>();
+    const candidates = desktop ? [desktop, terminal] : [terminal];
+    const pick = async (): Promise<
+      | { host: ChildHost; capability: Awaited<ReturnType<ChildHost["capabilities"]>> }
+      | undefined
+    > => {
+      for (const host of candidates) {
+        const capability = await host.capabilities();
+        if (capability.available) return { host, capability };
+      }
+      return undefined;
+    };
+    return {
+      async capabilities() {
+        const chosen = await pick();
+        if (chosen) return chosen.capability;
+        const all = await Promise.all(candidates.map((host) => host.capabilities()));
+        return {
+          available: false,
+          label: all[0]?.label ?? "child host",
+          separateWindow: false,
+          focus: false,
+          reason: all.map((cap) => `${cap.label}: ${cap.reason ?? "unavailable"}`).join("; "),
+        };
+      },
+      async prepare(input) {
+        const chosen = await pick();
+        if (!chosen) {
+          return {
+            ok: false,
+            error:
+              "no child host is available (the Terminal launcher and the Desktop tab service both refused)",
+          };
+        }
+        const prepared = await chosen.host.prepare(input);
+        if (prepared.ok) used.set(prepared.spec.workerId, chosen.host);
+        return prepared;
+      },
+      async launch(spec) {
+        const host = used.get(spec.workerId);
+        if (!host) return { ok: false, error: "the child was created by no bound host" };
+        return host.launch(spec);
+      },
+    };
+  }
+
+  function ensureOrchestratorChildHost(): ChildHost {
+    if (orchestratorChildHost) return orchestratorChildHost;
+    const terminal = createTerminalChildHost({
+      sdk: async () => ensureOrchestratorSdk(),
+      terminal: createTerminalHost({
+        platform: process.platform,
+        resolvePi: resolvePiCli,
+        label: "Pi Terminal",
+      }),
+    });
+    const desktop = ensureDesktopSessionHost();
+    orchestratorChildHost = createPreferringChildHost(
+      desktop
+        ? createDesktopChildHost({
+            host: desktop,
+            parentSessionRef: () => sessionRefFor(),
+            label: "Pi Desktop",
+          })
+        : undefined,
+      terminal,
+    );
+    void refreshOrchestratorHostCapability();
+    return orchestratorChildHost;
+  }
+
+  function sessionRefFor(): string {
+    try {
+      const id = (currentSessionCtx?.sessionManager as any)?.getSessionId?.();
+      if (typeof id === "string" && id.length > 0) return id;
+    } catch (_e) {
+      void _e;
+    }
+    return `${process.pid}`;
+  }
+
+  async function refreshOrchestratorHostCapability(): Promise<void> {
+    if (!orchestratorChildHost) return;
+    try {
+      orchestratorHostCapability = await orchestratorChildHost.capabilities();
+    } catch (error: unknown) {
+      orchestratorHostCapability = {
+        available: false,
+        label: "child host",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    updateStatusIfBound();
+  }
+
+  function updateStatusIfBound(): void {
+    if (!currentSessionCtx) return;
+    try {
+      updateStatus(currentSessionCtx);
+    } catch (_e) {
+      void _e;
+    }
+  }
+
+  function ensureOrchestratorLeases(): ReturnType<typeof createFileWorkspaceLeases> {
+    if (orchestratorLeases) return orchestratorLeases;
+    orchestratorLeases = createFileWorkspaceLeases({
+      root: path.join(getAgentDir(), "workflow"),
+    });
+    return orchestratorLeases;
+  }
+
+  function ensureOrchestratorControl(ctx: ExtensionContext): RunControl {
+    if (orchestratorControl) return orchestratorControl;
+    const view = orchestratorRuntime?.view();
+    if (!view) throw new Error("no orchestrator run is bound");
+    orchestratorControl = createRunControl({
+      profileDir: getAgentDir(),
+      runId: view.runId,
+      onEvent: async (event) => {
+        await ingestOrchestratorEvent({
+          messageId: event.messageId,
+          seq: event.seq,
+          kind: event.type,
+          runId: event.runId,
+          taskId: event.taskId,
+          attemptId: event.attemptId,
+          sessionId: event.sessionId,
+          generation: event.generation,
+          leaseGeneration: event.leaseGeneration,
+          epoch: orchestrationEpoch,
+          at: event.sentAt,
+          ...(event.payload && typeof event.payload === "object"
+            ? (event.payload as Record<string, unknown>)
+            : {}),
+        });
+        if (event.type === "candidate" || event.type === "waiting-user") {
+          await ensureOrchestratorPump().drainAndDeliver();
+        }
+        updateStatusIfBound();
+      },
+      onError: (error) => {
+        try {
+          pi.appendEntry("workflow-orchestrator-control-error", {
+            at: Date.now(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch (_e) {
+          void _e;
+        }
+      },
+    });
+    void ctx;
+    return orchestratorControl;
+  }
+
+  function builderModelPlan():
+    | { provider: string; id: string; thinking?: string }
+    | undefined {
+    const model = lastKnownModel ?? { id: "unknown", contextWindow: null, maxOutputTokens: null };
+    const resolved = resolveBudget({
+      role: "builder",
+      model: {
+        id: model.id,
+        contextWindow: model.contextWindow ?? null,
+        maxOutputTokens: model.maxOutputTokens ?? null,
+      },
+    });
+    if (!resolved.ok) return undefined;
+    return { provider: model.provider ?? "unknown", id: resolved.plan.model };
+  }
+
+  function ensureOrchestratorDispatcher(
+    ctx: ExtensionContext,
+  ): ReturnType<typeof createChildDispatcher> {
+    if (orchestratorDispatcher) return orchestratorDispatcher;
+    ensureOrchestratorChildHost();
+    const leases = ensureOrchestratorLeases();
+    const workspaceKey = orchestratorWorkspaceKey();
+    const control = ensureOrchestratorControl(ctx);
+    orchestratorDispatcher = createChildDispatcher({
+      runtime: () => orchestratorRuntime,
+      control: () => control,
+      host: () => ensureOrchestratorChildHost(),
+      builderModel: () => builderModelPlan(),
+      parentSessionRef: () => sessionRefFor(),
+      cwd: () => orchestratorRoot(),
+      agentDir: () => getAgentDir(),
+      trust: () => "session",
+      allocateGeneration: () => leases.nextGeneration?.(workspaceKey) ?? 1,
+      now: () => Date.now(),
+    });
+    return orchestratorDispatcher;
+  }
+
+  /** Minimal git runner used by the baseline/commit ports. */
+  function runGitSync(
+    args: string[],
+    cwd: string,
+  ): { ok: boolean; stdout: string; stderr: string } {
+    try {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+      return {
+        ok: result.status === 0,
+        stdout: String(result.stdout ?? ""),
+        stderr: String(result.stderr ?? ""),
+      };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  function createLiveBaselinePort(): ReturnType<typeof createGitBaselinePort> {
+    return createGitBaselinePort({ runGit: runGitSync });
+  }
+
+  async function captureOrchestratorBaseline(attemptId: string): Promise<void> {
+    if (orchestratorBaseline?.attemptId === attemptId) return;
+    const captured = await captureBaseline({
+      workspace: {
+        workspaceKey: orchestratorWorkspaceKey(),
+        root: path.resolve(orchestratorRoot()),
+        kind: "git",
+      },
+      port: createLiveBaselinePort(),
+      now: Date.now(),
+    });
+    if (captured.ok) {
+      orchestratorBaseline = { attemptId, baseline: captured.value };
+      orchestratorWorkspaceRev = captured.value.digest;
+    } else {
+      orchestratorBaseline = undefined;
+    }
+  }
+
+  function ensureOrchestratorVerify(
+    ctx: ExtensionContext,
+  ): ReturnType<typeof createVerifyRuntime> {
+    if (orchestratorVerify) return orchestratorVerify;
+    const baselinePort = createLiveBaselinePort();
+    orchestratorVerify = createVerifyRuntime({
+      runtime: () => orchestratorRuntime,
+      baseline: () => {
+        const mutation = orchestratorRuntime?.view()?.state.mutation;
+        if (!mutation) return orchestratorBaseline?.baseline;
+        return orchestratorBaseline?.attemptId === mutation.attemptId
+          ? orchestratorBaseline.baseline
+          : undefined;
+      },
+      candidate: async () => {
+        const captured = await captureBaseline({
+          workspace: {
+            workspaceKey: orchestratorWorkspaceKey(),
+            root: path.resolve(orchestratorRoot()),
+            kind: "git",
+          },
+          port: baselinePort,
+          now: Date.now(),
+        });
+        if (!captured.ok) throw new Error(captured.error);
+        return captured.value;
+      },
+      executor: {
+        async run(request) {
+          // The parent's only execution path is the supported gated tool, not
+          // a raw shell: policy, deadlines and cancellation still apply.
+          const command = request.command ?? request.name;
+          const execute = (ctx as any)?.executeTool;
+          if (typeof execute !== "function") {
+            return {
+              name: request.name,
+              status: "unavailable",
+              evidence: "this host cannot execute a check tool from a tool call",
+            } as never;
+          }
+          const started = Date.now();
+          const result: any = await execute.call(ctx, "bash", { command, cwd: request.cwd });
+          const text = JSON.stringify(result ?? {}).slice(0, 4_000);
+          const exit =
+            typeof result?.exitCode === "number"
+              ? result.exitCode
+              : typeof result?.details?.exitCode === "number"
+                ? result.details.exitCode
+                : /"exitCode":\s*[1-9]/.test(text)
+                  ? 1
+                  : 0;
+          return {
+            name: request.name,
+            status: exit === 0 ? "passed" : "failed",
+            exitCode: exit,
+            evidence: text,
+            durationMs: Date.now() - started,
+          } as never;
+        },
+      },
+      workspaceRevision: () => orchestratorWorkspaceRev ?? "unbaselined",
+      now: () => Date.now(),
+    });
+    return orchestratorVerify;
+  }
+
+  function ensureOrchestratorBudget(): ReturnType<typeof createBudgetRuntime> {
+    if (orchestratorBudget) return orchestratorBudget;
+    orchestratorBudget = createBudgetRuntime({
+      runtime: () => orchestratorRuntime,
+      budgets: DEFAULT_EXECUTION_BUDGETS,
+      now: () => Date.now(),
+    });
+    void orchestratorBudget.restore();
+    return orchestratorBudget;
+  }
+
+  function ensureOrchestratorFinal(): ReturnType<typeof createFinalRuntime> {
+    if (orchestratorFinal) return orchestratorFinal;
+    orchestratorFinal = createFinalRuntime({
+      runtime: () => orchestratorRuntime,
+      ledger: commitLedger,
+      git: {
+        async stage(paths) {
+          for (const target of paths) {
+            spawnSync("git", ["add", "--", target], {
+              cwd: orchestratorRoot(),
+              windowsHide: true,
+            });
+          }
+        },
+        async commit(input) {
+          const message = `${input.message}\n\n${input.trailer}`;
+          const result = spawnSync("git", ["commit", "-m", message, "--", ...input.paths], {
+            cwd: orchestratorRoot(),
+            encoding: "utf8",
+            windowsHide: true,
+          });
+          if (result.status !== 0) throw new Error(String(result.stderr ?? "git commit failed"));
+          const sha = runGitSync(["rev-parse", "HEAD"], orchestratorRoot());
+          return { sha: sha.stdout.trim() };
+        },
+        async findCommit(trailer) {
+          const found = runGitSync(["log", "--format=%H%x00%B%x00", "-n", "50"], orchestratorRoot());
+          if (!found.ok) return null;
+          const parts = found.stdout.split("\u0000");
+          for (let index = 0; index + 1 < parts.length; index += 2) {
+            if (parts[index + 1]?.includes(trailer)) return { sha: parts[index]!.trim() };
+          }
+          return null;
+        },
+      },
+      commitMode: () => "never",
+      now: () => Date.now(),
+    });
+    return orchestratorFinal;
+  }
+
+  /** Deliver `/orchestrator say` to the live child over the control channel. */
+  async function deliverOrchestratorSay(text: string): Promise<boolean> {
+    const mutation = orchestratorRuntime?.view()?.state.mutation;
+    if (!orchestratorControl || !mutation) return false;
+    return orchestratorControl.request("say", { text }, { sessionId: mutation.sessionId });
+  }
+
+  /** Journal a usage receipt for the current assistant message (idempotent). */
+  async function recordOrchestratorUsage(input: {
+    sessionId: string;
+    messageId: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens?: number;
+    costUsd?: number | null;
+  }): Promise<void> {
+    if (!orchestratorRuntime) return;
+    const budget = ensureOrchestratorBudget();
+    await budget.recordUsage({ ...input, at: Date.now() });
+    updateStatusIfBound();
+  }
+

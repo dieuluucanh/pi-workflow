@@ -2,7 +2,1406 @@
 
 All notable changes to this package are documented in this file.
 
-## [Unreleased]
+## [0.17.5] - 2026-11-27
+
+Release target: **0.17.5**, the first npm release after **0.13.0**. The
+0.14.0–0.17.4 sections below record development milestones included in this
+release, not separately published versions. Live human acceptance and Pi
+Desktop staging are **not verified** by this release.
+
+### Release overview and migration
+
+- **Breaking:** replaces the frozen/journaled execution engine with normal
+  markdown plans and a model-driven Orchestrator. Old engine runs are not
+  migrated; restart those from the approved plan. Each row uses an in-process
+  Build child; verification is ordinary visible bash, with no automatic
+  diff/check/acceptance engine.
+- **Breaking:** `/orchestrator <verb>` and `/review <verb>` replace the old
+  hyphenated command families. Reviewer body replacement and chunked plan
+  submission are removed. The Planner owns the body, the Reviewer owns its
+  appendix, and a bounded revision loop settles required changes before handoff.
+- Adds shell deadlines/quarantine, prompt refinement and its host-agnostic
+  composer contract, multi-repository rows, additive action groups/mode choices,
+  live profile/role model switching, and independent child TODO presentation.
+- Fixes dormant-run session ownership, child settle/report races, execution
+  TODOs firing during Plan/Review, shared safe-shell classification, and the
+  duplicate activation notices detailed below.
+- Maintains experimental Orchestrator status. Automated checks do not establish
+  real-provider, Terminal or Desktop acceptance.
+
+### Documentation and verification
+
+- Restores descending changelog milestone order, updates install/tested-version
+  examples, replaces obsolete operator instructions and clearly labels legacy
+  acceptance records. Desktop bundle pins must be checked independently.
+- Node 24.22.2: root release-tool tests and the four-package verification gate
+  pass, including typechecks, package tests, packed import closure and packed
+  extension load smoke tests.
+
+### Fixed — one activation notice
+
+- **No duplicated `/profile use` block.** Every live-owner summary now arrives
+  in one info notice. The Pi TUI `showStatus` renders each info row from one
+  mutable `lastStatusMessage`, so a row created before the next entry could be
+  repainted with a later message; the extension guarantees one info notice per
+  command and never interleaves durable entries between two info notices.
+- **One info notice per command.** The entry writer never notifies: each
+  activation, role, delete and editor command emits exactly one info notice,
+  after every durable entry, with the default profile, default model,
+  Default-mode model and live reviewer/builder-child/settling-child lines
+  folded into it.
+- **Applied-switch info notices removed.** The reviewer line no longer raises a
+  separate `notifyReview` info notice; when folded into the neutral activation
+  notice it is deliberately unprefixed (profile/role summary content), while
+  reviewer-authored warnings keep the `Review Mode:` prefix. The notify-scope
+  audited set drops from 29 to 28 review-owned call sites.
+- **`/role set`, `/role use`, the `/role` picker, profile delete and the
+  profile editor** fold their summary into the same single activation notice
+  instead of emitting an extra info row.
+- **Tests:** `profile-live-switch.test.ts` (30), the profiles composer tests and
+  `notify-scope.test.ts` (audited set 28) cover the one-notice contract.
+
+## [0.17.4] - 2026-11-27
+
+Local Workflow version **0.17.4**, not published to npm or GitHub. Desktop staging
+and live human acceptance are not verified by this entry.
+
+### Fixed — independent Orchestrator child TODO panel
+
+- Child display preference is independent of the parent's plan-scoped preference
+  and scoped to the child run: a new run gets effective Auto through scope
+  mismatch, while reloading the same run restores its choice.
+- `/todos` and terminal `Ctrl+Alt+O` target the active parent/child panel; use
+  `/orchestrator view parent|child|auto` to switch. The `todos` action group
+  exposes Auto, Show, Collapse and Hide in child view, including empty, hidden
+  and headerless states. `/todos clear` refuses in child view with parent-view
+  guidance.
+- Empty child presentation follows the real header/state matrix, without fake
+  rows or zero-total progress. Child refresh/replay preserves parent preference
+  and bookkeeping; progress remains non-empty-only.
+- Coverage includes pure panel derivation and decoding, contribution behavior,
+  live widget rendering, active targeting, empty/headerless selection, run-scope
+  persistence/replay, and parent-state isolation (`todo-panel.test.ts` and
+  `workflow-contributions.test.ts`). This is automated evidence, not live host
+  acceptance.
+
+### Changed — shared read-only shell classification
+
+- The shared classifier now recognizes a fail-closed subset of safe `sed` print/select programs, package-runner wrappers (`npx`, `pnpm exec`, and related forms), and transparent launchers such as `env`, `timeout`, `nice`, `stdbuf` and `command`. Plan and Review use the same verdict table; Explorer receives read-only commands but not verification commands. Read-only `sed` and wrapped verification no longer count as writes under `writePolicy: ask`.
+- `awk`, `sed -i`/`-f` and unsafe `sed` programs, installs, builds, real file redirects and git mutations remain restricted. Wrapper and `sed` file operands are attributed for path checks, including operands reached through wrappers.
+- Fail-closed safeguards include an environment-assignment name allowlist (excluding startup and module-resolution variables), wrapper flag checks and a recursion-depth cap. Package-runner option parsing respects `--`; timeout duration values are validated, and unknown command flags are refused. Review refusal reasons, copy and prompts now describe the shared policy; regression tests cover write-policy ask behavior and unchanged mutation grant keys.
+- Added `shell-programs.ts` and `shell-wrappers.ts` with their tests. Verification is not an OS sandbox: allowed verification may execute project code, and a package runner may fetch a missing named tool.
+
+## [0.17.3] - 2026-11-26
+
+This patch keeps execution TODOs out of the plan-editing phase. Version bumped by
+this change, **not published**; it builds on the unreleased `0.17.2` profile
+live-switch patch. A real Plan/Review session showed the failure: the revision
+turn's "Plan Steps" message started a run before the revision prompt arrived, and
+the TODO footer, reminder, `[DONE:n]` completion, stale warning and auto-commit
+fired while the Planner was only editing a plan.
+
+### Fixed — execution TODOs are live only after Build starts
+
+- **One follow-up per revision turn.** `sendRevisionFollowUp()` delivers only the
+  `# Planner revision — round N` prompt; the extra `workflow-todo-list` "Plan
+  Steps" custom message is gone, so a revision turn can no longer start an
+  execution run before its instructions arrive.
+- **The placeholder moved to the Build kickoff.** `agent_end` no longer
+  synthesizes a single "Step 1" row from the plan title during Plan/Review.
+  `seedExecutionTodoOnBuild()` creates the fallback row when Build starts from an
+  approved plan (best-effort, in its own `try/catch`, so it cannot block or roll
+  back the kickoff), and a list that belongs to a different plan is cleared
+  before the new `todos.planPath` is assigned, so a new plan does not inherit old
+  rows.
+- **The Plan TODO list is read-only.** `todoExecutionLive()` (`mode !== "plan"`)
+  is the single predicate: the passive `[TODO …]` footer, the `[TODO LIST]`
+  context reminder, `[DONE:n]` completion, the per-step auto-commit and the
+  "Todo list not updated" stale warning are all gated on it, and the footer skips
+  `.pi/plans/` writes. `workflow_todo` refuses every action except `list` in Plan
+  mode (`details.error: "plan-mode-read-only"`) and `list` reports the steps as
+  planned, not executing.
+- **Prompt wording.** The injected Plan context calls the list read-only execution
+  state created by the Build kickoff, the `[REVIEW MODE ACTIVE]` note says a
+  revision turn edits the plan and never touches the execution list, and
+  `buildPlanRevisionPrompt()` opens with "This is a planning turn, not
+  implementation" and tells the Planner to leave the execution TODO list
+  untouched (the old "update the TODO list" rule is gone).
+- **A custom continuation keeps an open revision cycle.** A non-user custom run
+  during a pending Planner revision no longer calls
+  `endReviewTurn()`/`beginReviewCycle()`, so a display message cannot reset the
+  cycle or drop the findings the Planner was asked to answer.
+- **The Plan-mode panel is a preview.** The pinned panel renders a Plan list as
+  `☐ Todos d/t · planned · not executing · /todos expand`, never promotes a row to
+  `▶` (including an `in_progress` row), and offers no `next` step until Build
+  starts.
+
+### Tests and docs
+
+- `review-negotiation.test.ts`, `plan-revision.test.ts`, `plan-naming.test.ts`,
+  `todo-panel.test.ts` and `workflow-mode.test.ts` cover the one-message revision
+  follow-up, the empty Plan list and the Build seed, the gated
+  footer/reminder/`[DONE]`/stale/auto-commit paths (with a Build-mode
+  counterpart), the read-only `workflow_todo`, the custom-continuation cycle
+  guard, the plan-preview panel and the `todoExecutionLive` table.
+- `README.md` documents the read-only Plan/Review list and the Build-kickoff
+  ownership; `package.json` is `0.17.3`.
+
+## [0.17.2] - 2026-11-26
+
+Development milestone included in 0.17.5; the one-notice behavior in 0.17.5
+supersedes this milestone's per-owner notification channels.
+
+### Added — live profile and role switching
+
+- `/profile use`, profile-picker activation, `/profile use none`, `/role set`
+  and role-picker saves reconcile the live parent, reviewer and Build child in
+  place. The in-flight request keeps its old model; the next request uses the
+  new model without an abort, session restart or re-seeded review round.
+- Reviewer model labels, footer/status and `/review status` follow the applied
+  model. Refused switches retain the live model, warn with both model names,
+  and preserve the selection for the next child or round. A settling child is
+  left alone.
+- One display-only `workflow-model-switch` audit per owner records
+  `scope`/`role`, `from`, `to`, `ok`, `changed`, `at` and any error/reason.
+  The entry writer is silent. Scopes are `parent`, `reviewer`, `builder-child`
+  and child-local `child`.
+
+### Changed — the parent owns the launch model
+
+- A child-local profile switch affects only that in-process session through
+  `setModel(..., { persist: false })`. It never writes the global profile,
+  Workflow default model, native default model/thinking mirror, or the parent's
+  transcript/settings. The parent alone chooses new children's launch model.
+- Tests cover running/paused/handoff/warm-idle reviewers, refused switches,
+  each owner and audit scope, child-local settings isolation, and runtime/UI
+  model labels (`profile-live-switch`, `in-process-child`, `review-runtime`
+  and `review-ui` suites).
+
+## [0.17.1] - 2026-11-26
+
+This release fixes the Planner↔Reviewer revision loop introduced in `0.17.0`
+(version bumped, not published). The loop existed but could stall, hand off a
+plan the reviewer had refused, or silently lose the reviewer's notes; the
+contract below is now enforced by the harness instead of trusted.
+
+### Fixed — Planner↔Reviewer revision loop
+
+- **Note ids are strict per-round `R<n>`.** Numbering restarts at `R1` in every
+  review round, so a restated note may reuse its previous id, and omitted ids
+  are still assigned `R1..Rn` in submission order (`R01` canonicalises to
+  `R1`). Any other supplied form (`RV1`, `F1`, `1`, a blank) and a duplicate id
+  inside one submission are rejected by `review_submit` with the offending
+  entries named. The rendered `## Reviewer Revisions` appendix is parsed back
+  and compared field by field (`id`/`step`/`change`/`findingIds`, in order)
+  with the submission, so a note that would not survive the one-bullet grammar
+  is refused **before** anything is written rather than silently dropped or
+  reshaped.
+- **`notes-unparsed` is a fail-closed outcome.** A `revise`/`block` round that
+  submitted required changes which parse to zero notes is neither revisable nor
+  approvable: the Planner gets no revision turn, the plan is **not handed off**,
+  and the notice names the submitted-versus-parsed counts so the refusal is
+  actionable. `ReviewNegotiationDecision` gained `handoff`, which is false for
+  `continue` and `notes-unparsed` and true for every terminal outcome
+  (`converged`, `exhausted`, `no-revision`, `review-failed`).
+- **The revision-turn lifecycle is tracked, not guessed.** A revision turn is
+  recorded before its follow-up is delivered and resolved exactly once by the
+  run that owns it; a pending turn that has not started blocks the leftover
+  `agent_end` from resolving, reviewing or handing off a stale snapshot, a
+  custom (todo/follow-up) run does not reset the turn, and a genuine new task
+  does. The decision is made from the round's result snapshot, never from the
+  mutable review-state closure, and a revise round can no longer fall through
+  to a silent handoff when the turn cannot be opened.
+- **A no-op revision gets one corrective turn.** A Planner turn that changes
+  nothing is not a revision and not a verdict: while the budget allows it, the
+  same notes earn one corrective turn whose prompt says the previous turn
+  changed nothing (no handoff, no re-review); once the budget is spent the
+  handoff carries the `exhausted` non-convergence line.
+- **Every revision turn opens a fresh review cycle.** The re-review is round 1
+  of its own cycle, so `rounds` stays a within-cycle cap and can never cut a
+  revision short; the previous session-wide counter (and any `keepRound`/
+  `loopReReview` bypass to work around it) is gone. A manual `/review` also
+  starts at round 1 of a new cycle instead of being refused as round 2.
+- **Every decision is audited.** Each negotiation decision writes one
+  `workflow-review-negotiation` entry (`outcome`, `request`, `handoff`, round,
+  budget, parsed notes, submitted changes, verdict, reason) from the round
+  snapshot it decided from, on both the automatic post-Plan path and manual
+  `/review`, so converged, exhausted, no-revision, review-failed and
+  notes-unparsed decisions all leave a trace.
+- **The attempt guard stops a non-final retry from ending the loop.** A
+  non-final (retried/truncated) run is skipped and audited: it may not resolve
+  the revision turn, review or hand off while the retried run owns the plan,
+  and the skip notice is shown once per distinct attempt.
+- New/updated tests: `review-notes.test.ts` (id grammar and round-trip),
+  `plan-revision.test.ts` (lifecycle seam, attempt guard, corrective turn),
+  `review-negotiation.test.ts` (decision matrix, fail-closed handoff, audit,
+  per-revision cycle) and `notify-scope.test.ts`.
+
+### Changed — docs and package manifest
+
+- `README.md` documents the strict per-round `R<n>` ids, `notes-unparsed`, the
+  corrective no-op turn, `rounds` (within-cycle cap) versus `maxRevisions` (the
+  loop budget), the handoff decision, the audit entry and the attempt guard, plus
+  the fact that each revision turn starts a fresh review cycle.
+- `package.json` is `0.17.1` and `files[]` now ships `plan-revision.ts` and
+  `review-negotiation.ts`, which `index.ts` imports but earlier tarballs did not
+  include.
+
+## [0.17.0] - 2026-11-26
+
+This release is **cut by the 2026-11-26 review-note/step-count plan** (version
+bumped by it, not published); the `0.16.0` advisory-note bullets below are
+superseded.
+
+### Breaking — the Planner↔Reviewer revision loop replaces the advisory notes (2026-11-26)
+
+- **The reviewed plan now has two owners.** The Planner owns the plan BODY; the
+  Reviewer owns the `## Reviewer Revisions (round N)` appendix. A revise verdict
+  with open required changes now earns the Planner a **revision turn** instead
+  of ending the cycle: it edits the body, answers every note id through
+  `plan_revision_done` as `applied`, `rejected` or `not_applicable` (a concrete
+  reason is required for the last two, an `applied` with an unchanged body is
+  refused, and editing the appendix is refused), and the reviewer re-reviews
+  the revised body with those responses. The loop repeats until the reviewer
+  approves or the budget is spent, then hands off.
+- **`maxRevisions` is the new budget** (`workflow.reviewMode.maxRevisions`,
+  `0`–`5`, default `3`; `0` = the previous one-shot review). `rounds` stays the
+  per-cycle Review round cap. When the budget is exhausted with notes still
+  open the loop stops without converging: the handoff says so, Approve accepts
+  the plan as written and Give feedback continues. The loop covers the
+  automatic post-Plan review and `/review` in Plan mode; `/review` outside Plan
+  mode stays one-shot.
+- **The downstream advisory-note pipeline is reverted, not deprecated.** Rows
+  no longer carry `reviewNotes`, the run no longer keeps `unboundReviewNotes`,
+  the child kickoff no longer carries a `## Review notes (advisory)` block, the
+  mission asks the parent for no note placement or acknowledgement (mission
+  **v6**), and the report no longer lists note conflicts. **The Orchestrator and
+  direct Build consume only the approved plan's steps** — they never read, parse
+  or bind the appendix. A step change goes back to Plan through the handoff's
+  Feedback path.
+- **`countPlanSteps`/`stepCount` are deleted.** The harness no longer guesses a
+  plan's step count from its text, so the note-to-row binding heuristic and its
+  false warning (a long plan reported as "24 numbered steps") are gone with it.
+  One step per row is the model's call.
+- **The chunked rewrite path stays deleted.** `review_plan_begin` /
+  `review_plan_chunk` / `review_plan_finalize`, the plan assembler, the
+  `replacement-body` submission and the `chunkedSubmit`/`chunkChars` settings
+  remain removed; there is no body rewrite left to configure.
+
+### Changed — docs
+
+- `README.md` and `docs/plan-format.md` describe the loop, the body/appendix
+  ownership split, the `plan_revision_done` dispositions and the fact that the
+  appendix never reaches a row or a child. `maxRevisions` is documented in the
+  Review Mode settings table.
+
+### Fixed — Orchestrator ownership follows execution, not record existence (2026-11-26)
+
+A finished run kept refusing every prompt: input ownership was derived from
+whether an `OrchestratorRun` record existed (`state.hasRun`) instead of whether
+a child or the run phase still owned execution, so an idle, interrupted or
+settled record blocked Orchestrator, Plan, Build and Default alike.
+
+- **Input is phase-based.** `orchestratorInputDecision()` now takes
+  `runPhase`/`childPhase`: `running` forwards, `paused` queues, `starting` and
+  `settling` return short truthful wait notices, the run phase `running`
+  (between rows) refuses, and every dormant or terminal phase allows the prompt.
+  It shares `executionOwnsSession()` with mode switching and Reviewer admission
+  so the three cannot drift. `OPERATOR_SCHEMA_VERSION` is `5`.
+- **A settled run auto-completes.** New `completeOrchestratorRunIfSettled()`
+  sets `completed` when every row is `completed`/`cancelled` and no child is
+  live, fired from a successful TODO write, the child's `idle` publish after its
+  report is recorded, and session restore. A recorded failure or abort wins, so
+  a settled run whose child then fails or is aborted stays `interrupted`/`paused`.
+- **Terminal runs are sealed and replaceable.** `completed`/`cancelled` runs are
+  not revivable by `orchestrator_dispatch` (explicit row included),
+  `orchestrator_retry`, `/orchestrator retry` or `/orchestrator resume`;
+  `orchestrator_start` and `/orchestrator start` replace a terminal or fully
+  settled run once no child is live. A cancelled row is terminal for `next`,
+  retry and resume selection, and terminal status reports no stale next row.
+- **Abort and stop clarified, not changed.** `/orchestrator abort` keeps
+  `requiresMode: true` because it only applies to a live child.
+  `/orchestrator stop` remains the escape when rows can no longer settle (for
+  example after `/todos clear`, since `runRowsSettled` reads the live TODO list).
+- New/updated tests: `orchestrator-run.test.ts` (terminal/settled helpers),
+  `orchestrator-operator.test.ts` (phase decisions, replacement, cancelled rows),
+  `orchestrator-lifecycle.test.ts` (settle → complete → prompt reaches parent in
+  Plan and Orchestrator → replacement start → `start <plan>` recording → failure
+  and abort precedence) and `workflow-contributions.test.ts` (no stale next row).
+
+## [0.16.0] - 2026-11-25
+
+### Changed — Review Mode is advisory: the plan body is never rewritten (2026-11-25)
+
+- **The reviewer is a reference, not an author.** `review_submit` appends
+  exactly one `## Reviewer Revisions (round N)` section to the plan file and
+  leaves the author's plan body byte-identical; a pass-2 resubmission replaces
+  that round's section instead of stacking a second one. Nothing in the
+  pipeline applies a revision to the body, so there is no diff and no
+  apply/keep choice at the handoff — the plan is printed as the planner wrote
+  it.
+- **Revision ids make every note addressable.** Each required change is
+  rendered as `- **R2 · Step 3:** … _(F1)_`: a stable `R<n>` id (normalised to
+  `R1..Rn` in submission order when the model omits one) plus the finding ids
+  it answers. The appendix also states its own precedence:
+  `_Advisory review notes. The approved plan body is authoritative on any
+  conflict._`
+- **The notes reach the Orchestrator and the Build child, with a fallback.**
+  `parseReviewNotes` parses the appendix deterministically (shared with the
+  renderer, with a render→parse round-trip test), the run keeps every note it
+  could not bind in `unboundReviewNotes`, and the mission tells the parent to
+  place those notes itself. Rows are bound only when the plan's numbered step
+  count and the model's row count match — otherwise every note stays unbound
+  and the mismatch is reported, never guessed onto a row.
+- **The child kickoff carries `## Review notes (advisory)`.** The Build child
+  gets the approved plan as authoritative and each bound row's notes as a
+  bounded block that never drops an id (surplus notes collapse into
+  `… and N more: R7, R8, R9`). Its final summary must acknowledge every id as
+  `applied`, `not applicable — <why>`, or
+  `conflicts with the plan — followed the plan`, and the parent reports each
+  conflict with the row ref and the child's reason. A note is never a
+  requirement, a gate or an acceptance criterion.
+- **The chunked rewrite path is deleted, not repaired.**
+  `review_plan_begin`/`review_plan_chunk`/`review_plan_finalize`, their
+  registration and permission rows, the plan assembler
+  (`beginPlan`/`appendPlanChunk`/`takeAssembledPlan`/`resetPlan`), the
+  `replacement-body` submission, the pass-1 chunk prompt branch, and the
+  `chunkedSubmit`/`chunkChars` config keys are gone. An old `settings.json`
+  that still carries those keys is tolerated: unknown review keys are ignored,
+  not fatal.
+- **The handoff names the note count.** The handoff line gains `· N notes`
+  beside the finding count (`Review: revise · 3 findings · 2 notes`). No body
+  rewrite is implied by it.
+- **`planHash` and the guards are documented as they behave.**
+  `stripReviewAppendix` removes only `## Review changes` and
+  `## Unresolved findings`, so the hash covers the author's body **plus** the
+  `## Reviewer Revisions` appendix: a reviewer round changes it once, and the
+  same body with the same appendix hashes identically. Tests pin the handoff
+  print dedupe, the Plannotator stale-tab check, the approval re-read and the
+  pause/review `unchanged` comparison against that behaviour.
+
+### Compatibility
+
+- This checkout is `@dieulc/workflow` **0.16.0**. Pi Desktop's
+  `resources/workflow.lock.json` still pins the previously published tarball;
+  it moves to 0.16.0 only after a separate, explicitly approved release. The
+  Desktop architecture docs that name an older publisher version are release
+  follow-ups, not part of this change.
+- The reviewer tool allowlist is exactly `read`, `grep`, `find`, `ls`,
+  `review_bash`, `review_explore`, `review_submit`, `review_pass_done`; the
+  removed `review_plan_*` names are not registered in any form.
+- Contribution v1, the mode/menu contract and the 0.14.0 verb grammar are
+  unchanged.
+
+## [0.15.0] - 2026-11-25
+
+### Changed — action groups, the mode menu and inline controls (2026-11-25)
+
+- **Action groups are additive v1 presentation data.** An action may carry
+  `group { id, label, order, placement }`. Identity is `(owner.id, group.id)`,
+  `placement` is the closed enum `inline | menu`, `order` defaults to `0`, and
+  `placement` defaults to `inline`; an ungrouped action keeps the old code path,
+  so an older host renders it exactly as before. Workflow publishes
+  `run-controls` (inline, order 30), `review-controls` (inline, order 30) and
+  `todos` (menu, order 40). Unknown placements and malformed groups fail the
+  envelope rather than being guessed.
+- **`mode-choice` is its own kind and slot.** A choice carries label,
+  description, tone, order and presentation-only `checked`; the required
+  same-owner `actionRef` names the `kind:"action"` that executes it. A choice
+  has no `command`, `enabled` or `disabledReason` of its own. A dangling, foreign
+  or wrong-kind reference parses but is refused by the resolver instead of
+  inventing a command.
+- **Four clean menu labels, one unchanged glyph identity.** The menu publishes
+  `Default`, `Plan`, `Orchestrator` and `Build` choices, while the composer mode
+  badge keeps its existing `◦ default`, `⏸ plan`, `🧭 orchestrator` and
+  `▶ build` labels byte-for-byte. Each choice resolves to a `mode-<key>` action
+  whose command is the registered `/default`, `/plan` (or `/workflow` when
+  `/plan` is held by another owner), `/orchestrator`, or `/build`.
+- **Mode actions are disabled precisely.** The current mode is disabled with
+  `current mode`; a live Review/handoff lock disables every other mode with the
+  lock notice; a mode whose command could not be registered is disabled with a
+  named reason instead of an enabled dead button.
+- **`Auto todos` and the TODO menu.** The display verbs are now `Auto todos`,
+  `Show todos`, `Collapse todos` and `Hide todos` in the `todos` menu group; the
+  computed `todos-toggle` action is removed. The four verbs are not published
+  when a live child pins the panel, and the TODO action set in that view is
+  only the `orchestrator-view` action — `Show parent todos` in child view,
+  `Show child todos` otherwise (the run controls stay in `run-controls`). The
+  progress row counts the list the pinned panel shows.
+- **Review controls are inline.** Running publishes `Pause review` +
+  `Abort review`; paused publishes `Resume review` + `Abort review`, both in
+  `review-controls`. The standalone `review` action (status/resume) is removed;
+  the `workflow-review` status line owns the phase, and handoff/transition
+  publish no controls because the review tab owns the decision. Commands are
+  `/review pause`, `/review resume`, `/review abort` — never the retired
+  hyphenated spellings.
+- **One child status surface.** Workflow no longer publishes an
+  `orchestrator-child` status row; the `workflow-orchestrator` setStatus line
+  remains the single child telemetry surface. The child action set is the TODO
+  view toggle plus `Pause child` / `Resume child` / `Abort child` in
+  `run-controls`.
+- **`setWorkingMessage` ownership is explicit.** On a generic-contribution
+  Desktop host the extension owns the working message only while it owns the
+  turn: the live child line (including pause/abort hints and paused/settling
+  guidance) is written with `setWorkingVisible(true)`, and a running, paused or
+  handoff Review suppresses the write entirely, so the reviewer's message is
+  never overwritten. The extension clears only a message it set, and it never
+  uses visibility as a liveness hack over a native retry/compaction indicator.
+
+### Compatibility
+
+- This checkout is `@dieulc/workflow` **0.15.0**. Pi Desktop's
+  `resources/workflow.lock.json` still pins the published **0.13.0** tarball and
+  its staged bundle is that 0.13.0 build (hyphenated commands, no groups or
+  `mode-choice`). This package has **not** been staged into Desktop.
+- Contribution v1 stays additive: a 0.13.0 host ignores `group` on an action and
+  drops the unknown `mode-choice` kind, keeping its action/status rows. A host
+  rendering 0.15.0 contributions gets groups, choices and inline controls.
+- The 0.14.0 verb grammar is unchanged in 0.15.0: `/orchestrator <verb>` and
+  `/review <verb>`, with no hyphenated aliases.
+
+## [0.14.0] - 2026-11-25
+
+### Changed — one command grammar for `/orchestrator` and `/review` (2026-11-25)
+
+- **One shape per family.** `/orchestrator <verb>` now owns
+  `start|status|inspect|pause|resume|abort|retry|stop|say|view|help`, and bare
+  `/orchestrator` enters the mode. `/review <verb>` owns
+  `status|pause|resume|abort|say|mode|prompt|help`, while bare `/review` or
+  `/review <path>` still runs a round. Both families get table-driven help and
+  argument completions, case-insensitive verbs, `--help`/`-h`, and
+  "did you mean" suggestions.
+- **Ten hyphenated registrations removed, with no aliases.**
+  `orchestrator-pause`, `orchestrator-resume`, `orchestrator-abort`,
+  `orchestrator-view`, `review-mode`, `review-prompt`, `review-status`,
+  `review-pause`, `review-resume` and `review-abort` are gone. The only
+  migration aid is the error sentence for the removed `cancel` verb: it is now
+  `stop`.
+- **Guards live in the verb tables.** The dispatcher applies mode, run and
+  child requirements in declared order; none is inferred from a handler body.
+  `/review status` and `/review mode status` answer different questions — the
+  round versus configuration — and the help teaches both. The default
+  `/review [path]` form keeps the path fallback: only an exact verb match
+  shadows a plan file, and the help names that caveat.
+- **Dead `/handoff execution|once` completions removed.** The tokens and
+  completion branches are gone, and `handoffArgumentCompletions` is wired to
+  `/handoff`; `/handoff execution` now prints the usage naming `execute`. The
+  live `/handoff execute <decision-id> orchestrator|build` stage-2 path is
+  unchanged.
+- **Review start and abort share one implementation.** The default round and
+  `/review say` use the same dispatcher admission (`blockWhileChildActive`, then
+  `admitReviewerNow`); `resume` uses only the resume admission, and `mode`
+  blocks with the corrected `/review mode` label. `/review abort` is the single
+  explicit exit that stops the round or discards the pause and settles the gate,
+  so no removed registration can drift from it.
+- **The 0.14.0 milestone was the parity target.** It was not separately
+  published to npm; the former claim of a published Desktop pin was incorrect.
+  Desktop staging must be verified independently. The W compatibility fixture
+  lists the two family commands instead of the ten removed names; new coverage
+  lives in `command-text.test.ts`,
+  `orchestrator-command.test.ts`, `review-command.test.ts` and
+  `review-command-handlers.test.ts`.
+
+### Changed — Review criteria are fixed; reviewer guidance is additive (2026-11-25)
+
+- **The five criteria moved out of the overridable prompt.** They now live in
+  `REVIEW_CRITERIA`, embedded verbatim in `REVIEW_SYSTEM_PROMPT`, instead of in
+  the `DEFAULT_REVIEW_PROMPT` text a file could replace. The rules of
+  engagement (read-only, protocol, restraint) moved with them.
+- **`review-prompt.md` is additional guidance.** `.pi/review-prompt.md`
+  (project) still wins over `~/.pi/agent/review-prompt.md` (global), but both
+  are now appended to the fixed criteria and can no longer replace a criterion —
+  an override cannot remove or weaken one, only add emphasis.
+- **Criterion 5 is extended to simplicity and over-engineering.** It now names
+  the smallest change that satisfies the requirements, and flags unnecessary
+  steps, speculative abstractions, extra layers, unwanted configuration or
+  dependencies, and out-of-scope work as findings.
+- **Pass 2 diffs the actual revisions.** It re-reads the original plan and the
+  appended `## Reviewer Revisions` section, and its prompt includes the named
+  **over-engineering check** (do the revisions add layers, abstractions,
+  configuration flags, dependencies, phases or steps the requirements do not
+  need?).
+- **A round's resubmission replaces its section.** Pass 2's `review_submit`
+  strips the round's `## Reviewer Revisions (round N)` section before appending,
+  so the section is replaced rather than stacked and `planHash` stays the
+  author's plan body.
+- **`/review-prompt` and the `prompt` status line say guidance-only.** The
+  command description reads "additional reviewer guidance — adds to (never
+  replaces) the fixed review criteria", and `/review-mode status` prints
+  `prompt : <source> (guidance; fixed criteria always apply)`, so neither reads
+  as a way to rewrite the criteria themselves.
+- `DEFAULT_REVIEW_PROMPT` is kept as a deprecated alias for the new
+  `DEFAULT_REVIEW_GUIDANCE`, which holds the built-in guidance text only.
+
+### Fixed — a settled Orchestrator child is released and its report can no longer be lost (2026-11-25)
+
+Session `01a20fc1-feb9-77a9-bb14-9e17961c1beb` proved three independent defects: a
+settle never released the child, the dispatch record overwrote the report, and
+the report was queued behind the parent's polling turn.
+
+- **The settle now releases the child.** `finish()` publishes `settling`, waits
+  (bounded) for `onSettled`, then publishes `idle`, unsubscribes and disposes
+  the session on the next macrotask. A report that cannot be recorded within
+  15 s fails honestly and still releases, so `orchestrator_dispatch` for the
+  next row can never be wedged by "a child is already settling".
+- **The lost update is fixed.** `dispatchOrchestratorRow` captured the run
+  record before `await controller.start()` and then wrote it back, clobbering
+  the report `onSettled` had just recorded (23:09:53.380 `idle`+report →
+  23:09:53.383 `running`+none). `recordDispatchIfNotReported(run, {startedAt})`
+  is a compare-and-set: a report at/after the attempt start wins. Dispatch is
+  also a short admission now (the tool no longer awaits the whole child run),
+  and the row's TODO status is only set when the dispatch was recorded.
+- **Reports are steered, not queued.** The wake message uses
+  `deliverAs: "steer"` (was `followUp`), so it lands at the parent's next tool
+  boundary instead of after its whole polling turn — the 23:12:56Z delay is
+  gone.
+- **The report is self-sufficient.** `orchestrator-report.ts` prepends
+  `Status:`, `Todos:`, `Cancelled:`, `Open:`, `Policy refusals:` and a
+  deterministic `Suggested:` line built from the child's final TODO list and
+  the policy refusals the controller observed. External blockers (a policy
+  refusal or a user-only action) are never re-dispatched; in-scope work is
+  retried on the same row. A hung settle cannot be misread as success.
+- **The parent can abort a live child.** New `orchestrator_abort` tool. It
+  releases `starting|running|paused`, preserves an existing report, and leaves
+  the row retryable; a settled child returns "nothing to abort" and its report
+  is never overwritten (the old path replaced it with "Child aborted: user
+  abort"). `orchestrator_retry` now accepts amended `instructions` for the
+  loop-back branch.
+- **Run-record honesty.** New `recordAbort`/`recordFailure`: abort keeps a real
+  report and records the reason as `paused`, failure records `interrupted`, and
+  `setRunPhase("paused")` no longer clears `blockedReason`.
+- **Child honesty.** `workflow_todo` gains `cancel`; a policy-blocked step is
+  recorded as `cancelled` (never `completed`) and the child contract requires
+  the final summary to name every step it did not complete and why. A cancelled
+  run row is terminal for row selection, so it cannot be re-dispatched forever.
+- **Mission v4** states the two-branch rubric, forbids polling while a child
+  runs, and requires the parent's final report to list every row's outcome and
+  every external deviation.
+- **Docs corrected:** the README no longer claims the deleted automatic
+  settle → diff → checks → verify → accept engine or "runtime-owned evidence";
+  the parent tool list is `start|dispatch|status|retry|abort`.
+- New tests: `orchestrator-report.test.ts`, `orchestrator-lifecycle.test.ts`
+  (7 end-to-end cases including the RC2 race and the policy-blocked branch),
+  plus controller/run/tool/operator/mission/contract coverage. The previously
+  unregistered `orchestrator-parity.test.ts` is now part of `npm test`.
+
+### Changed — plan filenames carry a UTC time prefix (2026-11-24)
+
+New plans are written to `.pi/plans/YYYY-MM-DD-HHmm-<slug>.md` (UTC `HHmm`), so
+same-day plans sort by creation time instead of by slug. The write gate, the
+Plan Mode prompt, the explicit `/review <path>` resolution and the reviewer's
+write path all use `getUtcPlanStamp` / `normalizePlanPath`;
+`dateCorrectedPlanPath` lets `/review` find a plan whose date was mistyped.
+
+- **Legacy date-only names keep working and are never renamed.** An existing
+  `.pi/plans/YYYY-MM-DD-<slug>.md` file is written in place; only a NEW file
+  gets a prefix. No migration is needed.
+- **Same minute + same slug is the same plan.** Distinct plans need distinct
+  slugs (the filename identifies a plan, not an event).
+- New tests: `plan-naming.test.ts` covers the stamp (day boundaries, zero
+  padding, invalid clock), every `normalizePlanPath` branch, the `/review`
+  lookup, the write gate, `applySubmittedPlan`, and the Plan Mode prompt.
+
+### Breaking — legacy engine deletion (2026-11-24 sweep, v0.14.0)
+
+This sweep finishes the 2026-11-24 refactor: the old engine is now actually
+deleted, not merely unreferenced by the new paths.
+
+- **Removed modules:** `orchestrator-runtime`, `orchestrator-state`,
+  `orchestrator-store`, `journal-payloads`, `orchestrator-types`,
+  `orchestrator-check-repair`, `orchestrator-repair-manifest`,
+  `orchestrator-adapters`, `plan-spec`, `plan-compiler`, `plan-checks`,
+  `plan-checks-block`, `plan-lint`, `plan-command-shape`, `frozen-snapshot`,
+  `todo-snapshot`, `final-gate`, `check-executor`, `execution-state`,
+  `verification-deadline`, `legacy-recovery`, and
+  `scripts/repair-orchestrator-checks.mjs`. The live workspace resolver and
+  bounded git runner moved to `workspace-node.ts` and `git-bounded.ts`.
+- **Removed tools/commands/status keys:** `workflow_execution`,
+  `/orchestrator-repair-checks`, the `workflow-execution` footer key and its
+  `execution` segment, and the `planContract` compat block.
+- **Run record is the only orchestration state.** `OrchestratorRun` holds the
+  plan path, rows, per-row workspace/cwd, instructions, reports, phase and
+  `blockedReason`. A reload restores it; a `running` phase becomes
+  `interrupted`. Old journals, frozen v1/v2 snapshots and run directories are
+  never read or migrated — restart from the approved plan.
+- **Multi-repo is first-class.** `orchestrator_start` takes
+  `workspaces: [{id, path}]` and steps of `string | {text, workspace?}`;
+  `orchestrator_dispatch` takes a declared alias or an absolute root as `cwd`.
+  Unknown, missing, broad or overlapping roots are refused; a multi-root run
+  with an unbound row fails closed.
+- **No Build execution engine.** Build completes when every non-cancelled TODO
+  row is done. The final gate, check executor, evidence map, barren-boundary
+  pause and `[DONE:ref]` evidence revert are gone. Verification is ordinary
+  bash. The shell quarantine survives a reload through the `workflow` entry's
+  `shellQuarantine` key.
+- **The parent is excluded from the worktree while a child is live.**
+  `parentMutationRefusal` (pure, in `parent-exclusion.ts`) refuses parent
+  `edit`/`write`/`powershell` and any `bash` command the classifier cannot
+  prove read-only during `starting|running|settling`; the managed child, a
+  paused child and a settled parent are allowed.
+- **Approval has no lint/check preview** and the handoff questionnaire has no
+  `checkPreview` option.
+- **Docs:** the plan-format/template/migration guides are now a normal markdown
+  guide; historical engine docs carry a **Superseded (2026-11-24)** banner.
+
+*Correction:* the earlier 2026-11-24 entry below described the removals as
+landed while the old modules, commands and tool were still reachable. They are
+now actually removed; that entry is retained for the contract decisions it
+records.
+
+
+### Breaking — model-driven Orchestrator and append-only review (2026-11-24)
+
+- **Orchestrator has Build permissions.** `ROLE_POLICIES.orchestrator` is now
+  `commandClass: "full"`, `canWrite: true`; the mode keeps `edit`/`write` and no
+  longer refuses bash/powershell. Delegation to a child is a prompt convention,
+  not a permission cage. An idle/paused run no longer blocks a mode switch.
+- **The plan contract is removed.** `plan_validate`, `/plan lint`, `/workflow lint`,
+  the freeze gate, the zero-gate acknowledgement, `plan-compiler`/`plan-spec`
+  validation on approval and the executable-check schema are gone. A plan is a
+  normal markdown document; the model extracts the TODO rows.
+- **Review appends, never rewrites.** `review_submit_plan` is replaced by
+  `review_submit` (findings, verdict, summary, revisions). The harness appends a
+  `## Reviewer Revisions (round N)` section and preserves the original body.
+  The chunked `review_plan_begin`/`chunk`/`finalize` write path is not registered.
+- **No frozen run.** The TODO list is mutable in every mode. Run metadata is a
+  session-entry record (plan path, rows, instructions, last child report); the
+  NDJSON journal, both frozen schemas, the diff gate, row-check execution, repair
+  rounds and the final-gate marker are removed. Old runs are not resumed.
+- **The parent dispatches; the child verifies.** `orchestrator_start` binds the
+  model-supplied steps; `orchestrator_dispatch` starts one in-process Build child
+  per row. A successful child report wakes the parent, which marks the row done
+  and dispatches the next. A blocker wakes the parent to inspect and amend the
+  instruction; the parent does not fix code and does not re-run the child's checks.
+- **Removed tooling:** `migration-scan`, `scripts/migration-report.mjs`,
+  `orchestrator-advance`, `orchestrator-todo-runtime`. The migration/integration
+  docs are historical and marked superseded.
+
+- **Notifier ownership: only reviewer notices carry `Review Mode:`.** A single helper,
+  `notifyReview()`, had doubled as the generic Workflow notifier and as the
+  reviewer-branded one, so an Orchestrator pause could surface
+  `Review Mode: Paused · Builder 3/19 · /orchestrator-resume to continue …` even
+  though no review round, review pause or reviewer session existed. The two scopes
+  are now explicit: `notifyWorkflow()` is the neutral helper for Plan/Build/
+  Orchestrator/handoff lifecycle notices, and `notifyReview()` is reserved for
+  messages emitted by the independent reviewer or a review-owned turn, keeping
+  `reviewNoticeText()` as the one idempotent prefix owner. Orchestrator/child,
+  handoff/Plannotator and plan-lifecycle notices lose the automatic prefix; they
+  may still mention review in their own sentence (`Browser review still open`,
+  `Review feedback — switched to Plan mode`). Repeated paused/settling Esc is
+  silent (no reminder row) because the composer border already names the resume
+  and abort controls. Tests: a `neutralNotice()` helper that requires the notice
+  and rejects a `Review Mode` prefix, whole-array negative checks in the
+  Orchestrator-only cases, targeted handoff assertions, a new `OE11` paused-child
+  queue case, and positive `Review Mode:` controls (HD2, `L`) so the reviewer side
+  cannot silently go neutral.
+
+- **The Orchestrator composer border is phase + controls only.** The top border used to render `Working · Builder 3/19 · bash npm test -- --watch … · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop`, because `orchestrator-activity.ts` echoed the child's last tool — a tool name plus up to 100 characters of its key argument — and the frozen-row counter. That reached ~190 columns, so on a normal-width terminal the editor fell back to a compact line that *still* carried the command, or truncated the state away. The border now says `Working · ESC or /orchestrator-pause to pause · /orchestrator-abort to stop`, `Starting…`, `Pausing…`, `Paused · /orchestrator-resume to continue · /orchestrator-abort to stop`, `Verifying`, and `Waiting · answer the dialog`, with a hint-free compact form for narrow terminals. The accepted input type was narrowed to `phase`/`pausePending`/`retrying` so the tool echo and the counters cannot come back by accident, and the Esc matrix, spinner and overflow geometry are untouched. The information moved rather than disappeared: the pinned TODO pane owns progress, the transcript band owns tool lines, and the footer `workflow-orchestrator` line now reads `child running · <model> · ctx 43% (86k/200k) · ↑12k ↓3.0k · 01:23` (parent view: `run running · next task-2 · child running`). `childPhaseWord()` gives every surface one phase word, fixing `settling` vs `verifying` and a premature `paused` during a pending pause; the host `orchestrator-child` row now uses the same formatter instead of its own bit list (ids/commands unchanged), and `/orchestrator status|view` keeps the richer `child 2/7 running · … · 3/5 todos` report. Tests: `orchestrator-activity`, `child-stats`, `tab-editor` (widths 16–200), `workflow-status`, `workflow-contributions`, `orchestrator-operator`, `orchestrator-child-view`, the previously stale `orchestrator-parity` expectation, and `OC1`/`OC2`/`OC3` end-to-end (a long bash command must never reach the border, while the footer keeps the telemetry and the transcript keeps the tool line).
+
+- **Rollout: read-only migration report, dual-read verification and the honest
+  gate record (row 19).** New `migration-scan.ts` (plus
+  `migration-scan.test.ts`, registered in `files`/`test`) inventories existing
+  state without writing: per run it replays the journal, applies
+  `plan-check-specs-repair` amendments in memory, reports the stored snapshot
+  version and what the reader upcast from, lists malformed/quarantined checks
+  and the exact bytes that will never execute, flags checks bound to an
+  unbound workspace alias, lists prose `acceptanceChecks` as criteria, and
+  detects a stale `snapshot.json`. Per plan it compiles with the same linter as
+  the freeze path and reports rows, gate/diagnostic/manual counts, row checks
+  and line-numbered errors. `scripts/migration-report.mjs` is the read-only
+  filesystem walk (`--runs-dir`, `--plans-dir`, `--plan`, `--json`, `--strict`)
+  and ends with an explicit repair list; it never edits a journal or snapshot.
+  Scanning the live runs root found 6 runs (4 v1, 1 already amended, 2 older
+  runs with no `todos.frozen`) and 134 plans (75 legacy plans still carry
+  prose bullets and do not compile), with no run rewritten. The repaired
+  ERP run still restores at `paused`, seq 76, 14/15 accepted, 6 valid checks
+  and stays v1 on disk (not migrated). Harness gates: `npm test` 2005/2005,
+  `typecheck`, `check:policy` 100/100, `check:read-policy`, and the pack gate
+  (111 files, 1/1 package). ERP static gates: `format:check`,
+  `check:docs-reference` (7 pages), `check:docs-glossary` (52 terms),
+  `typecheck` (91/91), `lint` (49/49) and `check` (20 sub-gates, exit 0).
+  Explicitly not claimed: ERP full `pnpm test`, Playwright, provider sandbox,
+  benchmark, N−1 seeded upgrade, release diagnostics, publish/commit, and
+  task 15's 15/15 (the user's `/orchestrator retry` remains). Outcome recorded
+  in `docs/rollout-2026-11-24-plan-execution-contract.md`; the migration guide
+  gains the read-only first step.
+
+- **Typed plan-execution contract, canonical docs and recovery, end to end
+  (Phase A + Phase B).** Plans are now compiled by one authority
+  (`plan-compiler.ts`) into a typed `PlanSpec`: rows from `## Plan Steps`, typed
+  row/final checks from fenced command blocks, whole-bullet code spans and a
+  restricted `checks:` block (`kind`, `workspace`, `timeoutMs`,
+  `expectedExitCode`), `Acceptance:` kept as non-executable criteria, and
+  line-numbered diagnostics. `/plan lint` / `/workflow lint` / `plan_validate`
+  plus the handoff preview and reviewer gate compile before approval, so an
+  ambiguous or prose-only check is refused instead of frozen; a zero-gate plan
+  needs an explicit acknowledgement. Freeze writes a `schemaVersion: 2`
+  `FrozenExecutionSnapshot` with provenance, typed checks, workspaces and a
+  validation report, while v1 snapshots upcast in memory, malformed v1 checks
+  are quarantined (never executed) and unknown versions fail closed. Journal
+  lines keep their v1 framing/checksum/`prev` chain but every known event type
+  now has a payload validator, unknown event types and payload versions are
+  rejected, and `snapshot.json` seq/revision is cross-checked. Restore reads the
+  journaled snapshot instead of re-freezing from mutable plan text and rebinds
+  by plan path when the digest changed. One `CheckExecutor` (host-tool and
+  headless transports with the same validation, workspace, deadline and output
+  bounds) classifies every failure; only `test`/`timeout` repair, while
+  `metadata`/`policy`/`environment` block with a concrete fix. The final gate is
+  journaled once as a content-addressed `final_gate` record, so a passed gate
+  cannot re-run and an amended list needs a new pass. `workflow.orchestrator`
+  owns `childTimeoutMs`, `verificationTimeoutSeconds` and `gitTimeoutMs`, and a
+  malformed frozen list is repaired by the append-only
+  `plan-check-specs-repair` `run.control` event through
+  `/orchestrator-repair-checks` or `scripts/repair-orchestrator-checks.mjs`.
+  New docs: `docs/plan-format.md` (format, surfaces, limits, failure taxonomy,
+  final-gate marker, amendment, settings, v1→v2 compatibility and what is never
+  auto-executed), `docs/plan-template.md` (canonical skeleton that lints clean)
+  and `docs/plan-migration.md`; the README gains a plan-format section. No
+  `package.json` version bump and no new `## [x.y.z]` section.
+
+- **Plan lint, preview and pre-approval gating.** The compiler is now consulted
+  before approval, not at run creation. `/plan lint [path]` (and `/workflow
+  lint [path]`) plus the read-only `plan_validate` tool print the row count,
+  gate/diagnostic/manual counts, every exact final/per-row command with its
+  workspace, timeout and expected exit code, and line-numbered
+  warnings/errors. The handoff sheet carries the same compiled preview. A plan
+  that does not compile is refused before `run.created`; a plan with zero final
+  `gate` checks needs an explicit acknowledgement, while a fenced-commands
+  `## Verification` freezes with no extra prompt. Reviewer rewrites go through
+  the same gate and cannot introduce an ambiguous check or drop every gate
+  silently. The Plan Mode prompt now documents the executable-check syntax,
+  per-row metadata, limits and the acknowledgement rule. New module
+  `plan-lint.ts` (registered in `package.json` `files` and the `test` script)
+  with `plan-lint.test.ts` coverage; no journal, snapshot or on-disk format
+  changed.
+
+- **Frozen plan-check recovery (Phase A).** `/orchestrator-repair-checks`
+  (`status`, `--file <manifest.json>`, `--from-plan`, `--allow-empty`, `--yes`)
+  and `scripts/repair-orchestrator-checks.mjs` append ONE durable
+  `plan-check-specs-repair` `run.control` amendment instead of rewriting the
+  journal. The current and proposed checks are shown first; the in-session path
+  asks `ui.confirm` unless `--yes` and re-freezes through the TODO store so
+  `validateFrozenSnapshot` re-checks the result and the panel updates. The
+  script defaults to a dry run, requires `--apply --yes`, enforces optional
+  `--expect-seq`/`--expect-accepted` fences, stores the manifest via
+  `journal.putArtifact`, then reopens the run and verifies seq +1, the checksum
+  chain, `snapshot.json`, the replayed specs and the unchanged accepted/task
+  states; a repeated apply is a no-op. The command is pinned in
+  `fixtures/compat-baseline.json`; new coverage: `plan-checks.test.ts` fixtures,
+  `repair-orchestrator-checks.test.ts` temp-run integration and `RC1`–`RC5`
+  command cases.
+
+- **Orchestrator Working/Paused on the composer, with pause-only Esc.** The in-process Build child is a separate session, so the host's native indicator never represented it and the child UI bridge (correctly) no-ops every chrome write. The Workflow editor now projects the child onto the real composer top border in Parent, Child and Auto views: `Working · Builder n/m · <tool>` with `ESC or /orchestrator-pause to pause · /orchestrator-abort to stop`, `Pausing…`, `Paused · /orchestrator-resume to continue`, and `Verifying…`. Esc is handled in the focused editor (not a global listener), so autocomplete and permission dialogs keep their own Esc. Once the child owns execution, EVERY Esc press is consumed: a pause burst cannot reach the host abort, dispose the child, or fail the row; paused/settling presses are inert and silent (the composer border already names
+  `/orchestrator-resume` and `/orchestrator-abort`). The controller now scopes pause intent across `agent_start`/`agent_settled` and the prompt rejection, suspends the active execution deadline while paused (remaining budget preserved), and resumes only after pause settlement; resume is a short admission so a resumed child can be paused again immediately. `/orchestrator-pause|resume|abort|view` now route through the operator, fixing duplicate/racy transitions and false "forwarded" prose for a starting child. New tests: `orchestrator-activity`, `orchestrator-child-controller`, `orchestrator-child-ui`, composer border/Esc cases in `tab-editor`, and `OC1`/`OC2` end-to-end cases.
+
+- **Live child model switching + child telemetry.** `/profile use` (picker and prompt), `/role set`, and the role picker now switch an ALREADY-RUNNING Orchestrator Build child and Review reviewer in place through the public `AgentSession.setModel` (`persist: false`): the in-flight request finishes on the old model, the next provider request uses the new one, nothing is aborted or restarted, the warm session is kept, and the next child/round always launches on the new model. A switch that races child creation is reconciled before the first prompt (a refused prepared-child switch is replaced by a fresh child); a paused child switches before resume. A refused switch keeps the live session, names both models, and never blocks the row/round. The Orchestrator child no longer persists a programmatic switch as the global default model/thinking. `in-process-child.ts` now exposes `currentModel()`/`stats()`/`setModel()` (feature-detected, never throwing); `child-stats.ts` is the one formatter for model, context %, tokens and elapsed time. `/orchestrator-view` now switches BOTH the pinned panel and the footer's `workflow-orchestrator` line (child view/auto: full child line; parent view: run/next plus a compact child hint), always one bounded row; a single unref'd repaint clock drives elapsed only while a shown child is starting/running and stops on pause/settle/parent-view/reload. The pinned panel header, `/orchestrator status|inspect`, and the host `orchestrator-child` contribution share the same truth (the child row keeps its historical shape and appends stats). New tests: `child-stats`, `orchestrator-stats-clock`, `in-process-child`, `orchestrator-child-controller`, `orchestrator-child-view`, plus `OE5`–`OE10`/`RE1` end-to-end cases.
+
+- **Reviewer ownership is Plan-only; no speculative Reviewer in Orchestrator/Build.**
+  Fixed two independent defects behind the execution-time `Review Mode: reviewer
+  unavailable …` warning:
+  - The `agent_end` handoff ran an unconditional reviewer **prefetch** before the
+    Plan-only return, so an Orchestrator parent turn and every in-process Build
+    child (which loads this extension) booted a reviewer session without a plan
+    review. The prefetch is removed; a Reviewer session is created only on
+    demand by an admitted Plan round.
+  - The isolated-session SDK probe rejected class constructors, falsely
+    reporting `ModelRuntime.create` / `SessionManager.inMemory` /
+    `SettingsManager.inMemory` as missing. Function/class carriers with callable
+    statics now pass; genuinely missing APIs still fail closed with the exact
+    names (no ambient or file-backed fallback).
+
+  New `review-policy.ts` is the single admission answer: a review round requires
+  a parent Plan session, no executing Orchestrator owner (child
+  `starting/running/paused/settling` or run `running/paused/blocked`, including
+  between-row windows), and — for automatic review — Review Mode on **plus** a
+  current Plan submission. `/review` and `/review-resume` are **Plan mode
+  only**; outside Plan they refuse with `/plan` guidance without switching
+  modes, while `/review-status`, `/review-pause` and `/review-abort` remain
+  available for recovery. Automatic review binds to the terminal `agent_end`:
+  retry/compaction/queued continuations do not review an incomplete plan.
+
+  The same ownership predicate now gates every mode transition at the point it
+  executes (commands, Tab/composer cycling, the `pi-code:plan-mode` host toggle,
+  approval-to-Build and legacy refine paths), and a validated child identity
+  cannot be overridden by restored Plan/manual metadata. Reviewer startup is
+  generation-guarded: teardown during a cold bootstrap disposes the late session
+  exactly once, and a stale start can neither install nor clear a newer one.
+  Child teardown (which runs without `session_shutdown`) releases review
+  ownership defensively.
+
+  Orchestrator row acceptance is unchanged and remains mechanical: diff gate,
+  acceptance checks, `task.verify` evidence and final plan checks. No LLM
+  review gate was added; a failed check still repairs/blocks exactly as before.
+  Tests: `review-policy.test.ts`, `extension.test.ts` (`RO*`, `MT*`, `SW*`,
+  `OER*`, `LR1`), `review.test.ts` (`lifetime:*`), plus the corrected
+  `isolated-session.test.ts` SDK-export contract. No version bump.
+
+- Documentation for the prompt-refinement feature set (parity plan step 41):
+  the package README now documents the `/prompt` and `/prompt-refine` commands,
+  the bounded inspect→ask→compose→submit operation, context/provider privacy
+  (no ambient extensions/skills/templates/themes or AGENTS/CLAUDE injection,
+  bounded parent-selected context, repository text treated as untrusted data),
+  `/prompt-model` scope/inherit/reset with Default-mode inheritance, the one-shot
+  composer arm, busy refusal and binding conflicts, Escape/Stop cancellation
+  scoped to the operation, conflict handling on a moved draft, failure/recovery
+  and attachment loss on process restart, image/Terminal-path limits, the public
+  `composer-transform-v1` capability (contribution shape, grant-only bootstrap,
+  private single-use rendezvous handoff, typed frames, old-host fallback, live
+  policy revocation), bundled/override/disable/safe-mode behavior for Pi
+  Desktop, a compatibility matrix, tested versions (0.13.0 + Pi SDK 1.5.0) and
+  honest acceptance limits (semantic quality is human-reviewed; live desktop,
+  real-terminal keyboard and Playwright composer runs remain NOT RUN). The root
+  README gains a matching `/prompt` summary. No behavior change, no version bump.
+
+- Prompt-refinement quality evaluation harness (parity plan step 35):
+  `prompt-refinement-eval.ts` (with `prompt-refinement-eval.test.ts`) and
+  `scripts/eval-prompt-refinement.mjs` run the frozen rubric corpus through the
+  real runtime with a deterministic scripted provider/tool harness, grade named
+  properties (literal fences, required/forbidden phrases, language retention,
+  evidenced terminology, suggestion consent, non-execution, injection
+  resistance, clarification, vision disclosure, bounded size) and require ten
+  generic mutants to be caught. The evaluation corpus grows to v2 with
+  no-repo, ambiguous `sub-session` vs `child session`, prompt-injection,
+  vision/no-vision and long-context cases; rubric weights and the prompt/result
+  versions are unchanged. A live-model sample is gated behind
+  `PI_PROMPT_REFINEMENT_EVAL_AUTHORIZED=1` plus an explicit `--model`, and the
+  recorded result at `docs/evaluations/2026-11-24-prompt-refinement-quality.md`
+  keeps fake-provider properties, live measurements (NOT RUN) and human rubric
+  sign-off (PENDING) separate.
+
+- `/btw` now delivers a note exactly once (parity fix, plan step 32). The
+  command used to append the same note three ways — a persisted
+  `workflow-btw` custom entry, a visible custom message through
+  `sendMessage`, and a second `sessionManager.appendCustomMessageEntry` — and
+  then re-inject it again from `before_agent_start`. The result was duplicate
+  transcript rows and a duplicate model disclosure. It now appends the entry,
+  sends one visible custom message (sessionManager fallback only when the host
+  has no `sendMessage`), and marks that note delivered so the per-mode context
+  hook injects only genuinely queued notes. Rewind clears the delivered scope
+  with the queue. Covered by `BTW1`–`BTW3` in `extension.test.ts`.
+
+- `/workflow` is now registered unconditionally as the Plan-mode entry
+  (parity fix, plan step 31). It used to exist only as the fallback when
+  `/plan` was already owned by another extension (pi-code), so hosts without
+  that package — Pi Desktop ships none — never had the documented alias.
+  `/plan` keeps its own registration and conflict tolerance; `/workflow` is no
+  longer tied to it. The frozen command baseline records both.
+
+- Frozen `composer-transform-v1` contract (`composer-transform.ts`,
+  `fixtures/composer-transform.conformance.json`): additive
+  `composer-control` contribution (composer-actions slot, semantic icon list,
+  checked/enabled state, one-shot return discriminator, same-owner toggle and
+  transform references, public-command/companion operation metadata), bounded
+  start/progress/candidate/status/cancel/apply/lifecycle frames, live SDK
+  `sourceInfo` binding for both commands, grant-only string bootstrap and the
+  single-use private EventBus rendezvous that hands the typed port to the
+  companion. The fixture is byte-identical with Pi Desktop and both suites
+  assert the same SHA-256 and verdicts. Drafts, images, model/context and
+  grants never travel through contribution args (the old 1 000-character args
+  limit is unchanged); diagnostics expose identity/counts only. An older host
+  drops the unknown kind and keeps text/status fallback, explicitly not
+  attachment-aware. The handshake is proven against unmodified SDK 1.5.
+
+- Shared isolated-session infrastructure (`isolated-session.ts`, `provider-auth.ts`):
+  Review and prompt refinement now share only the general second-session
+  bootstrap. Child sessions use an in-memory `SessionManager` and an in-memory
+  `SettingsManager` (no session/settings files), no ambient extensions, skills,
+  prompt templates, themes or AGENTS/CLAUDE context files, and explicit
+  caller-filtered context blocks. They get their own `ModelRuntime`, parent-only
+  provider seeding, a provider-agnostic auth preflight, an exact active-tool
+  assertion (missing, unexpected or unverifiable tools fail) and disposal of the
+  raw SDK session on every bootstrap failure. A substituted model fails instead
+  of falling back silently. Review keeps its prompts, submission tools, fallback
+  policy and legacy opt-in anti-recursion marker; prompt refinement sets no
+  process-global environment marker. `provider-auth.ts` holds the shared auth
+  probe while `review-providers.ts` keeps its reviewer-facing aliases and
+  messages.
+- Prompt-refinement prompt/schema contracts (v1): a provider-neutral system
+  prompt plus `pi.workflow.prompt-refinement.input.v1` and
+  `...result.v1` JSON schemas/validators. The prompt preserves intent,
+  constraints, original language(s), code/paths/commands and deliberately
+  distinct terms; terminology changes cite evidence; optional suggestions
+  require consent; refinement never executes or claims execution. Results
+  reject wrong versions, unknown fields, empty candidates, unconsented
+  suggestions and unsupported terminology. Adds the eight-case evaluation
+  corpus (typo-heavy, evidence-backed terminology, distinct terms,
+  multilingual/mixed, quoted commands, noncoding, sparse) and a versioned
+  quality rubric frozen before tuning.
+- Bounded prompt-refinement runtime (`prompt-refinement-runtime.ts`): one
+  inspect→ask→reinspect→compose→submit operation with a frozen model, system
+  prompt, prepared context and the initial read-policy/trust/grant ceiling.
+  Active work time is tracked separately from waiting for the user, and model
+  turns, inspection calls, question rounds and active time are hard-capped;
+  exhaustion is a recoverable failure. Exactly one structured candidate is
+  accepted and revalidated (schema, length, non-empty/truncated prose,
+  unapproved scope claims), then handed only to an injected composer port — the
+  runtime never sends or executes the request. Live authority is rechecked at
+  every provider request, question, inspection, turn boundary and candidate
+  delivery; narrowing (or any policy-generation change once file evidence
+  exists) invalidates the operation, revokes evidence and disposes the child
+  while preserving the draft. Local policy commands invalidate immediately,
+  later grants never widen a running operation, late tool/provider/session
+  completions cannot deliver, and sessions/subscriptions/timers/question
+  signals are released on every exit. Tests cover budgets, no-progress and
+  repeated questions, provider errors, untrusted/no-relevant-code operations,
+  scope-changing answers, revocation during questions or provider work, and
+  late completions.
+- Prompt-refinement result review and apply policy
+  (`prompt-refinement-review.ts`): the accepted candidate is re-validated at
+  the hand-back boundary and checked for composer readiness — non-empty, within
+  the hard size cap (over-cap is refused, never truncated), no explicit
+  truncation marker, no first-person implementation/verification claim and no
+  chat preamble posing as the prompt. Transport wrappers are stripped only when
+  they unambiguously wrap the whole text (`/prompt` prefix, short
+  "Here is the refined prompt:" label, whole-text Markdown fence or result-JSON
+  envelope, trailing sign-off), so headings, lists, quotes, inline code and
+  fences with a real language remain byte-identical. Original draft, candidate
+  and a short change summary live in a bounded in-memory review store outside
+  the parent conversation; View/Copy expose both texts plus advisory
+  literal/constraint findings (human-review hints, not a semantic guarantee).
+  Ordinary success inserts once without a second approval; a draft changed
+  during refinement is never overwritten — the candidate stays recoverable and
+  only an explicit replacement writes it, re-reading the exact confirmed
+  revision first. Tests cover size boundaries, wrong/missing/extra submission
+  fields, false implementation claims and refusals, malicious prompt text,
+  unapproved over-expansion, wrapper-vs-Markdown stripping, View/Copy and the
+  conflict/replacement policy.
+- Prompt-refinement model settings (`/prompt-model`): validated
+  `workflow.promptRefinement.model` overrides with trusted project/global
+  precedence, an explicit inherit sentinel, per-scope reset, capability/thinking
+  clamping, actionable invalid-setting refusals, serialized atomic writes that
+  preserve unrelated keys, and scoped argument completions. The main session
+  model, roles, profiles and Pi default-model mirror are never modified.
+- Orchestrator multi-repo workspaces: plan/row/tool declarations, per-root
+  baselines and attribution, workspace-scoped row/final checks, child cwd
+  binding, status/mission visibility, and additive old-snapshot compatibility.
+- Policy-safe inspection primitives: the reviewer's guarded read/grep/find/ls
+  construction now lives in reusable `inspection-policy.ts` + `inspection-tools.ts`.
+  A live authority resolver is re-read for every target and again before async
+  results are exposed (the build-time snapshot is only a ceiling); revoked
+  grants, new exclude/sensitive rules or lost trust refuse the in-flight result.
+  Recursive grep evaluates each enumerated file before reading it and renders
+  structured per-file matches after the final recheck (never the legacy text
+  parser as the boundary); find/ls filter each delegated entry. Symlink/Windows
+  alias escapes, unresolvable existing paths, content/details sizes and
+  temp-output/structured channels are constrained. Glass tests cover excluded
+  descendants, escapes, output modes, leaks, cancellation and mid-flight
+  grant/exclusion/trust changes; Review Mode behavior is unchanged.
+
+### Changed — Orchestrator runs an in-process Build child (no window or tab)
+
+- **One child per frozen row, inside this Pi process.** The external child chain
+  (Desktop tab, Terminal window, `pi --session`, child host, IPC pipe, start-ack,
+  workspace lease, 45 s wait) is gone. Each row is a second SDK `AgentSession`
+  with its own model runtime, an in-memory session and a fresh Workflow
+  extension instance, so it gets the Workflow-managed Build tools and every
+  policy gate. Extensions installed separately do not load inside the child.
+- **Automatic acceptance.** A natural settle journals the report, diffs the
+  workspace (including `previous.head..HEAD`, so a committed row is
+  attributable), runs the row checks, journals verification and accepts —
+  then starts the next row. A failure repairs the same warm child (max 2
+  rounds); exhaustion blocks the row, pauses the run and wakes the parent model.
+- **Prompt cascade.** Prose typed while a child runs is forwarded to it
+  (`you → child`) and does not start a parent turn; while paused, one note is
+  queued for the resume. Slash commands pass through.
+- **Commands.** Added `/orchestrator-pause`, `/orchestrator-resume`,
+  `/orchestrator-abort` and `/orchestrator-view` (the `/orchestrator` verbs
+  remain). `/orchestrator-view` toggles the pinned panel between the parent
+  roadmap and the child's local TODOs; it never changes prompt routing.
+- **Reload.** A restored `running` row is blocked ("the in-process Build child
+  did not survive the reload") and the run pauses; retry starts a fresh child.
+  Old managed-worker child sessions open as ordinary Build with a warning.
+- **Removed:** tools `workflow_worker_ready`, `orchestrator_report`,
+  `orchestrator_checkpoint`, `orchestrator_verify`, `orchestrator_accept`,
+  `orchestrator_repair`; the `workflow-bridge` command; the managed-worker
+  mode ring and its tool set; the Desktop related-session request for
+  Orchestrator. Parent tools are now `orchestrator_start|status|retry`.
+- **Host contract:** `session-host.ts` and the generic `related-session`
+  contribution kind remain for other features; Workflow's Orchestrator use of
+  them is gone.
+
+
+### Added — continuous Build execution and nonfatal shell quarantine
+
+- **Build continues through routine stops.** `agent_before_settle` adds one
+  bounded recovery/continuation message while an approved execution is active.
+  It continues through ordinary test failures and shell quarantine, and pauses
+  after three barren boundaries, a user pause/stop, or an explicit blocker.
+- **The two-attempt shell cap quarantines shell, not the run.** After the
+  second qualifying failure the run stays alive: shell tools are refused while
+  `read`/`grep`/`find`/`ls`/`edit`/`write`/LSP remain available. A required
+  shell check leaves its row **blocked/unverified**, never green. Quarantine
+  survives compaction, reload, tree/fork and child replacement; only a genuine
+  user prompt or `/shell-guard reset` starts a new shell budget.
+- **Execution controls and evidence.** `/build status|pause|resume|stop` and
+  `workflow_execution` provide status, checkpoints, row verification and
+  structured blockers. Completion claims (`done`, `toggle`, bulk update and
+  `[DONE]`) require fresh runtime evidence when a row has checks; editing source
+  invalidates it. The final plan check runs before the last acceptance, and a
+  failing or unavailable final gate cannot emit a green card.
+- **Paused recovery.** Reload/reopen/fork restores the execution paused. One
+  explicit `/build resume` continues the remaining non-shell work; persisted
+  history alone starts no provider request, edit or child.
+- **Lossless checks and child binding.** Verification commands preserve exact
+  quoting/whitespace/separators; overflow is rejected with a source diagnostic.
+  Child tasks inherit the parent shell limits/quarantine, and candidates are
+  delivered only after the child fence settles.
+- **Footer/status:** `workflow-execution` reports paused, blocked, recovering,
+  shell-quarantined and complete lifecycle state.
+
+### Fixed — child launch, retry recovery and automatic execution start (2026-11-22)
+
+- **A prepared child is actually launched.** `createChildDispatcher.wake()`
+  now calls `host.launch(spec)` and awaits the child's sealed `start-ack`
+  (45 s). It no longer returns success from a map lookup, so
+  "Dispatched … waiting for the report" cannot describe a metadata-only
+  session.
+- **Launch evidence is durable.** A successful launch journals
+  `task.launched` (session ref/file and handle when available). A launch
+  refusal applies `task.block` with the real launcher reason; a
+  delivered-but-unacknowledged start remains `running` and is reported as
+  uncertain instead of being relaunched.
+- **Retry recovers stale runs.** `orchestrator_retry` accepts an optional
+  `taskId`, unblocks `blocked`/`needs_fix` rows, and abandons a `running` row
+  only when a probe proves it never launched (no `task.launched`, no assistant
+  turn, no start marker). It dispatches immediately; `/orchestrator retry` uses
+  the same path.
+- **Orchestrator handoffs consume again.** `handoffRouteFor` and
+  `consumeHandoffRoute` agree on `orchestrator-start`; legacy
+  `orchestrator-prepare` receipts still parse. Choosing Orchestrator once again
+  writes `workflow-handoff-route` and consumes the decision.
+- **The chosen execution starts without another prompt.** A Direct Build
+  kickoff queued while the chooser is inside `agent_end` is released at
+  `agent_settled` (idle), and an Orchestrator start reports its dispatch
+  outcome immediately.
+- **Windows launcher no longer executes the npm shell shim.** `resolvePiCli`
+  prefers the Pi Node entrypoint (`process.execPath <cli.js>`) or `pi.cmd`
+  via `cmd /c`; the extensionless `…\npm\pi` shim previously failed with
+  `0x800700c1` (ERROR_BAD_EXE_FORMAT).
+- **Reload restores, never re-dispatches.** `session_start` rebinds the run
+  from its journal when the frozen list is present; a `running` row waits for
+  the explicit retry/probe path.
+
+### Changed — Orchestrator simplification: frozen plan TODOs and direct delegation (2026-11-22)
+
+**Breaking.** The Orchestrator no longer has a second planning/approval layer.
+
+- **Frozen TODO authority.** A new pure `todo-snapshot.ts` converts a plan (or an
+  explicitly agreed standalone list) into stable rows ONCE: one row per
+  top-level plan step, stable ids/refs, heading and 1-based source line, optional
+  `Acceptance:`/`Checks:`/`Files:` metadata, and plan-level `## Verification`
+  commands. Build and Orchestrator share it; only status changes afterwards.
+  The session `TodoStore` enforces the freeze (structural mutations refused as a
+  `{refused}` result rather than thrown) and persists it per branch.
+- **No execution breakdown approval.** `orchestrator_prepare`,
+  `orchestrator_propose_tasks`, `orchestrator_dispatch`, the execution preview,
+  the approval dialog/flow, budgets, rollover, drift, verifier, parity,
+  lifecycle/stages, the roadmap/final/commit runtimes, the event pump, the
+  packet/context/plan/source modules and `orchestrator-worker-todos` were
+  deleted. The model-facing tools are now `orchestrator_start|status|verify|
+  repair|accept|retry`.
+- **Start freezes and dispatches.** `orchestrator_start` (plan path or explicit
+  steps) freezes the list and dispatches row 1; acceptance of row N dispatches
+  row N+1; all rows accepted plus a passing plan check completes the run. A
+  dispatch failure leaves a retryable ready/blocked row, never a lost approval.
+- **Neutral destination.** `workflow.handoff.executionMode`,
+  `DEFAULT_EXECUTION_DESTINATION`, the recommendation fields,
+  `recommendHandoffDestination`, `/handoff execution` and `/handoff once` are
+  removed. Every approved plan asks Build/Orchestrator again; feedback stays in
+  Plan. Handoff decisions are codec version 3; version 2 is still read (its
+  recommendation fields are ignored) and approved records still require their
+  explicit `destination`.
+- **The child is a Build session.** Managed children switch to Build on session
+  start (mode/tools/model), create their own task-local TODO list, and edit
+  immediately: the readiness/fence edit interlock and the 45 s start wait are
+  gone. Report/checkpoint and parent-only tool refusal remain.
+- **Verification is row-scoped.** The parent captures the pre-work baseline,
+  runs the row checks, accepts with runtime-owned evidence, and runs the plan's
+  verification commands once after the last row. Repair is hard-capped at two
+  rounds.
+- **Status/footer.** The Orchestrator footer no longer renders approval or
+  recommendation prose; host contributions report phase/next/blocked only.
+
+### Changed — the composer mode label is the cycle control (2026-11-22)
+
+- **One cycle, two entry points.** `Tab`, `Ctrl+Alt+P` and the registered
+  `/workflow-cycle` command now call one serialized operation; the next mode is
+  computed inside it from the live mode, and the overlay/Review checks are
+  re-evaluated when the queued request runs. The ordinary ring is
+  Default → Plan → Orchestrator → Build (a managed worker omits Orchestrator;
+  quarantined workers use the worker ring instead of getting stuck on a refused
+  target). A transition queued before a rebind/shutdown is abandoned instead of
+  publishing into the replacement session.
+- **The generic mode contribution references its action.** `ModeContribution`
+  gained an optional `actionRef` naming a same-owner, top-level action. The
+  publisher emits one `mode-cycle` action for all four base modes (Default
+  included) and no longer sends the fixed-target `mode-plan` /
+  `mode-orchestrator` / `mode-build` buttons, so a host can make the mode label
+  itself the control. The retired ids are withdrawn explicitly; a Review turn
+  publishes the cycle action disabled with its reason. Task, progress, review,
+  handoff and recovery contributions are unchanged.
+- **Publication failures are visible.** `set()` results are inspected and a
+  rejected set keeps the last valid state and reports one bounded, deduplicated
+  diagnostic (never the payload).
+
+### Fixed — SDK SessionManager loader and host readiness (2026-11-22)
+
+**The Orchestrator can now create the durable Builder session on a host whose
+SDK exports `SessionManager` as a class.**
+
+- **The loader validates the contract, not the JavaScript type.** A class is a
+  function, not an object. `loadPiSdkModule()` accepts a class/function or an
+  object whose static `create` and `open` are functions, including a
+  `default.SessionManager` ESM/CJS interop shape. Invalid exports and import
+  failures name the package and report a bounded export shape.
+- **Terminal readiness includes the SDK.** `createTerminalChildHost` probes the
+  SDK worker storage in `capabilities()` and again before `prepare()`. A
+  terminal that exists but cannot load the SDK is advertised unavailable, so the
+  approval preview blocks before the user spends an approval.
+- **`/orchestrator start` resumes an approved run.** It restores the bound
+  plan's deterministic journal first, then uses the same one-dispatch auto-start
+  path as approval. A repeated start is still refused by the approval, phase and
+  mutation guards; passive reload never auto-dispatches.
+- **Non-creating probe.** `createSdkWorkerPort.probe()` loads and validates the
+  SDK without creating a session file or metadata.
+
+### Fixed — breakdown approval dialog and Builder bootstrap (2026-11-22)
+
+**The Orchestrator no longer asks the user to copy an approval command, and a
+valid approval can actually launch the Builder child.**
+
+- **Approval is a dialog.** After `orchestrator_propose_tasks` validates an
+  unblocked breakdown, the host opens the execution-approval questionnaire.
+  The fixed rows are *Approve execution — start the next ready task* and
+  *Deny — stay in Orchestrator*; the freeform row means “revise”. Esc/cancel
+  dismisses without approving or invalidating.
+- **Approve starts work.** Approval is journaled first, then the next
+  dependency-ready task is dispatched through the existing durable dispatch
+  path. A failed dispatch keeps the approval and reports the real blocker.
+- **Deny is durable.** The preview is invalidated through the runtime refine
+  path; typed feedback asks for a revised breakdown. The session stays in
+  Orchestrator mode.
+- **Headless fallback unchanged.** A host without UI still gets
+  `/orchestrator approve preview-<digest>`; the command now also starts the next
+  ready task after approval.
+- **Builder model bootstrap fixed.** `builderModelPlan()` no longer drops the
+  provider. `resolveBudget()` keeps a missing provider absent instead of writing
+  `""`, so a fallback is not defeated by a non-nullish empty string. Preview and
+  launch now share one resolver: effective Builder role/profile first, current
+  session model fallback, fail closed when neither has a provider/id.
+- **Truthful preview.** The preview shows the exact Builder model that will
+  launch, including a profile override and a conservative limit estimate when
+  the role model is not the live session model.
+- **Model-facing text.** The mission, preparation result and tool description
+  no longer instruct the model to print an approval command in a UI session.
+
+### Changed — plan approval and execution selection are separate decisions (2026-11-22)
+
+**Fixes the reported ordering bug.** After Review completed, the configured
+presenter was not given the plan first: the browser path asked a native
+destination question *before* opening Plannotator (and could look like a native
+fallback), while the native sheet combined "approve" with a destination. Both
+now follow the required order everywhere.
+
+- **Presenter first.** `confirmBrowserHandoffDestination()` — the pre-review
+  picker that wrote a global `executionMode` — is gone. The configured
+  presenter (Plannotator or native) is asked about the PLAN only:
+  *Approve plan (choose execution next)* / *Give feedback* / *Skip*.
+- **Separate execution chooser.** A plan approval records the approval and then
+  opens one chooser: *Orchestrator — prepare an execution breakdown* /
+  *Direct Build — execute in this session now* / *Decide later*. No approval,
+  saved default or one-off recommendation can execute by itself.
+- **Per-plan, not persisted.** The chooser's answer applies to that approved
+  plan. `workflow.handoff.executionMode` remains the saved RECOMMENDATION
+  (edited only by `/handoff execution …`) and is no longer written as a side
+  effect.
+- **Cancel keeps the approval.** Cancelling/escaping the chooser, or a reload
+  mid-choice, leaves the plan approved and the session in Plan with nothing
+  started. `/handoff continue <decision-id>` reopens it; a changed plan,
+  branch or session invalidates it instead.
+- **New command stages.** `/handoff approve <id>` is stage 1 only;
+  `/handoff continue <id>` reopens stage 2; `/handoff execute <id>
+  orchestrator|build` is the explicit headless/CLI stage 2; `/handoff once`
+  now changes only the recommendation and never executes.
+- **`handoff-routing.ts` v2.** The record now models
+  `pending → approved → routing → consumed` (plus `route-failed`,
+  `superseded`, `dismissed`), with separate approval, selection and route
+  receipts. v1 records migrate conservatively: the old captured destination
+  becomes a recommendation, and a consumed v1 record stays terminal.
+- **One owner for effects.** Browser events, native answers, reload recovery and
+  commands all approve/route through the same coordinator. Approval is journaled
+  before any effect; routing intent is persisted before Build/Orchestrator work;
+  a duplicate event cannot open a second chooser, and an uncertain delivery is
+  never retried automatically.
+- **Fallback keeps the decision.** Plannotator timeout/error, a closed review and
+  `/handoff fallback` now retire only the browser transport correlation — the
+  claim/identity/recommendation survive into the native sheet (previously the
+  decision was cleared and then "reused").
+- **Late events are refused.** One claim per review id, plus a state guard in
+  the deny handler, prevent an approve-then-deny pair or a stale tab from
+  revising or executing an already-approved plan.
+- **Status.** The footer/contribution detail distinguishes a pending plan review
+  from `execution choice pending`, labels the destination as a *recommendation*,
+  and offers a `Choose execution` action for an approved wait.
+- Tests: `handoff-routing.test.ts` (v2 + migration), new
+  `handoff-execution-view.test.ts`, and `extension.test.ts` now cover the
+  ordering, cancellation/resume, changed-plan refusal, duplicate channels, the
+  presenter×recommendation matrix, and the headless two-command flow.
+
+The Orchestrator preview approval is unchanged and still separate: choosing
+Orchestrator authorizes preparation only.
+
+### Added — Orchestrator mission and manual work entry (2026-11-22, third pass)
+
+- **Distinct Orchestrator identity.** `permissions.ts`/`policy-runtime.ts` now
+  resolve an `orchestrator` role (inspect + verify, no project writes). Refusals
+  name the delegation remedy instead of calling the session Plan or telling the
+  user to switch to `/build`. The role still cannot widen inherited authority.
+- **Authoritative mission injection.** `orchestrator-mission.ts` is the single
+  mission text: identity (not Plan/Builder), the work-entry tool, the breakdown
+  approval, delegation, evidence-backed acceptance, host readiness and the
+  current phase/next action. It replaces nothing else and never accumulates.
+- **Plan-or-discussion work source.** `orchestrator-source.ts` captures the
+  current discussion (objective, constraints, bullet/numbered requirements,
+  deterministic snapshot bytes + digest) or an explicit plan path. Explicit
+  discussion beats a stale `currentPlanFile`; ambiguity asks instead of guessing.
+- **Manual preparation entrypoint.** `orchestrator_prepare` is available before
+  a run is bound, and `/orchestrator start [path]` routes into the same service.
+  Bare `/orchestrator` still only selects the mode and launches nothing.
+- **Human-bound execution preview.** `orchestrator-preview-view.ts` renders the
+  derived scope, grouping, models, checks, host, dirty baseline, commit behavior
+  and limits. `/orchestrator preview` shows it; approval requires the exact
+  `preview-<digest>` id, so the old literal confirmation cannot approve and a
+  changed preview cannot be approved by a stale command.
+- **Durable refine.** `/orchestrator refine <what>` journals the invalidation,
+  clears plan/preview/approval, returns the run to awaiting approval and survives
+  reload; a restored journal can no longer resurrect a superseded approval.
+- **Content-addressed evidence.** Workspace capture now records a SHA-256 for
+  every non-deleted changed path. Same-length edits to already-dirty, untracked
+  and non-Git files change the revision; staged + unstaged observations are no
+  longer collapsed; unreadable/oversized content is incomplete coverage and
+  blocks acceptance instead of reading as unchanged. Verification recomputes the
+  revision after checks and refuses evidence when it moved.
+- **Durable fencing reservation.** `nextGeneration` reserves a workspace-wide
+  token on disk and `acquire` consumes it once; a restarted parent or a second
+  task cannot reuse a token, and replaying a consumed token is stale.
+- **Model input narrowed.** `orchestrator_propose_tasks` no longer exposes a
+  model-supplied requirement list (coverage uses the runtime's immutable roadmap)
+  and `orchestrator_dispatch` no longer exposes `sessionRef` (the runtime owns the
+  prepared identity).
+- **Packaging/docs:** the three new modules and their tests are in the package
+  files and test command; README/CHANGELOG describe both work-entry paths.
+- **Still NOT RUN:** real provider turns, visible Terminal/Desktop launches,
+  packaged Desktop E2E and macOS/Linux signoff. These remain explicit manual
+  acceptance items, not claims of passing.
+
+### Added — Live child composition (2026-11-22, second pass)
+
+- **Real child host composition.** `orchestrator-child-host.ts` builds a
+  dispatcher over a Terminal launcher or a source-bound Desktop tab. Prepare
+  creates the durable child and its metadata, writes a private grant, and only
+  then does the visible launch happen. A launcher success is not readiness.
+- **Authenticated run control.** `orchestrator-run-control.ts` connects the
+  existing envelope/HMAC decisions to real named-pipe/unix-socket transports:
+  `ready → one sealed start → start-ack`, plus post-start `say`/control pushes.
+  Forged, stale, reordered and duplicate frames are refused; a delivered but
+  unacknowledged start is `uncertain`, never a clean failure.
+- **Two-step mutation authority.** The child holds the verified grant until
+  `workflow_worker_ready` acknowledges the assignment; only that call applies
+  the grant and records the start ack. Delivery never opens the workspace.
+- **SDK persistence fix.** A lazy session file is materialized with a supported
+  user conversation entry (the real SDK does not persist setup entries alone),
+  verified against the installed SDK rather than only the fake.
+- **Workspace-wide fencing.** `acquire` now takes a durable per-workspace
+  generation, so a second task or a later run cannot reuse generation 1; the
+  high-water mark survives release and restart.
+- **Runtime-owned verification and acceptance.** `orchestrator_verify` captures
+  the baseline and candidate, runs the task checks through `ctx.executeTool`,
+  and applies acceptance atomically. `orchestrator_accept` no longer accepts a
+  model-supplied evidence object at all.
+- **Live runtimes wired:** usage is recorded from real assistant usage and
+  journaled idempotently; the parent TODO list is the accepted-coverage
+  projection (mutations refused); `/orchestrator finalize` runs the fail-closed
+  final gate and journals a scoped revision proposal when it fails;
+  `/orchestrator say` is delivered to the live child.
+- **UI/diagnostics:** the contribution contract now carries run phase/approval,
+  blocked reasons, host readiness and an explicit "Use direct Build" action when
+  no child host is reachable. A session rebind clears every control/host
+  reference so stale callbacks are inert.
+- **Still NOT RUN:** real provider turns, real Windows/macOS/Linux terminal
+  launches, packaged Desktop E2E and cross-platform signoff.
+
+### Added — Orchestrator integration (2026-11-22)
+
+- **Parent runtime is wired:** an approved Orchestrator handoff now snapshots the
+  exact roadmap bytes into a durable run journal and starts exactly one bounded
+  preparation turn. Breakdown approval is still a separate, digest-bound decision.
+- **Parent tools are registered** (`orchestrator_propose_tasks|dispatch|status|
+  verify|repair|accept`). Dispatch journals assign → start intent → one wake →
+  ack, and reports uncertain/lost starts instead of retrying blindly. They refuse
+  outside Orchestrator mode, on a managed worker, or without a bound run.
+- **Durable wake pump:** child events wake the parent at most once per settle
+  boundary; heartbeats/progress never do; `agent_end` is not a boundary; delivered
+  wakes are journaled so a reload cannot repeat them.
+- **Evidence-backed verification:** baseline→candidate capture, gated checks,
+  acceptance bound to the current workspace revision, no second acceptance, and a
+  bounded scoped repair on failure.
+- **Usage/rollover:** usage is durable and idempotent, unknown cost pauses under a
+  configured cap, and rollover preserves repair/no-progress/rollover counters.
+- **Operator commands:** `/orchestrator status|start|pause|resume|stop|inspect|
+  say|retry|approve|cancel`; bare `/orchestrator` remains mode entry.
+- **TODO ownership:** the parent roadmap projection derives from acceptance only;
+  checkboxes, child TODOs and child reports cannot move it.
+- **Commits and final gate:** an accepted task is committed at most once by the
+  parent; a required final check that was skipped/cancelled/timed-out is **not** a
+  pass (fail-closed), and a failed final gate records a revision proposal without
+  reopening accepted work.
+- **Quarantine:** present-but-unreadable managed metadata now quarantines the
+  session (inspection only) instead of restoring it as an ordinary writable one.
+- **Footer:** a `workflow-orchestrator` segment shows the saved destination before
+  consent and the run phase/approval/next/blocked state after it; native
+  mode-action order is Plan → Orchestrator → Build.
+- **Still NOT RUN:** real provider/model turns, real terminal launches, packaged
+  Desktop E2E and macOS/Linux signoff. This build binds no child host, so dispatch
+  and execution approval fail closed with an actionable reason.
+
+### Added — Orchestrator (experimental)
+
+An opt-in engine for long, phased roadmaps. It is **not** a release of the
+live orchestration loop: the durable contracts, reducers and host seam are
+implemented and tested, while real provider/turn wiring, cross-platform
+terminal launches and Desktop E2E remain manual/next-step work.
+
+- New `/orchestrator` mode and Orchestrator role with planner fallback; mode
+  entry never launches work and the ordinary Plan → Review → Build flow is
+  unchanged.
+- Durable run journal with checksummed append, single writer, idempotent event
+  ids, torn-write recovery and intent/ack reconciliation; roadmap ingestion
+  keeps every requirement and treats `- [x]` as a claim, not proof.
+- Task-only execution TODOs, coverage-validated decomposition, context and
+  capability budgets, execution preview/approval and bounded assignment packets.
+- Normal visible Build children: durable metadata before launch, readiness and
+  lease-gated wake, cross-platform terminal adapters, Desktop related-session
+  hosting, Build environment parity and worker-local TODOs.
+- Evidence-backed parent acceptance (real diff, real check output, workspace and
+  roadmap revision fences), scoped repair with persisted budgets, context
+  rollover with a safe-boundary checkpoint, and a final integration gate driven
+  only by accepted task coverage.
+- Parent-only commits with a durable evidence-keyed ledger; managed children
+  suppress TODO/`[DONE]`/checkbox/report auto-commits and may not push.
+- Run controls (pause/resume/stop with quiesce-before-lease-release), restart/
+  branch reconciliation, drift detection that never widens policy automatically,
+  bounded parent context/compaction pointers, usage/caps/retention, an optional
+  independent verifier and a future stage interface.
+- Generic host contribution and related-session contract; Pi Desktop renders two
+  unrelated fixture extensions with arbitrary mode names and source-bound
+  related-session ownership, with no Workflow parsing.
+- Automated coverage: generated transition invariants, provider-free fake-agent
+  process crashes, real on-disk journal recovery, workspace/lease/baseline
+  edges, generic Desktop contract fixtures, full extension test suites.
+- Live acceptance is **NOT RUN**: see `docs/orchestrator-live-acceptance.md` for
+  the manual checklist (real models, Windows Terminal, macOS Terminal and
+  Linux/tmux signoff).
 
 ### Fixed — shell probes can no longer hang a request indefinitely
 
@@ -1158,10 +2557,6 @@ Behaviour deliberately unchanged: the fallback (the author's plan is handed over
 
 Tests: 7 new cases in `review.test.ts` — `truncateErrorText`, the translator's provider lines, the decoder matrix, and runtime rounds asserting the new reason (including an error-stop run with no retries and the no-leak-into-pass-2 guarantee); the legacy no-submission regression test still passes. The README gains a troubleshooting entry keyed on the new message.
 
-## [0.3.1] - 2026-09-20
-
-- No user-facing changes recorded.
-
 ## [0.3.2] - 2026-09-21
 
 ### Fixed — Review Mode: any provider works as the reviewer
@@ -1338,6 +2733,10 @@ Tests: 7 new cases in `review.test.ts` — `truncateErrorText`, the translator's
 
 Tests: `pane.test.ts` removed; new `review-ui.test.ts` covers the buffer, formatters and
 renderers; `review.test.ts` adds the input-routing truth table and runtime streaming tests.
+
+## [0.3.1] - 2026-09-20
+
+- No user-facing changes recorded.
 
 ## [0.3.0] - 2026-09-18
 

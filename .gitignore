@@ -29,3 +29,7 @@ agent/models.*.bak
 
 # project-local workflow grants (machine-specific paths)
 /.pi/settings.json
+agent/orchestrator
+agent/workflow
+agent/workflow
+

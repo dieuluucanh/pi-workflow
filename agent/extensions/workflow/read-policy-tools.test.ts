@@ -189,6 +189,35 @@ test("writers: edit/write/ast_grep_replace are skipped unless guarded", () => {
   assert.deepEqual(guarded, [norm("../x", CWD)]);
 });
 
+test("writers: the reviewer's review_submit is exempt, not a read", () => {
+  // `review_submit` is the reviewer's only write path (it appends the advisory
+  // section — see review-tools.ts). Its findings carry `file` anchors, which the
+  // generic path scan would otherwise report as READS: a finding anchored in an
+  // excluded or sensitive file would then block the submission itself. The
+  // reviewer's own tool owns the write target, so the read gate must skip it.
+  const result = classifyReadCall(
+    "review_submit",
+    {
+      findings: [{ file: "../outside/notes.md", summary: "anchored finding" }],
+      verdict: "revise",
+      summary: "one finding",
+      revisions: [{ step: "2", change: "do the thing" }],
+    },
+    CWD,
+    DEFAULT_READ_POLICY_CONFIG,
+  );
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.uncertain.length, 0);
+  assert.ok(result.exempt);
+  // An unregistered `review_*` tool name gets no writer exemption: only the
+  // live tools in KNOWN_WRITE_TOOLS are skipped.
+  assert.equal(
+    targetPaths("review_unknown", { path: "../x" }).length,
+    1,
+    "an unregistered review tool with a path is still guarded",
+  );
+});
+
 test("guardedTools: forces a scan even for an exempt tool", () => {
   assert.deepEqual(
     targetPaths("memory_read", { path: "../x" }, ["memory_read"]),

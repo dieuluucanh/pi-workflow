@@ -13,6 +13,11 @@ import {
   reviewHandoffRecovery,
   shouldHandoffManualResult,
 } from "./review-handoff.ts";
+import {
+  classifyReviewExecution,
+  reviewResumeGateOutcome,
+  reviewResumeNotice,
+} from "./review.ts";
 
 test("reviewHandoffRecovery: pending keeps only a matching plan", () => {
   assert.deepEqual(
@@ -113,4 +118,30 @@ test("shouldHandoffManualResult: every settled manual round hands off", () => {
   assert.equal(shouldHandoffManualResult({ outcome: "paused" }), false);
   // Abort skips the reviewer but still presents the author's plan.
   assert.equal(shouldHandoffManualResult({ outcome: "aborted" }), true);
+});
+
+test("review notices: a settled append reads as advisory notes, not a rewrite", () => {
+  // `"rewritten"` is a ROUTING value: the plan TEXT changed (the appendix was
+  // appended), so every completed round reaches it, but the plan BODY is never
+  // replaced. The user-facing string must not claim a rewrite happened.
+  const outcome = classifyReviewExecution({
+    ok: true,
+    aborted: false,
+    paused: false,
+    planChanged: true,
+  });
+  assert.equal(outcome, "rewritten");
+  assert.equal(
+    reviewResumeNotice({ planText: "plan", outcome, paused: false }),
+    "Review finished — advisory notes appended.",
+  );
+  assert.equal(reviewResumeGateOutcome({ planText: "plan", outcome, paused: false }), "reviewed");
+  assert.equal(
+    reviewResumeNotice({
+      planText: "plan",
+      outcome: "unchanged",
+      paused: false,
+    }),
+    "Review finished — the reviewer kept the plan as-is.",
+  );
 });

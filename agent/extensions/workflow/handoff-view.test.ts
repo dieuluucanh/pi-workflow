@@ -12,7 +12,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  HANDOFF_APPROVE_BUILD_LABEL,
   HANDOFF_APPROVE_LABEL,
+  HANDOFF_APPROVE_ORCHESTRATOR_LABEL,
   HANDOFF_FEEDBACK_LABEL,
   HANDOFF_PLAN_ENTRY_TYPE,
   HANDOFF_PLAN_MAX_CHARS,
@@ -69,11 +71,11 @@ test("buildHandoffQuestion carries a short context, never the plan body", () => 
     findingCount: 2,
   });
   assert.equal(question.header, HANDOFF_QUESTION_HEADER);
-  assert.equal(question.question, "Plan ready — how do you want to proceed?");
+  assert.equal(question.question, "Plan ready — approve it, or ask for changes?");
   assert.deepEqual(
     question.options.map((o) => o.label),
     [HANDOFF_APPROVE_LABEL, HANDOFF_FEEDBACK_LABEL, HANDOFF_SKIP_LABEL],
-    "the recommended approve option is first",
+    "the plan question is destination-neutral",
   );
   const context = String(question.context ?? "");
   assert.ok(context.includes(".pi/plans/2026-11-15-hf.md"));
@@ -87,6 +89,10 @@ test("buildHandoffQuestion carries a short context, never the plan body", () => 
   assert.ok(
     !context.includes("Plan Steps"),
     "the plan body must not be pinned inside the modal",
+  );
+  assert.ok(
+    /not execution/.test(context),
+    "the question says approval is not execution",
   );
 });
 
@@ -105,6 +111,93 @@ test("buildHandoffQuestion pluralizes and omits missing detail", () => {
   assert.ok(!String(bare.context).includes("Review:"));
 });
 
+test("buildHandoffQuestion pluralizes and omits a non-positive note count", () => {
+  const two = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "revise",
+    findingCount: 2,
+    revisionCount: 2,
+  });
+  assert.ok(
+    String(two.context).includes("Review: revise · 2 findings · 2 notes"),
+    "the advisory note count sits on the existing Review line",
+  );
+
+  const one = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+    revisionCount: 1,
+  });
+  assert.ok(
+    String(one.context).includes("Review: approve · 3 findings · 1 note"),
+  );
+  assert.ok(!String(one.context).includes("1 notes"));
+
+  const zero = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+    revisionCount: 0,
+  });
+  assert.match(
+    String(zero.context),
+    /Review: approve · 3 findings$/m,
+    "0 notes must not be printed",
+  );
+  assert.doesNotMatch(String(zero.context), /\d+ notes?\b/);
+
+  const missing = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "approve",
+    findingCount: 3,
+  });
+  assert.match(String(missing.context), /Review: approve · 3 findings$/m);
+  assert.doesNotMatch(String(missing.context), /\d+ notes?\b/);
+});
+
+test("buildHandoffQuestion renders a non-convergence note only when supplied", () => {
+  const note =
+    "Review did not converge after 3 revisions — approving accepts the plan as written; Give feedback continues.";
+  const withNote = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    verdict: "revise",
+    findingCount: 2,
+    revisionCount: 2,
+    revisionNote: note,
+  });
+  const context = String(withNote.context ?? "");
+  assert.ok(context.includes(note), "the loop outcome is one line in the context");
+  assert.equal(
+    context.split("\n").filter((line) => line.includes("did not converge")).length,
+    1,
+    "the note is rendered once, not duplicated",
+  );
+  assert.deepEqual(
+    withNote.options.map((o) => o.label),
+    [HANDOFF_APPROVE_LABEL, HANDOFF_FEEDBACK_LABEL, HANDOFF_SKIP_LABEL],
+    "the non-convergence note never changes the options",
+  );
+
+  const without = buildHandoffQuestion({ planPath: "p", reason: "reviewed" });
+  assert.ok(!String(without.context).includes("did not converge"));
+
+  const blank = buildHandoffQuestion({
+    planPath: "p",
+    reason: "reviewed",
+    revisionNote: "   ",
+  });
+  assert.ok(
+    !String(blank.context).includes("did not converge"),
+    "a blank note is not rendered",
+  );
+});
+
 test("handoffReasonLabel covers every reason", () => {
   const reasons = [
     "reviewed",
@@ -121,14 +214,14 @@ test("handoffReasonLabel covers every reason", () => {
   assert.ok(handoffReasonLabel("handoff").includes("approve"));
 });
 
-test("handoffChoiceFromResult maps the approve row to execute", () => {
+test("handoffChoiceFromResult maps the approve row to a PLAN approval", () => {
   const result = {
     cancelled: false,
     answers: [
       { question: "q", answer: HANDOFF_APPROVE_LABEL, wasCustom: false },
     ],
   };
-  assert.deepEqual(handoffChoiceFromResult(result), { choice: "execute" });
+  assert.deepEqual(handoffChoiceFromResult(result), { choice: "approve" });
 });
 
 test("handoffChoiceFromResult maps the feedback row to refine", () => {
@@ -197,4 +290,33 @@ test("handoffChoiceFromResult tolerates a non-object host answer", () => {
     handoffChoiceFromResult({ cancelled: false, answers: [] } as never),
     { choice: "dismiss" },
   );
+});
+
+// ── Approval is stage 1 only ─────────────────────────────────────────
+
+test("native plan rows never carry an execution destination", () => {
+  const question = buildHandoffQuestion({ planPath: "p", reason: "reviewed" });
+  assert.equal(question.options.length, 3);
+  assert.equal(question.options[0]?.label, HANDOFF_APPROVE_LABEL);
+  assert.match(String(question.options[0]?.description), /choose Orchestrator \(in-process child per step\) or direct Build/);
+  for (const option of question.options) {
+    assert.doesNotMatch(
+      option.label,
+      /→ (Orchestrator|direct Build)/,
+      "no destination-specific approval row",
+    );
+  }
+});
+
+test("legacy destination labels approve the PLAN only", () => {
+  const answer = (label: string) =>
+    handoffChoiceFromResult({
+      cancelled: false,
+      answers: [{ question: "q", answer: label, wasCustom: false }],
+    });
+  // Pre-split labels are still readable, but they must never imply a route.
+  assert.deepEqual(answer(HANDOFF_APPROVE_ORCHESTRATOR_LABEL), { choice: "approve" });
+  assert.deepEqual(answer(HANDOFF_APPROVE_BUILD_LABEL), { choice: "approve" });
+  // A label that is only similar is never an approval.
+  assert.deepEqual(answer("Approve plan → Build maybe"), { choice: "dismiss" });
 });

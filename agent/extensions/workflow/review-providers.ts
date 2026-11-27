@@ -260,70 +260,13 @@ export function seedChildRuntimeProviders(
   return result;
 }
 
-/** Outcome of the reviewer's provider-auth preflight. */
-export interface ReviewerAuthCheck {
-  configured: boolean;
-  /** `hasConfiguredAuth` said yes (snapshot). */
-  viaSnapshot: boolean;
-  /** `checkAuth` resolved to something (credential resolution). */
-  viaCheckAuth: boolean;
-  /** True when the runtime exposes neither accessor (cannot verify — trust). */
-  unverifiable: boolean;
-}
-
 /**
- * Provider-agnostic reviewer auth preflight, mirroring the child session's own
- * prompt gate (`hasConfiguredAuth(provider) || checkAuth(provider) !==
- * undefined`) but tolerating a runtime that exposes neither accessor (old or
- * stubbed SDKs): "cannot verify" proceeds rather than blocks. Feature-detected
- * and never throws; a throwing `checkAuth` counts as "not configured".
+ * The reviewer's provider-auth preflight is the shared provider-agnostic probe
+ * (`provider-auth.ts`). The historical names stay exported here because Review
+ * Mode and the Orchestrator child import them from this module.
  */
-export async function checkReviewerProviderAuth(
-  runtimeLike: unknown,
-  providerId: string,
-): Promise<ReviewerAuthCheck> {
-  let viaSnapshot = false;
-  let sawSnapshotAccessor = false;
-  try {
-    const has = (runtimeLike as { hasConfiguredAuth?: unknown })
-      ?.hasConfiguredAuth;
-    if (typeof has === "function") {
-      sawSnapshotAccessor = true;
-      viaSnapshot =
-        (has as (this: unknown, id: string) => unknown).call(
-          runtimeLike,
-          providerId,
-        ) === true;
-    }
-  } catch {
-    viaSnapshot = false;
-  }
-  if (viaSnapshot) {
-    return { configured: true, viaSnapshot: true, viaCheckAuth: false, unverifiable: false };
-  }
-  let viaCheckAuth = false;
-  let sawCheckAuthAccessor = false;
-  try {
-    const check = (runtimeLike as { checkAuth?: unknown })?.checkAuth;
-    if (typeof check === "function") {
-      sawCheckAuthAccessor = true;
-      const resolved = await (check as (this: unknown, id: string) => unknown).call(
-        runtimeLike,
-        providerId,
-      );
-      viaCheckAuth = resolved !== undefined && resolved !== null;
-    }
-  } catch {
-    viaCheckAuth = false;
-  }
-  const unverifiable = !sawSnapshotAccessor && !sawCheckAuthAccessor;
-  return {
-    configured: viaCheckAuth || unverifiable,
-    viaSnapshot: false,
-    viaCheckAuth,
-    unverifiable,
-  };
-}
+export type { ProviderAuthCheck as ReviewerAuthCheck } from "./provider-auth.ts";
+export { checkProviderAuth as checkReviewerProviderAuth } from "./provider-auth.ts";
 
 /** One-line summary of a seed result, for preflight/failure messages. */
 export function describeSeedResult(result: ProviderSeedResult): string {

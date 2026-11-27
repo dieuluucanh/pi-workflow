@@ -180,6 +180,17 @@ test("recovery: a second, different failure also trips", () => {
   assert.match(second.reason, /second shell-guard failure/);
 });
 
+test("recovery: an adopted quarantine blocks shell without a new failure", () => {
+  const guard = createShellGuardRecovery();
+  guard.quarantine({ reason: "restored shell quarantine", command: "npm test", at: 7 });
+  assert.equal(guard.isStopped(), true);
+  assert.match(guard.stoppedReason() ?? "", /restored shell quarantine/);
+  assert.equal(
+    guard.recordFailure({ kind: "timeout", command: "unrelated" }).action,
+    "stop",
+  );
+});
+
 test("recovery: reset clears both the budget and the latch", () => {
   const guard = createShellGuardRecovery();
   guard.recordFailure({ kind: "timeout", command: "a" });
@@ -199,7 +210,8 @@ test("recovery: guidance never claims a replay or a rollback", () => {
 
   guard.recordFailure({ kind: "timeout", command: "x" });
   const stopped = guard.recordFailure({ kind: "timeout", command: "y" });
-  assert.match(shellFailureGuidance("timeout", stopped), /stopped this request/);
+  assert.match(shellFailureGuidance("timeout", stopped), /quarantined this execution/);
+  assert.match(shellFailureGuidance("timeout", stopped), /Continue with non-shell tools/);
 });
 
 test("fingerprint: whitespace-normalized and bounded", () => {
@@ -215,5 +227,11 @@ test("timeout classification is narrow and ignores user aborts", () => {
   );
   assert.equal(classifyShellFailureText("Command aborted"), undefined);
   assert.equal(classifyShellFailureText("exit code 1"), undefined);
+  assert.equal(
+    classifyShellFailureText(
+      "fixture says: Command timed out after 120 seconds\n\nCommand exited with code 1",
+    ),
+    undefined,
+  );
   assert.equal(classifyShellFailureText(undefined), undefined);
 });
