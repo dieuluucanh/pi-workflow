@@ -2,9 +2,9 @@
 
 All notable changes to this package are documented in this file.
 
-## [0.17.5] - 2026-11-27
+## [0.17.5] - 2026-11-28
 
-Release target: **0.17.5**, the first npm release after **0.13.0**. The
+Published **2026-11-28**: **0.17.5**, the first npm release after **0.13.0**. The
 0.14.0–0.17.4 sections below record development milestones included in this
 release, not separately published versions. Live human acceptance and Pi
 Desktop staging are **not verified** by this release.

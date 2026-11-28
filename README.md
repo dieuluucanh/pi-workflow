@@ -73,8 +73,8 @@ Revocation stops future disclosure — it cannot recall provider data already
 sent. A conflict is never overwritten; the original draft stays recoverable.
 Pi Desktop can bundle a pinned Workflow artifact with explicit
 override/disable/safe-mode paths; Terminal Pi keeps loading from npm or a
-checkout. The source tree targets Workflow **0.17.5** (release pending — npm
-still serves **0.13.0**) + Pi SDK **1.5.0**; semantic quality and live
+checkout. The source tree targets Workflow **0.17.5** (published — npm
+serves **0.17.5**) + Pi SDK **1.5.0**; semantic quality and live
 desktop/Terminal acceptance still require human verification, not inference
 from unit tests. Full detail: [`agent/extensions/workflow/README.md`](agent/extensions/workflow/README.md#prompt-refinement)
 and the Pi Desktop
@@ -91,9 +91,8 @@ pi install npm:@dieulc/autocompact
 pi install npm:@dieulc/server-logs
 pi install npm:@dieulc/browser-inspector
 
-# pinned, for reproducible installs (0.13.0 is the last published version;
-# 0.17.5 is release-pending in this checkout)
-pi install npm:@dieulc/workflow@0.13.0
+# pinned, for reproducible installs (0.17.5 is the current published version)
+pi install npm:@dieulc/workflow@0.17.5
 
 # project-local (writes .pi/settings.json for team sharing)
 pi install -l npm:@dieulc/workflow
@@ -128,7 +127,7 @@ First `pi` run prompts to **trust** the project — approve. Missing `npm:` pack
 
 ## Updating
 
-- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.13.0` to pin — 0.13.0 is the last published version, 0.17.5 is release-pending)
+- Extensions: `pi update --extensions` (or `pi install npm:@dieulc/workflow@0.17.5` to pin — 0.17.5 is the current published version)
 - Dotfiles: `cd ~/.pi && git pull`, then `pi update --extensions`
 
 ## Developing
