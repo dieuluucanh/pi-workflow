@@ -81,6 +81,8 @@ export interface MsysPathOptions {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   exists?: (value: string) => boolean;
+  /** Canonicalise a chosen root (defaults to `fs.realpathSync.native`). */
+  realpath?: (value: string) => string;
   /** Only translate when the session cwd is a native Windows path. */
   cwd?: string;
 }
@@ -114,6 +116,11 @@ function msysTempCacheKey(env: NodeJS.ProcessEnv): string {
  * bash `SHELL`. Candidates are tried in order and the first existing one
  * wins. Injected `env`/`exists` options bypass the cache (tests); no
  * `cygpath` subprocess.
+ *
+ * The chosen root is canonicalised (`realpathSync.native`): a runner can hand
+ * out the 8.3 short spelling (`C:\Users\RUNNER~1\...`) while policy roots are
+ * resolved to the long form, and returning the alias would make `/tmp` look
+ * outside the very folder it names.
  */
 export function resolveMsysTempRoot(
   opts: MsysPathOptions = {},
@@ -122,10 +129,13 @@ export function resolveMsysTempRoot(
   if (platform !== "win32") return undefined;
   const env = opts.env ?? process.env;
   const exists = opts.exists ?? fs.existsSync;
+  const realpath =
+    opts.realpath ?? ((value: string) => fs.realpathSync.native(value));
   const injected =
     opts.env !== undefined ||
     opts.exists !== undefined ||
-    opts.platform !== undefined;
+    opts.platform !== undefined ||
+    opts.realpath !== undefined;
   const key = msysTempCacheKey(env);
   if (!injected && msysTempCache?.key === key) return msysTempCache.root;
   const enabled =
@@ -150,7 +160,15 @@ export function resolveMsysTempRoot(
     candidates.push(path.join(env.LOCALAPPDATA, "Temp"));
   if (env.USERPROFILE)
     candidates.push(path.join(env.USERPROFILE, "AppData", "Local", "Temp"));
-  const root = candidates.find((candidate) => exists(candidate));
+  const candidate = candidates.find((value) => exists(value));
+  let root: string | undefined;
+  if (candidate) {
+    try {
+      root = realpath(candidate);
+    } catch {
+      root = candidate;
+    }
+  }
   if (!injected) msysTempCache = { key, root };
   return root;
 }

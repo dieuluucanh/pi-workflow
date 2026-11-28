@@ -14,7 +14,7 @@
     "release:status": "node scripts/status.mjs",
     "gallery": "node scripts/check-gallery.mjs",
   "eval:refinement": "node scripts/eval-prompt-refinement.mjs",
-    "test": "node --test scripts/check-gallery.test.mjs scripts/status.test.mjs scripts/release.test.mjs scripts/verify-packages.test.mjs"
+    "test": "node --test scripts/check-gallery.test.mjs scripts/status.test.mjs scripts/release.test.mjs scripts/release-gate.test.mjs scripts/verify-packages.test.mjs"
   },
   "repository": {
     "type": "git",

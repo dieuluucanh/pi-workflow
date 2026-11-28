@@ -13,6 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -54,7 +55,6 @@ import {
   writePolicyModeSourceOf,
   writeTargetPaths,
   writeWritePolicyConfig,
-  type WriteCallClassification,
   type WriteGateItem,
   type WritePolicyConfig,
 } from "./edit-policy.ts";
@@ -398,25 +398,63 @@ test("configPaths: global is the agent dir, project is <cwd>/.pi", () => {
 
 // ── path matching ───────────────────────────────────────────────────
 
-test("normalizeWritePath: absolute, forward slashes, lower-cased", () => {
+test("normalizeWritePath: absolute, forward slashes, platform case", () => {
   // Platform-agnostic: resolve the expectation the same way the
-  // implementation does, then compare the normalized forms.
-  const expected = path
-    .resolve("/work/proj", "src/File.ts")
-    .replace(/\\/g, "/")
-    .toLowerCase();
+  // implementation does, then compare the normalized forms. A POSIX path keeps
+  // its case (the filesystem is case-sensitive); a Windows spelling folds.
+  const base = path.resolve("/work/proj", "src/File.ts").replace(/\\/g, "/");
+  const expected = process.platform === "win32" ? base.toLowerCase() : base;
   const n = normalizeWritePath("src/File.ts", "/work/proj");
   assert.equal(n, expected);
   assert.ok(!n.includes("\\"));
-  assert.equal(n, n.toLowerCase());
+  if (process.platform === "win32") assert.equal(n, n.toLowerCase());
 });
 
 test("normalizeWritePath: an absolute path is kept as-is (resolved)", () => {
   const abs = path.resolve("/work/proj/src/a.ts");
   const n = normalizeWritePath(abs, path.resolve("/other"));
-  assert.equal(n, abs.replace(/\\/g, "/").toLowerCase());
+  const expected =
+    process.platform === "win32"
+      ? abs.replace(/\\/g, "/").toLowerCase()
+      : abs.replace(/\\/g, "/");
+  assert.equal(n, expected);
   // The cwd must not leak into an already-absolute path.
   assert.ok(!n.includes("other"));
+});
+
+test("normalizeWritePath: a mixed-case temp dir survives normalization", () => {
+  // Regression: unconditionally lower-casing the canonical path turned a
+  // mixed-case temp dir (`/tmp/rv-test-S3LSLD`) into a path that does not
+  // exist, so `git -C <normalized>` failed on case-sensitive CI hosts.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-Write-Policy-"));
+  try {
+    const n = normalizeWritePath(dir, os.tmpdir());
+    assert.equal(fs.existsSync(n), true);
+    if (process.platform === "win32") {
+      // A Windows host folds the canonical form; the folded path still exists
+      // because Windows identity is case-insensitive.
+      assert.equal(n, dir.replace(/\\/g, "/").toLowerCase());
+    } else {
+      // POSIX keeps the exact case, which is the only spelling that exists.
+      assert.equal(n, dir.replace(/\\/g, "/"));
+    }
+
+    // The CI failure mode was `git -C <normalized>` failing with "cannot
+    // change to". Exercise it when git is available; skip silently otherwise.
+    const init = spawnSync("git", ["init", "-q", dir], { encoding: "utf8" });
+    if (!init.error && init.status === 0) {
+      const res = spawnSync("git", ["-C", n, "rev-parse", "--show-toplevel"], {
+        encoding: "utf8",
+      });
+      assert.equal(
+        res.status,
+        0,
+        `git -C ${n} failed: ${res.stderr || res.error?.message || ""}`,
+      );
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("normalizeWritePath: empty/garbage input yields an empty string", () => {

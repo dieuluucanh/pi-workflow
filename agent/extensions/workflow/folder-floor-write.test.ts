@@ -25,6 +25,11 @@ interface BootOptions {
   selectAnswers?: Array<string | undefined>;
 }
 
+// The session temp folder has to be spelled the way the fixture root is
+// resolved: on Windows a runner's temp dir can be an 8.3 short path
+// (`RUNNER~1`) while the fixture/project root is the long form.
+const TEMP_ROOT = fs.realpathSync.native(os.tmpdir());
+
 async function boot(
   settings: Record<string, unknown>,
   options: BootOptions = {},
@@ -774,7 +779,7 @@ test("session: a denied session folder warns at startup", async () => {
       folderPolicy: {
         mode: "cwd",
         outside: "ask",
-        excludePaths: [os.tmpdir()],
+        excludePaths: [TEMP_ROOT],
       },
     },
   });
@@ -795,7 +800,7 @@ test("plan: a denied session folder cannot write plan files", async () => {
       folderPolicy: {
         mode: "cwd",
         outside: "ask",
-        excludePaths: [os.tmpdir()],
+        excludePaths: [TEMP_ROOT],
       },
     },
   });

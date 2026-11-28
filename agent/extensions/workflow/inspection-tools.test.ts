@@ -35,7 +35,13 @@ interface Sandbox {
 }
 
 function sandbox(): Sandbox {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-"));
+  // Canonical fixture root: on Windows a runner's temp dir can be the 8.3
+  // short path (`RUNNER~1`) while the resolved identity is `runneradmin`.
+  // Policy roots and exclusion patterns are canonicalised, so the fixture
+  // must be too; alias behaviour has its own regression below.
+  const root = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-")),
+  );
   fs.mkdirSync(path.join(root, ".git"), { recursive: true });
   fs.mkdirSync(path.join(root, "src"), { recursive: true });
   fs.mkdirSync(path.join(root, "excluded"), { recursive: true });
@@ -441,6 +447,46 @@ test("inspection find/ls: delegated entries are filtered per file before exposur
     assert.ok(!lsText.includes("excluded/"), "excluded folder is dropped");
     assert.ok(!lsText.includes(".env"), "sensitive entry is dropped");
   } finally {
+    box.cleanup();
+  }
+});
+
+test("inspection: an alias spelling of the approved root is judged by identity", async () => {
+  // Windows CI hands out an 8.3 short temp root (`RUNNER~1`) while the approved
+  // root is canonicalised (`runneradmin`). A junction/symlink reproduces the
+  // same shape on every host: the requested spelling is lexically outside the
+  // approved root, but resolves to the same folder.
+  const box = sandbox();
+  const aliasParent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-alias-"));
+  const alias = path.join(aliasParent, "repo");
+  try {
+    fs.symlinkSync(box.root, alias, "junction");
+    assert.equal(
+      fs.realpathSync.native(alias),
+      fs.realpathSync.native(box.root),
+      "the alias and the root are the same folder",
+    );
+    const toolbox = makeToolbox(box, fakeSdk({}), () => baseAuthority(box));
+
+    const read = await toolByName(toolbox, "read").execute("id", {
+      path: path.join(alias, "src", "a.ts"),
+    });
+    const readText = String(read.content[0].text);
+    assert.ok(!readText.includes("REFUSED"), "an alias of the root is allowed");
+    assert.match(readText, /read ok/);
+
+    // The alias must not become a way around an exclusion: resolve the link
+    // inside the approved root and reach the excluded folder through it.
+    const excludedLink = path.join(alias, "excluded-link");
+    fs.symlinkSync(path.join(box.root, "excluded"), excludedLink, "junction");
+    const denied = await toolByName(toolbox, "read").execute("id", {
+      path: path.join(excludedLink, "secret.ts"),
+    });
+    const deniedText = String(denied.content[0].text);
+    assert.match(deniedText, /REFUSED/);
+    assert.match(deniedText, /excluded/);
+  } finally {
+    fs.rmSync(aliasParent, { recursive: true, force: true });
     box.cleanup();
   }
 });

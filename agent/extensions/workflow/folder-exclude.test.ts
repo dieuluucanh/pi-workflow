@@ -33,7 +33,11 @@ function norm(value: string): string {
 }
 
 function tmpDir(): { dir: string; cleanup: () => void } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-folder-exclude-"));
+  // Canonical fixture root: symlink/exclusion matching compares the resolved
+  // identity, and a runner's temp dir can be an 8.3 short path (`RUNNER~1`).
+  const dir = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(os.tmpdir(), "pi-folder-exclude-")),
+  );
   return {
     dir,
     cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),

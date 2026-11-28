@@ -222,57 +222,79 @@ export function evaluateInspectionTarget(
         detail: `the ${label} project trust is not granted`,
       });
     }
+    const canonicalResult = canonicalizePolicyPath(lexical, cwd);
+    const canonical = canonicalResult.path || lexical;
+    const resolved = canonicalResult.resolved;
+    // A spelling and its resolved identity are the same file, so policy is
+    // evaluated against both: an 8.3 short name (RUNNER~1) or a junction
+    // alias of the approved root must not be refused as "outside", and an
+    // alias must not slip past a sensitive/exclusion rule either.
+    const spellings =
+      resolved && canonical !== lexical ? [lexical, canonical] : [lexical];
+    const targetFor = (spelling: string): FolderTarget => ({
+      path: spelling,
+      kind,
+    });
     // Sensitive-file rules win over every scope rule.
-    const sensitive = matchSensitivePath(lexical, authority.config, cwd);
-    if (sensitive.sensitive) {
+    const sensitive = spellings
+      .map((spelling) => matchSensitivePath(spelling, authority.config, cwd))
+      .find((match) => match.sensitive);
+    if (sensitive) {
       return deny("sensitive", {
         path: lexical,
         pattern: sensitive.pattern,
         detail: `matches the sensitive rule \`${sensitive.pattern ?? "sensitive"}\``,
       });
     }
-    const canonicalResult = canonicalizePolicyPath(lexical, cwd);
-    const canonical = canonicalResult.path || lexical;
-    const resolved = canonicalResult.resolved;
     const exists = pathExists(
       lexical.replace(/\//g, path.sep),
     );
-    const target: FolderTarget = { path: lexical, kind };
-    const evaluation = evaluateFolderTargets([target], {
-      config: authority.config,
-      grants: authority.grants,
-      cwd,
-      lockedRoots: [authority.root],
-      action: "read",
-    });
-    if (evaluation.sensitive.length > 0) {
+    const evaluations = spellings.map((spelling) =>
+      evaluateFolderTargets([targetFor(spelling)], {
+        config: authority.config,
+        grants: authority.grants,
+        cwd,
+        lockedRoots: [authority.root],
+        action: "read",
+      }),
+    );
+    const sensitiveMatch = evaluations.find((entry) => entry.sensitive.length > 0);
+    if (sensitiveMatch) {
       return deny("sensitive", {
         path: lexical,
-        pattern: evaluation.sensitive[0]?.pattern,
+        pattern: sensitiveMatch.sensitive[0]?.pattern,
         detail: "a sensitive rule matched the resolved path",
       });
     }
-    if (evaluation.excluded.length > 0) {
+    const excludedMatch = evaluations.find((entry) => entry.excluded.length > 0);
+    if (excludedMatch) {
       return deny("excluded", {
         path: lexical,
-        pattern: evaluation.excluded[0]?.pattern,
-        detail: `the path is inside the excluded folder \`${evaluation.excluded[0]?.root ?? ""}\``,
+        pattern: excludedMatch.excluded[0]?.pattern,
+        detail: `the path is inside the excluded folder \`${excludedMatch.excluded[0]?.root ?? ""}\``,
       });
     }
-    if (evaluation.uncertain.length > 0 && (resolved || exists)) {
+    if (
+      evaluations.some((entry) => entry.uncertain.length > 0) &&
+      (resolved || exists)
+    ) {
       return deny("unresolvable", {
         path: lexical,
         detail: "the target could not be verified against the approved roots",
       });
     }
-    if (evaluation.outside.length > 0) {
+    // Containment follows the resolved identity: that is the folder the bytes
+    // would actually come from. An unresolvable path keeps the lexical rule.
+    const identity = evaluations[evaluations.length - 1]!;
+    if (identity.outside.length > 0) {
       return deny("outside", {
         path: lexical,
         detail: `the path is outside the approved root \`${authority.root}\``,
       });
     }
     // Explicit belt-and-braces containment check for aliases/symlinks.
-    if (!isInsidePolicyPath(lexical, authority.root)) {
+    const confined = resolved ? canonical : lexical;
+    if (!isInsidePolicyPath(confined, authority.root)) {
       return deny("outside", {
         path: lexical,
         detail: `the path is outside the approved root \`${authority.root}\``,

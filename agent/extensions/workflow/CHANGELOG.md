@@ -38,9 +38,11 @@ Desktop staging are **not verified** by this release.
   `core.autocrlf` cannot invalidate its byte-level checksum. Verification errors
   retain enough test output to identify failed assertions in CI. PATH lookup uses
   the child platform's delimiter, multi-repo path rules follow each path's own
-  platform, write-allowlist paths are case-folded consistently on every host,
-  and the dead-code guard scans files in-process, so the suite passes without
-  Windows hosts or a ripgrep install.
+  platform, write-allowlist paths keep their case on POSIX, a Windows host still
+  folds the canonical form so drive and UNC identity is case-insensitive in
+  both the stored grant and the checked target, and the dead-code guard scans
+  files in-process, so the suite passes without Windows hosts or a ripgrep
+  install.
 - Node 24.22.2: root release-tool tests and the four-package verification gate
   pass, including typechecks, package tests, packed import closure and packed
   extension load smoke tests.
